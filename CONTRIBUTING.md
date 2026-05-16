@@ -28,7 +28,7 @@
    read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
    read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
     
-   git clone https://github.com/mdrakiburrahman/ivm-bench.git
+   git clone https://github.com/mdrakiburrahman/openivm-spark.git
 
    git config --global user.name "$user_name"
    git config --global user.email "$user_email"
