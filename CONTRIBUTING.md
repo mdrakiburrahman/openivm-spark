@@ -32,7 +32,7 @@
 
    git config --global user.name "$user_name"
    git config --global user.email "$user_email"
-   cd ivm-bench/
+   cd openivm-spark/
    git pull origin
 
    code .
