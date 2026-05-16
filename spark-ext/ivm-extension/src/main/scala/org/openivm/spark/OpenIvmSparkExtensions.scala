@@ -26,9 +26,7 @@ class OpenIvmSparkExtensions extends (SparkSessionExtensions => Unit) {
 
   override def apply(ext: SparkSessionExtensions): Unit = {
     ext.injectParser((session, parent) => new parser.IvmParser(session, parent))
-    // P4.dml / P4.cmds / P4.cat: injectResolutionRule + injectPostHocResolutionRule
-    // + injectCheckRule will land here once each surface is implemented.
-    // Keeping the scaffold non-disruptive lets us prove the jar loads cleanly
-    // before any rule starts firing.
+    ext.injectResolutionRule(session => new analyzer.IvmDmlInterceptorRule(session))
+    ext.injectPlannerStrategy(session => new analyzer.IvmStrategy(session))
   }
 }

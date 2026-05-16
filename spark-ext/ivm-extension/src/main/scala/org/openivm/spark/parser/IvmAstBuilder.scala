@@ -39,7 +39,7 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       else Map.empty[String, String]
     val queryText = extractQueryBody(ctx.queryBody())
     val queryPlan = session.sessionState.sqlParser.parsePlan(queryText)
-    CreateMaterializedViewCommand(name, queryPlan, properties, ifNotExists, provider)
+    CreateMaterializedViewCommand(name, queryPlan, properties, ifNotExists, provider, queryText)
   }
 
   override def visitRefreshMaterializedView(

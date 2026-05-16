@@ -1,0 +1,366 @@
+package org.openivm.spark.commands
+
+import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.{MvCatalog, StagingCatalog, StagingDelta}
+import org.openivm.spark.analyzer.IvmDmlInterceptorRule
+import org.scalatest.BeforeAndAfterAll
+import org.scalatest.funspec.AnyFunSpec
+import org.scalatest.matchers.should.Matchers
+
+import java.io.File
+import java.sql.Timestamp
+import java.util.UUID
+
+/**
+ * End-to-end integration tests for the three materialized-view DDL commands.
+ *
+ * Uses a real local SparkSession with the Delta and OpenIvm extensions loaded.
+ * The OpenIVM compiler subprocess must be reachable at the paths set by
+ * OPENIVM_EXTENSION_PATH / OPENIVM_CLI_PATH (propagated via build.sbt envVars).
+ */
+class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
+
+  private val warehouseDir: String = {
+    val d = new File(s"target/test-warehouse-cmds-${UUID.randomUUID().toString.take(8)}")
+    d.mkdirs()
+    d.getAbsolutePath
+  }
+
+  private var spark: SparkSession = _
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-spark-CommandsSpec")
+      .config(
+        "spark.sql.extensions",
+        "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+      )
+      .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+      .config("spark.openivm.enabled", "true")
+      .config("spark.sql.warehouse.dir", warehouseDir)
+      .config("spark.ui.enabled", "false")
+      // Suppress noisy Delta / Spark log lines in test output
+      .config("spark.sql.shuffle.partitions", "1")
+      .getOrCreate()
+
+    // Ensure catalog tables exist once for the whole suite
+    MvCatalog.ensureTables(spark)
+    StagingCatalog.ensureTables(spark)
+  }
+
+  override def afterAll(): Unit =
+    try {
+      if (spark != null) spark.stop()
+      deleteDir(new File(warehouseDir))
+    } finally {
+      super.afterAll()
+    }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /** Fully delete a directory tree (best-effort). */
+  private def deleteDir(f: File): Unit = {
+    if (f.isDirectory) Option(f.listFiles()).foreach(_.foreach(deleteDir))
+    f.delete()
+    ()
+  }
+
+  /**
+   * Create a staging Delta table that holds `rows` and register it in
+   * StagingCatalog.  Returns the staging path so tests can track it.
+   *
+   * This simulates what the P4.dml DML interceptor would do automatically.
+   * The bypass flag prevents the DML interceptor from re-wrapping these
+   * administrative writes (staging path is not a tracked source table).
+   */
+  private def simulateDmlStaging(
+      baseTable: String,
+      stagingSubPath: String,
+      rows: Seq[(String, Int)]
+  ): String = {
+    val stagingPath = s"$warehouseDir/_ivm/staging/$stagingSubPath"
+    IvmDmlInterceptorRule.bypass.set(true)
+    try {
+      spark.sql(
+        s"""CREATE TABLE IF NOT EXISTS delta.`$stagingPath` USING DELTA LOCATION '$stagingPath'
+            AS SELECT col1 AS region, col2 AS amount
+            FROM VALUES ${rows.map { case (r, a) => s"('$r', $a)" }.mkString(", ")}
+            AS t(col1, col2)
+         """
+      )
+      StagingCatalog.record(
+        spark,
+        StagingDelta(
+          baseTable  = baseTable,
+          opType     = "INSERT",
+          stagingPath = stagingPath,
+          txnTs      = new Timestamp(System.currentTimeMillis()),
+          consumedBy = Seq.empty
+        )
+      )
+    } finally {
+      IvmDmlInterceptorRule.bypass.set(false)
+    }
+    stagingPath
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 1 — CREATE happy path
+  // ---------------------------------------------------------------------------
+  describe("(1) CREATE MATERIALIZED VIEW — happy path") {
+    it("creates the MV table, loads initial data, and registers catalog entry") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t1 VALUES ('east', 100), ('west', 200)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t1 AS " +
+          "SELECT region, SUM(amount) AS total FROM sales_t1 GROUP BY region"
+      )
+
+      // The MV table must exist in the Spark catalog
+      spark.catalog.tableExists("mv_t1") shouldBe true
+
+      // Initial load: 2 distinct regions → 2 rows
+      spark.table("mv_t1").count() shouldBe 2L
+
+      // Catalog metadata must be present
+      MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 2 — CREATE … IF NOT EXISTS on an existing MV (no-op)
+  // ---------------------------------------------------------------------------
+  describe("(2) CREATE MATERIALIZED VIEW IF NOT EXISTS — already exists → no-op") {
+    it("silently does nothing when the MV already exists") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t2(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t2 VALUES ('north', 50)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t2 AS SELECT region, SUM(amount) AS total FROM sales_t2 GROUP BY region"
+      )
+      // Second CREATE with IF NOT EXISTS must not throw
+      noException should be thrownBy {
+        spark.sql(
+          "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t2 AS SELECT region, SUM(amount) AS total FROM sales_t2 GROUP BY region"
+        )
+      }
+      // Row count unchanged
+      spark.table("mv_t2").count() shouldBe 1L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 3 — CREATE without IF NOT EXISTS on an existing MV → AnalysisException
+  // ---------------------------------------------------------------------------
+  describe("(3) CREATE MATERIALIZED VIEW — duplicate without IF NOT EXISTS → error") {
+    it("throws AnalysisException when the MV already exists") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t3(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t3 VALUES ('south', 75)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t3 AS SELECT region, SUM(amount) AS total FROM sales_t3 GROUP BY region"
+      )
+      an[AnalysisException] should be thrownBy {
+        spark.sql(
+          "CREATE MATERIALIZED VIEW mv_t3 AS SELECT region, SUM(amount) AS total FROM sales_t3 GROUP BY region"
+        )
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 4 — REFRESH MATERIALIZED VIEW reflects new data
+  // ---------------------------------------------------------------------------
+  describe("(4) REFRESH MATERIALIZED VIEW — new row appears after staging + refresh") {
+    it("MV gains the new aggregate row after REFRESH; EXCEPT ALL check passes both ways") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t4(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t4 VALUES ('east', 100), ('west', 200)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t4 AS SELECT region, SUM(amount) AS total FROM sales_t4 GROUP BY region"
+      )
+      spark.table("mv_t4").count() shouldBe 2L
+
+      // Insert a new row into the base table
+      spark.sql("INSERT INTO sales_t4 VALUES ('north', 300)")
+
+      // Simulate what the DML interceptor would have recorded for this INSERT
+      simulateDmlStaging("default.sales_t4", "sales_t4/txn1", Seq("north" -> 300))
+
+      // Refresh
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t4")
+
+      // The MV must now reflect all current data in sales_t4
+      val expected = spark.sql(
+        "SELECT region, SUM(amount) AS total FROM sales_t4 GROUP BY region"
+      )
+      val mv = spark.table("mv_t4")
+
+      // Cross-check: EXCEPT ALL in both directions must be empty
+      mv.exceptAll(expected).count() shouldBe 0L
+      expected.exceptAll(mv).count() shouldBe 0L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 5 — REFRESH with no pending delta → no-op
+  // ---------------------------------------------------------------------------
+  describe("(5) REFRESH MATERIALIZED VIEW — no pending delta → no-op") {
+    it("returns without error and without changing the MV when no staging rows exist") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5 VALUES ('center', 500)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t5 AS SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
+      )
+      val countBefore = spark.table("mv_t5").count()
+      // No staging records → REFRESH must be a no-op
+      noException should be thrownBy { spark.sql("REFRESH MATERIALIZED VIEW mv_t5") }
+      spark.table("mv_t5").count() shouldBe countBefore
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 6 — REFRESH after schema change → AnalysisException
+  // ---------------------------------------------------------------------------
+  describe("(6) REFRESH MATERIALIZED VIEW — source schema changed → error") {
+    it("throws AnalysisException containing 'schema' when source table gains a column") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t6(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t6 VALUES ('a', 1)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t6 AS SELECT region, SUM(amount) AS total FROM sales_t6 GROUP BY region"
+      )
+
+      // Add a column to the source table after CREATE MV — fingerprint should mismatch
+      spark.sql("ALTER TABLE sales_t6 ADD COLUMN extra INT")
+
+      // Put a dummy staging record so the early-exit guard doesn't fire
+      simulateDmlStaging("default.sales_t6", "sales_t6/txn_schema", Seq("a" -> 1))
+
+      val ex = intercept[AnalysisException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t6")
+      }
+      ex.getMessage should include("schema")
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 7 — DROP MATERIALIZED VIEW
+  // ---------------------------------------------------------------------------
+  describe("(7) DROP MATERIALIZED VIEW") {
+    it("removes the table, the catalog entry, and the storage directory") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t7(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t7 VALUES ('x', 10)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t7 AS SELECT region, SUM(amount) AS total FROM sales_t7 GROUP BY region"
+      )
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t7")).get
+      val loc  = new java.io.File(meta.location)
+
+      spark.sql("DROP MATERIALIZED VIEW mv_t7")
+
+      // Spark table must be gone
+      spark.catalog.tableExists("mv_t7") shouldBe false
+      // Catalog entry must be gone
+      MvCatalog.lookup(spark, TableIdentifier("mv_t7")) shouldBe empty
+      // Physical directory must be gone
+      loc.exists() shouldBe false
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 8 — DROP IF EXISTS on a non-existent MV → no error
+  // ---------------------------------------------------------------------------
+  describe("(8) DROP MATERIALIZED VIEW IF EXISTS — non-existent → no-op") {
+    it("silently does nothing for a view that was never created") {
+      noException should be thrownBy {
+        spark.sql("DROP MATERIALIZED VIEW IF EXISTS mv_does_not_exist_8")
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 9 — DROP without IF EXISTS on a non-existent MV → AnalysisException
+  // ---------------------------------------------------------------------------
+  describe("(9) DROP MATERIALIZED VIEW — non-existent without IF EXISTS → error") {
+    it("throws AnalysisException when the view does not exist") {
+      an[AnalysisException] should be thrownBy {
+        spark.sql("DROP MATERIALIZED VIEW mv_does_not_exist_9")
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 10 — End-to-end conflicting-DML stress
+  // ---------------------------------------------------------------------------
+  describe("(10) End-to-end conflicting-DML stress") {
+    it("INSERT + DELETE + UPDATE on the same keys; single REFRESH; MV == ground-truth SELECT (EXCEPT ALL both ways)") {
+      spark.sql(
+        "CREATE TABLE IF NOT EXISTS sales_t10(region STRING, amount INT) USING DELTA"
+      )
+      // Seed data
+      spark.sql("INSERT INTO sales_t10 VALUES ('east', 100), ('west', 200), ('north', 50)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t10 AS " +
+          "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales_t10 GROUP BY region"
+      )
+      spark.table("mv_t10").count() shouldBe 3L
+
+      // Conflicting DML: delete a row, add rows, update an existing key
+      spark.sql("DELETE FROM sales_t10 WHERE region = 'north'")
+      spark.sql("INSERT INTO sales_t10 VALUES ('east', 50), ('south', 300)")
+      spark.sql("UPDATE sales_t10 SET amount = 250 WHERE region = 'west'")
+
+      // Build a staging Delta that contains ALL net-new/changed rows (post-DML snapshot of
+      // east and south additions — the exact net-delta for openivm's incremental merge):
+      // east: +50 new row; south: +300 new row; north: removed; west: was 200 now 250
+      // For a robust FULL-REFRESH-type test we record a staging entry with the combined
+      // current-state rows so the refresh triggers and then re-runs the view.
+      simulateDmlStaging(
+        "default.sales_t10",
+        "sales_t10/txn_stress",
+        Seq("east" -> 50, "south" -> 300)
+      )
+
+      // Refresh
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t10")
+
+      val groundTruth = spark.sql(
+        "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales_t10 GROUP BY region"
+      )
+      val mv = spark.table("mv_t10")
+
+      // Cross-check with EXCEPT ALL in both directions
+      mv.exceptAll(groundTruth).count() shouldBe 0L
+      groundTruth.exceptAll(mv).count() shouldBe 0L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test helper: REFRESH on a non-existent MV → AnalysisException
+  // ---------------------------------------------------------------------------
+  describe("REFRESH MATERIALIZED VIEW — non-existent → error") {
+    it("throws AnalysisException when the view has not been created") {
+      an[AnalysisException] should be thrownBy {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_ghost_11")
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Delta version is advanced after CREATE
+  // ---------------------------------------------------------------------------
+  describe("MvCatalog.advance is called after CREATE") {
+    it("lastVersion in MvMetadata is >= 0 after CREATE") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t12(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t12 VALUES ('z', 1)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t12 AS SELECT region, SUM(amount) AS total FROM sales_t12 GROUP BY region"
+      )
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t12")).get
+      meta.lastVersion should be >= 0L
+    }
+  }
+}

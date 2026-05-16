@@ -82,6 +82,18 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       cmd.query shouldBe a[Project]
       cmd.query.asInstanceOf[Project].child shouldBe a[Filter]
     }
+
+    // -------------------------------------------------------------------------
+    // Test 9 — originalQueryText is preserved verbatim
+    // -------------------------------------------------------------------------
+    it("captures originalQueryText verbatim from the AS clause") {
+      val queryBody = "SELECT 42 AS answer"
+      val sql       = s"CREATE MATERIALIZED VIEW v AS $queryBody"
+      val plan      = spark.sessionState.sqlParser.parsePlan(sql)
+      plan shouldBe a[CreateMaterializedViewCommand]
+      val cmd = plan.asInstanceOf[CreateMaterializedViewCommand]
+      cmd.originalQueryText shouldBe queryBody
+    }
   }
 
   // ---------------------------------------------------------------------------
