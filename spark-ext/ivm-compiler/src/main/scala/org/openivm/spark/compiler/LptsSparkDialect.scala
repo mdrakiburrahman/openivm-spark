@@ -89,7 +89,9 @@ object LptsSparkDialect {
             rewriteGenerateSeries(
               rewriteBareVarcharCast(
                 rewritePostfixCasts(
-                  rewriteNowTimestamp(sql)
+                  rewriteStructExtract(
+                    rewriteNowTimestamp(sql)
+                  )
                 )
               )
             )
@@ -99,6 +101,65 @@ object LptsSparkDialect {
     )
 
   // ── Individual passes ────────────────────────────────────────────────────────
+
+  /** Rewrites DuckDB's `struct_extract(<struct_expr>, '<field>')` →
+    * Spark's dot-notation field access `<struct_expr>.<field>`.
+    *
+    * openivm emits `struct_extract` when the source-table schema contains
+    * STRUCT columns and the user query accesses a nested field. Spark's
+    * SQL parser does not recognise `struct_extract`, so the openivm-emitted
+    * initial-load and refresh SQL fails with PARSE_SYNTAX_ERROR otherwise.
+    *
+    * The rewrite handles arbitrarily-nested calls (e.g.
+    * `struct_extract(struct_extract(s, 'a'), 'b')` →  `s.a.b`) by iterating
+    * the innermost-first regex until no more matches remain.
+    *
+    * Field names go through Spark backtick quoting if they contain anything
+    * other than a leading letter/underscore + alphanumerics/underscores,
+    * so DuckDB names like `'_c_id'` (leading underscore — legal in Spark
+    * but Spark's parser sometimes balks at sequences like `x._c_id`
+    * depending on tokenisation; backticks are always safe).
+    */
+  private[compiler] def rewriteStructExtract(sql: String): String = {
+    // Match struct_extract(<expr>, '<field>') where <expr> contains NO
+    // unmatched parens (i.e. is the innermost call). The negated character
+    // class for the first argument allows literal-paren-free expressions:
+    // identifiers, dotted names, backtick-wrapped names, and dotted chains
+    // of struct_extract output (after a prior pass).
+    //
+    // We do not match across a struct_extract( ... ( ... ) ... ) — the
+    // inner struct_extract is rewritten first, then the outer call is
+    // exposed and rewritten on the next pass.
+    val re = """(?i)struct_extract\s*\(\s*([^(),]+?)\s*,\s*'([^']*)'\s*\)""".r
+
+    def needsBackticks(name: String): Boolean = {
+      // Conservative: any character outside [A-Za-z0-9_] (including leading
+      // digit) forces quoting. Even a leading underscore is fine without
+      // quotes in Spark, but matching DuckDB's exact case-sensitive name
+      // requires backticks if the source schema name was case-mixed.
+      name.isEmpty || !name.matches("[A-Za-z_][A-Za-z0-9_]*")
+    }
+
+    var s          = sql
+    var prev       = ""
+    var iterations = 0
+    while (s != prev && iterations < 64) {
+      prev = s
+      s = re.replaceAllIn(
+        s,
+        m => {
+          val expr  = m.group(1).trim
+          val field = m.group(2)
+          val rendered =
+            if (needsBackticks(field)) s".`${field.replace("`", "``")}`"
+            else s".$field"
+          java.util.regex.Matcher.quoteReplacement(expr + rendered)
+        }
+      )
+      iterations += 1
+    }
+    s
+  }
 
   /** Rewrites `now()::timestamp` (any case) to `current_timestamp()`.
     * Must run before [[rewritePostfixCasts]].

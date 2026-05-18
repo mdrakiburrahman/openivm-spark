@@ -265,6 +265,56 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  // ── 4b. struct_extract → dot-notation field access ────────────────────────
+  describe("rewriteStructExtract") {
+    it("rewrites single-level struct_extract(s, 'k') to s.k") {
+      LptsSparkDialect.rewriteStructExtract("struct_extract(s, 'a')") shouldBe "s.a"
+    }
+
+    it("does NOT backtick fields with a leading underscore (Spark allows them as identifiers)") {
+      LptsSparkDialect.rewriteStructExtract("struct_extract(t4_Customer, '_c_id')") shouldBe
+        "t4_Customer._c_id"
+    }
+
+    it("backticks fields with special characters") {
+      LptsSparkDialect.rewriteStructExtract("struct_extract(s, 'a b')") shouldBe
+        "s.`a b`"
+    }
+
+    it("rewrites nested struct_extract bottom-up") {
+      LptsSparkDialect.rewriteStructExtract(
+        "struct_extract(struct_extract(t4_Customer, 'name'), 'c_l_name')"
+      ) shouldBe "t4_Customer.name.c_l_name"
+    }
+
+    it("rewrites triple-nested struct_extract") {
+      LptsSparkDialect.rewriteStructExtract(
+        "struct_extract(struct_extract(struct_extract(c, 'contactinfo'), 'c_phone_1'), 'c_local')"
+      ) shouldBe "c.contactinfo.c_phone_1.c_local"
+    }
+
+    it("rewrites struct_extract embedded inside a CAST expression") {
+      LptsSparkDialect.rewriteStructExtract(
+        "CAST(struct_extract(s, 'k') AS STRING)"
+      ) shouldBe "CAST(s.k AS STRING)"
+    }
+
+    it("is case-insensitive on the function name") {
+      LptsSparkDialect.rewriteStructExtract("STRUCT_EXTRACT(s, 'k')") shouldBe "s.k"
+    }
+
+    it("is idempotent") {
+      val once  = LptsSparkDialect.rewriteStructExtract("struct_extract(s, 'k')")
+      val twice = LptsSparkDialect.rewriteStructExtract(once)
+      once shouldBe twice
+    }
+
+    it("does not touch SQL that lacks struct_extract") {
+      val sql = "SELECT s.k FROM t"
+      LptsSparkDialect.rewriteStructExtract(sql) shouldBe sql
+    }
+  }
+
   // ── 5. translate pipeline ────────────────────────────────────────────────────
   describe("translate") {
     it("passes through SQL with no DuckDB-isms unchanged") {
