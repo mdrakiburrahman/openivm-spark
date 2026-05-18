@@ -18,6 +18,10 @@
 #
 # Environment: only Docker is required on the host.  Pinned image SHAs come
 # from `spark-ext/dev/pins.env`.
+#
+# Environment variables honoured:
+#   PRE_CLEAN=1   `verify` first force-removes every running Docker container
+#                 on the host (named cache volumes survive).
 # ============================================================================
 set -euo pipefail
 
@@ -86,6 +90,25 @@ cmd_verify() {
     # One-shot: lint → compile → assembly → full test in a single sbt JVM.
     # Forwarded arguments are inserted before the task list so callers can pass
     # global `set` commands or `-D…` system properties (e.g. test-fork count).
+    #
+    # Set PRE_CLEAN=1 to force-remove every running Docker container on the
+    # host before invoking sbt. Useful for stripping orphan containers (e.g.
+    # from a Ctrl+C'd previous run) that may still be holding the shared
+    # sbt-cache / ivy-cache / coursier-cache named volumes. Named volumes
+    # themselves survive container removal, so the next `compose run` reuses
+    # the warm cache.
+    if [[ "${PRE_CLEAN:-0}" == "1" ]]; then
+        local running
+        running="$(docker ps -q)"
+        if [[ -n "$running" ]]; then
+            echo "[verify] PRE_CLEAN=1 → force-removing $(echo "$running" | wc -l | tr -d ' ') running container(s)..."
+            # shellcheck disable=SC2086
+            docker rm -f $running
+        else
+            echo "[verify] PRE_CLEAN=1 → no running containers to remove."
+        fi
+    fi
+
     run_sbt "$@" \
         scalafmtCheckAll \
         scalafmtSbtCheck \

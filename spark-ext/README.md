@@ -67,8 +67,13 @@ following subcommands:
 `verify` is the canonical one-liner — it lints, compiles, assembles the fat
 jar, and runs every unit + integration + parity suite in a single sbt JVM.
 Wall-clock on the reference 32-core / 124 GiB host is ~40 minutes end-to-end.
-Override the test-fork concurrency with `./spark-ext/dev/dev verify -- -Dopenivm.test.forks=8`
-if you're running on a smaller box.
+
+### Environment variables
+
+| Variable                  | Default | Scope    | Effect                                                                                                                                                                |
+| ------------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PRE_CLEAN`               | `0`     | `verify` | When `1`, force-removes every running Docker container on the host before sbt starts. Named cache volumes (`sbt-cache`, `ivy-cache`, `coursier-cache`) are preserved. |
+| `openivm.test.forks` (-D) | `32`    | sbt JVM  | Cap on parallel forked test JVMs. Pass via `./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8` on smaller hosts.                                                |
 
 The container image is named `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}` so that bumping
 SHAs in `pins.env` produces a fresh image, leaving any in-progress workspace
