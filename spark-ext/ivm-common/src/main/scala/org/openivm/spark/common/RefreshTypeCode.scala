@@ -22,26 +22,31 @@ object RefreshTypeCode {
     * multiset delta — i.e. a persisted view-delta that downstream MVs can
     * consume as their source delta for MV-over-MV cascade refresh.
     *
-    * Today this is restricted to **AGGREGATE_GROUP and AGGREGATE_HAVING** with
-    * `openivm_force_view_delta_cascade=true`, which adds the per-key
-    * retract+add companion in openivm (`refresh_sql.cpp`). For these types
-    * the view-delta carries the SIGNED multiset semantics downstream
-    * COUNT(*)/DISTINCT cascade requires.
+    * Enabled for:
+    *   - **AGGREGATE_GROUP / AGGREGATE_HAVING** (with
+    *     `openivm_force_view_delta_cascade=true`): openivm adds the per-key
+    *     retract+add companions in `refresh_sql.cpp` so the view-delta carries
+    *     SIGNED multiset semantics. Downstream COUNT(*)/DISTINCT cascade works.
+    *   - **SIMPLE_PROJECTION**: openivm's `GenerateRefreshSQL` always
+    *     prepends a `delta_query` block that INSERTs into
+    *     `openivm_delta_<view>`. The Spark side rewrites this into a CTAS
+    *     into the per-refresh view-delta path. Downstream SIMPLE_PROJECTION
+    *     / AGGREGATE_GROUP cascade picks up the +1/-1 rows directly.
     *
     * SIMPLE_AGGREGATE (1) is intentionally EXCLUDED. The openivm compile-only
     * mode does not emit a snapshot companion (refresh_sql.cpp build_snapshot_companion)
     * unless the registered downstream metadata is non-empty — and openivm-spark
     * compiles each MV in an isolated DuckDB subprocess where that metadata is
-    * always absent. The MV_VIEW_DELTA we'd persist would carry only the +1
+    * always absent. The view-delta we'd persist would carry only the +1
     * add rows, missing the -1 retract for the pre-refresh scalar value (e.g.
-    * the initial-CTAS NULL row). Downstream SIMPLE_PROJECTION cascade over a
-    * SIMPLE_AGGREGATE upstream would therefore double-emit (initial NULL +
-    * new value both present in the downstream MV). The right fix requires
-    * also rewriting the snapshot pre/post-companion on the Spark side, which
-    * is out of scope; for now SIMPLE_AGGREGATE upstreams force downstream
+    * the initial-CTAS NULL row). Downstream cascade over a SIMPLE_AGGREGATE
+    * upstream would therefore double-emit (initial NULL + new value both
+    * present in the downstream MV). The right fix requires also rewriting
+    * the snapshot pre/post-companion on the Spark side, which is out of
+    * scope; for now SIMPLE_AGGREGATE upstreams force downstream
     * FullRefresh-demotion.
     *
-    * The complement set — SIMPLE_AGGREGATE, WINDOW_PARTITION, GROUP_RECOMPUTE,
+    * The remaining complement set — WINDOW_PARTITION, GROUP_RECOMPUTE,
     * DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH — does
     * NOT emit a cascade-usable view-delta. Downstream MVs over a
     * non-cascade-delta-capable upstream MUST be FullRefresh-demoted at CREATE
@@ -52,7 +57,7 @@ object RefreshTypeCode {
     * `CreateMaterializedViewCommand`.
     */
   def emitsCascadeViewDelta(rt: Int): Boolean = rt match {
-    case AggregateGroup | AggregateHaving => true
-    case _                                => false
+    case AggregateGroup | AggregateHaving | SimpleProjection => true
+    case _                                                   => false
   }
 }
