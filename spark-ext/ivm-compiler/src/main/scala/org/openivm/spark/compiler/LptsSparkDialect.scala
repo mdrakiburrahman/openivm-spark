@@ -90,7 +90,9 @@ object LptsSparkDialect {
               rewriteBareVarcharCast(
                 rewritePostfixCasts(
                   rewriteStructExtract(
-                    rewriteNowTimestamp(sql)
+                    rewriteTimestampWithTimeZone(
+                      rewriteNowTimestamp(sql)
+                    )
                   )
                 )
               )
@@ -101,6 +103,26 @@ object LptsSparkDialect {
     )
 
   // ── Individual passes ────────────────────────────────────────────────────────
+
+  /** Rewrites DuckDB's `TIMESTAMP WITH TIME ZONE` (and `WITHOUT`) to Spark's
+    * `TIMESTAMP`. Spark 3.5 does not accept the SQL-standard `WITH TIME ZONE`
+    * suffix in CAST or column-type contexts.
+    *
+    * openivm emits `CAST(<expr> AS TIMESTAMP WITH TIME ZONE)` when the source
+    * column is a tz-aware timestamp (TPC-DI `_ActionTS` for example).
+    *
+    * Both variants collapse to the same Spark type because Spark's
+    * `TIMESTAMP` is timezone-aware (TIMESTAMP_LTZ); `TIMESTAMP_NTZ` is
+    * available since Spark 3.4 but openivm-emitted SQL never targets it.
+    */
+  private[compiler] def rewriteTimestampWithTimeZone(sql: String): String = {
+    val withTz    = """(?i)\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b""".r
+    val withoutTz = """(?i)\bTIMESTAMP\s+WITHOUT\s+TIME\s+ZONE\b""".r
+    withTz.replaceAllIn(
+      withoutTz.replaceAllIn(sql, java.util.regex.Matcher.quoteReplacement("TIMESTAMP")),
+      java.util.regex.Matcher.quoteReplacement("TIMESTAMP")
+    )
+  }
 
   /** Rewrites DuckDB's `struct_extract(<struct_expr>, '<field>')` →
     * Spark's dot-notation field access `<struct_expr>.<field>`.

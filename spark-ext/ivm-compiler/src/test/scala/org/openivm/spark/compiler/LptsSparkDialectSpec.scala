@@ -315,6 +315,39 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  // ── 4c. TIMESTAMP WITH TIME ZONE → TIMESTAMP ──────────────────────────────
+  describe("rewriteTimestampWithTimeZone") {
+    it("rewrites WITH TIME ZONE form") {
+      LptsSparkDialect.rewriteTimestampWithTimeZone(
+        "CAST(x AS TIMESTAMP WITH TIME ZONE)"
+      ) shouldBe "CAST(x AS TIMESTAMP)"
+    }
+
+    it("rewrites WITHOUT TIME ZONE form") {
+      LptsSparkDialect.rewriteTimestampWithTimeZone(
+        "CAST(x AS TIMESTAMP WITHOUT TIME ZONE)"
+      ) shouldBe "CAST(x AS TIMESTAMP)"
+    }
+
+    it("is case-insensitive and tolerates extra whitespace") {
+      LptsSparkDialect.rewriteTimestampWithTimeZone(
+        "CAST(x AS timestamp   with   time   zone)"
+      ) shouldBe "CAST(x AS TIMESTAMP)"
+    }
+
+    it("leaves bare TIMESTAMP unchanged") {
+      LptsSparkDialect.rewriteTimestampWithTimeZone(
+        "CAST(x AS TIMESTAMP)"
+      ) shouldBe "CAST(x AS TIMESTAMP)"
+    }
+
+    it("is idempotent") {
+      val sql  = "CAST(x AS TIMESTAMP WITH TIME ZONE)"
+      val once = LptsSparkDialect.rewriteTimestampWithTimeZone(sql)
+      LptsSparkDialect.rewriteTimestampWithTimeZone(once) shouldBe once
+    }
+  }
+
   // ── 5. translate pipeline ────────────────────────────────────────────────────
   describe("translate") {
     it("passes through SQL with no DuckDB-isms unchanged") {
