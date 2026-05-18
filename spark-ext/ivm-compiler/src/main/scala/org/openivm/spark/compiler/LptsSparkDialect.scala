@@ -86,12 +86,16 @@ object LptsSparkDialect {
       rewriteErrorFn(
         rewriteCountStar(
           rewriteIntervalLiterals(
-            rewriteGenerateSeries(
-              rewriteBareVarcharCast(
-                rewritePostfixCasts(
-                  rewriteStructExtract(
-                    rewriteTimestampWithTimeZone(
-                      rewriteNowTimestamp(sql)
+            rewriteToTemporalUnit(
+              rewriteGenerateSeries(
+                rewriteBareVarcharCast(
+                  rewritePostfixCasts(
+                    rewriteStructExtract(
+                      rewriteTimestampWithTimeZone(
+                        rewriteSparkFunctionInlinings(
+                          rewriteNowTimestamp(sql)
+                        )
+                      )
                     )
                   )
                 )
@@ -101,6 +105,115 @@ object LptsSparkDialect {
         )
       )
     )
+
+  /** Reverse the inlining of Spark-function shim macros registered by
+    * [[org.openivm.spark.compiler.OpenIvmCompiler.sparkFunctionShimsPrologue]].
+    *
+    * When openivm parses a view body that calls a shim function like
+    * `regexp_like(s, p)`, DuckDB's binder resolves it against the macro,
+    * and the LPTS-emitted refresh SQL serializes the macro's expansion
+    * (`regexp_matches(s, p)`) — NOT the original Spark function name. Spark
+    * has `regexp_like` but NOT `regexp_matches`, so the emitted SQL fails
+    * with `UNRESOLVED_ROUTINE` at refresh time.
+    *
+    * This post-pass restores the original Spark-side name for shims whose
+    * macro body is a simple 1:1 function call. More complex shims
+    * (`unix_timestamp`, `date_format`, `from_unixtime`) have macro bodies
+    * that don't admit a clean back-translation; those remain inlined, and
+    * MVs using them either work by coincidence (the macro body happens to
+    * be valid Spark) or fail at refresh — see the gap notes on the shim
+    * prologue.
+    */
+  private[compiler] def rewriteSparkFunctionInlinings(sql: String): String = {
+    // regexp_matches(s, p) → regexp_like(s, p)
+    // Spark has regexp_like; not regexp_matches. The shim macro body
+    // (`regexp_matches(s, p)`) gets inlined by openivm's LPTS serializer
+    // — undo that here so Spark's analyzer binds against the built-in.
+    val regexpMatches = """(?i)\bregexp_matches\s*\(""".r
+    regexpMatches.replaceAllIn(sql, "regexp_like(")
+  }
+
+  /** Rewrites DuckDB's `to_<unit>(N)` interval constructors to Spark's
+    * `INTERVAL N <UNIT>` syntax. openivm emits these forms when a user view
+    * body uses `INTERVAL N <unit>` and the LPTS pipeline serializes the
+    * bound AST in DuckDB's preferred form (e.g. `INTERVAL 1 MILLISECOND`
+    * round-trips as `to_milliseconds(CAST(1 AS DOUBLE))`).
+    *
+    * Supported units (matching DuckDB's interval-helper functions):
+    *   - to_milliseconds(N)  → INTERVAL N MILLISECOND
+    *   - to_seconds(N)       → INTERVAL N SECOND
+    *   - to_minutes(N)       → INTERVAL N MINUTE
+    *   - to_hours(N)         → INTERVAL N HOUR
+    *   - to_days(N)          → INTERVAL N DAY
+    *   - to_months(N)        → INTERVAL N MONTH
+    *   - to_years(N)         → INTERVAL N YEAR
+    *
+    * The argument can be any expression with balanced parentheses (e.g.
+    * `1`, `CAST(1 AS DOUBLE)`, `<column>`). Spark's `INTERVAL <expr> <UNIT>`
+    * accepts any numeric expression as long as the value can be evaluated to
+    * a numeric constant — for column refs, the user should use multiplication
+    * `<col> * INTERVAL 1 MILLISECOND` instead, but the LPTS-emitted form
+    * never uses column args here, just CAST'd literals.
+    */
+  private[compiler] def rewriteToTemporalUnit(sql: String): String = {
+    val unitMap = Seq(
+      "milliseconds" -> "MILLISECOND",
+      "seconds"      -> "SECOND",
+      "minutes"      -> "MINUTE",
+      "hours"        -> "HOUR",
+      "days"         -> "DAY",
+      "months"       -> "MONTH",
+      "years"        -> "YEAR"
+    )
+    // Helper: extract the balanced-paren argument starting at `start` (which
+    // should be the opening `(` index). Returns the argument substring and
+    // the index just past the closing `)`, or (None, -1) if unbalanced.
+    def extractBalancedArg(s: String, openIdx: Int): (Option[String], Int) = {
+      if (openIdx >= s.length || s.charAt(openIdx) != '(') return (None, -1)
+      var depth    = 1
+      var i        = openIdx + 1
+      val argStart = i
+      while (i < s.length && depth > 0) {
+        s.charAt(i) match {
+          case '(' => depth += 1
+          case ')' => depth -= 1
+          case _   => ()
+        }
+        if (depth > 0) i += 1
+      }
+      if (depth != 0) (None, -1)
+      else (Some(s.substring(argStart, i)), i + 1)
+    }
+    var s = sql
+    for ((fn, unit) <- unitMap) {
+      val callRe  = ("(?i)\\bto_" + fn + "\\s*(?=\\()").r
+      var changed = true
+      while (changed) {
+        changed = false
+        callRe.findFirstMatchIn(s) match {
+          case None =>
+            ()
+          case Some(m) =>
+            val (argOpt, endIdx) = extractBalancedArg(s, m.end)
+            argOpt match {
+              case Some(arg) =>
+                val before = s.substring(0, m.start)
+                val after  = s.substring(endIdx)
+                // Use Spark's `<expr> * INTERVAL 1 <UNIT>` form because Spark
+                // 3.5's `INTERVAL <expr> <UNIT>` requires the expression to be
+                // a literal — openivm/lpts emits `to_milliseconds(CAST(1 AS
+                // DOUBLE))` for `INTERVAL 1 MILLISECOND`, so the arg is rarely
+                // a bare literal.
+                val argTrim = arg.trim
+                s = s"${before}(($argTrim) * INTERVAL 1 $unit)$after"
+                changed = true
+              case None => ()
+            }
+        }
+      }
+    }
+    s
+  }
 
   // ── Individual passes ────────────────────────────────────────────────────────
 

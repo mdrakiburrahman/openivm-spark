@@ -151,6 +151,12 @@ class OpenIvmCompiler private (
     sb ++= "SET openivm_target_dialect='spark';\n"
     sb ++= "SET openivm_compile_only=true;\n"
     sb ++= "SET openivm_enable_view_matching=false;\n"
+    // Force-emit the AGGREGATE_GROUP / AGGREGATE_HAVING retract companion to
+    // openivm_delta_<view> even when no downstream MV is registered in this
+    // ephemeral DuckDB subprocess. Without this, openivm produces an
+    // additive-only view-delta that breaks downstream cascade for COUNT(*),
+    // MIN/MAX, DISTINCT etc. See openivm refresh_sql.cpp:has_downstream.
+    sb ++= "SET openivm_force_view_delta_cascade=true;\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -163,6 +169,23 @@ class OpenIvmCompiler private (
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
     for ((_, ddl)       <- tableDdls) sb ++= s"$ddl;\n"
+    // ── Spark-only function shims ──
+    //
+    // openivm_compile_only=true means DuckDB only parses + binds the MV body;
+    // it does not execute the functions. The Spark side runs the *original*
+    // function call at refresh time (openivm preserves the function name in
+    // the emitted refresh SQL when the source body uses it; it does not
+    // expand the macro). These shims unblock Spark-only function calls in
+    // MV bodies — without them, finwire-style models using `regexp_like` /
+    // `to_date(s, fmt)` etc. fail compile with `Catalog Error: Function with
+    // name X does not exist`, get caught by the OpenIvmCompileException
+    // handler in `MaterializedViewCommands`, and silently demote to
+    // FULL_REFRESH.
+    //
+    // Each macro is type-correct (returns a value of the type Spark would
+    // return) but not necessarily semantically correct — at compile-time
+    // DuckDB only needs the binder to succeed.
+    sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
     sb ++= s"PRAGMA compile_refresh('${escapeSql(req.viewName)}');\n"
     sb.toString
@@ -438,5 +461,40 @@ object OpenIvmCompiler {
     Option(new File(extPath).getParentFile)
       .map(dir => new File(dir, "duckdb").getAbsolutePath)
       .getOrElse("/opt/openivm/duckdb")
+  }
+
+  /** Prologue of `CREATE OR REPLACE MACRO` statements that register
+    * type-correct stubs for Spark-only functions which DuckDB's binder would
+    * otherwise reject. The set is driven by the dbt-server corpus (TPC-DI
+    * bronze/silver/gold models) — extend as new gaps surface.
+    *
+    * Contract: each macro must return a value of the type the equivalent
+    * Spark function returns. Critically, the macro body MUST be a 1:1 call
+    * to a Spark-native function (or a syntactic construct identical to
+    * Spark) — because openivm's LPTS serializer INLINES the macro body into
+    * the emitted refresh SQL, NOT the original macro name. A macro like
+    * `CREATE MACRO date_format(d, fmt) AS CAST(d AS VARCHAR)` would lose
+    * the format-string semantic at refresh time (Spark would CAST instead
+    * of date-formatting). For such functions, `LptsSparkDialect.translate`
+    * MUST have a corresponding back-translation pass to recover the
+    * original Spark name — see `rewriteSparkFunctionInlinings`.
+    *
+    * Functions with DuckDB-native-name collisions (e.g. Spark's 2-arg
+    * `to_date(s, fmt)` shadowing DuckDB's 1-arg `to_date(s)`) cannot be
+    * registered directly as macros — DuckDB binds the call against the
+    * built-in first. Those will require a pre-pass + post-pass round-trip
+    * (rename to `__sparkfn_*` before compile, rename back in
+    * `LptsSparkDialect.translate`); deferred to a follow-up.
+    */
+  private[compiler] val sparkFunctionShimsPrologue: String = {
+    val macros = Seq(
+      // regexp_like(string, pattern) → BOOLEAN
+      // Spark-only function; DuckDB has `regexp_matches` (same semantics).
+      // No name collision — direct macro registration works. The inlined
+      // `regexp_matches` call is back-translated to `regexp_like` in
+      // `LptsSparkDialect.rewriteSparkFunctionInlinings`.
+      "CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);"
+    )
+    macros.mkString("", "\n", "\n")
   }
 }

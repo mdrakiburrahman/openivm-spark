@@ -11,8 +11,8 @@ import java.sql.Timestamp
  * A single DML delta written by the DML interceptor for one base table.
  *
  * @param baseTable   qualified name of the base table being modified
- * @param opType      operation type: INSERT | DELETE | UPDATE_BEFORE | UPDATE_AFTER |
- *                    MERGE_SRC | OVERWRITE
+ * @param opType      operation type. See [[StagingDelta.OpTypes]] for the
+ *                    formal set + multiplicity-handling contract.
  * @param stagingPath path of the Delta table holding the staged rows
  * @param txnTs       wall-clock timestamp of the originating DML transaction
  * @param consumedBy  MV names that have already applied this delta (idempotency guard)
@@ -24,6 +24,49 @@ final case class StagingDelta(
     txnTs: Timestamp,
     consumedBy: Seq[String]
 )
+
+/** Formal set of supported `opType` values + their multiplicity-handling
+  * contract.
+  *
+  * `StagingDeltaView.buildSourceDeltaViewSql` decides how to assemble the
+  * `openivm_delta_<source>` temp view per opType:
+  *
+  *  - `INSERT`, `OVERWRITE`, `UPDATE_AFTER` — synthesise
+  *    `openivm_multiplicity = +1` for every row at the staging path.
+  *  - `DELETE`, `UPDATE_BEFORE` — synthesise `openivm_multiplicity = -1`.
+  *  - `MERGE_SRC` — currently dropped (returns None from the multiplicity
+  *    helper); rows fall through to the empty-view fallback.
+  *  - `MV_VIEW_DELTA` — **preserves the existing multiplicity column at the
+  *    staging path** rather than synthesising one. Used by the MV-over-MV
+  *    cascade: an upstream MV's incremental refresh writes a view-delta
+  *    Delta table with `openivm_multiplicity` + `openivm_timestamp` columns
+  *    already populated; the downstream's refresh consumes it as-is.
+  *
+  * Invariants:
+  *  - Any code that introduces a new opType MUST also extend
+  *    `StagingDeltaView.buildSourceDeltaViewSql` and add a docstring entry
+  *    here.
+  *  - Never treat `MV_VIEW_DELTA` like an `INSERT`/`OVERWRITE` — doing so
+  *    would overwrite the upstream's signed multiplicities to +1 and silently
+  *    corrupt downstream aggregates.
+  */
+object StagingDelta {
+  object OpTypes {
+    val Insert       = "INSERT"
+    val Delete       = "DELETE"
+    val UpdateBefore = "UPDATE_BEFORE"
+    val UpdateAfter  = "UPDATE_AFTER"
+    val MergeSrc     = "MERGE_SRC"
+    val Overwrite    = "OVERWRITE"
+
+    /** Marker for an upstream MV's persisted view-delta. The staging path
+      * IS a Delta table whose columns are `<userCols> + openivm_timestamp +
+      * openivm_multiplicity`. Downstream's `openivm_delta_<src>` temp view
+      * preserves these columns verbatim.
+      */
+    val MvViewDelta = "MV_VIEW_DELTA"
+  }
+}
 
 /**
  * Delta-backed catalog for DML staging records.
@@ -111,17 +154,76 @@ object StagingCatalog extends DeltaRetrySupport {
   /**
    * Returns every staging row for `sources` that has NOT yet been consumed by `viewName`,
    * ordered by txn_ts ascending.
+   *
+   * @param sources    base-table names to scan. Only rows where `base_table IN sources`
+   *                   are returned.
+   * @param watermarks per-source low-water-mark filter. A row for source `S` is returned
+   *                   only if `txn_ts > watermarks(S)`. Sources absent from the map are
+   *                   unfiltered (legacy semantics). Used by MV-over-MV cascade to prevent
+   *                   newly-created downstream MVs from double-applying upstream view-deltas
+   *                   that pre-date their creation.
    */
-  def collectFor(spark: SparkSession, viewName: String, sources: Seq[String]): Seq[StagingDelta] = {
+  def collectFor(
+      spark: SparkSession,
+      viewName: String,
+      sources: Seq[String],
+      watermarks: Map[String, Timestamp] = Map.empty
+  ): Seq[StagingDelta] = {
     if (sources.isEmpty) return Seq.empty
-    DeltaTable
+    val base = DeltaTable
       .forPath(spark, tablePath(spark))
       .toDF
       .where(col("base_table").isin(sources: _*) && !array_contains(col("consumed_by"), viewName))
+
+    val filtered =
+      if (watermarks.isEmpty) base
+      else {
+        // Build a (base_table → ts) lookup with a SQL CASE expression so the filter
+        // pushes down to Delta scan.
+        val cases = watermarks.toSeq.map { case (src, ts) =>
+          s"WHEN base_table = ${sqlLit(src)} THEN txn_ts > CAST(${sqlLit(ts.toString)} AS TIMESTAMP)"
+        }
+        if (cases.isEmpty) base
+        else {
+          val expr = s"CASE ${cases.mkString(" ")} ELSE TRUE END"
+          base.where(expr)
+        }
+      }
+
+    filtered
       .orderBy("txn_ts")
       .collect()
       .map(rowToDelta)
       .toSeq
+  }
+
+  /**
+   * Capture the current per-source watermark — the MAX(txn_ts) over all
+   * `StagingCatalog` rows for each given source.
+   *
+   * Returns an empty map entry (skipped) for sources with no rows yet, so callers
+   * who add the result to `MvMetadata.properties` only store keys that filter
+   * actual rows.
+   *
+   * Used at downstream MV CREATE time so the new MV's first REFRESH ignores
+   * upstream view-delta rows that were recorded before the MV existed (would
+   * otherwise double-apply once + recompute-from-scratch via the initial CTAS).
+   */
+  def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, Timestamp] = {
+    if (sources.isEmpty) return Map.empty
+    import org.apache.spark.sql.functions.max
+    DeltaTable
+      .forPath(spark, tablePath(spark))
+      .toDF
+      .where(col("base_table").isin(sources: _*))
+      .groupBy(col("base_table"))
+      .agg(max(col("txn_ts")).as("max_ts"))
+      .collect()
+      .flatMap { row =>
+        val src = row.getAs[String]("base_table")
+        Option(row.getAs[Timestamp]("max_ts")).map(ts => src -> ts)
+      }
+      .toMap
   }
 
   /**
@@ -165,5 +267,20 @@ object StagingCatalog extends DeltaRetrySupport {
         )
       }
     }
+  }
+
+  /**
+   * Delete every staging row with the given `baseTable`. Used by
+   * `DropMaterializedViewCommand` when an MV is dropped: every downstream
+   * MV's pending `MV_VIEW_DELTA` or trigger row from this MV becomes stale
+   * (its `staging_path` may point at deleted view-delta dirs, and a future
+   * CREATE of the same name might inherit unconsumed rows).
+   *
+   * Idempotent: no error if no rows match.
+   */
+  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = withDeltaRetry {
+    DeltaTable
+      .forPath(spark, tablePath(spark))
+      .delete(s"base_table = ${sqlLit(baseTable)}")
   }
 }

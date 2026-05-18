@@ -114,6 +114,8 @@ object SparkRefreshRewriter {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
             Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath))
+          case StatementKind.ViewDeltaCompanion =>
+            Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
             Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.SimpleProjectionDataInsert =>
@@ -155,7 +157,29 @@ object SparkRefreshRewriter {
   private object StatementKind {
     case object InProgressFlag  extends StatementKind
     case object ViewDeltaInsert extends StatementKind
-    case object MvMerge         extends StatementKind
+
+    /** AGGREGATE_GROUP / AGGREGATE_HAVING **retract companion** that openivm
+      * emits when `openivm_force_view_delta_cascade=true` (or when a downstream
+      * MV is registered in native mode). Shape:
+      *
+      *   INSERT INTO openivm_delta_<view> (cols)
+      *   SELECT d.<key>, 0, …, 0, -1
+      *   FROM   openivm_delta_<view> d
+      *   WHERE  d.openivm_multiplicity > 0
+      *     AND  d.openivm_timestamp > '…'::TIMESTAMP
+      *     AND  EXISTS (SELECT 1 FROM openivm_data_<view> m
+      *                  WHERE d.<key> IS NOT DISTINCT FROM m.<key>);
+      *
+      * Rewrite: APPEND retract rows to the view-delta path (the upstream
+      * already CTAS'd it). Replace `openivm_delta_<view>` with
+      * `delta.\`<viewDeltaPath>\`` and `openivm_data_<view>` with the MV
+      * Spark identifier. Without this companion, downstream MVs over an
+      * AGGREGATE_GROUP source compute wrong COUNT(*)/MIN/MAX deltas because
+      * the additive view-delta lacks retraction rows for groups that already
+      * exist in the data table. */
+    case object ViewDeltaCompanion extends StatementKind
+
+    case object MvMerge extends StatementKind
 
     /** SIMPLE_PROJECTION Statement C: `INSERT INTO openivm_data_<view> SELECT … FROM openivm_delta_<view>, generate_series(…)` */
     case object SimpleProjectionDataInsert extends StatementKind
@@ -216,6 +240,18 @@ object SparkRefreshRewriter {
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
     val upper            = stmt.toUpperCase.trim
     val affectedKeysName = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val compactName      = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
+    // openivm-side compact_delta_view cleanup statements:
+    //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
+    //   2. DELETE FROM openivm_delta_<view> WHERE ...
+    //   3. INSERT INTO openivm_delta_<view> SELECT ... FROM openivm_old_compact_<view>
+    //   4. DROP TABLE openivm_old_compact_<view>
+    // These collapse the duck-side delta table after the MERGE; the Spark side
+    // already writes each refresh's view-delta to a fresh `viewDeltaPath`, so
+    // none of them are relevant — drop unconditionally.
+    if (upper.contains(compactName)) {
+      return StatementKind.Cleanup
+    }
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
     } else if (upper.startsWith("CREATE OR REPLACE TEMP TABLE") && upper.contains(affectedKeysName)) {
@@ -225,7 +261,22 @@ object SparkRefreshRewriter {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
-      StatementKind.ViewDeltaInsert
+      // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
+      // emitted when `openivm_force_view_delta_cascade=true`) from the main
+      // view-delta CTAS.  Both target `openivm_delta_<view>`.  The companion is
+      // an APPEND of synthesized retract rows; its SELECT body references the
+      // delta-view itself in the FROM clause (`FROM openivm_delta_<view> d
+      // WHERE d.openivm_multiplicity > 0 AND EXISTS (… openivm_data_<view> …)`).
+      // The main delta-query never reads back from openivm_delta_<view>.
+      val deltaSelf = s"openivm_delta_${viewLogicalName}".toUpperCase
+      val insertIdx = upper.indexOf(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")
+      val tail      = if (insertIdx >= 0) upper.substring(insertIdx) else upper
+      // First-occurrence is the INSERT keyword itself; check if the table is
+      // referenced AGAIN after the column list — that indicates a self-join
+      // companion shape rather than a delta-query CTAS.
+      val nextOccurrence = tail.indexOf(deltaSelf, deltaSelf.length)
+      if (nextOccurrence > 0) StatementKind.ViewDeltaCompanion
+      else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
     } else if (
@@ -304,12 +355,16 @@ object SparkRefreshRewriter {
     *      — strip only the `openivm_timestamp … AND ` prefix.
     */
   private def stripTimestampPredicate(sql: String): String = {
+    // The column can be optionally qualified with a table alias prefix
+    // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
+    // emitted by openivm when `openivm_force_view_delta_cascade=true`).
+    val qcol = "(?:\\w+\\.)?openivm_timestamp"
     // Case 1: standalone `WHERE openivm_timestamp OP '...'::TIMESTAMP`
-    val standalone = """(?i)\s+WHERE\s+openivm_timestamp\s*(?:>=|>|<=|<|=)\s*'[^']*'::\s*TIMESTAMP""".r
+    val standalone = ("(?i)\\s+WHERE\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP").r
     // Case 2: trailing `AND openivm_timestamp OP '...'::TIMESTAMP`
-    val trailingAnd = """(?i)\s+AND\s+openivm_timestamp\s*(?:>=|>|<=|<|=)\s*'[^']*'::\s*TIMESTAMP""".r
+    val trailingAnd = ("(?i)\\s+AND\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP").r
     // Case 3: leading `openivm_timestamp OP '...'::TIMESTAMP AND `
-    val leadingAnd = """(?i)\bopenivm_timestamp\s*(?:>=|>|<=|<|=)\s*'[^']*'::\s*TIMESTAMP\s+AND\s+""".r
+    val leadingAnd = ("(?i)\\b" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP\\s+AND\\s+").r
 
     leadingAnd.replaceAllIn(
       trailingAnd.replaceAllIn(
@@ -445,6 +500,66 @@ object SparkRefreshRewriter {
            |WITH __openivm_placeholder ($colList) AS ($selectBody)
            |SELECT * FROM __openivm_placeholder""".stripMargin
     }
+  }
+
+  /** Rewrite the AGGREGATE_GROUP / AGGREGATE_HAVING retract companion INSERT
+    * (emitted by openivm when `openivm_force_view_delta_cascade=true`):
+    *
+    *   INSERT INTO openivm_delta_<view> (cols)
+    *   SELECT d.<key>, 0, …, -1
+    *   FROM   openivm_delta_<view> d
+    *   WHERE  d.openivm_multiplicity > 0 AND d.openivm_timestamp > '…'::TIMESTAMP
+    *     AND  EXISTS (SELECT 1 FROM openivm_data_<view> m WHERE …);
+    *
+    * into:
+    *
+    *   INSERT INTO delta.`<viewDeltaPath>` (cols)
+    *   SELECT d.<key>, 0, …, -1
+    *   FROM   delta.`<viewDeltaPath>` d
+    *   WHERE  d.openivm_multiplicity > 0
+    *     AND  EXISTS (SELECT 1 FROM <mvName> m WHERE …);
+    *
+    * Notes:
+    *  - The `openivm_timestamp` predicate is stripped (the per-refresh
+    *    view-delta path contains only this refresh's rows, no historical
+    *    timestamp filter needed).
+    *  - Uses `INSERT INTO delta.\`<path>\`` (append) NOT `CREATE OR REPLACE`,
+    *    so the retract rows are added to the existing CTAS output rather
+    *    than replacing it.
+    */
+  private def rewriteViewDeltaCompanion(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      viewDeltaPath: String
+  ): String = {
+    var s           = stmt
+    val escapedPath = viewDeltaPath.replace("`", "``")
+
+    // Replace the INSERT target: `INSERT INTO openivm_delta_<view>` → `INSERT INTO delta.\`<path>\``
+    val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?").r
+    s = insertTargetRe.replaceAllIn(
+      s,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
+    )
+
+    // Replace the FROM/EXISTS source delta-view references: `openivm_delta_<view>` → `delta.\`<path>\``
+    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+
+    // Replace data-table reference inside the EXISTS subquery: `openivm_data_<view>` → MV table name
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    val mvSqlName = backtickMvName(mvName)
+    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(mvSqlName))
+
+    // Strip the openivm_timestamp predicate (the view-delta path is per-refresh
+    // scratch; no historical timestamp horizon to filter against).
+    s = stripTimestampPredicate(s)
+
+    s
   }
 
   // ── Statement C rewrite (MERGE INTO openivm_data_<view>) ─────────────────
@@ -1299,13 +1414,30 @@ object SparkRefreshRewriter {
     * @param viewLogicalName   The bare view name (the `<view>` in `openivm_delta_<view>`).
     */
   def hasRealDelta(compiledSql: String, viewLogicalName: String): Boolean = {
-    val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+    val stmts      = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+    val deltaTbl   = s"openivm_delta_$viewLogicalName".toUpperCase
+    val compactTbl = s"openivm_old_compact_$viewLogicalName".toUpperCase
     val deltaStmts = stmts.filter { stmt =>
-      stmt.toUpperCase.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")
+      stmt.toUpperCase.contains(s"INSERT INTO $deltaTbl")
+    }
+    // Filter out openivm-internal bookkeeping INSERTs that don't carry actual
+    // delta semantics:
+    //   - AGGREGATE_GROUP retract/add companions (`openivm_force_view_delta_cascade=true`):
+    //     SELECT body references `openivm_delta_<view>` in the FROM clause
+    //     (self-join). The main delta-query CTAS reads from a CTE alias.
+    //   - compact_delta_view post-processing (emitted when has_downstream=true):
+    //     `INSERT INTO openivm_delta_<view> SELECT ... FROM openivm_old_compact_<view>`.
+    //     This collapses sign-cancelling rows in the duck-side delta — irrelevant
+    //     for the Spark-side view-delta path (which is per-refresh scratch).
+    val realDeltaStmts = deltaStmts.filterNot { stmt =>
+      val upper     = stmt.toUpperCase
+      val insertIdx = upper.indexOf(s"INSERT INTO $deltaTbl")
+      val tail      = if (insertIdx >= 0) upper.substring(insertIdx + s"INSERT INTO $deltaTbl".length) else upper
+      tail.contains(deltaTbl) || tail.contains(compactTbl)
     }
     // A placeholder ends with `SELECT … WHERE false` (case-insensitive); a real
     // delta ends with `SELECT * FROM <lastCte>` preceded by a CTE block.
-    deltaStmts.nonEmpty && !deltaStmts.forall(_.toUpperCase.contains("WHERE FALSE"))
+    realDeltaStmts.nonEmpty && !realDeltaStmts.forall(_.toUpperCase.contains("WHERE FALSE"))
   }
 
   /** Split SQL on `;` boundaries, respecting single-quoted string literals

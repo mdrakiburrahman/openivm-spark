@@ -35,7 +35,36 @@ final case class MvMetadata(
     location: String,
     createdAt: Timestamp,
     properties: Map[String, String]
-)
+) {
+
+  /** Decode `_ivm_watermark:<src>=<ts>` properties into a per-source low
+    * water-mark map. Used by `StagingCatalog.collectFor` at REFRESH time to
+    * skip staging rows that pre-date this MV's CREATE (otherwise a newly
+    * created downstream MV would double-apply upstream view-deltas it has
+    * already absorbed via its initial CTAS).
+    */
+  def sourceWatermarks: Map[String, Timestamp] =
+    properties.iterator
+      .filter(_._1.startsWith(MvMetadata.WatermarkKeyPrefix))
+      .flatMap { case (k, v) =>
+        val src = k.stripPrefix(MvMetadata.WatermarkKeyPrefix)
+        scala.util.Try(Timestamp.valueOf(v)).toOption.map(ts => src -> ts)
+      }
+      .toMap
+}
+
+object MvMetadata {
+
+  /** Property-key prefix for per-source low-water-mark timestamps. The
+    * full key is `<WatermarkKeyPrefix><qualified-source-name>`, value is
+    * the timestamp's `Timestamp.toString` form (`yyyy-MM-dd HH:mm:ss[.fff]`).
+    */
+  val WatermarkKeyPrefix: String = "_ivm_watermark:"
+
+  /** Build the property-map entries for the given source-watermarks. */
+  def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
+    watermarks.map { case (src, ts) => s"$WatermarkKeyPrefix$src" -> ts.toString }
+}
 
 /**
  * Delta-backed catalog for materialized-view metadata.
@@ -207,16 +236,44 @@ object MvCatalog extends DeltaRetrySupport {
   }
 
   /**
-   * SHA-256 hex fingerprint of the source-table schemas.
-   * Deterministic: input sorted by table name, encoded as `name=DDL` joined by newlines.
-   * Changes whenever any column name or type changes.
+   * SHA-256 hex fingerprint of the source-table schemas, optionally extended
+   * with per-source MV identity hashes.
+   *
+   * Deterministic: input sorted by source name, encoded as `name=DDL` lines.
+   * When `mvIdentityBySource` is non-empty, each entry contributes an
+   * additional line `name#mv-identity=<hex>` so that a DROP + recreate of an
+   * upstream MV with the same user schema but different body produces a
+   * different fingerprint — `RefreshMaterializedViewCommand.run`'s
+   * `INCOMPATIBLE_VIEW_SCHEMA_CHANGE` guard then catches the mismatch.
+   *
+   * Changes whenever any column name or type changes, or any tracked
+   * upstream MV's identity changes.
    */
-  def schemaFingerprint(sources: Map[String, StructType]): String = {
-    val content = sources.toSeq
+  def schemaFingerprint(
+      sources: Map[String, StructType],
+      mvIdentityBySource: Map[String, String] = Map.empty
+  ): String = {
+    val schemaLines = sources.toSeq
       .sortBy(_._1)
       .map { case (name, schema) => s"$name=${schema.toDDL}" }
-      .mkString("\n")
-    val digest = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
+    val mvIdLines = mvIdentityBySource.toSeq
+      .sortBy(_._1)
+      .map { case (name, ident) => s"$name#mv-identity=$ident" }
+    val content = (schemaLines ++ mvIdLines).mkString("\n")
+    val digest  = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
+    digest.map("%02x".format(_)).mkString
+  }
+
+  /**
+   * Identity hash for an upstream MV: SHA-256 over
+   * `<metaName(name)>|<location>|<querySql>`. Used by
+   * [[schemaFingerprint]]'s `mvIdentityBySource` argument so a DROP + recreate
+   * of the same MV name with a different body is detected as drift.
+   */
+  def mvIdentity(meta: MvMetadata): String = {
+    val serialized = meta.name.database.fold(meta.name.identifier)(db => s"$db.${meta.name.identifier}")
+    val content    = s"$serialized|${meta.location}|${meta.querySql}"
+    val digest     = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
     digest.map("%02x".format(_)).mkString
   }
 }

@@ -377,9 +377,12 @@ case class CreateMaterializedViewCommand(
         )
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
-          logWarning(
-            s"openivm compile failed for '${sqlIdent(name)}'; demoting to " +
-              s"FULL_REFRESH. Cause: ${e.getMessage}"
+          // ERROR-level so the demotion is visible in the dbt-server / Livy
+          // container log. Structured shape — operator can grep on
+          // `[openivm-mv]` to enumerate all demotions for a run.
+          logError(
+            s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='COMPILE_FAILED' " +
+              s"effective_refresh_type='FULL_REFRESH' reason='compile_failed' cause=${e.getMessage}"
           )
           org.openivm.spark.compiler.CompiledRefresh(
             refreshType = RefreshTypeCode.FullRefresh,
@@ -392,8 +395,11 @@ case class CreateMaterializedViewCommand(
     // Storage location
     val location = mvLocation(spark, name)
 
-    // Fingerprint the current source schemas
-    val fingerprint = MvCatalog.schemaFingerprint(qualSchemas)
+    // Move the fingerprint computation below the upstream-MV enumeration so we
+    // can include each upstream MV's identity hash. This way DROP + recreate
+    // of an upstream MV with the same user schema but a different body
+    // triggers `INCOMPATIBLE_VIEW_SCHEMA_CHANGE` at the next REFRESH.
+    // (Definition of `fingerprint` deferred to line ~525 below.)
 
     // If openivm emits only an empty-placeholder delta (e.g. for multi-source JOINs
     // that it cannot compute incrementally), classify the MV as FULL_REFRESH so every
@@ -455,38 +461,79 @@ case class CreateMaterializedViewCommand(
       if (compiled.refreshType == RefreshTypeCode.AggregateHaving)
         extractHavingPredicateSql(analyzed)
       else None
-    // MV-over-MV chains (depth ≤ 2 per PLAN.md §12, Risk #5): if any source
-    // table is itself a tracked materialized view, route the downstream MV
-    // through FULL_REFRESH. The dependent's refresh re-runs the view body
-    // against the now-up-to-date upstream MV via `INSERT OVERWRITE`, which
-    // is correct regardless of the upstream MV's incremental output shape.
-    // The trigger (`stagingDeltas.nonEmpty`) is provided by
-    // [[RefreshMaterializedViewCommand.postRefreshCleanup]] which synthesizes
-    // a staging entry against every downstream MV after a successful upstream
-    // refresh.
-    val sourceIsMv: Boolean = {
-      val mvNames: Set[String] =
-        try MvCatalog.list(spark).map(m => metaName(m.name)).toSet
-        catch { case _: Throwable => Set.empty[String] }
-      qualNames.exists { qn =>
-        // Also try the short name (without db prefix) for symmetry with how
-        // MvCatalog serializes single-segment identifiers.
+    // MV-over-MV chains: enumerate every upstream source that resolves to a
+    // tracked materialized view, capturing the upstream's effective refresh
+    // type so the demotion rule below can be capability-driven (not blanket).
+    //
+    // Lookup is symmetric on db.table vs bare-name matching to handle MVs
+    // created with or without an explicit db prefix.
+    val upstreamMvByQual: Map[String, MvMetadata] = {
+      val all: Seq[MvMetadata] =
+        try MvCatalog.list(spark)
+        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
+      qualNames.flatMap { qn =>
         val short = qn.split("\\.").last
-        mvNames.contains(qn) || mvNames.contains(short)
-      }
+        byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> m)
+      }.toMap
     }
-    val effectiveRefreshType =
-      if (isTopKView) RefreshTypeCode.FullRefresh
-      else if (sourceIsMv) RefreshTypeCode.FullRefresh
-      else if (compiled.refreshType == RefreshTypeCode.WindowPartition) compiled.refreshType
-      else if (compiled.refreshType == RefreshTypeCode.GroupRecompute) compiled.refreshType
+    val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
+    val nonCascadeUpstreams: Seq[String] =
+      upstreamMvByQual.toSeq.collect {
+        case (q, m) if !RefreshTypeCode.emitsCascadeViewDelta(m.refreshType) => q
+      }
+    // ── Effective refresh-type classification with structured logging ──────
+    //
+    // Every demotion of `compiled.refreshType` to FULL_REFRESH below is
+    // surfaced via [[logError]] with a `reason=<key>` tag so the operator can
+    // see WHY each MV ended up FULL_REFRESH in the spark-ext / dbt-server
+    // container log. The reason keys mirror the if-else branches:
+    //   - top_k                       Top-K view (ORDER BY ... LIMIT ...) forced to FULL_REFRESH
+    //   - non_cascade_upstream        Upstream MV's refresh type doesn't emit `openivm_delta_<view>`
+    //                                 (WINDOW_PARTITION, GROUP_RECOMPUTE, DISTINCT_INCREMENTAL,
+    //                                 SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH). There is no
+    //                                 persisted upstream delta to consume incrementally, so
+    //                                 downstream must also FullRefresh.
+    //   - window_partition_kept       compiler classified WINDOW_PARTITION; kept (no demotion)
+    //   - group_recompute_kept        compiler classified GROUP_RECOMPUTE; kept
+    //   - having_pred_empty           AggregateHaving with no extractable HAVING predicate
+    //   - no_real_delta               openivm emitted only empty-placeholder delta
+    //   - kept                        compiled type is preserved verbatim (incremental MV-over-MV
+    //                                 case included — upstream is cascade-delta-capable)
+    //
+    // INFO-level for "kept" so the per-MV decision is always visible during
+    // normal operation; ERROR-level for any demotion so even
+    // production-tuned log filters surface it.
+    val (effectiveRefreshType, classifyReason) = {
+      if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
+      else if (nonCascadeUpstreams.nonEmpty)
+        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreams.mkString(",")}")
+      else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
+        (compiled.refreshType, "window_partition_kept")
+      else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
+        (compiled.refreshType, "group_recompute_kept")
       else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
-        RefreshTypeCode.FullRefresh
-      else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)) RefreshTypeCode.FullRefresh
-      else compiled.refreshType
+        (RefreshTypeCode.FullRefresh, "having_pred_empty")
+      else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table))
+        (RefreshTypeCode.FullRefresh, "no_real_delta")
+      else (compiled.refreshType, "kept")
+    }
+    // `sourceIsMv` is computed for logging visibility only; the demotion is
+    // now driven by `nonCascadeUpstreams.nonEmpty` (see above).
+    val _ = sourceIsMv
     val effectiveRefreshTypeName =
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
       else compiled.refreshTypeName
+
+    {
+      val msg =
+        s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${compiled.refreshTypeName}' " +
+          s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason'"
+      if (effectiveRefreshType == RefreshTypeCode.FullRefresh && compiled.refreshType != RefreshTypeCode.FullRefresh)
+        logError(msg)
+      else
+        logInfo(msg)
+    }
 
     // AGGREGATE_HAVING split: the data table stores ALL groups (so a group
     // whose aggregate later crosses the threshold can be re-promoted by an
@@ -504,8 +551,21 @@ case class CreateMaterializedViewCommand(
     val baseProps  = Map("_ivm_group_keys" -> groupKeys.mkString(","))
     val countProp  = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp = havingPred.map(p => "_ivm_having_pred" -> p).toMap
-    val allProps   = properties ++ baseProps ++ countProp ++ havingProp
-    val now        = new Timestamp(System.currentTimeMillis())
+    // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
+    // REFRESH ignores any staging rows that pre-date this MV (otherwise we'd
+    // double-apply upstream view-deltas this MV already absorbed via the CTAS).
+    // See `StagingCatalog.currentWatermarks` + `StagingCatalog.collectFor`.
+    val watermarks     = StagingCatalog.currentWatermarks(spark, qualNames)
+    val watermarkProps = MvMetadata.watermarkProperties(watermarks)
+    val allProps       = properties ++ baseProps ++ countProp ++ havingProp ++ watermarkProps
+    val now            = new Timestamp(System.currentTimeMillis())
+
+    // Fingerprint the current source schemas + every upstream MV's identity
+    // hash. Captures schema drift AND upstream-body drift (DROP + recreate
+    // with same schema but different body).
+    val mvIdentityBySource: Map[String, String] =
+      upstreamMvByQual.map { case (qn, m) => qn -> MvCatalog.mvIdentity(m) }
+    val fingerprint = MvCatalog.schemaFingerprint(qualSchemas, mvIdentityBySource)
 
     val meta = MvMetadata(
       name = name,
@@ -617,15 +677,43 @@ case class RefreshMaterializedViewCommand(
         )
       )
 
-    val viewNameStr   = metaName(name)
-    val stagingDeltas = StagingCatalog.collectFor(spark, viewNameStr, meta.sourceTables)
+    val viewNameStr = metaName(name)
+    val stagingDeltas = StagingCatalog.collectFor(
+      spark,
+      viewNameStr,
+      meta.sourceTables,
+      meta.sourceWatermarks
+    )
 
     // No pending deltas → nothing to do
-    if (stagingDeltas.isEmpty) return Seq.empty
+    if (stagingDeltas.isEmpty) {
+      logInfo(
+        s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+          "outcome='no_pending_deltas'"
+      )
+      return Seq.empty
+    }
 
-    // Resolve current source schemas and check for schema drift
-    val freshSchemas     = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
-    val freshFingerprint = MvCatalog.schemaFingerprint(freshSchemas)
+    logInfo(
+      s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+        s"pending_deltas=${stagingDeltas.size} source_tables=${meta.sourceTables.mkString(",")}"
+    )
+
+    // Resolve current source schemas and check for schema drift. Include
+    // upstream MV identity hashes so a DROP + recreate-with-same-schema
+    // upstream is also caught.
+    val freshSchemas = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
+    val freshMvIdentityBySource: Map[String, String] = {
+      val all: Seq[MvMetadata] =
+        try MvCatalog.list(spark)
+        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
+      meta.sourceTables.flatMap { qn =>
+        val short = qn.split("\\.").last
+        byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> MvCatalog.mvIdentity(m))
+      }.toMap
+    }
+    val freshFingerprint = MvCatalog.schemaFingerprint(freshSchemas, freshMvIdentityBySource)
     if (freshFingerprint != meta.sourceSchemaFingerprint)
       throw new AnalysisException(
         "INCOMPATIBLE_VIEW_SCHEMA_CHANGE",
@@ -689,10 +777,18 @@ case class RefreshMaterializedViewCommand(
       )
     )
 
-    // Per-refresh scratch path for the view-delta CTAS emitted by statement B.
+    // Per-refresh view-delta path under a STABLE per-MV namespace
+    // (`<warehouse>/_ivm/view_deltas/<safe-qualified-mv-name>/<txn-ts-uuid>`).
+    // The path is uniquely named per refresh, but the parent directory is
+    // shared across all of this MV's refreshes — so the Phase-7 orphan sweep
+    // and the MV's DROP path can clean up the entire namespace at once.
+    //
+    // The fully-qualified MV name (db.table) is used (not just the short
+    // name) so two MVs with the same short name in different databases
+    // don't collide on disk.
     val warehouse     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val escapedName   = name.table.replace(".", "_").replace(" ", "_")
-    val viewDeltaPath = s"$warehouse/_ivm/_tmp/${escapedName}_delta_${java.util.UUID.randomUUID()}"
+    val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
+    val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
     val byTable            = stagingDeltas.groupBy(_.baseTable)
     val tempViewShortNames = scala.collection.mutable.ArrayBuffer[String]()
@@ -743,6 +839,15 @@ case class RefreshMaterializedViewCommand(
       )
 
       try {
+        // Log the rewritten SQL at DEBUG so cascade-related issues are
+        // observable when -Dlog4j2.logger.org.openivm.spark.commands=DEBUG
+        // is set, without polluting the default INFO output.
+        rewritten.statements.zipWithIndex.foreach { case (stmt, i) =>
+          logInfo(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' stmt[$i]=" +
+              stmt.replace('\n', ' ').take(4000)
+          )
+        }
         rewritten.statements.foreach { sql =>
           RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
         }
@@ -760,8 +865,65 @@ case class RefreshMaterializedViewCommand(
             RetryPolicy.DeltaConflicts.execute { spark.sql(deleteSql).collect() }
           }
         }
+
+        // MV-over-MV cascade: persist this MV's view-delta as a
+        // `StagingDelta` row so any downstream MV's next REFRESH consumes it.
+        // Only refresh types that actually emit `INSERT INTO openivm_delta_<view>`
+        // (per RefreshTypeCode.emitsCascadeViewDelta) produce a view-delta on
+        // disk; for the others the rewriter writes the MV directly without a
+        // view-delta CTAS, so there is nothing to persist.
+        //
+        // Strict ordering for crash safety:
+        //   1. refresh program executes (writes data table + view-delta CTAS)
+        //   2. countMonoid cleanup
+        //   3. record(MV_VIEW_DELTA, viewDeltaPath) — MUST precede step 4
+        //   4. postRefreshCleanup → markConsumed → MvCatalog.advance
+        //
+        // If we crash between (1) and (3): the data table is updated and
+        // input staging is still unconsumed (a retry replays it — at-least-once
+        // semantics; see PRE-EXISTING idempotency gap). The view-delta on disk
+        // is orphan (no catalog row) and is collected by Phase 7's orphan sweep.
+        //
+        // One MV_VIEW_DELTA row is recorded per distinct downstream
+        // `sourceTables` form referencing this MV. Downstream MVs may
+        // reference this MV as `db.name` or bare `name` depending on the
+        // session's current schema at downstream CREATE time; each form
+        // becomes a separate trigger key so `StagingCatalog.collectFor`
+        // (which matches `base_table` exactly against the downstream's
+        // `meta.sourceTables`) finds it.
+        if (RefreshTypeCode.emitsCascadeViewDelta(meta.refreshType)) {
+          val mvShortName = name.identifier
+          val triggerKeys: Set[String] = MvCatalog
+            .list(spark)
+            .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
+            .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
+            .toSet
+          val keysToRecord =
+            if (triggerKeys.isEmpty) Set(viewNameStr) // record under our own name even with no downstream yet
+            else triggerKeys
+          val txnTs = new Timestamp(System.currentTimeMillis())
+          keysToRecord.foreach { triggerKey =>
+            StagingCatalog.record(
+              spark,
+              StagingDelta(
+                baseTable = triggerKey,
+                opType = StagingDelta.OpTypes.MvViewDelta,
+                stagingPath = viewDeltaPath,
+                txnTs = txnTs,
+                consumedBy = Seq.empty
+              )
+            )
+          }
+        }
       } catch {
         case t: Throwable =>
+          // Best-effort cleanup of any partial view-delta on failure. Phase 7
+          // orphan-sweep is the long-tail safety net.
+          try {
+            val hadoopPath = new Path(viewDeltaPath)
+            val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+            if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+          } catch { case _: Throwable => () }
           val sqlSnippet = rewritten.statements.zipWithIndex
             .map { case (s, i) => s"[${i + 1}] $s" }
             .mkString("\n---\n")
@@ -770,15 +932,6 @@ case class RefreshMaterializedViewCommand(
               s"Rewritten SQL:\n$sqlSnippet",
             t
           )
-      } finally {
-        // Drop the per-refresh view-delta scratch table on disk.
-        try {
-          val hadoopPath = new Path(viewDeltaPath)
-          val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
-          if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
-        } catch {
-          case _: Throwable => // best-effort cleanup
-        }
       }
 
       postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr)
@@ -796,16 +949,40 @@ case class RefreshMaterializedViewCommand(
   /** Advance the MV's tracked Delta version and prune fully-consumed staging
     * rows. Shared between the FullRefresh and incremental paths.
     *
-    * MV-over-MV cascade (PLAN.md §12, depth ≤ 2): if any other tracked MV
-    * lists `name` as a source table, this method synthesizes a staging entry
-    * pointing at this MV's own data table so that the downstream MV's next
-    * REFRESH does not short-circuit on the `stagingDeltas.isEmpty` guard.
-    * Downstream MVs that have an MV in their `sourceTables` are forced to
-    * `FullRefresh` at CREATE time, so the synthetic staging entry's content
-    * is never read — it only serves as a trigger. Per Risk #5 / §12 the
-    * cascade is intentionally limited to depth 2: the synthetic entry's
-    * `consumed_by` is tracked normally, so a third level would not propagate
-    * automatically without further cascade plumbing.
+    * MV-over-MV cascade trigger:
+    *
+    * For every other tracked MV that lists `name` as a source table, this
+    * method ensures the downstream MV's next REFRESH does not short-circuit
+    * on the `stagingDeltas.isEmpty` guard at the top of [[runUnderLock]].
+    *
+    * Two paths depending on `meta.refreshType`:
+    *
+    *  - **Cascade-delta-capable** (per [[RefreshTypeCode.emitsCascadeViewDelta]]
+    *    — AGGREGATE_GROUP, SIMPLE_AGGREGATE, SIMPLE_PROJECTION,
+    *    AGGREGATE_HAVING): nothing to synthesise here — the
+    *    `MV_VIEW_DELTA` staging row was already recorded inside the
+    *    incremental refresh's success block ([[runUnderLock]] step 3).
+    *    Downstream MVs whose `MvMetadata.sourceTables` references this MV
+    *    pick up that row via `StagingCatalog.collectFor`.
+    *
+    *  - **NOT cascade-delta-capable** (FullRefresh, WINDOW_PARTITION,
+    *    GROUP_RECOMPUTE, DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K):
+    *    these refresh types do not write `INSERT INTO openivm_delta_<view>`,
+    *    so there is no persisted upstream delta downstream can consume.
+    *    Synthesise a **unique per-refresh trigger** row so the downstream's
+    *    next REFRESH fires. The unique suffix prevents
+    *    `StagingCatalog.record`'s `(base_table, staging_path)` idempotency
+    *    key from collapsing multiple consecutive triggers into one row with
+    *    stale `consumed_by`. Downstream MVs over these upstream types are
+    *    themselves FullRefresh-demoted at CREATE time, so they never
+    *    interpret the trigger row's content — only its presence.
+    *
+    * Match the downstream's source-table entry by its trailing short-name
+    * segment so the synthetic staging uses the exact form recorded in the
+    * downstream's `MvMetadata.sourceTables` (the DML-interceptor convention
+    * stores sources with their Spark-resolved namespace prefix, e.g.
+    * `default.ch_sales_by_region`, but [[TableIdentifier]] for a
+    * `CREATE MATERIALIZED VIEW` issued without a db prefix is db-less).
     */
   private def postRefreshCleanup(
       spark: SparkSession,
@@ -829,33 +1006,32 @@ case class RefreshMaterializedViewCommand(
       .map { case (t, pairs) => t -> pairs.map(_._2) }
     StagingCatalog.pruneFullyConsumed(spark, viewsByTable)
 
-    // MV-over-MV cascade trigger: synthesize a staging row for every MV that
-    // depends on the MV we just refreshed.  The staging path points at this
-    // MV's own Delta data table — downstream MVs are routed to FullRefresh at
-    // CREATE time so the path content is never interpreted by the rewriter.
-    //
-    // Match the downstream's source-table entry by its trailing short-name
-    // segment so the synthetic staging uses the exact form recorded in the
-    // downstream's `MvMetadata.sourceTables` (the DML-interceptor convention
-    // stores sources with their Spark-resolved namespace prefix, e.g.
-    // `default.ch_sales_by_region`, but [[TableIdentifier]] for a
-    // `CREATE MATERIALIZED VIEW` issued without a db prefix is db-less).
-    val mvShortName = name.identifier
-    val triggerKeys: Set[String] = allMvs
-      .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
-      .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
-      .toSet
-    triggerKeys.foreach { triggerKey =>
-      StagingCatalog.record(
-        spark,
-        StagingDelta(
-          baseTable = triggerKey,
-          opType = "OVERWRITE",
-          stagingPath = meta.location,
-          txnTs = new Timestamp(System.currentTimeMillis()),
-          consumedBy = Seq.empty
+    // MV-over-MV cascade trigger (non-cascade-capable upstream only — see
+    // method docstring). For cascade-delta-capable types the MV_VIEW_DELTA
+    // row is already recorded; emitting an OVERWRITE trigger here would
+    // pile a +1 multiplicity full-table delta on top of the +/- signed
+    // view-delta and silently double-add downstream rows.
+    if (!RefreshTypeCode.emitsCascadeViewDelta(meta.refreshType)) {
+      val mvShortName = name.identifier
+      val triggerKeys: Set[String] = allMvs
+        .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
+        .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
+        .toSet
+      triggerKeys.foreach { triggerKey =>
+        // Unique per-refresh path under the MV's location so repeats don't
+        // collapse on (base_table, staging_path) idempotency.
+        val triggerPath = s"${meta.location}/_trigger/${java.util.UUID.randomUUID()}"
+        StagingCatalog.record(
+          spark,
+          StagingDelta(
+            baseTable = triggerKey,
+            opType = StagingDelta.OpTypes.Overwrite,
+            stagingPath = triggerPath,
+            txnTs = new Timestamp(System.currentTimeMillis()),
+            consumedBy = Seq.empty
+          )
         )
-      )
+      }
     }
   }
 
@@ -932,6 +1108,29 @@ case class DropMaterializedViewCommand(
         val hadoopPath = new Path(meta.location)
         val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
         if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+
+        // MV-over-MV cleanup: remove every `StagingCatalog` row whose
+        // `base_table` could reference this MV. Without this, a subsequent
+        // CREATE of the SAME name with a different body could consume stale
+        // view-deltas from the old incarnation. Two forms are pruned:
+        //   - exact match on `metaName(name)` (qualified `db.table`)
+        //   - bare short-name match (downstream MVs created without a db
+        //     prefix store their source as the bare name)
+        //
+        // Also delete the per-MV view-delta namespace on disk so view-delta
+        // Delta paths from previous refreshes are gone.
+        val mvQual  = metaName(name)
+        val mvShort = name.identifier
+        StagingCatalog.removeForBaseTable(spark, mvQual)
+        if (mvShort != mvQual) StagingCatalog.removeForBaseTable(spark, mvShort)
+
+        val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
+        val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
+        try {
+          val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
+          if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
+        } catch { case _: Throwable => () }
 
         // Remove the tracking row from the MV catalog
         MvCatalog.remove(spark, name)
