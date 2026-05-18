@@ -319,16 +319,38 @@ case class CreateMaterializedViewCommand(
     val groupKeys      = extractGroupKeys(analyzed)
     val countStarAlias = extractCountStarAlias(analyzed)
 
-    // Compile the view via OpenIVM
+    // Compile the view via OpenIVM. If openivm's DuckDB subprocess cannot
+    // compile the query (e.g. the user's view body references Spark-only
+    // functions like `regexp_like`, `to_date(string)`, etc. that DuckDB does
+    // not recognise), demote the view to FULL_REFRESH so each refresh
+    // re-executes the original Spark SQL via INSERT OVERWRITE. This trades
+    // incrementality for correctness: the MV stays bag-equal to the live
+    // query while the user retains source-of-truth control over the SQL
+    // they wrote.
     val compiler = OpenIvmCompilers.forSession(spark)
-    val compiled = compiler.compile(
-      CompileRequest(
-        viewName = name.table,
-        viewSql = originalQueryText,
-        sources = compileSchemas,
-        sourceQualifiedNames = shortToQual
-      )
-    )
+    val compiled =
+      try
+        compiler.compile(
+          CompileRequest(
+            viewName = name.table,
+            viewSql = originalQueryText,
+            sources = compileSchemas,
+            sourceQualifiedNames = shortToQual
+          )
+        )
+      catch {
+        case e: org.openivm.spark.compiler.OpenIvmCompileException =>
+          logWarning(
+            s"openivm compile failed for '${sqlIdent(name)}'; demoting to " +
+              s"FULL_REFRESH. Cause: ${e.getMessage}"
+          )
+          org.openivm.spark.compiler.CompiledRefresh(
+            refreshType = RefreshTypeCode.FullRefresh,
+            refreshTypeName = "FULL_REFRESH",
+            sql = "",
+            initialLoadSql = ""
+          )
+      }
 
     // Storage location
     val location = mvLocation(spark, name)
