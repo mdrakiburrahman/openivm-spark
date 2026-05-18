@@ -22,6 +22,11 @@ ThisBuild / Test / javaOptions ++= jvmModuleOpts
 ThisBuild / Test / parallelExecution := false
 ThisBuild / Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-oDF")
 
+// Cap parallel forked JVMs. Override with `-Dopenivm.test.forks=N`.
+Global / concurrentRestrictions := Seq(
+  Tags.limit(Tags.ForkedTestGroup, sys.props.getOrElse("openivm.test.forks", "32").toInt)
+)
+
 lazy val root = (project in file("."))
   .aggregate(ivmExecutor, ivmCommon, ivmCompiler, ivmExtension, ivmIt)
   .settings(
@@ -62,5 +67,6 @@ lazy val ivmExtension = (project in file("ivm-extension"))
 lazy val ivmIt = (project in file("ivm-it"))
   .dependsOn(ivmExtension % "compile->compile;test->test")
   .settings(commonSettings: _*)
+  .settings(parallelForkSettings: _*)
   .settings(libraryDependencies ++= Dependencies.it)
   .settings(publish / skip := true)

@@ -77,7 +77,8 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       sourceTempViews: Map[String, String],
       viewDeltaPath: String,
-      postProcess: String => String = identity
+      postProcess: String => String = identity,
+      sourceSchemas: Map[String, Seq[String]] = Map.empty
   ): RewrittenRefresh = {
     val _ = (mvLocation, sourceTempViews) // reserved for future passes
 
@@ -95,56 +96,146 @@ object SparkRefreshRewriter {
         case StatementKind.ScalarUpdate =>
           Seq(rewriteScalarUpdate(stmt, viewLogicalName, mvName, viewDeltaPath))
         case StatementKind.ScalarDeleteMv =>
-          Seq(rewriteScalarDeleteMv(stmt, viewLogicalName, mvName))
+          Seq(rewriteScalarDeleteMv(stmt, viewLogicalName, mvName, viewDeltaPath))
         case StatementKind.ScalarFullRecomputeInsert =>
-          Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName))
+          Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
+        case StatementKind.PartitionScopedDelete =>
+          rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
+        case StatementKind.PartitionScopedInsert =>
+          Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
+        case StatementKind.GroupRecomputeAffectedCreate =>
+          Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName))
+        case StatementKind.GroupRecomputeAffectedDrop =>
+          Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
         case StatementKind.Unknown => Nil
       }
     }
 
-    RewrittenRefresh(rewritten.map(postProcess))
+    // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
+    // exclusion syntax — `EXCEPT` is parsed as the set operator.  Expand any
+    // surviving `SELECT * EXCEPT (col1, col2) FROM openivm_delta_<short>` form
+    // (emitted by openivm for multi-source join-aware GROUP_RECOMPUTE and
+    // similar refresh programs) into an explicit column list using the source
+    // schemas supplied by the caller.
+    val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
+    RewrittenRefresh(withExceptExpanded.map(postProcess))
   }
 
   // ── Statement classification ─────────────────────────────────────────────
 
   private sealed trait StatementKind
   private object StatementKind {
-    case object InProgressFlag            extends StatementKind
-    case object ViewDeltaInsert           extends StatementKind
-    case object MvMerge                   extends StatementKind
+    case object InProgressFlag  extends StatementKind
+    case object ViewDeltaInsert extends StatementKind
+    case object MvMerge         extends StatementKind
+
     /** SIMPLE_PROJECTION Statement C: `INSERT INTO openivm_data_<view> SELECT … FROM openivm_delta_<view>, generate_series(…)` */
     case object SimpleProjectionDataInsert extends StatementKind
+
     /** SIMPLE_AGGREGATE Statements C/D/E: any `UPDATE openivm_data_<view> SET …` form,
       * including the CTE-prefixed incremental-sum update, the hidden-column recompute,
       * and the null-reset for an empty source. */
-    case object ScalarUpdate              extends StatementKind
+    case object ScalarUpdate extends StatementKind
+
     /** SIMPLE_AGGREGATE full-recompute for non-additive aggregates (MIN/MAX):
       * `DELETE FROM openivm_data_<view>` — clears the MV before re-insert. */
-    case object ScalarDeleteMv            extends StatementKind
+    case object ScalarDeleteMv extends StatementKind
+
     /** SIMPLE_AGGREGATE full-recompute for non-additive aggregates (MIN/MAX):
       * `INSERT INTO openivm_data_<view> WITH scan_0 … SELECT … FROM memory.main.<src>`
-      * — re-inserts by querying the live source table (not the delta). */
+      * — re-inserts by querying the live source table (not the delta); identified by
+      * the presence of `memory.main.` which distinguishes it from SIMPLE_PROJECTION. */
     case object ScalarFullRecomputeInsert extends StatementKind
-    case object Cleanup                   extends StatementKind
-    case object Unknown                   extends StatementKind
+
+    /** GROUP_RECOMPUTE (type 6) Statement B: materialise the set of affected group keys
+      * as a TEMP VIEW.  openivm emits this as
+      *   `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS
+      *      SELECT DISTINCT <keys> FROM (<delta-substituted view query>);`
+      * which is rewritten to `CREATE OR REPLACE TEMPORARY VIEW openivm_affected_<view>`
+      * with DuckDB-isms (`SELECT * EXCLUDE`, `memory.main.<src>`, timestamp predicate)
+      * normalised for Spark. */
+    case object GroupRecomputeAffectedCreate extends StatementKind
+
+    /** GROUP_RECOMPUTE (type 6) Statement E: drop the affected-keys scratch object.
+      * `DROP TABLE IF EXISTS openivm_affected_<view>` → `DROP VIEW IF EXISTS …`. */
+    case object GroupRecomputeAffectedDrop extends StatementKind
+
+    /** WINDOW_PARTITION (type 5) DELETE: `DELETE FROM openivm_data_<view> WHERE
+      * <part_col> IN (SELECT DISTINCT <src_col> FROM openivm_delta_<src> WHERE
+      * openivm_timestamp > '<ts>'::TIMESTAMP)`, with one `IN (SELECT …)` clause
+      * per partition column OR-joined together (see openivm
+      * `refresh_compiler_aux.cpp:265-291`).  Delta Lake does NOT support
+      * `IN (subquery)` in `DELETE`, so we rewrite each clause as a `MERGE INTO
+      * <mv> AS v USING (<subquery>) AS d ON v.<col> <=> d.<col> WHEN MATCHED
+      * THEN DELETE` and emit one MERGE per clause.  Running the per-clause
+      * MERGEs in sequence is semantically equivalent to the original OR-joined
+      * DELETE: any row matching ANY clause is deleted. */
+    case object PartitionScopedDelete extends StatementKind
+
+    /** WINDOW_PARTITION (type 5) INSERT: `INSERT INTO openivm_data_<view>
+      * SELECT * FROM (<view_body referencing memory.main.<src>>) openivm_recompute
+      * WHERE <part_col> IN (SELECT DISTINCT <src_col> FROM openivm_delta_<src>
+      * WHERE openivm_timestamp > '<ts>'::TIMESTAMP)`.  Spark / Delta DO support
+      * `IN (subquery)` in `INSERT … SELECT … WHERE`, so we keep the original
+      * shape: substitute `openivm_data_<view>` → MV name, rewrite
+      * `memory.main.<x>` → `` `<x>` ``, and strip the inner timestamp filter
+      * (the Spark staging delta temp view already restricts visible rows). */
+    case object PartitionScopedInsert extends StatementKind
+    case object Cleanup               extends StatementKind
+    case object Unknown               extends StatementKind
   }
 
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
-    val upper = stmt.toUpperCase.trim
+    val upper            = stmt.toUpperCase.trim
+    val affectedKeysName = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
+    } else if (upper.startsWith("CREATE OR REPLACE TEMP TABLE") && upper.contains(affectedKeysName)) {
+      // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
+      StatementKind.GroupRecomputeAffectedCreate
+    } else if (upper.startsWith("DROP TABLE IF EXISTS") && upper.contains(affectedKeysName)) {
+      // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
+      StatementKind.GroupRecomputeAffectedDrop
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
-    } else if (upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-               upper.contains(s"OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
-      StatementKind.SimpleProjectionDataInsert
-    } else if (upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
-      // Full-recompute INSERT for non-additive aggregates (MIN/MAX): reads from live source
+    } else if (
+      upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains("OPENIVM_RECOMPUTE") &&
+      containsInSubquery(upper)
+    ) {
+      // WINDOW_PARTITION (type 5) INSERT: `INSERT INTO openivm_data_<v> SELECT * FROM
+      // (<view body referencing memory.main.<src>>) openivm_recompute WHERE <part> IN
+      // (SELECT DISTINCT <part> FROM openivm_delta_<src> WHERE …)`.  The `openivm_recompute`
+      // alias is openivm's marker for `BuildDeleteInsertRefreshSQL` output
+      // (refresh_helpers.cpp:178-184); together with an `IN (SELECT …)` clause it
+      // identifies the WINDOW_PARTITION INSERT (vs the MIN/MAX full-recompute INSERT,
+      // which has neither marker).
+      StatementKind.PartitionScopedInsert
+    } else if (
+      upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains("MEMORY.MAIN.")
+    ) {
+      // Full-recompute INSERT for non-additive aggregates (MIN/MAX) and GROUP_RECOMPUTE
+      // statement D: reads from live source. The presence of `memory.main.` distinguishes
+      // it from the SIMPLE_PROJECTION delta-fed INSERT.
       StatementKind.ScalarFullRecomputeInsert
+    } else if (upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
+      StatementKind.SimpleProjectionDataInsert
     } else if (upper.contains(s"UPDATE OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ScalarUpdate
+    } else if (
+      upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      containsInSubquery(upper)
+    ) {
+      // WINDOW_PARTITION (type 5) DELETE: `DELETE FROM openivm_data_<v> WHERE <part>
+      // IN (SELECT DISTINCT <part> FROM openivm_delta_<src> WHERE …)`.  Delta does
+      // not support `IN (subquery)` in DELETE; rewriter emits one MERGE per IN clause.
+      // The `IN (SELECT` marker distinguishes this from the MIN/MAX bare DELETE
+      // (handled by ScalarDeleteMv) and from GROUP_RECOMPUTE / AGGREGATE_GROUP+minmax
+      // DELETEs (both use `WHERE EXISTS`, not `WHERE IN`).
+      StatementKind.PartitionScopedDelete
     } else if (upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ScalarDeleteMv
     } else if (upper.startsWith("DELETE FROM") || upper.startsWith("UPDATE ")) {
@@ -378,13 +469,17 @@ object SparkRefreshRewriter {
     val userCols: Seq[String] = selectRe.findFirstMatchIn(stmt) match {
       case None => Nil
       case Some(m) =>
-        m.group(1).split(",").map(_.trim).map { col =>
-          // Normalise DuckDB double-quoted identifiers: "name" → `name`
-          if (col.startsWith("\"") && col.endsWith("\""))
-            s"`${col.substring(1, col.length - 1)}`"
-          else
-            s"`${col.replace("`", "``")}`"
-        }.toSeq
+        m.group(1)
+          .split(",")
+          .map(_.trim)
+          .map { col =>
+            // Normalise DuckDB double-quoted identifiers: "name" → `name`
+            if (col.startsWith("\"") && col.endsWith("\""))
+              s"`${col.substring(1, col.length - 1)}`"
+            else
+              s"`${col.replace("`", "``")}`"
+          }
+          .toSeq
     }
 
     if (userCols.isEmpty) return Nil
@@ -467,26 +562,344 @@ object SparkRefreshRewriter {
 
   /** Rewrites `DELETE FROM openivm_data_<view>` → `DELETE FROM <mv>`.
     *
-    * Emitted by openivm for non-additive aggregates (MIN/MAX) before the full-recompute INSERT.
+    * Emitted by openivm for:
+    *   - non-additive aggregates (MIN/MAX) before the full-recompute INSERT
+    *     (no WHERE clause, no timestamp predicate);
+    *   - GROUP_RECOMPUTE statement 2 (WHERE EXISTS referencing
+    *     `openivm_affected_<view>` temp object — no timestamp predicate);
+    *   - AGGREGATE_GROUP + has_minmax: `DELETE FROM openivm_data_<view> AS
+    *     openivm_tgt WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT <keys>
+    *     FROM openivm_delta_<view>) AS openivm_aff WHERE …)` — inline affected-
+    *     keys subquery, needs `openivm_delta_<view>` → `delta.<viewDeltaPath>`
+    *     substitution AND the surrounding `DELETE … WHERE EXISTS` reshaped to
+    *     a `MERGE … WHEN MATCHED THEN DELETE` because Delta Lake disallows
+    *     subqueries in DELETE WHERE conditions
+    *     (refresh_compiler.cpp:372-387, refresh_helpers.cpp:195-218);
+    *   - WINDOW_PARTITION delete-by-partition (WHERE <part_col> IN (SELECT
+    *     DISTINCT <part_col> FROM openivm_delta_<source> WHERE openivm_timestamp > '<ts>'::TIMESTAMP)
+    *     — the timestamp predicate must be stripped because the Spark-side
+    *     staging-delta temp view already restricts visible rows to the pending
+    *     batch).
+    *
+    * `stripTimestampPredicate` is a safe no-op when the inner subquery has no
+    * timestamp filter (MIN/MAX, AGGREGATE_GROUP+minmax, and GROUP_RECOMPUTE shapes).
     */
   private def rewriteScalarDeleteMv(
       stmt: String,
       viewLogicalName: String,
-      mvName: TableIdentifier
+      mvName: TableIdentifier,
+      viewDeltaPath: String
   ): String = {
     val mvRef = backtickMvName(mvName)
     val dataViewRe = ("(?i)\\bopenivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
-    dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
+    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
+    s = stripTimestampPredicate(s)
+    // AGGREGATE_GROUP+minmax affected-keys subquery references the view delta
+    // table inline (no separate openivm_affected_<view> temp object).  Repoint
+    // those references at the per-refresh CTAS Delta path.  No-op for SIMPLE_
+    // AGGREGATE MIN/MAX (no openivm_delta_<view> reference in the DELETE) and
+    // for GROUP_RECOMPUTE (which uses the openivm_affected_<view> temp view).
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    // Delta Lake forbids subqueries (including EXISTS) inside DELETE WHERE
+    // conditions, so rewrite the affected-keys form into a MERGE…WHEN MATCHED
+    // THEN DELETE.  No-op when the DELETE has no EXISTS WHERE clause.
+    s = rewriteDeleteExistsAsMerge(s, mvRef)
+    s
   }
 
   /** Rewrites the full-recompute `INSERT INTO openivm_data_<view> WITH scan_0 … SELECT … FROM memory.main.<src>`
     * into `INSERT INTO <mv> WITH scan_0 … SELECT … FROM \`<src>\``.
     *
-    * Emitted by openivm for non-additive aggregates (MIN/MAX) — the MV is cleared by a preceding
-    * ScalarDeleteMv statement and then fully re-populated from the live source table.
+    * Emitted by openivm for:
+    *   - non-additive aggregates (MIN/MAX) — the MV is cleared by a preceding
+    *     ScalarDeleteMv statement and then fully re-populated from the live source;
+    *   - GROUP_RECOMPUTE statement 3 (`WHERE EXISTS … openivm_affected_<view>`);
+    *   - AGGREGATE_GROUP + has_minmax: `INSERT INTO openivm_data_<view> SELECT *
+    *     FROM (<view_query_sql>) openivm_recompute WHERE EXISTS (SELECT 1 FROM
+    *     (SELECT DISTINCT <keys> FROM openivm_delta_<view>) AS openivm_aff
+    *     WHERE …)` — inline affected-keys subquery, needs `openivm_delta_<view>`
+    *     → `delta.<viewDeltaPath>` substitution
+    *     (refresh_compiler.cpp:372-387, refresh_helpers.cpp:195-218);
+    *   - WINDOW_PARTITION recompute INSERT (`SELECT * FROM (<view_body>) openivm_recompute
+    *     WHERE <part_col> IN (SELECT DISTINCT <part_col> FROM openivm_delta_<source>
+    *     WHERE openivm_timestamp > '<ts>'::TIMESTAMP)`) — the timestamp predicate
+    *     must be stripped because the Spark-side staging-delta temp view already
+    *     restricts visible rows to the pending batch.
+    *
+    * `stripTimestampPredicate` is a safe no-op for the MIN/MAX, AGGREGATE_GROUP+minmax,
+    * and GROUP_RECOMPUTE shapes (their INSERT WHERE clauses reference temp objects
+    * or inline subqueries, not delta tables with timestamps).
     */
   private def rewriteScalarFullRecomputeInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      viewDeltaPath: String
+  ): String = {
+    val mvRef = backtickMvName(mvName)
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
+    s = rewriteMemoryMainPrefix(s)
+    s = stripTimestampPredicate(s)
+    // AGGREGATE_GROUP+minmax: inline affected-keys subquery references the
+    // view delta table.  Repoint at the per-refresh CTAS Delta path.  No-op
+    // for SIMPLE_AGGREGATE MIN/MAX and for the temp-table GROUP_RECOMPUTE form.
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    s
+  }
+
+  /** Rewrites the AGGREGATE_GROUP+minmax `DELETE FROM <mv> AS openivm_tgt
+    * WHERE EXISTS (SELECT 1 FROM (<inner>) AS openivm_aff WHERE <match>)` form
+    * into a Delta-compatible `MERGE INTO <mv> AS openivm_tgt USING (<inner>)
+    * AS openivm_aff ON <match> WHEN MATCHED THEN DELETE`.
+    *
+    * Delta Lake's DELETE does not allow subqueries in the WHERE clause (it
+    * raises DELTA_UNSUPPORTED_SUBQUERY), but MERGE accepts an arbitrary source
+    * subquery, so reshaping is the only path that preserves the affected-keys
+    * semantics.
+    *
+    * Returns the input unchanged if no such pattern is found (e.g. MIN/MAX
+    * bare DELETE statements with no WHERE clause, or the GROUP_RECOMPUTE form
+    * that already references a temp view rather than an inline subquery).
+    *
+    * Uses paren-aware extraction so nested subqueries inside the affected-keys
+    * block (which the existing AGGREGATE_GROUP+minmax shape emits) are
+    * captured correctly.
+    */
+  private def rewriteDeleteExistsAsMerge(stmt: String, mvRef: String): String = {
+    val headerRe = ("(?is)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+EXISTS\\s*\\(").r
+    headerRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val tgtAlias    = Option(m.group(1)).getOrElse("v")
+        val existsOpen  = m.end - 1
+        val existsClose = findMatchingCloseParen(stmt, existsOpen)
+        if (existsClose < 0) return stmt
+        val existsBody = stmt.substring(existsOpen + 1, existsClose).trim
+        val trailing   = stmt.substring(existsClose + 1).trim
+        // The trailing text past the EXISTS must be just a terminator (`)` or
+        // empty) — anything else means the surrounding context is more complex
+        // than the inline affected-keys form and we bail out rather than
+        // mangle the SQL.
+        if (trailing.nonEmpty && trailing != ";") return stmt
+
+        // EXISTS body forms (from refresh_helpers.cpp:195-218):
+        //   (a) inline subquery — `SELECT 1 FROM (<sub>) AS <aff> WHERE <cond>`
+        //   (b) temp object     — `SELECT 1 FROM <temp_obj> AS <aff> WHERE <cond>`
+        val inlineRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+\(""".r
+        inlineRe.findFirstMatchIn(existsBody) match {
+          case Some(b) =>
+            val subOpen  = b.end - 1
+            val subClose = findMatchingCloseParen(existsBody, subOpen)
+            if (subClose < 0) return stmt
+            val subBody = existsBody.substring(subOpen + 1, subClose).trim
+            val tail    = existsBody.substring(subClose + 1).trim
+            val tailRe  = """(?is)^(?:AS\s+)?(\w+)\s+WHERE\s+(.+?)\s*$""".r
+            tailRe
+              .findFirstMatchIn(tail)
+              .map { t =>
+                val affAlias = t.group(1)
+                val onCond   = t.group(2)
+                s"""|MERGE INTO $mvRef AS $tgtAlias
+                  |USING (
+                  |$subBody
+                  |) AS $affAlias
+                  |ON $onCond
+                  |WHEN MATCHED THEN DELETE""".stripMargin
+              }
+              .getOrElse(stmt)
+          case None =>
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:AS\s+)?(\w+)\s+WHERE\s+(.+?)\s*$""".r
+            tempRe
+              .findFirstMatchIn(existsBody)
+              .map { t =>
+                val src      = t.group(1)
+                val affAlias = t.group(2)
+                val onCond   = t.group(3)
+                s"""|MERGE INTO $mvRef AS $tgtAlias
+                  |USING $src AS $affAlias
+                  |ON $onCond
+                  |WHEN MATCHED THEN DELETE""".stripMargin
+              }
+              .getOrElse(stmt)
+        }
+    }
+  }
+
+  // ── WINDOW_PARTITION (RefreshType 5) statement rewrites ───────────────────
+
+  /** Returns `true` when `upperCaseStmt` contains an `IN (SELECT …)` clause
+    * (top-level, with a top-level `SELECT`). Used by the classifier to
+    * distinguish the WINDOW_PARTITION DELETE/INSERT shapes from the MIN/MAX
+    * and GROUP_RECOMPUTE / AGGREGATE_GROUP+minmax shapes.
+    */
+  private def containsInSubquery(upperCaseStmt: String): Boolean = {
+    val re = """\bIN\s*\(\s*SELECT\b""".r
+    re.findFirstIn(upperCaseStmt).isDefined
+  }
+
+  /** Rewrites a WINDOW_PARTITION DELETE statement into one or more `MERGE INTO
+    * <mv> AS v USING (<subquery>) AS d ON v.<col> <=> d.<col> WHEN MATCHED THEN
+    * DELETE` statements, one per `IN (SELECT …)` clause in the WHERE.
+    *
+    * openivm emits the WINDOW_PARTITION DELETE as:
+    * {{{
+    *   DELETE FROM openivm_data_<v> WHERE
+    *     <part_col_1> IN (SELECT DISTINCT <src_col_1> FROM openivm_delta_<src> WHERE openivm_timestamp > '<ts>'::TIMESTAMP)
+    *     OR <part_col_2> IN (SELECT DISTINCT <src_col_2> FROM openivm_delta_<src> WHERE …)
+    *     OR …
+    * }}}
+    * (One IN-clause per (partition column × source table) pair, OR-joined —
+    * `refresh_compiler_aux.cpp:265-291`).
+    *
+    * Delta Lake does not support `IN (subquery)` in `DELETE` (see
+    * `DeltaErrors.subqueryNotSupportedException`), so we split the OR-joined
+    * IN-clauses and emit one MERGE per clause.  Running the MERGEs in
+    * sequence is semantically equivalent: each MERGE deletes the rows
+    * satisfying its clause, and the union of deletions matches the original
+    * OR-joined predicate.
+    *
+    * The inner timestamp filter is stripped: the Spark staging delta temp
+    * view already restricts visible rows to the pending refresh batch.
+    *
+    * @return one MERGE statement per IN-clause; an empty Seq if no IN-clause
+    *         is found (callers should fall back to the original statement).
+    */
+  private def rewritePartitionScopedDelete(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): Seq[String] = {
+    val mvRef = backtickMvName(mvName)
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
+    s = stripTimestampPredicate(s)
+
+    // Extract WHERE clause body.
+    val whereRe = ("(?is)^\\s*DELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "\\s+WHERE\\s+(.+?)\\s*;?\\s*$").r
+    val whereBody = whereRe.findFirstMatchIn(s).map(_.group(1).trim).getOrElse {
+      return Seq(s)
+    }
+
+    splitTopLevelOr(whereBody).flatMap { clause =>
+      val trimmed = clause.trim
+      inClauseToMerge(trimmed, mvRef)
+    }
+  }
+
+  /** Convert a single `<col> IN (SELECT …)` clause to a `MERGE INTO <mv> AS v
+    * USING (<subquery>) AS d ON v.<col> <=> d.<col> WHEN MATCHED THEN DELETE`
+    * statement.  Returns None when `clause` doesn't match the expected shape
+    * (in which case the caller should bail out).
+    */
+  private def inClauseToMerge(clause: String, mvRef: String): Option[String] = {
+    val openIdx = clause.toUpperCase.indexOf(" IN ")
+    if (openIdx < 0) return None
+    val lhs  = clause.substring(0, openIdx).trim
+    val rest = clause.substring(openIdx + 4).trim // skip " IN "
+    if (!rest.startsWith("(")) return None
+    val close = findMatchingCloseParen(rest, 0)
+    if (close < 0) return None
+    val subq = rest.substring(1, close).trim
+    // Strip surrounding parens on lhs (composite tuple form) if present —
+    // although openivm's non-DuckLake path only emits single-column IN clauses.
+    val lhsCols = if (lhs.startsWith("(") && lhs.endsWith(")")) {
+      lhs.stripPrefix("(").stripSuffix(")").split(",").map(_.trim)
+    } else {
+      Array(lhs)
+    }
+    val onCond = lhsCols
+      .map(c => s"v.$c IS NOT DISTINCT FROM d.$c")
+      .mkString(" AND ")
+    Some(
+      s"""|MERGE INTO $mvRef AS v
+          |USING ($subq) AS d
+          |ON $onCond
+          |WHEN MATCHED THEN DELETE""".stripMargin
+    )
+  }
+
+  /** Split a SQL boolean expression on top-level `OR` (whitespace-delimited,
+    * case-insensitive), respecting nesting of `(` `)` and single-quoted
+    * string literals (with `''` as the escape for an embedded quote).
+    *
+    * Used to break the OR-joined IN-clauses in a WINDOW_PARTITION DELETE
+    * predicate into independent per-clause units.
+    */
+  private def splitTopLevelOr(expr: String): Seq[String] = {
+    val pieces = scala.collection.mutable.ArrayBuffer[String]()
+    val sb     = new StringBuilder
+    var depth  = 0
+    var i      = 0
+    while (i < expr.length) {
+      val c = expr(i)
+      c match {
+        case '\'' =>
+          sb += c
+          i += 1
+          var done = false
+          while (i < expr.length && !done) {
+            val sc = expr(i)
+            sb += sc
+            i += 1
+            if (sc == '\'') {
+              if (i < expr.length && expr(i) == '\'') {
+                sb += expr(i)
+                i += 1
+              } else {
+                done = true
+              }
+            }
+          }
+        case '(' =>
+          depth += 1
+          sb += c
+          i += 1
+        case ')' =>
+          depth -= 1
+          sb += c
+          i += 1
+        case _
+            if depth == 0 &&
+              i + 4 <= expr.length &&
+              (expr(i) == 'O' || expr(i) == 'o') &&
+              (expr(i + 1) == 'R' || expr(i + 1) == 'r') &&
+              (i == 0 || expr(i - 1).isWhitespace) &&
+              expr(i + 2).isWhitespace =>
+          // Found a top-level OR (preceded by whitespace, followed by whitespace, depth 0).
+          pieces += sb.toString
+          sb.clear()
+          i += 3 // skip "OR "
+        case _ =>
+          sb += c
+          i += 1
+      }
+    }
+    pieces += sb.toString
+    pieces.toSeq.map(_.trim).filter(_.nonEmpty)
+  }
+
+  /** Rewrites the WINDOW_PARTITION INSERT: substitute `openivm_data_<v>` →
+    * backticked MV name, `memory.main.<src>` → `` `<src>` `` for source-table
+    * references, and strip the inner `openivm_timestamp > '<ts>'::TIMESTAMP`
+    * predicate.
+    *
+    * Spark/Delta `INSERT INTO <table> SELECT … WHERE <col> IN (subquery)` is
+    * supported (the IN-subquery restriction only applies to DELETE/UPDATE),
+    * so the OR-joined IN-clauses are kept verbatim.
+    */
+  private def rewritePartitionScopedInsert(
       stmt: String,
       viewLogicalName: String,
       mvName: TableIdentifier
@@ -496,7 +909,153 @@ object SparkRefreshRewriter {
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
     s = rewriteMemoryMainPrefix(s)
+    s = stripTimestampPredicate(s)
     s
+  }
+
+  // ── GROUP_RECOMPUTE (RefreshType 6) statement rewrites ────────────────────
+
+  /** Rewrites the GROUP_RECOMPUTE Statement B into a Spark-executable
+    * `CREATE OR REPLACE TEMPORARY VIEW` of the affected group keys.
+    *
+    * Input (DuckDB-target):
+    * {{{
+    *   CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS
+    *     SELECT DISTINCT <keys> FROM (
+    *       WITH scan_0 (…) AS (
+    *         SELECT … FROM (SELECT * EXCLUDE (openivm_multiplicity, openivm_timestamp)
+    *                        FROM openivm_delta_<src>
+    *                        WHERE openivm_timestamp >= '<ts>'::TIMESTAMP)
+    *       ), …
+    *       SELECT … FROM projection_N
+    *     ) openivm_src_<i>_<occ>
+    *     UNION
+    *     SELECT DISTINCT <keys> FROM (… memory.main.<src> …) openivm_src_<j>_<occ>;
+    * }}}
+    *
+    * Output (Spark-executable):
+    * {{{
+    *   CREATE OR REPLACE TEMPORARY VIEW openivm_affected_<view> AS
+    *     SELECT DISTINCT <keys> FROM (
+    *       WITH scan_0 (…) AS (
+    *         SELECT … FROM (SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)
+    *                        FROM `openivm_delta_<src>`)
+    *       ), …
+    *       SELECT … FROM projection_N
+    *     ) openivm_src_<i>_<occ>
+    *     UNION …
+    * }}}
+    *
+    * Transformations applied (in order):
+    *   1. `CREATE OR REPLACE TEMP TABLE` → `CREATE OR REPLACE TEMPORARY VIEW`
+    *   2. Strip `openivm_timestamp >= '…'::TIMESTAMP` predicates (Spark-side
+    *      `openivm_delta_<src>` TEMP VIEWs already restrict visible rows to the
+    *      pending batch, and the timestamp value references openivm's own
+    *      bookkeeping which is not present on the Spark side).
+    *   3. `memory.main.<src>` → `` `<src>` ``
+    *   4. `SELECT * EXCLUDE (…)` → `SELECT * EXCEPT (…)`  (Spark 3.4+ syntax).
+    */
+  private def rewriteGroupRecomputeAffectedCreate(
+      stmt: String,
+      viewLogicalName: String
+  ): String = {
+    val _ = viewLogicalName // captured by the SQL itself; reserved for future use
+    var s = stmt
+    s = """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
+      .replaceFirstIn(s, "CREATE OR REPLACE TEMPORARY VIEW")
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  /** Rewrites the GROUP_RECOMPUTE Statement E into a Spark
+    * `DROP VIEW IF EXISTS` matching the TEMPORARY VIEW created by Statement B.
+    *
+    * Rebuilds the statement from `viewLogicalName` to avoid fragile pattern
+    * preservation (openivm sometimes emits the identifier unquoted, sometimes
+    * with DuckDB double-quotes).
+    */
+  private def rewriteGroupRecomputeAffectedDrop(
+      stmt: String,
+      viewLogicalName: String
+  ): String = {
+    val _            = stmt
+    val affectedName = s"openivm_affected_$viewLogicalName"
+    s"DROP VIEW IF EXISTS `$affectedName`"
+  }
+
+  /** Rewrites `SELECT * EXCLUDE (col1, col2)` (DuckDB) by stripping the
+    * `EXCLUDE (...)` clause entirely.
+    *
+    * Spark 3.5 does not support either `SELECT * EXCLUDE` (DuckDB) or
+    * `SELECT * EXCEPT (...)` (Databricks / Spark 4.0+) column-exclusion
+    * syntax. In the openivm-emitted GROUP_RECOMPUTE program the inner
+    * subquery `(SELECT * EXCLUDE (openivm_multiplicity, openivm_timestamp)
+    * FROM openivm_delta_<src>)` is always wrapped by an outer SELECT that
+    * lists the user-facing columns by name, so stripping the EXCLUDE clause
+    * just lets the hidden `openivm_multiplicity` / `openivm_timestamp`
+    * columns flow through to the outer SELECT, which then ignores them.
+    *
+    * Scoped to `EXCLUDE` immediately preceded by `*` and followed by a
+    * parenthesised column list — unrelated occurrences of `EXCLUDE` (e.g.
+    * inside identifiers or string literals) are left alone.
+    */
+  private def rewriteExcludeAsExcept(sql: String): String = {
+    val re = """(?is)(\*\s*)EXCLUDE\s*\([^)]*\)""".r
+    re.replaceAllIn(sql, m => java.util.regex.Matcher.quoteReplacement(m.group(1)))
+  }
+
+  /** Expand DuckDB-style `SELECT * EXCEPT (col1, col2) FROM <openivm_delta_short>`
+    * into an explicit column list `SELECT <c_a>, <c_b>, … FROM …`.
+    *
+    * Spark 3.5 does NOT support `SELECT * EXCEPT (col, …)` for column exclusion
+    * — the SQL parser interprets `EXCEPT` as the set operation and raises
+    * `PARSE_SYNTAX_ERROR` on the first column inside the parenthesised list.
+    * openivm emits this syntax inside `scan_<i>` CTEs of GROUP_RECOMPUTE
+    * affected-keys queries (and other multi-source refresh programs) to strip
+    * `openivm_multiplicity` / `openivm_timestamp` before joining the delta with
+    * other relations — see `openivm/src/rules/join.cpp` and the staging delta
+    * temp view shape in [[StagingDeltaView.buildSourceDeltaViewSql]].
+    *
+    * `sourceSchemas` maps each source's short table name to its user-facing
+    * column list (NOT including bookkeeping columns).  For a match against
+    * `openivm_delta_<short>` we emit the source columns minus the EXCEPT list.
+    * Unknown source tables, or absence of a matching schema, leave the
+    * statement unchanged so the failing parser path surfaces a clear error
+    * during refresh rather than silently dropping the clause.
+    */
+  private def expandSelectStarExcept(sql: String, sourceSchemas: Map[String, Seq[String]]): String = {
+    if (sourceSchemas.isEmpty) return sql
+    // Match `SELECT * EXCEPT (a, b, …) FROM <table>` where the table is one of
+    // the openivm delta temp views.  Allow optional whitespace, backticks, and
+    // an optional table alias after FROM.  The trailing `)` / token boundary
+    // is captured so we can splice cleanly.
+    val re =
+      """(?is)SELECT\s+\*\s+EXCEPT\s*\(([^)]+)\)\s+FROM\s+`?(openivm_delta_[A-Za-z0-9_]+)`?""".r
+    re.replaceAllIn(
+      sql,
+      mm => {
+        val excludedCols = mm
+          .group(1)
+          .split(",")
+          .map { c =>
+            c.trim.stripPrefix("`").stripSuffix("`").stripPrefix("\"").stripSuffix("\"").toLowerCase
+          }
+          .toSet
+        val tableName = mm.group(2)
+        val shortName = tableName.stripPrefix("openivm_delta_")
+        sourceSchemas.get(shortName) match {
+          case None => java.util.regex.Matcher.quoteReplacement(mm.matched)
+          case Some(cols) =>
+            val kept = cols.filterNot(c => excludedCols.contains(c.toLowerCase))
+            val projection =
+              if (kept.isEmpty) "NULL"
+              else kept.map(c => s"`${c.replace("`", "``")}`").mkString(", ")
+            java.util.regex.Matcher.quoteReplacement(s"SELECT $projection FROM `$tableName`")
+        }
+      }
+    )
   }
 
   /** Rewrite the null-reset UPDATE as a MERGE that counts the source table rows.
@@ -539,14 +1098,17 @@ object SparkRefreshRewriter {
         val updatePart = stmt.substring(closeParenIdx + 1).trim
         val aliasMap   = parseCteSelectAliases(cteBody)
         val refRe      = """(?i)\(\s*SELECT\s+(\w+)\s+FROM\s+openivm_delta\s*\)""".r
-        refRe.replaceAllIn(updatePart, mm => {
-          val alias = mm.group(1).toUpperCase
-          aliasMap.get(alias) match {
-            case None       => mm.matched
-            case Some(expr) =>
-              java.util.regex.Matcher.quoteReplacement(s"(SELECT $expr FROM $deltaRef)")
+        refRe.replaceAllIn(
+          updatePart,
+          mm => {
+            val alias = mm.group(1).toUpperCase
+            aliasMap.get(alias) match {
+              case None => mm.matched
+              case Some(expr) =>
+                java.util.regex.Matcher.quoteReplacement(s"(SELECT $expr FROM $deltaRef)")
+            }
           }
-        })
+        )
     }
   }
 
@@ -592,7 +1154,7 @@ object SparkRefreshRewriter {
     * → Map("D_TOTAL" → "SUM(openivm_multiplicity * total)")
     */
   private def parseCteSelectAliases(cteBody: String): Map[String, String] = {
-    val upper = cteBody.toUpperCase.trim
+    val upper       = cteBody.toUpperCase.trim
     val selectStart = if (upper.startsWith("SELECT")) 6 else return Map.empty
 
     var depth   = 0
@@ -602,9 +1164,10 @@ object SparkRefreshRewriter {
       upper(i) match {
         case '(' => depth += 1; i += 1
         case ')' => depth -= 1; i += 1
-        case 'F' if depth == 0 && i + 4 <= upper.length &&
-            upper.substring(i, i + 4) == "FROM" &&
-            (i + 4 >= upper.length || upper(i + 4).isWhitespace) =>
+        case 'F'
+            if depth == 0 && i + 4 <= upper.length &&
+              upper.substring(i, i + 4) == "FROM" &&
+              (i + 4 >= upper.length || upper(i + 4).isWhitespace) =>
           fromIdx = i
         case _ => i += 1
       }
@@ -612,7 +1175,7 @@ object SparkRefreshRewriter {
 
     val selectList =
       if (fromIdx > 0) cteBody.substring(selectStart, fromIdx).trim
-      else             cteBody.substring(selectStart).trim
+      else cteBody.substring(selectStart).trim
 
     splitSelectList(selectList).flatMap { item =>
       val trimmed = item.trim
@@ -653,18 +1216,21 @@ object SparkRefreshRewriter {
     */
   private def deduplicateCteColumnAliases(sql: String): String = {
     val cteColListRe = ("""(\w+)\s*\(([^)]+)\)\s+AS\s+\(""").r
-    cteColListRe.replaceAllIn(sql, mm => {
-      val cteName = mm.group(1)
-      val rawCols = mm.group(2).split(",").map(_.trim)
-      val seen    = scala.collection.mutable.Map[String, Int]()
-      val newCols = rawCols.map { col =>
-        val count = seen.getOrElse(col, 0)
-        seen(col) = count + 1
-        if (count == 0) col else s"${col}_$count"
+    cteColListRe.replaceAllIn(
+      sql,
+      mm => {
+        val cteName = mm.group(1)
+        val rawCols = mm.group(2).split(",").map(_.trim)
+        val seen    = scala.collection.mutable.Map[String, Int]()
+        val newCols = rawCols.map { col =>
+          val count = seen.getOrElse(col, 0)
+          seen(col) = count + 1
+          if (count == 0) col else s"${col}_$count"
+        }
+        if (newCols sameElements rawCols) mm.matched
+        else java.util.regex.Matcher.quoteReplacement(s"$cteName (${newCols.mkString(", ")}) AS (")
       }
-      if (newCols sameElements rawCols) mm.matched
-      else java.util.regex.Matcher.quoteReplacement(s"$cteName (${newCols.mkString(", ")}) AS (")
-    })
+    )
   }
 
   /** Returns `true` if the compiled openivm SQL contains at least one

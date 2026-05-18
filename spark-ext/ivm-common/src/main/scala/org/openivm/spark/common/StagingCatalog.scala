@@ -31,7 +31,7 @@ final case class StagingDelta(
  * All operations target `<warehouse>/_ivm/_meta/staging`.
  * Callers MUST invoke [[ensureTables]] once before any other method.
  */
-object StagingCatalog {
+object StagingCatalog extends DeltaRetrySupport {
 
   private val MetaSubPath = "_ivm/_meta/staging"
 
@@ -91,7 +91,7 @@ object StagingCatalog {
    * Record a new DML delta.  Uses MERGE on (base_table, staging_path) so the call is
    * idempotent: re-recording the same path does not overwrite `consumed_by`.
    */
-  def record(spark: SparkSession, delta: StagingDelta): Unit = {
+  def record(spark: SparkSession, delta: StagingDelta): Unit = withDeltaRetry {
     val sourceDF = spark.createDataFrame(
       spark.sparkContext.parallelize(Seq(deltaToRow(delta)), 1),
       StagingSchema
@@ -128,7 +128,7 @@ object StagingCatalog {
    * Append `viewName` to `consumed_by` for each staging row identified by `paths`.
    * Uses `array_union` so repeated calls with the same viewName are idempotent.
    */
-  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
+  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = withDeltaRetry {
     if (paths.isEmpty) return
     val markerSchema = StructType(
       Array(
@@ -153,7 +153,7 @@ object StagingCatalog {
    *
    * @param viewsByTable maps each base_table name to the set of MV names that depend on it
    */
-  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
+  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = withDeltaRetry {
     if (viewsByTable.isEmpty) return
     val dt = DeltaTable.forPath(spark, tablePath(spark))
     viewsByTable.foreach { case (baseTable, mvs) =>

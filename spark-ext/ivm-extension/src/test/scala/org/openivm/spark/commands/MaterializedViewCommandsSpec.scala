@@ -97,10 +97,10 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       StagingCatalog.record(
         spark,
         StagingDelta(
-          baseTable  = baseTable,
-          opType     = "INSERT",
+          baseTable = baseTable,
+          opType = "INSERT",
           stagingPath = stagingPath,
-          txnTs      = new Timestamp(System.currentTimeMillis()),
+          txnTs = new Timestamp(System.currentTimeMillis()),
           consumedBy = Seq.empty
         )
       )
@@ -184,20 +184,20 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
       spark.table("mv_t4").count() shouldBe 2L
 
-      // Insert a new row into the base table
+      // Insert a new row into the base table — the DML interceptor records
+      // a staging Delta entry automatically.
       spark.sql("INSERT INTO sales_t4 VALUES ('north', 300)")
-
-      // Simulate what the DML interceptor would have recorded for this INSERT
-      simulateDmlStaging("default.sales_t4", "sales_t4/txn1", Seq("north" -> 300))
 
       // Refresh
       spark.sql("REFRESH MATERIALIZED VIEW mv_t4")
 
-      // The MV must now reflect all current data in sales_t4
+      // The MV must now reflect all current data in sales_t4.
+      // Project the user-visible columns (the openivm-emitted initial load
+      // includes a hidden openivm_count_star bookkeeping column).
       val expected = spark.sql(
         "SELECT region, SUM(amount) AS total FROM sales_t4 GROUP BY region"
       )
-      val mv = spark.table("mv_t4")
+      val mv = spark.table("mv_t4").select("region", "total")
 
       // Cross-check: EXCEPT ALL in both directions must be empty
       mv.exceptAll(expected).count() shouldBe 0L
@@ -308,29 +308,21 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
       spark.table("mv_t10").count() shouldBe 3L
 
-      // Conflicting DML: delete a row, add rows, update an existing key
+      // Conflicting DML — the DML interceptor records DELETE / INSERT /
+      // UPDATE_BEFORE+UPDATE_AFTER staging entries automatically.
       spark.sql("DELETE FROM sales_t10 WHERE region = 'north'")
       spark.sql("INSERT INTO sales_t10 VALUES ('east', 50), ('south', 300)")
       spark.sql("UPDATE sales_t10 SET amount = 250 WHERE region = 'west'")
 
-      // Build a staging Delta that contains ALL net-new/changed rows (post-DML snapshot of
-      // east and south additions — the exact net-delta for openivm's incremental merge):
-      // east: +50 new row; south: +300 new row; north: removed; west: was 200 now 250
-      // For a robust FULL-REFRESH-type test we record a staging entry with the combined
-      // current-state rows so the refresh triggers and then re-runs the view.
-      simulateDmlStaging(
-        "default.sales_t10",
-        "sales_t10/txn_stress",
-        Seq("east" -> 50, "south" -> 300)
-      )
-
-      // Refresh
+      // Single REFRESH replays all pending deltas.
       spark.sql("REFRESH MATERIALIZED VIEW mv_t10")
 
       val groundTruth = spark.sql(
         "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales_t10 GROUP BY region"
       )
-      val mv = spark.table("mv_t10")
+      // Project user-visible columns; the openivm-emitted initial load may
+      // add a hidden openivm_count_star bookkeeping column.
+      val mv = spark.table("mv_t10").select("region", "total", "cnt")
 
       // Cross-check with EXCEPT ALL in both directions
       mv.exceptAll(groundTruth).count() shouldBe 0L

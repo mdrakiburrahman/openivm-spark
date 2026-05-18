@@ -143,8 +143,10 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
 
     it("rewrites AVG-style pattern from openivm MERGE: COALESCE(v.sum + d.sum, v.sum, d.sum)::DOUBLE") {
-      val input    = "COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x)::DOUBLE"
-      val expected = "CAST(COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x) AS DOUBLE)"
+      val input =
+        "COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x)::DOUBLE"
+      val expected =
+        "CAST(COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x) AS DOUBLE)"
       LptsSparkDialect.rewriteParenthesisedCasts(input) shouldBe expected
     }
 
@@ -165,8 +167,8 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
 
     it("rewrites multiple func(...)::TYPE occurrences in one pass") {
-      val input    = "COALESCE(a, b)::DOUBLE / NULLIF(COALESCE(c, d), 0)::DOUBLE"
-      val result   = LptsSparkDialect.rewriteParenthesisedCasts(input)
+      val input  = "COALESCE(a, b)::DOUBLE / NULLIF(COALESCE(c, d), 0)::DOUBLE"
+      val result = LptsSparkDialect.rewriteParenthesisedCasts(input)
       result should include("CAST(COALESCE(a, b) AS DOUBLE)")
       result should include("CAST(NULLIF(COALESCE(c, d), 0) AS DOUBLE)")
     }
@@ -192,7 +194,8 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
 
     it("rewrites a realistic AVG MERGE SET clause from openivm") {
-      val input = "avg_x = COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x)::DOUBLE / NULLIF(COALESCE(v.openivm_count_avg_x + d.openivm_count_avg_x, v.openivm_count_avg_x, d.openivm_count_avg_x), 0)"
+      val input =
+        "avg_x = COALESCE(v.openivm_sum_avg_x + d.openivm_sum_avg_x, v.openivm_sum_avg_x, d.openivm_sum_avg_x)::DOUBLE / NULLIF(COALESCE(v.openivm_count_avg_x + d.openivm_count_avg_x, v.openivm_count_avg_x, d.openivm_count_avg_x), 0)"
       val result = LptsSparkDialect.rewritePostfixCasts(input)
       result should include("CAST(COALESCE(")
       result should not include "::DOUBLE"

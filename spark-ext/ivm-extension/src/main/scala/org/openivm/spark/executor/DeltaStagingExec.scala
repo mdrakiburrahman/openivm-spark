@@ -42,8 +42,7 @@ case class DeltaStagingExec(
   override def output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute] = child.output
 
   override protected def doExecute(): RDD[org.apache.spark.sql.catalyst.InternalRow] = {
-    val spark = SparkSession
-      .getActiveSession
+    val spark = SparkSession.getActiveSession
       .getOrElse(throw new IllegalStateException("No active SparkSession for DeltaStagingExec"))
     val schema = StructType(child.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
 
@@ -66,10 +65,10 @@ case class DeltaStagingExec(
     StagingCatalog.record(
       spark,
       StagingDelta(
-        baseTable  = baseTable,
-        opType     = opType,
+        baseTable = baseTable,
+        opType = opType,
         stagingPath = stagingPath,
-        txnTs      = new Timestamp(System.currentTimeMillis()),
+        txnTs = new Timestamp(System.currentTimeMillis()),
         consumedBy = Seq.empty
       )
     )

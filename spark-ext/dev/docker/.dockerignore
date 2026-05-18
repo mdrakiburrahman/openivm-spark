@@ -1,0 +1,15 @@
+## Anything below this point ships into the container image. Keep it lean.
+
+.git
+.gitignore
+.idea
+.vscode
+**/target
+**/project/target
+**/project/project
+**/build
+**/.bsp
+**/.metals
+*.log
+**/node_modules
+**/__pycache__

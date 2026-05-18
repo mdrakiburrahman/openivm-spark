@@ -22,7 +22,7 @@ case class WithDeltaStaging(
     opType: String,
     baseTable: String
 ) extends UnaryNode {
-  override def output: Seq[Attribute]                                               = child.output
+  override def output: Seq[Attribute] = child.output
   override protected def withNewChildInternal(newChild: LogicalPlan): WithDeltaStaging =
     copy(child = newChild)
 }

@@ -81,15 +81,17 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
     import org.apache.spark.sql.execution.datasources.LogicalRelation
     try {
       val analyzed = spark.sql(s"SELECT * FROM $tableName").queryExecution.analyzed
-      analyzed.collectFirst {
-        case r: LogicalRelation if r.catalogTable.isDefined =>
-          val id = r.catalogTable.get.identifier
-          id.database.fold(id.table)(db => s"$db.${id.table}")
-        case r: DataSourceV2Relation if r.identifier.isDefined =>
-          val id = r.identifier.get
-          val ns = id.namespace()
-          if (ns.nonEmpty) (ns :+ id.name()).mkString(".") else id.name()
-      }.getOrElse(tableName)
+      analyzed
+        .collectFirst {
+          case r: LogicalRelation if r.catalogTable.isDefined =>
+            val id = r.catalogTable.get.identifier
+            id.database.fold(id.table)(db => s"$db.${id.table}")
+          case r: DataSourceV2Relation if r.identifier.isDefined =>
+            val id = r.identifier.get
+            val ns = id.namespace()
+            if (ns.nonEmpty) (ns :+ id.name()).mkString(".") else id.name()
+        }
+        .getOrElse(tableName)
     } catch { case _: Exception => tableName }
   }
 
@@ -103,16 +105,16 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
     spark.sql(s"CREATE TABLE $tableName $ddlSchema USING DELTA")
     val qn = qualifiedName(tableName)
     val meta = MvMetadata(
-      name                    = CatalystSqlParser.parseTableIdentifier(s"mv_$tableName"),
-      querySql                = s"SELECT * FROM $tableName",
-      refreshType             = 0,
-      refreshTypeName         = "SIMPLE_PROJECTION",
-      lastVersion             = 0L,
-      sourceTables            = Seq(qn),
+      name = CatalystSqlParser.parseTableIdentifier(s"mv_$tableName"),
+      querySql = s"SELECT * FROM $tableName",
+      refreshType = 0,
+      refreshTypeName = "SIMPLE_PROJECTION",
+      lastVersion = 0L,
+      sourceTables = Seq(qn),
       sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
         Map(qn -> spark.table(tableName).schema)
       ),
-      location  = s"$warehouseDir/mv_$tableName",
+      location = s"$warehouseDir/mv_$tableName",
       createdAt = new Timestamp(System.currentTimeMillis()),
       properties = Map.empty
     )
@@ -145,7 +147,9 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
 
       val qn   = qualifiedName(tbl)
       val rows = stagingRows(qn)
-      info(s"Staging entries after DELETE + UPDATE + INSERT: ${rows.map(r => r.opType -> r.stagingPath).mkString(", ")}")
+      info(
+        s"Staging entries after DELETE + UPDATE + INSERT: ${rows.map(r => r.opType -> r.stagingPath).mkString(", ")}"
+      )
       rows.size should be >= 3
     }
   }
@@ -205,7 +209,7 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       remaining should not contain 100
       remaining should contain(200)
 
-      val staged = stagingRows(qn)
+      val staged        = stagingRows(qn)
       val deleteEntries = staged.filter(_.opType == "DELETE")
       deleteEntries should not be empty
       // Verify staging Delta table contains the deleted row
@@ -235,12 +239,14 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       staged.filter(_.opType == "UPDATE_BEFORE") should not be empty
       staged.filter(_.opType == "UPDATE_AFTER") should not be empty
 
-      val beforeData = spark.read.format("delta")
+      val beforeData = spark.read
+        .format("delta")
         .load(staged.filter(_.opType == "UPDATE_BEFORE").head.stagingPath)
         .collect()
       beforeData.map(_.getAs[String]("name")) should contain("old-name")
 
-      val afterData = spark.read.format("delta")
+      val afterData = spark.read
+        .format("delta")
         .load(staged.filter(_.opType == "UPDATE_AFTER").head.stagingPath)
         .collect()
       afterData.map(_.getAs[String]("name")) should contain("new-name")
@@ -337,7 +343,8 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       spark.sql(s"INSERT INTO $tbl VALUES (1, 'a')")
 
       // Confirm exactly one INSERT staging entry was written
-      val staged = StagingCatalog.collectFor(spark, "__idem_probe__", Seq(qn))
+      val staged = StagingCatalog
+        .collectFor(spark, "__idem_probe__", Seq(qn))
         .filter(_.opType == "INSERT")
       staged should have size 1
     }

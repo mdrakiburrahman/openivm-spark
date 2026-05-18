@@ -11,16 +11,25 @@ import org.apache.spark.sql.types._
 final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
-    sql: String              // full refresh SQL program in the target dialect
+    sql: String,             // full refresh SQL program in the target dialect
+    initialLoadSql: String   // SELECT query for initial MV load including hidden columns; empty if unavailable
 )
 
 /** Sources: Spark table name → resolved StructType.  Used by the bridge to
   * register matching empty DuckDB tables so OpenIVM can plan/classify.
+  *
+  * @param sourceQualifiedNames Optional map from short table name (matching
+  *   keys of [[sources]]) to the fully-qualified Spark table name as it should
+  *   appear in the rewritten initial-load SQL. Used to translate
+  *   `memory.main.<short>` references emitted by openivm into the correct
+  *   Spark identifier. Empty by default — callers that don't need rewriting
+  *   can leave it unset.
   */
 final case class CompileRequest(
     viewName: String,
     viewSql: String,
-    sources: Map[String, StructType]
+    sources: Map[String, StructType],
+    sourceQualifiedNames: Map[String, String] = Map.empty
 )
 
 /** Wraps DuckDB CLI errors surfaced by the OpenIVM compiler bridge.
@@ -72,7 +81,9 @@ class OpenIvmCompiler private (
     try {
       val script           = buildScript(req, tableDdls, tmpDir)
       val (stdout, stderr) = runCli(script)
-      parseCompileResult(stdout, req.viewName, stderr)
+      val partial          = parseCompileResult(stdout, req.viewName, stderr)
+      val initLoad         = parseInitialLoadSql(tmpDir, req)
+      partial.copy(initialLoadSql = initLoad)
     } catch {
       case e: OpenIvmCompileException => throw e
       case e: IllegalStateException   => throw e
@@ -140,13 +151,44 @@ class OpenIvmCompiler private (
     sb ++= "SET openivm_target_dialect='spark';\n"
     sb ++= "SET openivm_compile_only=true;\n"
     sb ++= "SET openivm_enable_view_matching=false;\n"
+    // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
+    // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
+    // compile-time delta tables and picks the insert-only MERGE fast path
+    // (refresh_delta_fast_paths.cpp:80-126), which silently produces wrong
+    // values once a delete or update of the current min/max arrives at refresh
+    // time. The fast path can be re-enabled later by analysing the staged delta
+    // contents before invoking the compiler.
+    sb ++= "SET openivm_minmax_incremental=false;\n"
     sb ++= s"SET openivm_files_path='${escapeSql(tmpDir.toAbsolutePath.toString)}';\n"
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
     for ((_, ddl)       <- tableDdls) sb ++= s"$ddl;\n"
-    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${req.viewSql};\n"
+    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(req.viewSql)};\n"
     sb ++= s"PRAGMA compile_refresh('${escapeSql(req.viewName)}');\n"
     sb.toString
+  }
+
+  /** Spark-specific join syntaxes that DuckDB does not parse.  Translates them
+    * to the equivalent DuckDB form before the view definition is sent to
+    * `CREATE MATERIALIZED VIEW`.
+    *
+    * Currently translated:
+    *   - `LEFT SEMI JOIN` → `SEMI JOIN` (DuckDB does not accept the LEFT prefix)
+    *   - `LEFT ANTI JOIN` → `ANTI JOIN`
+    *
+    * Both forms have identical semantics on the Spark side (`LEFT SEMI`/`LEFT
+    * ANTI` are the documented Spark spellings; bare `SEMI`/`ANTI` is also
+    * accepted by Spark) so the translation is round-trip safe — the original
+    * Spark SQL is still stored in `MvMetadata.querySql` and used for
+    * FULL_REFRESH `INSERT OVERWRITE`.
+    */
+  private[compiler] def normalizeSparkSqlForDuckdb(sql: String): String = {
+    val leftSemi = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
+    val leftAnti = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
+    leftAnti.replaceAllIn(
+      leftSemi.replaceAllIn(sql, "SEMI JOIN"),
+      "ANTI JOIN"
+    )
   }
 
   /** Escapes single-quote characters for embedding a value inside SQL single quotes. */
@@ -198,6 +240,44 @@ class OpenIvmCompiler private (
     }
   }
 
+  /** Reads `<tmpDir>/openivm_compiled_queries_<viewName>.sql` and extracts the
+    * `create table openivm_data_<viewName> as <query>;` body, which represents
+    * the initial-load query (including any hidden `openivm_count_star` column).
+    *
+    * Returns the empty string if the file is missing or no matching CTAS is
+    * found.  The extracted SQL has `memory.main.<short>` references rewritten
+    * to the qualified Spark table name supplied via `req.sourceQualifiedNames`,
+    * any leftover `memory.main.` prefix stripped, and is run through
+    * [[LptsSparkDialect.translate]] to handle DuckDB-isms (e.g. `count_star()`,
+    * `::TIMESTAMP` casts).
+    */
+  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest): String = {
+    import java.util.regex.Pattern
+    val file = tmpDir.resolve(s"openivm_compiled_queries_${req.viewName}.sql")
+    if (!Files.exists(file)) return ""
+    val content = new String(Files.readAllBytes(file), "UTF-8")
+
+    val pat = Pattern.compile(
+      s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
+      Pattern.DOTALL
+    )
+    val m = pat.matcher(content)
+    if (!m.find()) return ""
+
+    var sql = m.group(1).trim
+
+    // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
+    // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
+    // tables, so fall back to the original user-supplied view body instead.
+    if ("""(?i)\browid\b""".r.findFirstIn(sql).isDefined) return ""
+
+    for ((short, qual) <- req.sourceQualifiedNames) {
+      sql = sql.replace(s"memory.main.$short", qual)
+    }
+    sql = sql.replaceAll("memory\\.main\\.", "")
+    LptsSparkDialect.translate(sql)
+  }
+
   /** Parses a single `-jsonlines` row of the form
     * `{"refresh_type":N,"refresh_type_name":"...","sql":"..."}`.
     */
@@ -217,7 +297,7 @@ class OpenIvmCompiler private (
     val sqlValIdx = nextStringStart(line, sqlKeyIdx + "\"sql\"".length)
     val (sql, _)  = decodeJsonString(line, sqlValIdx)
 
-    CompiledRefresh(refreshType, refreshTypeName, sql)
+    CompiledRefresh(refreshType, refreshTypeName, sql, initialLoadSql = "")
   }
 
   /** Returns the index of the `"` that starts a JSON string value at or after `from`. */

@@ -1,7 +1,7 @@
 package org.openivm.spark.analyzer
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.analysis.NamedRelation
@@ -73,9 +73,9 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val tableName = extractTableName(d.child)
         if (tableName.isEmpty || !hasDependentMvs(tableName)) d
         else {
-          val cond = d.condition.getOrElse(Literal(true))
+          val cond                     = d.condition.getOrElse(Literal(true))
           val deletedPlan: LogicalPlan = Filter(cond, d.child)
-          val ops = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
+          val ops                      = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
           StagedDmlNode(d, ops, tableName)
         }
 
@@ -86,14 +86,46 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val tableName = extractTableName(u.child)
         if (tableName.isEmpty || !hasDependentMvs(tableName)) u
         else {
-          // condition: Option[Expression]
-          val beforePlan: LogicalPlan =
+          // Both staging plans must be executed BEFORE the DML so that the
+          // WHERE condition still matches the original rows.
+          //
+          // beforePlan: rows matching the condition (the "old" values to retract).
+          // afterPlan:  the same rows projected through the SET assignments (new
+          //             values to add).
+          //
+          // DeltaUpdateTable.updateColumns/updateExpressions carry only the SET
+          // columns (one entry per assignment clause), NOT one entry per table
+          // column.  We therefore build an assignment map keyed by column name and
+          // project ALL columns: SET columns get their new expression, unchanged
+          // columns keep their original AttributeReference.  This mirrors the
+          // UpdateTable fallback case below and ensures the staging AFTER file
+          // contains every source column so that the StagingDeltaView SELECT can
+          // reference any of them (e.g. `SELECT region, amount FROM delta.AFTER`).
+          val filteredPlan: LogicalPlan =
             u.condition.map(c => Filter(c, u.child)).getOrElse(u.child)
-          val afterPlan: LogicalPlan =
-            u.condition.map(c => Filter(c, u.child)).getOrElse(u.child)
-          val preOps  = Seq((beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"))
-          val postOps = Seq((afterPlan,  stagingPath(tableName, "UPDATE_AFTER"),  "UPDATE_AFTER"))
-          StagedDmlNode(u, preOps, tableName, postOps)
+          val beforePlan: LogicalPlan = filteredPlan
+          val assignMap: Map[String, Expression] =
+            u.updateColumns
+              .zip(u.updateExpressions)
+              .flatMap { case (colExpr, valueExpr) =>
+                DeltaUpdateTable
+                  .getTargetColNameParts(colExpr)
+                  .headOption
+                  .map(_.toLowerCase -> valueExpr)
+              }
+              .toMap
+          val afterProjections = filteredPlan.output.map { attr =>
+            assignMap.get(attr.name.toLowerCase) match {
+              case Some(newValue) => Alias(newValue, attr.name)()
+              case None           => attr
+            }
+          }
+          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val preOps = Seq(
+            (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
+            (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
+          )
+          StagedDmlNode(u, preOps, tableName)
         }
 
       // -----------------------------------------------------------------------
@@ -120,7 +152,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
             val afterPlan: LogicalPlan  = r.query
             Seq(
               (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
-              (afterPlan,  stagingPath(tableName, "UPDATE_AFTER"),  "UPDATE_AFTER")
+              (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
             )
           } else {
             val deletedPlan: LogicalPlan = Filter(r.condition, r.originalTable)
@@ -145,7 +177,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         if (tableName.isEmpty || !hasDependentMvs(tableName)) d
         else {
           val deletedPlan: LogicalPlan = Filter(d.condition, d.table)
-          val ops = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
+          val ops                      = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
           StagedDmlNode(d, ops, tableName)
         }
 
@@ -153,13 +185,31 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val tableName = extractTableName(u.table)
         if (tableName.isEmpty || !hasDependentMvs(tableName)) u
         else {
-          val beforePlan: LogicalPlan =
+          // Both staging plans must be executed BEFORE the DML (same reason as
+          // DeltaUpdateTable above).
+          //
+          // beforePlan: rows matching the condition (old values to retract).
+          // afterPlan:  the same rows projected through the SET assignments (new
+          //             values to add).  For columns not mentioned in assignments
+          //             the original AttributeReference is kept unchanged.
+          val filteredPlan: LogicalPlan =
             u.condition.map(c => Filter(c, u.table)).getOrElse(u.table)
-          val afterPlan: LogicalPlan =
-            u.condition.map(c => Filter(c, u.table)).getOrElse(u.table)
-          val preOps  = Seq((beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"))
-          val postOps = Seq((afterPlan,  stagingPath(tableName, "UPDATE_AFTER"),  "UPDATE_AFTER"))
-          StagedDmlNode(u, preOps, tableName, postOps)
+          val beforePlan: LogicalPlan = filteredPlan
+          val assignMap: Map[String, Expression] = u.assignments.collect { case Assignment(attr: Attribute, value) =>
+            attr.name.toLowerCase -> value
+          }.toMap
+          val afterProjections = filteredPlan.output.map { attr =>
+            assignMap.get(attr.name.toLowerCase) match {
+              case Some(newValue) => Alias(newValue, attr.name)()
+              case None           => attr
+            }
+          }
+          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val preOps = Seq(
+            (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
+            (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
+          )
+          StagedDmlNode(u, preOps, tableName)
         }
 
       case m: MergeIntoTable =>
@@ -184,12 +234,10 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
    * filter-to-keep scan produced by DELETE.
    */
   private def isUpdateReplaceData(r: ReplaceData): Boolean =
-    r.query
-      .find {
-        case Project(list, _) => list.exists(_.isInstanceOf[Alias])
-        case _                => false
-      }
-      .isDefined
+    r.query.find {
+      case Project(list, _) => list.exists(_.isInstanceOf[Alias])
+      case _                => false
+    }.isDefined
 
   private def alreadyWrapped(p: LogicalPlan): Boolean =
     p.find(_.isInstanceOf[StagedDmlNode]).isDefined
@@ -217,15 +265,15 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
     case r: LogicalRelation if r.catalogTable.isDefined =>
       val id = r.catalogTable.get.identifier
       id.database.fold(id.table)(db => s"$db.${id.table}")
-    case n: NamedRelation => n.name
+    case n: NamedRelation        => n.name
     case SubqueryAlias(_, child) => extractTableName(child)
-    case _                => ""
+    case _                       => ""
   }
 
   private def stagingPath(tableName: String, opType: String): String = {
-    val warehouse  = session.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val safeTable  = tableName.replace(".", "_").replace(" ", "_")
-    val txnTs      = DateTimeFormatter
+    val warehouse = session.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val safeTable = tableName.replace(".", "_").replace(" ", "_")
+    val txnTs = DateTimeFormatter
       .ofPattern("yyyy-MM-dd'T'HH-mm-ss.SSS'Z'")
       .withZone(ZoneOffset.UTC)
       .format(Instant.now())

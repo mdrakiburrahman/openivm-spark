@@ -110,6 +110,54 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  // ── Test 4b: empty-placeholder delta detection for multi-source JOIN ──────
+  //
+  // For a two-source CTE JOIN, openivm emits `NULL WHERE false` as the delta
+  // INSERT (it cannot compute incremental deltas for multi-table JOINs).
+  // hasRealDelta should return false for this case, which triggers FullRefresh
+  // reclassification at CREATE MATERIALIZED VIEW time.
+  it should "emit an empty-placeholder delta for a two-source CTE JOIN" in {
+    val usersSchema    = StructType.fromDDL("id INT, name STRING, age INT")
+    val activitySchema = StructType.fromDDL("id INT, last_seen_days_ago INT")
+    val req = CompileRequest(
+      viewName = "mv_c3_probe",
+      viewSql = """WITH adults AS (SELECT id, name FROM users_c3 WHERE age >= 18),
+          |     active  AS (SELECT id FROM activity_c3 WHERE last_seen_days_ago <= 7)
+          |SELECT u.id, u.name FROM adults u JOIN active a ON u.id = a.id""".stripMargin,
+      sources = Map("users_c3" -> usersSchema, "activity_c3" -> activitySchema)
+    )
+    val result = sharedCompiler.compile(req)
+    import org.openivm.spark.common.SparkRefreshRewriter
+    SparkRefreshRewriter.hasRealDelta(result.sql, "mv_c3_probe") shouldBe false
+  }
+
+  // ── Test 4c: CTE-fed DISTINCT compiled SQL inspection ────────────────────
+  it should "compile a CTE-fed DISTINCT view and produce expected SQL structure" in {
+    val salesSchema2 = StructType.fromDDL("region STRING, amount INT")
+    val req = CompileRequest(
+      viewName = "mv_c6_probe",
+      viewSql = """WITH t AS (SELECT region FROM sales_c6)
+          |SELECT DISTINCT region FROM t""".stripMargin,
+      sources = Map("sales_c6" -> salesSchema2)
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
+  // ── Test 4d: plain COUNT(*) GROUP BY compiled SQL (ag_cnt_2c comparison) ─────
+  it should "compile a plain COUNT GROUP BY and show its SQL structure" in {
+    val tSchema = StructType.fromDDL("k STRING, x INT")
+    val req = CompileRequest(
+      viewName = "mv_cnt_probe",
+      viewSql = "SELECT k, COUNT(*) AS cnt FROM ag_cnt_probe GROUP BY k",
+      sources = Map("ag_cnt_probe" -> tSchema)
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
   // ── Test 5: SPARK dialect identifier quoting ──────────────────────────────
   //
   // With openivm_target_dialect='spark' set by the CLI script, OpenIVM
@@ -231,5 +279,31 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       sources = Map("sales" -> salesSchema)
     )
     a[IllegalStateException] should be thrownBy disposableCompiler.compile(req)
+  }
+
+  // ── Test 10: Spark→DuckDB syntax normalization ────────────────────────────
+
+  "normalizeSparkSqlForDuckdb" should "translate LEFT SEMI/ANTI JOIN to bare SEMI/ANTI JOIN" in {
+    val in = "SELECT g.* FROM gods g LEFT SEMI JOIN payments p ON g.uid = p.from_uid"
+    sharedCompiler.normalizeSparkSqlForDuckdb(in) shouldBe
+      "SELECT g.* FROM gods g SEMI JOIN payments p ON g.uid = p.from_uid"
+
+    val in2 = "SELECT g.* FROM gods g LEFT ANTI JOIN payments p ON g.uid = p.from_uid"
+    sharedCompiler.normalizeSparkSqlForDuckdb(in2) shouldBe
+      "SELECT g.* FROM gods g ANTI JOIN payments p ON g.uid = p.from_uid"
+  }
+
+  it should "be case-insensitive and whitespace-tolerant" in {
+    val in  = "SELECT * FROM a   left   semi   join b ON a.k = b.k"
+    val out = sharedCompiler.normalizeSparkSqlForDuckdb(in)
+    out should not include "left"
+    out.toLowerCase should include("semi join")
+    // Round-trip safe: applying the normalizer again is a no-op.
+    sharedCompiler.normalizeSparkSqlForDuckdb(out) shouldBe out
+  }
+
+  it should "be a no-op for SQL without LEFT SEMI/ANTI JOIN clauses" in {
+    val in = "SELECT region, SUM(amount) FROM sales GROUP BY region"
+    sharedCompiler.normalizeSparkSqlForDuckdb(in) shouldBe in
   }
 }

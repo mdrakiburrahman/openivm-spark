@@ -43,7 +43,7 @@ final case class MvMetadata(
  * All operations target `<warehouse>/_ivm/_meta/mv_metadata`.
  * Callers MUST invoke [[ensureTables]] once before any other method.
  */
-object MvCatalog {
+object MvCatalog extends DeltaRetrySupport {
 
   private val MetaSubPath = "_ivm/_meta/mv_metadata"
 
@@ -133,25 +133,11 @@ object MvCatalog {
 
   /** MERGE-based upsert keyed on `name`. Inserts new rows; updates all mutable fields.
    *
-   *  Retries up to [[UpsertMaxRetries]] times on [[io.delta.exceptions.DeltaConcurrentModificationException]]
-   *  so that concurrent upserts of distinct MVs all succeed via Delta's OCC.
+   *  Retries on every concurrent-modification flavour Delta can throw (METADATA_CHANGED,
+   *  PROTOCOL_CHANGED, CONCURRENT_APPEND/DELETE/TRANSACTION) via [[DeltaRetrySupport.withDeltaRetry]],
+   *  which uses [[RetryPolicy.DeltaConflicts]] with up to 5 attempts and linear backoff.
    */
-  def upsert(spark: SparkSession, meta: MvMetadata): Unit = {
-    val MaxRetries = 5
-    var attempt    = 0
-    while (true) {
-      try {
-        upsertOnce(spark, meta)
-        return
-      } catch {
-        case _: io.delta.exceptions.DeltaConcurrentModificationException if attempt < MaxRetries =>
-          attempt += 1
-          Thread.sleep(math.min(100L * attempt, 1000L))
-      }
-    }
-  }
-
-  private def upsertOnce(spark: SparkSession, meta: MvMetadata): Unit = {
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit = withDeltaRetry {
     val sourceDF = spark.createDataFrame(
       spark.sparkContext.parallelize(Seq(metaToRow(meta)), 1),
       MvSchema
@@ -201,22 +187,24 @@ object MvCatalog {
       .toSeq
 
   /** Advance `last_version` after a successful refresh. No-op if the MV is not tracked. */
-  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = withDeltaRetry {
     DeltaTable
       .forPath(spark, tablePath(spark))
       .updateExpr(
         s"name = ${sqlLit(serializeName(name))}",
         Map("last_version" -> newVersion.toString)
       )
+  }
 
   /**
    * Delete the tracking row.
    * Idempotent: no error if the MV is already gone (safe for DROP MV IF EXISTS).
    */
-  def remove(spark: SparkSession, name: TableIdentifier): Unit =
+  def remove(spark: SparkSession, name: TableIdentifier): Unit = withDeltaRetry {
     DeltaTable
       .forPath(spark, tablePath(spark))
       .delete(s"name = ${sqlLit(serializeName(name))}")
+  }
 
   /**
    * SHA-256 hex fingerprint of the source-table schemas.

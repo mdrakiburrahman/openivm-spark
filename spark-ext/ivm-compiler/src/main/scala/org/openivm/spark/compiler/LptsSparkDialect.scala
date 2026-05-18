@@ -60,6 +60,15 @@ object LptsSparkDialect {
     */
   private val CountStarRe = """(?i)\bcount_star\s*\(\s*\)""".r
 
+  /** `error(<args>)` — DuckDB function used by lpts when emitting assertion-style
+    * checks (e.g. divide-by-zero guards in scalar-subquery rewrites).  Spark has
+    * no `error` builtin; the equivalent is `raise_error(<args>)`.
+    *
+    * We anchor on a word-boundary + opening-paren so partial matches
+    * (e.g. `division_error(`) are not rewritten.
+    */
+  private val ErrorFnRe = """(?i)\berror\s*\(""".r
+
   // ── Public API ───────────────────────────────────────────────────────────────
 
   /** Run all post-processing passes in order.
@@ -74,11 +83,15 @@ object LptsSparkDialect {
     */
   def translate(sql: String): String =
     rewriteDoubleQuotedIdentifiers(
-      rewriteCountStar(
-        rewriteIntervalLiterals(
-          rewriteGenerateSeries(
-            rewritePostfixCasts(
-              rewriteNowTimestamp(sql)
+      rewriteErrorFn(
+        rewriteCountStar(
+          rewriteIntervalLiterals(
+            rewriteGenerateSeries(
+              rewriteBareVarcharCast(
+                rewritePostfixCasts(
+                  rewriteNowTimestamp(sql)
+                )
+              )
             )
           )
         )
@@ -238,6 +251,62 @@ object LptsSparkDialect {
   private[compiler] def rewriteCountStar(sql: String): String =
     CountStarRe.replaceAllIn(sql, "COUNT(*)")
 
+  /** Rewrites bare `error(...)` to Spark's `raise_error(...)`.
+    *
+    * Skipped inside SQL string literals so that a user-supplied `'error('` in a
+    * text column is preserved verbatim. The transform uses the same
+    * placeholder-based literal-protection scheme as [[rewritePostfixCasts]].
+    */
+  private[compiler] def rewriteErrorFn(sql: String): String = {
+    val literals = scala.collection.mutable.ArrayBuffer[String]()
+    val withPlaceholders: String = {
+      val sb = new StringBuilder
+      var i  = 0
+      while (i < sql.length) {
+        if (sql(i) == '\'') {
+          val start = i
+          i += 1
+          var closed = false
+          while (i < sql.length && !closed) {
+            if (sql(i) == '\'') {
+              i += 1
+              if (i >= sql.length || sql(i) != '\'') closed = true else i += 1
+            } else i += 1
+          }
+          val literal = sql.substring(start, i)
+          val idx     = literals.size
+          literals += literal
+          sb.append(s"__STRLIT_${idx}__")
+        } else {
+          sb.append(sql(i))
+          i += 1
+        }
+      }
+      sb.toString
+    }
+    val rewritten = ErrorFnRe.replaceAllIn(withPlaceholders, "raise_error(")
+    val restoreRe = """__STRLIT_(\d+)__""".r
+    restoreRe.replaceAllIn(rewritten, m => java.util.regex.Matcher.quoteReplacement(literals(m.group(1).toInt)))
+  }
+
+  /** Rewrites bare `CAST(<expr> AS VARCHAR)` (no length) to `CAST(<expr> AS STRING)`.
+    *
+    * DuckDB and openivm/lpts emit `VARCHAR` without a length in some contexts
+    * (e.g. `COALESCE(col, CAST('<orphan>' AS VARCHAR))` for FULL OUTER JOIN's
+    * NULL-placeholder values).  Spark 3.5 requires every `VARCHAR` to carry an
+    * explicit length parameter — `VARCHAR` alone raises `DATATYPE_MISSING_SIZE`.
+    * Spark's `STRING` type is the closest semantic match (variable-length text
+    * with no encoding limit), so we map bare `VARCHAR` / `CHAR` / `TEXT` to it.
+    *
+    * Preserves `CAST(x AS VARCHAR(n))` and `CAST(x AS CHAR(n))` (which Spark
+    * supports) by matching only when the type identifier is NOT followed by an
+    * open-paren length spec.
+    */
+  private[compiler] def rewriteBareVarcharCast(sql: String): String = {
+    val re = """(?i)\bAS\s+(VARCHAR|CHAR|TEXT)\b(?!\s*\()""".r
+    re.replaceAllIn(sql, _ => "AS STRING")
+  }
+
   /** Rewrites DuckDB double-quoted identifiers (e.g. `"name"`) to Spark
     * backtick-quoted identifiers (e.g. `` `name` ``).  Only matches tokens
     * that contain valid SQL identifier characters; skips occurrences that
@@ -248,10 +317,10 @@ object LptsSparkDialect {
     */
   private[compiler] def rewriteDoubleQuotedIdentifiers(sql: String): String = {
     // Step 1: replace single-quoted string literals with numbered placeholders
-    val literals                        = scala.collection.mutable.ArrayBuffer[String]()
+    val literals = scala.collection.mutable.ArrayBuffer[String]()
     val withPlaceholders: String = {
-      val sb    = new StringBuilder
-      var i     = 0
+      val sb = new StringBuilder
+      var i  = 0
       while (i < sql.length) {
         if (sql(i) == '\'') {
           val start = i

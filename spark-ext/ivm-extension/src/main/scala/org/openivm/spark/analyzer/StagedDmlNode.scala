@@ -82,10 +82,10 @@ case class StagedDmlNode(
     StagingCatalog.record(
       spark,
       StagingDelta(
-        baseTable  = baseTable,
-        opType     = opTyp,
+        baseTable = baseTable,
+        opType = opTyp,
         stagingPath = stagPath,
-        txnTs      = new Timestamp(System.currentTimeMillis()),
+        txnTs = new Timestamp(System.currentTimeMillis()),
         consumedBy = Seq.empty
       )
     )

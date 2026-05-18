@@ -1,0 +1,87 @@
+# docker-compose.yml for the openivm-spark dev loop.
+#
+#   build       → sbt compile + sbt assembly (spark-ext stage)
+#   test        → sbt test (spark-ext stage, all suites)
+#   it          → sbt ivm-it/test (integration suites only)
+#   shell       → interactive bash inside spark-ext stage
+#   fmt         → sbt scalafmtAll
+#   openivm-test→ runs `make test` inside the openivm-tester stage; verifies the
+#                 upstream OpenIVM sqllogictest suite (including our patches)
+#
+# Tweak SHAs / versions via dev/pins.env. The build args are read from there.
+
+x-spark-ext: &spark-ext
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    target: spark-ext
+    args:
+      OPENIVM_REPO: ${OPENIVM_REPO}
+      OPENIVM_BRANCH: ${OPENIVM_BRANCH}
+      OPENIVM_COMMIT: ${OPENIVM_COMMIT}
+      LPTS_REPO: ${LPTS_REPO}
+      LPTS_BRANCH: ${LPTS_BRANCH}
+      LPTS_COMMIT: ${LPTS_COMMIT}
+      JDK_VERSION: ${JDK_VERSION}
+      SBT_VERSION: ${SBT_VERSION}
+      SCALA_VERSION: ${SCALA_VERSION}
+      DUCKDB_JDBC_VERSION: ${DUCKDB_JDBC_VERSION}
+      UBUNTU_MIRROR: ${UBUNTU_MIRROR}
+  image: openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}
+  volumes:
+    - ..:/work/spark-ext-dev:ro
+    - ../..:/work/spark-ext:rw
+    - sbt-cache:/root/.sbt
+    - ivy-cache:/root/.ivy2
+    - coursier-cache:/root/.cache/coursier
+  working_dir: /work/spark-ext
+  environment:
+    SBT_OPTS: "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
+
+services:
+  build:
+    <<: *spark-ext
+    command: ["sbt", "compile"]
+
+  assembly:
+    <<: *spark-ext
+    command: ["sbt", "ivmExtension/assembly"]
+
+  test:
+    <<: *spark-ext
+    command: ["sbt", "test"]
+
+  it:
+    <<: *spark-ext
+    command: ["sbt", "ivmIt/test"]
+
+  shell:
+    <<: *spark-ext
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+  fmt:
+    <<: *spark-ext
+    command: ["sbt", "scalafmtAll", "scalafmtSbt"]
+
+  openivm-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: openivm-tester
+      args:
+        OPENIVM_REPO: ${OPENIVM_REPO}
+        OPENIVM_BRANCH: ${OPENIVM_BRANCH}
+        OPENIVM_COMMIT: ${OPENIVM_COMMIT}
+        LPTS_REPO: ${LPTS_REPO}
+        LPTS_BRANCH: ${LPTS_BRANCH}
+        LPTS_COMMIT: ${LPTS_COMMIT}
+        UBUNTU_MIRROR: ${UBUNTU_MIRROR}
+    image: openivm-spark/openivm-tester:${OPENIVM_COMMIT}-${LPTS_COMMIT}
+    command: ["make", "test"]
+
+volumes:
+  sbt-cache:
+  ivy-cache:
+  coursier-cache:
