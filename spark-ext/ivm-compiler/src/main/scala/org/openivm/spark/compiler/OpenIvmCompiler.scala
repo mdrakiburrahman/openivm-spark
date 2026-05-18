@@ -163,9 +163,46 @@ class OpenIvmCompiler private (
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
     for ((_, ddl)       <- tableDdls) sb ++= s"$ddl;\n"
-    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(req.viewSql)};\n"
+    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
     sb ++= s"PRAGMA compile_refresh('${escapeSql(req.viewName)}');\n"
     sb.toString
+  }
+
+  /** Rewrites occurrences of a tracked qualified source name (`<db>.<table>`)
+    * to its short form (`<table>`) in the supplied SQL.
+    *
+    * Spark stores `originalQueryText` verbatim as the user wrote it; when a
+    * dbt-style workload references tables as `<db>.<table>` the resulting
+    * SQL flows into the DuckDB compiler subprocess, which only has the short
+    * tables registered (`CREATE TABLE <table> (...)`). Without this rewrite,
+    * `PRAGMA compile_refresh` fails with `Catalog Error: Table with name
+    * "<db>.<table>" does not exist because schema "<db>" does not exist.`
+    *
+    * Implementation: word-boundary regex, longest qualified name first so a
+    * 3-part `catalog.db.table` substring doesn't get half-rewritten. The
+    * `memory.main.<short>` references that openivm emits in the compiled
+    * output are unaffected — they go through the inverse rewrite in
+    * `parseInitialLoadSql` and `SparkRefreshRewriter`.
+    *
+    * @param sql              caller-supplied view SELECT body
+    * @param shortToQualified `req.sourceQualifiedNames` (short → qualified)
+    * @return                 SQL with qualified names replaced by their short
+    *                         counterparts. Unchanged if the map is empty or
+    *                         no qualified names contain a dot.
+    */
+  private[compiler] def stripDbQualifiers(
+      sql: String,
+      shortToQualified: Map[String, String]
+  ): String = {
+    val pairs = shortToQualified.toSeq.collect {
+      case (short, qual) if qual.contains(".") && qual != short => (qual, short)
+    }
+    // Longest first to ensure `catalog.db.table` is matched before `db.table`.
+    val sorted = pairs.sortBy(-_._1.length)
+    sorted.foldLeft(sql) { case (acc, (qual, short)) =>
+      val pattern = "(?i)\\b" + java.util.regex.Pattern.quote(qual) + "\\b"
+      acc.replaceAll(pattern, java.util.regex.Matcher.quoteReplacement(short))
+    }
   }
 
   /** Spark-specific join syntaxes that DuckDB does not parse.  Translates them

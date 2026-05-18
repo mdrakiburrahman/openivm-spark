@@ -662,7 +662,13 @@ case class RefreshMaterializedViewCommand(
         // into an explicit column list (Spark 3.5 does not support that syntax).
         sourceSchemas = freshSchemas.map { case (qual, schema) =>
           qual.split("\\.").last -> schema.fieldNames.toSeq
-        }
+        },
+        // Pass the short → qualified source name map so the rewriter can
+        // expand `memory.main.<short>` to the fully-qualified Spark name
+        // when the user's view body referenced a Hive-qualified table.
+        // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
+        // Spark would resolve `<short>` against the current_schema.
+        sourceQualifiedNames = shortToQual
       )
 
       try {

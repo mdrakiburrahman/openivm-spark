@@ -46,6 +46,24 @@ final case class RewrittenRefresh(statements: Seq[String])
   */
 object SparkRefreshRewriter {
 
+  /** Per-rewrite map of short source-table name → fully-qualified Spark name.
+    *
+    * Populated at the top of [[rewrite]] from the caller's
+    * `sourceQualifiedNames` argument and consulted by
+    * [[rewriteMemoryMainPrefix]] so live-source references like
+    * `memory.main.<short>` are rewritten to `` `<db>`.`<table>` `` instead
+    * of the unqualified `` `<short>` ``. Internal openivm names (e.g.
+    * `openivm_delta_<short>`, `openivm_data_<view>`) are not in the map
+    * and keep the default bare-backtick rewrite.
+    *
+    * Stored in a ThreadLocal so concurrent refreshes on different threads
+    * don't trample each other's per-MV qualification context.
+    */
+  private val activeQualifiedNames: ThreadLocal[Map[String, String]] =
+    new ThreadLocal[Map[String, String]] {
+      override def initialValue(): Map[String, String] = Map.empty
+    }
+
   /** Rewrite the openivm-emitted multi-statement refresh SQL into Spark-
     * executable statements.
     *
@@ -78,47 +96,57 @@ object SparkRefreshRewriter {
       sourceTempViews: Map[String, String],
       viewDeltaPath: String,
       postProcess: String => String = identity,
-      sourceSchemas: Map[String, Seq[String]] = Map.empty
+      sourceSchemas: Map[String, Seq[String]] = Map.empty,
+      sourceQualifiedNames: Map[String, String] = Map.empty
   ): RewrittenRefresh = {
     val _ = (mvLocation, sourceTempViews) // reserved for future passes
 
-    val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+    // Make qualified-name remapping visible to every private rewriter below,
+    // so `memory.main.<short>` becomes the correct `<db>.<table>` reference
+    // in all six call sites instead of a current-schema-bound `<short>`.
+    val prior = activeQualifiedNames.get()
+    activeQualifiedNames.set(sourceQualifiedNames)
+    try {
+      val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
-    val rewritten: Seq[String] = stmts.flatMap { stmt =>
-      classify(stmt, viewLogicalName) match {
-        case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
-        case StatementKind.ViewDeltaInsert =>
-          Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath))
-        case StatementKind.MvMerge =>
-          Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
-        case StatementKind.SimpleProjectionDataInsert =>
-          rewriteSimpleProjectionDataInsert(stmt, viewLogicalName, mvName, viewDeltaPath)
-        case StatementKind.ScalarUpdate =>
-          Seq(rewriteScalarUpdate(stmt, viewLogicalName, mvName, viewDeltaPath))
-        case StatementKind.ScalarDeleteMv =>
-          Seq(rewriteScalarDeleteMv(stmt, viewLogicalName, mvName, viewDeltaPath))
-        case StatementKind.ScalarFullRecomputeInsert =>
-          Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
-        case StatementKind.PartitionScopedDelete =>
-          rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
-        case StatementKind.PartitionScopedInsert =>
-          Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
-        case StatementKind.GroupRecomputeAffectedCreate =>
-          Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName))
-        case StatementKind.GroupRecomputeAffectedDrop =>
-          Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
-        case StatementKind.Unknown => Nil
+      val rewritten: Seq[String] = stmts.flatMap { stmt =>
+        classify(stmt, viewLogicalName) match {
+          case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
+          case StatementKind.ViewDeltaInsert =>
+            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath))
+          case StatementKind.MvMerge =>
+            Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
+          case StatementKind.SimpleProjectionDataInsert =>
+            rewriteSimpleProjectionDataInsert(stmt, viewLogicalName, mvName, viewDeltaPath)
+          case StatementKind.ScalarUpdate =>
+            Seq(rewriteScalarUpdate(stmt, viewLogicalName, mvName, viewDeltaPath))
+          case StatementKind.ScalarDeleteMv =>
+            Seq(rewriteScalarDeleteMv(stmt, viewLogicalName, mvName, viewDeltaPath))
+          case StatementKind.ScalarFullRecomputeInsert =>
+            Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
+          case StatementKind.PartitionScopedDelete =>
+            rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
+          case StatementKind.PartitionScopedInsert =>
+            Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.GroupRecomputeAffectedCreate =>
+            Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName))
+          case StatementKind.GroupRecomputeAffectedDrop =>
+            Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+          case StatementKind.Unknown => Nil
+        }
       }
-    }
 
-    // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
-    // exclusion syntax — `EXCEPT` is parsed as the set operator.  Expand any
-    // surviving `SELECT * EXCEPT (col1, col2) FROM openivm_delta_<short>` form
-    // (emitted by openivm for multi-source join-aware GROUP_RECOMPUTE and
-    // similar refresh programs) into an explicit column list using the source
-    // schemas supplied by the caller.
-    val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
-    RewrittenRefresh(withExceptExpanded.map(postProcess))
+      // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
+      // exclusion syntax — `EXCEPT` is parsed as the set operator.  Expand any
+      // surviving `SELECT * EXCEPT (col1, col2) FROM openivm_delta_<short>` form
+      // (emitted by openivm for multi-source join-aware GROUP_RECOMPUTE and
+      // similar refresh programs) into an explicit column list using the source
+      // schemas supplied by the caller.
+      val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
+      RewrittenRefresh(withExceptExpanded.map(postProcess))
+    } finally {
+      activeQualifiedNames.set(prior)
+    }
   }
 
   // ── Statement classification ─────────────────────────────────────────────
@@ -292,15 +320,40 @@ object SparkRefreshRewriter {
     )
   }
 
-  /** Replace `memory.main.<identifier>` → `` `<identifier>` ``.
+  /** Replace `memory.main.<identifier>` → either
+    *   - `` `<db>`.`<table>` `` if `<identifier>` is a tracked source whose
+    *     fully-qualified name is registered in [[activeQualifiedNames]]; OR
+    *   - `` `<identifier>` `` otherwise (the default openivm internal name
+    *     e.g. `openivm_delta_<n>`, `openivm_data_<v>`).
     *
     * openivm always emits the DuckDB catalog prefix `memory.main.` when the
-    * SPARK target dialect is selected; on the Spark side these reference our
-    * temp views and tables directly.
+    * SPARK target dialect is selected; on the Spark side most of these
+    * reference our internal temp views/tables (which we created with the
+    * short name), but live-source references (`memory.main.<short>`) must
+    * be expanded to `<db>.<table>` when the user's view body referenced a
+    * Hive-qualified table — otherwise Spark resolves `<short>` against the
+    * session's current_schema (typically `default`) and fails to find it.
     */
   private def rewriteMemoryMainPrefix(sql: String): String = {
-    val re = """memory\.main\.(\w+)""".r
-    re.replaceAllIn(sql, m => s"`${m.group(1)}`")
+    val qualifiedMap = activeQualifiedNames.get()
+    val re           = """memory\.main\.(\w+)""".r
+    re.replaceAllIn(
+      sql,
+      m => {
+        val short = m.group(1)
+        qualifiedMap.get(short) match {
+          case Some(qual) if qual.contains(".") =>
+            val parts = qual.split("\\.")
+            // Wrap each segment in backticks so Spark resolves the table
+            // against the specific database in the qualified name, not the
+            // current session schema. `quoteReplacement` keeps regex meta-
+            // characters (`$`, `\\`) in identifier strings inert.
+            java.util.regex.Matcher.quoteReplacement(parts.map(p => s"`$p`").mkString("."))
+          case _ =>
+            java.util.regex.Matcher.quoteReplacement(s"`$short`")
+        }
+      }
+    )
   }
 
   /** Transform openivm's `WITH ... INSERT INTO openivm_delta_<view> (cols) SELECT * FROM <lastCte>`

@@ -232,6 +232,38 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     ex.getMessage should include("Unsupported Spark DataType")
   }
 
+  // ── Test 7b: DB-qualified source references in viewSql (Hive/dbt path) ────
+  //
+  // The unit test below pokes the private[compiler] stripDbQualifiers helper
+  // directly; the integration check exercises an end-to-end compile with a
+  // qualified table reference in the view body.
+
+  it should "compile a view that references a tracked source by its qualified <db>.<table> name" in {
+    val req = CompileRequest(
+      viewName = "mv_qual_count",
+      viewSql = "SELECT COUNT(*) AS c FROM tpcdi.sales",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
+  it should "compile a view that joins two sources via qualified <db>.<table> names" in {
+    val depts = StructType.fromDDL("dept_id INT, dept_name STRING")
+    val emps  = StructType.fromDDL("emp_id INT, dept_id INT, name STRING")
+    val req = CompileRequest(
+      viewName = "mv_qual_join",
+      viewSql = "SELECT e.emp_id, d.dept_name FROM tpcdi.employees e JOIN tpcdi.departments d ON e.dept_id = d.dept_id",
+      sources = Map("employees" -> emps, "departments" -> depts),
+      sourceQualifiedNames = Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
   // ── Test 8: Thread safety ─────────────────────────────────────────────────
 
   it should "handle 8 concurrent compile calls without errors" in {
@@ -305,5 +337,55 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   it should "be a no-op for SQL without LEFT SEMI/ANTI JOIN clauses" in {
     val in = "SELECT region, SUM(amount) FROM sales GROUP BY region"
     sharedCompiler.normalizeSparkSqlForDuckdb(in) shouldBe in
+  }
+
+  // ── Test 11: stripDbQualifiers (Hive/dbt qualified-name handling) ─────────
+
+  "stripDbQualifiers" should "be a no-op when the qualified map is empty" in {
+    val sql = "SELECT * FROM sales"
+    sharedCompiler.stripDbQualifiers(sql, Map.empty) shouldBe sql
+  }
+
+  it should "be a no-op when no qualified name actually contains a dot" in {
+    val sql = "SELECT * FROM sales"
+    // short == qualified — nothing to strip.
+    sharedCompiler.stripDbQualifiers(sql, Map("sales" -> "sales")) shouldBe sql
+  }
+
+  it should "rewrite tpcdi.sales to sales" in {
+    val sql = "SELECT region FROM tpcdi.sales WHERE amount > 0"
+    sharedCompiler.stripDbQualifiers(sql, Map("sales" -> "tpcdi.sales")) shouldBe
+      "SELECT region FROM sales WHERE amount > 0"
+  }
+
+  it should "rewrite multiple distinct qualified sources in a JOIN" in {
+    val sql =
+      "SELECT e.id FROM tpcdi.employees e JOIN tpcdi.departments d ON e.dept = d.id"
+    sharedCompiler.stripDbQualifiers(
+      sql,
+      Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments")
+    ) shouldBe
+      "SELECT e.id FROM employees e JOIN departments d ON e.dept = d.id"
+  }
+
+  it should "not touch column qualifications like alias.col" in {
+    val sql = "SELECT t.region FROM tpcdi.sales t"
+    sharedCompiler.stripDbQualifiers(sql, Map("sales" -> "tpcdi.sales")) shouldBe
+      "SELECT t.region FROM sales t"
+  }
+
+  it should "be case-insensitive on the qualified name" in {
+    val sql = "SELECT * FROM TPCDI.SALES"
+    sharedCompiler.stripDbQualifiers(sql, Map("sales" -> "tpcdi.sales")) shouldBe
+      "SELECT * FROM sales"
+  }
+
+  it should "prefer the longest qualified name when both 2-part and 3-part are tracked" in {
+    val sql =
+      "SELECT * FROM spark_catalog.tpcdi.sales s JOIN tpcdi.audit a ON s.id = a.id"
+    sharedCompiler.stripDbQualifiers(
+      sql,
+      Map("sales" -> "spark_catalog.tpcdi.sales", "audit" -> "tpcdi.audit")
+    ) shouldBe "SELECT * FROM sales s JOIN audit a ON s.id = a.id"
   }
 }
