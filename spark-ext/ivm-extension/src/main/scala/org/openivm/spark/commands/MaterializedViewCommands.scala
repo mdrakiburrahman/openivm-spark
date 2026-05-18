@@ -51,6 +51,43 @@ private[commands] object OpenIvmCompilers {
 }
 
 // ---------------------------------------------------------------------------
+// Per-MV refresh mutex — JVM-wide. openivm itself uses a per-view mutex
+// (see openivm/test/sql/concurrency.test prologue), and we replicate that
+// invariant here because the Spark-side incremental refresh path is NOT
+// safe under naive Delta OCC + retry: the per-statement retry harness
+// re-executes the same MERGE without re-reading the staging-delta
+// snapshot, so two threads that both observed the same unconsumed delta
+// can each apply it once, double-counting the count-monoid aggregates.
+// ---------------------------------------------------------------------------
+private[commands] object RefreshMutex {
+
+  private val locks: java.util.Map[String, AnyRef] =
+    Collections.synchronizedMap(new java.util.HashMap[String, AnyRef]())
+
+  /** Acquire (creating if absent) and synchronize on the lock object that
+    * keys this MV. The lock identity is the fully-qualified MV name so two
+    * refreshes targeting the SAME logical MV serialise, even if they
+    * originate from different Spark sessions in the same JVM.
+    */
+  def withLock[A](mvKey: String)(body: => A): A = {
+    val existing = locks.get(mvKey)
+    val lock =
+      if (existing != null) existing
+      else
+        locks.synchronized {
+          val again = locks.get(mvKey)
+          if (again != null) again
+          else {
+            val l = new Object
+            locks.put(mvKey, l)
+            l
+          }
+        }
+    lock.synchronized(body)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 private[commands] object MvCommandHelper {
@@ -556,6 +593,18 @@ case class RefreshMaterializedViewCommand(
 ) extends LeafRunnableCommand {
 
   override def run(spark: SparkSession): Seq[Row] = {
+    import MvCommandHelper._
+
+    // Serialize concurrent REFRESHes against the same MV — see comment on
+    // RefreshMutex above. Without this, two threads that both read the
+    // same unconsumed staging-delta snapshot each apply it once, doubling
+    // count-monoid aggregates.
+    RefreshMutex.withLock(metaName(name)) {
+      runUnderLock(spark)
+    }
+  }
+
+  private def runUnderLock(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
