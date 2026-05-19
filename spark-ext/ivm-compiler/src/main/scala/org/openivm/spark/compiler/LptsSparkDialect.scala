@@ -69,6 +69,26 @@ object LptsSparkDialect {
     */
   private val ErrorFnRe = """(?i)\berror\s*\(""".r
 
+  /** `to_timestamp(CAST('<literal>' AS DOUBLE))` — openivm's DuckDB binder
+    * resolves the user's `to_timestamp('<date-string>')` to the only matching
+    * DuckDB signature `to_timestamp(DOUBLE)` (UNIX epoch seconds), inserting
+    * a `CAST(<string-literal> AS DOUBLE)` around the original arg. In Spark,
+    * `CAST('9999-12-31 23:59:59.999' AS DOUBLE)` evaluates to NULL because
+    * the string isn't a valid number, and `to_timestamp(NULL)` returns NULL.
+    *
+    * Restore Spark semantics by stripping the spurious `CAST(... AS DOUBLE)`
+    * wrapper when its argument is a single-quoted string literal.
+    *
+    * Matches:
+    *   - `to_timestamp(CAST('...' AS DOUBLE))`              → `to_timestamp('...')`
+    *   - `to_timestamp(CAST(__STRLIT_N__ AS DOUBLE))`       (placeholder form)
+    *
+    * Numeric / column arguments (real UNIX epochs) are intentionally NOT
+    * matched so genuine `to_timestamp(<double>)` calls remain untouched.
+    */
+  private val ToTimestampDoubleCastRe =
+    """(?is)\bto_timestamp\s*\(\s*CAST\s*\(\s*('(?:''|[^'])*')\s*AS\s*DOUBLE\s*\)\s*\)""".r
+
   // ── Public API ───────────────────────────────────────────────────────────────
 
   /** Run all post-processing passes in order.
@@ -93,7 +113,9 @@ object LptsSparkDialect {
                     rewriteStructExtract(
                       rewriteTimestampWithTimeZone(
                         rewriteSparkFunctionInlinings(
-                          rewriteNowTimestamp(sql)
+                          rewriteToTimestampDoubleCast(
+                            rewriteNowTimestamp(sql)
+                          )
                         )
                       )
                     )
@@ -104,6 +126,17 @@ object LptsSparkDialect {
           )
         )
       )
+    )
+
+  /** Removes the spurious `CAST(<string-literal> AS DOUBLE)` wrapper that
+    * openivm inserts around `to_timestamp('<date-string>')` arguments due to
+    * a DuckDB function-binder collision. See [[ToTimestampDoubleCastRe]]
+    * for details. Idempotent; numeric/column args are untouched.
+    */
+  private[compiler] def rewriteToTimestampDoubleCast(sql: String): String =
+    ToTimestampDoubleCastRe.replaceAllIn(
+      sql,
+      m => java.util.regex.Matcher.quoteReplacement(s"to_timestamp(${m.group(1)})")
     )
 
   /** Reverse the inlining of Spark-function shim macros registered by

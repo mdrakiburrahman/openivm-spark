@@ -1,0 +1,2 @@
+cdc_flag,cdc_dsn,t_id,t_dts,t_st_id,t_tt_id,t_is_cash,t_s_symb,t_qty,t_bid_price,t_ca_id,t_exec_name,t_trade_price,t_chrg,t_comm,t_tax
+U,1488405,372101,2017-07-08T00:57:49.000Z,SBMT,TLS,0,AAAAAAAAAAAABFV,5225,4.06,428,990,,,,

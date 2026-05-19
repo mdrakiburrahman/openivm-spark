@@ -113,7 +113,15 @@ object Settings {
       // Tests do not care about plan toString output; raise the limit so the warn
       // never fires (belt + suspenders with the log4j2 silencer in
       // `ivm-common/src/test/resources/log4j2.properties`).
-      "-Dspark.sql.debug.maxToStringFields=2147483647"
+      "-Dspark.sql.debug.maxToStringFields=2147483647",
+      // Per-fork DEBUG log directory. `dev.sh setup_test_log_dir` sets
+      // OPENIVM_TEST_LOG_DIR in the host shell and forwards it as a -D
+      // on the sbt JVM via SBT_OPTS. We then propagate the SAME -D into
+      // each forked test JVM so log4j2.properties' File appender can
+      // resolve `${sys:openivm.test.log.dir}` (sbt does NOT auto-inherit
+      // parent-JVM -D's into forks). Falls back to /tmp/openivm-test-logs
+      // when sbt was launched without dev.sh.
+      s"-Dopenivm.test.log.dir=${sys.props.getOrElse("openivm.test.log.dir", "/tmp/openivm-test-logs")}"
     )
   )
 

@@ -37,6 +37,13 @@ x-spark-ext: &spark-ext
   working_dir: /work/spark-ext
   environment:
     SBT_OPTS: "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
+    # Test-log directory inside the container, mirroring the host's
+    # repo-root/.logs/test-<TS>/ layout. `dev.sh` (host) sets this env
+    # var on each `test` / `verify` invocation; log4j2.properties uses
+    # ${env:OPENIVM_TEST_LOG_DIR} to route per-fork DEBUG logs.
+    # Defaults to /tmp/openivm-test-logs when unset (interactive
+    # `compose run` without dev.sh) so log4j2 doesn't fail to open.
+    OPENIVM_TEST_LOG_DIR: ${OPENIVM_TEST_LOG_DIR:-/tmp/openivm-test-logs}
 
 services:
   build:

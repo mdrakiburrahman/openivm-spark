@@ -138,6 +138,18 @@ conventions:
 - `SIMPLE_PROJECTION` MVs over a source with byte-identical duplicate rows
   are not fully supported (the value-equality MERGE deletes all copies).
 
+## Principles
+
+- We do NOT tolerate verbose logging in test code. Tests should ONLY emit the test status from the test framework,
+  there should be nothing else in the console stdout.
+
+  Verbose logs are written to `.logs/test-<YYYYMMDD-HHMMSS>/` at the repo root on every
+  `./spark-ext/dev/dev.sh test` and `./spark-ext/dev/dev.sh verify` run.
+
+  Each forked test JVM writes its own `fork-<HHmmss-SSS>.log`.
+
+  `.logs/` is git-ignored.
+
 ## Activation outside tests
 
 ```bash

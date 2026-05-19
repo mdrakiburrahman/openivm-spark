@@ -348,6 +348,65 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("rewriteToTimestampDoubleCast") {
+    it("strips the spurious CAST('<literal>' AS DOUBLE) wrapper") {
+      val sql      = "to_timestamp(CAST('9999-12-31 23:59:59.999' AS DOUBLE))"
+      val expected = "to_timestamp('9999-12-31 23:59:59.999')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe expected
+    }
+
+    it("is case-insensitive (to_timestamp, CAST, AS, DOUBLE)") {
+      val sql      = "TO_TIMESTAMP(cast('2024-01-01' as Double))"
+      val expected = "to_timestamp('2024-01-01')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe expected
+    }
+
+    it("tolerates extra whitespace") {
+      val sql      = "to_timestamp(  CAST(  '2024-01-01 00:00:00'   AS   DOUBLE  )  )"
+      val expected = "to_timestamp('2024-01-01 00:00:00')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe expected
+    }
+
+    it("does NOT rewrite to_timestamp(<numeric-expr>) (real UNIX epoch)") {
+      val sql = "to_timestamp(CAST(epoch_sec AS DOUBLE))"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe sql
+    }
+
+    it("does NOT rewrite to_timestamp('<literal>') (already correct)") {
+      val sql = "to_timestamp('2024-01-01')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe sql
+    }
+
+    it("rewrites multiple occurrences in one SQL") {
+      val sql =
+        "SELECT to_timestamp(CAST('a' AS DOUBLE)), to_timestamp(CAST('b' AS DOUBLE))"
+      val expected =
+        "SELECT to_timestamp('a'), to_timestamp('b')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe expected
+    }
+
+    it("preserves embedded single-quote escapes in the literal") {
+      // openivm/DuckDB doubles a single quote inside a string literal:
+      // 'O''Brien' is the SQL form of O'Brien.
+      val sql      = "to_timestamp(CAST('O''Brien' AS DOUBLE))"
+      val expected = "to_timestamp('O''Brien')"
+      LptsSparkDialect.rewriteToTimestampDoubleCast(sql) shouldBe expected
+    }
+
+    it("is idempotent") {
+      val input = "to_timestamp(CAST('9999-12-31 23:59:59.999' AS DOUBLE))"
+      val once  = LptsSparkDialect.rewriteToTimestampDoubleCast(input)
+      val twice = LptsSparkDialect.rewriteToTimestampDoubleCast(once)
+      once shouldBe twice
+    }
+
+    it("translate pipeline applies it") {
+      val input    = "to_timestamp(CAST('2024-01-01' AS DOUBLE))"
+      val expected = "to_timestamp('2024-01-01')"
+      LptsSparkDialect.translate(input) shouldBe expected
+    }
+  }
+
   // ── 5. translate pipeline ────────────────────────────────────────────────────
   describe("translate") {
     it("passes through SQL with no DuckDB-isms unchanged") {

@@ -1,0 +1,2 @@
+cdc_flag,cdc_dsn,customerid,taxid,status,lastname,firstname,middleinitial,gender,tier,dob,addressline1,addressline2,postalcode,city,stateprov,country,c_ctry_1,c_area_1,c_local_1,c_ext_1,c_ctry_2,c_area_2,c_local_2,c_ext_2,c_ctry_3,c_area_3,c_local_3,c_ext_3,email1,email2,lcl_tx_id,nat_tx_id
+I,6455,4739,016-32-5107,ACTV,Moncur,Vittorio,,M,3,1983-06-21,19452 Bryant Irvin West,,H2E 1V8,Paterson,TX,United States of America,,,821-2946,,,,205-8612,06614,1,968,027-5679,,Vittorio.Moncur@farce.de,,MD4,MT5

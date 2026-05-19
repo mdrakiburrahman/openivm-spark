@@ -134,21 +134,23 @@ object StagingCatalog extends DeltaRetrySupport {
    * Record a new DML delta.  Uses MERGE on (base_table, staging_path) so the call is
    * idempotent: re-recording the same path does not overwrite `consumed_by`.
    */
-  def record(spark: SparkSession, delta: StagingDelta): Unit = withDeltaRetry {
-    val sourceDF = spark.createDataFrame(
-      spark.sparkContext.parallelize(Seq(deltaToRow(delta)), 1),
-      StagingSchema
-    )
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .as("target")
-      .merge(
-        sourceDF.as("source"),
-        "target.base_table = source.base_table AND target.staging_path = source.staging_path"
+  def record(spark: SparkSession, delta: StagingDelta): Unit = StagingCatalog.synchronized {
+    withDeltaRetry {
+      val sourceDF = spark.createDataFrame(
+        spark.sparkContext.parallelize(Seq(deltaToRow(delta)), 1),
+        StagingSchema
       )
-      .whenNotMatched()
-      .insertAll()
-      .execute()
+      DeltaTable
+        .forPath(spark, tablePath(spark))
+        .as("target")
+        .merge(
+          sourceDF.as("source"),
+          "target.base_table = source.base_table AND target.staging_path = source.staging_path"
+        )
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+    }
   }
 
   /**
@@ -230,24 +232,27 @@ object StagingCatalog extends DeltaRetrySupport {
    * Append `viewName` to `consumed_by` for each staging row identified by `paths`.
    * Uses `array_union` so repeated calls with the same viewName are idempotent.
    */
-  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = withDeltaRetry {
-    if (paths.isEmpty) return
-    val markerSchema = StructType(
-      Array(
-        StructField("staging_path", StringType, nullable = false),
-        StructField("new_view", StringType, nullable = false)
-      )
-    )
-    val rows     = paths.map(p => Row(p, viewName))
-    val markerDF = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), markerSchema)
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .as("target")
-      .merge(markerDF.as("source"), "target.staging_path = source.staging_path")
-      .whenMatched()
-      .updateExpr(Map("consumed_by" -> "array_union(target.consumed_by, array(source.new_view))"))
-      .execute()
-  }
+  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit =
+    StagingCatalog.synchronized {
+      withDeltaRetry {
+        if (paths.isEmpty) return
+        val markerSchema = StructType(
+          Array(
+            StructField("staging_path", StringType, nullable = false),
+            StructField("new_view", StringType, nullable = false)
+          )
+        )
+        val rows     = paths.map(p => Row(p, viewName))
+        val markerDF = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), markerSchema)
+        DeltaTable
+          .forPath(spark, tablePath(spark))
+          .as("target")
+          .merge(markerDF.as("source"), "target.staging_path = source.staging_path")
+          .whenMatched()
+          .updateExpr(Map("consumed_by" -> "array_union(target.consumed_by, array(source.new_view))"))
+          .execute()
+      }
+    }
 
   /**
    * Delete every staging row whose `consumed_by` covers ALL currently tracked MVs for its
@@ -255,19 +260,22 @@ object StagingCatalog extends DeltaRetrySupport {
    *
    * @param viewsByTable maps each base_table name to the set of MV names that depend on it
    */
-  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = withDeltaRetry {
-    if (viewsByTable.isEmpty) return
-    val dt = DeltaTable.forPath(spark, tablePath(spark))
-    viewsByTable.foreach { case (baseTable, mvs) =>
-      if (mvs.nonEmpty) {
-        val mvsExpr = mvs.map(sqlLit).mkString(", ")
-        dt.delete(
-          s"base_table = ${sqlLit(baseTable)} AND " +
-            s"size(array_except(array($mvsExpr), consumed_by)) = 0"
-        )
+  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit =
+    StagingCatalog.synchronized {
+      withDeltaRetry {
+        if (viewsByTable.isEmpty) return
+        val dt = DeltaTable.forPath(spark, tablePath(spark))
+        viewsByTable.foreach { case (baseTable, mvs) =>
+          if (mvs.nonEmpty) {
+            val mvsExpr = mvs.map(sqlLit).mkString(", ")
+            dt.delete(
+              s"base_table = ${sqlLit(baseTable)} AND " +
+                s"size(array_except(array($mvsExpr), consumed_by)) = 0"
+            )
+          }
+        }
       }
     }
-  }
 
   /**
    * Delete every staging row with the given `baseTable`. Used by
@@ -278,9 +286,12 @@ object StagingCatalog extends DeltaRetrySupport {
    *
    * Idempotent: no error if no rows match.
    */
-  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = withDeltaRetry {
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .delete(s"base_table = ${sqlLit(baseTable)}")
-  }
+  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
+    StagingCatalog.synchronized {
+      withDeltaRetry {
+        DeltaTable
+          .forPath(spark, tablePath(spark))
+          .delete(s"base_table = ${sqlLit(baseTable)}")
+      }
+    }
 }

@@ -162,24 +162,30 @@ object MvCatalog extends DeltaRetrySupport {
 
   /** MERGE-based upsert keyed on `name`. Inserts new rows; updates all mutable fields.
    *
-   *  Retries on every concurrent-modification flavour Delta can throw (METADATA_CHANGED,
-   *  PROTOCOL_CHANGED, CONCURRENT_APPEND/DELETE/TRANSACTION) via [[DeltaRetrySupport.withDeltaRetry]],
-   *  which uses [[RetryPolicy.DeltaConflicts]] with up to 5 attempts and linear backoff.
+   *  Wrapped in a JVM-wide `synchronized` block so concurrent CREATE / REFRESH calls
+   *  from multiple driver threads (e.g. the parallel-wave scheduler in
+   *  [[org.openivm.spark.parity.TpcDiSpec]]) serialize on the single
+   *  `_ivm/_meta/mv_metadata` Delta table, eliminating
+   *  `DELTA_CONCURRENT_APPEND` flooding. Cross-process conflicts (unusual for
+   *  openivm-spark which runs single-driver) are still handled by
+   *  [[DeltaRetrySupport.withDeltaRetry]] inside the lock.
    */
-  def upsert(spark: SparkSession, meta: MvMetadata): Unit = withDeltaRetry {
-    val sourceDF = spark.createDataFrame(
-      spark.sparkContext.parallelize(Seq(metaToRow(meta)), 1),
-      MvSchema
-    )
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .as("target")
-      .merge(sourceDF.as("source"), "target.name = source.name")
-      .whenMatched()
-      .updateAll()
-      .whenNotMatched()
-      .insertAll()
-      .execute()
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit = MvCatalog.synchronized {
+    withDeltaRetry {
+      val sourceDF = spark.createDataFrame(
+        spark.sparkContext.parallelize(Seq(metaToRow(meta)), 1),
+        MvSchema
+      )
+      DeltaTable
+        .forPath(spark, tablePath(spark))
+        .as("target")
+        .merge(sourceDF.as("source"), "target.name = source.name")
+        .whenMatched()
+        .updateAll()
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+    }
   }
 
   /** Returns None if the MV is not tracked. */
@@ -216,23 +222,28 @@ object MvCatalog extends DeltaRetrySupport {
       .toSeq
 
   /** Advance `last_version` after a successful refresh. No-op if the MV is not tracked. */
-  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = withDeltaRetry {
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .updateExpr(
-        s"name = ${sqlLit(serializeName(name))}",
-        Map("last_version" -> newVersion.toString)
-      )
-  }
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+    MvCatalog.synchronized {
+      withDeltaRetry {
+        DeltaTable
+          .forPath(spark, tablePath(spark))
+          .updateExpr(
+            s"name = ${sqlLit(serializeName(name))}",
+            Map("last_version" -> newVersion.toString)
+          )
+      }
+    }
 
   /**
    * Delete the tracking row.
    * Idempotent: no error if the MV is already gone (safe for DROP MV IF EXISTS).
    */
-  def remove(spark: SparkSession, name: TableIdentifier): Unit = withDeltaRetry {
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .delete(s"name = ${sqlLit(serializeName(name))}")
+  def remove(spark: SparkSession, name: TableIdentifier): Unit = MvCatalog.synchronized {
+    withDeltaRetry {
+      DeltaTable
+        .forPath(spark, tablePath(spark))
+        .delete(s"name = ${sqlLit(serializeName(name))}")
+    }
   }
 
   /**
