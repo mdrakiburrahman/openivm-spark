@@ -130,7 +130,7 @@ From repo root:
 ```bash
 cd /home/mdrrahman/openivm-spark
 export SCALE_FACTOR=3 BATCH_1_PCT=1 BATCH_2_PCT=0.001 BATCH_3_PCT=0.002
-export PARALLEL=0
+export PARALLEL=1
 export ENGINES=duckdb-openivm,spark-openivm
 export PRESERVE_RAW=1
 export OPENIVM_VALIDATE=1
@@ -139,7 +139,7 @@ cd .temp/ivm-bench
 bash src/.scripts/benchmark.sh
 ```
 
-This is a long-running command (~45 min). Use the `bash` tool with
+This is a long-running command (~30 min). Use the `bash` tool with
 `mode: "sync"`, `initial_wait: 60`. The benchmark will go to the
 background and you will be notified on completion. Do not poll.
 
