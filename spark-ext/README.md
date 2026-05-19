@@ -19,7 +19,7 @@ spark-ext/
 └── dev/
     ├── dev            # single entry-point CLI wrapper (build, test, verify, shell, …)
     ├── docker/        # multi-stage Dockerfile + docker-compose.yml
-    └── pins.env       # pinned SHAs of openivm / lpts forks
+    └── pins.env       # pinned SHAs of openivm / lpts / ivm-bench forks
 ```
 
 ## Supported RefreshTypes
@@ -51,7 +51,8 @@ A single entry-point lives at `spark-ext/dev/dev`. Run it with one of the
 following subcommands:
 
 ```bash
-./spark-ext/dev/dev.sh verify                                                     # lint + build + assembly + full test
+./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
+./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench}, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
 ./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
@@ -64,9 +65,19 @@ following subcommands:
 ./spark-ext/dev/dev.sh help                                                       # this help text
 ```
 
-`verify` is the canonical one-liner — it lints, compiles, assembles the fat
+`verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
+missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and
+aligning each to its pinned branch), then lints, compiles, assembles the fat
 jar, and runs every unit + integration + parity suite in a single sbt JVM.
 Wall-clock on the reference 32-core / 124 GiB host is ~40 minutes end-to-end.
+
+`pins-sync` exits non-zero only when a pinned repo or branch is missing on
+GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned
+COMMIT — or between the `ivm-bench` Dockerfile's `ARG OPENIVM_/LPTS_*`
+defaults and `pins.env` — is reported as a `⚠ WARNING` but does not block
+`verify`. Bumping any pinned SHA therefore requires editing **both**
+`spark-ext/dev/pins.env` **and** the matching `ARG` in
+`.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile`.
 
 ### Environment variables
 
