@@ -141,6 +141,26 @@ usage() {
         | sed -e 's/^# \{0,1\}//' -e '/^=\{3,\}$/d'
 }
 
+# Read the default value of `ARG <name>=<value>` from a Dockerfile.
+#
+# Docker exposes no CLI to read ARG defaults without actually building the
+# image (no `docker dockerfile inspect`, no `buildx args --print`), so we parse
+# the file directly. Awk's pattern is anchored to start-of-line + exact ARG
+# name + `=`, which avoids substring collisions between e.g. OPENIVM_COMMIT and
+# OPENIVM_SPARK_COMMIT. Surrounding single/double quotes are stripped from the
+# returned value. Emits empty string if the ARG is absent or has no default.
+dockerfile_arg_default() {
+    local file="$1" name="$2"
+    awk -v n="$name" '
+        $0 ~ "^[[:space:]]*ARG[[:space:]]+" n "=" {
+            sub("^[[:space:]]*ARG[[:space:]]+" n "=", "")
+            gsub(/^"|"$/, "")
+            gsub(/^'\''|'\''$/, "")
+            print
+            exit
+        }' "$file"
+}
+
 # ── subcommand implementations ─────────────────────────────────────────────
 
 cmd_fmt()         { pre_clean_if_requested; compose run --rm fmt; }
@@ -246,11 +266,51 @@ cmd_pins_sync() {
         fi
     done
 
+    # After all three repos are aligned, cross-check that the ivm-bench
+    # spark-openivm-build Dockerfile pins the SAME openivm + lpts SHAs as our
+    # pins.env. The Dockerfile's own header comment requires this (the spark
+    # compiler is ABI-sensitive to the duckdb-side build) — drift here is a
+    # silent footgun, so surface it the same way as HEAD drift.
+    local dockerfile="$temp_dir/ivm-bench/src/containers/spark-openivm-build/Dockerfile"
+    echo
+    echo "[pins-sync] ── ivm-bench Dockerfile ARGs ──"
+    if [[ ! -f "$dockerfile" ]]; then
+        echo "[pins-sync]   ⚠ WARNING: expected Dockerfile not found at"
+        echo "[pins-sync]              .temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile"
+        echo "[pins-sync]              (skipping ARG validation)"
+        drift=1
+    else
+        local check_args=(
+            OPENIVM_REPO
+            OPENIVM_BRANCH
+            OPENIVM_COMMIT
+            LPTS_REPO
+            LPTS_BRANCH
+            LPTS_COMMIT
+        )
+        for arg in "${check_args[@]}"; do
+            local actual expected
+            expected="${!arg}"
+            actual="$(dockerfile_arg_default "$dockerfile" "$arg")"
+            if [[ -z "$actual" ]]; then
+                echo "[pins-sync]   ⚠ WARNING: ARG $arg not declared with a default in Dockerfile"
+                drift=1
+            elif [[ "$actual" == "$expected" ]]; then
+                echo "[pins-sync]   ✓ $arg = $actual"
+            else
+                echo "[pins-sync]   ⚠ WARNING: $arg mismatch"
+                echo "[pins-sync]     Dockerfile = $actual"
+                echo "[pins-sync]     pins.env   = $expected"
+                drift=1
+            fi
+        done
+    fi
+
     echo
     if [[ "$drift" -eq 0 ]]; then
-        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits."
+        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits AND the ivm-bench Dockerfile ARGs agree with pins.env."
     else
-        echo "[pins-sync] ⚠ One or more repos have drifted from the pin. See WARNINGs above."
+        echo "[pins-sync] ⚠ Drift detected — see WARNINGs above (HEAD drift and/or Dockerfile ARG mismatch)."
     fi
 }
 
