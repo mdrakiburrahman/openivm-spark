@@ -11,10 +11,14 @@
 #   help                    Print this message.
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
 #   openivm-test            Run upstream openivm sqllogictest suite.
+#   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
+#                           branches in pins.env and warn if local HEAD has
+#                           drifted from the pinned COMMIT.
 #   shell                   Drop into bash inside the spark-ext container.
 #   test [sbt-args]         `sbt test` (all suites) inside the dev container.
 #                           Extra args are appended to sbt (e.g. `testOnly ...`).
-#   verify                  Lint + compile + assembly + test in one Docker call.
+#   verify                  pins-sync + lint + compile + assembly + test in
+#                           one Docker call.
 #
 # Environment: only Docker is required on the host.  Pinned image SHAs come
 # from `spark-ext/dev/pins.env`.
@@ -146,6 +150,110 @@ cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
 
+# Ensure $REPO_ROOT/.temp/{openivm,lpts,ivm-bench} are cloned on the branches
+# declared in pins.env, then compare each local HEAD against the pinned COMMIT.
+#
+#   * If the working copy is missing, clone fresh on the pinned branch.
+#   * If the working copy exists, fetch origin and switch to the pinned branch
+#     (creating a local tracking branch if needed).
+#   * If the repo/branch does not exist remotely, abort with a hard error.
+#   * After alignment, log per-repo whether HEAD == pin; emit a WARNING for
+#     each repo that has drifted. Drift is non-fatal (exit 0).
+cmd_pins_sync() {
+    local temp_dir="$REPO_ROOT/.temp"
+    mkdir -p "$temp_dir"
+
+    # Tuples: dir_name | repo_url_var | branch_var | commit_var
+    local entries=(
+        "openivm|OPENIVM_REPO|OPENIVM_BRANCH|OPENIVM_COMMIT"
+        "lpts|LPTS_REPO|LPTS_BRANCH|LPTS_COMMIT"
+        "ivm-bench|IVM_BENCH_REPO|IVM_BENCH_BRANCH|IVM_BENCH_COMMIT"
+    )
+
+    local drift=0
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r name repo_var branch_var commit_var <<< "$entry"
+        local repo="${!repo_var}"
+        local branch="${!branch_var}"
+        local commit="${!commit_var}"
+        local dest="$temp_dir/$name"
+
+        echo
+        echo "[pins-sync] ── $name ──"
+        echo "[pins-sync]   repo   = $repo"
+        echo "[pins-sync]   branch = $branch"
+        echo "[pins-sync]   pin    = $commit"
+
+        if [[ ! -d "$dest/.git" ]]; then
+            if [[ -e "$dest" ]]; then
+                echo "[pins-sync] FATAL: $dest exists but is not a git checkout" >&2
+                exit 1
+            fi
+            echo "[pins-sync]   cloning into .temp/$name ..."
+            if ! git clone --branch "$branch" "$repo" "$dest"; then
+                echo "[pins-sync] FATAL: failed to clone $repo @ $branch" >&2
+                echo "[pins-sync]        verify the repository and branch exist remotely." >&2
+                exit 1
+            fi
+        else
+            echo "[pins-sync]   already cloned at .temp/$name"
+            local current_remote
+            current_remote="$(git -C "$dest" remote get-url origin 2>/dev/null || echo '')"
+            if [[ -n "$current_remote" && "$current_remote" != "$repo" ]]; then
+                echo "[pins-sync]   WARNING: origin remote mismatch"
+                echo "[pins-sync]     local  = $current_remote"
+                echo "[pins-sync]     pinned = $repo"
+            fi
+
+            echo "[pins-sync]   fetching origin ..."
+            if ! git -C "$dest" fetch origin --quiet --prune; then
+                echo "[pins-sync] FATAL: 'git fetch origin' failed in .temp/$name" >&2
+                exit 1
+            fi
+
+            if ! git -C "$dest" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+                echo "[pins-sync] FATAL: branch '$branch' does not exist on origin in .temp/$name" >&2
+                exit 1
+            fi
+
+            local current_branch
+            current_branch="$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || echo '')"
+            if [[ "$current_branch" != "$branch" ]]; then
+                echo "[pins-sync]   switching from '${current_branch:-<detached>}' → '$branch'"
+                if git -C "$dest" show-ref --verify --quiet "refs/heads/$branch"; then
+                    if ! git -C "$dest" checkout --quiet "$branch"; then
+                        echo "[pins-sync] FATAL: 'git checkout $branch' failed in .temp/$name" >&2
+                        exit 1
+                    fi
+                else
+                    if ! git -C "$dest" checkout --quiet -b "$branch" --track "origin/$branch"; then
+                        echo "[pins-sync] FATAL: failed to create tracking branch '$branch' in .temp/$name" >&2
+                        exit 1
+                    fi
+                fi
+            fi
+        fi
+
+        local head
+        head="$(git -C "$dest" rev-parse HEAD)"
+        if [[ "$head" == "$commit" ]]; then
+            echo "[pins-sync]   ✓ HEAD matches pin ($head)"
+        else
+            echo "[pins-sync]   ⚠ WARNING: HEAD has drifted from pin"
+            echo "[pins-sync]     HEAD = $head"
+            echo "[pins-sync]     pin  = $commit"
+            drift=1
+        fi
+    done
+
+    echo
+    if [[ "$drift" -eq 0 ]]; then
+        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits."
+    else
+        echo "[pins-sync] ⚠ One or more repos have drifted from the pin. See WARNINGs above."
+    fi
+}
+
 cmd_test() {
     pre_clean_if_requested
     setup_test_log_dir
@@ -164,6 +272,12 @@ cmd_verify() {
     # Set PRE_CLEAN=1 to force-remove every running Docker container on the
     # host before invoking sbt (see `pre_clean_if_requested` at the top of
     # this file).
+    #
+    # Always reconcile .temp/{openivm,lpts,ivm-bench} against pins.env first
+    # so a `verify` run flags any drifted dependency before spending compute
+    # on the full sbt cycle. Drift is non-fatal (WARNING only); a missing
+    # repo/branch hard-fails per cmd_pins_sync's contract.
+    cmd_pins_sync
     pre_clean_if_requested
     setup_test_log_dir
 
@@ -267,6 +381,7 @@ case "$cmd" in
     shell)        cmd_shell "$@" ;;
     image-build|image_build) cmd_image_build "$@" ;;
     openivm-test|openivm_test) cmd_openivm_test "$@" ;;
+    pins-sync|pins_sync)     cmd_pins_sync "$@" ;;
     dev-build|dev_build)     cmd_dev_build "$@" ;;
     help|-h|--help)          usage ;;
     *)

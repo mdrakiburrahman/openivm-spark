@@ -51,17 +51,17 @@ A single entry-point lives at `spark-ext/dev/dev`. Run it with one of the
 following subcommands:
 
 ```bash
-./spark-ext/dev/dev.sh verify                  # lint + build + assembly + full test
-./spark-ext/dev/dev.sh build                   # sbt compile
-./spark-ext/dev/dev.sh assembly                # sbt ivmExtension/assembly (fat jar)
-./spark-ext/dev/dev.sh test                    # sbt test (every suite)
+./spark-ext/dev/dev.sh verify                                                     # lint + build + assembly + full test
+./spark-ext/dev/dev.sh build                                                      # sbt compile
+./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
+./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.it.ExtensionLoadingSpec'
-./spark-ext/dev/dev.sh fmt                     # scalafmtAll (auto-format)
-./spark-ext/dev/dev.sh shell                   # interactive bash inside the dev image
-./spark-ext/dev/dev.sh openivm-test            # upstream openivm sqllogictests
-./spark-ext/dev/dev.sh dev-build [build|test|all]   # iterate on .temp/openivm + .temp/lpts
-./spark-ext/dev/dev.sh image-build             # docker compose build (force rebuild)
-./spark-ext/dev/dev.sh help                    # this help text
+./spark-ext/dev/dev.sh fmt                                                        # scalafmtAll (auto-format)
+./spark-ext/dev/dev.sh shell                                                      # interactive bash inside the dev image
+./spark-ext/dev/dev.sh openivm-test                                               # upstream openivm sqllogictests
+./spark-ext/dev/dev.sh dev-build [build|test|all]                                 # iterate on .temp/openivm + .temp/lpts
+./spark-ext/dev/dev.sh image-build                                                # docker compose build (force rebuild)
+./spark-ext/dev/dev.sh help                                                       # this help text
 ```
 
 `verify` is the canonical one-liner — it lints, compiles, assembles the fat
