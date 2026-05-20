@@ -705,20 +705,23 @@ object SparkRefreshRewriter {
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     val mvSqlName = backtickMvName(mvName)
 
-    // Detect the MERGE target alias: `MERGE INTO openivm_data_<view> [AS] <alias> USING`.
-    // When an alias is present, Spark/Delta requires column references in the
-    // ON / WHEN clauses to use the alias — not the fully-qualified table name.
-    val mergeAliasRe = ("(?is)\\bMERGE\\s+INTO\\s+openivm_data_" +
-      java.util.regex.Pattern.quote(viewLogicalName) +
-      "\\s+(?:AS\\s+)?(\\w+)(?=\\s+USING\\b)").r
+    // First, replace all openivm_data_<view> references with the MV name.
+    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(mvSqlName))
 
-    mergeAliasRe.findFirstMatchIn(s) match {
-      case Some(m) =>
-        val alias = m.group(1)
-        s = s.substring(0, m.start) + s"MERGE INTO $mvSqlName $alias" + s.substring(m.end)
-        s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(alias))
-      case None =>
-        s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(mvSqlName))
+    // After the replacement, if this is a MERGE with an alias, Spark/Delta
+    // requires column references in the ON / WHEN clauses to use the alias
+    // — not the fully-qualified table name.  Detect the alias from the
+    // already-rewritten `MERGE INTO <mv> [AS] <alias> USING` and replace
+    // any `<mv>.` column-ref prefixes in the body with `<alias>.`.
+    val mvEscaped = java.util.regex.Pattern.quote(mvSqlName)
+    val postMergeAliasRe =
+      ("(?is)MERGE\\s+INTO\\s+" + mvEscaped + "\\s+(?:AS\\s+)?\"?(\\w+)\"?(?=\\s+USING\\b)").r
+    postMergeAliasRe.findFirstMatchIn(s).foreach { m =>
+      val alias     = m.group(1)
+      val bodyStart = m.end
+      val body      = s.substring(bodyStart)
+      val fixedBody = body.replaceAll(mvEscaped + "\\.", alias + ".")
+      s = s.substring(0, bodyStart) + fixedBody
     }
 
     s

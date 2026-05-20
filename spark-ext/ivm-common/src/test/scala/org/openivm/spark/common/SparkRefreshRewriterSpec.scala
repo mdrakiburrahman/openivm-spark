@@ -170,7 +170,70 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       mergeStmt should include("v.openivm_left_key")
       mergeStmt should not include "`mydb`.`mv_r`.openivm_left_key"
       // The MERGE INTO target must still use the full MV name
-      mergeStmt should include("MERGE INTO `mydb`.`mv_r` v")
+      mergeStmt should include("MERGE INTO `mydb`.`mv_r`")
+      mergeStmt should include regex "MERGE INTO `mydb`.`mv_r` (AS )?v"
+    }
+
+    it("uses the MERGE alias with a qualified multi-part MV name (fact_market_history repro)") {
+      val fmhInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'fact_market_history';
+          |INSERT INTO openivm_delta_fact_market_history (sk_security_id, openivm_multiplicity)
+          |SELECT sk_security_id, openivm_multiplicity FROM memory.main.openivm_delta_daily_market
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_fact_market_history AS v USING openivm_delta_fact_market_history AS _d
+          |ON _d.openivm_left_key IS NOT DISTINCT FROM openivm_data_fact_market_history.openivm_left_key
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_fact_market_history SELECT sk_security_id FROM memory.main.daily_market;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'fact_market_history';
+          |""".stripMargin
+
+      val fmhMv        = TableIdentifier("fact_market_history", Some("gold"))
+      val fmhDeltaPath = "dbfs:/delta/_ivm/view_deltas/gold_fact_market_history/uuid"
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = fmhInput,
+        mvName = fmhMv,
+        mvLocation = "dbfs:/delta/fact_market_history",
+        viewLogicalName = "fact_market_history",
+        sourceTempViews = Map("daily_market" -> "openivm_delta_daily_market"),
+        viewDeltaPath = fmhDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("MERGE INTO")).get
+      mergeStmt should include("v.openivm_left_key")
+      mergeStmt should not include "`gold`.`fact_market_history`.openivm_left_key"
+      mergeStmt should include("MERGE INTO `gold`.`fact_market_history`")
+      mergeStmt should include regex "MERGE INTO `gold`.`fact_market_history` (AS )?v"
+    }
+
+    it("handles the MERGE alias even when DuckDB emits dotted column refs") {
+      // After dataViewRe replacement, the statement has `<mv>.col` references
+      // that must become `<alias>.col`. Validates the post-replacement fixup.
+      val quotedInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, total, openivm_multiplicity FROM memory.main.openivm_delta_sales
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_mv_r AS v USING openivm_delta_mv_r AS _d
+          |ON _d.openivm_left_key IS NOT DISTINCT FROM openivm_data_mv_r.openivm_left_key
+          |AND _d.region IS NOT DISTINCT FROM openivm_data_mv_r.region
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_mv_r SELECT region, total FROM memory.main.sales;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = quotedInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("MERGE INTO")).get
+      // Both column refs in the ON clause must use the alias
+      mergeStmt should include("v.openivm_left_key")
+      mergeStmt should include("v.region")
+      mergeStmt should not include "`mydb`.`mv_r`.openivm_left_key"
+      mergeStmt should not include "`mydb`.`mv_r`.region"
     }
   }
 
