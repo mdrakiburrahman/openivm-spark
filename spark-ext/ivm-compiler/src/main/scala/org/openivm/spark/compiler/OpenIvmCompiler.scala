@@ -181,9 +181,10 @@ class OpenIvmCompiler private (
     //
     // openivm_compile_only=true means DuckDB only parses + binds the MV body;
     // it does not execute the functions. openivm's LPTS serializer INLINES the
-    // macro body into the emitted refresh SQL, so collision-prone Spark
-    // built-ins use a pre-pass (`renameTwoArgDateFns`) to rename the user call
-    // to `__sparkfn_*` before DuckDB sees it, and a post-pass
+    // macro body into the emitted refresh SQL, so collision-prone and
+    // arity-mismatched Spark built-ins use a pre-pass
+    // (`renameSparkFunctionShimCalls`) to rename the user call to
+    // `__sparkfn_*` before DuckDB sees it, and a post-pass
     // (`LptsSparkDialect.rewriteSparkFunctionInlinings`) to recover Spark's
     // original spelling before refresh-time execution.
     //
@@ -236,9 +237,10 @@ class OpenIvmCompiler private (
     * DuckDB's parser/binder.
     *
     * Currently translated:
-    *   - Spark 2-arg `to_date` / `to_timestamp` / `date_format` →
+    *   - Spark 1-arg / 2-arg `to_date` / `to_timestamp`, 2-arg
+    *     `date_format`, and 2-arg `last_value(expr, ignoreNulls)` →
     *     collision-free `__sparkfn_*` names so DuckDB binds our shim macro
-    *     instead of its own incompatible built-in overloads.
+    *     instead of its own incompatible built-in overloads / arities.
     *   - `LEFT SEMI JOIN` → `SEMI JOIN` (DuckDB does not accept the LEFT prefix)
     *   - `LEFT ANTI JOIN` → `ANTI JOIN`
     *
@@ -249,7 +251,7 @@ class OpenIvmCompiler private (
   private[compiler] def normalizeSparkSqlForDuckdb(sql: String): String = {
     val leftSemi   = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
     val leftAnti   = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
-    val renamedFns = OpenIvmCompiler.renameTwoArgDateFns(sql)
+    val renamedFns = OpenIvmCompiler.renameSparkFunctionShimCalls(sql)
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
@@ -468,8 +470,8 @@ object OpenIvmCompiler {
       .getOrElse("/opt/openivm/duckdb")
   }
 
-  private[compiler] def renameTwoArgDateFns(sql: String): String =
-    SparkFunctionShimSql.renameTwoArgDateFns(sql)
+  private[compiler] def renameSparkFunctionShimCalls(sql: String): String =
+    SparkFunctionShimSql.renameSparkFunctionShimCalls(sql)
 
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would
@@ -482,12 +484,23 @@ object OpenIvmCompiler {
     * must preserve enough structure for `LptsSparkDialect.translate` to
     * recover Spark's original spelling at refresh time.
     *
-    * Collision-prone Spark built-ins (`to_date(s, fmt)`, `to_timestamp(s,
-    * fmt)`, `date_format(d, fmt)`) are renamed to `__sparkfn_*` by
-    * [[renameTwoArgDateFns]] before the SQL reaches DuckDB. The macros below
-    * define the corresponding DuckDB-side bodies that openivm will inline, and
-    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses those inlinings
-    * back to Spark's original functions in the emitted refresh SQL.
+    * Collision-prone or arity-incompatible Spark built-ins (1-arg / 2-arg
+    * `to_date`, 1-arg / 2-arg `to_timestamp`, 2-arg `date_format`, 2-arg
+    * `last_value(expr, ignoreNulls)`) are renamed to `__sparkfn_*` by
+    * [[renameSparkFunctionShimCalls]] before the SQL reaches DuckDB. The
+    * 1-arg date/time spellings use dedicated `*_1arg` macro names because
+    * DuckDB macros do not overload by arity. The macros below define the
+    * corresponding DuckDB-side bodies that openivm will inline.
+    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses the date/time
+    * inlinings back to Spark's original functions in the emitted refresh SQL.
+    *
+    * `__sparkfn_last_value` is an intentional semantic compromise: DuckDB has
+    * no ignore-nulls overload, so the macro drops the boolean flag and uses
+    * DuckDB's `last(expr)` window aggregate as the compile-time stand-in.
+    * `LptsSparkDialect.rewriteSparkFunctionInlinings` then recovers Spark's
+    * 1-arg `last_value(expr)` form in the emitted refresh SQL. Workloads that
+    * truly rely on ignore-null semantics must be caught by parity tests with
+    * null-bearing fixtures.
     */
   private[compiler] val sparkFunctionShimsPrologue: String = {
     val macros = Seq(
@@ -497,13 +510,25 @@ object OpenIvmCompiler {
       // `regexp_matches` call is back-translated to `regexp_like` in
       // `LptsSparkDialect.rewriteSparkFunctionInlinings`.
       "CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);",
-      // 2-arg Spark-only spellings that collide with DuckDB built-ins are
+      // 1-arg / 2-arg Spark spellings that collide with DuckDB built-ins are
       // pre-renamed to `__sparkfn_*` before compile. openivm inlines the body,
       // and LptsSparkDialect rewrites the inlined `strptime` / `strftime`
       // forms back to Spark's original function spelling at refresh time.
+      // DuckDB macros do not overload by arity, so the 1-arg shims use
+      // dedicated `*_1arg` names. They rely on fixed DuckDB-safe format
+      // literals purely so the binder accepts them during compile; the exact
+      // literal match is what the post-pass uses to recover Spark's original
+      // 1-arg spelling.
+      "CREATE OR REPLACE MACRO __sparkfn_to_date_1arg(s) AS CAST(strptime(s, '%Y-%m-%d') AS DATE);",
       "CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);",
+      "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS strptime(s, '%Y-%m-%d %H:%M:%S');",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
-      "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);"
+      "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      // Spark's 2-arg last_value(expr, ignoreNulls) has no DuckDB equivalent.
+      // Drop the flag during compile and use DuckDB's `last(expr)` window
+      // aggregate as the stand-in; the post-pass rewrites `last(expr) OVER`
+      // back to Spark's 1-arg `last_value(expr) OVER` form.
+      "CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);"
     )
     macros.mkString("", "\n", "\n")
   }

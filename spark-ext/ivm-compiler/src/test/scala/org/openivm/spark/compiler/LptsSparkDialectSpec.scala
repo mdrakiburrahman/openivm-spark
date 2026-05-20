@@ -433,13 +433,25 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
   }
 
   describe("rewriteSparkFunctionInlinings") {
-    it("rewrites CAST(strptime(... ) AS DATE) to to_date(...)") {
+    it("rewrites CAST(strptime(..., '%Y-%m-%d') AS DATE) to 1-arg to_date(...)") {
+      val sql = "CAST(strptime(raw, '%Y-%m-%d') AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_date(raw)"
+    }
+
+    it("rewrites CAST(strptime(... ) AS DATE) to to_date(..., fmt)") {
       val sql = "CAST(strptime(raw, 'yyyyMMdd') AS DATE)"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
         "to_date(raw, 'yyyyMMdd')"
     }
 
-    it("rewrites bare strptime(... ) to to_timestamp(...)") {
+    it("rewrites bare strptime(..., '%Y-%m-%d %H:%M:%S') to 1-arg to_timestamp(...)") {
+      val sql = "strptime(raw, '%Y-%m-%d %H:%M:%S')"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_timestamp(raw)"
+    }
+
+    it("rewrites bare strptime(... ) to to_timestamp(..., fmt)") {
       val sql = "strptime(raw, 'yyyy-MM-dd HH:mm:ss')"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
         "to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss')"
@@ -451,35 +463,41 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "date_format(ts, 'yyyyMMdd')"
     }
 
+    it("rewrites last(expr) OVER (...) to last_value(expr) OVER (...)") {
+      val sql = "last(name) OVER (PARTITION BY grp ORDER BY ts)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "last_value(name) OVER (PARTITION BY grp ORDER BY ts)"
+    }
+
     it("is case-insensitive for the date/time shim bodies") {
       val sql =
-        "CAST(STRPTIME(raw, 'yyyyMMdd') AS DATE), Strptime(raw, 'yyyy-MM-dd HH:mm:ss'), STRFTIME(ts, 'yyyyMMdd')"
+        "CAST(STRPTIME(raw, '%Y-%m-%d') AS DATE), Strptime(raw, 'yyyy-MM-dd HH:mm:ss'), STRPTIME(raw2, '%Y-%m-%d %H:%M:%S'), STRFTIME(ts, 'yyyyMMdd'), LAST(name) OVER (PARTITION BY grp ORDER BY ts)"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
-        "to_date(raw, 'yyyyMMdd'), to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss'), date_format(ts, 'yyyyMMdd')"
+        "to_date(raw), to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss'), to_timestamp(raw2), date_format(ts, 'yyyyMMdd'), last_value(name) OVER (PARTITION BY grp ORDER BY ts)"
     }
 
     it("does not touch shim names inside string literals or comments") {
       val sql =
-        """SELECT 'strptime(raw, ''yyyyMMdd'')' AS raw_txt,
+        """SELECT 'strptime(raw, ''%Y-%m-%d %H:%M:%S'')' AS raw_txt,
           |       -- strftime(ts, 'yyyyMMdd')
           |       strftime(ts, 'yyyyMMdd') AS fmt
-          |FROM src /* CAST(strptime(raw, 'yyyyMMdd') AS DATE) */""".stripMargin
+          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE) */""".stripMargin
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
-        """SELECT 'strptime(raw, ''yyyyMMdd'')' AS raw_txt,
+        """SELECT 'strptime(raw, ''%Y-%m-%d %H:%M:%S'')' AS raw_txt,
           |       -- strftime(ts, 'yyyyMMdd')
           |       date_format(ts, 'yyyyMMdd') AS fmt
-          |FROM src /* CAST(strptime(raw, 'yyyyMMdd') AS DATE) */""".stripMargin
+          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE) */""".stripMargin
     }
 
     it("rewrites nested shim expansions recursively") {
-      val sql = "strftime(CAST(strptime(coalesce(a, b), 'yyyyMMdd') AS DATE), 'yyyy-MM')"
+      val sql = "strftime(CAST(strptime(coalesce(a, b), '%Y-%m-%d') AS DATE), 'yyyy-MM')"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
-        "date_format(to_date(coalesce(a, b), 'yyyyMMdd'), 'yyyy-MM')"
+        "date_format(to_date(coalesce(a, b)), 'yyyy-MM')"
     }
 
     it("is idempotent for the date/time shim translations") {
       val sql =
-        "CAST(strptime(coalesce(a, b), 'yyyyMMdd') AS DATE), strptime(raw, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd')"
+        "CAST(strptime(coalesce(a, b), '%Y-%m-%d') AS DATE), CAST(strptime(raw, 'yyyyMMdd') AS DATE), strptime(raw2, '%Y-%m-%d %H:%M:%S'), strptime(raw3, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd'), last(name) OVER (PARTITION BY grp ORDER BY ts)"
       val once  = LptsSparkDialect.translate(sql)
       val twice = LptsSparkDialect.translate(once)
       twice shouldBe once

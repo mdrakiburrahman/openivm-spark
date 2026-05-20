@@ -149,12 +149,15 @@ object LptsSparkDialect {
     * inlined DuckDB-side body unless we translate it back here.
     *
     * Current back-translations:
-    *   - `regexp_matches(s, p)`               -> `regexp_like(s, p)`
-    *   - `CAST(strptime(s, fmt) AS DATE)`     -> `to_date(s, fmt)`
-    *   - `strptime(s, fmt)`                   -> `to_timestamp(s, fmt)`
-    *   - `strftime(d, fmt)`                   -> `date_format(d, fmt)`
+    *   - `regexp_matches(s, p)`                    -> `regexp_like(s, p)`
+    *   - `CAST(strptime(s, '%Y-%m-%d') AS DATE)`  -> `to_date(s)`
+    *   - `CAST(strptime(s, fmt) AS DATE)`         -> `to_date(s, fmt)`
+    *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`       -> `to_timestamp(s)`
+    *   - `strptime(s, fmt)`                       -> `to_timestamp(s, fmt)`
+    *   - `strftime(d, fmt)`                       -> `date_format(d, fmt)`
+    *   - `last(expr) OVER (...)`                  -> `last_value(expr) OVER (...)`
     *
-    * The 2-arg date/time rewrites use the shared quote/comment-aware scanner in
+    * These shim rewrites use the shared quote/comment-aware scanner in
     * [[SparkFunctionShimSql]] so only full call-shapes are rewritten, never
     * text inside string literals or comments.
     */
@@ -164,7 +167,7 @@ object LptsSparkDialect {
     // (`regexp_matches(s, p)`) gets inlined by openivm's LPTS serializer
     // — undo that here so Spark's analyzer binds against the built-in.
     val regexpMatches = """(?i)\bregexp_matches\s*\(""".r
-    SparkFunctionShimSql.rewriteInlinedTwoArgDateFns(
+    SparkFunctionShimSql.rewriteInlinedSparkShimCalls(
       regexpMatches.replaceAllIn(sql, "regexp_like(")
     )
   }

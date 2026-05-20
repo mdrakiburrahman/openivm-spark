@@ -20,49 +20,89 @@ private[compiler] object SparkFunctionShimSql {
     def args(sql: String): String = sql.substring(openParen + 1, closeParen)
   }
 
-  private val twoArgDateFnRenames: Map[String, String] = Map(
-    "to_date"      -> "__sparkfn_to_date",
-    "to_timestamp" -> "__sparkfn_to_timestamp",
-    "date_format"  -> "__sparkfn_date_format"
+  private final case class RenameRule(
+      replacementByTopLevelCommaCount: Map[Int, String]
+  ) {
+    def replacementFor(call: FunctionCall): Option[String] =
+      replacementByTopLevelCommaCount.get(call.topLevelCommaCount)
+  }
+
+  private val OneArgToDateLiteral      = "'%Y-%m-%d'"
+  private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
+
+  private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
+    "to_date" -> RenameRule(
+      Map(
+        0 -> "__sparkfn_to_date_1arg",
+        1 -> "__sparkfn_to_date"
+      )
+    ),
+    "to_timestamp" -> RenameRule(
+      Map(
+        0 -> "__sparkfn_to_timestamp_1arg",
+        1 -> "__sparkfn_to_timestamp"
+      )
+    ),
+    "date_format" -> RenameRule(
+      Map(
+        1 -> "__sparkfn_date_format"
+      )
+    ),
+    "last_value" -> RenameRule(
+      Map(
+        1 -> "__sparkfn_last_value"
+      )
+    )
   )
 
-  /** Pre-pass for the compile bridge: rename Spark's 2-arg date/time functions
-    * to collision-free `__sparkfn_*` spellings before the SQL reaches DuckDB.
+  /** Pre-pass for the compile bridge: rename Spark function spellings that
+    * DuckDB would otherwise parse or bind incompatibly to collision-free
+    * `__sparkfn_*` spellings before the SQL reaches DuckDB.
     *
     * Only the function NAME is rewritten; argument text is preserved verbatim.
-    * 1-arg `to_date(...)` / `to_timestamp(...)` calls are left untouched.
+    * Current coverage:
+    *   - 1-arg / 2-arg `to_date(...)`
+    *   - 1-arg / 2-arg `to_timestamp(...)`
+    *   - 2-arg `date_format(...)`
+    *   - 2-arg `last_value(expr, ignoreNulls)`
     */
-  def renameTwoArgDateFns(sql: String): String =
+  def renameSparkFunctionShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
       if (!isIdentifierStart(sql.charAt(i)) || !hasLeftIdentifierBoundary(sql, i)) None
       else {
         val identEnd = readIdentifierEnd(sql, i)
         val lower    = sql.substring(i, identEnd).toLowerCase(Locale.ROOT)
-        twoArgDateFnRenames.get(lower).flatMap { replacement =>
+        sparkFunctionRenameRules.get(lower).flatMap { rule =>
           parseFunctionCall(sql, identEnd)
-            .filter(_.topLevelCommaCount == 1)
-            .map(_ => identEnd -> replacement)
+            .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
         }
       }
     }
 
   /** Post-pass for the LPTS serializer: reverse the inlined DuckDB macro bodies
-    * back to Spark's original 2-arg date/time spellings.
+    * back to Spark's original shim spellings.
     *
     * Rewrites:
-    *   - `CAST(strptime(s, fmt) AS DATE)` -> `to_date(s, fmt)`
-    *   - `strptime(s, fmt)`               -> `to_timestamp(s, fmt)`
-    *   - `strftime(d, fmt)`               -> `date_format(d, fmt)`
+    *   - `CAST(strptime(s, '%Y-%m-%d') AS DATE)` -> `to_date(s)`
+    *   - `CAST(strptime(s, fmt) AS DATE)`        -> `to_date(s, fmt)`
+    *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`      -> `to_timestamp(s)`
+    *   - `strptime(s, fmt)`                      -> `to_timestamp(s, fmt)`
+    *   - `strftime(d, fmt)`                      -> `date_format(d, fmt)`
+    *   - `last(expr) OVER (...)`                 -> `last_value(expr) OVER (...)`
     *
-    * Nested shim expansions are rewritten recursively so expressions like
+    * The 1-arg date/time rewrites only trigger when the format literal matches
+    * the exact shim body registered by
+    * [[OpenIvmCompiler.sparkFunctionShimsPrologue]]. Nested shim expansions are
+    * rewritten recursively so expressions like
     * `strftime(CAST(strptime(x, f) AS DATE), g)` become
     * `date_format(to_date(x, f), g)`.
     */
-  def rewriteInlinedTwoArgDateFns(sql: String): String =
+  def rewriteInlinedSparkShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
       parseCastStrptimeAsDate(sql, i)
-        .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp"))
+        .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
+        .orElse(parseWindowFunctionNameRewrite(sql, i, "last", "last_value"))
     }
 
   private def parseCastStrptimeAsDate(sql: String, start: Int): Option[(Int, String)] =
@@ -84,8 +124,8 @@ private[compiler] object SparkFunctionShimSql {
                 strptimeCall.topLevelCommaCount == 1
             if (!typeOk) None
             else {
-              val args = rewriteInlinedTwoArgDateFns(strptimeCall.args(sql))
-              Some((castCall.closeParen + 1, s"to_date($args)"))
+              rewriteSparkDateCall(sql, strptimeCall, "to_date", Some(OneArgToDateLiteral))
+                .map(replacement => (castCall.closeParen + 1, replacement))
             }
           }
         }
@@ -96,14 +136,113 @@ private[compiler] object SparkFunctionShimSql {
       sql: String,
       start: Int,
       duckdbName: String,
-      sparkName: String
+      sparkName: String,
+      oneArgLiteral: Option[String] = None
   ): Option[(Int, String)] =
     parseFunctionCallAt(sql, start, duckdbName)
       .filter(_.topLevelCommaCount == 1)
-      .map { call =>
-        val args = rewriteInlinedTwoArgDateFns(call.args(sql))
-        (call.closeParen + 1, s"$sparkName($args)")
+      .flatMap { call =>
+        rewriteSparkDateCall(sql, call, sparkName, oneArgLiteral)
+          .map(replacement => (call.closeParen + 1, replacement))
       }
+
+  private def parseWindowFunctionNameRewrite(
+      sql: String,
+      start: Int,
+      duckdbName: String,
+      sparkName: String
+  ): Option[(Int, String)] =
+    if (!isIdentifierStart(sql.charAt(start)) || !hasLeftIdentifierBoundary(sql, start)) None
+    else {
+      val nameEnd = start + duckdbName.length
+      if (nameEnd > sql.length || !sql.regionMatches(true, start, duckdbName, 0, duckdbName.length)) None
+      else if (!hasRightIdentifierBoundary(sql, nameEnd)) None
+      else {
+        parseFunctionCall(sql, nameEnd)
+          .filter(_.topLevelCommaCount == 0)
+          .filter(call => hasOverClause(sql, call.closeParen + 1))
+          .map(_ => nameEnd -> sparkName)
+      }
+    }
+
+  private def rewriteSparkDateCall(
+      sql: String,
+      call: FunctionCall,
+      sparkName: String,
+      oneArgLiteral: Option[String]
+  ): Option[String] =
+    splitTopLevelArgs(sql, call).map { argRanges =>
+      oneArgLiteral
+        .filter(literal => argRanges.size == 2 && argEqualsSingleQuotedLiteral(sql, argRanges(1), literal))
+        .map { _ =>
+          val expr = rewriteInlinedSparkShimCalls(sql.substring(argRanges.head._1, argRanges.head._2))
+          s"$sparkName($expr)"
+        }
+        .getOrElse {
+          val args = rewriteInlinedSparkShimCalls(call.args(sql))
+          s"$sparkName($args)"
+        }
+    }
+
+  private def hasOverClause(sql: String, start: Int): Boolean = {
+    val overStart = skipTriviaForward(sql, start, sql.length)
+    overStart < sql.length &&
+    startsWithKeyword(sql, overStart, "OVER") &&
+    hasLeftIdentifierBoundary(sql, overStart) &&
+    hasRightIdentifierBoundary(sql, overStart + "OVER".length)
+  }
+
+  private def splitTopLevelArgs(sql: String, call: FunctionCall): Option[Seq[(Int, Int)]] = {
+    val args     = scala.collection.mutable.ArrayBuffer.empty[(Int, Int)]
+    var depth    = 1
+    var argStart = call.openParen + 1
+    var i        = argStart
+    while (i < call.closeParen) {
+      if (startsLineComment(sql, i)) {
+        i = consumeLineComment(sql, i).min(call.closeParen)
+      } else if (startsBlockComment(sql, i)) {
+        i = consumeBlockComment(sql, i).min(call.closeParen)
+      } else {
+        sql.charAt(i) match {
+          case '\'' => i = consumeSingleQuoted(sql, i).min(call.closeParen)
+          case '"'  => i = consumeDoubleQuoted(sql, i).min(call.closeParen)
+          case '(' =>
+            depth += 1
+            i += 1
+          case ')' =>
+            depth -= 1
+            i += 1
+          case ',' if depth == 1 =>
+            args += ((argStart, i))
+            argStart = i + 1
+            i += 1
+          case _ =>
+            i += 1
+        }
+      }
+    }
+    if (depth != 1) None
+    else {
+      args += ((argStart, call.closeParen))
+      Some(args.toSeq)
+    }
+  }
+
+  private def argEqualsSingleQuotedLiteral(
+      sql: String,
+      argRange: (Int, Int),
+      expectedLiteral: String
+  ): Boolean = {
+    val (start, endExclusive) = argRange
+    val literalStart          = skipTriviaForward(sql, start, endExclusive)
+    if (literalStart >= endExclusive || sql.charAt(literalStart) != '\'') false
+    else {
+      val literalEnd = consumeSingleQuoted(sql, literalStart).min(endExclusive)
+      literalEnd <= endExclusive &&
+      sql.substring(literalStart, literalEnd) == expectedLiteral &&
+      isTriviaOnly(sql, literalEnd, endExclusive)
+    }
+  }
 
   private def rewriteOutsideProtected(sql: String)(matcher: Int => Option[(Int, String)]): String = {
     val out = new StringBuilder(sql.length)

@@ -9,8 +9,9 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.util.UUID
 
-/** Parity coverage for the compile-bridge shims that keep Spark's 2-arg
-  * `to_date`, `to_timestamp`, and `date_format` on the incremental path.
+/** Parity coverage for the compile-bridge shims that keep Spark's 1-arg / 2-arg
+  * `to_date`, 2-arg `to_timestamp`, `date_format`, and the Spark-only
+  * `last_value(expr, ignoreNulls)` window form on the incremental path.
   *
   * All table / MV names are prefixed with `cbdf_` so parallel forked specs do
   * not collide on Delta warehouse paths.
@@ -80,6 +81,26 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
     meta.refreshTypeName should not equal "FULL_REFRESH"
   }
 
+  describe("compile-bridge shim: to_date(raw)") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH") {
+      spark.sql("CREATE TABLE cbdf_to_date_iso_src (id INT, trade_date_raw STRING) USING DELTA")
+      spark.sql(
+        "INSERT INTO cbdf_to_date_iso_src VALUES (1, '2024-01-01'), (2, '2024-01-15'), (3, '2024-02-01')"
+      )
+
+      val mvName   = "cbdf_mv_to_date_iso"
+      val viewBody = "SELECT id, to_date(trade_date_raw) AS trade_date FROM cbdf_to_date_iso_src"
+      spark.sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+
+      spark.sql("INSERT INTO cbdf_to_date_iso_src VALUES (4, '2024-02-15'), (5, '2024-03-01')")
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
   describe("compile-bridge shim: to_date(raw, fmt)") {
     it("keeps the MV incremental and correct after INSERT + REFRESH") {
       spark.sql("CREATE TABLE cbdf_to_date_src (id INT, trade_date_raw STRING) USING DELTA")
@@ -141,6 +162,41 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
 
       spark.sql(
         "INSERT INTO cbdf_date_format_src VALUES (4, TIMESTAMP'2024-01-03 00:00:00'), (5, TIMESTAMP'2024-01-03 12:34:56')"
+      )
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
+  describe("compile-bridge shim: last_value(expr, ignoreNulls)") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH when the data is null-free") {
+      spark.sql(
+        "CREATE TABLE cbdf_last_value_src (id INT, customer_id INT, effective_ts TIMESTAMP, status STRING) USING DELTA"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_last_value_src VALUES " +
+          "(1, 10, TIMESTAMP'2024-01-01 09:00:00', 'bronze'), " +
+          "(2, 10, TIMESTAMP'2024-01-02 09:00:00', 'silver'), " +
+          "(3, 20, TIMESTAMP'2024-01-01 12:00:00', 'starter')"
+      )
+
+      // The compile bridge intentionally drops `ignoreNulls`; keep the fixture
+      // null-free so Spark's 1-arg `last_value(expr)` remains bag-equal to the
+      // user's original 2-arg query.
+      val mvName = "cbdf_mv_last_value"
+      val viewBody =
+        "SELECT id, customer_id, effective_ts, " +
+          "last_value(status, true) OVER (PARTITION BY customer_id ORDER BY effective_ts) AS carried_status " +
+          "FROM cbdf_last_value_src"
+      spark.sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+
+      spark.sql(
+        "INSERT INTO cbdf_last_value_src VALUES " +
+          "(4, 10, TIMESTAMP'2024-01-03 09:00:00', 'gold'), " +
+          "(5, 20, TIMESTAMP'2024-01-02 12:00:00', 'growth')"
       )
       refreshMv(mvName)
       assertIncremental(mvName)
