@@ -138,6 +138,40 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stmtC should include("`mydb`.`mv_r`")
       stmtC should not include "openivm_data_mv_r"
     }
+
+    it("uses the MERGE alias for column references when the target has an alias") {
+      // Regression: openivm compiler may emit
+      //   MERGE INTO openivm_data_<view> AS v USING openivm_delta_<view> AS _d
+      //   ON _d.col IS NOT DISTINCT FROM openivm_data_<view>.col
+      // The fully-qualified table name in the ON clause must become the alias,
+      // otherwise Spark raises DELTA_MERGE_UNRESOLVED_EXPRESSION.
+      val aliasedMergeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, total, openivm_multiplicity FROM memory.main.openivm_delta_sales
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_mv_r AS v USING openivm_delta_mv_r AS _d
+          |ON _d.openivm_left_key IS NOT DISTINCT FROM openivm_data_mv_r.openivm_left_key
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_mv_r SELECT region, total FROM memory.main.sales;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = aliasedMergeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("MERGE INTO")).get
+      // The ON clause must reference the alias 'v', not the full MV name
+      mergeStmt should include("v.openivm_left_key")
+      mergeStmt should not include "`mydb`.`mv_r`.openivm_left_key"
+      // The MERGE INTO target must still use the full MV name
+      mergeStmt should include("MERGE INTO `mydb`.`mv_r` v")
+    }
   }
 
   // ── 5. openivm_delta_mv_r → delta.`<viewDeltaPath>` ───────────────────────

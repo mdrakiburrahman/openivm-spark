@@ -704,7 +704,22 @@ object SparkRefreshRewriter {
     val dataViewRe = ("(?i)\\bopenivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     val mvSqlName = backtickMvName(mvName)
-    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(mvSqlName))
+
+    // Detect the MERGE target alias: `MERGE INTO openivm_data_<view> [AS] <alias> USING`.
+    // When an alias is present, Spark/Delta requires column references in the
+    // ON / WHEN clauses to use the alias — not the fully-qualified table name.
+    val mergeAliasRe = ("(?is)\\bMERGE\\s+INTO\\s+openivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) +
+      "\\s+(?:AS\\s+)?(\\w+)(?=\\s+USING\\b)").r
+
+    mergeAliasRe.findFirstMatchIn(s) match {
+      case Some(m) =>
+        val alias = m.group(1)
+        s = s.substring(0, m.start) + s"MERGE INTO $mvSqlName $alias" + s.substring(m.end)
+        s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(alias))
+      case None =>
+        s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(mvSqlName))
+    }
 
     s
   }
