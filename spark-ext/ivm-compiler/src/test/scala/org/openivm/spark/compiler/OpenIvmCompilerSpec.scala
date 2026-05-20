@@ -91,6 +91,41 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  it should "emit signed cascade-delta SQL for WINDOW_PARTITION recomputes" in {
+    val salesWpSchema = StructType.fromDDL("id INT, region STRING, amount INT")
+    val req = CompileRequest(
+      viewName = "mv_wp_cascade",
+      viewSql =
+        "SELECT id, region, amount, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount, id) AS rn FROM sales_wp",
+      sources = Map("sales_wp" -> salesWpSchema)
+    )
+    val result = sharedCompiler.compile(req)
+    import org.openivm.spark.common.SparkRefreshRewriter
+    result.refreshType shouldBe 5
+    result.refreshTypeName shouldBe "WINDOW_PARTITION"
+    result.sql should include("CREATE OR REPLACE TEMP TABLE openivm_old_mv_wp_cascade")
+    result.sql should include("CREATE OR REPLACE TEMP TABLE openivm_new_mv_wp_cascade")
+    result.sql.toUpperCase should include("INSERT INTO OPENIVM_DELTA_MV_WP_CASCADE")
+    SparkRefreshRewriter.hasRealDelta(result.sql, "mv_wp_cascade") shouldBe true
+  }
+
+  it should "emit signed cascade-delta SQL for GROUP_RECOMPUTE recomputes" in {
+    val salesGrSchema = StructType.fromDDL("id INT, region STRING, amount INT")
+    val req = CompileRequest(
+      viewName = "mv_gr_cascade",
+      viewSql = "SELECT region, SUM(DISTINCT amount) AS total_distinct FROM sales_gr GROUP BY region",
+      sources = Map("sales_gr" -> salesGrSchema)
+    )
+    val result = sharedCompiler.compile(req)
+    import org.openivm.spark.common.SparkRefreshRewriter
+    result.refreshType shouldBe 6
+    result.refreshTypeName shouldBe "GROUP_RECOMPUTE"
+    result.sql should include("CREATE OR REPLACE TEMP TABLE openivm_old_mv_gr_cascade")
+    result.sql should include("CREATE OR REPLACE TEMP TABLE openivm_new_mv_gr_cascade")
+    result.sql.toUpperCase should include("INSERT INTO OPENIVM_DELTA_MV_GR_CASCADE")
+    SparkRefreshRewriter.hasRealDelta(result.sql, "mv_gr_cascade") shouldBe true
+  }
+
   // ── Test 4: SELECT DISTINCT compile ──────────────────────────────────────
   //
   // OpenIVM internally represents top-level SELECT DISTINCT as a GROUP BY

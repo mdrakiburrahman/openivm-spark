@@ -19,23 +19,32 @@ import java.util.UUID
   *   - GROUP BY ROLLUP / CUBE / GROUPING SETS
   *   - UNION over aggregates
   *
-  * openivm emits a four-statement program scoped to affected groups:
+  * With openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` and
+  * `openivm_emit_cascade_delta_for_recompute=true`, GROUP_RECOMPUTE emits an
+  * extended affected-groups program:
   *
   *   1. `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS
   *        SELECT DISTINCT <keys> FROM (<delta-substituted view query>);`
-  *   2. `DELETE FROM openivm_data_<view> AS openivm_tgt
+  *   2. `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS SELECT * FROM
+  *        openivm_data_<view> WHERE EXISTS (… openivm_affected_<view> …);`
+  *   3. `CREATE OR REPLACE TEMP TABLE openivm_new_<view> AS SELECT * FROM
+  *        (<view_query_sql>) WHERE EXISTS (… openivm_affected_<view> …);`
+  *   4. `DELETE FROM openivm_data_<view> AS openivm_tgt
   *        WHERE EXISTS (SELECT 1 FROM openivm_affected_<view> AS openivm_aff
   *                      WHERE openivm_aff.k IS NOT DISTINCT FROM openivm_tgt.k);`
-  *   3. `INSERT INTO openivm_data_<view>
-  *        SELECT * FROM (<view_query_sql>) AS openivm_tgt
-  *        WHERE EXISTS (SELECT 1 FROM openivm_affected_<view> AS openivm_aff
-  *                      WHERE openivm_aff.k IS NOT DISTINCT FROM openivm_tgt.k);`
-  *   4. `DROP TABLE IF EXISTS openivm_affected_<view>;`
+  *   5. `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>;`
+  *   6. `INSERT INTO openivm_delta_<view>
+  *        SELECT *, -1, CURRENT_TIMESTAMP FROM openivm_old_<view>
+  *        UNION ALL
+  *        SELECT *,  1, CURRENT_TIMESTAMP FROM openivm_new_<view>;`
+  *   7. `DROP TABLE IF EXISTS openivm_affected_<view>;`
+  *      `DROP TABLE IF EXISTS openivm_old_<view>;`
+  *      `DROP TABLE IF EXISTS openivm_new_<view>;`
   *
-  * The Spark rewriter has dedicated classifier kinds for the CREATE/DROP
-  * scaffolding (TEMP TABLE → TEMP VIEW, EXCLUDE → EXCEPT, timestamp predicate
-  * strip), and reuses the existing ScalarDeleteMv / ScalarFullRecomputeInsert
-  * paths for the data-modifying statements 2 and 3.
+  * The Spark rewriter has dedicated classifier kinds for the affected-key
+  * scaffolding plus the old/new snapshot objects. The local MV refresh still
+  * depends on the affected-group DELETE + INSERT; the signed view-delta in
+  * step 6 is the downstream cascade feed.
   *
   * == Observed refreshType per test ==
   *

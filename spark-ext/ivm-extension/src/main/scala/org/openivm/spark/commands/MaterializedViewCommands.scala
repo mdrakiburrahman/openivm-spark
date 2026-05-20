@@ -406,32 +406,29 @@ case class CreateMaterializedViewCommand(
     // refresh re-executes the original view query from live tables instead of silently
     // performing a no-op incremental update.
     //
-    // WINDOW_PARTITION (RefreshType 5) is EXEMPT from the `hasRealDelta` demotion.
-    // openivm's `CompileWindowRecompute()` (`src/upsert/refresh_compiler_aux.cpp:265-291`)
-    // and `BuildWindowPartitionRefresh()` (`src/upsert/refresh_window.cpp:353-385`) emit a
-    // partition-scoped DELETE+INSERT directly against `openivm_data_<view>`, **without**
-    // an `INSERT INTO openivm_delta_<view>` preamble — there is no view delta to write,
-    // because the affected partitions are derived from the source delta by name (the
-    // partition column appears verbatim in both tables). The absence of the view-delta
-    // INSERT is the WINDOW_PARTITION shape, not a "no-op placeholder". The rewriter's
-    // PartitionScopedDelete + PartitionScopedInsert kinds handle this shape directly.
+    // WINDOW_PARTITION (RefreshType 5) is still EXEMPT from the `hasRealDelta`
+    // demotion, but the reason changed in openivm
+    // `4471f4e929fd3b21ac55ea0c47249d4716853c98`
+    // ("feat: emit openivm_delta_<view> from recompute paths"). With
+    // `openivm_emit_cascade_delta_for_recompute=true`,
+    // `CompileWindowRecompute()` now snapshots the affected pre-refresh rows and
+    // recomputed post-refresh rows before mutating `openivm_data_<view>`, then
+    // appends them as `-1/+1` rows into `openivm_delta_<view>`. The PRIMARY
+    // execution shape is still the partition-scoped DELETE+INSERT that refreshes
+    // this MV in place; the new view-delta exists so downstream MV-over-MV chains
+    // can consume the recompute incrementally. The rewriter therefore handles
+    // both pieces: the direct DELETE/INSERT plus the auxiliary cascade delta.
     //
-    // GROUP_RECOMPUTE (RefreshType 6) is also EXEMPT for the same structural reason.
-    // openivm's `CompileGroupRecompute()` (`src/upsert/refresh_compiler.cpp:849-934`)
-    // emits a four-statement program:
-    //   1. `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS SELECT DISTINCT
-    //      <keys> FROM (<delta-substituted view query>);`
-    //   2. `DELETE FROM openivm_data_<view> WHERE EXISTS (… openivm_affected_<view> …);`
-    //   3. `INSERT INTO openivm_data_<view> SELECT * FROM (<view_body>) WHERE EXISTS
-    //      (… openivm_affected_<view> …);`
-    //   4. `DROP TABLE IF EXISTS openivm_affected_<view>;`
-    // No `INSERT INTO openivm_delta_<view>` is emitted (the recompute reads the live
-    // source via `memory.main.<src>`, not a view-delta staging table), so the generic
-    // `hasRealDelta` heuristic would otherwise demote every GROUP_RECOMPUTE view to
-    // FULL_REFRESH. The rewriter's GroupRecomputeAffectedCreate +
-    // GroupRecomputeAffectedDrop kinds (plus the shared ScalarDeleteMv / ScalarFullRecomputeInsert
-    // paths) handle the actual program. See CLAUDE.md: "Do not fix OpenIVM correctness
-    // bugs by avoiding incrementalization."
+    // GROUP_RECOMPUTE (RefreshType 6) likewise stopped being a "no view-delta"
+    // exception once the same pragma is enabled. `CompileGroupRecompute()` still
+    // materialises the affected-key set and refreshes the MV by DELETEing and
+    // re-INSERTing those groups, but openivm now also snapshots the old/new group
+    // rows and emits a signed `INSERT INTO openivm_delta_<view>` companion. That
+    // extra delta is not the authoritative local refresh mechanism — it is the
+    // downstream cascade feed. The Spark side therefore keeps the dedicated
+    // GROUP_RECOMPUTE rewrites for the affected-group program while also
+    // persisting the new signed view-delta. See CLAUDE.md: "Do not fix OpenIVM
+    // correctness bugs by avoiding incrementalization."
     //
     // Top-K views (`ORDER BY … [LIMIT k] [OFFSET m]`) are also routed to FULL_REFRESH.
     // openivm classifies the *inner* stripped query as SIMPLE_PROJECTION (2) or
@@ -480,7 +477,7 @@ case class CreateMaterializedViewCommand(
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
     val nonCascadeUpstreams: Seq[String] =
       upstreamMvByQual.toSeq.collect {
-        case (q, m) if !RefreshTypeCode.emitsCascadeViewDelta(m.refreshType) => q
+        case (q, m) if !m.emitsCascadeViewDelta => q
       }
     // ── Effective refresh-type classification with structured logging ──────
     //
@@ -489,13 +486,21 @@ case class CreateMaterializedViewCommand(
     // see WHY each MV ended up FULL_REFRESH in the spark-ext / dbt-server
     // container log. The reason keys mirror the if-else branches:
     //   - top_k                       Top-K view (ORDER BY ... LIMIT ...) forced to FULL_REFRESH
-    //   - non_cascade_upstream        Upstream MV's refresh type doesn't emit `openivm_delta_<view>`
-    //                                 (WINDOW_PARTITION, GROUP_RECOMPUTE, DISTINCT_INCREMENTAL,
-    //                                 SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH). There is no
-    //                                 persisted upstream delta to consume incrementally, so
-    //                                 downstream must also FullRefresh.
-    //   - window_partition_kept       compiler classified WINDOW_PARTITION; kept (no demotion)
+    //   - non_cascade_upstream        Upstream MV instance does NOT emit a
+    //                                 persisted `openivm_delta_<view>` downstream can
+    //                                 consume incrementally (e.g. SIMPLE_AGGREGATE,
+    //                                 DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K,
+    //                                 FULL_REFRESH, or a recompute MV whose compiled SQL
+    //                                 lacked a real view-delta). WINDOW_PARTITION /
+    //                                 GROUP_RECOMPUTE only escape this bucket when their
+    //                                 concrete compiled SQL actually emitted the cascade
+    //                                 delta guarded by `_ivm_emits_cascade_view_delta`.
+    //   - window_partition_kept       compiler classified WINDOW_PARTITION; kept
+    //                                 (primary refresh is still partition recompute,
+    //                                 now with an auxiliary cascade view-delta)
     //   - group_recompute_kept        compiler classified GROUP_RECOMPUTE; kept
+    //                                 (affected-group recompute plus auxiliary
+    //                                 cascade view-delta)
     //   - having_pred_empty           AggregateHaving with no extractable HAVING predicate
     //   - no_real_delta               openivm emitted only empty-placeholder delta
     //   - kept                        compiled type is preserved verbatim (incremental MV-over-MV
@@ -524,11 +529,15 @@ case class CreateMaterializedViewCommand(
     val effectiveRefreshTypeName =
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
       else compiled.refreshTypeName
+    val emitsCascadeViewDelta =
+      RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+        SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 
     {
       val msg =
         s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${compiled.refreshTypeName}' " +
-          s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason'"
+          s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
+          s"emits_cascade_view_delta='$emitsCascadeViewDelta'"
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh && compiled.refreshType != RefreshTypeCode.FullRefresh)
         logError(msg)
       else
@@ -548,17 +557,19 @@ case class CreateMaterializedViewCommand(
       if (isHavingViewIncremental) analyzed.output.map(_.name) else Nil
 
     // Persist internal metadata alongside any user-provided properties
-    val baseProps  = Map("_ivm_group_keys" -> groupKeys.mkString(","))
-    val countProp  = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
-    val havingProp = havingPred.map(p => "_ivm_having_pred" -> p).toMap
+    val baseProps         = Map("_ivm_group_keys" -> groupKeys.mkString(","))
+    val countProp         = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
+    val havingProp        = havingPred.map(p => "_ivm_having_pred" -> p).toMap
+    val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
     // REFRESH ignores any staging rows that pre-date this MV (otherwise we'd
     // double-apply upstream view-deltas this MV already absorbed via the CTAS).
     // See `StagingCatalog.currentWatermarks` + `StagingCatalog.collectFor`.
     val watermarks     = StagingCatalog.currentWatermarks(spark, qualNames)
     val watermarkProps = MvMetadata.watermarkProperties(watermarks)
-    val allProps       = properties ++ baseProps ++ countProp ++ havingProp ++ watermarkProps
-    val now            = new Timestamp(System.currentTimeMillis())
+    val allProps =
+      properties ++ baseProps ++ countProp ++ havingProp ++ cascadeDeltaProps ++ watermarkProps
+    val now = new Timestamp(System.currentTimeMillis())
 
     // Fingerprint the current source schemas + every upstream MV's identity
     // hash. Captures schema drift AND upstream-body drift (DROP + recreate
@@ -835,7 +846,8 @@ case class RefreshMaterializedViewCommand(
         // when the user's view body referenced a Hive-qualified table.
         // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
         // Spark would resolve `<short>` against the current_schema.
-        sourceQualifiedNames = shortToQual
+        sourceQualifiedNames = shortToQual,
+        mvVersionBeforeRefresh = Some(meta.lastVersion)
       )
 
       try {
@@ -891,7 +903,7 @@ case class RefreshMaterializedViewCommand(
         // becomes a separate trigger key so `StagingCatalog.collectFor`
         // (which matches `base_table` exactly against the downstream's
         // `meta.sourceTables`) finds it.
-        if (RefreshTypeCode.emitsCascadeViewDelta(meta.refreshType)) {
+        if (meta.emitsCascadeViewDelta) {
           val mvShortName = name.identifier
           val triggerKeys: Set[String] = MvCatalog
             .list(spark)
@@ -955,21 +967,20 @@ case class RefreshMaterializedViewCommand(
     * method ensures the downstream MV's next REFRESH does not short-circuit
     * on the `stagingDeltas.isEmpty` guard at the top of [[runUnderLock]].
     *
-    * Two paths depending on `meta.refreshType`:
+    * Two paths depending on `meta.emitsCascadeViewDelta`:
     *
-    *  - **Cascade-delta-capable** (per [[RefreshTypeCode.emitsCascadeViewDelta]]
-    *    — AGGREGATE_GROUP, SIMPLE_AGGREGATE, SIMPLE_PROJECTION,
-    *    AGGREGATE_HAVING): nothing to synthesise here — the
+    *  - **Cascade-delta-capable** (per [[MvMetadata.emitsCascadeViewDelta]]):
+    *    nothing to synthesise here — the
     *    `MV_VIEW_DELTA` staging row was already recorded inside the
     *    incremental refresh's success block ([[runUnderLock]] step 3).
     *    Downstream MVs whose `MvMetadata.sourceTables` references this MV
     *    pick up that row via `StagingCatalog.collectFor`.
     *
-    *  - **NOT cascade-delta-capable** (FullRefresh, WINDOW_PARTITION,
-    *    GROUP_RECOMPUTE, DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K):
-    *    these refresh types do not write `INSERT INTO openivm_delta_<view>`,
-    *    so there is no persisted upstream delta downstream can consume.
-    *    Synthesise a **unique per-refresh trigger** row so the downstream's
+    *  - **NOT cascade-delta-capable** (e.g. FullRefresh,
+    *    SIMPLE_AGGREGATE, DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K,
+    *    or a recompute MV whose compiled SQL emitted no real view-delta):
+    *    is no persisted upstream delta downstream can consume. Synthesise a
+    *    **unique per-refresh trigger** row so the downstream's
     *    next REFRESH fires. The unique suffix prevents
     *    `StagingCatalog.record`'s `(base_table, staging_path)` idempotency
     *    key from collapsing multiple consecutive triggers into one row with
@@ -1011,7 +1022,7 @@ case class RefreshMaterializedViewCommand(
     // row is already recorded; emitting an OVERWRITE trigger here would
     // pile a +1 multiplicity full-table delta on top of the +/- signed
     // view-delta and silently double-add downstream rows.
-    if (!RefreshTypeCode.emitsCascadeViewDelta(meta.refreshType)) {
+    if (!meta.emitsCascadeViewDelta) {
       val mvShortName = name.identifier
       val triggerKeys: Set[String] = allMvs
         .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))

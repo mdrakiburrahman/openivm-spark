@@ -194,6 +194,39 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
   }
 
   // ---------------------------------------------------------------------------
+  // Test 8: persisted cascade-delta capability override
+  // ---------------------------------------------------------------------------
+  describe("MvMetadata.emitsCascadeViewDelta") {
+    it("falls back to the refresh-type capability when no property is stored") {
+      sampleMeta("cascade_default")
+        .copy(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          properties = Map.empty
+        )
+        .emitsCascadeViewDelta shouldBe true
+
+      sampleMeta("cascade_full")
+        .copy(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          properties = Map.empty
+        )
+        .emitsCascadeViewDelta shouldBe false
+    }
+
+    it("honors the persisted per-MV override when present") {
+      sampleMeta("cascade_override")
+        .copy(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          properties = MvMetadata.cascadeViewDeltaProperties(false)
+        )
+        .emitsCascadeViewDelta shouldBe false
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Test 11: concurrent writers don't double-insert
   // ---------------------------------------------------------------------------
   describe("MvCatalog concurrent writers") {

@@ -45,9 +45,11 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   ): CompiledRefresh =
     compiler.compile(CompileRequest(viewName = viewName, viewSql = body, sources = sources))
 
-  // ── regexp_like ──────────────────────────────────────────────────────────────
+  // ── regexp_like / 2-arg date-function shims ─────────────────────────────────
 
-  private val textSchema: StructType = StructType.fromDDL("id INT, txt STRING")
+  private val textSchema: StructType    = StructType.fromDDL("id INT, txt STRING")
+  private val rawDateSchema: StructType = StructType.fromDDL("id INT, raw STRING")
+  private val tsSchema: StructType      = StructType.fromDDL("id INT, ts TIMESTAMP")
 
   "shim regexp_like(s, p)" should "compile and emit a non-FULL_REFRESH classification" in {
     val r = compileBody(
@@ -75,10 +77,52 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should not include "regexp_matches"
   }
 
+  "shim to_date(s, fmt)" should "compile, stay incremental, and translate back to Spark to_date" in {
+    val r = compileBody(
+      viewName = "shim_to_date_v1",
+      sources = Map("datesrc" -> rawDateSchema),
+      body = "SELECT id, to_date(raw, 'yyyyMMdd') AS parsed_date FROM datesrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("to_date(")
+    translated should not include "strptime"
+  }
+
+  "shim to_timestamp(s, fmt)" should "compile, stay incremental, and translate back to Spark to_timestamp" in {
+    val r = compileBody(
+      viewName = "shim_to_timestamp_v1",
+      sources = Map("timesrc" -> rawDateSchema),
+      body = "SELECT id, to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss') AS parsed_ts FROM timesrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("to_timestamp(")
+    translated should not include "strptime"
+  }
+
+  "shim date_format(d, fmt)" should "compile, stay incremental, and translate back to Spark date_format" in {
+    val r = compileBody(
+      viewName = "shim_date_format_v1",
+      sources = Map("timesrc" -> tsSchema),
+      body = "SELECT id, date_format(ts, 'yyyyMMdd') AS formatted_ts FROM timesrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("date_format(")
+    translated should not include "strftime"
+  }
+
   // ── sparkFunctionShimsPrologue contract ──────────────────────────────────────
 
-  "sparkFunctionShimsPrologue" should "register the regexp_like shim macro" in {
+  "sparkFunctionShimsPrologue" should "register the regexp_like and __sparkfn_* shim macros" in {
     val p = OpenIvmCompiler.sparkFunctionShimsPrologue
     p should include("CREATE OR REPLACE MACRO regexp_like")
+    p should include("CREATE OR REPLACE MACRO __sparkfn_to_date")
+    p should include("CREATE OR REPLACE MACRO __sparkfn_to_timestamp")
+    p should include("CREATE OR REPLACE MACRO __sparkfn_date_format")
   }
 }

@@ -2,7 +2,7 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{MvCatalog, StagingCatalog, StagingDelta}
+import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, StagingCatalog, StagingDelta}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -327,6 +327,57 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       // Cross-check with EXCEPT ALL in both directions
       mv.exceptAll(groundTruth).count() shouldBe 0L
       groundTruth.exceptAll(mv).count() shouldBe 0L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 11 — downstream demotion uses persisted cascade capability
+  // ---------------------------------------------------------------------------
+  describe("(11) MV-over-MV demotion uses the persisted cascade capability") {
+    it("demotes downstreams and synthesizes OVERWRITE triggers when an upstream opts out of cascade view-delta") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t11(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t11 VALUES ('east', 100), ('west', 200)")
+      spark.sql("CREATE MATERIALIZED VIEW mv_t11_up AS SELECT region, amount FROM sales_t11")
+
+      val upstreamMeta = MvCatalog.lookup(spark, TableIdentifier("mv_t11_up")).get
+      MvCatalog.upsert(
+        spark,
+        upstreamMeta.copy(
+          properties = upstreamMeta.properties ++ MvMetadata.cascadeViewDeltaProperties(false)
+        )
+      )
+
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t11_down AS " +
+          "SELECT region, COUNT(*) AS cnt FROM mv_t11_up GROUP BY region"
+      )
+
+      val downstreamMeta = MvCatalog.lookup(spark, TableIdentifier("mv_t11_down")).get
+      downstreamMeta.refreshType shouldBe RefreshTypeCode.FullRefresh
+      downstreamMeta.refreshTypeName shouldBe "FULL_REFRESH"
+
+      spark.sql("INSERT INTO sales_t11 VALUES ('east', 50), ('north', 300)")
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t11_up")
+
+      val pending = StagingCatalog.collectFor(
+        spark,
+        MvCommandHelper.metaName(downstreamMeta.name),
+        downstreamMeta.sourceTables,
+        downstreamMeta.sourceWatermarks
+      )
+      pending should not be empty
+      pending.map(_.opType).toSet shouldBe Set(StagingDelta.OpTypes.Overwrite)
+
+      noException should be thrownBy {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t11_down")
+      }
+
+      val expected = spark.sql(
+        "SELECT region, COUNT(*) AS cnt FROM mv_t11_up GROUP BY region"
+      )
+      val mv = spark.table("mv_t11_down").select("region", "cnt")
+      mv.exceptAll(expected).count() shouldBe 0L
+      expected.exceptAll(mv).count() shouldBe 0L
     }
   }
 

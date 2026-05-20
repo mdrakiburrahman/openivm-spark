@@ -74,6 +74,11 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       LptsSparkDialect.rewritePostfixCasts("123::BIGINT") shouldBe "CAST(123 AS BIGINT)"
     }
 
+    it("normalises HUGEINT/UHUGEINT postfix casts to BIGINT") {
+      LptsSparkDialect.rewritePostfixCasts("123::HUGEINT, 456::UHUGEINT") shouldBe
+        "CAST(123 AS BIGINT), CAST(456 AS BIGINT)"
+    }
+
     it("rewrites DECIMAL type with precision/scale: col::DECIMAL(10,2)") {
       LptsSparkDialect.rewritePostfixCasts("amount::DECIMAL(10,2)") shouldBe
         "CAST(amount AS DECIMAL(10,2))"
@@ -164,6 +169,11 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     it("normalises VARCHAR to STRING: func(x)::VARCHAR") {
       LptsSparkDialect.rewriteParenthesisedCasts("TRIM(x)::VARCHAR") shouldBe
         "CAST(TRIM(x) AS STRING)"
+    }
+
+    it("normalises HUGEINT/UHUGEINT parenthesised casts to BIGINT") {
+      LptsSparkDialect.rewriteParenthesisedCasts("COALESCE(x, 0)::HUGEINT + NULLIF(y, 0)::UHUGEINT") shouldBe
+        "CAST(COALESCE(x, 0) AS BIGINT) + CAST(NULLIF(y, 0) AS BIGINT)"
     }
 
     it("rewrites multiple func(...)::TYPE occurrences in one pass") {
@@ -407,6 +417,75 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("rewriteBareHugeIntCast") {
+    it("rewrites CAST(... AS HUGEINT/UHUGEINT) to BIGINT") {
+      val sql = "CAST(0 AS HUGEINT), CAST(NULL AS UHUGEINT)"
+      LptsSparkDialect.rewriteBareHugeIntCast(sql) shouldBe
+        "CAST(0 AS BIGINT), CAST(NULL AS BIGINT)"
+    }
+
+    it("is case-insensitive and idempotent") {
+      val sql  = "CAST(v AS hugeint)"
+      val once = LptsSparkDialect.rewriteBareHugeIntCast(sql)
+      once shouldBe "CAST(v AS BIGINT)"
+      LptsSparkDialect.rewriteBareHugeIntCast(once) shouldBe once
+    }
+  }
+
+  describe("rewriteSparkFunctionInlinings") {
+    it("rewrites CAST(strptime(... ) AS DATE) to to_date(...)") {
+      val sql = "CAST(strptime(raw, 'yyyyMMdd') AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_date(raw, 'yyyyMMdd')"
+    }
+
+    it("rewrites bare strptime(... ) to to_timestamp(...)") {
+      val sql = "strptime(raw, 'yyyy-MM-dd HH:mm:ss')"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss')"
+    }
+
+    it("rewrites bare strftime(... ) to date_format(...)") {
+      val sql = "strftime(ts, 'yyyyMMdd')"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "date_format(ts, 'yyyyMMdd')"
+    }
+
+    it("is case-insensitive for the date/time shim bodies") {
+      val sql =
+        "CAST(STRPTIME(raw, 'yyyyMMdd') AS DATE), Strptime(raw, 'yyyy-MM-dd HH:mm:ss'), STRFTIME(ts, 'yyyyMMdd')"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_date(raw, 'yyyyMMdd'), to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss'), date_format(ts, 'yyyyMMdd')"
+    }
+
+    it("does not touch shim names inside string literals or comments") {
+      val sql =
+        """SELECT 'strptime(raw, ''yyyyMMdd'')' AS raw_txt,
+          |       -- strftime(ts, 'yyyyMMdd')
+          |       strftime(ts, 'yyyyMMdd') AS fmt
+          |FROM src /* CAST(strptime(raw, 'yyyyMMdd') AS DATE) */""".stripMargin
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        """SELECT 'strptime(raw, ''yyyyMMdd'')' AS raw_txt,
+          |       -- strftime(ts, 'yyyyMMdd')
+          |       date_format(ts, 'yyyyMMdd') AS fmt
+          |FROM src /* CAST(strptime(raw, 'yyyyMMdd') AS DATE) */""".stripMargin
+    }
+
+    it("rewrites nested shim expansions recursively") {
+      val sql = "strftime(CAST(strptime(coalesce(a, b), 'yyyyMMdd') AS DATE), 'yyyy-MM')"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "date_format(to_date(coalesce(a, b), 'yyyyMMdd'), 'yyyy-MM')"
+    }
+
+    it("is idempotent for the date/time shim translations") {
+      val sql =
+        "CAST(strptime(coalesce(a, b), 'yyyyMMdd') AS DATE), strptime(raw, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd')"
+      val once  = LptsSparkDialect.translate(sql)
+      val twice = LptsSparkDialect.translate(once)
+      twice shouldBe once
+    }
+  }
+
   // ── 5. translate pipeline ────────────────────────────────────────────────────
   describe("translate") {
     it("passes through SQL with no DuckDB-isms unchanged") {
@@ -433,6 +512,13 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     it("rewrites count_star() to COUNT(*) as part of the pipeline") {
       LptsSparkDialect.translate("SELECT count_star() FROM t") shouldBe
         "SELECT COUNT(*) FROM t"
+    }
+
+    it("normalises DuckDB HUGEINT casts that leak through compiled SQL") {
+      val input =
+        "CAST(CASE WHEN vol = CAST(0 AS HUGEINT) THEN CAST(NULL AS UHUGEINT) ELSE vol END AS DOUBLE)"
+      LptsSparkDialect.translate(input) shouldBe
+        "CAST(CASE WHEN vol = CAST(0 AS BIGINT) THEN CAST(NULL AS BIGINT) ELSE vol END AS DOUBLE)"
     }
 
     it("leaves IS NOT DISTINCT FROM unchanged") {

@@ -254,10 +254,72 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  // ── 9. hasRealDelta detection ─────────────────────────────────────────────
+  // ── 9. Recompute-cascade snapshot rewrite ────────────────────────────────
+  describe("pragma-gated recompute cascade rewrite") {
+    it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
+      val windowCascadeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |CREATE OR REPLACE TEMP TABLE openivm_old_mv_r AS
+          |SELECT * FROM openivm_data_mv_r
+          |WHERE region IN (SELECT DISTINCT region FROM openivm_delta_sales WHERE openivm_timestamp > '2026-01-01 00:00:00'::TIMESTAMP);
+          |CREATE OR REPLACE TEMP TABLE openivm_new_mv_r AS
+          |SELECT * FROM (SELECT id, region, amount FROM memory.main.sales) openivm_recompute
+          |WHERE region IN (SELECT DISTINCT region FROM openivm_delta_sales WHERE openivm_timestamp > '2026-01-01 00:00:00'::TIMESTAMP);
+          |DELETE FROM openivm_data_mv_r WHERE region IN (SELECT DISTINCT region FROM openivm_delta_sales WHERE openivm_timestamp > '2026-01-01 00:00:00'::TIMESTAMP);
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DROP TABLE IF EXISTS openivm_old_mv_r;
+          |DROP TABLE IF EXISTS openivm_new_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = windowCascadeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L)
+      )
+
+      rewritten.statements should have size 7
+      rewritten.statements.head should include(s"delta.`$mvLocation` VERSION AS OF 7")
+      rewritten.statements.head should not include "openivm_data_mv_r"
+      rewritten.statements(1) should include("`sales`")
+      rewritten.statements(1) should not include "memory.main.sales"
+      rewritten.statements(3) should include("INSERT INTO `mydb`.`mv_r` SELECT * FROM openivm_new_mv_r")
+      val deltaCtas = rewritten.statements
+        .find(_.contains(s"delta.`$viewDeltaPath`"))
+        .getOrElse(fail("view-delta CTAS missing"))
+      deltaCtas should include("AS openivm_multiplicity")
+      deltaCtas should include("AS openivm_timestamp")
+      rewritten.statements.takeRight(2) shouldBe Seq(
+        "DROP VIEW IF EXISTS `openivm_old_mv_r`",
+        "DROP VIEW IF EXISTS `openivm_new_mv_r`"
+      )
+    }
+  }
+
+  // ── 10. hasRealDelta detection ────────────────────────────────────────────
   describe("hasRealDelta") {
     it("returns true for a real CTE-prefixed delta (single-source AGGREGATE_GROUP)") {
       SparkRefreshRewriter.hasRealDelta(sevenStatementInput, viewLogicalName) shouldBe true
+    }
+
+    it("returns true for pragma-gated recompute signed deltas without an INSERT column list") {
+      val bareInsertSql =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+      SparkRefreshRewriter.hasRealDelta(bareInsertSql, viewLogicalName) shouldBe true
     }
 
     it("returns false for an empty-placeholder delta (NULL WHERE false — multi-source JOIN)") {

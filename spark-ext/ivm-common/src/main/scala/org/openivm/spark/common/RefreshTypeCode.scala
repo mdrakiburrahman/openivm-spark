@@ -17,10 +17,15 @@ object RefreshTypeCode {
   val DistinctIncremental = 8
   val SemiAntiRecompute   = 9
 
-  /** True for refresh types whose openivm-emitted refresh program writes an
+  /** True for refresh types whose compiled SQL shape CAN write an
     * `INSERT INTO openivm_delta_<view>` statement carrying a USABLE signed
     * multiset delta — i.e. a persisted view-delta that downstream MVs can
     * consume as their source delta for MV-over-MV cascade refresh.
+    *
+    * This is a coarse refresh-type capability only. Persisted MVs should use
+    * `MvMetadata.emitsCascadeViewDelta`, which further gates WINDOW_PARTITION /
+    * GROUP_RECOMPUTE (and any future dynamic cases) on whether the specific
+    * compiled SQL actually emitted a real view-delta.
     *
     * Enabled for:
     *   - **AGGREGATE_GROUP / AGGREGATE_HAVING** (with
@@ -32,6 +37,15 @@ object RefreshTypeCode {
     *     `openivm_delta_<view>`. The Spark side rewrites this into a CTAS
     *     into the per-refresh view-delta path. Downstream SIMPLE_PROJECTION
     *     / AGGREGATE_GROUP cascade picks up the +1/-1 rows directly.
+    *   - **WINDOW_PARTITION / GROUP_RECOMPUTE** (with
+    *     `openivm_emit_cascade_delta_for_recompute=true`, added in
+    *     openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
+    *     "feat: emit openivm_delta_<view> from recompute paths"): openivm
+    *     snapshots the affected pre-refresh rows plus the recomputed
+    *     post-refresh rows before mutating `openivm_data_<view>`, then appends
+    *     them as `-1/+1` rows into `openivm_delta_<view>`. The old
+    *     `WINDOW_PARTITION / GROUP_RECOMPUTE do not cascade` explanation is now
+    *     obsolete once that pragma is enabled in the compiler prologue.
     *
     * SIMPLE_AGGREGATE (1) is intentionally EXCLUDED. The openivm compile-only
     * mode does not emit a snapshot companion (refresh_sql.cpp build_snapshot_companion)
@@ -46,9 +60,9 @@ object RefreshTypeCode {
     * scope; for now SIMPLE_AGGREGATE upstreams force downstream
     * FullRefresh-demotion.
     *
-    * The remaining complement set — WINDOW_PARTITION, GROUP_RECOMPUTE,
-    * DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH — does
-    * NOT emit a cascade-usable view-delta. Downstream MVs over a
+    * The remaining complement set — DISTINCT_INCREMENTAL,
+    * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH, SIMPLE_AGGREGATE — does NOT
+    * emit a cascade-usable view-delta. Downstream MVs over a
     * non-cascade-delta-capable upstream MUST be FullRefresh-demoted at CREATE
     * time.
     *
@@ -57,7 +71,7 @@ object RefreshTypeCode {
     * `CreateMaterializedViewCommand`.
     */
   def emitsCascadeViewDelta(rt: Int): Boolean = rt match {
-    case AggregateGroup | AggregateHaving | SimpleProjection => true
-    case _                                                   => false
+    case AggregateGroup | AggregateHaving | SimpleProjection | WindowPartition | GroupRecompute => true
+    case _                                                                                      => false
   }
 }

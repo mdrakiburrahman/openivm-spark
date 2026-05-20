@@ -51,6 +51,21 @@ final case class MvMetadata(
         scala.util.Try(Timestamp.valueOf(v)).toOption.map(ts => src -> ts)
       }
       .toMap
+
+  /** Whether this persisted MV instance writes a downstream-consumable
+    * `openivm_delta_<view>` on REFRESH. Falls back to the coarse refresh-type
+    * capability for pre-property metadata rows created before
+    * `_ivm_emits_cascade_view_delta` existed.
+    */
+  def emitsCascadeViewDelta: Boolean =
+    properties
+      .get(MvMetadata.EmitsCascadeViewDeltaKey)
+      .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+      .collect {
+        case "true"  => true
+        case "false" => false
+      }
+      .getOrElse(RefreshTypeCode.emitsCascadeViewDelta(refreshType))
 }
 
 object MvMetadata {
@@ -61,9 +76,18 @@ object MvMetadata {
     */
   val WatermarkKeyPrefix: String = "_ivm_watermark:"
 
+  /** Property key recording whether this concrete MV emits a persisted
+    * cascade-usable view-delta at REFRESH time.
+    */
+  val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
+
   /** Build the property-map entries for the given source-watermarks. */
   def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
     watermarks.map { case (src, ts) => s"$WatermarkKeyPrefix$src" -> ts.toString }
+
+  /** Build the property entry capturing this MV instance's cascade-delta capability. */
+  def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
+    Map(EmitsCascadeViewDeltaKey -> enabled.toString)
 }
 
 /**

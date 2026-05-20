@@ -157,6 +157,14 @@ class OpenIvmCompiler private (
     // additive-only view-delta that breaks downstream cascade for COUNT(*),
     // MIN/MAX, DISTINCT etc. See openivm refresh_sql.cpp:has_downstream.
     sb ++= "SET openivm_force_view_delta_cascade=true;\n"
+    // openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
+    // ("feat: emit openivm_delta_<view> from recompute paths") extends the
+    // same cascade-delta contract to WINDOW_PARTITION / GROUP_RECOMPUTE by
+    // snapshotting old/new rows around the recompute and appending `-1/+1`
+    // rows into openivm_delta_<view>. Enable it for every compile so depth-2
+    // MV-over-MV chains consume the new signed view-delta instead of falling
+    // back to FULL_REFRESH via `non_cascade_upstream`.
+    sb ++= "SET openivm_emit_cascade_delta_for_recompute=true;\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -172,19 +180,15 @@ class OpenIvmCompiler private (
     // ── Spark-only function shims ──
     //
     // openivm_compile_only=true means DuckDB only parses + binds the MV body;
-    // it does not execute the functions. The Spark side runs the *original*
-    // function call at refresh time (openivm preserves the function name in
-    // the emitted refresh SQL when the source body uses it; it does not
-    // expand the macro). These shims unblock Spark-only function calls in
-    // MV bodies — without them, finwire-style models using `regexp_like` /
-    // `to_date(s, fmt)` etc. fail compile with `Catalog Error: Function with
-    // name X does not exist`, get caught by the OpenIvmCompileException
-    // handler in `MaterializedViewCommands`, and silently demote to
-    // FULL_REFRESH.
+    // it does not execute the functions. openivm's LPTS serializer INLINES the
+    // macro body into the emitted refresh SQL, so collision-prone Spark
+    // built-ins use a pre-pass (`renameTwoArgDateFns`) to rename the user call
+    // to `__sparkfn_*` before DuckDB sees it, and a post-pass
+    // (`LptsSparkDialect.rewriteSparkFunctionInlinings`) to recover Spark's
+    // original spelling before refresh-time execution.
     //
     // Each macro is type-correct (returns a value of the type Spark would
-    // return) but not necessarily semantically correct — at compile-time
-    // DuckDB only needs the binder to succeed.
+    // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
     sb ++= s"PRAGMA compile_refresh('${escapeSql(req.viewName)}');\n"
@@ -228,25 +232,26 @@ class OpenIvmCompiler private (
     }
   }
 
-  /** Spark-specific join syntaxes that DuckDB does not parse.  Translates them
-    * to the equivalent DuckDB form before the view definition is sent to
-    * `CREATE MATERIALIZED VIEW`.
+  /** Spark-specific pre-normalizations applied before the MV body is handed to
+    * DuckDB's parser/binder.
     *
     * Currently translated:
+    *   - Spark 2-arg `to_date` / `to_timestamp` / `date_format` →
+    *     collision-free `__sparkfn_*` names so DuckDB binds our shim macro
+    *     instead of its own incompatible built-in overloads.
     *   - `LEFT SEMI JOIN` → `SEMI JOIN` (DuckDB does not accept the LEFT prefix)
     *   - `LEFT ANTI JOIN` → `ANTI JOIN`
     *
-    * Both forms have identical semantics on the Spark side (`LEFT SEMI`/`LEFT
-    * ANTI` are the documented Spark spellings; bare `SEMI`/`ANTI` is also
-    * accepted by Spark) so the translation is round-trip safe — the original
-    * Spark SQL is still stored in `MvMetadata.querySql` and used for
-    * FULL_REFRESH `INSERT OVERWRITE`.
+    * The original Spark SQL is still stored in `MvMetadata.querySql` and used
+    * for FULL_REFRESH `INSERT OVERWRITE`; this normalization only affects the
+    * compile-bridge copy sent to DuckDB.
     */
   private[compiler] def normalizeSparkSqlForDuckdb(sql: String): String = {
-    val leftSemi = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
-    val leftAnti = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
+    val leftSemi   = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
+    val leftAnti   = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
+    val renamedFns = OpenIvmCompiler.renameTwoArgDateFns(sql)
     leftAnti.replaceAllIn(
-      leftSemi.replaceAllIn(sql, "SEMI JOIN"),
+      leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
     )
   }
@@ -463,28 +468,26 @@ object OpenIvmCompiler {
       .getOrElse("/opt/openivm/duckdb")
   }
 
+  private[compiler] def renameTwoArgDateFns(sql: String): String =
+    SparkFunctionShimSql.renameTwoArgDateFns(sql)
+
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would
     * otherwise reject. The set is driven by the dbt-server corpus (TPC-DI
     * bronze/silver/gold models) — extend as new gaps surface.
     *
     * Contract: each macro must return a value of the type the equivalent
-    * Spark function returns. Critically, the macro body MUST be a 1:1 call
-    * to a Spark-native function (or a syntactic construct identical to
-    * Spark) — because openivm's LPTS serializer INLINES the macro body into
-    * the emitted refresh SQL, NOT the original macro name. A macro like
-    * `CREATE MACRO date_format(d, fmt) AS CAST(d AS VARCHAR)` would lose
-    * the format-string semantic at refresh time (Spark would CAST instead
-    * of date-formatting). For such functions, `LptsSparkDialect.translate`
-    * MUST have a corresponding back-translation pass to recover the
-    * original Spark name — see `rewriteSparkFunctionInlinings`.
+    * Spark function returns. openivm's LPTS serializer INLINES the macro body
+    * into the emitted refresh SQL, NOT the original macro name, so the body
+    * must preserve enough structure for `LptsSparkDialect.translate` to
+    * recover Spark's original spelling at refresh time.
     *
-    * Functions with DuckDB-native-name collisions (e.g. Spark's 2-arg
-    * `to_date(s, fmt)` shadowing DuckDB's 1-arg `to_date(s)`) cannot be
-    * registered directly as macros — DuckDB binds the call against the
-    * built-in first. Those will require a pre-pass + post-pass round-trip
-    * (rename to `__sparkfn_*` before compile, rename back in
-    * `LptsSparkDialect.translate`); deferred to a follow-up.
+    * Collision-prone Spark built-ins (`to_date(s, fmt)`, `to_timestamp(s,
+    * fmt)`, `date_format(d, fmt)`) are renamed to `__sparkfn_*` by
+    * [[renameTwoArgDateFns]] before the SQL reaches DuckDB. The macros below
+    * define the corresponding DuckDB-side bodies that openivm will inline, and
+    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses those inlinings
+    * back to Spark's original functions in the emitted refresh SQL.
     */
   private[compiler] val sparkFunctionShimsPrologue: String = {
     val macros = Seq(
@@ -493,7 +496,14 @@ object OpenIvmCompiler {
       // No name collision — direct macro registration works. The inlined
       // `regexp_matches` call is back-translated to `regexp_like` in
       // `LptsSparkDialect.rewriteSparkFunctionInlinings`.
-      "CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);"
+      "CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);",
+      // 2-arg Spark-only spellings that collide with DuckDB built-ins are
+      // pre-renamed to `__sparkfn_*` before compile. openivm inlines the body,
+      // and LptsSparkDialect rewrites the inlined `strptime` / `strftime`
+      // forms back to Spark's original function spelling at refresh time.
+      "CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);",
+      "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);"
     )
     macros.mkString("", "\n", "\n")
   }

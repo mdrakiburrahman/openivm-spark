@@ -108,13 +108,15 @@ object LptsSparkDialect {
           rewriteIntervalLiterals(
             rewriteToTemporalUnit(
               rewriteGenerateSeries(
-                rewriteBareVarcharCast(
-                  rewritePostfixCasts(
-                    rewriteStructExtract(
-                      rewriteTimestampWithTimeZone(
-                        rewriteSparkFunctionInlinings(
-                          rewriteToTimestampDoubleCast(
-                            rewriteNowTimestamp(sql)
+                rewriteBareHugeIntCast(
+                  rewriteBareVarcharCast(
+                    rewritePostfixCasts(
+                      rewriteStructExtract(
+                        rewriteTimestampWithTimeZone(
+                          rewriteSparkFunctionInlinings(
+                            rewriteToTimestampDoubleCast(
+                              rewriteNowTimestamp(sql)
+                            )
                           )
                         )
                       )
@@ -142,20 +144,19 @@ object LptsSparkDialect {
   /** Reverse the inlining of Spark-function shim macros registered by
     * [[org.openivm.spark.compiler.OpenIvmCompiler.sparkFunctionShimsPrologue]].
     *
-    * When openivm parses a view body that calls a shim function like
-    * `regexp_like(s, p)`, DuckDB's binder resolves it against the macro,
-    * and the LPTS-emitted refresh SQL serializes the macro's expansion
-    * (`regexp_matches(s, p)`) — NOT the original Spark function name. Spark
-    * has `regexp_like` but NOT `regexp_matches`, so the emitted SQL fails
-    * with `UNRESOLVED_ROUTINE` at refresh time.
+    * openivm serializes the macro's expansion — NOT the original Spark
+    * function name — into the emitted refresh SQL. Spark therefore sees the
+    * inlined DuckDB-side body unless we translate it back here.
     *
-    * This post-pass restores the original Spark-side name for shims whose
-    * macro body is a simple 1:1 function call. More complex shims
-    * (`unix_timestamp`, `date_format`, `from_unixtime`) have macro bodies
-    * that don't admit a clean back-translation; those remain inlined, and
-    * MVs using them either work by coincidence (the macro body happens to
-    * be valid Spark) or fail at refresh — see the gap notes on the shim
-    * prologue.
+    * Current back-translations:
+    *   - `regexp_matches(s, p)`               -> `regexp_like(s, p)`
+    *   - `CAST(strptime(s, fmt) AS DATE)`     -> `to_date(s, fmt)`
+    *   - `strptime(s, fmt)`                   -> `to_timestamp(s, fmt)`
+    *   - `strftime(d, fmt)`                   -> `date_format(d, fmt)`
+    *
+    * The 2-arg date/time rewrites use the shared quote/comment-aware scanner in
+    * [[SparkFunctionShimSql]] so only full call-shapes are rewritten, never
+    * text inside string literals or comments.
     */
   private[compiler] def rewriteSparkFunctionInlinings(sql: String): String = {
     // regexp_matches(s, p) → regexp_like(s, p)
@@ -163,8 +164,17 @@ object LptsSparkDialect {
     // (`regexp_matches(s, p)`) gets inlined by openivm's LPTS serializer
     // — undo that here so Spark's analyzer binds against the built-in.
     val regexpMatches = """(?i)\bregexp_matches\s*\(""".r
-    regexpMatches.replaceAllIn(sql, "regexp_like(")
+    SparkFunctionShimSql.rewriteInlinedTwoArgDateFns(
+      regexpMatches.replaceAllIn(sql, "regexp_like(")
+    )
   }
+
+  private def normalizeSparkTypeName(rawType: String): String =
+    rawType.toUpperCase match {
+      case "VARCHAR" | "CHAR" | "TEXT" => "STRING"
+      case "HUGEINT" | "UHUGEINT"      => "BIGINT"
+      case t                           => t
+    }
 
   /** Rewrites DuckDB's `to_<unit>(N)` interval constructors to Spark's
     * `INTERVAL N <UNIT>` syntax. openivm emits these forms when a user view
@@ -387,15 +397,10 @@ object LptsSparkDialect {
     // Normalise DuckDB type names that Spark cannot parse bare:
     //   VARCHAR (without length) → STRING
     //   CHAR / TEXT              → STRING
+    //   HUGEINT / UHUGEINT       → BIGINT
     val rewritten = CastRe.replaceAllIn(
       withPlaceholders,
-      m => {
-        val sparkType = m.group(2).toUpperCase match {
-          case "VARCHAR" | "CHAR" | "TEXT" => "STRING"
-          case t                           => t
-        }
-        s"CAST(${m.group(1)} AS $sparkType)"
-      }
+      m => s"CAST(${m.group(1)} AS ${normalizeSparkTypeName(m.group(2))})"
     )
 
     // ── Step 2b: rewrite func(...)::TYPE (parenthesised postfix casts) ───────
@@ -454,13 +459,10 @@ object LptsSparkDialect {
                 c.isLetterOrDigit || c == '_' || c == '.'
               }
             ) exprStart -= 1
-            val sparkType = castType.toUpperCase match {
-              case "VARCHAR" | "CHAR" | "TEXT" => "STRING"
-              case t                           => t
-            }
-            val prefix = s.substring(0, exprStart)
-            val expr   = s.substring(exprStart, closeParenIdx + 1) // up to and including ')'
-            val after  = s.substring(m.end)                        // after ::TYPE
+            val sparkType = normalizeSparkTypeName(castType)
+            val prefix    = s.substring(0, exprStart)
+            val expr      = s.substring(exprStart, closeParenIdx + 1) // up to and including ')'
+            val after     = s.substring(m.end)                        // after ::TYPE
             s = s"${prefix}CAST($expr AS $sparkType)$after"
             changed = true
           }
@@ -534,6 +536,17 @@ object LptsSparkDialect {
   private[compiler] def rewriteBareVarcharCast(sql: String): String = {
     val re = """(?i)\bAS\s+(VARCHAR|CHAR|TEXT)\b(?!\s*\()""".r
     re.replaceAllIn(sql, _ => "AS STRING")
+  }
+
+  /** Rewrites bare `CAST(<expr> AS HUGEINT|UHUGEINT)` to `CAST(<expr> AS BIGINT)`.
+    *
+    * DuckDB promotes some integer aggregates (e.g. `SUM(BIGINT)`) to 128-bit
+    * `HUGEINT` / `UHUGEINT` in the compiled SQL. Spark 3.5 does not recognize
+    * those type names, but the matching Spark aggregate/result type is BIGINT.
+    */
+  private[compiler] def rewriteBareHugeIntCast(sql: String): String = {
+    val re = """(?i)\bAS\s+(UHUGEINT|HUGEINT)\b""".r
+    re.replaceAllIn(sql, _ => "AS BIGINT")
   }
 
   /** Rewrites DuckDB double-quoted identifiers (e.g. `"name"`) to Spark

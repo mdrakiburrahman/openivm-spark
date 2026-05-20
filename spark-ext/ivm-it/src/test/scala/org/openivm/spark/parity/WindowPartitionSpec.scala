@@ -31,13 +31,15 @@ import java.util.UUID
   *                          WHERE openivm_timestamp > '<last_refresh>'::TIMESTAMP);
   * }}}
   *
-  * Note that WINDOW_PARTITION views (unlike AGGREGATE_GROUP) **do NOT** emit an
-  * `INSERT INTO openivm_delta_<view>` preamble — the affected partition keys
-  * are derived directly from the source delta by name, so the view-delta table
-  * is unused (it still exists for housekeeping but receives no rows).
-  * `MaterializedViewCommands` exempts RefreshType 5 from the
-  * `hasRealDelta` demotion: the absence of the view-delta INSERT here is the
-  * WINDOW_PARTITION shape, not a "no-op placeholder".
+  * With openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` and
+  * `openivm_emit_cascade_delta_for_recompute=true`, WINDOW_PARTITION now ALSO
+  * emits an `INSERT INTO openivm_delta_<view>` companion: openivm snapshots
+  * the affected pre-refresh rows into `openivm_old_<view>`, the recomputed
+  * post-refresh rows into `openivm_new_<view>`, refreshes
+  * `openivm_data_<view>` via the existing partition-scoped DELETE+INSERT, and
+  * then appends `-1/+1` rows into `openivm_delta_<view>`. The primary local
+  * refresh is still the DELETE+INSERT program; the auxiliary view-delta exists
+  * so downstream MV-over-MV chains can stay incremental.
   *
   * == Observed `refreshType` per test ==
   *

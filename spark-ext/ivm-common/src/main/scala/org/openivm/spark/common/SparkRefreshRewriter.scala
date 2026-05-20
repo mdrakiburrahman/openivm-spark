@@ -72,9 +72,10 @@ object SparkRefreshRewriter {
     *                         already happened upstream — though [[postProcess]]
     *                         offers a final hook).
     * @param mvName           Fully-qualified MV identifier (e.g. `db.v`).
-    * @param mvLocation       Reserved for future use; the MV's Delta path is
-    *                         not directly referenced by any rewritten
-    *                         statement (statement C uses the table identifier).
+    * @param mvLocation       The MV's Delta path. Used for pragma-gated
+    *                         recompute cascade support, where `openivm_old_<view>`
+    *                         must read the pre-refresh snapshot via Delta time
+    *                         travel while the live table is being mutated.
     * @param viewLogicalName  The bare view name openivm uses internally (the
     *                         `<view>` in `openivm_data_<view>` and
     *                         `openivm_delta_<view>`); typically `mvName.table`.
@@ -87,6 +88,10 @@ object SparkRefreshRewriter {
     *                         from `delta.\`<viewDeltaPath>\``.
     * @param postProcess      Final dialect translation applied to each
     *                         surviving statement (e.g. [[org.openivm.spark.compiler.LptsSparkDialect.translate]]).
+    * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
+    *                         Required when pragma-gated recompute cascade emits an
+    *                         `openivm_old_<view>` snapshot that must stay pinned to
+    *                         the pre-refresh MV contents.
     */
   def rewrite(
       compiledSql: String,
@@ -97,9 +102,10 @@ object SparkRefreshRewriter {
       viewDeltaPath: String,
       postProcess: String => String = identity,
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
-      sourceQualifiedNames: Map[String, String] = Map.empty
+      sourceQualifiedNames: Map[String, String] = Map.empty,
+      mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
-    val _ = (mvLocation, sourceTempViews) // reserved for future passes
+    val _ = sourceTempViews // reserved for future passes
 
     // Make qualified-name remapping visible to every private rewriter below,
     // so `memory.main.<short>` becomes the correct `<db>.<table>` reference
@@ -134,6 +140,14 @@ object SparkRefreshRewriter {
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName))
           case StatementKind.GroupRecomputeAffectedDrop =>
             Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+          case StatementKind.OldSnapshotCreate =>
+            Seq(rewriteOldSnapshotCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
+          case StatementKind.NewSnapshotCreate =>
+            Seq(rewriteNewSnapshotCreate(stmt))
+          case StatementKind.SnapshotDataInsert =>
+            Seq(rewriteSnapshotDataInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.SnapshotDrop =>
+            Seq(rewriteSnapshotDrop(stmt, viewLogicalName))
           case StatementKind.Unknown => Nil
         }
       }
@@ -212,6 +226,40 @@ object SparkRefreshRewriter {
       * `DROP TABLE IF EXISTS openivm_affected_<view>` → `DROP VIEW IF EXISTS …`. */
     case object GroupRecomputeAffectedDrop extends StatementKind
 
+    /** Recompute-cascade snapshot of the PRE-refresh MV rows.
+      *
+      * When openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
+      * (`openivm_emit_cascade_delta_for_recompute=true`) is enabled, both
+      * WINDOW_PARTITION and GROUP_RECOMPUTE emit
+      * `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS SELECT … FROM openivm_data_<view> …`.
+      * Spark must keep this pinned to the pre-refresh MV contents, so we rewrite
+      * it to a TEMPORARY VIEW over `delta.<mvLocation> VERSION AS OF <pre-refresh-version>`.
+      */
+    case object OldSnapshotCreate extends StatementKind
+
+    /** Recompute-cascade snapshot of the POST-refresh rows to be inserted into
+      * the MV and the downstream view-delta.
+      *
+      * Rewritten to `CREATE OR REPLACE TEMPORARY VIEW openivm_new_<view> AS …`;
+      * unlike `openivm_old_<view>`, this query reads only stable source staging / live
+      * source tables during the refresh, so a temp view is sufficient.
+      */
+    case object NewSnapshotCreate extends StatementKind
+
+    /** Recompute-cascade data-table INSERT fed by `openivm_new_<view>`.
+      *
+      * Shape (WINDOW_PARTITION / GROUP_RECOMPUTE with the new pragma enabled):
+      * `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>`.
+      */
+    case object SnapshotDataInsert extends StatementKind
+
+    /** Drop the pragma-gated recompute snapshot scratch objects:
+      * `DROP TABLE IF EXISTS openivm_old_<view>` / `openivm_new_<view>`.
+      * They are rewritten to `DROP VIEW IF EXISTS` because Spark materialises
+      * them as TEMPORARY VIEWs.
+      */
+    case object SnapshotDrop extends StatementKind
+
     /** WINDOW_PARTITION (type 5) DELETE: `DELETE FROM openivm_data_<view> WHERE
       * <part_col> IN (SELECT DISTINCT <src_col> FROM openivm_delta_<src> WHERE
       * openivm_timestamp > '<ts>'::TIMESTAMP)`, with one `IN (SELECT …)` clause
@@ -240,6 +288,8 @@ object SparkRefreshRewriter {
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
     val upper            = stmt.toUpperCase.trim
     val affectedKeysName = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val oldSnapshotName  = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
+    val newSnapshotName  = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
     val compactName      = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
@@ -254,12 +304,21 @@ object SparkRefreshRewriter {
     }
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
-    } else if (upper.startsWith("CREATE OR REPLACE TEMP TABLE") && upper.contains(affectedKeysName)) {
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
-    } else if (upper.startsWith("DROP TABLE IF EXISTS") && upper.contains(affectedKeysName)) {
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $oldSnapshotName")) {
+      StatementKind.OldSnapshotCreate
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $newSnapshotName")) {
+      StatementKind.NewSnapshotCreate
+    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
+    } else if (
+      upper.startsWith(s"DROP TABLE IF EXISTS $oldSnapshotName") ||
+      upper.startsWith(s"DROP TABLE IF EXISTS $newSnapshotName")
+    ) {
+      StatementKind.SnapshotDrop
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
       // emitted when `openivm_force_view_delta_cascade=true`) from the main
@@ -279,6 +338,11 @@ object SparkRefreshRewriter {
       else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
+    } else if (
+      upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains(s"FROM $newSnapshotName")
+    ) {
+      StatementKind.SnapshotDataInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
       upper.contains("OPENIVM_RECOMPUTE") &&
@@ -336,6 +400,7 @@ object SparkRefreshRewriter {
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
+    s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
     s
   }
 
@@ -499,6 +564,49 @@ object SparkRefreshRewriter {
         s"""CREATE OR REPLACE TABLE delta.`$escapedPath` USING DELTA AS
            |WITH __openivm_placeholder ($colList) AS ($selectBody)
            |SELECT * FROM __openivm_placeholder""".stripMargin
+    }
+  }
+
+  /** Fallback CTAS rewrite for pragma-gated recompute-cascade delta INSERTs
+    * that omit the target column list and instead rely on positional insert
+    * into the pre-created DuckDB `openivm_delta_<view>` table:
+    *
+    *   INSERT INTO openivm_delta_<view>
+    *   SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_<view>
+    *   UNION ALL
+    *   SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_<view>
+    *
+    * Spark CTAS has no pre-declared target schema, so the trailing metadata
+    * expressions must be aliased explicitly as `openivm_multiplicity` /
+    * `openivm_timestamp` before materialising the SELECT.
+    */
+  private def rewriteInsertNoColumnListToCtas(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    val bareInsertRe = ("(?is)^\\s*INSERT\\s+INTO\\s+(?:`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) +
+      "`?)\\s+(SELECT\\b.+)$").r
+
+    bareInsertRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val selectBodyUpper = m.group(1).toUpperCase
+        if (
+          !selectBodyUpper.contains(s"OPENIVM_OLD_${viewLogicalName.toUpperCase}") &&
+          !selectBodyUpper.contains(s"OPENIVM_NEW_${viewLogicalName.toUpperCase}")
+        ) {
+          stmt
+        } else {
+          val multAliased = """(?i)CAST\(\s*[+-]?\d+\s+AS\s+INTEGER\s*\)(?!\s+AS\s+openivm_multiplicity\b)""".r
+            .replaceAllIn(m.group(1).trim, m0 => s"${m0.matched} AS openivm_multiplicity")
+          val tsAliased = """(?i)\bCURRENT_TIMESTAMP(?:\(\))?(?!\s+AS\s+openivm_timestamp\b)""".r
+            .replaceAllIn(multAliased, m0 => s"${m0.matched} AS openivm_timestamp")
+          val escapedPath = viewDeltaPath.replace("`", "``")
+          s"""CREATE OR REPLACE TABLE delta.`$escapedPath` USING DELTA AS
+             |$tsAliased""".stripMargin
+        }
     }
   }
 
@@ -1081,6 +1189,73 @@ object SparkRefreshRewriter {
     s
   }
 
+  private def rewriteCreateOrReplaceTempTableAsView(stmt: String): String =
+    """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
+      .replaceFirstIn(stmt, "CREATE OR REPLACE TEMPORARY VIEW")
+
+  /** Rewrites the pragma-gated `openivm_old_<view>` snapshot create into a
+    * TEMPORARY VIEW over the MV's pre-refresh Delta version.
+    */
+  private def rewriteOldSnapshotCreate(
+      stmt: String,
+      viewLogicalName: String,
+      mvLocation: String,
+      mvVersionBeforeRefresh: Option[Long]
+  ): String = {
+    val escapedLocation = mvLocation.replace("`", "``")
+    val snapshotTable = mvVersionBeforeRefresh match {
+      case Some(version) => s"delta.`$escapedLocation` VERSION AS OF $version"
+      case None          => s"delta.`$escapedLocation`"
+    }
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) +
+      "\\b").r
+
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = stripTimestampPredicate(s)
+    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(snapshotTable))
+    s
+  }
+
+  /** Rewrites the pragma-gated `openivm_new_<view>` snapshot create into a
+    * Spark TEMPORARY VIEW. The query itself stays live because it only depends
+    * on stable source staging / base tables during the current refresh.
+    */
+  private def rewriteNewSnapshotCreate(stmt: String): String = {
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  /** Rewrites `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>`
+    * to target the actual MV identifier.
+    */
+  private def rewriteSnapshotDataInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String = {
+    val insertTargetRe = ("(?i)\\bINSERT\\s+INTO\\s+openivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    insertTargetRe.replaceFirstIn(
+      stmt,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO ${backtickMvName(mvName)}")
+    )
+  }
+
+  /** Rewrites `DROP TABLE IF EXISTS openivm_old_<view>` / `openivm_new_<view>`
+    * to `DROP VIEW IF EXISTS …` matching the TEMPORARY VIEW materialisation.
+    */
+  private def rewriteSnapshotDrop(stmt: String, viewLogicalName: String): String = {
+    val upper = stmt.toUpperCase
+    if (upper.contains(s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"))
+      s"DROP VIEW IF EXISTS `openivm_old_$viewLogicalName`"
+    else
+      s"DROP VIEW IF EXISTS `openivm_new_$viewLogicalName`"
+  }
+
   // ── GROUP_RECOMPUTE (RefreshType 6) statement rewrites ────────────────────
 
   /** Rewrites the GROUP_RECOMPUTE Statement B into a Spark-executable
@@ -1128,9 +1303,7 @@ object SparkRefreshRewriter {
       viewLogicalName: String
   ): String = {
     val _ = viewLogicalName // captured by the SQL itself; reserved for future use
-    var s = stmt
-    s = """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
-      .replaceFirstIn(s, "CREATE OR REPLACE TEMPORARY VIEW")
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteExcludeAsExcept(s)

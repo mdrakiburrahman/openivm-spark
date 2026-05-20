@@ -5,9 +5,9 @@ bronze.brokerage_trade	SIMPLE_PROJECTION	2
 bronze.brokerage_trade_history	SIMPLE_PROJECTION	2
 bronze.brokerage_watch_history	SIMPLE_PROJECTION	2
 bronze.crm_customer_mgmt	SIMPLE_PROJECTION	2
-bronze.finwire_company	FULL_REFRESH	3
-bronze.finwire_financial	FULL_REFRESH	3
-bronze.finwire_security	FULL_REFRESH	3
+bronze.finwire_company	SIMPLE_PROJECTION	2
+bronze.finwire_financial	SIMPLE_PROJECTION	2
+bronze.finwire_security	SIMPLE_PROJECTION	2
 bronze.hr_employee	SIMPLE_PROJECTION	2
 bronze.reference_date	SIMPLE_PROJECTION	2
 bronze.reference_industry	SIMPLE_PROJECTION	2
@@ -31,11 +31,11 @@ gold.fact_holdings	FULL_REFRESH	3
 gold.fact_market_history	FULL_REFRESH	3
 gold.fact_trade	FULL_REFRESH	3
 gold.fact_watches	FULL_REFRESH	3
-gold.market_volatility	FULL_REFRESH	3
+gold.market_volatility	WINDOW_PARTITION	5
 gold.trade_volume_stats	FULL_REFRESH	3
 silver.accounts	WINDOW_PARTITION	5
 silver.cash_transactions	FULL_REFRESH	3
-silver.companies	FULL_REFRESH	3
+silver.companies	WINDOW_PARTITION	5
 silver.customers	WINDOW_PARTITION	5
 silver.daily_market	WINDOW_PARTITION	5
 silver.date	SIMPLE_PROJECTION	2
