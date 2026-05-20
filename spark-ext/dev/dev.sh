@@ -306,11 +306,99 @@ cmd_pins_sync() {
         done
     fi
 
+    # Cross-check OPENIVM_SPARK_COMMIT in the Dockerfile against the HEAD of
+    # this repo's current branch on origin. The Dockerfile pins the
+    # openivm-spark repo (i.e. *this* repo) at a specific SHA — it must match
+    # what's been pushed to origin so the benchmark builds the code on the
+    # working branch, not a stale snapshot.
+    echo
+    echo "[pins-sync] ── openivm-spark self-pin (OPENIVM_SPARK_COMMIT) ──"
+    if [[ -f "$dockerfile" ]]; then
+        # The Dockerfile declares OPENIVM_SPARK_COMMIT in two stages
+        # (spark-ext-builder and final). Both must be identical and must
+        # match origin HEAD for the current branch.
+        local -a dockerfile_commits
+        mapfile -t dockerfile_commits < <(
+            awk '/^[[:space:]]*ARG[[:space:]]+OPENIVM_SPARK_COMMIT=/ {
+                sub(/^[[:space:]]*ARG[[:space:]]+OPENIVM_SPARK_COMMIT=/, "")
+                gsub(/"/, ""); gsub(/'"'"'/, "")
+                print
+            }' "$dockerfile"
+        )
+
+        local n_commits=${#dockerfile_commits[@]}
+        if [[ "$n_commits" -eq 0 ]]; then
+            echo "[pins-sync]   ⚠ WARNING: no ARG OPENIVM_SPARK_COMMIT found in Dockerfile"
+            drift=1
+        else
+            # Verify all occurrences are identical.
+            local all_same=1
+            for c in "${dockerfile_commits[@]}"; do
+                if [[ "$c" != "${dockerfile_commits[0]}" ]]; then
+                    all_same=0
+                    break
+                fi
+            done
+            if [[ "$all_same" -eq 0 ]]; then
+                echo "[pins-sync]   ⚠ WARNING: OPENIVM_SPARK_COMMIT differs across Dockerfile stages:"
+                for i in "${!dockerfile_commits[@]}"; do
+                    echo "[pins-sync]     occurrence $((i+1)) = ${dockerfile_commits[$i]}"
+                done
+                drift=1
+            else
+                echo "[pins-sync]   Dockerfile OPENIVM_SPARK_COMMIT = ${dockerfile_commits[0]} ($n_commits occurrence(s))"
+            fi
+
+            local pinned_spark_commit="${dockerfile_commits[0]}"
+
+            # Resolve the current branch and its origin HEAD.
+            local current_branch
+            current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+            if [[ -z "$current_branch" || "$current_branch" == "HEAD" ]]; then
+                echo "[pins-sync]   ⚠ WARNING: openivm-spark is in detached HEAD state; skipping origin check"
+                drift=1
+            else
+                echo "[pins-sync]   current branch = $current_branch"
+                local origin_head
+                origin_head="$(git ls-remote --heads origin "refs/heads/$current_branch" 2>/dev/null | awk '{print $1}')"
+                if [[ -z "$origin_head" ]]; then
+                    echo "[pins-sync]   ⚠ WARNING: branch '$current_branch' not found on origin"
+                    drift=1
+                else
+                    echo "[pins-sync]   origin HEAD    = $origin_head"
+                    if [[ "$pinned_spark_commit" == "$origin_head" ]]; then
+                        echo "[pins-sync]   ✓ OPENIVM_SPARK_COMMIT matches origin/$current_branch"
+                    else
+                        echo "[pins-sync]   ⚠ WARNING: OPENIVM_SPARK_COMMIT does not match origin/$current_branch"
+                        echo "[pins-sync]     Dockerfile = $pinned_spark_commit"
+                        echo "[pins-sync]     origin     = $origin_head"
+                        drift=1
+                    fi
+                fi
+            fi
+
+            # Also verify OPENIVM_SPARK_BRANCH is consistent with the
+            # local branch.
+            local dockerfile_branch
+            dockerfile_branch="$(dockerfile_arg_default "$dockerfile" OPENIVM_SPARK_BRANCH)"
+            if [[ -n "$dockerfile_branch" && -n "$current_branch" && "$current_branch" != "HEAD" ]]; then
+                if [[ "$dockerfile_branch" == "$current_branch" ]]; then
+                    echo "[pins-sync]   ✓ OPENIVM_SPARK_BRANCH = $dockerfile_branch"
+                else
+                    echo "[pins-sync]   ⚠ WARNING: OPENIVM_SPARK_BRANCH mismatch"
+                    echo "[pins-sync]     Dockerfile = $dockerfile_branch"
+                    echo "[pins-sync]     local      = $current_branch"
+                    drift=1
+                fi
+            fi
+        fi
+    fi
+
     echo
     if [[ "$drift" -eq 0 ]]; then
-        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits AND the ivm-bench Dockerfile ARGs agree with pins.env."
+        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits, the ivm-bench Dockerfile ARGs agree with pins.env, AND OPENIVM_SPARK_COMMIT matches origin."
     else
-        echo "[pins-sync] ⚠ Drift detected — see WARNINGs above (HEAD drift and/or Dockerfile ARG mismatch)."
+        echo "[pins-sync] ⚠ Drift detected — see WARNINGs above (HEAD drift, Dockerfile ARG mismatch, and/or OPENIVM_SPARK_COMMIT origin mismatch)."
     fi
 }
 
