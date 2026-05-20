@@ -439,6 +439,20 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "to_date(raw)"
     }
 
+    it("rewrites the polymorphic CASE-based DATE shim to 1-arg to_date(...)") {
+      val sql =
+        "CAST(CASE WHEN raw_ts IS NOT NULL THEN NULL WHEN raw_ts IS NULL THEN NULL ELSE NULL END AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_date(raw_ts)"
+    }
+
+    it("rewrites the parenthesized serializer form of the CASE-based DATE shim") {
+      val sql =
+        "CAST(CASE WHEN (raw_ts) IS NOT NULL THEN NULL WHEN (raw_ts) IS NULL THEN NULL ELSE NULL END AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_date((raw_ts))"
+    }
+
     it("rewrites CAST(strptime(... ) AS DATE) to to_date(..., fmt)") {
       val sql = "CAST(strptime(raw, 'yyyyMMdd') AS DATE)"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
@@ -449,6 +463,20 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val sql = "strptime(raw, '%Y-%m-%d %H:%M:%S')"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
         "to_timestamp(raw)"
+    }
+
+    it("rewrites the polymorphic CASE-based TIMESTAMP shim to 1-arg to_timestamp(...)") {
+      val sql =
+        "CAST(CASE WHEN epoch_s IS NOT NULL THEN NULL WHEN epoch_s IS NULL THEN NULL ELSE NULL END AS TIMESTAMP)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_timestamp(epoch_s)"
+    }
+
+    it("rewrites the parenthesized serializer form of the CASE-based TIMESTAMP shim") {
+      val sql =
+        "CAST(CASE WHEN (epoch_s) IS NOT NULL THEN NULL WHEN (epoch_s) IS NULL THEN NULL ELSE NULL END AS TIMESTAMP)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "to_timestamp((epoch_s))"
     }
 
     it("rewrites bare strptime(... ) to to_timestamp(..., fmt)") {
@@ -489,6 +517,11 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
           |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE) */""".stripMargin
     }
 
+    it("does not rewrite the polymorphic CASE shim when the branch expressions differ") {
+      val sql = "CAST(CASE WHEN left_expr IS NOT NULL THEN NULL WHEN right_expr IS NULL THEN NULL END AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe sql
+    }
+
     it("rewrites nested shim expansions recursively") {
       val sql = "strftime(CAST(strptime(coalesce(a, b), '%Y-%m-%d') AS DATE), 'yyyy-MM')"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
@@ -497,7 +530,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
     it("is idempotent for the date/time shim translations") {
       val sql =
-        "CAST(strptime(coalesce(a, b), '%Y-%m-%d') AS DATE), CAST(strptime(raw, 'yyyyMMdd') AS DATE), strptime(raw2, '%Y-%m-%d %H:%M:%S'), strptime(raw3, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd'), last(name) OVER (PARTITION BY grp ORDER BY ts)"
+        "CAST(CASE WHEN coalesce(a, b) IS NOT NULL THEN NULL WHEN coalesce(a, b) IS NULL THEN NULL ELSE NULL END AS DATE), CAST(strptime(raw, 'yyyyMMdd') AS DATE), CAST(CASE WHEN epoch_s IS NOT NULL THEN NULL WHEN epoch_s IS NULL THEN NULL ELSE NULL END AS TIMESTAMP), strptime(raw3, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd'), last(name) OVER (PARTITION BY grp ORDER BY ts)"
       val once  = LptsSparkDialect.translate(sql)
       val twice = LptsSparkDialect.translate(once)
       twice shouldBe once

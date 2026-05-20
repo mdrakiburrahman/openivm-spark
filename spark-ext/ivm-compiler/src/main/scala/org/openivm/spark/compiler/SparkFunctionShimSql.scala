@@ -83,15 +83,18 @@ private[compiler] object SparkFunctionShimSql {
     * back to Spark's original shim spellings.
     *
     * Rewrites:
-    *   - `CAST(strptime(s, '%Y-%m-%d') AS DATE)` -> `to_date(s)`
-    *   - `CAST(strptime(s, fmt) AS DATE)`        -> `to_date(s, fmt)`
-    *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`      -> `to_timestamp(s)`
-    *   - `strptime(s, fmt)`                      -> `to_timestamp(s, fmt)`
-    *   - `strftime(d, fmt)`                      -> `date_format(d, fmt)`
-    *   - `last(expr) OVER (...)`                 -> `last_value(expr) OVER (...)`
+    *   - `CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS DATE)` -> `to_date(s)`
+    *   - `CAST(strptime(s, '%Y-%m-%d') AS DATE)`                                         -> `to_date(s)`
+    *   - `CAST(strptime(s, fmt) AS DATE)`                                                 -> `to_date(s, fmt)`
+    *   - `CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP)` -> `to_timestamp(s)`
+    *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`                                               -> `to_timestamp(s)`
+    *   - `strptime(s, fmt)`                                                               -> `to_timestamp(s, fmt)`
+    *   - `strftime(d, fmt)`                                                               -> `date_format(d, fmt)`
+    *   - `last(expr) OVER (...)`                                                          -> `last_value(expr) OVER (...)`
     *
-    * The 1-arg date/time rewrites only trigger when the format literal matches
-    * the exact shim body registered by
+    * The 1-arg date/time rewrites trigger when the inlined body matches either
+    * the legacy fixed-format `strptime` shim or the current polymorphic
+    * `CASE WHEN expr IS [NOT] NULL THEN NULL ...` shim registered by
     * [[OpenIvmCompiler.sparkFunctionShimsPrologue]]. Nested shim expansions are
     * rewritten recursively so expressions like
     * `strftime(CAST(strptime(x, f) AS DATE), g)` become
@@ -99,13 +102,13 @@ private[compiler] object SparkFunctionShimSql {
     */
   def rewriteInlinedSparkShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
-      parseCastStrptimeAsDate(sql, i)
+      parseCastTemporalShim(sql, i)
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
         .orElse(parseWindowFunctionNameRewrite(sql, i, "last", "last_value"))
     }
 
-  private def parseCastStrptimeAsDate(sql: String, start: Int): Option[(Int, String)] =
+  private def parseCastTemporalShim(sql: String, start: Int): Option[(Int, String)] =
     parseFunctionCallAt(sql, start, "cast").flatMap { castCall =>
       val bodyStart = castCall.openParen + 1
       val bodyEnd   = castCall.closeParen
@@ -114,23 +117,40 @@ private[compiler] object SparkFunctionShimSql {
         val typeStart = skipTriviaForward(sql, asStart + 2, bodyEnd)
         if (exprStart >= bodyEnd || typeStart >= bodyEnd) None
         else {
-          parseFunctionCallAt(sql, exprStart, "strptime").flatMap { strptimeCall =>
-            val typeEnd = readIdentifierEnd(sql, typeStart)
-            val typeOk =
-              typeEnd > typeStart &&
-                sql.substring(typeStart, typeEnd).equalsIgnoreCase("DATE") &&
-                isTriviaOnly(sql, strptimeCall.closeParen + 1, asStart) &&
-                isTriviaOnly(sql, typeEnd, bodyEnd) &&
-                strptimeCall.topLevelCommaCount == 1
-            if (!typeOk) None
-            else {
-              rewriteSparkDateCall(sql, strptimeCall, "to_date", Some(OneArgToDateLiteral))
-                .map(replacement => (castCall.closeParen + 1, replacement))
-            }
+          val typeEnd = readIdentifierEnd(sql, typeStart)
+          if (typeEnd <= typeStart || !isTriviaOnly(sql, typeEnd, bodyEnd)) None
+          else {
+            val replacement =
+              sql.substring(typeStart, typeEnd).toUpperCase(Locale.ROOT) match {
+                case "DATE" =>
+                  rewriteCastTemporalBody(sql, exprStart, asStart, "to_date", Some(OneArgToDateLiteral))
+                case "TIMESTAMP" =>
+                  rewriteCastTemporalBody(sql, exprStart, asStart, "to_timestamp", Some(OneArgToTimestampLiteral))
+                case _ =>
+                  None
+              }
+            replacement.map(rewritten => (castCall.closeParen + 1, rewritten))
           }
         }
       }
     }
+
+  private def rewriteCastTemporalBody(
+      sql: String,
+      exprStart: Int,
+      exprEndExclusive: Int,
+      sparkName: String,
+      oneArgLiteral: Option[String]
+  ): Option[String] =
+    parseFunctionCallAt(sql, exprStart, "strptime")
+      .filter(call => isTriviaOnly(sql, call.closeParen + 1, exprEndExclusive) && call.topLevelCommaCount == 1)
+      .flatMap(call => rewriteSparkDateCall(sql, call, sparkName, oneArgLiteral))
+      .orElse(
+        parseCaseNullShimArg(sql, exprStart, exprEndExclusive).map { expr =>
+          val rewrittenExpr = rewriteInlinedSparkShimCalls(expr)
+          s"$sparkName($rewrittenExpr)"
+        }
+      )
 
   private def parseFunctionRewrite(
       sql: String,
@@ -183,6 +203,78 @@ private[compiler] object SparkFunctionShimSql {
           s"$sparkName($args)"
         }
     }
+
+  private def parseCaseNullShimArg(sql: String, start: Int, endExclusive: Int): Option[String] = {
+    val caseStart = skipTriviaForward(sql, start, endExclusive)
+    if (!isKeywordAt(sql, caseStart, "CASE")) None
+    else {
+      val when1Start = skipTriviaForward(sql, caseStart + "CASE".length, endExclusive)
+      if (!isKeywordAt(sql, when1Start, "WHEN")) None
+      else {
+        val cond1Start = skipTriviaForward(sql, when1Start + "WHEN".length, endExclusive)
+        findTopLevelKeywordRespectingCase(sql, cond1Start, endExclusive, "THEN").flatMap { then1Start =>
+          parseIsNullConditionExpr(sql, cond1Start, then1Start, expectsNot = true).flatMap { expr1 =>
+            val then1ValueStart = skipTriviaForward(sql, then1Start + "THEN".length, endExclusive)
+            findTopLevelKeywordRespectingCase(sql, then1ValueStart, endExclusive, "WHEN").flatMap { when2Start =>
+              if (!isBareNull(sql, then1ValueStart, when2Start)) None
+              else {
+                val cond2Start = skipTriviaForward(sql, when2Start + "WHEN".length, endExclusive)
+                findTopLevelKeywordRespectingCase(sql, cond2Start, endExclusive, "THEN").flatMap { then2Start =>
+                  parseIsNullConditionExpr(sql, cond2Start, then2Start, expectsNot = false).flatMap { expr2 =>
+                    if (expr1 != expr2) None
+                    else {
+                      val then2ValueStart = skipTriviaForward(sql, then2Start + "THEN".length, endExclusive)
+                      val elseStart = findTopLevelKeywordRespectingCase(sql, then2ValueStart, endExclusive, "ELSE")
+                      val endStart  = findTopLevelKeywordRespectingCase(sql, then2ValueStart, endExclusive, "END")
+                      endStart.flatMap { endPos =>
+                        val tailOk = elseStart match {
+                          case Some(elsePos) if elsePos < endPos =>
+                            isBareNull(sql, then2ValueStart, elsePos) &&
+                            isBareNull(sql, elsePos + "ELSE".length, endPos) &&
+                            isTriviaOnly(sql, endPos + "END".length, endExclusive)
+                          case _ =>
+                            isBareNull(sql, then2ValueStart, endPos) &&
+                            isTriviaOnly(sql, endPos + "END".length, endExclusive)
+                        }
+                        if (tailOk) Some(expr1) else None
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private def parseIsNullConditionExpr(
+      sql: String,
+      start: Int,
+      endExclusive: Int,
+      expectsNot: Boolean
+  ): Option[String] =
+    findTopLevelKeywordRespectingCase(sql, start, endExclusive, "IS").flatMap { isStart =>
+      val expr = sql.substring(skipTriviaForward(sql, start, isStart), isStart).trim
+      if (expr.isEmpty) None
+      else {
+        val afterIs = skipTriviaForward(sql, isStart + "IS".length, endExclusive)
+        val nullStart =
+          if (expectsNot) {
+            if (!isKeywordAt(sql, afterIs, "NOT")) -1
+            else skipTriviaForward(sql, afterIs + "NOT".length, endExclusive)
+          } else afterIs
+        if (nullStart < 0 || !isKeywordAt(sql, nullStart, "NULL")) None
+        else if (!isTriviaOnly(sql, nullStart + "NULL".length, endExclusive)) None
+        else Some(expr)
+      }
+    }
+
+  private def isBareNull(sql: String, start: Int, endExclusive: Int): Boolean = {
+    val nullStart = skipTriviaForward(sql, start, endExclusive)
+    isKeywordAt(sql, nullStart, "NULL") && isTriviaOnly(sql, nullStart + "NULL".length, endExclusive)
+  }
 
   private def hasOverClause(sql: String, start: Int): Boolean = {
     val overStart = skipTriviaForward(sql, start, sql.length)
@@ -349,6 +441,49 @@ private[compiler] object SparkFunctionShimSql {
     None
   }
 
+  private def findTopLevelKeywordRespectingCase(
+      sql: String,
+      start: Int,
+      endExclusive: Int,
+      keyword: String
+  ): Option[Int] = {
+    var parenDepth      = 0
+    var nestedCaseDepth = 0
+    var i               = start
+    while (i < endExclusive) {
+      if (startsLineComment(sql, i)) {
+        i = consumeLineComment(sql, i).min(endExclusive)
+      } else if (startsBlockComment(sql, i)) {
+        i = consumeBlockComment(sql, i).min(endExclusive)
+      } else {
+        sql.charAt(i) match {
+          case '\'' =>
+            i = consumeSingleQuoted(sql, i).min(endExclusive)
+          case '"' =>
+            i = consumeDoubleQuoted(sql, i).min(endExclusive)
+          case '(' =>
+            parenDepth += 1
+            i += 1
+          case ')' =>
+            parenDepth -= 1
+            i += 1
+          case _ if parenDepth == 0 && isKeywordAt(sql, i, "CASE") =>
+            nestedCaseDepth += 1
+            i += "CASE".length
+          case _ if parenDepth == 0 && isKeywordAt(sql, i, "END") =>
+            if (nestedCaseDepth == 0 && keyword.equalsIgnoreCase("END")) return Some(i)
+            if (nestedCaseDepth > 0) nestedCaseDepth -= 1
+            i += "END".length
+          case _ if parenDepth == 0 && nestedCaseDepth == 0 && isKeywordAt(sql, i, keyword) =>
+            return Some(i)
+          case _ =>
+            i += 1
+        }
+      }
+    }
+    None
+  }
+
   private def isTriviaOnly(sql: String, start: Int, endExclusive: Int): Boolean = {
     var i = start
     while (i < endExclusive) {
@@ -387,6 +522,12 @@ private[compiler] object SparkFunctionShimSql {
 
   private def startsWithKeyword(sql: String, start: Int, keyword: String): Boolean =
     start + keyword.length <= sql.length && sql.regionMatches(true, start, keyword, 0, keyword.length)
+
+  private def isKeywordAt(sql: String, start: Int, keyword: String): Boolean =
+    start >= 0 && start + keyword.length <= sql.length &&
+      startsWithKeyword(sql, start, keyword) &&
+      hasLeftIdentifierBoundary(sql, start) &&
+      hasRightIdentifierBoundary(sql, start + keyword.length)
 
   private def readIdentifierEnd(sql: String, start: Int): Int = {
     var i = start + 1

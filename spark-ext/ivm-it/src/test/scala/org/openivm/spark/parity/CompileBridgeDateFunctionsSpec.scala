@@ -10,7 +10,7 @@ import java.io.File
 import java.util.UUID
 
 /** Parity coverage for the compile-bridge shims that keep Spark's 1-arg / 2-arg
-  * `to_date`, 2-arg `to_timestamp`, `date_format`, and the Spark-only
+  * `to_date`, 1-arg / 2-arg `to_timestamp`, `date_format`, and the Spark-only
   * `last_value(expr, ignoreNulls)` window form on the incremental path.
   *
   * All table / MV names are prefixed with `cbdf_` so parallel forked specs do
@@ -101,6 +101,77 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
     }
   }
 
+  describe("compile-bridge shim: to_date(timestamp_col) in gold-style CTE + join") {
+    it("compiles and stays correct after INSERT + REFRESH") {
+      spark.sql(
+        "CREATE TABLE cbdf_cash_transactions_src (account_id INT, transaction_timestamp TIMESTAMP, amount DOUBLE, description STRING) USING DELTA"
+      )
+      spark.sql(
+        "CREATE TABLE cbdf_dim_account_src (account_id INT, effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP, sk_customer_id INT, sk_account_id INT) USING DELTA"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_dim_account_src VALUES " +
+          "(10, TIMESTAMP'2023-12-01 00:00:00', TIMESTAMP'2024-12-31 23:59:59', 100, 1000), " +
+          "(20, TIMESTAMP'2023-12-01 00:00:00', TIMESTAMP'2024-12-31 23:59:59', 200, 2000)"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_cash_transactions_src VALUES " +
+          "(10, TIMESTAMP'2024-01-01 09:15:00', 125.5D, 'seed cash'), " +
+          "(10, TIMESTAMP'2024-01-15 10:30:45', 20.0D, 'fee rebate'), " +
+          "(20, TIMESTAMP'2024-02-01 00:00:00', 99.9D, 'wire in')"
+      )
+
+      val mvName = "cbdf_mv_fact_cash_transactions"
+      val viewBody =
+        """WITH s1 AS (
+          |  SELECT
+          |    *,
+          |    to_date(transaction_timestamp) AS sk_transaction_date
+          |  FROM cbdf_cash_transactions_src
+          |)
+          |SELECT
+          |  sk_customer_id,
+          |  sk_account_id,
+          |  sk_transaction_date,
+          |  transaction_timestamp,
+          |  amount,
+          |  description
+          |FROM s1
+          |JOIN cbdf_dim_account_src a
+          |  ON s1.account_id = a.account_id
+          | AND s1.transaction_timestamp BETWEEN a.effective_timestamp AND a.end_timestamp""".stripMargin
+      spark.sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+
+      // Multi-source CTE JOINs still hit the known `hasRealDelta` gap and are
+      // demoted to FULL_REFRESH; this coverage is here to ensure the shimmed
+      // `to_date(timestamp_col)` body still compiles and the fallback path stays
+      // bag-correct.
+      val createMeta = MvCatalog
+        .lookup(
+          spark,
+          spark.sessionState.sqlParser.parseTableIdentifier(mvName)
+        )
+        .getOrElse(fail(s"Missing MV metadata for $mvName"))
+      createMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      assertMvCorrect(mvName, viewBody)
+
+      spark.sql(
+        "INSERT INTO cbdf_cash_transactions_src VALUES " +
+          "(10, TIMESTAMP'2024-02-15 12:00:00', 75.25D, 'cash out'), " +
+          "(20, TIMESTAMP'2024-03-01 18:45:00', 250.0D, 'bonus')"
+      )
+      refreshMv(mvName)
+      val refreshedMeta = MvCatalog
+        .lookup(
+          spark,
+          spark.sessionState.sqlParser.parseTableIdentifier(mvName)
+        )
+        .getOrElse(fail(s"Missing MV metadata for $mvName"))
+      refreshedMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
   describe("compile-bridge shim: to_date(raw, fmt)") {
     it("keeps the MV incremental and correct after INSERT + REFRESH") {
       spark.sql("CREATE TABLE cbdf_to_date_src (id INT, trade_date_raw STRING) USING DELTA")
@@ -138,6 +209,111 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
 
       spark.sql(
         "INSERT INTO cbdf_to_timestamp_src VALUES (4, '2024-01-03 00:00:00'), (5, '2024-01-03 12:34:56')"
+      )
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
+  describe("compile-bridge shim: to_timestamp(bigint_col) in bronze-style UNION ALL") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH") {
+      spark.sql(
+        "CREATE TABLE cbdf_customer_cdc_src (cdc_dsn BIGINT, cdc_flag STRING, customerid BIGINT, taxid STRING, gender STRING, tier INT, dob DATE, lastname STRING, firstname STRING, middleinitial STRING, addressline1 STRING, addressline2 STRING, postalcode STRING, city STRING, stateprov STRING, country STRING, email1 STRING, email2 STRING, c_ctry_1 STRING, c_area_1 STRING, c_local_1 STRING, c_ext_1 STRING, c_ctry_2 STRING, c_area_2 STRING, c_local_2 STRING, c_ext_2 STRING, c_ctry_3 STRING, c_area_3 STRING, c_local_3 STRING, c_ext_3 STRING, lcl_tx_id STRING, nat_tx_id STRING) USING DELTA"
+      )
+      spark.sql(
+        "CREATE TABLE cbdf_account_cdc_src (cdc_dsn BIGINT, cdc_flag STRING, ca_c_id BIGINT, accountid BIGINT, taxstatus INT, ca_b_id BIGINT, accountdesc STRING) USING DELTA"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_customer_cdc_src VALUES " +
+          "(1704100500, 'I', 1, 'TAX-1', 'F', 1, DATE'1990-01-01', 'Doe', 'Jane', 'Q', '1 Main', 'Apt 2', '11111', 'Seattle', 'WA', 'US', 'jane@example.com', 'jane.alt@example.com', '1', '206', '5550101', '11', '1', '206', '5550102', '12', '1', '206', '5550103', '13', 'LCL-1', 'NAT-1'), " +
+          "(1704101445, 'U', 2, 'TAX-2', 'M', 2, DATE'1988-02-02', 'Roe', 'John', 'R', '2 Pine', NULL, '22222', 'Portland', 'OR', 'US', 'john@example.com', 'john.alt@example.com', '1', '503', '5550201', NULL, '1', '503', '5550202', NULL, '1', '503', '5550203', NULL, 'LCL-2', 'NAT-2')"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_account_cdc_src VALUES " +
+          "(1704100500, 'I', 1, 1001, 1, 77, 'Checking'), " +
+          "(1704101445, 'U', 2, 2002, 2, 88, 'Brokerage')"
+      )
+
+      val mvName = "cbdf_mv_crm_customer_mgmt"
+      val viewBody =
+        """WITH staging_customers AS (
+          |  SELECT
+          |    to_timestamp(cdc_dsn) AS action_ts,
+          |    CASE cdc_flag WHEN 'I' THEN 'NEW' WHEN 'U' THEN 'UPDCUST' END AS action_type,
+          |    CAST(customerid AS BIGINT) AS c_id,
+          |    taxid AS c_tax_id,
+          |    gender AS c_gndr,
+          |    CAST(tier AS INT) AS c_tier,
+          |    dob AS c_dob,
+          |    lastname AS c_l_name,
+          |    firstname AS c_f_name,
+          |    middleinitial AS c_m_name,
+          |    addressline1 AS c_adline1,
+          |    addressline2 AS c_adline2,
+          |    postalcode AS c_zipcode,
+          |    city AS c_city,
+          |    stateprov AS c_state_prov,
+          |    country AS c_ctry,
+          |    email1 AS c_prim_email,
+          |    email2 AS c_alt_email,
+          |    concat_ws('-', c_ctry_1, c_area_1, c_local_1, c_ext_1) AS c_phone_1,
+          |    concat_ws('-', c_ctry_2, c_area_2, c_local_2, c_ext_2) AS c_phone_2,
+          |    concat_ws('-', c_ctry_3, c_area_3, c_local_3, c_ext_3) AS c_phone_3,
+          |    lcl_tx_id AS c_lcl_tx_id,
+          |    nat_tx_id AS c_nat_tx_id,
+          |    CAST(NULL AS BIGINT) AS ca_id,
+          |    CAST(NULL AS INT) AS ca_tax_st,
+          |    CAST(NULL AS BIGINT) AS ca_b_id,
+          |    CAST(NULL AS STRING) AS ca_name
+          |  FROM cbdf_customer_cdc_src
+          |  WHERE cdc_flag IN ('I', 'U')
+          |),
+          |staging_accounts AS (
+          |  SELECT
+          |    to_timestamp(cdc_dsn) AS action_ts,
+          |    CASE cdc_flag WHEN 'I' THEN 'ADDACCT' WHEN 'U' THEN 'UPDACCT' END AS action_type,
+          |    CAST(ca_c_id AS BIGINT) AS c_id,
+          |    CAST(NULL AS STRING) AS c_tax_id,
+          |    CAST(NULL AS STRING) AS c_gndr,
+          |    CAST(NULL AS INT) AS c_tier,
+          |    CAST(NULL AS DATE) AS c_dob,
+          |    CAST(NULL AS STRING) AS c_l_name,
+          |    CAST(NULL AS STRING) AS c_f_name,
+          |    CAST(NULL AS STRING) AS c_m_name,
+          |    CAST(NULL AS STRING) AS c_adline1,
+          |    CAST(NULL AS STRING) AS c_adline2,
+          |    CAST(NULL AS STRING) AS c_zipcode,
+          |    CAST(NULL AS STRING) AS c_city,
+          |    CAST(NULL AS STRING) AS c_state_prov,
+          |    CAST(NULL AS STRING) AS c_ctry,
+          |    CAST(NULL AS STRING) AS c_prim_email,
+          |    CAST(NULL AS STRING) AS c_alt_email,
+          |    CAST(NULL AS STRING) AS c_phone_1,
+          |    CAST(NULL AS STRING) AS c_phone_2,
+          |    CAST(NULL AS STRING) AS c_phone_3,
+          |    CAST(NULL AS STRING) AS c_lcl_tx_id,
+          |    CAST(NULL AS STRING) AS c_nat_tx_id,
+          |    CAST(accountid AS BIGINT) AS ca_id,
+          |    CAST(taxstatus AS INT) AS ca_tax_st,
+          |    CAST(ca_b_id AS BIGINT) AS ca_b_id,
+          |    accountdesc AS ca_name
+          |  FROM cbdf_account_cdc_src
+          |  WHERE cdc_flag IN ('I', 'U')
+          |)
+          |SELECT * FROM staging_customers
+          |UNION ALL
+          |SELECT * FROM staging_accounts""".stripMargin
+      spark.sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+
+      spark.sql(
+        "INSERT INTO cbdf_customer_cdc_src VALUES " +
+          "(1704240000, 'I', 3, 'TAX-3', 'F', 3, DATE'1995-03-03', 'Smith', 'Alex', NULL, '3 Cedar', NULL, '33333', 'San Francisco', 'CA', 'US', 'alex@example.com', NULL, '1', '415', '5550301', NULL, '1', '415', '5550302', NULL, '1', '415', '5550303', NULL, 'LCL-3', 'NAT-3')"
+      )
+      spark.sql(
+        "INSERT INTO cbdf_account_cdc_src VALUES (1704285296, 'I', 3, 3003, 1, 99, 'Retirement')"
       )
       refreshMv(mvName)
       assertIncremental(mvName)

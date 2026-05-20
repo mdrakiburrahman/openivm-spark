@@ -50,6 +50,7 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   private val textSchema: StructType    = StructType.fromDDL("id INT, txt STRING")
   private val rawDateSchema: StructType = StructType.fromDDL("id INT, raw STRING")
   private val tsSchema: StructType      = StructType.fromDDL("id INT, ts TIMESTAMP")
+  private val epochSchema: StructType   = StructType.fromDDL("id INT, epoch BIGINT")
   private val windowSchema: StructType  = StructType.fromDDL("id INT, grp INT, ts TIMESTAMP, name STRING")
 
   "shim regexp_like(s, p)" should "compile and emit a non-FULL_REFRESH classification" in {
@@ -92,6 +93,20 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should not include "%Y-%m-%d"
   }
 
+  it should "compile to_date(<timestamp_col>) without binder error" in {
+    val r = compileBody(
+      viewName = "shim_to_date_v0_ts",
+      sources = Map("timesrc" -> tsSchema),
+      body = "SELECT id, to_date(ts) AS parsed_date FROM timesrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("to_date(")
+    translated should not include "CASE WHEN"
+    translated should not include "IS NOT NULL"
+  }
+
   "shim to_date(s, fmt)" should "compile, stay incremental, and translate back to Spark to_date" in {
     val r = compileBody(
       viewName = "shim_to_date_v1",
@@ -117,6 +132,20 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should include("to_timestamp(")
     translated should not include "strptime"
     translated should not include "%Y-%m-%d %H:%M:%S"
+  }
+
+  it should "compile to_timestamp(<bigint_col>) without binder error" in {
+    val r = compileBody(
+      viewName = "shim_to_timestamp_v0_epoch",
+      sources = Map("epochsrc" -> epochSchema),
+      body = "SELECT id, to_timestamp(epoch) AS parsed_ts FROM epochsrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("to_timestamp(")
+    translated should not include "CASE WHEN"
+    translated should not include "IS NOT NULL"
   }
 
   "shim to_timestamp(s, fmt)" should "compile, stay incremental, and translate back to Spark to_timestamp" in {
@@ -164,9 +193,13 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   "sparkFunctionShimsPrologue" should "register the regexp_like and __sparkfn_* shim macros" in {
     val p = OpenIvmCompiler.sparkFunctionShimsPrologue
     p should include("CREATE OR REPLACE MACRO regexp_like")
-    p should include("CREATE OR REPLACE MACRO __sparkfn_to_date_1arg(s) AS CAST(strptime(s, '%Y-%m-%d') AS DATE);")
+    p should include(
+      "CREATE OR REPLACE MACRO __sparkfn_to_date_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS DATE);"
+    )
     p should include("CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);")
-    p should include("CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS strptime(s, '%Y-%m-%d %H:%M:%S');")
+    p should include(
+      "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);"
+    )
     p should include("CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);")

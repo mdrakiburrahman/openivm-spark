@@ -512,16 +512,15 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);",
       // 1-arg / 2-arg Spark spellings that collide with DuckDB built-ins are
       // pre-renamed to `__sparkfn_*` before compile. openivm inlines the body,
-      // and LptsSparkDialect rewrites the inlined `strptime` / `strftime`
-      // forms back to Spark's original function spelling at refresh time.
-      // DuckDB macros do not overload by arity, so the 1-arg shims use
-      // dedicated `*_1arg` names. They rely on fixed DuckDB-safe format
-      // literals purely so the binder accepts them during compile; the exact
-      // literal match is what the post-pass uses to recover Spark's original
-      // 1-arg spelling.
-      "CREATE OR REPLACE MACRO __sparkfn_to_date_1arg(s) AS CAST(strptime(s, '%Y-%m-%d') AS DATE);",
+      // and LptsSparkDialect rewrites the inlined `CASE` / `strptime` /
+      // `strftime` forms back to Spark's original function spelling at refresh
+      // time. DuckDB macros do not overload by arity, so the 1-arg shims use
+      // dedicated `*_1arg` names. Those 1-arg bodies use only `IS NULL` /
+      // `IS NOT NULL` predicates so DuckDB binds them for any argument type
+      // while still referencing the original expression for post-pass recovery.
+      "CREATE OR REPLACE MACRO __sparkfn_to_date_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS DATE);",
       "CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);",
-      "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS strptime(s, '%Y-%m-%d %H:%M:%S');",
+      "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
       // Spark's 2-arg last_value(expr, ignoreNulls) has no DuckDB equivalent.
