@@ -23,12 +23,15 @@ to assign fixes across the 3 source repos.
 
 ## CRITICAL RULES (read before touching anything)
 
-### CR-A. Never `git commit` automatically
+### CR-A. Auto-commit and push on non-main branches
 
-Treat this as ABSOLUTE across all repos. Local-only commits on the
-working branch (for the openivm-spark / openivm / lpts pin-bump path
-in Phase 4) require the user to confirm via `ask_user` every time. The
-human always reviews and commits.
+For every repo (`openivm-spark`, `.temp/openivm`, `.temp/lpts`,
+`.temp/ivm-bench`), check the current branch with
+`git -C <repo> symbolic-ref --short HEAD`. If the branch is **not**
+`main`, you MUST commit and push changes automatically — do not
+prompt the user. Use descriptive commit messages prefixed with
+`[ivm-investigation]`. If the branch IS `main`, do NOT modify that
+repo — report the gap and move on (per CR-D).
 
 ### CR-B. Never weaken correctness for performance
 
@@ -79,9 +82,9 @@ any real IVM win. Run the overhead test in Phase 4-bis before
 assigning R1–R5 root causes; if overhead dominates, the terminal
 finding is **R0**, not a Spark IVM bug.
 
-### CR-H. Pins-sync retry budget is 3
+### CR-H. Pins-sync auto-fix retry budget is 3
 
-Phase 0 prompts the user up to 3 times. After that, write a
+Phase 0 auto-fixes drift up to 3 times. After that, write a
 `pins-sync drift unresolved` finding to the report and stop.
 
 ---
@@ -95,29 +98,36 @@ cd /home/mdrrahman/openivm-spark
 ./spark-ext/dev/dev.sh pins-sync 2>&1 | tee /tmp/pins-sync.out
 ```
 
-Read `/tmp/pins-sync.out`. Pass condition:
-
-> `[pins-sync] ✓ All 3 repos are on their pinned branches AND match
-their pinned commits AND the ivm-bench Dockerfile ARGs agree with
-pins.env.`
+Read `/tmp/pins-sync.out`. Pass condition: **no** `⚠` warnings.
 
 Drift conditions (any of):
 
 - `⚠ WARNING: HEAD has drifted from pin`
 - `⚠ WARNING: ARG ... mismatch`
+- `⚠ WARNING: OPENIVM_SPARK_COMMIT does not match origin/…`
 - `⚠ Drift detected`
 
-On drift, do NOT auto-`git reset --hard`. Use `ask_user`:
+On drift, auto-fix without prompting (per CR-A):
 
-> "pins-sync reports drift in {list-of-repos}: {brief-summary}. Fix
-> the pinned SHA(s) by either:
-> (a) hard-resetting the working tree to the pin in
-> `spark-ext/dev/pins.env`, OR
-> (b) updating `pins.env` (and the spark-openivm-build Dockerfile
-> ARGs) to a new SHA you intend to keep.
-> Reply with `continue` when fixed."
+1. **HEAD drift** in `.temp/{openivm,lpts,ivm-bench}`: hard-reset to
+   the pinned commit — `git -C .temp/<repo> reset --hard <pin>`.
 
-Re-run `pins-sync` after the user replies. Retry budget per CR-H: 3.
+2. **Dockerfile ARG mismatch** (OPENIVM_COMMIT, LPTS_COMMIT, or their
+   REPO/BRANCH variants): update the ARG defaults in
+   `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile` to
+   match `spark-ext/dev/pins.env`, then commit + push on ivm-bench's
+   working branch.
+
+3. **OPENIVM_SPARK_COMMIT mismatch**: update both `ARG
+   OPENIVM_SPARK_COMMIT=` lines in the Dockerfile (stage 2 and stage 3)
+   to the origin HEAD SHA reported by `pins-sync`, then commit + push
+   on ivm-bench's working branch.
+
+4. **OPENIVM_SPARK_BRANCH mismatch**: update `ARG
+   OPENIVM_SPARK_BRANCH=` in the Dockerfile to the current local
+   branch, then commit + push on ivm-bench's working branch.
+
+Re-run `pins-sync` after each auto-fix pass. Retry budget per CR-H: 3.
 On exhaustion, append a `## Pins-sync drift (unresolved)` section to
 the report and stop with `{ "status": "Failed" }`.
 
@@ -455,28 +465,32 @@ Edit `.temp/openivm/src/upsert/refresh.cpp` or `refresh_sql.cpp` or
 `refresh_sql.cpp:293-347` already exist — enable them or promote to
 table rows on `openivm_refresh_history`.
 
-**Deployment** under the no-commit rule requires `ask_user`:
+**Deployment** (auto-commit per CR-A):
 
-> "Patching openivm requires either (A) a local commit on
-> branch `openivm-spark` of `.temp/openivm` plus a pins.env bump,
-> or (B) overlay-building `openivm.duckdb_extension` and replacing
-> `.temp/ivm-bench/mount/bin/spark-openivm/openivm.duckdb_extension`
-> manually. Pick A or B and confirm."
+1. Commit the C++ patch on the working branch of `.temp/openivm`:
+   ```bash
+   git -C .temp/openivm add -A && \
+   git -C .temp/openivm commit -m "[ivm-investigation] <describe patch>"
+   ```
+2. Push: `git -C .temp/openivm push origin HEAD`
+3. Capture the new SHA:
+   `NEW_SHA=$(git -C .temp/openivm rev-parse HEAD)`
+4. Bump `OPENIVM_COMMIT` in `spark-ext/dev/pins.env` to `$NEW_SHA`.
+5. Bump the matching `ARG OPENIVM_COMMIT` default in
+   `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile`
+   (ABI-sensitive build — the two must match).
+6. Commit + push pins.env in openivm-spark, and Dockerfile in
+   ivm-bench, on their respective working branches.
+7. Re-run `pins-sync` to verify alignment.
 
-If the user picks (A), bump `OPENIVM_COMMIT` in
-`spark-ext/dev/pins.env` to the new SHA they just created on the
-working branch. ALSO bump the matching `ARG OPENIVM_COMMIT` default
-in `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile`
-(per the repo memory: ABI-sensitive build, the two must match).
-Re-run `pins-sync` to verify.
-
-If neither A nor B is feasible, declare the gap unaddressable in the
-report and move on.
+If the branch is `main` for any repo in this chain, report the gap
+and move on (per CR-D).
 
 ### 5.C — lpts patches (C++)
 
 Edit `.temp/lpts/src/lpts_pipeline.cpp` or `cte_nodes.cpp`. Same
-deployment options as 5.B with `LPTS_COMMIT` instead.
+auto-commit deployment flow as 5.B with `LPTS_COMMIT` instead of
+`OPENIVM_COMMIT`.
 
 ### 5.D — ivm-bench patches
 
@@ -602,8 +616,8 @@ investigation — the primary finding is R0.)
 ## Where Spark time is spent (per-step)
 
 (Only present if Phase 5.A patches were applied. Otherwise: "Not
-captured — gap not closeable under no-commit constraint" with a list
-of patches that would close it.)
+captured — patches were not applied" with a list of patches that
+would close it.)
 
 ## Where DuckDB time is spent (per-step)
 
