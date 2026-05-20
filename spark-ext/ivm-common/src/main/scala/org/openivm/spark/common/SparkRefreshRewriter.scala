@@ -452,14 +452,16 @@ object SparkRefreshRewriter {
     )
   }
 
-  /** Replace `memory.main.<identifier>` → either
+  /** Replace `memory.main.<identifier>` (bare or backticked) → either
     *   - `` `<db>`.`<table>` `` if `<identifier>` is a tracked source whose
     *     fully-qualified name is registered in [[activeQualifiedNames]]; OR
     *   - `` `<identifier>` `` otherwise (the default openivm internal name
     *     e.g. `openivm_delta_<n>`, `openivm_data_<v>`).
     *
-    * openivm always emits the DuckDB catalog prefix `memory.main.` when the
-    * SPARK target dialect is selected; on the Spark side most of these
+    * openivm usually emits the DuckDB catalog prefix `memory.main.` when the
+    * SPARK target dialect is selected, but some translated statements arrive
+    * as the equivalent backticked multipart identifier
+    * `` `memory`.`main`.`<identifier>` ``. On the Spark side most of these
     * reference our internal temp views/tables (which we created with the
     * short name), but live-source references (`memory.main.<short>`) must
     * be expanded to `<db>.<table>` when the user's view body referenced a
@@ -468,7 +470,8 @@ object SparkRefreshRewriter {
     */
   private def rewriteMemoryMainPrefix(sql: String): String = {
     val qualifiedMap = activeQualifiedNames.get()
-    val re           = """memory\.main\.(\w+)""".r
+    val re =
+      """(?i)(?:`?memory`?\s*\.\s*`?main`?\s*\.\s*`?([A-Za-z0-9_]+)`?)""".r
     re.replaceAllIn(
       sql,
       m => {

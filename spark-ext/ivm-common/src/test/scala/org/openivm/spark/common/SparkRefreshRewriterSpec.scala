@@ -104,6 +104,23 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stmtB should include("`openivm_delta_sales`")
       stmtB should not include "memory.main.openivm_delta_sales"
     }
+
+    it("rewrites backticked memory.main.openivm_delta_sales to backtick-quoted openivm_delta_sales in statement B") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = sevenStatementInput.replace(
+          "memory.main.openivm_delta_sales",
+          "`memory`.`main`.`openivm_delta_sales`"
+        ),
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val stmtB = rewritten.statements.head
+      stmtB should include("`openivm_delta_sales`")
+      stmtB should not include("`memory`.`main`.`openivm_delta_sales`")
+    }
   }
 
   // ── 4. openivm_data_mv_r → `mydb`.`mv_r` ──────────────────────────────────
