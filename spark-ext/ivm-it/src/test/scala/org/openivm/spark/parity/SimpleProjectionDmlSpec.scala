@@ -1,6 +1,7 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{MvCatalog, StagingCatalog}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -201,6 +202,43 @@ class SimpleProjectionDmlSpec extends AnyFunSpec with Matchers with BeforeAndAft
 
       spark.table("mv_sp13").count() shouldBe 120L
       assertMvCorrect("mv_sp13", "SELECT user_id, name, age FROM users_p13")
+    }
+  }
+
+  // ── (14) Positive-only refresh skips delete MERGE ─────────────────────────
+
+  describe("(14) Positive-only refresh skips delete MERGE") {
+    it("refreshing a positive-only batch appends rows without a MERGE commit on the MV Delta history") {
+      spark.sql("CREATE TABLE IF NOT EXISTS users_p14(user_id INT, name STRING, age INT) USING DELTA")
+      spark.sql("INSERT INTO users_p14 VALUES (1, 'Alice', 30)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_sp14 AS SELECT name, age FROM users_p14 WHERE age > 25"
+      )
+
+      val meta = MvCatalog
+        .lookup(spark, TableIdentifier("mv_sp14"))
+        .getOrElse(fail("mv_sp14 metadata missing"))
+      val escapedLocation = meta.location.replace("`", "``")
+      val preRefreshVersion = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .selectExpr("max(version) AS version")
+        .head()
+        .getAs[Long]("version")
+
+      spark.sql("INSERT INTO users_p14 VALUES (2, 'Bob', 28), (3, 'Carol', 35)")
+      refreshMv("mv_sp14")
+
+      assertMvCorrect("mv_sp14", "SELECT name, age FROM users_p14 WHERE age > 25")
+
+      val refreshHistory = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .where(s"version > $preRefreshVersion")
+        .collect()
+
+      refreshHistory should have size 1
+      refreshHistory.head.getAs[String]("operation") shouldBe "WRITE"
+      Option(refreshHistory.head.getAs[Map[String, String]]("operationParameters"))
+        .flatMap(_.get("mode")) shouldBe Some("Append")
     }
   }
 }

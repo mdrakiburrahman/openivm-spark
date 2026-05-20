@@ -40,6 +40,20 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
       |""".stripMargin
 
+  private val simpleProjectionInput: String =
+    """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+      |INSERT INTO openivm_delta_mv_r (name, age, openivm_multiplicity, openivm_timestamp)
+      |SELECT name, age, openivm_multiplicity, openivm_timestamp
+      |FROM memory.main.openivm_delta_users
+      |WHERE openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP;
+      |INSERT INTO openivm_data_mv_r
+      |SELECT name, age
+      |FROM openivm_delta_mv_r, generate_series(1, openivm_multiplicity::BIGINT)
+      |WHERE openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP AND openivm_multiplicity > 0;
+      |DELETE FROM openivm_delta_mv_r;
+      |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+      |""".stripMargin
+
   // ── 1. Statement splitter: keep only B and C ──────────────────────────────
   describe("splitStatements + rewrite") {
     it("reduces the 7-statement openivm program to 2 surviving Spark statements") {
@@ -237,7 +251,30 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  // ── 8. postProcess is applied to each surviving statement ────────────────
+  // ── 8. SIMPLE_PROJECTION delete MERGE is tagged for runtime skip ─────────
+  describe("simple projection delete MERGE tagging") {
+    it("tags the delete-only MERGE so refresh execution can skip it when the view-delta has no negative rows") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = simpleProjectionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 3
+      SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements.head) shouldBe false
+      SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(1)) shouldBe false
+      SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(2)) shouldBe true
+
+      val deleteMerge = SparkRefreshRewriter.stripExecutionMarker(rewritten.statements(2))
+      deleteMerge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      deleteMerge should include("WHERE `openivm_multiplicity` < 0")
+    }
+  }
+
+  // ── 9. postProcess is applied to each surviving statement ────────────────
   describe("postProcess hook") {
     it("invokes the supplied postProcess function on every kept statement") {
       val tagged = SparkRefreshRewriter.rewrite(
@@ -254,7 +291,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  // ── 9. Recompute-cascade snapshot rewrite ────────────────────────────────
+  // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
       val windowCascadeInput =
@@ -304,7 +341,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  // ── 10. hasRealDelta detection ────────────────────────────────────────────
+  // ── 11. hasRealDelta detection ───────────────────────────────────────────
   describe("hasRealDelta") {
     it("returns true for a real CTE-prefixed delta (single-source AGGREGATE_GROUP)") {
       SparkRefreshRewriter.hasRealDelta(sevenStatementInput, viewLogicalName) shouldBe true

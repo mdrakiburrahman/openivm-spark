@@ -64,6 +64,18 @@ object SparkRefreshRewriter {
       override def initialValue(): Map[String, String] = Map.empty
     }
 
+  private[spark] val SimpleProjectionDeleteMergeMarker: String =
+    "/*OPENIVM_SIMPLE_PROJECTION_DELETE_MERGE*/"
+
+  private def markSimpleProjectionDeleteMerge(sql: String): String =
+    s"$SimpleProjectionDeleteMergeMarker\n$sql"
+
+  private[spark] def isSimpleProjectionDeleteMerge(sql: String): Boolean =
+    sql.contains(SimpleProjectionDeleteMergeMarker)
+
+  private[spark] def stripExecutionMarker(sql: String): String =
+    sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
+
   /** Rewrite the openivm-emitted multi-statement refresh SQL into Spark-
     * executable statements.
     *
@@ -773,7 +785,7 @@ object SparkRefreshRewriter {
     val onCondition = userCols
       .map(c => s"v.$c IS NOT DISTINCT FROM d.$c")
       .mkString(" AND ")
-    val deleteMergeSql =
+    val deleteMergeSql = markSimpleProjectionDeleteMerge(
       s"""|MERGE INTO $mv AS v
           |USING (
           |  SELECT $colList
@@ -782,6 +794,7 @@ object SparkRefreshRewriter {
           |) AS d
           |ON $onCondition
           |WHEN MATCHED THEN DELETE""".stripMargin
+    )
 
     Seq(insertSql, deleteMergeSql)
   }

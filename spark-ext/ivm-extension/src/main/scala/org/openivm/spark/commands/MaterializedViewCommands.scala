@@ -851,17 +851,31 @@ case class RefreshMaterializedViewCommand(
       )
 
       try {
+        lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
+
         // Log the rewritten SQL at DEBUG so cascade-related issues are
         // observable when -Dlog4j2.logger.org.openivm.spark.commands=DEBUG
         // is set, without polluting the default INFO output.
         rewritten.statements.zipWithIndex.foreach { case (stmt, i) =>
+          val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' stmt[$i]=" +
-              stmt.replace('\n', ' ').take(4000)
+              sql.replace('\n', ' ').take(4000)
           )
         }
-        rewritten.statements.foreach { sql =>
-          RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+        rewritten.statements.foreach { stmt =>
+          val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+          val skipDeleteMerge =
+            SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+
+          if (skipDeleteMerge) {
+            logInfo(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
+            )
+          } else {
+            RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+          }
         }
 
         // For count-monoid refresh types, the openivm-emitted MERGE leaves
@@ -937,7 +951,7 @@ case class RefreshMaterializedViewCommand(
             if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
           } catch { case _: Throwable => () }
           val sqlSnippet = rewritten.statements.zipWithIndex
-            .map { case (s, i) => s"[${i + 1}] $s" }
+            .map { case (s, i) => s"[${i + 1}] ${SparkRefreshRewriter.stripExecutionMarker(s)}" }
             .mkString("\n---\n")
           throw new RuntimeException(
             s"Incremental refresh of '${sqlIdent(name)}' failed: ${t.getMessage}\n" +
@@ -956,6 +970,19 @@ case class RefreshMaterializedViewCommand(
     }
 
     Seq.empty
+  }
+
+  private def hasNegativeSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    spark
+      .sql(
+        s"""SELECT 1
+           |FROM delta.`$escapedPath`
+           |WHERE `openivm_multiplicity` < 0
+           |LIMIT 1""".stripMargin
+      )
+      .head(1)
+      .nonEmpty
   }
 
   /** Advance the MV's tracked Delta version and prune fully-consumed staging
