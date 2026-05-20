@@ -171,7 +171,8 @@ object SparkRefreshRewriter {
       // similar refresh programs) into an explicit column list using the source
       // schemas supplied by the caller.
       val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
-      RewrittenRefresh(withExceptExpanded.map(postProcess))
+      val withAliasFixup    = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
+      RewrittenRefresh(withAliasFixup.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
     }
@@ -713,15 +714,24 @@ object SparkRefreshRewriter {
     // — not the fully-qualified table name.  Detect the alias from the
     // already-rewritten `MERGE INTO <mv> [AS] <alias> USING` and replace
     // any `<mv>.` column-ref prefixes in the body with `<alias>.`.
-    val mvEscaped = java.util.regex.Pattern.quote(mvSqlName)
-    val postMergeAliasRe =
-      ("(?is)MERGE\\s+INTO\\s+" + mvEscaped + "\\s+(?:AS\\s+)?\"?(\\w+)\"?(?=\\s+USING\\b)").r
-    postMergeAliasRe.findFirstMatchIn(s).foreach { m =>
-      val alias     = m.group(1)
-      val bodyStart = m.end
-      val body      = s.substring(bodyStart)
-      val fixedBody = body.replaceAll(mvEscaped + "\\.", alias + ".")
-      s = s.substring(0, bodyStart) + fixedBody
+    // Note: the compiler may emit newlines between the alias and USING,
+    // so whitespace matching must handle \n, not just spaces.
+    val mergeIntoPrefix = s"MERGE INTO $mvSqlName"
+    val usingRe         = "(?i)\\sUSING\\s".r
+    val usingMatch      = usingRe.findFirstMatchIn(s)
+    if (s.contains(mergeIntoPrefix) && usingMatch.isDefined) {
+      val usingIdx = usingMatch.get.start
+      val afterMv = s.substring(mergeIntoPrefix.length, usingIdx).trim
+      val alias = afterMv
+        .replaceFirst("(?i)^AS\\s+", "")
+        .replaceAll("\"", "")
+        .trim
+      if (alias.nonEmpty && alias.matches("\\w+")) {
+        val mvDotPrefix = mvSqlName + "."
+        val body        = s.substring(usingIdx)
+        val fixedBody   = body.replace(mvDotPrefix, alias + ".")
+        s = s.substring(0, usingIdx) + fixedBody
+      }
     }
 
     s
@@ -1695,5 +1705,37 @@ object SparkRefreshRewriter {
   private def backtickMvName(id: TableIdentifier): String = {
     val parts = id.catalog.toSeq ++ id.database.toSeq ++ Seq(id.table)
     parts.map(p => s"`${p.replace("`", "``")}`").mkString(".")
+  }
+
+  /** Fix MERGE alias references: when a MERGE INTO targets a multi-part MV
+    * name with an alias (e.g. `MERGE INTO \`db\`.\`table\` AS v USING ...`),
+    * Spark/Delta requires the ON / WHEN clauses to use the alias (`v.col`)
+    * rather than the fully-qualified name (`\`db\`.\`table\`.col`).
+    *
+    * Runs as a top-level pass on every rewritten statement — after all
+    * per-statement rewriters and before the dialect postProcess — so it
+    * catches cases regardless of which rewriter produced the MERGE.
+    */
+  private def fixMergeAliasRefs(stmt: String, mvName: TableIdentifier): String = {
+    val mvSqlName = backtickMvName(mvName)
+    val mvDot     = mvSqlName + "."
+
+    // Quick exit: no MV-qualified column references to fix.
+    if (!stmt.contains(mvDot)) return stmt
+
+    // Detect: MERGE INTO <mv> [AS] <alias> <whitespace> USING
+    val mergeRe = ("(?is)MERGE\\s+INTO\\s+" +
+      java.util.regex.Pattern.quote(mvSqlName) +
+      "\\s+(?:AS\\s+)?\"?(\\w+)\"?\\s+USING\\b").r
+
+    mergeRe.findFirstMatchIn(stmt) match {
+      case Some(m) =>
+        val alias     = m.group(1)
+        val bodyStart = m.end - "USING".length // keep USING in the body
+        val body      = stmt.substring(bodyStart)
+        val fixedBody = body.replace(mvDot, alias + ".")
+        stmt.substring(0, bodyStart) + fixedBody
+      case None => stmt
+    }
   }
 }
