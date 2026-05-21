@@ -165,9 +165,9 @@ class CompileRefreshSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll
     // OpenIvmCompiler always sets the SPARK dialect on its embedded DuckDB
     // session, so we verify by compiling a SIMPLE_PROJECTION view (which
     // exercises the lpts SPARK pipeline) and asserting the generated SQL
-    // contains the fully-qualified `memory.main.` table reference that the
-    // SPARK dialect emits.
-    it("emits SPARK-dialect SQL with fully-qualified memory.main. references for SIMPLE_PROJECTION") {
+    // contains the fully-qualified quoted `memory`.`main`.`...` table reference
+    // that the SPARK dialect emits.
+    it("emits SPARK-dialect SQL with fully-qualified quoted memory.main references for SIMPLE_PROJECTION") {
       val result = sharedCompiler.compile(
         CompileRequest(
           viewName = "mv_sales_proj",
@@ -177,7 +177,7 @@ class CompileRefreshSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll
       )
       result.refreshType shouldBe 2
       result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-      result.sql should include("memory.main.")
+      result.sql should include("`memory`.`main`.")
     }
 
     // openivm Test 5 — AGGREGATE_GROUP shape, compile returns non-empty SQL.

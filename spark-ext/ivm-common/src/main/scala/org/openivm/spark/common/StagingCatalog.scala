@@ -1,10 +1,12 @@
 package org.openivm.spark.common
 
-import io.delta.tables.DeltaTable
-import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.types._
+import org.apache.spark.sql.SparkSession
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
 import java.sql.Timestamp
+import scala.collection.mutable
 
 /**
  * A single DML delta written by the DML interceptor for one base table.
@@ -67,138 +69,117 @@ object StagingDelta {
   }
 }
 
-/**
- * Delta-backed catalog for DML staging records.
- *
- * All operations target `<warehouse>/_ivm/_meta/staging`.
- * Callers MUST invoke [[ensureTables]] once before any other method.
- *
- * == Snapshot caching ==
- *
- * Read calls ([[collectFor]], [[currentWatermarks]]) are served from an
- * in-process Delta-version-aware snapshot cache so a TPC-DI-scale
- * benchmark (per-MV `collectFor` × 49 MVs × 3 batches, plus a
- * `currentWatermarks` per MV CREATE) does not pay the full
- * `DeltaTable.toDF.collect()` cost on every staging metadata read. The
- * cache is invalidated explicitly after every write
- * ([[record]], [[markConsumed]], [[pruneFullyConsumed]],
- * [[removeForBaseTable]]) and implicitly when the Delta log version on
- * disk advances since the last load.
- */
-object StagingCatalog extends DeltaRetrySupport {
+/** RocksDB-backed catalog for DML staging records. */
+object StagingCatalog {
 
-  private val MetaSubPath = "_ivm/_meta/staging"
+  private val IndexDbColumnFamilies = Seq("mv_index", "source_to_mvs", "table_index")
+  private val MvDbColumnFamilies    = Seq("meta", "properties", "consumed")
+  private val BaseDbColumnFamilies  = Seq("staging")
 
-  /** In-process Delta-version-aware cache for the staging snapshot. */
-  private[common] val snapshotCache: DeltaSnapshotCache[Seq[StagingDelta]] =
-    new DeltaSnapshotCache[Seq[StagingDelta]]()
+  private val MvIndexCf    = "mv_index"
+  private val TableIndexCf = "table_index"
+  private val StagingCf    = "staging"
+  private val ConsumedCf   = "consumed"
 
-  private def reloadFromDelta(spark: SparkSession, path: String): Seq[StagingDelta] = {
-    DeltaTable
-      .forPath(spark, path)
-      .toDF
-      .collect()
-      .map(rowToDelta)
-      .toSeq
+  private def warehouseDir(spark: SparkSession): String =
+    RocksDBCodec.requireLocalPath(spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/"))
+
+  private def indexDbPath(spark: SparkSession): String =
+    Paths.get(warehouseDir(spark), "_openivm", "index", "rocksdb").toString
+
+  private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
+    Paths
+      .get(warehouseDir(spark), "_openivm", "tables", RocksDBCodec.safePathSegment(baseTable), "rocksdb")
+      .toString
+
+  private def openIndexDb(spark: SparkSession): OpenIvmRocksDB = {
+    // Request ALL column families hosted by the shared index DB; the registry rejects widening
+    // the CF set on a later reopen of the same path.
+    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath(spark), IndexDbColumnFamilies)
   }
 
-  private def snapshot(spark: SparkSession): Seq[StagingDelta] = {
-    val path = tablePath(spark)
-    snapshotCache.snapshot(spark, path, s => reloadFromDelta(s, path))
-  }
+  private def openBaseTableDb(spark: SparkSession, baseTable: String): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(spark, baseTableDbPath(spark, baseTable), BaseDbColumnFamilies)
 
-  // -------------------------------------------------------------------------
-  // Internal helpers
-  // -------------------------------------------------------------------------
-
-  private def tablePath(spark: SparkSession): String = {
-    val warehouseDir = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    s"$warehouseDir/$MetaSubPath"
-  }
-
-  private def sqlLit(s: String): String =
-    s"'${s.replace("\\", "\\\\").replace("'", "\\'")}'"
-
-  private val StagingSchema: StructType = StructType(
-    Array(
-      StructField("base_table", StringType, nullable = false),
-      StructField("op_type", StringType, nullable = false),
-      StructField("staging_path", StringType, nullable = false),
-      StructField("txn_ts", TimestampType, nullable = false),
-      StructField("consumed_by", ArrayType(StringType, containsNull = false), nullable = false)
-    )
-  )
-
-  private def rowToDelta(row: Row): StagingDelta =
-    StagingDelta(
-      baseTable = row.getAs[String]("base_table"),
-      opType = row.getAs[String]("op_type"),
-      stagingPath = row.getAs[String]("staging_path"),
-      txnTs = row.getAs[Timestamp]("txn_ts"),
-      consumedBy = row.getSeq[String](row.fieldIndex("consumed_by"))
-    )
-
-  private def deltaToRow(d: StagingDelta): Row =
-    Row(d.baseTable, d.opType, d.stagingPath, d.txnTs, d.consumedBy.toArray)
-
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
-
-  /** Idempotent: creates `_ivm._meta.staging` if absent. */
-  def ensureTables(spark: SparkSession): Unit =
-    DeltaTable
-      .createIfNotExists(spark)
-      .location(tablePath(spark))
-      .addColumn(StructField("base_table", StringType, nullable = false))
-      .addColumn(StructField("op_type", StringType, nullable = false))
-      .addColumn(StructField("staging_path", StringType, nullable = false))
-      .addColumn(StructField("txn_ts", TimestampType, nullable = false))
-      .addColumn(
-        StructField("consumed_by", ArrayType(StringType, containsNull = false), nullable = false)
-      )
-      .execute()
-
-  /**
-   * Record a new DML delta.  Uses MERGE on (base_table, staging_path) so the call is
-   * idempotent: re-recording the same path does not overwrite `consumed_by`.
-   */
-  def record(spark: SparkSession, delta: StagingDelta): Unit = StagingCatalog.synchronized {
-    val path = tablePath(spark)
-    withDeltaRetry {
-      val sourceDF = spark.createDataFrame(
-        spark.sparkContext.parallelize(Seq(deltaToRow(delta)), 1),
-        StagingSchema
-      )
-      DeltaTable
-        .forPath(spark, path)
-        .as("target")
-        .merge(
-          sourceDF.as("source"),
-          "target.base_table = source.base_table AND target.staging_path = source.staging_path"
-        )
-        .whenNotMatched()
-        .insertAll()
-        .execute()
+  private def openTrackedMvDb(
+      spark: SparkSession,
+      indexDb: OpenIvmRocksDB,
+      viewName: String
+  ): Option[OpenIvmRocksDB] =
+    indexDb.get(MvIndexCf, RocksDBCodec.utf8(viewName)).map { pathBytes =>
+      val mvDbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
+      // Request ALL column families hosted by the per-MV DB even though StagingCatalog only
+      // touches `consumed`; the registry enforces subset-safe reopen semantics per path.
+      OpenIvmRocksDBRegistry.getOrOpen(spark, mvDbPath, MvDbColumnFamilies)
     }
-    snapshotCache.invalidate(path)
+
+  private def decodeStagingKey(key: Array[Byte]): (Long, String) = {
+    val parts = RocksDBCodec.splitComposite(key, 2)
+    require(parts.length == 2, s"Expected 2-part staging key, found ${parts.length} part(s).")
+    RocksDBCodec.decodeLongBE(parts.head) -> RocksDBCodec.fromUtf8(parts(1))
   }
 
-  /**
-   * Returns every staging row for `sources` that has NOT yet been consumed by `viewName`,
-   * ordered by txn_ts ascending.
-   *
-   * Reads from the snapshot cache: this is one of the hottest reads
-   * (one call per REFRESH × per MV).
-   *
-   * @param sources    base-table names to scan. Only rows where `base_table IN sources`
-   *                   are returned.
-   * @param watermarks per-source low-water-mark filter. A row for source `S` is returned
-   *                   only if `txn_ts > watermarks(S)`. Sources absent from the map are
-   *                   unfiltered (legacy semantics). Used by MV-over-MV cascade to prevent
-   *                   newly-created downstream MVs from double-applying upstream view-deltas
-   *                   that pre-date their creation.
-   */
+  private def decodeOpType(value: Array[Byte]): String = {
+    val parts = RocksDBCodec.splitComposite(value, 2)
+    require(parts.nonEmpty, "Expected at least one part in staging value.")
+    RocksDBCodec.fromUtf8(parts.head)
+  }
+
+  private def deleteRecursively(path: Path): Unit =
+    if (Files.exists(path)) {
+      Files.walkFileTree(
+        path,
+        new SimpleFileVisitor[Path] {
+          override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
+            Files.deleteIfExists(file)
+            FileVisitResult.CONTINUE
+          }
+
+          override def postVisitDirectory(dir: Path, exc: java.io.IOException): FileVisitResult = {
+            if (exc != null) throw exc
+            Files.deleteIfExists(dir)
+            FileVisitResult.CONTINUE
+          }
+        }
+      )
+    }
+
+  def ensureTables(spark: SparkSession): Unit = {
+    openIndexDb(spark)
+    ()
+  }
+
+  def record(spark: SparkSession, delta: StagingDelta): Unit = {
+    val baseDbPath = baseTableDbPath(spark, delta.baseTable)
+    val baseDb     = openBaseTableDb(spark, delta.baseTable)
+    // `consumedBy` is intentionally ignored on write: consumed state now lives in each MV's
+    // dedicated RocksDB under the `consumed` column family.
+    val stagingKey = RocksDBCodec.compositeKey(
+      Seq(RocksDBCodec.encodeLongBE(delta.txnTs.getTime), RocksDBCodec.utf8(delta.stagingPath))
+    )
+    val stagingValue = RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(delta.opType)))
+
+    // `IvmDmlInterceptorRule.stagingPath` already uses millisecond-resolution timestamps, so a
+    // same-millisecond same-table same-op collision is a pre-existing path-generation bug that is
+    // intentionally left to follow-up work.
+    baseDb.withBatch { batch =>
+      OpenIvmRocksDBBatchOps.put(baseDb, batch, StagingCf, stagingKey, stagingValue)
+    }
+
+    val indexDb = openIndexDb(spark)
+    if (indexDb.get(TableIndexCf, RocksDBCodec.utf8(delta.baseTable)).isEmpty) {
+      indexDb.withBatch { batch =>
+        OpenIvmRocksDBBatchOps.put(
+          indexDb,
+          batch,
+          TableIndexCf,
+          RocksDBCodec.utf8(delta.baseTable),
+          RocksDBCodec.utf8(baseDbPath)
+        )
+      }
+    }
+  }
+
   def collectFor(
       spark: SparkSession,
       viewName: String,
@@ -206,116 +187,120 @@ object StagingCatalog extends DeltaRetrySupport {
       watermarks: Map[String, Timestamp] = Map.empty
   ): Seq[StagingDelta] = {
     if (sources.isEmpty) return Seq.empty
-    val sourceSet = sources.toSet
-    val all       = snapshot(spark)
-    val matched = all.filter { d =>
-      sourceSet.contains(d.baseTable) && !d.consumedBy.contains(viewName) && {
-        watermarks.get(d.baseTable) match {
-          case Some(wm) => d.txnTs.after(wm)
-          case None     => true
-        }
-      }
-    }
-    matched.sortBy(_.txnTs.getTime)
-  }
 
-  /**
-   * Capture the current per-source watermark — the MAX(txn_ts) over all
-   * `StagingCatalog` rows for each given source.
-   *
-   * Reads from the snapshot cache.
-   *
-   * Returns an empty map entry (skipped) for sources with no rows yet, so callers
-   * who add the result to `MvMetadata.properties` only store keys that filter
-   * actual rows.
-   *
-   * Used at downstream MV CREATE time so the new MV's first REFRESH ignores
-   * upstream view-delta rows that were recorded before the MV existed (would
-   * otherwise double-apply once + recompute-from-scratch via the initial CTAS).
-   */
-  def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, Timestamp] = {
-    if (sources.isEmpty) return Map.empty
-    val sourceSet = sources.toSet
-    snapshot(spark).iterator
-      .filter(d => sourceSet.contains(d.baseTable))
-      .foldLeft(Map.empty[String, Timestamp]) { (acc, d) =>
-        acc.get(d.baseTable) match {
-          case Some(existing) if existing.getTime >= d.txnTs.getTime => acc
-          case _                                                     => acc + (d.baseTable -> d.txnTs)
-        }
-      }
-  }
-
-  /**
-   * Append `viewName` to `consumed_by` for each staging row identified by `paths`.
-   * Uses `array_union` so repeated calls with the same viewName are idempotent.
-   */
-  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit =
-    StagingCatalog.synchronized {
-      withDeltaRetry {
-        if (paths.isEmpty) return
-        val path = tablePath(spark)
-        val markerSchema = StructType(
-          Array(
-            StructField("staging_path", StringType, nullable = false),
-            StructField("new_view", StringType, nullable = false)
-          )
-        )
-        val rows     = paths.map(p => Row(p, viewName))
-        val markerDF = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), markerSchema)
-        DeltaTable
-          .forPath(spark, path)
-          .as("target")
-          .merge(markerDF.as("source"), "target.staging_path = source.staging_path")
-          .whenMatched()
-          .updateExpr(Map("consumed_by" -> "array_union(target.consumed_by, array(source.new_view))"))
-          .execute()
-        snapshotCache.invalidate(path)
-      }
-    }
-
-  /**
-   * Delete every staging row whose `consumed_by` covers ALL currently tracked MVs for its
-   * `base_table`.  Used after a successful refresh to prune fully-replayed deltas.
-   *
-   * @param viewsByTable maps each base_table name to the set of MV names that depend on it
-   */
-  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit =
-    StagingCatalog.synchronized {
-      withDeltaRetry {
-        if (viewsByTable.isEmpty) return
-        val path = tablePath(spark)
-        val dt   = DeltaTable.forPath(spark, path)
-        viewsByTable.foreach { case (baseTable, mvs) =>
-          if (mvs.nonEmpty) {
-            val mvsExpr = mvs.map(sqlLit).mkString(", ")
-            dt.delete(
-              s"base_table = ${sqlLit(baseTable)} AND " +
-                s"size(array_except(array($mvsExpr), consumed_by)) = 0"
+    val indexDb   = openIndexDb(spark)
+    val maybeMvDb = openTrackedMvDb(spark, indexDb, viewName)
+    val deltas = sources.distinct.iterator.flatMap { source =>
+      val dbPath = baseTableDbPath(spark, source)
+      if (!Files.exists(Paths.get(dbPath))) {
+        Iterator.empty
+      } else {
+        val baseDb = openBaseTableDb(spark, source)
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).flatMap { case (key, value) =>
+          val (txnTsMillis, stagingPath) = decodeStagingKey(key)
+          val watermarkPassed            = watermarks.get(source).forall(wm => txnTsMillis > wm.getTime)
+          val alreadyConsumed            = maybeMvDb.exists(_.get(ConsumedCf, RocksDBCodec.utf8(stagingPath)).isDefined)
+          if (watermarkPassed && !alreadyConsumed) {
+            Iterator.single(
+              StagingDelta(
+                baseTable = source,
+                opType = decodeOpType(value),
+                stagingPath = stagingPath,
+                txnTs = new Timestamp(txnTsMillis),
+                // The RocksDB layout tracks consumption per MV, not per staging row. Verified
+                // callers only consult `collectFor` for presence/path/op/timestamp, so the
+                // informational `consumedBy` field stays empty on read-back.
+                consumedBy = Seq.empty
+              )
             )
+          } else {
+            Iterator.empty
           }
         }
-        snapshotCache.invalidate(path)
       }
-    }
+    }.toVector
 
-  /**
-   * Delete every staging row with the given `baseTable`. Used by
-   * `DropMaterializedViewCommand` when an MV is dropped: every downstream
-   * MV's pending `MV_VIEW_DELTA` or trigger row from this MV becomes stale
-   * (its `staging_path` may point at deleted view-delta dirs, and a future
-   * CREATE of the same name might inherit unconsumed rows).
-   *
-   * Idempotent: no error if no rows match.
-   */
-  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
-    StagingCatalog.synchronized {
-      val path = tablePath(spark)
-      withDeltaRetry {
-        DeltaTable
-          .forPath(spark, path)
-          .delete(s"base_table = ${sqlLit(baseTable)}")
+    deltas.sortBy(_.txnTs.getTime)
+  }
+
+  def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, Timestamp] = {
+    if (sources.isEmpty) return Map.empty
+
+    sources.distinct.iterator.flatMap { source =>
+      val dbPath = baseTableDbPath(spark, source)
+      if (!Files.exists(Paths.get(dbPath))) {
+        None
+      } else {
+        val baseDb = openBaseTableDb(spark, source)
+        var found  = false
+        var maxTs  = 0L
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).foreach { case (key, _) =>
+          found = true
+          maxTs = math.max(maxTs, decodeStagingKey(key)._1)
+        }
+        if (found) Some(source -> new Timestamp(maxTs)) else None
       }
-      snapshotCache.invalidate(path)
+    }.toMap
+  }
+
+  def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
+    if (paths.isEmpty) return
+
+    val indexDb = openIndexDb(spark)
+    openTrackedMvDb(spark, indexDb, viewName).foreach { mvDb =>
+      mvDb.withBatch { batch =>
+        paths.distinct.foreach { path =>
+          OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
+        }
+      }
     }
+    // Corner case: if `mv_index` does not yet contain `viewName`, we intentionally skip the mark.
+    // There is no back-fill mechanism today; the owning MvCatalog rewrite writes that index entry.
+  }
+
+  def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
+    if (viewsByTable.isEmpty) return
+
+    val indexDb   = openIndexDb(spark)
+    val mvDbCache = mutable.HashMap.empty[String, Option[OpenIvmRocksDB]]
+
+    def trackedMvDb(viewName: String): Option[OpenIvmRocksDB] =
+      mvDbCache.getOrElseUpdate(viewName, openTrackedMvDb(spark, indexDb, viewName))
+
+    viewsByTable.foreach { case (baseTable, rawMvs) =>
+      val mvs    = rawMvs.distinct
+      val dbPath = baseTableDbPath(spark, baseTable)
+      if (mvs.nonEmpty && Files.exists(Paths.get(dbPath))) {
+        val baseDb = openBaseTableDb(spark, baseTable)
+        val toDelete = baseDb
+          .prefixScan(StagingCf, Array.emptyByteArray)
+          .flatMap { case (key, _) =>
+            val (_, stagingPath) = decodeStagingKey(key)
+            val consumedByAll = mvs.forall { mvName =>
+              trackedMvDb(mvName).exists(_.get(ConsumedCf, RocksDBCodec.utf8(stagingPath)).isDefined)
+            }
+            if (consumedByAll) Iterator.single(key.clone()) else Iterator.empty
+          }
+          .toList
+
+        if (toDelete.nonEmpty) {
+          baseDb.withBatch { batch =>
+            toDelete.foreach(key => OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key))
+          }
+        }
+      }
+    }
+  }
+
+  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
+    val indexDb = openIndexDb(spark)
+    indexDb.get(TableIndexCf, RocksDBCodec.utf8(baseTable)).foreach { pathBytes =>
+      val dbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
+      OpenIvmRocksDBRegistry.close(dbPath)
+      deleteRecursively(Paths.get(dbPath))
+      indexDb.withBatch { batch =>
+        OpenIvmRocksDBBatchOps.delete(indexDb, batch, TableIndexCf, RocksDBCodec.utf8(baseTable))
+      }
+    }
+  }
 }

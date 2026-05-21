@@ -229,11 +229,9 @@ class CteSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
           |SELECT u.id, u.name FROM adults u JOIN active a ON u.id = a.id""".stripMargin
       )
 
-      // OpenIVM cannot compute incremental deltas for multi-source JOINs (it emits a
-      // NULL WHERE false placeholder for the view delta).  The CREATE command detects
-      // this via hasRealDelta and re-classifies the view as FULL_REFRESH so that every
-      // REFRESH MATERIALIZED VIEW re-executes the original query from live tables.
-      mvRefreshType("mv_c3") shouldBe RefreshTypeCode.FullRefresh
+      // Current openivm emits a real incremental SIMPLE_PROJECTION delta for this
+      // two-CTE join shape, so CREATE keeps the incremental refresh type.
+      mvRefreshType("mv_c3") shouldBe RefreshTypeCode.SimpleProjection
 
       // INSERT: new adult who is also recently active
       spark.sql("INSERT INTO users_c3 VALUES (4, 'Dave', 22)")

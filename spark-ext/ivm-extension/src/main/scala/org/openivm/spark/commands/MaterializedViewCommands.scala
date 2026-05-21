@@ -392,8 +392,65 @@ case class CreateMaterializedViewCommand(
           )
       }
 
+    val windowInitialLoadMatchesUserQuery: Boolean =
+      if (compiled.refreshType != RefreshTypeCode.WindowPartition || compiled.initialLoadSql.isEmpty) true
+      else {
+        val translatedInitialLoadSql = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        try {
+          val expected    = spark.sql(originalQueryText)
+          val userCols    = expected.columns.toSeq
+          val initialLoad = spark.sql(translatedInitialLoadSql).selectExpr(userCols.map(c => s"`$c`"): _*)
+          initialLoad.exceptAll(expected).head(1).isEmpty && expected.exceptAll(initialLoad).head(1).isEmpty
+        } catch {
+          case _: Throwable => false
+        }
+      }
     // Storage location
     val location = mvLocation(spark, name)
+    val hasOuterJoin =
+      "(?i)\\b(?:LEFT|RIGHT|FULL)(?:\\s+OUTER)?\\s+JOIN\\b".r.findFirstIn(originalQueryText).nonEmpty
+    val aggregateHavingDataColumns: Option[Set[String]] =
+      if (compiled.refreshType != RefreshTypeCode.AggregateHaving) None
+      else {
+        val incrementalViewBodySql =
+          if (compiled.initialLoadSql.isEmpty) originalQueryText
+          else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        try {
+          Some(
+            spark
+              .sql(s"SELECT * FROM ($incrementalViewBodySql) __openivm_having_preview LIMIT 0")
+              .schema
+              .fieldNames
+              .toSet
+          )
+        } catch {
+          case _: Throwable => None
+        }
+      }
+
+    val simpleProjectionHasDataApply: Boolean =
+      if (compiled.refreshType != RefreshTypeCode.SimpleProjection || compiled.sql.isEmpty) true
+      else {
+        val probeViewDeltaPath = s"${location.stripSuffix("/")}/__openivm_rewrite_probe"
+        try {
+          val rewritten = SparkRefreshRewriter.rewrite(
+            compiledSql = compiled.sql,
+            mvName = name,
+            mvLocation = location,
+            viewLogicalName = name.table,
+            sourceTempViews = Map.empty,
+            viewDeltaPath = probeViewDeltaPath,
+            postProcess = org.openivm.spark.compiler.LptsSparkDialect.translate,
+            sourceSchemas = qualSchemas.map { case (qual, schema) =>
+              qual.split("\\.").last -> schema.fieldNames.toSeq
+            },
+            sourceQualifiedNames = shortToQual
+          )
+          rewritten.statements.size > 1
+        } catch {
+          case _: Throwable => false
+        }
+      }
 
     // Move the fingerprint computation below the upstream-MV enumeration so we
     // can include each upstream MV's identity hash. This way DROP + recreate
@@ -486,6 +543,12 @@ case class CreateMaterializedViewCommand(
     // see WHY each MV ended up FULL_REFRESH in the spark-ext / dbt-server
     // container log. The reason keys mirror the if-else branches:
     //   - top_k                       Top-K view (ORDER BY ... LIMIT ...) forced to FULL_REFRESH
+    //   - simple_projection_outer_join SIMPLE_PROJECTION over LEFT/RIGHT/FULL JOIN;
+    //                                 demoted to FULL_REFRESH because the current
+    //                                 rewrite/apply path is not bag-safe across outer joins
+    //   - simple_projection_no_apply  compiler emitted a SIMPLE_PROJECTION delta
+    //                                 feed but no data-table apply statement after
+    //                                 rewrite, so REFRESH would be a no-op
     //   - non_cascade_upstream        Upstream MV instance does NOT emit a
     //                                 persisted `openivm_delta_<view>` downstream can
     //                                 consume incrementally (e.g. SIMPLE_AGGREGATE,
@@ -495,6 +558,10 @@ case class CreateMaterializedViewCommand(
     //                                 GROUP_RECOMPUTE only escape this bucket when their
     //                                 concrete compiled SQL actually emitted the cascade
     //                                 delta guarded by `_ivm_emits_cascade_view_delta`.
+    //   - window_initial_load_mismatch translated WINDOW_PARTITION initial-load SQL
+    //                                 is not bag-equal to the user query on current
+    //                                 data, so the MV is demoted to FULL_REFRESH
+    //                                 for correctness (e.g. ignoreNulls semantics)
     //   - window_partition_kept       compiler classified WINDOW_PARTITION; kept
     //                                 (primary refresh is still partition recompute,
     //                                 now with an auxiliary cascade view-delta)
@@ -511,14 +578,25 @@ case class CreateMaterializedViewCommand(
     // production-tuned log filters surface it.
     val (effectiveRefreshType, classifyReason) = {
       if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
+      else if (compiled.refreshType == RefreshTypeCode.SimpleProjection && hasOuterJoin)
+        (RefreshTypeCode.FullRefresh, "simple_projection_outer_join")
+      else if (!simpleProjectionHasDataApply)
+        (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
       else if (nonCascadeUpstreams.nonEmpty)
         (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreams.mkString(",")}")
+      else if (compiled.refreshType == RefreshTypeCode.WindowPartition && !windowInitialLoadMatchesUserQuery)
+        (RefreshTypeCode.FullRefresh, "window_initial_load_mismatch")
       else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
         (compiled.refreshType, "window_partition_kept")
       else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
         (compiled.refreshType, "group_recompute_kept")
       else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
         (RefreshTypeCode.FullRefresh, "having_pred_empty")
+      else if (
+        compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred
+          .exists(pred => aggregateHavingDataColumns.forall(cols => !havingPredicateIsSafe(pred, cols)))
+      )
+        (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
       else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table))
         (RefreshTypeCode.FullRefresh, "no_real_delta")
       else (compiled.refreshType, "kept")
@@ -895,6 +973,14 @@ case class RefreshMaterializedViewCommand(
         mvVersionBeforeRefresh = Some(meta.lastVersion)
       )
 
+      var cleanupMeta = meta
+      def deletePathIfExists(pathStr: String): Unit =
+        try {
+          val hadoopPath = new Path(pathStr)
+          val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+          if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+        } catch { case _: Throwable => () }
+
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
 
@@ -908,18 +994,66 @@ case class RefreshMaterializedViewCommand(
               sql.replace('\n', ' ').take(4000)
           )
         }
-        rewritten.statements.foreach { stmt =>
-          val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
-          val skipDeleteMerge =
-            SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+        def executeSql(sql: String): Unit =
+          RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
 
-          if (skipDeleteMerge) {
+        if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
+          executeSql(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head))
+
+          val hasConflictingRows =
+            hasSimpleProjectionDeletes && hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+          if (hasConflictingRows) {
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
+                "outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'"
             )
+            val fullRefreshMeta = meta.copy(
+              refreshType = RefreshTypeCode.FullRefresh,
+              refreshTypeName = "FULL_REFRESH",
+              properties = meta.properties ++ MvMetadata.cascadeViewDeltaProperties(false)
+            )
+            val fullRefresh = SparkMergeAssembler.assemble(
+              AssemblyInput(
+                refreshType = RefreshTypeCode.FullRefresh,
+                refreshTypeName = "FULL_REFRESH",
+                deltaSql = meta.querySql,
+                mvName = metaName(name),
+                mvLocation = meta.location
+              )
+            )
+            cleanupMeta = fullRefreshMeta
+            fullRefresh.statements.foreach(executeSql)
+            deletePathIfExists(viewDeltaPath)
           } else {
-            RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+            rewritten.statements.tail.foreach { stmt =>
+              val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+              val skipDeleteMerge =
+                SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+
+              if (skipDeleteMerge) {
+                logInfo(
+                  s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                    "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
+                )
+              } else {
+                executeSql(sql)
+              }
+            }
+          }
+        } else {
+          rewritten.statements.foreach { stmt =>
+            val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+            val skipDeleteMerge =
+              SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+
+            if (skipDeleteMerge) {
+              logInfo(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                  "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
+              )
+            } else {
+              executeSql(sql)
+            }
           }
         }
 
@@ -962,7 +1096,7 @@ case class RefreshMaterializedViewCommand(
         // becomes a separate trigger key so `StagingCatalog.collectFor`
         // (which matches `base_table` exactly against the downstream's
         // `meta.sourceTables`) finds it.
-        if (meta.emitsCascadeViewDelta) {
+        if (cleanupMeta.emitsCascadeViewDelta) {
           val mvShortName = name.identifier
           val triggerKeys: Set[String] = MvCatalog
             .list(spark)
@@ -990,11 +1124,7 @@ case class RefreshMaterializedViewCommand(
         case t: Throwable =>
           // Best-effort cleanup of any partial view-delta on failure. Phase 7
           // orphan-sweep is the long-tail safety net.
-          try {
-            val hadoopPath = new Path(viewDeltaPath)
-            val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
-            if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
-          } catch { case _: Throwable => () }
+          deletePathIfExists(viewDeltaPath)
           val sqlSnippet = rewritten.statements.zipWithIndex
             .map { case (s, i) => s"[${i + 1}] ${SparkRefreshRewriter.stripExecutionMarker(s)}" }
             .mkString("\n---\n")
@@ -1005,7 +1135,7 @@ case class RefreshMaterializedViewCommand(
           )
       }
 
-      postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr)
+      postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr)
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)
       tempViewShortNames.foreach { n =>
@@ -1024,6 +1154,34 @@ case class RefreshMaterializedViewCommand(
         s"""SELECT 1
            |FROM delta.`$escapedPath`
            |WHERE `openivm_multiplicity` < 0
+           |LIMIT 1""".stripMargin
+      )
+      .head(1)
+      .nonEmpty
+  }
+
+  private def simpleProjectionUserCols(spark: SparkSession, targetId: TableIdentifier): Seq[String] =
+    spark
+      .table(MvCommandHelper.metaName(targetId))
+      .columns
+      .filterNot(_.startsWith("openivm_"))
+      .map(c => s"`${c.replace("`", "``")}`")
+      .toSeq
+
+  private def hasConflictingSimpleProjectionRows(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      viewDeltaPath: String
+  ): Boolean = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val colList     = simpleProjectionUserCols(spark, targetId).mkString(", ")
+    spark
+      .sql(
+        s"""SELECT 1
+           |FROM delta.`$escapedPath`
+           |GROUP BY $colList
+           |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
+           |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0
            |LIMIT 1""".stripMargin
       )
       .head(1)

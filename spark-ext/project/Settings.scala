@@ -136,6 +136,7 @@ object Settings {
     },
     assembly / assemblyShadeRules := Seq(
       ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inAll,
+      ShadeRule.rename("org.rocksdb.**" -> "org.openivm.shaded.rocksdb.@1").inAll,
       ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
     ),
     assembly / test := {}

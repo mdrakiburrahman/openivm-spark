@@ -1,6 +1,5 @@
 package org.openivm.spark.common
 
-import io.delta.tables.DeltaTable
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
@@ -38,8 +37,7 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    // Truncate the catalog table before each test for isolation
-    DeltaTable.forPath(spark, s"$warehouseDir/_ivm/_meta/mv_metadata").delete("1=1")
+    MvCatalog.list(spark).foreach(meta => MvCatalog.remove(spark, meta.name))
   }
 
   override def afterAll(): Unit = {

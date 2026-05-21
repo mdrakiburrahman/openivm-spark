@@ -107,7 +107,7 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should not include "IS NOT NULL"
   }
 
-  "shim to_date(s, fmt)" should "compile, stay incremental, and translate back to Spark to_date" in {
+  "shim to_date(s, fmt)" should "compile, stay incremental, and translate to a Spark-executable DATE cast" in {
     val r = compileBody(
       viewName = "shim_to_date_v1",
       sources = Map("datesrc" -> rawDateSchema),
@@ -116,7 +116,8 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     r.refreshTypeName should not equal "FULL_REFRESH"
 
     val translated = LptsSparkDialect.translate(r.sql)
-    translated should include("to_date(")
+    translated should include("to_timestamp(")
+    translated.toUpperCase should include(" AS DATE)")
     translated should not include "strptime"
   }
 

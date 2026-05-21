@@ -1,15 +1,20 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
+import java.nio.file.Paths
 import java.sql.Timestamp
 import java.util.UUID
 
 class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
+
+  private val IndexDbColumnFamilies = Seq("mv_index", "source_to_mvs", "table_index")
+  private val MvDbColumnFamilies    = Seq("meta", "properties", "consumed")
 
   private var spark: SparkSession = _
 
@@ -32,8 +37,12 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   }
 
   override def afterAll(): Unit = {
-    if (spark != null) spark.stop()
-    deleteDir(new File(warehouseDir))
+    try {
+      if (spark != null) spark.stop()
+    } finally {
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteDir(new File(warehouseDir))
+    }
   }
 
   private def deleteDir(f: File): Unit = {
@@ -53,9 +62,40 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   ): StagingDelta =
     StagingDelta(baseTable, opType, path, ts(epochMs), consumedBy)
 
-  // ---------------------------------------------------------------------------
-  // Test 1 (catalog-level): ensureTables is idempotent
-  // ---------------------------------------------------------------------------
+  private def indexDbPath: String =
+    Paths.get(warehouseDir, "_openivm", "index", "rocksdb").toString
+
+  private def trackedMvDbPath(viewName: String): String =
+    Paths
+      .get(warehouseDir, "_openivm", "mvs", RocksDBCodec.safePathSegment(viewName), "rocksdb")
+      .toString
+
+  private def openIndexDb(): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath, IndexDbColumnFamilies)
+
+  private def openTrackedMvDb(viewName: String): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(spark, trackedMvDbPath(viewName), MvDbColumnFamilies)
+
+  private def registerTrackedView(viewName: String): Unit = {
+    val indexDb = openIndexDb()
+    openTrackedMvDb(viewName)
+    indexDb.withBatch { batch =>
+      OpenIvmRocksDBBatchOps.put(
+        indexDb,
+        batch,
+        "mv_index",
+        RocksDBCodec.utf8(viewName),
+        RocksDBCodec.utf8(trackedMvDbPath(viewName))
+      )
+    }
+  }
+
+  private def consumedPaths(viewName: String): Seq[String] =
+    openTrackedMvDb(viewName)
+      .prefixScan("consumed", Array.emptyByteArray)
+      .map { case (key, _) => RocksDBCodec.fromUtf8(key) }
+      .toVector
+
   describe("StagingCatalog.ensureTables") {
     it("is idempotent — calling twice does not throw") {
       StagingCatalog.ensureTables(spark)
@@ -63,95 +103,73 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Test 8: record + collectFor returns only unconsumed deltas in txn_ts order
-  // ---------------------------------------------------------------------------
   describe("StagingCatalog.record + collectFor") {
     it("returns only unconsumed deltas for the given sources, ordered by txn_ts") {
       StagingCatalog.ensureTables(spark)
+      registerTrackedView("mv_a")
 
-      val d1 = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/1", 1000L)
-      val d2 = delta("orders", "DELETE", s"$warehouseDir/stg/orders/del/2", 2000L)
-      val d3 = delta("products", "INSERT", s"$warehouseDir/stg/products/ins/3", 500L)
-      // d4 already consumed by mv_a
-      val d4 = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/4", 800L, Seq("mv_a"))
+      val ordersBase   = "orders_record_collect"
+      val productsBase = "products_record_collect"
+      val d1           = delta(ordersBase, "INSERT", s"$warehouseDir/stg/orders/ins/1", 1000L)
+      val d2           = delta(ordersBase, "DELETE", s"$warehouseDir/stg/orders/del/2", 2000L)
+      val d3           = delta(productsBase, "INSERT", s"$warehouseDir/stg/products/ins/3", 500L)
+      val d4           = delta(ordersBase, "INSERT", s"$warehouseDir/stg/orders/ins/4", 800L)
 
       Seq(d1, d2, d3, d4).foreach(StagingCatalog.record(spark, _))
+      StagingCatalog.markConsumed(spark, "mv_a", Seq(d4.stagingPath))
 
-      // mv_a asking for orders — should see d1, d2 (not d4, already consumed; not d3, wrong table)
-      val result = StagingCatalog.collectFor(spark, "mv_a", Seq("orders"))
+      val result = StagingCatalog.collectFor(spark, "mv_a", Seq(ordersBase))
       result.map(_.stagingPath) shouldBe Seq(d1.stagingPath, d2.stagingPath)
-
-      // txn_ts ordering: d1=1000, d2=2000 → ascending
       result.map(_.txnTs.getTime) shouldBe Seq(1000L, 2000L)
+
+      val watermarks = StagingCatalog
+        .currentWatermarks(spark, Seq(ordersBase, productsBase, "unused_base_table"))
+        .map { case (table, timestamp) => table -> timestamp.getTime }
+      watermarks shouldBe Map(ordersBase -> 2000L, productsBase -> 500L)
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Test 9: markConsumed updates consumed_by idempotently
-  // ---------------------------------------------------------------------------
   describe("StagingCatalog.markConsumed") {
-    it("appends viewName to consumed_by and is idempotent on repeated calls") {
+    it("records per-MV consumed paths idempotently") {
       StagingCatalog.ensureTables(spark)
+      registerTrackedView("mv_x")
 
-      val d = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/mc", 3000L)
+      val baseTable = "orders_mark_consumed"
+      val d         = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/mc", 3000L)
       StagingCatalog.record(spark, d)
 
       StagingCatalog.markConsumed(spark, "mv_x", Seq(d.stagingPath))
-      StagingCatalog.markConsumed(spark, "mv_x", Seq(d.stagingPath)) // idempotent
+      StagingCatalog.markConsumed(spark, "mv_x", Seq(d.stagingPath))
 
-      // mv_x should now have consumed it
-      val afterFirst = StagingCatalog.collectFor(spark, "mv_x", Seq("orders"))
-      afterFirst.filter(_.stagingPath == d.stagingPath) shouldBe empty
+      val remaining = StagingCatalog.collectFor(spark, "mv_x", Seq(baseTable))
+      remaining.filter(_.stagingPath == d.stagingPath) shouldBe empty
 
-      // Verify consumed_by has exactly one "mv_x" entry (no duplicates)
-      import org.apache.spark.sql.functions.col
-      val rows = spark.read
-        .format("delta")
-        .load(s"$warehouseDir/_ivm/_meta/staging")
-        .where(col("staging_path") === d.stagingPath)
-        .collect()
-      rows should have size 1
-      val consumedBy = rows.head.getSeq[String](rows.head.fieldIndex("consumed_by"))
-      consumedBy.count(_ == "mv_x") shouldBe 1
+      val consumed = consumedPaths("mv_x")
+      consumed.count(_ == d.stagingPath) shouldBe 1
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Test 10: pruneFullyConsumed deletes fully-consumed rows, leaves others
-  // ---------------------------------------------------------------------------
   describe("StagingCatalog.pruneFullyConsumed") {
     it("deletes rows consumed by all dependent MVs; leaves partially-consumed rows") {
       StagingCatalog.ensureTables(spark)
+      registerTrackedView("mv_p")
+      registerTrackedView("mv_q")
 
-      // Two MVs depend on "orders": mv_p and mv_q
-      val dFull    = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/full", 5000L, Seq("mv_p", "mv_q"))
-      val dPartial = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/partial", 6000L, Seq("mv_p"))
-      val dNone    = delta("orders", "INSERT", s"$warehouseDir/stg/orders/ins/none", 7000L)
+      val baseTable = "orders_prune"
+      val dFull     = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/full", 5000L)
+      val dPartial  = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/partial", 6000L)
+      val dNone     = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/none", 7000L)
 
       Seq(dFull, dPartial, dNone).foreach(StagingCatalog.record(spark, _))
 
-      // Mark dFull as consumed by both
       StagingCatalog.markConsumed(spark, "mv_p", Seq(dFull.stagingPath, dPartial.stagingPath))
       StagingCatalog.markConsumed(spark, "mv_q", Seq(dFull.stagingPath))
+      StagingCatalog.pruneFullyConsumed(spark, Map(baseTable -> Seq("mv_p", "mv_q")))
 
-      StagingCatalog.pruneFullyConsumed(spark, Map("orders" -> Seq("mv_p", "mv_q")))
+      val remaining =
+        StagingCatalog.collectFor(spark, "__probe_remaining__", Seq(baseTable)).map(_.stagingPath).toSet
 
-      import org.apache.spark.sql.functions.col
-      val remaining = spark.read
-        .format("delta")
-        .load(s"$warehouseDir/_ivm/_meta/staging")
-        .where(col("base_table") === "orders")
-        .collect()
-        .map(_.getAs[String]("staging_path"))
-        .toSet
-
-      // dFull is fully consumed → pruned
-      remaining should not contain dFull.stagingPath
-      // dPartial only consumed by mv_p → kept
-      remaining should contain(dPartial.stagingPath)
-      // dNone consumed by nobody → kept
-      remaining should contain(dNone.stagingPath)
+      remaining shouldBe Set(dPartial.stagingPath, dNone.stagingPath)
     }
   }
 }

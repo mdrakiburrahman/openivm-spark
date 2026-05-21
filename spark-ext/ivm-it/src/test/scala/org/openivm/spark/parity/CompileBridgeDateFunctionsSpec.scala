@@ -142,17 +142,15 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
           | AND s1.transaction_timestamp BETWEEN a.effective_timestamp AND a.end_timestamp""".stripMargin
       spark.sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
 
-      // Multi-source CTE JOINs still hit the known `hasRealDelta` gap and are
-      // demoted to FULL_REFRESH; this coverage is here to ensure the shimmed
-      // `to_date(timestamp_col)` body still compiles and the fallback path stays
-      // bag-correct.
+      // The translated `to_date(timestamp_col)` body now keeps the MV
+      // incremental even through the multi-source CTE + JOIN shape.
       val createMeta = MvCatalog
         .lookup(
           spark,
           spark.sessionState.sqlParser.parseTableIdentifier(mvName)
         )
         .getOrElse(fail(s"Missing MV metadata for $mvName"))
-      createMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      createMeta.refreshTypeName should not equal "FULL_REFRESH"
       assertMvCorrect(mvName, viewBody)
 
       spark.sql(
@@ -167,7 +165,7 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
           spark.sessionState.sqlParser.parseTableIdentifier(mvName)
         )
         .getOrElse(fail(s"Missing MV metadata for $mvName"))
-      refreshedMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      refreshedMeta.refreshTypeName should not equal "FULL_REFRESH"
       assertMvCorrect(mvName, viewBody)
     }
   }

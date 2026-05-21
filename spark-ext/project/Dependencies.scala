@@ -17,13 +17,14 @@ object Dependencies {
   val sparkCat  = "org.apache.spark" %% "spark-catalyst" % sparkV   % Provided
   val delta     = "io.delta"         %% "delta-spark"    % deltaV   % Provided
   val duckdb    = "org.duckdb"        % "duckdb_jdbc"    % duckdbV
+  val rocksdb   = "org.rocksdb"       % "rocksdbjni"     % "8.3.2"
   val antlr     = "org.antlr"         % "antlr4-runtime" % antlrV
   val slf4j     = "org.slf4j"         % "slf4j-api"      % "2.0.12" % Provided
   val scalaTest = "org.scalatest"    %% "scalatest"      % scalaTV  % Test
   val scalaMock = "org.scalamock"    %% "scalamock"      % "5.2.0"  % Test
 
   val executor  = Seq(sparkCore, sparkSql, sparkCat, delta, slf4j, scalaTest, scalaMock)
-  val common    = Seq(sparkCore, sparkSql, sparkCat, delta, slf4j, scalaTest, scalaMock)
+  val common    = Seq(sparkCore, sparkSql, sparkCat, delta, rocksdb, slf4j, scalaTest, scalaMock)
   val compiler  = Seq(sparkSql, sparkCat, slf4j, scalaTest, scalaMock)
   val extension = Seq(sparkCore, sparkSql, sparkCat, sparkHive, delta, antlr, slf4j, scalaTest, scalaMock)
   val it        = Seq(sparkCore, sparkSql, sparkCat, sparkHive, delta, scalaTest)
