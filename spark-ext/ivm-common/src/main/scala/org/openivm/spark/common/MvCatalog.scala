@@ -4,7 +4,6 @@ import io.delta.tables.DeltaTable
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.functions.{array_contains, col}
 import org.apache.spark.sql.types._
 
 import java.security.MessageDigest
@@ -81,6 +80,20 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
+  /** Property key recording the cached `CompiledRefresh.sql` from the
+    * DuckDB-CLI compile-bridge at CREATE time, so REFRESH can skip
+    * re-invoking the bridge. Empty / absent for legacy MVs created before
+    * this caching was added; in that case REFRESH compiles lazily and
+    * back-fills.
+    */
+  val CompiledSqlKey: String = "_ivm_compiled_sql"
+
+  /** Property key recording the cached `CompiledRefresh.initialLoadSql`
+    * companion to [[CompiledSqlKey]]. Kept under the same MV row so the
+    * pair is atomic.
+    */
+  val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
+
   /** Build the property-map entries for the given source-watermarks. */
   def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
     watermarks.map { case (src, ts) => s"$WatermarkKeyPrefix$src" -> ts.toString }
@@ -88,6 +101,18 @@ object MvMetadata {
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
+
+  /** Build the property entries persisting the DuckDB-CLI compile result
+    * so REFRESH can reuse it. Returns an empty map when `compiledSql` is
+    * empty (legacy / compile-failed views) — the absence of the key is the
+    * sentinel that REFRESH must compile on-the-fly.
+    */
+  def compiledProperties(compiledSql: String, initialLoadSql: String): Map[String, String] = {
+    val a = if (compiledSql.nonEmpty) Map(CompiledSqlKey -> compiledSql) else Map.empty
+    val b =
+      if (initialLoadSql.nonEmpty) Map(CompiledInitialLoadSqlKey -> initialLoadSql) else Map.empty
+    a ++ b
+  }
 }
 
 /**
@@ -95,10 +120,44 @@ object MvMetadata {
  *
  * All operations target `<warehouse>/_ivm/_meta/mv_metadata`.
  * Callers MUST invoke [[ensureTables]] once before any other method.
+ *
+ * == Snapshot caching ==
+ *
+ * Read calls ([[list]], [[lookup]], [[viewsForSource]]) are served from
+ * an in-process Delta-version-aware snapshot cache so a TPC-DI-scale
+ * benchmark (49 MVs × 3 batches × per-DML `viewsForSource`) does not
+ * pay the full `DeltaTable.toDF.collect()` cost on every metadata read.
+ * The cache is invalidated explicitly after every write
+ * ([[upsert]], [[advance]], [[remove]]) and implicitly when the Delta
+ * log version on disk advances since the last load (covers the rare
+ * multi-driver case).
  */
 object MvCatalog extends DeltaRetrySupport {
 
   private val MetaSubPath = "_ivm/_meta/mv_metadata"
+
+  /** In-process Delta-version-aware cache for the mv_metadata snapshot.
+    * Keyed by absolute table path so two SparkSessions in the same JVM
+    * (e.g. parallel ivm-it forks pointing at the same warehouse) share
+    * cache lookups.
+    */
+  private[common] val snapshotCache: DeltaSnapshotCache[Seq[MvMetadata]] =
+    new DeltaSnapshotCache[Seq[MvMetadata]]()
+
+  /** Reload the snapshot from Delta by issuing a single `DeltaTable.toDF.collect()`. */
+  private def reloadFromDelta(spark: SparkSession, path: String): Seq[MvMetadata] = {
+    val rows = DeltaTable
+      .forPath(spark, path)
+      .toDF
+      .orderBy("name")
+      .collect()
+    rows.map(rowToMetadata).toSeq
+  }
+
+  private def snapshot(spark: SparkSession): Seq[MvMetadata] = {
+    val path = tablePath(spark)
+    snapshotCache.snapshot(spark, path, s => reloadFromDelta(s, path))
+  }
 
   // -------------------------------------------------------------------------
   // Internal helpers
@@ -186,22 +245,27 @@ object MvCatalog extends DeltaRetrySupport {
 
   /** MERGE-based upsert keyed on `name`. Inserts new rows; updates all mutable fields.
    *
-   *  Wrapped in a JVM-wide `synchronized` block so concurrent CREATE / REFRESH calls
+   *  Wrapped in a JVM-wide `synchronized` block so concurrent CREATE calls
    *  from multiple driver threads (e.g. the parallel-wave scheduler in
    *  [[org.openivm.spark.parity.TpcDiSpec]]) serialize on the single
    *  `_ivm/_meta/mv_metadata` Delta table, eliminating
    *  `DELTA_CONCURRENT_APPEND` flooding. Cross-process conflicts (unusual for
    *  openivm-spark which runs single-driver) are still handled by
    *  [[DeltaRetrySupport.withDeltaRetry]] inside the lock.
+   *
+   *  Invalidates the snapshot cache after a successful commit so subsequent
+   *  reads in the same process see the write without an extra log
+   *  round-trip.
    */
   def upsert(spark: SparkSession, meta: MvMetadata): Unit = MvCatalog.synchronized {
+    val path = tablePath(spark)
     withDeltaRetry {
       val sourceDF = spark.createDataFrame(
         spark.sparkContext.parallelize(Seq(metaToRow(meta)), 1),
         MvSchema
       )
       DeltaTable
-        .forPath(spark, tablePath(spark))
+        .forPath(spark, path)
         .as("target")
         .merge(sourceDF.as("source"), "target.name = source.name")
         .whenMatched()
@@ -210,64 +274,111 @@ object MvCatalog extends DeltaRetrySupport {
         .insertAll()
         .execute()
     }
+    snapshotCache.invalidate(path)
   }
 
-  /** Returns None if the MV is not tracked. */
-  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .toDF
-      .where(col("name") === serializeName(name))
-      .collect()
-      .headOption
-      .map(rowToMetadata)
+  /** Returns None if the MV is not tracked. Read from the snapshot cache
+    * (Delta-log version-checked) so the call costs O(MV count) in memory
+    * instead of a full Delta scan per invocation.
+    */
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val serialized = serializeName(name)
+    snapshot(spark).find(m => serializeName(m.name) == serialized)
+  }
 
-  /** Lists every tracked materialized view, ordered by name. */
-  def list(spark: SparkSession): Seq[MvMetadata] =
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .toDF
-      .orderBy("name")
-      .collect()
-      .map(rowToMetadata)
-      .toSeq
+  /** Lists every tracked materialized view, ordered by name. Read from the
+    * snapshot cache (Delta-log version-checked).
+    */
+  def list(spark: SparkSession): Seq[MvMetadata] = snapshot(spark)
 
   /**
    * Returns MVs whose `source_tables` array contains `table`.
    * Used by the DML interceptor to determine whether a staging row is needed.
+   *
+   * Read from the snapshot cache: this is the single hottest catalog read
+   * because it fires on every base-table DML.
    */
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .toDF
-      .where(array_contains(col("source_tables"), table))
-      .collect()
-      .map(rowToMetadata)
-      .toSeq
+    snapshot(spark).filter(_.sourceTables.contains(table))
 
-  /** Advance `last_version` after a successful refresh. No-op if the MV is not tracked. */
-  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
-    MvCatalog.synchronized {
-      withDeltaRetry {
-        DeltaTable
-          .forPath(spark, tablePath(spark))
-          .updateExpr(
-            s"name = ${sqlLit(serializeName(name))}",
-            Map("last_version" -> newVersion.toString)
-          )
-      }
+  /** Advance `last_version` after a successful refresh. No-op if the MV is not tracked.
+    *
+    * Two notable properties:
+    *
+    *  - **Monotonic**: the UPDATE predicate is `name = … AND last_version <
+    *    newVersion`, so a cross-process race that delivers stale `advance`
+    *    calls in reverse order cannot rewind the recorded version.
+    *  - **Lock-free**: the global `MvCatalog.synchronized` lock has been
+    *    removed from this hot end-of-REFRESH write so 8-way parallel dbt
+    *    refreshes don't serialise on a single JVM monitor. Delta OCC +
+    *    [[DeltaRetrySupport.withDeltaRetry]] handles the (rare) write
+    *    conflicts that remain. See `RefreshMutex` in
+    *    `MaterializedViewCommands.scala` which still serialises per-MV
+    *    REFRESH execution; this method is invoked under that per-MV lock
+    *    so two concurrent `advance` calls necessarily target different
+    *    rows of mv_metadata.
+    */
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {
+    val path = tablePath(spark)
+    withDeltaRetry {
+      DeltaTable
+        .forPath(spark, path)
+        .updateExpr(
+          s"name = ${sqlLit(serializeName(name))} AND last_version < $newVersion",
+          Map("last_version" -> newVersion.toString)
+        )
     }
+    snapshotCache.invalidate(path)
+  }
+
+  /**
+   * Update the free-form `properties` map for a single MV without touching
+   * any other field (including `last_version`). Used by the REFRESH path
+   * to back-fill the [[MvMetadata.CompiledSqlKey]] /
+   * [[MvMetadata.CompiledInitialLoadSqlKey]] cache for legacy MVs created
+   * before compile-result caching was added.
+   *
+   * Implementation overwrites the whole properties map (Delta has no
+   * partial-map update primitive), so callers MUST pass the FULL desired
+   * properties — typically `existing ++ newKeys`.
+   */
+  def updateProperties(
+      spark: SparkSession,
+      name: TableIdentifier,
+      properties: Map[String, String]
+  ): Unit = MvCatalog.synchronized {
+    val path = tablePath(spark)
+    withDeltaRetry {
+      val literalMap =
+        if (properties.isEmpty) "map()"
+        else {
+          val kvs = properties.toSeq
+            .map { case (k, v) => s"${sqlLit(k)}, ${sqlLit(v)}" }
+            .mkString(", ")
+          s"map($kvs)"
+        }
+      DeltaTable
+        .forPath(spark, path)
+        .updateExpr(
+          s"name = ${sqlLit(serializeName(name))}",
+          Map("properties" -> literalMap)
+        )
+    }
+    snapshotCache.invalidate(path)
+  }
 
   /**
    * Delete the tracking row.
    * Idempotent: no error if the MV is already gone (safe for DROP MV IF EXISTS).
    */
   def remove(spark: SparkSession, name: TableIdentifier): Unit = MvCatalog.synchronized {
+    val path = tablePath(spark)
     withDeltaRetry {
       DeltaTable
-        .forPath(spark, tablePath(spark))
+        .forPath(spark, path)
         .delete(s"name = ${sqlLit(serializeName(name))}")
     }
+    snapshotCache.invalidate(path)
   }
 
   /**

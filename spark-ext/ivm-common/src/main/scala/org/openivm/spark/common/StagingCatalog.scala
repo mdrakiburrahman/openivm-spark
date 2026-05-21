@@ -2,7 +2,6 @@ package org.openivm.spark.common
 
 import io.delta.tables.DeltaTable
 import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.functions.{array_contains, col}
 import org.apache.spark.sql.types._
 
 import java.sql.Timestamp
@@ -73,10 +72,40 @@ object StagingDelta {
  *
  * All operations target `<warehouse>/_ivm/_meta/staging`.
  * Callers MUST invoke [[ensureTables]] once before any other method.
+ *
+ * == Snapshot caching ==
+ *
+ * Read calls ([[collectFor]], [[currentWatermarks]]) are served from an
+ * in-process Delta-version-aware snapshot cache so a TPC-DI-scale
+ * benchmark (per-MV `collectFor` × 49 MVs × 3 batches, plus a
+ * `currentWatermarks` per MV CREATE) does not pay the full
+ * `DeltaTable.toDF.collect()` cost on every staging metadata read. The
+ * cache is invalidated explicitly after every write
+ * ([[record]], [[markConsumed]], [[pruneFullyConsumed]],
+ * [[removeForBaseTable]]) and implicitly when the Delta log version on
+ * disk advances since the last load.
  */
 object StagingCatalog extends DeltaRetrySupport {
 
   private val MetaSubPath = "_ivm/_meta/staging"
+
+  /** In-process Delta-version-aware cache for the staging snapshot. */
+  private[common] val snapshotCache: DeltaSnapshotCache[Seq[StagingDelta]] =
+    new DeltaSnapshotCache[Seq[StagingDelta]]()
+
+  private def reloadFromDelta(spark: SparkSession, path: String): Seq[StagingDelta] = {
+    DeltaTable
+      .forPath(spark, path)
+      .toDF
+      .collect()
+      .map(rowToDelta)
+      .toSeq
+  }
+
+  private def snapshot(spark: SparkSession): Seq[StagingDelta] = {
+    val path = tablePath(spark)
+    snapshotCache.snapshot(spark, path, s => reloadFromDelta(s, path))
+  }
 
   // -------------------------------------------------------------------------
   // Internal helpers
@@ -135,13 +164,14 @@ object StagingCatalog extends DeltaRetrySupport {
    * idempotent: re-recording the same path does not overwrite `consumed_by`.
    */
   def record(spark: SparkSession, delta: StagingDelta): Unit = StagingCatalog.synchronized {
+    val path = tablePath(spark)
     withDeltaRetry {
       val sourceDF = spark.createDataFrame(
         spark.sparkContext.parallelize(Seq(deltaToRow(delta)), 1),
         StagingSchema
       )
       DeltaTable
-        .forPath(spark, tablePath(spark))
+        .forPath(spark, path)
         .as("target")
         .merge(
           sourceDF.as("source"),
@@ -151,11 +181,15 @@ object StagingCatalog extends DeltaRetrySupport {
         .insertAll()
         .execute()
     }
+    snapshotCache.invalidate(path)
   }
 
   /**
    * Returns every staging row for `sources` that has NOT yet been consumed by `viewName`,
    * ordered by txn_ts ascending.
+   *
+   * Reads from the snapshot cache: this is one of the hottest reads
+   * (one call per REFRESH × per MV).
    *
    * @param sources    base-table names to scan. Only rows where `base_table IN sources`
    *                   are returned.
@@ -172,36 +206,24 @@ object StagingCatalog extends DeltaRetrySupport {
       watermarks: Map[String, Timestamp] = Map.empty
   ): Seq[StagingDelta] = {
     if (sources.isEmpty) return Seq.empty
-    val base = DeltaTable
-      .forPath(spark, tablePath(spark))
-      .toDF
-      .where(col("base_table").isin(sources: _*) && !array_contains(col("consumed_by"), viewName))
-
-    val filtered =
-      if (watermarks.isEmpty) base
-      else {
-        // Build a (base_table → ts) lookup with a SQL CASE expression so the filter
-        // pushes down to Delta scan.
-        val cases = watermarks.toSeq.map { case (src, ts) =>
-          s"WHEN base_table = ${sqlLit(src)} THEN txn_ts > CAST(${sqlLit(ts.toString)} AS TIMESTAMP)"
-        }
-        if (cases.isEmpty) base
-        else {
-          val expr = s"CASE ${cases.mkString(" ")} ELSE TRUE END"
-          base.where(expr)
+    val sourceSet = sources.toSet
+    val all       = snapshot(spark)
+    val matched = all.filter { d =>
+      sourceSet.contains(d.baseTable) && !d.consumedBy.contains(viewName) && {
+        watermarks.get(d.baseTable) match {
+          case Some(wm) => d.txnTs.after(wm)
+          case None     => true
         }
       }
-
-    filtered
-      .orderBy("txn_ts")
-      .collect()
-      .map(rowToDelta)
-      .toSeq
+    }
+    matched.sortBy(_.txnTs.getTime)
   }
 
   /**
    * Capture the current per-source watermark — the MAX(txn_ts) over all
    * `StagingCatalog` rows for each given source.
+   *
+   * Reads from the snapshot cache.
    *
    * Returns an empty map entry (skipped) for sources with no rows yet, so callers
    * who add the result to `MvMetadata.properties` only store keys that filter
@@ -213,19 +235,15 @@ object StagingCatalog extends DeltaRetrySupport {
    */
   def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, Timestamp] = {
     if (sources.isEmpty) return Map.empty
-    import org.apache.spark.sql.functions.max
-    DeltaTable
-      .forPath(spark, tablePath(spark))
-      .toDF
-      .where(col("base_table").isin(sources: _*))
-      .groupBy(col("base_table"))
-      .agg(max(col("txn_ts")).as("max_ts"))
-      .collect()
-      .flatMap { row =>
-        val src = row.getAs[String]("base_table")
-        Option(row.getAs[Timestamp]("max_ts")).map(ts => src -> ts)
+    val sourceSet = sources.toSet
+    snapshot(spark).iterator
+      .filter(d => sourceSet.contains(d.baseTable))
+      .foldLeft(Map.empty[String, Timestamp]) { (acc, d) =>
+        acc.get(d.baseTable) match {
+          case Some(existing) if existing.getTime >= d.txnTs.getTime => acc
+          case _                                                     => acc + (d.baseTable -> d.txnTs)
+        }
       }
-      .toMap
   }
 
   /**
@@ -236,6 +254,7 @@ object StagingCatalog extends DeltaRetrySupport {
     StagingCatalog.synchronized {
       withDeltaRetry {
         if (paths.isEmpty) return
+        val path = tablePath(spark)
         val markerSchema = StructType(
           Array(
             StructField("staging_path", StringType, nullable = false),
@@ -245,12 +264,13 @@ object StagingCatalog extends DeltaRetrySupport {
         val rows     = paths.map(p => Row(p, viewName))
         val markerDF = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), markerSchema)
         DeltaTable
-          .forPath(spark, tablePath(spark))
+          .forPath(spark, path)
           .as("target")
           .merge(markerDF.as("source"), "target.staging_path = source.staging_path")
           .whenMatched()
           .updateExpr(Map("consumed_by" -> "array_union(target.consumed_by, array(source.new_view))"))
           .execute()
+        snapshotCache.invalidate(path)
       }
     }
 
@@ -264,7 +284,8 @@ object StagingCatalog extends DeltaRetrySupport {
     StagingCatalog.synchronized {
       withDeltaRetry {
         if (viewsByTable.isEmpty) return
-        val dt = DeltaTable.forPath(spark, tablePath(spark))
+        val path = tablePath(spark)
+        val dt   = DeltaTable.forPath(spark, path)
         viewsByTable.foreach { case (baseTable, mvs) =>
           if (mvs.nonEmpty) {
             val mvsExpr = mvs.map(sqlLit).mkString(", ")
@@ -274,6 +295,7 @@ object StagingCatalog extends DeltaRetrySupport {
             )
           }
         }
+        snapshotCache.invalidate(path)
       }
     }
 
@@ -288,10 +310,12 @@ object StagingCatalog extends DeltaRetrySupport {
    */
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
     StagingCatalog.synchronized {
+      val path = tablePath(spark)
       withDeltaRetry {
         DeltaTable
-          .forPath(spark, tablePath(spark))
+          .forPath(spark, path)
           .delete(s"base_table = ${sqlLit(baseTable)}")
       }
+      snapshotCache.invalidate(path)
     }
 }

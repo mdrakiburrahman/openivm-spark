@@ -171,7 +171,7 @@ object SparkRefreshRewriter {
       // similar refresh programs) into an explicit column list using the source
       // schemas supplied by the caller.
       val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
-      val withAliasFixup    = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
+      val withAliasFixup     = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
       RewrittenRefresh(withAliasFixup.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
@@ -721,7 +721,7 @@ object SparkRefreshRewriter {
     val usingMatch      = usingRe.findFirstMatchIn(s)
     if (s.contains(mergeIntoPrefix) && usingMatch.isDefined) {
       val usingIdx = usingMatch.get.start
-      val afterMv = s.substring(mergeIntoPrefix.length, usingIdx).trim
+      val afterMv  = s.substring(mergeIntoPrefix.length, usingIdx).trim
       val alias = afterMv
         .replaceFirst("(?i)^AS\\s+", "")
         .replaceAll("\"", "")

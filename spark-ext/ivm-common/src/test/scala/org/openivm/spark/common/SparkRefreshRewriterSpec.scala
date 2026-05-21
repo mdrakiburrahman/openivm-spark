@@ -119,7 +119,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       )
       val stmtB = rewritten.statements.head
       stmtB should include("`openivm_delta_sales`")
-      stmtB should not include("`memory`.`main`.`openivm_delta_sales`")
+      stmtB should not include ("`memory`.`main`.`openivm_delta_sales`")
     }
   }
 
