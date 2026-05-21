@@ -134,9 +134,15 @@ object Settings {
       case "reference.conf"                        => MergeStrategy.concat
       case _                                       => MergeStrategy.first
     },
+    // Note: we deliberately do NOT shade `org.rocksdb.**`. The `rocksdbjni`
+    // native library (`librocksdbjni-linux64.so` inside the jar) hardcodes
+    // JNI symbol names like `Java_org_rocksdb_RocksDB_version`. Renaming
+    // the Java classes via sbt-assembly does not rewrite those symbols,
+    // so any shaded callsite would fail at runtime with
+    // `UnsatisfiedLinkError`. We pin the same `rocksdbjni` version Spark
+    // 3.5 ships (8.3.2) so the unshaded classpath is consistent.
     assembly / assemblyShadeRules := Seq(
       ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inAll,
-      ShadeRule.rename("org.rocksdb.**" -> "org.openivm.shaded.rocksdb.@1").inAll,
       ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
     ),
     assembly / test := {}
