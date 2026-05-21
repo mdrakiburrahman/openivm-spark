@@ -12,7 +12,8 @@ import org.rocksdb.{
   WriteOptions
 }
 
-import java.nio.file.{Files, Paths, StandardCopyOption}
+import java.nio.channels.{FileChannel, FileLock, OverlappingFileLockException}
+import java.nio.file.{Files, Paths, StandardCopyOption, StandardOpenOption}
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import scala.collection.JavaConverters._
@@ -234,11 +235,137 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private[rocksdb] def compactCallCount: Long = compactCalls.get()
 
-  def withBatch[A](f: WriteBatch => A): Long = withWriteLock {
+  /** Cross-JVM POSIX file lock at `<dbPath>/openivm-jvm.lock`. Used only in
+    * multi-process mode to mutex other JVMs out before opening the RocksDB
+    * directory (which RocksDB itself enforces with `<dbPath>/LOCK` —
+    * concurrent multi-process opens fail with `Resource temporarily
+    * unavailable`).
+    */
+  private def externalLockPath = dbDir.resolve("openivm-jvm.lock")
+
+  private def withExternalLock[A](body: => A): A = {
+    Files.createDirectories(dbDir)
+    val ch = FileChannel.open(externalLockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+    try {
+      val deadline             = System.currentTimeMillis() + conf.lockTimeoutMs
+      var acquired: FileLock   = null
+      var lastError: Throwable = null
+      while (acquired == null && System.currentTimeMillis() < deadline) {
+        try {
+          acquired = ch.tryLock()
+        } catch {
+          case e: OverlappingFileLockException =>
+            lastError = e
+            acquired = null
+          case e: java.io.IOException =>
+            lastError = e
+            acquired = null
+        }
+        if (acquired == null) {
+          try Thread.sleep(50)
+          catch { case _: InterruptedException => () }
+        }
+      }
+      if (acquired == null) {
+        throw new RuntimeException(
+          s"OpenIVM RocksDB external lock acquisition timed out after ${conf.lockTimeoutMs}ms on $externalLockPath",
+          lastError
+        )
+      }
+      try body
+      finally
+        try acquired.release()
+        catch { case _: Throwable => () }
+    } finally {
+      closeQuietly(ch)
+    }
+  }
+
+  private def openInternal(): Unit = {
+    Files.createDirectories(dbDir)
+    Files.createDirectories(manifestsDir)
+
+    val allColumnFamilies = (listExistingColumnFamilies() ++ declaredColumnFamilies).distinct
+    val descriptors = allColumnFamilies.map { name =>
+      new ColumnFamilyDescriptor(RocksDBCodec.utf8(name), new ColumnFamilyOptions())
+    }
+    val handles           = new java.util.ArrayList[ColumnFamilyHandle]()
+    val options           = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)
+    var openedDb: RocksDB = null
+    try {
+      openedDb = RocksDB.open(options, normalizedDbPath, descriptors.asJava, handles)
+      dbHandle = openedDb
+      columnFamilyHandles = allColumnFamilies.zip(handles.asScala).toMap
+      versionValue = readCurrentVersion()
+    } catch {
+      case t: Throwable =>
+        handles.asScala.foreach(closeQuietly)
+        closeQuietly(openedDb)
+        throw t
+    } finally {
+      descriptors.foreach(descriptor => closeQuietly(descriptor.getOptions))
+      options.close()
+    }
+  }
+
+  private def closeInternal(): Unit = {
+    val localDb               = dbHandle
+    val localHandles          = columnFamilyHandles.values.toSeq
+    var firstError: Throwable = null
+
+    try {
+      if (localDb != null) flushAll(localDb)
+    } catch { case t: Throwable => firstError = t }
+
+    try localHandles.foreach(closeQuietly)
+    finally columnFamilyHandles = Map.empty
+
+    try {
+      if (localDb != null) localDb.close()
+    } catch {
+      case t: Throwable =>
+        if (firstError == null) firstError = t
+        else firstError.addSuppressed(t)
+    } finally {
+      dbHandle = null
+    }
+
+    if (firstError != null) throw firstError
+  }
+
+  /** Wrap a body that needs the native RocksDB handle live for its duration.
+    *
+    * In single-process mode this just ensures the cached handle is open;
+    * the handle is NOT closed afterwards (kept hot for the lifetime of the
+    * Spark application).
+    *
+    * In multi-process mode this:
+    *   1. acquires the external POSIX lock,
+    *   2. opens a fresh RocksDB,
+    *   3. runs `body`,
+    *   4. closes RocksDB (releasing `<dbPath>/LOCK`),
+    *   5. releases the external lock.
+    *
+    * Always holds the in-JVM `writeMutex` so within one JVM concurrent
+    * threads serialise; the external lock then mutexes other JVMs.
+    */
+  private[rocksdb] def withNativeHandle[A](body: => A): A = withWriteLock {
     if (closed) {
       throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
     }
-    load()
+    if (conf.multiProcess) {
+      withExternalLock {
+        openInternal()
+        try body
+        finally closeInternal()
+      }
+    } else {
+      if (dbHandle == null) openInternal()
+      body
+    }
+  }
+
+  def withBatch[A](f: WriteBatch => A): Long = withNativeHandle {
     val batch = new WriteBatch()
     try {
       f(batch)
@@ -248,65 +375,58 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] =
-    Option(ensureLoaded().get(cf(columnFamily), key))
+  def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle {
+    Option(dbHandle.get(cf(columnFamily), key))
+  }
 
+  /** Returns a snapshot iterator of `(key,value)` pairs for the prefix.
+    *
+    * In single-process mode this is a lazy iterator over the live RocksDB
+    * `newIterator(...)`. In multi-process mode we cannot return a live
+    * iterator (the RocksDB handle is closed after this method returns), so
+    * we materialise the full result into a Vector inside the lock. The
+    * caller observes the same `Iterator[(Array[Byte], Array[Byte])]` shape.
+    */
   def prefixScan(columnFamily: String, prefix: Array[Byte]): Iterator[(Array[Byte], Array[Byte])] =
-    new PrefixScanIterator(ensureLoaded(), cf(columnFamily), prefix.clone())
+    if (conf.multiProcess) {
+      withNativeHandle {
+        val it = new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
+        try {
+          val buffer = scala.collection.mutable.ArrayBuffer.empty[(Array[Byte], Array[Byte])]
+          while (it.hasNext) buffer += it.next()
+          buffer.iterator
+        } finally {
+          it.close()
+        }
+      }
+    } else {
+      withNativeHandle {
+        new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
+      }
+    }
 
-  def currentVersion: Long = {
-    ensureLoaded()
+  def currentVersion: Long = withNativeHandle {
     versionValue
   }
 
-  def load(): Long = withWriteLock {
-    if (closed) {
-      throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
-    }
-    if (dbHandle != null) {
-      versionValue
-    } else {
-      Files.createDirectories(dbDir)
-      Files.createDirectories(manifestsDir)
-
-      val allColumnFamilies = (listExistingColumnFamilies() ++ declaredColumnFamilies).distinct
-      val descriptors = allColumnFamilies.map { name =>
-        new ColumnFamilyDescriptor(RocksDBCodec.utf8(name), new ColumnFamilyOptions())
-      }
-      val handles           = new java.util.ArrayList[ColumnFamilyHandle]()
-      val options           = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)
-      var openedDb: RocksDB = null
-      try {
-        openedDb = RocksDB.open(options, normalizedDbPath, descriptors.asJava, handles)
-        dbHandle = openedDb
-        columnFamilyHandles = allColumnFamilies.zip(handles.asScala).toMap
-        versionValue = readCurrentVersion()
-        versionValue
-      } catch {
-        case t: Throwable =>
-          handles.asScala.foreach(closeQuietly)
-          closeQuietly(openedDb)
-          throw t
-      } finally {
-        descriptors.foreach(descriptor => closeQuietly(descriptor.getOptions))
-        options.close()
-      }
-    }
+  def load(): Long = withNativeHandle {
+    versionValue
   }
 
   def cleanup(minVersionsToRetain: Int): Unit = withWriteLock {
     if (closed) return
     require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
-    val threshold = currentVersion - minVersionsToRetain
-    manifestVersions.filter(_ < threshold).foreach { version =>
-      Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+    def body(): Unit = {
+      val threshold = readCurrentVersion() - minVersionsToRetain
+      manifestVersions.filter(_ < threshold).foreach { version =>
+        Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+      }
     }
+    if (conf.multiProcess) withExternalLock(body()) else body()
   }
 
-  def compactRange(): Unit = withWriteLock {
-    if (closed) return
-    val localDb = ensureLoaded()
-    localDb.compactRange()
+  def compactRange(): Unit = withNativeHandle {
+    dbHandle.compactRange()
     compactCalls.incrementAndGet()
     ()
   }
@@ -315,45 +435,18 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     if (closed) return
     closed = true
 
-    val localDb               = dbHandle
-    val localHandles          = columnFamilyHandles.values.toSeq
-    var firstError: Throwable = null
-
-    try {
-      if (localDb != null) {
-        flushAll(localDb)
-      }
-    } catch {
-      case t: Throwable => firstError = t
-    }
-
-    try {
-      localHandles.foreach(closeQuietly)
-    } finally {
-      columnFamilyHandles = Map.empty
-    }
-
-    try {
-      if (localDb != null) {
-        localDb.close()
-      }
-    } catch {
-      case t: Throwable =>
-        if (firstError == null) {
-          firstError = t
-        } else {
-          firstError.addSuppressed(t)
-        }
-    } finally {
-      dbHandle = null
-    }
-
-    if (firstError != null) {
-      throw firstError
+    if (dbHandle != null) {
+      try closeInternal()
+      catch { case _: Throwable => () }
     }
   }
 
   def sstFileCount: Int = {
-    if (closed) 0 else sstFileCountInternal(ensureLoaded())
+    if (closed) 0
+    else if (conf.multiProcess) {
+      withNativeHandle(sstFileCountInternal(dbHandle))
+    } else {
+      sstFileCountInternal(ensureLoaded())
+    }
   }
 }

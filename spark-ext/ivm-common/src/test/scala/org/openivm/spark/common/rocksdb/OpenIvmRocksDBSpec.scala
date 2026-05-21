@@ -24,6 +24,30 @@ object OpenIvmRocksDBCrashWriter {
   }
 }
 
+/** Stand-alone main used by the multi-process test below. Each invocation:
+  *   1. opens the DB at `args(0)` in multi-process mode,
+  *   2. writes `<args(1)> = <args(2)>` to the `meta` CF in one withBatch,
+  *   3. cleanly closes and exits.
+  *
+  * Two concurrent invocations against the same DB path must both succeed
+  * because every public op grabs the cross-JVM POSIX file lock at
+  * `<dbPath>/openivm-jvm.lock`, opens RocksDB, runs the op, then closes
+  * RocksDB (releasing `<dbPath>/LOCK`) before releasing the file lock.
+  */
+object OpenIvmRocksDBMultiProcessWriter {
+  def main(args: Array[String]): Unit = {
+    val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)
+    val db   = new OpenIvmRocksDB(args(0), conf, Seq("meta"))
+    try {
+      db.withBatch { batch =>
+        db.put(batch, "meta", RocksDBCodec.utf8(args(1)), RocksDBCodec.utf8(args(2)))
+      }
+    } finally {
+      db.close()
+    }
+  }
+}
+
 class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
 
   private def newDbDir(prefix: String): File = {
@@ -241,6 +265,52 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
         db.get("meta", RocksDBCodec.utf8("k2")).map(RocksDBCodec.fromUtf8) shouldBe Some("v2")
       } finally {
         closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("allows concurrent multi-process writers with multiProcess=true") {
+      val dir       = newDbDir("multi-process")
+      val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+      val classpath = System.getProperty("java.class.path")
+      val procCount = 4
+
+      val processes = (1 to procCount).map { idx =>
+        val logFile = new File(dir, s"mp-writer-$idx.log")
+        new ProcessBuilder(
+          javaHome,
+          "-cp",
+          classpath,
+          "org.openivm.spark.common.rocksdb.OpenIvmRocksDBMultiProcessWriter",
+          dir.getAbsolutePath,
+          s"mp-key-$idx",
+          s"mp-value-$idx"
+        )
+          .redirectErrorStream(true)
+          .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+          .start()
+      }
+
+      val reopened = new OpenIvmRocksDB(
+        dir.getAbsolutePath,
+        OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L),
+        Seq("meta")
+      )
+
+      try {
+        processes.foreach { p =>
+          p.waitFor(60, TimeUnit.SECONDS) shouldBe true
+          p.exitValue() shouldBe 0
+        }
+
+        (1 to procCount).foreach { idx =>
+          reopened
+            .get("meta", RocksDBCodec.utf8(s"mp-key-$idx"))
+            .map(RocksDBCodec.fromUtf8) shouldBe Some(s"mp-value-$idx")
+        }
+        reopened.currentVersion shouldBe procCount.toLong
+      } finally {
+        closeQuietly(reopened)
         deleteRecursively(dir)
       }
     }
