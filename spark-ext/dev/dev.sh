@@ -369,10 +369,40 @@ cmd_pins_sync() {
                     if [[ "$pinned_spark_commit" == "$origin_head" ]]; then
                         echo "[pins-sync]   ✓ OPENIVM_SPARK_COMMIT matches origin/$current_branch"
                     else
-                        echo "[pins-sync]   ⚠ WARNING: OPENIVM_SPARK_COMMIT does not match origin/$current_branch"
-                        echo "[pins-sync]     Dockerfile = $pinned_spark_commit"
-                        echo "[pins-sync]     origin     = $origin_head"
-                        drift=1
+                        # Tolerate a benign lag: Dockerfile pin is an ancestor of
+                        # origin HEAD AND the only diff between them is in
+                        # files that don't affect the spark-openivm build.
+                        # This breaks the chicken-and-egg where bumping
+                        # IVM_BENCH_COMMIT in pins.env advances origin HEAD
+                        # and would otherwise require yet another Dockerfile +
+                        # pins.env round-trip. Extend the array below as new
+                        # build-irrelevant paths are added to the repo.
+                        local -a benign_lag_patterns=(
+                            'spark-ext/dev/pins\.env'  # host-side tooling pin
+                            '.*\.md'                   # any markdown doc
+                        )
+                        local benign_lag_regex
+                        benign_lag_regex="^($(IFS='|'; echo "${benign_lag_patterns[*]}"))$"
+                        local benign_lag=0
+                        if git merge-base --is-ancestor "$pinned_spark_commit" "$origin_head" 2>/dev/null; then
+                            local changed_files
+                            changed_files="$(git diff --name-only "$pinned_spark_commit" "$origin_head" 2>/dev/null || echo '')"
+                            local non_benign
+                            non_benign="$(echo "$changed_files" | grep -vE "$benign_lag_regex" | grep -v '^$' || true)"
+                            if [[ -z "$non_benign" ]]; then
+                                benign_lag=1
+                            fi
+                        fi
+                        if [[ "$benign_lag" -eq 1 ]]; then
+                            echo "[pins-sync]   ✓ OPENIVM_SPARK_COMMIT lags origin/$current_branch by benign files only (${benign_lag_patterns[*]})"
+                            echo "[pins-sync]     Dockerfile = $pinned_spark_commit"
+                            echo "[pins-sync]     origin     = $origin_head"
+                        else
+                            echo "[pins-sync]   ⚠ WARNING: OPENIVM_SPARK_COMMIT does not match origin/$current_branch"
+                            echo "[pins-sync]     Dockerfile = $pinned_spark_commit"
+                            echo "[pins-sync]     origin     = $origin_head"
+                            drift=1
+                        fi
                     fi
                 fi
             fi
