@@ -407,8 +407,6 @@ case class CreateMaterializedViewCommand(
       }
     // Storage location
     val location = mvLocation(spark, name)
-    val hasOuterJoin =
-      "(?i)\\b(?:LEFT|RIGHT|FULL)(?:\\s+OUTER)?\\s+JOIN\\b".r.findFirstIn(originalQueryText).nonEmpty
     val aggregateHavingDataColumns: Option[Set[String]] =
       if (compiled.refreshType != RefreshTypeCode.AggregateHaving) None
       else {
@@ -543,9 +541,6 @@ case class CreateMaterializedViewCommand(
     // see WHY each MV ended up FULL_REFRESH in the spark-ext / dbt-server
     // container log. The reason keys mirror the if-else branches:
     //   - top_k                       Top-K view (ORDER BY ... LIMIT ...) forced to FULL_REFRESH
-    //   - simple_projection_outer_join SIMPLE_PROJECTION over LEFT/RIGHT/FULL JOIN;
-    //                                 demoted to FULL_REFRESH because the current
-    //                                 rewrite/apply path is not bag-safe across outer joins
     //   - simple_projection_no_apply  compiler emitted a SIMPLE_PROJECTION delta
     //                                 feed but no data-table apply statement after
     //                                 rewrite, so REFRESH would be a no-op
@@ -578,8 +573,6 @@ case class CreateMaterializedViewCommand(
     // production-tuned log filters surface it.
     val (effectiveRefreshType, classifyReason) = {
       if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
-      else if (compiled.refreshType == RefreshTypeCode.SimpleProjection && hasOuterJoin)
-        (RefreshTypeCode.FullRefresh, "simple_projection_outer_join")
       else if (!simpleProjectionHasDataApply)
         (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
       else if (nonCascadeUpstreams.nonEmpty)
@@ -774,16 +767,30 @@ case class RefreshMaterializedViewCommand(
         )
       )
 
-    val viewNameStr = metaName(name)
+    val viewNameStr      = metaName(name)
+    val sourceWatermarks = meta.sourceWatermarks
+
+    if (
+      meta.refreshType != RefreshTypeCode.FullRefresh &&
+      !StagingCatalog.hasPendingDeltas(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
+    ) {
+      logInfo(
+        s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+          "outcome='no_pending_deltas'"
+      )
+      return Seq.empty
+    }
+
     val stagingDeltas = StagingCatalog.collectFor(
       spark,
       viewNameStr,
       meta.sourceTables,
-      meta.sourceWatermarks
+      sourceWatermarks
     )
 
-    // No pending deltas → nothing to do
-    if (stagingDeltas.isEmpty) {
+    // Defensive backstop: the cheap existence probe above and the full collect
+    // can diverge if another refresh consumes the same rows before we collect.
+    if (meta.refreshType != RefreshTypeCode.FullRefresh && stagingDeltas.isEmpty) {
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
           "outcome='no_pending_deltas'"
@@ -1000,8 +1007,11 @@ case class RefreshMaterializedViewCommand(
         if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
           executeSql(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head))
 
+          val usesValueEqualityDeleteMerge =
+            rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
           val hasConflictingRows =
-            hasSimpleProjectionDeletes && hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+            usesValueEqualityDeleteMerge && hasSimpleProjectionDeletes &&
+              hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
           if (hasConflictingRows) {
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +

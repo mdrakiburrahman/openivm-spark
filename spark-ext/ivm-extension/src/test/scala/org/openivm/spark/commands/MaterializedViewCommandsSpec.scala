@@ -382,10 +382,10 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   // ---------------------------------------------------------------------------
-  // Test 12 — WINDOW_PARTITION demotes when initial-load SQL changes semantics
+  // Test 12 — WINDOW_PARTITION preserves ignore-null forward-fill semantics
   // ---------------------------------------------------------------------------
-  describe("(12) WINDOW_PARTITION demotes when initial-load SQL is not bag-equal") {
-    it("falls back to FULL_REFRESH for ignoreNulls windows whose translated initial load drops semantics") {
+  describe("(12) WINDOW_PARTITION preserves ignore-null forward-fill semantics") {
+    it("stays incremental for ignoreNulls windows whose translated initial load is bag-equal") {
       spark.sql(
         "CREATE TABLE IF NOT EXISTS sales_t12_window(id INT, customer_id INT, effective_ts TIMESTAMP, status STRING) USING DELTA"
       )
@@ -403,9 +403,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t12_window AS $viewBody")
 
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t12_window")).get
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      meta.refreshTypeName shouldBe "FULL_REFRESH"
-      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe false
+      meta.refreshType shouldBe RefreshTypeCode.WindowPartition
+      meta.refreshTypeName shouldBe "WINDOW_PARTITION"
+      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe true
 
       val expectedCreate = spark.sql(viewBody)
       val mvCreate       = spark.table("mv_t12_window").select("id", "customer_id", "effective_ts", "carried_status")

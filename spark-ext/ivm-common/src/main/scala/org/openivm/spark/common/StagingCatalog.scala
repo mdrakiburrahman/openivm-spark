@@ -180,6 +180,30 @@ object StagingCatalog {
     }
   }
 
+  def hasPendingDeltas(
+      spark: SparkSession,
+      viewName: String,
+      sources: Seq[String],
+      watermarks: Map[String, Timestamp] = Map.empty
+  ): Boolean = {
+    if (sources.isEmpty) return false
+
+    val indexDb   = openIndexDb(spark)
+    val maybeMvDb = openTrackedMvDb(spark, indexDb, viewName)
+    sources.distinct.exists { source =>
+      val dbPath = baseTableDbPath(spark, source)
+      Files.exists(Paths.get(dbPath)) && {
+        val baseDb = openBaseTableDb(spark, source)
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).exists { case (key, _) =>
+          val (txnTsMillis, stagingPath) = decodeStagingKey(key)
+          val watermarkPassed            = watermarks.get(source).forall(wm => txnTsMillis > wm.getTime)
+          val alreadyConsumed            = maybeMvDb.exists(_.get(ConsumedCf, RocksDBCodec.utf8(stagingPath)).isDefined)
+          watermarkPassed && !alreadyConsumed
+        }
+      }
+    }
+  }
+
   def collectFor(
       spark: SparkSession,
       viewName: String,

@@ -141,9 +141,9 @@ object SparkRefreshRewriter {
           case StatementKind.ScalarUpdate =>
             Seq(rewriteScalarUpdate(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.ScalarDeleteMv =>
-            Seq(rewriteScalarDeleteMv(stmt, viewLogicalName, mvName, viewDeltaPath))
+            rewriteScalarDeleteMv(stmt, viewLogicalName, mvName, viewDeltaPath)
           case StatementKind.ScalarFullRecomputeInsert =>
-            Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, mvLocation, viewDeltaPath))
           case StatementKind.PartitionScopedDelete =>
             rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
           case StatementKind.PartitionScopedInsert =>
@@ -351,6 +351,8 @@ object SparkRefreshRewriter {
       else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
+    } else if (upper.contains(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
+      StatementKind.ScalarDeleteMv
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
       upper.contains(s"FROM $newSnapshotName")
@@ -909,11 +911,12 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       mvName: TableIdentifier,
       viewDeltaPath: String
-  ): String = {
+  ): Seq[String] = {
     val mvRef = backtickMvName(mvName)
     val dataViewRe = ("(?i)\\bopenivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
+    s = rewriteMemoryMainPrefix(s)
     s = stripTimestampPredicate(s)
     // AGGREGATE_GROUP+minmax affected-keys subquery references the view delta
     // table inline (no separate openivm_affected_<view> temp object).  Repoint
@@ -924,11 +927,20 @@ object SparkRefreshRewriter {
     val deltaViewRe = ("(?i)\\bopenivm_delta_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
-    // Delta Lake forbids subqueries (including EXISTS) inside DELETE WHERE
-    // conditions, so rewrite the affected-keys form into a MERGE…WHEN MATCHED
-    // THEN DELETE.  No-op when the DELETE has no EXISTS WHERE clause.
-    s = rewriteDeleteExistsAsMerge(s, mvRef)
-    s
+    // openivm's self-join SIMPLE_PROJECTION delete keys on the virtual `rowid`
+    // column of `openivm_data_<v>` (a DuckDB-only pseudo-column). Spark Delta
+    // has no rowid, so the rewrite cannot be executed. Drop the DELETE so the
+    // CREATE-time apply probe demotes the MV to FULL_REFRESH via
+    // `simple_projection_no_apply` instead of producing a runtime error.
+    if (referencesRowid(s)) return Seq.empty
+    // Delta Lake forbids DELETE subqueries and DELETE ... USING. Rewrite the
+    // affected-key delete forms that openivm emits for outer-join partial
+    // recompute into Delta-compatible MERGE ... WHEN MATCHED THEN DELETE.
+    val usingRewritten = rewriteDeleteUsingAsMerge(s, mvRef)
+    if (usingRewritten != s) return Seq(usingRewritten)
+    val inRewritten = rewriteDeleteInAsMerge(s, mvRef)
+    if (inRewritten.nonEmpty) return inRewritten
+    Seq(rewriteDeleteExistsAsMerge(s, mvRef))
   }
 
   /** Rewrites the full-recompute `INSERT INTO openivm_data_<view> WITH scan_0 … SELECT … FROM memory.main.<src>`
@@ -958,6 +970,7 @@ object SparkRefreshRewriter {
       stmt: String,
       viewLogicalName: String,
       mvName: TableIdentifier,
+      mvLocation: String,
       viewDeltaPath: String
   ): String = {
     val mvRef = backtickMvName(mvName)
@@ -973,7 +986,240 @@ object SparkRefreshRewriter {
     val deltaViewRe = ("(?i)\\bopenivm_delta_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    val escapedLocation = mvLocation.replace("`", "``")
+    s = rewriteInsertSelectStarFromSubquery(s, mvRef, s"delta.`$escapedLocation`")
     s
+  }
+
+  private def rewriteInsertSelectStarFromSubquery(stmt: String, mvRef: String, writeTargetRef: String): String = {
+    val prefixRe = ("(?is)\\bINSERT\\s+INTO\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "\\s+SELECT\\s+\\*\\s+FROM\\s*\\(").r
+    prefixRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val openIdx  = m.end - 1
+        val closeIdx = findMatchingCloseParen(stmt, openIdx)
+        if (closeIdx < 0) return stmt
+        val afterSubquery = stmt.substring(closeIdx + 1)
+        val aliasRe       = """(?is)^\s+(\w+)\b(.*)$""".r
+        aliasRe.findFirstMatchIn(afterSubquery) match {
+          case None => stmt
+          case Some(aliasMatch) =>
+            val alias = aliasMatch.group(1)
+            val rest  = aliasMatch.group(2)
+            val inner = stmt.substring(openIdx + 1, closeIdx)
+            finalSelectAliases(inner) match {
+              case Nil => stmt
+              case aliases =>
+                val statementPrefix = stmt.substring(0, m.start).trim
+                val projection      = aliases.map(c => s"$alias.$c").mkString(", ")
+                val insertCols      = aliases.mkString(", ")
+                val sourceSql =
+                  if (statementPrefix.nonEmpty) {
+                    s"""|(
+                        |$statementPrefix
+                        |SELECT $projection FROM ($inner) $alias$rest
+                        |)""".stripMargin
+                  } else {
+                    s"""|(
+                        |SELECT $projection FROM ($inner) $alias$rest
+                        |)""".stripMargin
+                  }
+                val values = aliases.map(c => s"d.$c").mkString(", ")
+                s"""|MERGE INTO $writeTargetRef AS v
+                    |USING $sourceSql AS d
+                    |ON false
+                    |WHEN NOT MATCHED THEN INSERT ($insertCols) VALUES ($values)""".stripMargin
+            }
+        }
+    }
+  }
+
+  private def finalSelectAliases(sql: String): Seq[String] = {
+    var depth       = 0
+    var lastSelect  = -1
+    var i           = 0
+    val upperLength = sql.length
+    while (i < upperLength) {
+      sql.charAt(i) match {
+        case '\'' => i = consumeSqlSingleQuoted(sql, i)
+        case '"'  => i = consumeSqlDoubleQuoted(sql, i)
+        case '('  => depth += 1; i += 1
+        case ')'  => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(sql, i, "SELECT") =>
+          lastSelect = i
+          i += "SELECT".length
+        case _ => i += 1
+      }
+    }
+    if (lastSelect < 0) Nil
+    else {
+      findTopLevelSqlKeyword(sql, lastSelect + "SELECT".length, sql.length, "FROM") match {
+        case None => Nil
+        case Some(fromIdx) =>
+          splitSelectList(sql.substring(lastSelect + "SELECT".length, fromIdx)).flatMap(selectItemAlias(_))
+      }
+    }
+  }
+
+  private def selectItemAlias(item: String): Option[String] = {
+    val trimmed = item.trim
+    val asRe    = """(?is)^.+\s+AS\s+(`[^`]+`|\"[^\"]+\"|\w+)\s*$""".r
+    val raw     = asRe.findFirstMatchIn(trimmed).map(_.group(1)).getOrElse(trimmed.split("\\.").last.trim)
+    if (raw.isEmpty || raw.contains(" ") || raw.contains("(")) None else Some(normalizeColumnRef(raw))
+  }
+
+  private def findTopLevelSqlKeyword(sql: String, start: Int, endExclusive: Int, keyword: String): Option[Int] = {
+    var depth = 0
+    var i     = start
+    while (i < endExclusive) {
+      sql.charAt(i) match {
+        case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
+        case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
+        case '('  => depth += 1; i += 1
+        case ')'  => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(sql, i, keyword) => return Some(i)
+        case _                                                        => i += 1
+      }
+    }
+    None
+  }
+
+  private def startsWithSqlKeyword(sql: String, start: Int, keyword: String): Boolean = {
+    val end = start + keyword.length
+    end <= sql.length &&
+    sql.regionMatches(true, start, keyword, 0, keyword.length) &&
+    (start == 0 || !isSqlIdentifierPart(sql.charAt(start - 1))) &&
+    (end == sql.length || !isSqlIdentifierPart(sql.charAt(end)))
+  }
+
+  private def isSqlIdentifierPart(c: Char): Boolean = c.isLetterOrDigit || c == '_'
+
+  private def consumeSqlSingleQuoted(sql: String, start: Int): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      if (sql.charAt(i) == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 2
+      else if (sql.charAt(i) == '\'') return i + 1
+      else i += 1
+    }
+    sql.length
+  }
+
+  private def consumeSqlDoubleQuoted(sql: String, start: Int): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      if (sql.charAt(i) == '"' && i + 1 < sql.length && sql.charAt(i + 1) == '"') i += 2
+      else if (sql.charAt(i) == '"') return i + 1
+      else i += 1
+    }
+    sql.length
+  }
+
+  /** Rewrites `DELETE FROM <mv> AS t USING <source> s WHERE <match>` into a
+    * Delta-compatible delete MERGE. Handles an optional leading CTE by moving it
+    * inside the MERGE source subquery.
+    */
+  private def rewriteDeleteUsingAsMerge(stmt: String, mvRef: String): String = {
+    val deleteRe = ("(?is)^(.*?)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "(?:\\s+AS\\s+(\\w+))?\\s+USING\\s+(\\S+)\\s+(?:AS\\s+)?(\\w+)\\s+WHERE\\s+(.+?)\\s*;?\\s*$").r
+    deleteRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val ctePrefix = m.group(1).trim
+        val tgtAlias  = Option(m.group(2)).getOrElse("v")
+        val src       = m.group(3).trim
+        val srcAlias  = m.group(4).trim
+        val onCond    = m.group(5).trim
+        // openivm's self-join SIMPLE_PROJECTION delete keys on the virtual
+        // `rowid` column of `openivm_data_<v>`. Spark Delta tables have no
+        // rowid, so rewriting that shape would emit a MERGE referencing a
+        // non-existent column. Decline and let the CREATE-time apply probe
+        // demote the MV to FULL_REFRESH via `simple_projection_no_apply`.
+        if (referencesRowid(onCond)) stmt
+        else {
+          val usingSql =
+            if (ctePrefix.nonEmpty) s"(\n$ctePrefix\nSELECT * FROM $src\n)"
+            else src
+          s"""|MERGE INTO $mvRef AS $tgtAlias
+              |USING $usingSql AS $srcAlias
+              |ON $onCond
+              |WHEN MATCHED THEN DELETE""".stripMargin
+        }
+    }
+  }
+
+  private val rowidColumnRe = "(?i)(?<![A-Za-z0-9_])rowid(?![A-Za-z0-9_])".r
+
+  private def referencesRowid(sql: String): Boolean =
+    rowidColumnRe.findFirstIn(sql).isDefined
+
+  /** Rewrites `DELETE FROM <mv> WHERE <col> IN (<subquery>) [OR ...]` into one
+    * delete MERGE per top-level IN clause. Handles an optional leading CTE by
+    * moving it inside each MERGE source subquery. Used for FULL OUTER projection
+    * partial recompute over `openivm_left_key` / `openivm_right_key`.
+    */
+  private def rewriteDeleteInAsMerge(stmt: String, mvRef: String): Seq[String] = {
+    val deleteRe = ("(?is)^(.*?)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+(.+?)\\s*;?\\s*$").r
+    deleteRe.findFirstMatchIn(stmt) match {
+      case None => Nil
+      case Some(m) =>
+        val ctePrefix = m.group(1).trim
+        val tgtAlias  = Option(m.group(2)).getOrElse("v")
+        val whereBody = m.group(3).trim
+        splitTopLevelOr(whereBody).flatMap { clause =>
+          inClauseToMergeWithOptionalCte(clause.trim, mvRef, tgtAlias, ctePrefix)
+        }
+    }
+  }
+
+  private def inClauseToMergeWithOptionalCte(
+      clause: String,
+      mvRef: String,
+      tgtAlias: String,
+      ctePrefix: String
+  ): Option[String] = {
+    val openIdx = clause.toUpperCase.indexOf(" IN ")
+    if (openIdx < 0) return None
+    val lhs  = clause.substring(0, openIdx).trim
+    val rest = clause.substring(openIdx + 4).trim
+    if (!rest.startsWith("(")) return None
+    val close = findMatchingCloseParen(rest, 0)
+    if (close < 0) return None
+    val subq   = rest.substring(1, close).trim
+    val rhsCol = selectedColumnAlias(subq).getOrElse(return None)
+    // openivm's self-join SIMPLE_PROJECTION delete keys on the virtual `rowid`
+    // column. Spark Delta has no rowid, so decline and let the CREATE-time
+    // apply probe demote the MV to FULL_REFRESH via `simple_projection_no_apply`.
+    if (referencesRowid(lhs) || referencesRowid(subq)) return None
+    val source =
+      if (ctePrefix.nonEmpty) s"(\n$ctePrefix\n$subq\n)"
+      else s"($subq)"
+    Some(
+      s"""|MERGE INTO $mvRef AS $tgtAlias
+          |USING $source AS d
+          |ON $tgtAlias.$lhs IS NOT DISTINCT FROM d.$rhsCol
+          |WHEN MATCHED THEN DELETE""".stripMargin
+    )
+  }
+
+  private def selectedColumnAlias(selectSql: String): Option[String] = {
+    val re = """(?is)^\s*SELECT\s+(?:DISTINCT\s+)?(.+?)\s+FROM\s+.+$""".r
+    re.findFirstMatchIn(selectSql).flatMap { m =>
+      val items = splitSelectList(m.group(1).trim)
+      if (items.size != 1) None
+      else {
+        val item = items.head.trim
+        val asRe = """(?is)^.+\s+AS\s+(`[^`]+`|\"[^\"]+\"|\w+)\s*$""".r
+        val raw  = asRe.findFirstMatchIn(item).map(_.group(1)).getOrElse(item.split("\\.").last.trim)
+        Some(normalizeColumnRef(raw))
+      }
+    }
+  }
+
+  private def normalizeColumnRef(col: String): String = {
+    val trimmed = col.trim.stripPrefix("`").stripSuffix("`").stripPrefix("\"").stripSuffix("\"")
+    s"`${trimmed.replace("`", "``")}`"
   }
 
   /** Rewrites the AGGREGATE_GROUP+minmax `DELETE FROM <mv> AS openivm_tgt

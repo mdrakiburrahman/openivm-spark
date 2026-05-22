@@ -497,6 +497,12 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "last_value(name) OVER (PARTITION BY grp ORDER BY ts)"
     }
 
+    it("rewrites last_value(expr IGNORE NULLS) OVER (...) to Spark's two-arg spelling") {
+      val sql = "last_value(coalesce(name, alt_name) IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "last_value(coalesce(name, alt_name), true) OVER (PARTITION BY grp ORDER BY ts)"
+    }
+
     it("is case-insensitive for the date/time shim bodies") {
       val sql =
         "CAST(STRPTIME(raw, '%Y-%m-%d') AS DATE), Strptime(raw, 'yyyy-MM-dd HH:mm:ss'), STRPTIME(raw2, '%Y-%m-%d %H:%M:%S'), STRFTIME(ts, 'yyyyMMdd'), LAST(name) OVER (PARTITION BY grp ORDER BY ts)"

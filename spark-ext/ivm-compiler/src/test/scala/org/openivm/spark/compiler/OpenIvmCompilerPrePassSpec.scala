@@ -17,7 +17,7 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
         "SELECT __sparkfn_to_date_1arg(raw), __sparkfn_to_timestamp_1arg(raw), date_format(ts), __sparkfn_to_date(raw, 'yyyyMMdd'), " +
         "__sparkfn_to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss'), __sparkfn_date_format(ts, 'yyyyMMdd'), " +
         "last_value(raw) OVER (PARTITION BY grp ORDER BY ts), " +
-        "__sparkfn_last_value(raw, true) OVER (PARTITION BY grp ORDER BY ts) FROM src"
+        "last_value(raw IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts) FROM src"
     }
 
     it("counts only top-level commas inside the matched call") {
@@ -30,7 +30,7 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
       OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
         "SELECT __sparkfn_to_date_1arg(coalesce(a, b)), __sparkfn_to_date(coalesce(a, b), 'yyyyMMdd'), " +
         "coalesce(__sparkfn_to_timestamp_1arg(raw), ts), coalesce(__sparkfn_to_timestamp(raw, 'yyyy-MM-dd HH:mm:ss'), ts), " +
-        "__sparkfn_last_value(coalesce(a, b), true) OVER (PARTITION BY grp ORDER BY ts), " +
+        "last_value(coalesce(a, b) IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts), " +
         "__sparkfn_date_format(coalesce(ts1, ts2), 'yyyyMMdd') FROM src"
     }
 
@@ -58,7 +58,7 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
           |       "to_timestamp" AS quoted_name,
           |       -- last_value(raw, true) OVER (PARTITION BY grp ORDER BY ts)
           |       __sparkfn_to_date_1arg(raw) AS parsed,
-          |       __sparkfn_last_value(raw, true) OVER (PARTITION BY grp ORDER BY ts) AS filled
+          |       last_value(raw IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts) AS filled
           |FROM src /* to_timestamp(raw), to_date(raw, 'yyyyMMdd') */""".stripMargin
     }
 

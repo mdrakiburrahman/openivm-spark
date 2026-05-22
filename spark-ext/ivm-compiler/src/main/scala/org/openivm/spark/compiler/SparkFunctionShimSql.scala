@@ -59,12 +59,15 @@ private[compiler] object SparkFunctionShimSql {
     * DuckDB would otherwise parse or bind incompatibly to collision-free
     * `__sparkfn_*` spellings before the SQL reaches DuckDB.
     *
-    * Only the function NAME is rewritten; argument text is preserved verbatim.
+    * Only the function NAME is rewritten for generic shim calls; argument text is
+    * preserved verbatim. The Spark-only literal-boolean
+    * `last_value(expr, ignoreNulls)` spelling is instead translated to DuckDB's
+    * native window modifier so ignore-null semantics survive planning.
     * Current coverage:
     *   - 1-arg / 2-arg `to_date(...)`
     *   - 1-arg / 2-arg `to_timestamp(...)`
     *   - 2-arg `date_format(...)`
-    *   - 2-arg `last_value(expr, ignoreNulls)`
+    *   - 2-arg `last_value(expr, true|false)`
     */
   def renameSparkFunctionShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
@@ -72,9 +75,11 @@ private[compiler] object SparkFunctionShimSql {
       else {
         val identEnd = readIdentifierEnd(sql, i)
         val lower    = sql.substring(i, identEnd).toLowerCase(Locale.ROOT)
-        sparkFunctionRenameRules.get(lower).flatMap { rule =>
-          parseFunctionCall(sql, identEnd)
-            .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
+        parseSparkLastValueLiteralBoolRewrite(sql, i, identEnd).orElse {
+          sparkFunctionRenameRules.get(lower).flatMap { rule =>
+            parseFunctionCall(sql, identEnd)
+              .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
+          }
         }
       }
     }
@@ -90,6 +95,7 @@ private[compiler] object SparkFunctionShimSql {
     *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`                                               -> `to_timestamp(s)`
     *   - `strptime(s, fmt)`                                                               -> `to_timestamp(s, fmt)`
     *   - `strftime(d, fmt)`                                                               -> `date_format(d, fmt)`
+    *   - `last_value(expr IGNORE NULLS) OVER (...)`                                      -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                                                          -> `last_value(expr) OVER (...)`
     *
     * The 1-arg date/time rewrites trigger when the inlined body matches either
@@ -105,8 +111,50 @@ private[compiler] object SparkFunctionShimSql {
       parseCastTemporalShim(sql, i)
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
+        .orElse(parseLastValueIgnoreNullsRewrite(sql, i))
         .orElse(parseWindowFunctionNameRewrite(sql, i, "last", "last_value"))
     }
+
+  private def parseSparkLastValueLiteralBoolRewrite(
+      sql: String,
+      start: Int,
+      identEnd: Int
+  ): Option[(Int, String)] = {
+    if (
+      identEnd - start != "last_value".length || !sql.regionMatches(true, start, "last_value", 0, "last_value".length)
+    ) None
+    else {
+      parseFunctionCall(sql, identEnd)
+        .filter(_.topLevelCommaCount == 1)
+        .flatMap { call =>
+          splitTopLevelArgs(sql, call).flatMap {
+            case Seq(exprRange, boolRange) =>
+              parseBooleanLiteralArg(sql, boolRange).map { ignoreNulls =>
+                val expr = sql.substring(exprRange._1, exprRange._2).trim
+                val replacement =
+                  if (ignoreNulls) s"last_value($expr IGNORE NULLS)"
+                  else s"last_value($expr)"
+                call.closeParen + 1 -> replacement
+              }
+            case _ => None
+          }
+        }
+    }
+  }
+
+  private def parseLastValueIgnoreNullsRewrite(sql: String, start: Int): Option[(Int, String)] =
+    parseFunctionCallAt(sql, start, "last_value")
+      .filter(_.topLevelCommaCount == 0)
+      .filter(call => hasOverClause(sql, call.closeParen + 1))
+      .flatMap { call =>
+        findTopLevelKeyword(sql, call.openParen + 1, call.closeParen, "IGNORE").flatMap { ignoreStart =>
+          val nullsStart = skipTriviaForward(sql, ignoreStart + "IGNORE".length, call.closeParen)
+          val expr       = sql.substring(call.openParen + 1, ignoreStart).trim
+          if (expr.isEmpty || !isKeywordAt(sql, nullsStart, "NULLS")) None
+          else if (!isTriviaOnly(sql, nullsStart + "NULLS".length, call.closeParen)) None
+          else Some(call.closeParen + 1 -> s"last_value(${rewriteInlinedSparkShimCalls(expr)}, true)")
+        }
+      }
 
   private def parseCastTemporalShim(sql: String, start: Int): Option[(Int, String)] =
     parseFunctionCallAt(sql, start, "cast").flatMap { castCall =>
@@ -318,6 +366,22 @@ private[compiler] object SparkFunctionShimSql {
       args += ((argStart, call.closeParen))
       Some(args.toSeq)
     }
+  }
+
+  private def parseBooleanLiteralArg(sql: String, argRange: (Int, Int)): Option[Boolean] = {
+    val (start, endExclusive) = argRange
+    val literalStart          = skipTriviaForward(sql, start, endExclusive)
+    if (isKeywordAt(sql, literalStart, "TRUE") && isTriviaOnly(sql, literalStart + "TRUE".length, endExclusive)) {
+      Some(true)
+    } else if (
+      isKeywordAt(sql, literalStart, "FALSE") && isTriviaOnly(
+        sql,
+        literalStart + "FALSE".length,
+        endExclusive
+      )
+    ) {
+      Some(false)
+    } else None
   }
 
   private def argEqualsSingleQuotedLiteral(

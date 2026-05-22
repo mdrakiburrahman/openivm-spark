@@ -415,6 +415,81 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("outer-join projection partial recompute rewrites") {
+    it("rewrites FULL OUTER CTE-prefixed IN deletes into key-safe delete MERGEs") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (name, amount, openivm_left_key, openivm_right_key, openivm_multiplicity)
+          |SELECT name, amount, openivm_left_key, openivm_right_key, openivm_multiplicity
+          |FROM memory.main.openivm_delta_users WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |WITH openivm_affected AS (
+          |  SELECT DISTINCT id AS _k FROM memory.main.openivm_delta_users WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |  UNION
+          |  SELECT DISTINCT user_id AS _k FROM memory.main.openivm_delta_orders WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |)
+          |DELETE FROM openivm_data_mv_r
+          |WHERE openivm_left_key IN (SELECT _k FROM openivm_affected)
+          |   OR openivm_right_key IN (SELECT _k FROM openivm_affected);
+          |WITH openivm_affected AS (
+          |  SELECT DISTINCT id AS _k FROM memory.main.openivm_delta_users WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |  UNION
+          |  SELECT DISTINCT user_id AS _k FROM memory.main.openivm_delta_orders WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |)
+          |INSERT INTO openivm_data_mv_r
+          |SELECT * FROM (SELECT u.name, o.amount, u.id AS openivm_left_key, o.user_id AS openivm_right_key
+          |FROM memory.main.users u FULL OUTER JOIN memory.main.orders o ON u.id = o.user_id) openivm_foj
+          |WHERE openivm_left_key IN (SELECT _k FROM openivm_affected)
+          |   OR openivm_right_key IN (SELECT _k FROM openivm_affected);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+
+      val deleteMerges = rewritten.statements.filter(_.contains("WHEN MATCHED THEN DELETE"))
+      deleteMerges should have size 2
+      deleteMerges.head should include("ON v.openivm_left_key IS NOT DISTINCT FROM d.`_k`")
+      deleteMerges(1) should include("ON v.openivm_right_key IS NOT DISTINCT FROM d.`_k`")
+      deleteMerges.foreach(_ should include("WITH openivm_affected AS"))
+      rewritten.statements.last should include(s"MERGE INTO delta.`$mvLocation` AS v")
+      rewritten.statements.last should include("WHEN NOT MATCHED THEN INSERT")
+    }
+
+    it("rewrites DELETE USING into a key-safe delete MERGE") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |WITH openivm_affected AS (
+          |  SELECT DISTINCT openivm_left_key FROM openivm_delta_mv_r WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |)
+          |DELETE FROM openivm_data_mv_r AS openivm_delete_target
+          |USING openivm_affected _d
+          |WHERE _d.openivm_left_key IS NOT DISTINCT FROM openivm_delete_target.openivm_left_key;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 1
+      rewritten.statements.head should include("MERGE INTO `mydb`.`mv_r` AS openivm_delete_target")
+      rewritten.statements.head should include("USING (")
+      rewritten.statements.head should include("SELECT * FROM openivm_affected")
+      rewritten.statements.head should include("WHEN MATCHED THEN DELETE")
+    }
+  }
+
   // ── 9. postProcess is applied to each surviving statement ────────────────
   describe("postProcess hook") {
     it("invokes the supplied postProcess function on every kept statement") {

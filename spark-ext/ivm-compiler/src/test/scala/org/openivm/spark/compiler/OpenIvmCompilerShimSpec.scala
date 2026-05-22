@@ -175,7 +175,7 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should not include "strftime"
   }
 
-  "shim last_value(expr, ignoreNulls)" should "compile, stay incremental, and emit Spark's 1-arg last_value at refresh time" in {
+  "shim last_value(expr, ignoreNulls)" should "compile, stay incremental, and emit Spark's ignore-null last_value at refresh time" in {
     val r = compileBody(
       viewName = "shim_last_value_v1",
       sources = Map("winsrc" -> windowSchema),
@@ -187,6 +187,7 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     val translated = LptsSparkDialect.translate(r.sql)
     translated should not include "__sparkfn_last_value"
     translated should include("last_value(")
+    translated should include(", true)")
   }
 
   // ── sparkFunctionShimsPrologue contract ──────────────────────────────────────

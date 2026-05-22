@@ -1,5 +1,10 @@
 package org.openivm.spark.parity
 
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.openivm.spark.common.{MvCatalog, StagingCatalog}
 import org.scalatest.BeforeAndAfterAll
@@ -8,6 +13,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.util.UUID
+import scala.collection.mutable.ArrayBuffer
 
 /** Split from the original parity spec.  Scope:
   * Depth-2 chains exercised by fan-out, empty-intermediate, and UPDATE-driven DML mutations from `chained.test`.
@@ -54,11 +60,44 @@ class ChainedDmlSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
+  private final class BufferingAppender(name: String)
+      extends AbstractAppender(
+        name,
+        null,
+        PatternLayout.createDefaultLayout(),
+        false,
+        Property.EMPTY_ARRAY
+      ) {
+    private val buffer = ArrayBuffer.empty[String]
+
+    override def append(event: LogEvent): Unit =
+      buffer.synchronized {
+        buffer += event.getMessage.getFormattedMessage
+      }
+
+    def messages: Seq[String] = buffer.synchronized(buffer.toVector)
+  }
+
   private def deleteDir(f: File): Unit = {
     if (f.isDirectory) Option(f.listFiles()).foreach(_.foreach(deleteDir))
     f.delete()
     ()
   }
+
+  private def withLogCapture[A](body: BufferingAppender => A): A = {
+    val appender = new BufferingAppender(s"chm-${UUID.randomUUID()}")
+    val root     = LogManager.getRootLogger.asInstanceOf[Logger]
+    appender.start()
+    root.addAppender(appender)
+    try body(appender)
+    finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
+
+  private def noPendingFor(logs: Seq[String], viewName: String): Boolean =
+    logs.exists(msg => msg.contains(s"view='`$viewName`'") && msg.contains("outcome='no_pending_deltas'"))
 
   /** Bidirectional `EXCEPT ALL` equivalence between the MV and the recomputed
     * view body, projecting the MV onto the expected column list to drop any
@@ -91,6 +130,30 @@ class ChainedDmlSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   //     MV chain so it had to travel with the heavy `it`) so it runs in its
   //     own forked JVM and does not bottleneck the rest of this spec.
   // ──────────────────────────────────────────────────────────────────────────
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // (G) Downstream refresh must see an upstream MV_VIEW_DELTA trigger even
+  //     when the original base table has no direct pending rows for it.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("(G) Downstream MV refresh sees upstream cascade deltas") {
+    it("does not no-op short-circuit after the upstream MV refresh emits a view-delta") {
+      spark.sql("CREATE TABLE IF NOT EXISTS chm_rsc_base(id INT, val INT) USING DELTA")
+      spark.sql("INSERT INTO chm_rsc_base VALUES (1, 10)")
+      spark.sql("CREATE MATERIALIZED VIEW chm_rsc_l1 AS SELECT id, val FROM chm_rsc_base")
+      spark.sql("CREATE MATERIALIZED VIEW chm_rsc_l2 AS SELECT id, val FROM chm_rsc_l1")
+
+      spark.sql("INSERT INTO chm_rsc_base VALUES (2, 20)")
+      refreshChain("chm_rsc_l1")
+      withLogCapture { appender =>
+        refreshChain("chm_rsc_l2")
+        noPendingFor(appender.messages, "chm_rsc_l2") shouldBe false
+      }
+
+      assertMvCorrect("chm_rsc_l1", "SELECT id, val FROM chm_rsc_base")
+      assertMvCorrect("chm_rsc_l2", "SELECT id, val FROM chm_rsc_base")
+    }
+  }
 
   // ──────────────────────────────────────────────────────────────────────────
   // (H) Intermediate MV becomes completely empty mid-test

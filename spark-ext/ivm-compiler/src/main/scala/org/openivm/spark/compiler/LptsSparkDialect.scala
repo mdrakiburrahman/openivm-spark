@@ -155,6 +155,7 @@ object LptsSparkDialect {
     *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`       -> `to_timestamp(s)`
     *   - `strptime(s, fmt)`                       -> `to_timestamp(s, fmt)`
     *   - `strftime(d, fmt)`                       -> `date_format(d, fmt)`
+    *   - `last_value(expr IGNORE NULLS) OVER (...)` -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                  -> `last_value(expr) OVER (...)`
     *
     * These shim rewrites use the shared quote/comment-aware scanner in

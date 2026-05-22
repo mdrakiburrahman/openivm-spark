@@ -344,7 +344,7 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
   }
 
   describe("compile-bridge shim: last_value(expr, ignoreNulls)") {
-    it("keeps the MV incremental and correct after INSERT + REFRESH when the data is null-free") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH") {
       spark.sql(
         "CREATE TABLE cbdf_last_value_src (id INT, customer_id INT, effective_ts TIMESTAMP, status STRING) USING DELTA"
       )
@@ -355,9 +355,8 @@ class CompileBridgeDateFunctionsSpec extends AnyFunSpec with Matchers with Befor
           "(3, 20, TIMESTAMP'2024-01-01 12:00:00', 'starter')"
       )
 
-      // The compile bridge intentionally drops `ignoreNulls`; keep the fixture
-      // null-free so Spark's 1-arg `last_value(expr)` remains bag-equal to the
-      // user's original 2-arg query.
+      // Literal `ignoreNulls = true` is normalized to DuckDB's native
+      // `IGNORE NULLS` modifier and restored to Spark's 2-arg spelling.
       val mvName = "cbdf_mv_last_value"
       val viewBody =
         "SELECT id, customer_id, effective_ts, " +

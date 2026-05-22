@@ -150,6 +150,9 @@ conventions:
 
   `.logs/` is git-ignored.
 
+- Always try to parallelize tasks using subagents and isolated docker containers and delegating
+  tasks to agents per container so we can get things done faster.
+
 ## Activation outside tests
 
 ```bash
