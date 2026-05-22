@@ -269,6 +269,36 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("allows reentrant catalog ops within withBatch under multiProcess=true") {
+      val dir  = newDbDir("mp-reentrant")
+      val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        // Seed two pre-existing entries to make the prefix scan non-trivial.
+        db.withBatch { batch =>
+          db.put(batch, "meta", RocksDBCodec.utf8("seed-1"), RocksDBCodec.utf8("v1"))
+          db.put(batch, "meta", RocksDBCodec.utf8("seed-2"), RocksDBCodec.utf8("v2"))
+        }
+
+        // Mimic MvCatalog.rewriteProperties: call prefixScan + get from inside
+        // withBatch. Both nested calls must succeed without throwing
+        // OverlappingFileLockException.
+        db.withBatch { batch =>
+          val seeded = db.prefixScan("meta", Array.emptyByteArray).toList
+          seeded.size shouldBe 2
+          val existingV1 = db.get("meta", RocksDBCodec.utf8("seed-1")).map(RocksDBCodec.fromUtf8)
+          existingV1 shouldBe Some("v1")
+          db.put(batch, "meta", RocksDBCodec.utf8("new"), RocksDBCodec.utf8("v3"))
+        }
+
+        db.get("meta", RocksDBCodec.utf8("new")).map(RocksDBCodec.fromUtf8) shouldBe Some("v3")
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
     it("allows concurrent multi-process writers with multiProcess=true") {
       val dir       = newDbDir("multi-process")
       val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString

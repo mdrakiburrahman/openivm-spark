@@ -243,41 +243,63 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     */
   private def externalLockPath = dbDir.resolve("openivm-jvm.lock")
 
+  // Reentrancy guard for the cross-JVM external lock. `FileChannel.tryLock()`
+  // throws `OverlappingFileLockException` if the same JVM already holds an
+  // overlapping region of the same file, so we cannot naively re-acquire
+  // from within a callback (e.g. `MvCatalog.rewriteProperties` calls
+  // `collectPrefix` from inside `withBatch`). The outer `writeMutex`
+  // (ReentrantLock) serialises threads within this JVM, so a single-thread
+  // "owner + depth" pattern is sufficient.
+  @volatile private var externalLockOwner: Thread = _
+  private var externalLockDepth: Int              = 0
+
   private def withExternalLock[A](body: => A): A = {
-    Files.createDirectories(dbDir)
-    val ch = FileChannel.open(externalLockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-    try {
-      val deadline             = System.currentTimeMillis() + conf.lockTimeoutMs
-      var acquired: FileLock   = null
-      var lastError: Throwable = null
-      while (acquired == null && System.currentTimeMillis() < deadline) {
-        try {
-          acquired = ch.tryLock()
-        } catch {
-          case e: OverlappingFileLockException =>
-            lastError = e
-            acquired = null
-          case e: java.io.IOException =>
-            lastError = e
-            acquired = null
+    val current = Thread.currentThread()
+    if (externalLockOwner eq current) {
+      externalLockDepth += 1
+      try body
+      finally externalLockDepth -= 1
+    } else {
+      Files.createDirectories(dbDir)
+      val ch = FileChannel.open(externalLockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+      try {
+        val deadline             = System.currentTimeMillis() + conf.lockTimeoutMs
+        var acquired: FileLock   = null
+        var lastError: Throwable = null
+        while (acquired == null && System.currentTimeMillis() < deadline) {
+          try {
+            acquired = ch.tryLock()
+          } catch {
+            case e: OverlappingFileLockException =>
+              lastError = e
+              acquired = null
+            case e: java.io.IOException =>
+              lastError = e
+              acquired = null
+          }
+          if (acquired == null) {
+            try Thread.sleep(50)
+            catch { case _: InterruptedException => () }
+          }
         }
         if (acquired == null) {
-          try Thread.sleep(50)
-          catch { case _: InterruptedException => () }
+          throw new RuntimeException(
+            s"OpenIVM RocksDB external lock acquisition timed out after ${conf.lockTimeoutMs}ms on $externalLockPath",
+            lastError
+          )
         }
+        externalLockOwner = current
+        externalLockDepth = 1
+        try body
+        finally {
+          externalLockDepth = 0
+          externalLockOwner = null
+          try acquired.release()
+          catch { case _: Throwable => () }
+        }
+      } finally {
+        closeQuietly(ch)
       }
-      if (acquired == null) {
-        throw new RuntimeException(
-          s"OpenIVM RocksDB external lock acquisition timed out after ${conf.lockTimeoutMs}ms on $externalLockPath",
-          lastError
-        )
-      }
-      try body
-      finally
-        try acquired.release()
-        catch { case _: Throwable => () }
-    } finally {
-      closeQuietly(ch)
     }
   }
 
@@ -355,9 +377,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
     if (conf.multiProcess) {
       withExternalLock {
-        openInternal()
-        try body
-        finally closeInternal()
+        if (dbHandle != null) {
+          // Reentry from a callback running inside an outer withNativeHandle
+          // (e.g. MvCatalog.rewriteProperties calls collectPrefix inside
+          // withBatch). The outer frame owns the open/close; we just run.
+          body
+        } else {
+          openInternal()
+          try body
+          finally closeInternal()
+        }
       }
     } else {
       if (dbHandle == null) openInternal()
