@@ -16,7 +16,7 @@ bronze.reference_tax_rate	SIMPLE_PROJECTION	2
 bronze.reference_trade_type	SIMPLE_PROJECTION	2
 bronze.syndicated_prospect	SIMPLE_PROJECTION	2
 gold.broker_performance	WINDOW_PARTITION	5
-gold.customer_concentration	WINDOW_PARTITION	5
+gold.customer_concentration	FULL_REFRESH	3
 gold.daily_market_pulse	WINDOW_PARTITION	5
 gold.dim_account	SIMPLE_PROJECTION	2
 gold.dim_broker	SIMPLE_PROJECTION	2
@@ -30,9 +30,9 @@ gold.fact_cash_transactions	SIMPLE_PROJECTION	2
 gold.fact_holdings	SIMPLE_PROJECTION	2
 gold.fact_market_history	SIMPLE_PROJECTION	2
 gold.fact_trade	SIMPLE_PROJECTION	2
-gold.fact_watches	SIMPLE_PROJECTION	2
+gold.fact_watches	FULL_REFRESH	3
 gold.market_volatility	WINDOW_PARTITION	5
-gold.trade_volume_stats	WINDOW_PARTITION	5
+gold.trade_volume_stats	FULL_REFRESH	3
 silver.accounts	WINDOW_PARTITION	5
 silver.cash_transactions	SIMPLE_PROJECTION	2
 silver.companies	WINDOW_PARTITION	5

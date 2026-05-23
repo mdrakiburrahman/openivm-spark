@@ -530,10 +530,27 @@ case class CreateMaterializedViewCommand(
       }.toMap
     }
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
-    val nonCascadeUpstreams: Seq[String] =
+    val nonCascadeUpstreams: Seq[(String, String)] =
       upstreamMvByQual.toSeq.collect {
-        case (q, m) if !m.emitsCascadeViewDelta => q
+        case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
+        // PR-2 inline NULL-companion at openivm/src/upsert/refresh_sql.cpp:898-960 emits a key-only
+        // retract with non-key columns NULL when the upstream is AGGREGATE_GROUP. Downstream
+        // SIMPLE_PROJECTION's value-equality MERGE cannot match such a retract, so the SCD-2 update is
+        // silently dropped. Demote to FULL_REFRESH at CREATE time so the downstream MV recomputes
+        // against the live upstream instead of trying to apply the unusable cascade delta.
+        // See .research/OPENIVM_VALIDATE.md — Failure Mode 1.
+        case (q, m)
+            if m.refreshType == RefreshTypeCode.AggregateGroup &&
+              compiled.refreshType == RefreshTypeCode.SimpleProjection =>
+          q -> "aggregate_group_into_simple_projection"
       }
+    val nonCascadeUpstreamReason: String =
+      nonCascadeUpstreams
+        .groupBy(_._2)
+        .toSeq
+        .sortBy(_._1)
+        .map { case (reason, entries) => s"${reason}:${entries.map(_._1).mkString(",")}" }
+        .mkString(";")
     // ── Effective refresh-type classification with structured logging ──────
     //
     // Every demotion of `compiled.refreshType` to FULL_REFRESH below is
@@ -544,15 +561,13 @@ case class CreateMaterializedViewCommand(
     //   - simple_projection_no_apply  compiler emitted a SIMPLE_PROJECTION delta
     //                                 feed but no data-table apply statement after
     //                                 rewrite, so REFRESH would be a no-op
-    //   - non_cascade_upstream        Upstream MV instance does NOT emit a
+    //   - non_cascade_upstream        Upstream MV instance either does NOT emit a
     //                                 persisted `openivm_delta_<view>` downstream can
-    //                                 consume incrementally (e.g. SIMPLE_AGGREGATE,
-    //                                 DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K,
-    //                                 FULL_REFRESH, or a recompute MV whose compiled SQL
-    //                                 lacked a real view-delta). WINDOW_PARTITION /
-    //                                 GROUP_RECOMPUTE only escape this bucket when their
-    //                                 concrete compiled SQL actually emitted the cascade
-    //                                 delta guarded by `_ivm_emits_cascade_view_delta`.
+    //                                 consume incrementally, or is AGGREGATE_GROUP feeding
+    //                                 a SIMPLE_PROJECTION whose value-equality MERGE cannot
+    //                                 consume AGGREGATE_GROUP's key-only NULL retracts. The
+    //                                 interpolated reason distinguishes `non_cascade` from
+    //                                 `aggregate_group_into_simple_projection`.
     //   - window_initial_load_mismatch translated WINDOW_PARTITION initial-load SQL
     //                                 is not bag-equal to the user query on current
     //                                 data, so the MV is demoted to FULL_REFRESH
@@ -576,7 +591,7 @@ case class CreateMaterializedViewCommand(
       else if (!simpleProjectionHasDataApply)
         (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
       else if (nonCascadeUpstreams.nonEmpty)
-        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreams.mkString(",")}")
+        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason}")
       else if (compiled.refreshType == RefreshTypeCode.WindowPartition && !windowInitialLoadMatchesUserQuery)
         (RefreshTypeCode.FullRefresh, "window_initial_load_mismatch")
       else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
