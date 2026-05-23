@@ -8,6 +8,7 @@ import org.apache.spark.sql.catalyst.analysis.NamedRelation
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.openivm.spark.common.{FeatureGate, MvCatalog}
+import org.rocksdb.RocksDBException
 
 import java.time.format.DateTimeFormatter
 import java.time.{Instant, ZoneOffset}
@@ -252,8 +253,17 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         MvCatalog.viewsForSource(session, tableName).nonEmpty
       }
     } catch {
+      case e: RocksDBException =>
+        logError(s"[openivm] RocksDB failure resolving dependent MVs for $tableName: ${e.getMessage}", e)
+        throw new IllegalStateException(
+          s"[openivm] cannot determine dependent MVs for $tableName (RocksDB error: ${e.getMessage}); " +
+            "refusing to silently un-tee INSERT. Likely cause: another Spark driver JVM holds the openivm " +
+            "RocksDB LOCK. If running under ivm-bench, ensure all callers share one Livy session " +
+            "(see services/spark_openivm_sources.py).",
+          e
+        )
       case e: Exception =>
-        logWarning(s"[openivm] hasDependentMvs failed for $tableName: ${e.getClass.getName}: ${e.getMessage}")
+        logError(s"[openivm] hasDependentMvs failed for $tableName: ${e.getClass.getName}: ${e.getMessage}", e)
         false
     }
 
