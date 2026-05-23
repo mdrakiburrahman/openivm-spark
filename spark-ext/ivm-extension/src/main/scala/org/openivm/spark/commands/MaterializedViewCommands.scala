@@ -1257,33 +1257,21 @@ case class RefreshMaterializedViewCommand(
       .map { case (t, pairs) => t -> pairs.map(_._2) }
     StagingCatalog.pruneFullyConsumed(spark, viewsByTable)
 
-    // MV-over-MV cascade trigger (non-cascade-capable upstream only — see
-    // method docstring). For cascade-delta-capable types the MV_VIEW_DELTA
-    // row is already recorded; emitting an OVERWRITE trigger here would
-    // pile a +1 multiplicity full-table delta on top of the +/- signed
-    // view-delta and silently double-add downstream rows.
-    if (!meta.emitsCascadeViewDelta) {
-      val mvShortName = name.identifier
-      val triggerKeys: Set[String] = allMvs
-        .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
-        .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
-        .toSet
-      triggerKeys.foreach { triggerKey =>
-        // Unique per-refresh path under the MV's location so repeats don't
-        // collapse on (base_table, staging_path) idempotency.
-        val triggerPath = s"${meta.location}/_trigger/${java.util.UUID.randomUUID()}"
-        StagingCatalog.record(
-          spark,
-          StagingDelta(
-            baseTable = triggerKey,
-            opType = StagingDelta.OpTypes.Overwrite,
-            stagingPath = triggerPath,
-            txnTs = new Timestamp(System.currentTimeMillis()),
-            consumedBy = Seq.empty
-          )
-        )
-      }
-    }
+    // MV-over-MV cascade trigger removed: the previous implementation
+    // synthesised a `<location>/_trigger/<uuid>` sentinel path and
+    // recorded it as an Overwrite-typed staging entry so downstream MVs
+    // could detect upstream non-incremental refreshes. Downstream
+    // consumption then crashed with `[DELTA_INVALID_PARTITION_PATH]
+    // _trigger/<uuid>` because `StagingDeltaView.buildSourceDeltaViewSql`
+    // treats Overwrite entries as Delta paths to scan.
+    //
+    // Correct cascade for non-cascade-capable upstreams is already
+    // enforced at CREATE time (`nonCascadeUpstreams.nonEmpty` ⇒
+    // `effectiveRefreshType = FullRefresh`, see
+    // `CreateMaterializedViewCommand`). Downstream MVs whose upstream
+    // is non-cascade are therefore re-routed through `BuildFullRefresh`,
+    // which reads the live source on every REFRESH and is correct by
+    // construction. No additional run-time trigger is needed.
   }
 
   /** True for refresh types whose openivm-emitted MERGE preserves rows whose
