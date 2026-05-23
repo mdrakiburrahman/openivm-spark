@@ -140,8 +140,8 @@ From repo root:
 ```bash
 cd /home/mdrrahman/openivm-spark
 export SCALE_FACTOR=3 BATCH_1_PCT=1 BATCH_2_PCT=0.001 BATCH_3_PCT=0.002
-export PARALLEL=1
-export ENGINES=duckdb-openivm,spark-openivm
+export PARALLEL=0
+export ENGINES=duckdb-openivm,spark-openivm,spark
 export PRESERVE_RAW=1
 export OPENIVM_VALIDATE=1
 export OPENIVM_PROFILE_REFRESH=1
@@ -153,21 +153,25 @@ This is a long-running command (~30 min). Use the `bash` tool with
 `mode: "sync"`, `initial_wait: 60`. The benchmark will go to the
 background and you will be notified on completion. Do not poll.
 
+Our goal here is:
+
+1. spark-openivm **MUST** exceed spark in Batch 2 and Batch 3 so that IVM
+   is actually useful. Otherwise, this whole openivm-spark project is a waste
+   of compute.
+
+   It is OK for Batch 1 to be slower to hydrate the initial IVM state.
+
+2. spark-openivm **SHOULD** strive to be as close as possible to duckdb-openivm 
+  in Batch 2 and Batch 3. Large gaps here are signals of openivm-spark bugs or inefficiencies 
+  that can and should be fixed.
+
 ### Phase 1 failure handling (per-engine isolation)
-
-If the combined run fails, retry each engine individually (the
-benchmark-server tears both down on first serial failure):
-
-```bash
-ENGINES=duckdb-openivm bash src/.scripts/benchmark.sh
-ENGINES=spark-openivm  bash src/.scripts/benchmark.sh
-```
 
 Record the outcome of each isolated run as separate evidence:
 duckdb-openivm-success + spark-openivm-fail is itself a strong R3/R6
 signal.
 
-If both isolated runs fail, dump `mount/logs/3/benchmark-server.log`
+If the runs fail, dump `mount/logs/3/benchmark-server.log`
 and the per-engine dbt logs into the report's appendix and stop with
 `{ "status": "Failed" }`.
 
