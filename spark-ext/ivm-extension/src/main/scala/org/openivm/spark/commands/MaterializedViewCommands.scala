@@ -530,6 +530,8 @@ case class CreateMaterializedViewCommand(
       }.toMap
     }
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
+    val distinctUpstreamMvCount: Int =
+      upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
     val nonCascadeUpstreams: Seq[(String, String)] =
       upstreamMvByQual.toSeq.collect {
         case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
@@ -543,6 +545,10 @@ case class CreateMaterializedViewCommand(
             if m.refreshType == RefreshTypeCode.AggregateGroup &&
               compiled.refreshType == RefreshTypeCode.SimpleProjection =>
           q -> "aggregate_group_into_simple_projection"
+        case (q, _)
+            if compiled.refreshType == RefreshTypeCode.SimpleProjection &&
+              distinctUpstreamMvCount >= 2 =>
+          q -> "multi_mv_simple_projection"
       }
     val nonCascadeUpstreamReason: String =
       nonCascadeUpstreams
@@ -565,9 +571,11 @@ case class CreateMaterializedViewCommand(
     //                                 persisted `openivm_delta_<view>` downstream can
     //                                 consume incrementally, or is AGGREGATE_GROUP feeding
     //                                 a SIMPLE_PROJECTION whose value-equality MERGE cannot
-    //                                 consume AGGREGATE_GROUP's key-only NULL retracts. The
-    //                                 interpolated reason distinguishes `non_cascade` from
-    //                                 `aggregate_group_into_simple_projection`.
+    //                                 consume AGGREGATE_GROUP's key-only NULL retracts, or a
+    //                                 multi-MV-upstream SIMPLE_PROJECTION whose refresh only consumes
+    //                                 one upstream delta term. The interpolated reason distinguishes
+    //                                 `non_cascade`, `aggregate_group_into_simple_projection`, and
+    //                                 `multi_mv_simple_projection`.
     //   - window_initial_load_mismatch translated WINDOW_PARTITION initial-load SQL
     //                                 is not bag-equal to the user query on current
     //                                 data, so the MV is demoted to FULL_REFRESH
@@ -611,7 +619,7 @@ case class CreateMaterializedViewCommand(
     }
     // `sourceIsMv` is computed for logging visibility only; the demotion is
     // now driven by `nonCascadeUpstreams.nonEmpty` (see above).
-    val _ = sourceIsMv
+    val _ = (sourceIsMv, distinctUpstreamMvCount)
     val effectiveRefreshTypeName =
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
       else compiled.refreshTypeName
