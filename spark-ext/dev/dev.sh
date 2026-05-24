@@ -14,6 +14,11 @@
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
 #                           branches in pins.env and warn if local HEAD has
 #                           drifted from the pinned COMMIT.
+#   pins-fix                Commit + push uncommitted changes across
+#                           openivm-spark + .temp/{openivm,lpts,ivm-bench}
+#                           (refuses to push to main/master), then rewrite
+#                           pins.env + the ivm-bench Dockerfile so the next
+#                           pins-sync reports green.
 #   shell                   Drop into bash inside the spark-ext container.
 #   test [sbt-args]         `sbt test` (all suites) inside the dev container.
 #                           Extra args are appended to sbt (e.g. `testOnly ...`).
@@ -444,6 +449,367 @@ cmd_pins_sync() {
     fi
 }
 
+# ── pins-fix helpers ───────────────────────────────────────────────────────
+
+# Rewrite `KEY=...` in pins.env using awk (URLs contain `/`, so sed -i is
+# fragile). Idempotent — silent when the value is already correct.
+_pins_env_set() {
+    local key="$1" value="$2"
+    local file="$PINS_FILE"
+    if ! grep -qE "^${key}=" "$file"; then
+        echo "[pins-fix] FATAL: no '${key}=' line in $file" >&2
+        exit 1
+    fi
+    local current
+    current="$(awk -F= -v k="$key" '$1==k {sub(/^[^=]+=/,""); print; exit}' "$file")"
+    if [[ "$current" == "$value" ]]; then
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    awk -v k="$key" -v v="$value" '
+        BEGIN { done = 0 }
+        !done && index($0, k "=") == 1 { print k "=" v; done = 1; next }
+        { print }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+    echo "[pins-fix]   pins.env $key: $current → $value"
+}
+
+# Rewrite ALL occurrences of `ARG <name>=...` defaults in a Dockerfile via awk.
+# Preserves leading whitespace, logs nothing when the file is unchanged.
+# Robust against multi-occurrence ARGs (e.g. OPENIVM_SPARK_COMMIT) where the
+# two stages may temporarily disagree — the rewrite normalises them all.
+_dockerfile_arg_set() {
+    local file="$1" name="$2" value="$3"
+    local before
+    before="$(dockerfile_arg_default "$file" "$name")"
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    awk -v n="$name" -v v="$value" '
+        {
+            if (match($0, "^[[:space:]]*ARG[[:space:]]+" n "=")) {
+                prefix = substr($0, 1, RLENGTH)
+                print prefix v
+            } else {
+                print
+            }
+        }
+    ' "$file" > "$tmp"
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    mv "$tmp" "$file"
+    echo "[pins-fix]   Dockerfile ARG $name: $before → $value"
+}
+
+# Return 0 if $1 is a benign-lag predecessor of $2 in the openivm-spark repo
+# (ancestor + only pins.env / *.md diffs). Same definition as cmd_pins_sync.
+_pins_fix_is_benign_lag() {
+    local from="$1" to="$2"
+    [[ -n "$from" && -n "$to" ]] || return 1
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 1
+    local changed non_benign
+    changed="$(git -C "$REPO_ROOT" diff --name-only "$from" "$to" 2>/dev/null || true)"
+    non_benign="$(echo "$changed" | grep -vE '^(spark-ext/dev/pins\.env|.*\.md)$' | grep -v '^$' || true)"
+    [[ -z "$non_benign" ]]
+}
+
+# Refuse to push to main/master/detached HEAD, then verify the repo isn't
+# mid-rebase/merge/cherry-pick/bisect.
+_pins_fix_assert_safe_branch() {
+    local dest="$1"
+    local br
+    br="$(git -C "$dest" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    if [[ -z "$br" || "$br" == "HEAD" ]]; then
+        echo "[pins-fix] FATAL: $dest is in detached HEAD state — check out a branch first" >&2
+        exit 1
+    fi
+    if [[ "$br" == "main" || "$br" == "master" ]]; then
+        echo "[pins-fix] FATAL: $dest is on '$br' — pins-fix refuses to push to main/master" >&2
+        exit 1
+    fi
+    local gitdir
+    gitdir="$(git -C "$dest" rev-parse --git-dir)"
+    if [[ -d "$dest/$gitdir/rebase-merge" || -d "$dest/$gitdir/rebase-apply" \
+       || -f "$dest/$gitdir/MERGE_HEAD"   || -f "$dest/$gitdir/CHERRY_PICK_HEAD" \
+       || -f "$dest/$gitdir/BISECT_LOG" ]]; then
+        echo "[pins-fix] FATAL: $dest has an in-progress rebase/merge/cherry-pick/bisect — resolve it first" >&2
+        exit 1
+    fi
+    echo "$br"
+}
+
+# fetch + commit-if-dirty + rebase + push. Used for the three .temp repos
+# (where we don't care about commit granularity — any dirty change is "user
+# work in this dependency"). NOT used for openivm-spark, which gets
+# fine-grained path-specific commits.
+_pins_fix_push_dep() {
+    local dest="$1" branch="$2" msg="$3"
+    git -C "$dest" fetch --quiet --prune origin
+
+    if [[ -n "$(git -C "$dest" status --porcelain)" ]]; then
+        echo "[pins-fix]   staging + committing dirty changes in .temp/$(basename "$dest")"
+        git -C "$dest" add -A
+        git -C "$dest" commit --quiet -m "$msg"
+    fi
+
+    if git -C "$dest" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        if ! git -C "$dest" rebase --quiet "origin/$branch"; then
+            echo "[pins-fix] FATAL: rebase onto origin/$branch failed in $dest — resolve conflicts manually" >&2
+            git -C "$dest" rebase --abort 2>/dev/null || true
+            exit 1
+        fi
+    fi
+
+    local ahead
+    ahead="$(git -C "$dest" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
+    if [[ "$ahead" -gt 0 ]]; then
+        echo "[pins-fix]   pushing $ahead commit(s) to origin/$branch"
+        if ! git -C "$dest" push --quiet origin "$branch"; then
+            echo "[pins-fix] FATAL: 'git push origin $branch' failed in $dest" >&2
+            exit 1
+        fi
+    else
+        echo "[pins-fix]   nothing to push (origin/$branch is up to date)"
+    fi
+}
+
+# Commit + push a *path-restricted* bookkeeping change in openivm-spark.
+# Verifies the staged diff matches exactly the expected paths so the resulting
+# commit can be relied on as a "benign" pins.env-only commit (preserving the
+# benign-lag invariant after step 8). Skips silently when nothing to commit.
+_pins_fix_commit_paths_and_push() {
+    local branch="$1" msg="$2"
+    shift 2
+    local -a paths=("$@")
+
+    git -C "$REPO_ROOT" add -- "${paths[@]}"
+    local staged
+    staged="$(git -C "$REPO_ROOT" diff --cached --name-only)"
+    if [[ -z "$staged" ]]; then
+        return 0
+    fi
+
+    # Refuse if the staged set isn't a subset of $paths.
+    local p ok=1
+    while IFS= read -r f; do
+        ok=0
+        for p in "${paths[@]}"; do [[ "$p" == "$f" ]] && ok=1 && break; done
+        if [[ "$ok" -ne 1 ]]; then
+            echo "[pins-fix] FATAL: unexpected staged file '$f' for bookkeeping commit" >&2
+            git -C "$REPO_ROOT" reset --quiet HEAD -- "$f" >/dev/null 2>&1 || true
+            exit 1
+        fi
+    done <<< "$staged"
+
+    git -C "$REPO_ROOT" commit --quiet -m "$msg"
+
+    # Absorb any concurrent pushes to origin/<branch> before our own push.
+    # Rebase is safe here because our last commit only touches $paths.
+    git -C "$REPO_ROOT" fetch --quiet --prune origin
+    if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        if ! git -C "$REPO_ROOT" rebase --quiet "origin/$branch"; then
+            echo "[pins-fix] FATAL: rebase onto origin/$branch failed during bookkeeping push" >&2
+            git -C "$REPO_ROOT" rebase --abort 2>/dev/null || true
+            exit 1
+        fi
+    fi
+
+    if ! git -C "$REPO_ROOT" push --quiet origin "$branch"; then
+        echo "[pins-fix] FATAL: 'git push origin $branch' failed during bookkeeping push" >&2
+        exit 1
+    fi
+}
+
+# Idempotent counterpart for "commit ALL dirty files in openivm-spark" — used
+# for the *first* push, which intentionally bundles whatever the user had
+# uncommitted (including pins.env auto-updates from step 3).
+_pins_fix_commit_all_and_push() {
+    local branch="$1" msg="$2"
+    git -C "$REPO_ROOT" fetch --quiet --prune origin
+
+    if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+        git -C "$REPO_ROOT" add -A
+        git -C "$REPO_ROOT" commit --quiet -m "$msg"
+    fi
+
+    if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        if ! git -C "$REPO_ROOT" rebase --quiet "origin/$branch"; then
+            echo "[pins-fix] FATAL: rebase onto origin/$branch failed in $REPO_ROOT" >&2
+            git -C "$REPO_ROOT" rebase --abort 2>/dev/null || true
+            exit 1
+        fi
+    fi
+
+    local ahead
+    ahead="$(git -C "$REPO_ROOT" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
+    if [[ "$ahead" -gt 0 ]]; then
+        echo "[pins-fix]   pushing $ahead openivm-spark commit(s) to origin/$branch"
+        if ! git -C "$REPO_ROOT" push --quiet origin "$branch"; then
+            echo "[pins-fix] FATAL: 'git push origin $branch' failed in $REPO_ROOT" >&2
+            exit 1
+        fi
+    else
+        echo "[pins-fix]   openivm-spark already at origin/$branch (no commits to push)"
+    fi
+}
+
+# Commit working-tree changes across openivm-spark + .temp/{openivm,lpts,
+# ivm-bench}, push them to origin (refusing main/master), then rewrite
+# pins.env + the ivm-bench Dockerfile so the next pins-sync reports ✓ green.
+#
+# Ordering rationale (see _pins_fix_is_benign_lag for the invariant):
+#   1. Push .temp/openivm + .temp/lpts → capture new HEADs.
+#   2. Bake those HEADs into pins.env (OPENIVM_COMMIT, LPTS_COMMIT).
+#   3. Bake those HEADs + current openivm-spark branch into the Dockerfile
+#      (OPENIVM_*/LPTS_*/OPENIVM_SPARK_BRANCH). NOT OPENIVM_SPARK_COMMIT yet.
+#   4. First openivm-spark push: bundles user dirty changes + pins.env
+#      OPENIVM/LPTS bumps → new spark HEAD C.
+#   5. Bake C into the Dockerfile (OPENIVM_SPARK_COMMIT, both stages) ONLY if
+#      the current Dockerfile value is NOT already a benign-lag ancestor of
+#      C — otherwise we'd churn the world on every pins-fix invocation.
+#   6. Push .temp/ivm-bench (carries the Dockerfile edits) → new bench HEAD D.
+#   7. Update pins.env IVM_BENCH_COMMIT=D.
+#   8. SECOND openivm-spark push, path-restricted to spark-ext/dev/pins.env so
+#      origin lags Dockerfile OPENIVM_SPARK_COMMIT by exactly one
+#      pins.env-only commit → benign lag ✓.
+#   9. Run pins-sync to validate.
+#
+# Idempotency: when invoked on an already-aligned tree, every phase becomes a
+# no-op (no commits, no pushes, no file writes) and the final pins-sync just
+# re-prints the same ✓ green report.
+cmd_pins_fix() {
+    local temp_dir="$REPO_ROOT/.temp"
+    local dockerfile="$temp_dir/ivm-bench/src/containers/spark-openivm-build/Dockerfile"
+
+    echo "[pins-fix] ── pre-flight ──"
+
+    # All three .temp/* must already be git checkouts on their pinned branches.
+    local entries=(
+        "openivm|OPENIVM_REPO|OPENIVM_BRANCH|OPENIVM_COMMIT"
+        "lpts|LPTS_REPO|LPTS_BRANCH|LPTS_COMMIT"
+        "ivm-bench|IVM_BENCH_REPO|IVM_BENCH_BRANCH|IVM_BENCH_COMMIT"
+    )
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r name _repo_var branch_var _commit_var <<< "$entry"
+        local dest="$temp_dir/$name"
+        local pinned_branch="${!branch_var}"
+        if [[ ! -d "$dest/.git" ]]; then
+            echo "[pins-fix] FATAL: $dest is not a git checkout — run pins-sync first to clone it" >&2
+            exit 1
+        fi
+        local actual_branch
+        actual_branch="$(_pins_fix_assert_safe_branch "$dest")"
+        if [[ "$actual_branch" != "$pinned_branch" ]]; then
+            echo "[pins-fix] FATAL: .temp/$name is on '$actual_branch', expected '$pinned_branch' (per pins.env) — run pins-sync first" >&2
+            exit 1
+        fi
+        echo "[pins-fix]   ✓ .temp/$name on '$actual_branch'"
+    done
+
+    # And openivm-spark itself must be on a non-default branch.
+    local spark_branch
+    spark_branch="$(_pins_fix_assert_safe_branch "$REPO_ROOT")"
+    echo "[pins-fix]   ✓ openivm-spark on '$spark_branch'"
+
+    if [[ ! -f "$dockerfile" ]]; then
+        echo "[pins-fix] FATAL: ivm-bench Dockerfile not found at $dockerfile" >&2
+        exit 1
+    fi
+
+    # ── Phase 1+2: push .temp/openivm + .temp/lpts, capture new HEADs ──
+    declare -A new_head
+    for entry in "openivm|OPENIVM_REPO|OPENIVM_BRANCH|OPENIVM_COMMIT" \
+                 "lpts|LPTS_REPO|LPTS_BRANCH|LPTS_COMMIT"; do
+        IFS='|' read -r name _ branch_var _ <<< "$entry"
+        local branch="${!branch_var}"
+        local dest="$temp_dir/$name"
+        echo
+        echo "[pins-fix] ── .temp/$name ──"
+        _pins_fix_push_dep "$dest" "$branch" "chore(pins-fix): snapshot working tree"
+        new_head[$name]="$(git -C "$dest" rev-parse HEAD)"
+        echo "[pins-fix]   HEAD = ${new_head[$name]}"
+    done
+
+    # ── Phase 3: bake openivm + lpts HEADs into pins.env ──
+    echo
+    echo "[pins-fix] ── pins.env (openivm + lpts) ──"
+    _pins_env_set OPENIVM_COMMIT "${new_head[openivm]}"
+    _pins_env_set LPTS_COMMIT    "${new_head[lpts]}"
+
+    # ── Phase 3b: bake openivm/lpts pins + current spark branch into Dockerfile ──
+    echo
+    echo "[pins-fix] ── ivm-bench Dockerfile (openivm/lpts + OPENIVM_SPARK_BRANCH) ──"
+    _dockerfile_arg_set "$dockerfile" OPENIVM_REPO        "$OPENIVM_REPO"
+    _dockerfile_arg_set "$dockerfile" OPENIVM_BRANCH      "$OPENIVM_BRANCH"
+    _dockerfile_arg_set "$dockerfile" OPENIVM_COMMIT      "${new_head[openivm]}"
+    _dockerfile_arg_set "$dockerfile" LPTS_REPO           "$LPTS_REPO"
+    _dockerfile_arg_set "$dockerfile" LPTS_BRANCH         "$LPTS_BRANCH"
+    _dockerfile_arg_set "$dockerfile" LPTS_COMMIT         "${new_head[lpts]}"
+    _dockerfile_arg_set "$dockerfile" OPENIVM_SPARK_BRANCH "$spark_branch"
+
+    # ── Phase 4: first openivm-spark push (bundles user work + pins.env bumps) ──
+    echo
+    echo "[pins-fix] ── openivm-spark (first push: user work + pins.env bumps) ──"
+    _pins_fix_commit_all_and_push "$spark_branch" "chore(pins-fix): snapshot openivm-spark working tree + bump OPENIVM/LPTS pins"
+    local spark_first_head
+    spark_first_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    echo "[pins-fix]   openivm-spark HEAD = $spark_first_head"
+
+    # ── Phase 5: bake spark_first_head into Dockerfile OPENIVM_SPARK_COMMIT ──
+    # Skip when the current Dockerfile value is already a benign-lag ancestor
+    # of spark_first_head — otherwise repeated pins-fix runs would churn the
+    # Dockerfile + ivm-bench + pins.env forever.
+    echo
+    echo "[pins-fix] ── ivm-bench Dockerfile (OPENIVM_SPARK_COMMIT) ──"
+    local current_dockerfile_spark
+    current_dockerfile_spark="$(dockerfile_arg_default "$dockerfile" OPENIVM_SPARK_COMMIT)"
+    if [[ "$current_dockerfile_spark" == "$spark_first_head" ]]; then
+        echo "[pins-fix]   Dockerfile OPENIVM_SPARK_COMMIT already = $spark_first_head"
+    elif _pins_fix_is_benign_lag "$current_dockerfile_spark" "$spark_first_head"; then
+        echo "[pins-fix]   Dockerfile OPENIVM_SPARK_COMMIT ($current_dockerfile_spark)"
+        echo "[pins-fix]     is a benign-lag ancestor of $spark_first_head — leaving unchanged"
+    else
+        _dockerfile_arg_set "$dockerfile" OPENIVM_SPARK_COMMIT "$spark_first_head"
+    fi
+
+    # ── Phase 6: push .temp/ivm-bench (carries Dockerfile edits) ──
+    echo
+    echo "[pins-fix] ── .temp/ivm-bench ──"
+    _pins_fix_push_dep "$temp_dir/ivm-bench" "$IVM_BENCH_BRANCH" "chore(pins-fix): sync openivm-spark + deps"
+    local bench_head
+    bench_head="$(git -C "$temp_dir/ivm-bench" rev-parse HEAD)"
+    echo "[pins-fix]   .temp/ivm-bench HEAD = $bench_head"
+
+    # ── Phase 7: bake bench_head into pins.env IVM_BENCH_COMMIT ──
+    echo
+    echo "[pins-fix] ── pins.env (ivm-bench) ──"
+    _pins_env_set IVM_BENCH_COMMIT "$bench_head"
+
+    # ── Phase 8: second openivm-spark push — path-restricted to pins.env ──
+    # The restriction is what preserves the benign-lag guarantee: any other
+    # dirty file slipping into this commit would make Dockerfile
+    # OPENIVM_SPARK_COMMIT lag origin by a non-pins.env diff, and pins-sync
+    # would report drift.
+    echo
+    echo "[pins-fix] ── openivm-spark (second push: pins.env IVM_BENCH_COMMIT bump) ──"
+    _pins_fix_commit_paths_and_push "$spark_branch" \
+        "chore(pins-fix): bump IVM_BENCH_COMMIT to $bench_head" \
+        "spark-ext/dev/pins.env"
+
+    # ── Phase 9: re-source pins.env (in-memory vars are stale) and validate ──
+    # shellcheck disable=SC1090
+    set -a
+    source "$PINS_FILE"
+    set +a
+
+    echo
+    echo "[pins-fix] ── validating with pins-sync ──"
+    cmd_pins_sync
+}
+
 cmd_test() {
     pre_clean_if_requested
     setup_test_log_dir
@@ -572,6 +938,7 @@ case "$cmd" in
     image-build|image_build) cmd_image_build "$@" ;;
     openivm-test|openivm_test) cmd_openivm_test "$@" ;;
     pins-sync|pins_sync)     cmd_pins_sync "$@" ;;
+    pins-fix|pins_fix)       cmd_pins_fix "$@" ;;
     dev-build|dev_build)     cmd_dev_build "$@" ;;
     help|-h|--help)          usage ;;
     *)
