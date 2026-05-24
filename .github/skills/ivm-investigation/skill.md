@@ -430,6 +430,11 @@ if DuckDB-OpenIVM can do better. If any MV with `refresh_type_name='FULL_REFRESH
 with a gameplan on how to improve the openivm-spark + openivm + lpts changes to incrementalize it.
 
 > If you find that any query is also full refreshing in DuckDB, then leave it.
+>
+> If you find DuckDB OpenIVM **is** incrementalizing, **STUDY LOCALLY THE SOURCE CODE DEEPLY FOR `openivm` and `lpts`
+> VS `openivm-spark` - throw **AS MANY SUBAGENTS AS NECESSARY** to build a robust understanding of the problem,
+> and **LEAVE NO STONE UNTURNED** to improve openivm-spark. You can be **AS AMBITIOUS** and take **AS MUCH TIME** as
+> necessary by throwing subagents at the problem.
 
 ---
 
