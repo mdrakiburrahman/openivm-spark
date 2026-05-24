@@ -1539,7 +1539,7 @@ sequenceDiagram
     Spark->>MV: no MV write yet
     Test->>Spark: seed INSERT INTO aggsum_nullable_grp
     Spark->>Rule: analyzed DML
-    Rule-->>Spark: no tracked MV yet; normal Delta write
+    Rule-->>Spark: no tracked MV yet, normal Delta write
     Spark->>StageCat: no staging row
     Test->>Spark: CREATE MATERIALIZED VIEW aggsum_mv_null_grp AS SELECT grp, SUM(val) ... GROUP BY grp
     Spark->>Parser: parse CREATE MATERIALIZED VIEW

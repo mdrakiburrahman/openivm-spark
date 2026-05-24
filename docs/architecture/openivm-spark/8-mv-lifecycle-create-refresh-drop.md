@@ -305,7 +305,7 @@ sequenceDiagram
     participant Stage as StagingCatalog/RocksDB
     participant Log as log/telemetry
     Caller->>Cmd: CREATE MATERIALIZED VIEW db.v AS SELECT ...
-    Cmd->>MvCat: ensureTables(); lookup(db.v)
+    Cmd->>MvCat: ensureTables(), lookup(db.v)
     Cmd->>Stage: ensureTables()
     Cmd->>Spark: analyze originalQueryText
     Spark-->>Cmd: source names, schemas, group keys, HAVING shape
@@ -316,7 +316,7 @@ sequenceDiagram
         Cmd->>Log: compiled/effective refresh type and cascade flag
     else OpenIvmCompileException
         Compiler--xCmd: compile failure
-        Cmd->>Log: compile_failed; demote to FULL_REFRESH
+        Cmd->>Log: compile_failed, demote to FULL_REFRESH
         Cmd->>Cmd: synthesize FULL_REFRESH CompiledRefresh placeholder
     end
     Cmd->>Stage: currentWatermarks(sources)
