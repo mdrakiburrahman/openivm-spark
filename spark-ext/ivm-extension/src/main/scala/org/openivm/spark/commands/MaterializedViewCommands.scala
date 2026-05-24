@@ -1030,9 +1030,17 @@ case class RefreshMaterializedViewCommand(
         // is set, without polluting the default INFO output.
         rewritten.statements.zipWithIndex.foreach { case (stmt, i) =>
           val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+          val limit =
+            try {
+              sys.env
+                .get("OPENIVM_LOG_SQL_LIMIT")
+                .orElse(sys.props.get("openivm.log.sql.limit"))
+                .map(_.toInt)
+                .getOrElse(4000)
+            } catch { case _: Throwable => 4000 }
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' stmt[$i]=" +
-              sql.replace('\n', ' ').take(4000)
+              sql.replace('\n', ' ').take(limit)
           )
         }
         def executeSql(sql: String): Unit =
