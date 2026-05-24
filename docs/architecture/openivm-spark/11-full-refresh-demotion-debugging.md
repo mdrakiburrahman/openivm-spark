@@ -143,7 +143,7 @@ persisted field, the value that should be stored in `MvMetadata.demotionReason`.
 |---|---|---|
 | `top_k` | Top-level `ORDER BY`, `LIMIT`, `OFFSET`, or `TAIL` wrapper is present. Spark does not maintain the OpenIVM inner-table + outer-view split for top-k in this code path. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:183-206`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-599` |
 | `simple_projection_no_apply` | OpenIVM classified `SIMPLE_PROJECTION`, but Spark's rewrite probe did not produce a data-table apply statement after the view-delta statement. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:429-451`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-600` |
-| `non_cascade_upstream:<detail>` | A source table is itself an MV whose persisted instance cannot emit a downstream-consumable `MV_VIEW_DELTA`, or the downstream/simple-projection cascade shape is known unsafe. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:516-559`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:601-602` |
+| `non_cascade_upstream:<detail>` | A source table is itself an MV whose persisted instance cannot emit a downstream-consumable `MV_VIEW_DELTA`. The only sub-tag emitted today is `non_cascade:<upstream>` (upstream MV is `FULL_REFRESH` or otherwise not cascade-capable). | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:516-559`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:601-602` |
 | `window_initial_load_mismatch` | OpenIVM classified `WINDOW_PARTITION`, but Spark-translated initial-load SQL is not bag-equal to the user query on current data. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:395-407`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:603-604` |
 | `having_pred_empty` | OpenIVM classified `AGGREGATE_HAVING`, but Spark could not extract the HAVING predicate from the analyzed `Filter(cond, Aggregate)` shape. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:245-277`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:512-515`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:609-610` |
 | `having_pred_hidden_agg` | HAVING references an aggregate or synthetic analyzer attribute that is not materialized as a data-table column. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:279-288`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:410-427`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:611-615` |
@@ -328,11 +328,22 @@ Recovery:
 - Keep the downstream full-refresh if the upstream MV is cheap to scan.
 - Or change the upstream MV into a cascade-capable shape.
 - Or add Spark-side support for the missing upstream view-delta companion.
-- For `aggregate_group_into_simple_projection`, fix the downstream projection
-  delete semantics so key-only NULL retracts from the upstream aggregate can be
-  matched safely.
-- For `multi_mv_simple_projection`, teach the rewriter to consume more than one
-  upstream MV delta term in one refresh.
+
+Note: two earlier sub-tags of `non_cascade_upstream` —
+`aggregate_group_into_simple_projection` and `multi_mv_simple_projection` — were
+removed. Multi-source SIMPLE_PROJECTION cascade is now supported (openivm emits
+one `INSERT INTO openivm_delta_<view>` UNION-ALL-ing all upstream delta arms;
+the Spark rewriter handles every `memory.main.openivm_delta_<src>` reference
+regardless of source count). The AGGREGATE_GROUP→SIMPLE_PROJECTION cascade
+follows duckdb-openivm's positive-only bag-apply contract: negative-multiplicity
+retracts from the upstream's NULL-companion (`openivm/src/upsert/refresh_sql.cpp:898-960`)
+are dropped at the downstream join filter (`BETWEEN` over NULL → UNKNOWN). At
+scales where upstream dim deltas remain empty across batches — the canonical
+TPC-DI 100/1/1 layout — Spark and DuckDB agree at every batch boundary. At
+larger scales where dimension SCD-2 retracts manifest, both engines exhibit the
+drift documented in `.scratch/OPENIVM_VALIDATE.md` — Failure Mode 1, and the
+fix lives in openivm itself (emit pre-merge snapshot retracts instead of
+NULL-companion).
 
 ### 3.4 `window_initial_load_mismatch`
 

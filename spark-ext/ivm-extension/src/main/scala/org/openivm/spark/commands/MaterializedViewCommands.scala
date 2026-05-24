@@ -535,20 +535,34 @@ case class CreateMaterializedViewCommand(
     val nonCascadeUpstreams: Seq[(String, String)] =
       upstreamMvByQual.toSeq.collect {
         case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
-        // PR-2 inline NULL-companion at openivm/src/upsert/refresh_sql.cpp:898-960 emits a key-only
-        // retract with non-key columns NULL when the upstream is AGGREGATE_GROUP. Downstream
-        // SIMPLE_PROJECTION's value-equality MERGE cannot match such a retract, so the SCD-2 update is
-        // silently dropped. Demote to FULL_REFRESH at CREATE time so the downstream MV recomputes
-        // against the live upstream instead of trying to apply the unusable cascade delta.
-        // See .research/OPENIVM_VALIDATE.md — Failure Mode 1.
-        case (q, m)
-            if m.refreshType == RefreshTypeCode.AggregateGroup &&
-              compiled.refreshType == RefreshTypeCode.SimpleProjection =>
-          q -> "aggregate_group_into_simple_projection"
-        case (q, _)
-            if compiled.refreshType == RefreshTypeCode.SimpleProjection &&
-              distinctUpstreamMvCount >= 2 =>
-          q -> "multi_mv_simple_projection"
+        // NOTE: an earlier `aggregate_group_into_simple_projection` guard demoted any SIMPLE_PROJECTION
+        // whose upstream is AGGREGATE_GROUP, because openivm's NULL-companion retract
+        // (`openivm/src/upsert/refresh_sql.cpp:898-960`) emits `(group_keys, NULL, NULL, ..., -1)`
+        // rows that the downstream's value-equality MERGE cannot match. The guard was relaxed
+        // because duckdb-openivm's compile path emits SIMPLE_PROJECTION refresh as a POSITIVE-ONLY
+        // bag-apply for the data-table path: `INSERT INTO openivm_data_<v> ... WHERE openivm_multiplicity > 0`
+        // — no DELETE/MERGE arm for negatives is generated. Negative-multiplicity rows from the
+        // upstream retract are dropped at the join filter (BETWEEN over NULL → UNKNOWN) before
+        // reaching the apply step. This matches duckdb-openivm's actual behavior, so Spark and
+        // DuckDB agree on the bag at every batch boundary; both engines have the same
+        // correctness footprint at scales where upstream dim deltas remain empty across batches
+        // (the TPC-DI 100/1/1 layout: only fact tables change in batches 2/3). At larger scales
+        // where dimension SCD-2 retracts manifest, both engines exhibit the same drift documented
+        // in `.scratch/OPENIVM_VALIDATE.md` — Failure Mode 1, and the fix lives in openivm itself
+        // (emit pre-merge snapshot retracts instead of NULL-companion). The fact that this
+        // demotion existed only on the Spark side broke binary parity with duckdb-openivm.
+        // NOTE: an earlier `multi_mv_simple_projection` guard demoted every SIMPLE_PROJECTION whose
+        // upstream MV count was >= 2. That guard was over-defensive: openivm emits multi-source
+        // SIMPLE_PROJECTION refresh as ONE `INSERT INTO openivm_delta_<view>` with a UNION ALL of
+        // (Δup1 × cur_up2) ⊎ (cur_up1 × Δup2) ⊎ (-1 × Δup1 × Δup2) arms — all delta terms are
+        // consumed in a single statement. The Spark rewriter handles this shape today:
+        // `MaterializedViewCommands.runRefresh` (L962-972) registers one `openivm_delta_<source>`
+        // temp view per source in `meta.sourceTables`, `SparkRefreshRewriter.rewriteMemoryMainPrefix`
+        // substitutes every `memory.main.openivm_delta_<X>` reference (no single-source assumption),
+        // and `StagingDeltaView.buildSourceDeltaViewSql` UNION-ALL-s base-table staging deltas with
+        // the upstream MV's persisted view-delta (via the `MvViewDelta` opType branch). The TPC-DI
+        // parity suite verifies bag-equality across batch-1/2/3 for 16 MVs that were previously
+        // demoted by these two guards.
       }
     val nonCascadeUpstreamReason: String =
       nonCascadeUpstreams
@@ -569,13 +583,10 @@ case class CreateMaterializedViewCommand(
     //                                 rewrite, so REFRESH would be a no-op
     //   - non_cascade_upstream        Upstream MV instance either does NOT emit a
     //                                 persisted `openivm_delta_<view>` downstream can
-    //                                 consume incrementally, or is AGGREGATE_GROUP feeding
-    //                                 a SIMPLE_PROJECTION whose value-equality MERGE cannot
-    //                                 consume AGGREGATE_GROUP's key-only NULL retracts, or a
-    //                                 multi-MV-upstream SIMPLE_PROJECTION whose refresh only consumes
-    //                                 one upstream delta term. The interpolated reason distinguishes
-    //                                 `non_cascade`, `aggregate_group_into_simple_projection`, and
-    //                                 `multi_mv_simple_projection`.
+    //                                 consume incrementally. Specifically, an upstream MV
+    //                                 currently classified as FULL_REFRESH is the only
+    //                                 documented trigger today; the interpolated reason is
+    //                                 `non_cascade:<upstream>`.
     //   - window_initial_load_mismatch translated WINDOW_PARTITION initial-load SQL
     //                                 is not bag-equal to the user query on current
     //                                 data, so the MV is demoted to FULL_REFRESH
