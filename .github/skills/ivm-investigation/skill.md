@@ -422,7 +422,7 @@ If validation is included in the batch duration on this branch, flag
 it as R6 in the report and recommend a perf-only re-run with
 `OPENIVM_VALIDATE=0` to confirm IVM ratios before bucketing.
 
-### `FULL_REFRESH` must be eliminated reliably
+### `FULL_REFRESH` must be eliminated reliably despite the coding cost to get there
 
 Under `spark-ext/ivm-it/src/test/resources/tpcdi/classifications.tsv` you will find
 a few `FULL_REFRESH` due to limitations in the IVM engine. This is unacceptable, specially
