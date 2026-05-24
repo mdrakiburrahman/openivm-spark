@@ -422,6 +422,15 @@ If validation is included in the batch duration on this branch, flag
 it as R6 in the report and recommend a perf-only re-run with
 `OPENIVM_VALIDATE=0` to confirm IVM ratios before bucketing.
 
+### `FULL_REFRESH` must be eliminated reliably
+
+Under `spark-ext/ivm-it/src/test/resources/tpcdi/classifications.tsv` you will find
+a few `FULL_REFRESH` due to limitations in the IVM engine. This is unacceptable, specially
+if DuckDB-OpenIVM can do better. If any MV with `refresh_type_name='FULL_REFRESH'`, come up
+with a gameplan on how to improve the openivm-spark + openivm + lpts changes to incrementalize it.
+
+> If you find that any query is also full refreshing in DuckDB, then leave it.
+
 ---
 
 ## PHASE 5 — Observability patches (only if needed)
