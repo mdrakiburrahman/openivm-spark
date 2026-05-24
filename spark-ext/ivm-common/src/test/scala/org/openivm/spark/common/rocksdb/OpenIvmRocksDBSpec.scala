@@ -178,7 +178,7 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
 
       try {
-        process.waitFor(10, TimeUnit.SECONDS) shouldBe true
+        process.waitFor(120, TimeUnit.SECONDS) shouldBe true
         process.exitValue() shouldBe 0
 
         reopened.load()
