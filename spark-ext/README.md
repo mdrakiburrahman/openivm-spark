@@ -53,6 +53,7 @@ following subcommands:
 ```bash
 ./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
 ./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench}, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
+./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
 ./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
@@ -78,6 +79,19 @@ defaults and `pins.env` — is reported as a `⚠ WARNING` but does not block
 `verify`. Bumping any pinned SHA therefore requires editing **both**
 `spark-ext/dev/pins.env` **and** the matching `ARG` in
 `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile`.
+
+`pins-fix` automates that bump end-to-end. Given any combination of
+uncommitted changes across `openivm-spark` and `.temp/{openivm,lpts,
+ivm-bench}`, it commits each working tree, pushes to `origin/<branch>`
+(refusing `main` / `master` / detached HEAD in any of the four repos, and
+aborting on rebase conflicts), then deterministically rewrites
+`spark-ext/dev/pins.env` and the `ivm-bench` Dockerfile `ARG` defaults so the
+next `pins-sync` reports `✓` green. The ordering is designed around the
+chicken-and-egg where bumping `IVM_BENCH_COMMIT` advances `openivm-spark`
+origin past whatever was just baked into Dockerfile `OPENIVM_SPARK_COMMIT`:
+the final pin lags by exactly one commit whose only diff is `pins.env`,
+which `pins-sync` accepts as a "benign lag". The command is idempotent —
+running it on an already-aligned tree is a no-op.
 
 ### Environment variables
 
