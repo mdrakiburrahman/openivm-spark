@@ -26,7 +26,7 @@ import org.openivm.spark.common._
 import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
-import java.util.Collections
+import java.util.{Collections, UUID}
 
 // ---------------------------------------------------------------------------
 // Compiler singleton — one OpenIvmCompiler per SparkSession, lazily created.
@@ -1272,21 +1272,39 @@ case class RefreshMaterializedViewCommand(
       .map { case (t, pairs) => t -> pairs.map(_._2) }
     StagingCatalog.pruneFullyConsumed(spark, viewsByTable)
 
-    // MV-over-MV cascade trigger removed: the previous implementation
-    // synthesised a `<location>/_trigger/<uuid>` sentinel path and
-    // recorded it as an Overwrite-typed staging entry so downstream MVs
-    // could detect upstream non-incremental refreshes. Downstream
-    // consumption then crashed with `[DELTA_INVALID_PARTITION_PATH]
-    // _trigger/<uuid>` because `StagingDeltaView.buildSourceDeltaViewSql`
-    // treats Overwrite entries as Delta paths to scan.
-    //
-    // Correct cascade for non-cascade-capable upstreams is already
-    // enforced at CREATE time (`nonCascadeUpstreams.nonEmpty` ⇒
-    // `effectiveRefreshType = FullRefresh`, see
-    // `CreateMaterializedViewCommand`). Downstream MVs whose upstream
-    // is non-cascade are therefore re-routed through `BuildFullRefresh`,
-    // which reads the live source on every REFRESH and is correct by
-    // construction. No additional run-time trigger is needed.
+    if (!meta.emitsCascadeViewDelta) {
+      val upstreamShortName = name.identifier
+      val downstreamSourceKeys = allMvs
+        .filterNot(m => metaName(m.name) == viewNameStr)
+        .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
+        .distinct
+
+      if (downstreamSourceKeys.nonEmpty) {
+        val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
+        val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
+        spark
+          .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
+          .write
+          .format("delta")
+          .mode("overwrite")
+          .save(triggerPath)
+
+        val txnTs = new Timestamp(System.currentTimeMillis())
+        downstreamSourceKeys.foreach { sourceKey =>
+          StagingCatalog.record(
+            spark,
+            StagingDelta(
+              baseTable = sourceKey,
+              opType = StagingDelta.OpTypes.Overwrite,
+              stagingPath = triggerPath,
+              txnTs = txnTs,
+              consumedBy = Seq.empty
+            )
+          )
+        }
+      }
+    }
   }
 
   /** True for refresh types whose openivm-emitted MERGE preserves rows whose
