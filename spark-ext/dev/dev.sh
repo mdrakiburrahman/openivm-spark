@@ -252,6 +252,18 @@ cmd_pins_sync() {
                     fi
                 fi
             fi
+
+            # Fast-forward the local branch to origin/<branch> so we iterate
+            # on the latest code rather than a stale local snapshot. Use
+            # --ff-only to surface any divergence (e.g. local commits or a
+            # dirty working tree blocking the merge) as a hard error rather
+            # than silently leaving HEAD behind origin.
+            echo "[pins-sync]   pulling origin/$branch (ff-only) ..."
+            if ! git -C "$dest" pull --ff-only --quiet origin "$branch"; then
+                echo "[pins-sync] FATAL: 'git pull --ff-only origin $branch' failed in .temp/$name" >&2
+                echo "[pins-sync]        local branch has diverged or working tree is dirty." >&2
+                exit 1
+            fi
         fi
 
         local head
