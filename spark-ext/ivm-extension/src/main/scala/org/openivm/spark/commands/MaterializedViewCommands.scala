@@ -980,6 +980,30 @@ case class RefreshMaterializedViewCommand(
         val viewSql     = StagingDeltaView.buildSourceDeltaViewSql(qualTable, schema, tableDeltas)
         spark.sql(viewSql)
         tempViewShortNames += qualTable.split("\\.").last
+
+        if (diagnosticsEnabled) {
+          val short = qualTable.split("\\.").last
+          try {
+            val counts = spark
+              .sql(s"""SELECT
+                      |  COUNT(*) AS total,
+                      |  COUNT(CASE WHEN `openivm_multiplicity` > 0 THEN 1 END) AS pos,
+                      |  COUNT(CASE WHEN `openivm_multiplicity` < 0 THEN 1 END) AS neg
+                      |FROM `openivm_delta_$short`""".stripMargin)
+              .head()
+            logInfo(
+              s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
+                s"deltas=${tableDeltas.size} total=${counts.getLong(0)} " +
+                s"pos=${counts.getLong(1)} neg=${counts.getLong(2)}"
+            )
+          } catch {
+            case t: Throwable =>
+              logInfo(
+                s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
+                  s"error='${t.getClass.getSimpleName}: ${t.getMessage}'"
+              )
+          }
+        }
       }
 
       // For AGGREGATE_HAVING the user-facing object is a Spark VIEW; the actual
@@ -1048,6 +1072,7 @@ case class RefreshMaterializedViewCommand(
 
         if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
           executeSql(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head))
+          logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
 
           val usesValueEqualityDeleteMerge =
             rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
@@ -1093,7 +1118,7 @@ case class RefreshMaterializedViewCommand(
             }
           }
         } else {
-          rewritten.statements.foreach { stmt =>
+          rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
             val skipDeleteMerge =
               SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
@@ -1105,6 +1130,12 @@ case class RefreshMaterializedViewCommand(
               )
             } else {
               executeSql(sql)
+              // After any CTAS that wrote to the view-delta path, log a diagnostic
+              // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
+              // rows. Gated by OPENIVM_REFRESH_DIAGNOSTICS=1.
+              if (diagnosticsEnabled && sql.contains(s"`$viewDeltaPath`")) {
+                logViewDeltaDiagnostics(spark, name, viewDeltaPath, idx)
+              }
             }
           }
         }
@@ -1210,6 +1241,73 @@ case class RefreshMaterializedViewCommand(
       )
       .head(1)
       .nonEmpty
+  }
+
+  /** Diagnostic gated by OPENIVM_REFRESH_DIAGNOSTICS=1 or
+    * -Dopenivm.refresh.diagnostics=1. After the view-delta CTAS, log row counts
+    * by multiplicity sign + a small sample of rows. Useful when CI surfaces a
+    * downstream MV miss and we need to know whether the row is present in the
+    * upstream cascade-delta vs dropped by the downstream's inclusion-exclusion
+    * CTAS.
+    */
+  private def diagnosticsEnabled: Boolean = {
+    try {
+      val raw = sys.env
+        .get("OPENIVM_REFRESH_DIAGNOSTICS")
+        .orElse(sys.props.get("openivm.refresh.diagnostics"))
+        .getOrElse("0")
+      raw.trim == "1" || raw.trim.equalsIgnoreCase("true")
+    } catch { case _: Throwable => false }
+  }
+
+  private def logViewDeltaDiagnostics(
+      spark: SparkSession,
+      viewName: TableIdentifier,
+      viewDeltaPath: String,
+      stmtIdx: Int
+  ): Unit = {
+    if (!diagnosticsEnabled) return
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val viewId      = MvCommandHelper.sqlIdent(viewName)
+    try {
+      // Row counts by multiplicity sign.
+      val counts = spark
+        .sql(
+          s"""SELECT
+             |  COUNT(*) AS total,
+             |  COUNT(CASE WHEN `openivm_multiplicity` > 0 THEN 1 END) AS pos,
+             |  COUNT(CASE WHEN `openivm_multiplicity` < 0 THEN 1 END) AS neg,
+             |  COUNT(CASE WHEN `openivm_multiplicity` = 0 THEN 1 END) AS zero
+             |FROM delta.`$escapedPath`""".stripMargin
+        )
+        .head()
+      logInfo(
+        s"[openivm-mv-diag] refresh view='$viewId' stmt[$stmtIdx]_view_delta " +
+          s"path='$viewDeltaPath' total=${counts.getLong(0)} pos=${counts.getLong(1)} " +
+          s"neg=${counts.getLong(2)} zero=${counts.getLong(3)}"
+      )
+      // Sample the first 8 rows as JSON (avoids depending on the view's column shape).
+      val sample = spark
+        .sql(
+          s"""SELECT to_json(struct(*)) AS row_json
+             |FROM delta.`$escapedPath`
+             |LIMIT 8""".stripMargin
+        )
+        .collect()
+        .map(_.getString(0))
+      sample.zipWithIndex.foreach { case (json, idx) =>
+        logInfo(
+          s"[openivm-mv-diag] refresh view='$viewId' stmt[$stmtIdx]_view_delta " +
+            s"sample[$idx]=$json"
+        )
+      }
+    } catch {
+      case t: Throwable =>
+        logInfo(
+          s"[openivm-mv-diag] refresh view='$viewId' stmt[$stmtIdx]_view_delta " +
+            s"error='${t.getClass.getSimpleName}: ${t.getMessage}'"
+        )
+    }
   }
 
   private def simpleProjectionUserCols(spark: SparkSession, targetId: TableIdentifier): Seq[String] =

@@ -224,4 +224,136 @@ class ChainedMinMaxJoinSpec extends AnyFunSpec with Matchers with BeforeAndAfter
       )
     }
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // (3) TPC-DI fact_watches shape (3-way JOIN, dim is itself an SCD2 MV that
+  //     mutates in the same batch). Mirrors the actual failing CI shape:
+  //
+  //     events_hist (DML)
+  //        └── upstream (AGGREGATE_GROUP, MIN/MAX over conditional-NULL)
+  //                                           │
+  //     customers_raw (DML)                   │
+  //        └── dim (WINDOW_PARTITION SCD2)    │
+  //                                           ▼
+  //                              downstream (SIMPLE_PROJECTION, 2-way JOIN
+  //                                          with BETWEEN on dim.eff/end)
+  //
+  //   Both the upstream MV (silver.watches-equivalent) AND the SCD2 dim MV
+  //   (dim_customer-equivalent) emit a cascade-delta in batch 2, exercising
+  //   the multi-delta IVM rule on the downstream. Two scenarios:
+  //
+  //     (a) Update: existing customer's watch UPDATE (ACTV→CNCL) +
+  //         dim_customer SCD2 update for the same customer.
+  //     (b) Insert: brand-new customer (no prior dim row) with first ACTV.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe("(3) Multi-delta cascade: upstream AGGREGATE_GROUP + SCD2 dim MV") {
+
+    it("downstream insert-miss / update-miss when both upstream and dim emit cascade-deltas") {
+      // ── Source tables (DML targets). `cmmj3_events` mirrors silver.watches's
+      // source (watches_history); `cmmj3_customers_raw` mirrors silver.customers.
+      spark.sql(
+        "CREATE TABLE IF NOT EXISTS cmmj3_events(k INT, p TIMESTAMP, r TIMESTAMP) USING DELTA"
+      )
+      spark.sql(
+        "CREATE TABLE IF NOT EXISTS cmmj3_customers_raw(k INT, name STRING, eff TIMESTAMP) USING DELTA"
+      )
+
+      // ── Upstream MV: AGGREGATE_GROUP with MIN/MAX (silver.watches shape).
+      spark.sql(
+        "CREATE MATERIALIZED VIEW cmmj3_upstream AS " +
+          "SELECT k, MIN(p) AS placed, MAX(r) AS removed FROM cmmj3_events GROUP BY k"
+      )
+
+      // ── SCD2 dim MV (dim_customer-equivalent). WINDOW_PARTITION with
+      // ROW_NUMBER (synthetic surrogate key) + LEAD on `eff` to derive
+      // `end` from the next version's effective_timestamp.  Matches the
+      // TPC-DI dim_customer compile path (WINDOW_PARTITION RefreshType=5).
+      spark.sql(
+        "CREATE MATERIALIZED VIEW cmmj3_dim AS " +
+          "SELECT k, name, eff, " +
+          "COALESCE(LEAD(eff) OVER (PARTITION BY k ORDER BY eff) - INTERVAL 1 SECOND, " +
+          "         TIMESTAMP '9999-12-31 00:00:00') AS endts " +
+          "FROM cmmj3_customers_raw"
+      )
+
+      // ── Downstream MV: SIMPLE_PROJECTION 2-way JOIN with SCD2 BETWEEN.
+      spark.sql(
+        "CREATE MATERIALIZED VIEW cmmj3_downstream AS " +
+          "SELECT u.k AS k, u.placed AS placed, u.removed AS removed " +
+          "FROM cmmj3_upstream u " +
+          "JOIN cmmj3_dim d ON u.k = d.k AND u.placed BETWEEN d.eff AND d.endts"
+      )
+
+      // ── Batch 1: customer A's first ACTV + initial customer registration.
+      // Layout:
+      //   customer k=1 ("alice"): registered 2000-01-01; ACTV watch on 2016-03-22
+      //   (Both will get a batch-2 mutation to reproduce the failing CI case.)
+      spark.sql(
+        "INSERT INTO cmmj3_events VALUES " +
+          "(1, TIMESTAMP '2016-03-22 00:00:00', NULL)"
+      )
+      spark.sql(
+        "INSERT INTO cmmj3_customers_raw VALUES " +
+          "(1, 'alice', TIMESTAMP '2000-01-01 00:00:00')"
+      )
+      refreshChain("cmmj3_upstream", "cmmj3_dim", "cmmj3_downstream")
+
+      assertMvCorrect(
+        "cmmj3_downstream",
+        "SELECT u.k AS k, u.placed AS placed, u.removed AS removed " +
+          "FROM (SELECT k, MIN(p) AS placed, MAX(r) AS removed FROM cmmj3_events GROUP BY k) u " +
+          "JOIN (SELECT k, name, eff, " +
+          "       COALESCE(LEAD(eff) OVER (PARTITION BY k ORDER BY eff) - INTERVAL 1 SECOND, " +
+          "                TIMESTAMP '9999-12-31 00:00:00') AS endts " +
+          "      FROM cmmj3_customers_raw) d " +
+          "ON u.k = d.k AND u.placed BETWEEN d.eff AND d.endts"
+      )
+
+      // ── Batch 2: mutate BOTH upstream and dim_customer at the same time.
+      //
+      // (a) UPDATE: customer 1's ACTV gets a CNCL on 2017-07-08 → upstream
+      //     row updates from (placed=2016-03-22, removed=NULL) to
+      //     (placed=2016-03-22, removed=2017-07-08).
+      // (b) UPDATE: customer 1 ALSO gets an SCD2 name change effective
+      //     2018-01-01 (still after the watch placement, so dim BETWEEN
+      //     match is unchanged for the placed=2016-03-22 row, but the
+      //     dim MV emits a cascade-delta).
+      // (c) INSERT: brand-new customer k=2 ("bob") with first ACTV on
+      //     2017-07-08 — pure insert miss case (6e228a in the CI diff).
+      spark.sql(
+        "INSERT INTO cmmj3_events VALUES " +
+          "(1, NULL, TIMESTAMP '2017-07-08 00:00:00'), " +
+          "(2, TIMESTAMP '2017-07-08 00:00:00', NULL)"
+      )
+      spark.sql(
+        "INSERT INTO cmmj3_customers_raw VALUES " +
+          "(1, 'alice-renamed', TIMESTAMP '2018-01-01 00:00:00'), " +
+          "(2, 'bob', TIMESTAMP '2017-01-01 00:00:00')"
+      )
+      refreshChain("cmmj3_upstream", "cmmj3_dim", "cmmj3_downstream")
+
+      assertMvCorrect(
+        "cmmj3_upstream",
+        "SELECT k, MIN(p) AS placed, MAX(r) AS removed FROM cmmj3_events GROUP BY k"
+      )
+      assertMvCorrect(
+        "cmmj3_dim",
+        "SELECT k, name, eff, " +
+          "COALESCE(LEAD(eff) OVER (PARTITION BY k ORDER BY eff) - INTERVAL 1 SECOND, " +
+          "         TIMESTAMP '9999-12-31 00:00:00') AS endts " +
+          "FROM cmmj3_customers_raw"
+      )
+      assertMvCorrect(
+        "cmmj3_downstream",
+        "SELECT u.k AS k, u.placed AS placed, u.removed AS removed " +
+          "FROM (SELECT k, MIN(p) AS placed, MAX(r) AS removed FROM cmmj3_events GROUP BY k) u " +
+          "JOIN (SELECT k, name, eff, " +
+          "       COALESCE(LEAD(eff) OVER (PARTITION BY k ORDER BY eff) - INTERVAL 1 SECOND, " +
+          "                TIMESTAMP '9999-12-31 00:00:00') AS endts " +
+          "      FROM cmmj3_customers_raw) d " +
+          "ON u.k = d.k AND u.placed BETWEEN d.eff AND d.endts"
+      )
+    }
+  }
 }
