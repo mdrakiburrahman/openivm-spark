@@ -446,8 +446,23 @@ case class CreateMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    MvCatalog.ensureTables(spark)
-    StagingCatalog.ensureTables(spark)
+    val createT0 = System.nanoTime()
+    val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
+    try runCreate(spark, profile)
+    finally {
+      val totalMs = (System.nanoTime() - createT0) / 1000000L
+      profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
+      profile.flush()
+    }
+  }
+
+  private def runCreate(spark: SparkSession, profile: RefreshProfile): Seq[Row] = {
+    import MvCommandHelper._
+
+    profile.timeStep("create_mv_system_tables", "scope=mv_and_staging") {
+      MvCatalog.ensureTables(spark)
+      StagingCatalog.ensureTables(spark)
+    }
 
     // Existence guard
     MvCatalog.lookup(spark, name) match {
@@ -478,7 +493,10 @@ case class CreateMaterializedViewCommand(
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
     val compiler = OpenIvmCompilers.forSession(spark)
-    val compiled =
+    val compiled = profile.timeStep(
+      "create_compile_classification",
+      s"sources=${qualNames.size};group_cols=${groupKeys.size}"
+    ) {
       try
         compiler.compile(
           CompileRequest(
@@ -504,6 +522,7 @@ case class CreateMaterializedViewCommand(
             initialLoadSql = ""
           )
       }
+    }
 
     val windowInitialLoadMatchesUserQuery: Boolean =
       if (compiled.refreshType != RefreshTypeCode.WindowPartition || compiled.initialLoadSql.isEmpty) true
@@ -842,7 +861,12 @@ case class CreateMaterializedViewCommand(
         s"${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
     IvmDmlInterceptorRule.bypass.set(true)
     try {
-      spark.sql(initSql)
+      profile.timeStep(
+        "create_mv_initial_load",
+        s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${initSql.length}"
+      ) {
+        spark.sql(initSql)
+      }
 
       // For AGGREGATE_HAVING we additionally create the user-facing Spark VIEW
       // that projects only the user columns from the data table and applies the
@@ -850,33 +874,39 @@ case class CreateMaterializedViewCommand(
       // rows from the data table so this VIEW does not need a separate
       // `openivm_count_star > 0` guard.
       if (isHavingViewIncremental) {
-        val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
-        val pred     = havingPred.getOrElse("TRUE")
-        if (!havingPredicateIsSafe(pred, dataCols)) {
-          throw new RuntimeException(
-            s"HAVING predicate '$pred' references columns not present on data table " +
-              s"${sqlIdent(dataIdent)} (columns: ${dataCols.mkString(", ")}). " +
-              "This indicates the HAVING clause uses an aggregate not in SELECT; " +
-              "such views are not currently supported in the incremental AGGREGATE_HAVING " +
-              "path — they will be retried as FULL_REFRESH on the next CREATE."
+        profile.timeStep("create_mv_user_view", "kind=aggregate_having") {
+          val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
+          val pred     = havingPred.getOrElse("TRUE")
+          if (!havingPredicateIsSafe(pred, dataCols)) {
+            throw new RuntimeException(
+              s"HAVING predicate '$pred' references columns not present on data table " +
+                s"${sqlIdent(dataIdent)} (columns: ${dataCols.mkString(", ")}). " +
+                "This indicates the HAVING clause uses an aggregate not in SELECT; " +
+                "such views are not currently supported in the incremental AGGREGATE_HAVING " +
+                "path — they will be retried as FULL_REFRESH on the next CREATE."
+            )
+          }
+          val colList = userOutputCols
+            .map(c => s"`${c.replace("`", "``")}`")
+            .mkString(", ")
+          spark.sql(
+            s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
+              s"SELECT $colList FROM ${sqlIdent(dataIdent)} WHERE ($pred)"
           )
         }
-        val colList = userOutputCols
-          .map(c => s"`${c.replace("`", "``")}`")
-          .mkString(", ")
-        spark.sql(
-          s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
-            s"SELECT $colList FROM ${sqlIdent(dataIdent)} WHERE ($pred)"
-        )
       }
 
-      // Write metadata catalog entry
-      MvCatalog.upsert(spark, meta)
+      profile.timeStep("create_view_index", s"sources=${meta.sourceTables.size}") {
+        // Write metadata catalog entry
+        MvCatalog.upsert(spark, meta)
+      }
 
-      // Record the Delta version of the initial snapshot
-      val version =
-        DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
-      MvCatalog.advance(spark, name, version)
+      profile.timeStep("create_mv_publish_metadata", "phase=advance_version") {
+        // Record the Delta version of the initial snapshot
+        val version =
+          DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
+        MvCatalog.advance(spark, name, version)
+      }
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)
     }
@@ -900,19 +930,24 @@ case class RefreshMaterializedViewCommand(
     // RefreshMutex above. Without this, two threads that both read the
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
+    val lockT0 = System.nanoTime()
     RefreshMutex.withLock(metaName(name)) {
-      runUnderLock(spark)
+      val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
+      runUnderLock(spark, lockAcqMs)
     }
   }
 
-  private def runUnderLock(spark: SparkSession): Seq[Row] = {
+  private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
-    val refreshId  = UUID.randomUUID().toString
     val refreshT0  = System.nanoTime()
     val viewLabel  = sqlIdent(name)
+    val viewMeta   = metaName(name)
     val threadName = Thread.currentThread().getName
+    val profile    = RefreshProfile.start(spark, viewMeta, RefreshProfile.Mode.Refresh)
+    val refreshId  = profile.refreshId
+    profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
     RefreshPerf.emit(refreshId, viewLabel, "start", s"thread='$threadName'")
 
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
@@ -924,6 +959,12 @@ case class RefreshMaterializedViewCommand(
         s"total_ms=$totalMs refresh_type='$refreshTypeName' " +
           s"outcome='$outcome' pending_deltas=$pendingDeltas"
       )
+      profile.appendStep(
+        "total_refresh",
+        s"refresh_type=$refreshTypeName;outcome=$outcome;pending_deltas=$pendingDeltas",
+        totalMs
+      )
+      profile.flush()
     }
 
     val meta = MvCatalog
@@ -951,13 +992,15 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
-    val stagingDeltas = RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
-      StagingCatalog.collectFor(
-        spark,
-        viewNameStr,
-        meta.sourceTables,
-        sourceWatermarks
-      )
+    val stagingDeltas = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
+      RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
+        StagingCatalog.collectFor(
+          spark,
+          viewNameStr,
+          meta.sourceTables,
+          sourceWatermarks
+        )
+      }
     }
 
     // Defensive backstop: the cheap existence probe above and the full collect
@@ -981,25 +1024,32 @@ case class RefreshMaterializedViewCommand(
       "deltas_resolved",
       s"refresh_type='${meta.refreshTypeName}' pending_deltas=${stagingDeltas.size}"
     )
+    profile.appendStep(
+      "generate_refresh_sql.dispatch",
+      s"refresh_type=${meta.refreshTypeName};pending_deltas=${stagingDeltas.size}",
+      0L
+    )
 
     // Resolve current source schemas and check for schema drift. Include
     // upstream MV identity hashes so a DROP + recreate-with-same-schema
     // upstream is also caught.
     val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
-      RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
-        val schemas = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
-        val identityMap: Map[String, String] = {
-          val all: Seq[MvMetadata] =
-            try MvCatalog.list(spark)
-            catch { case _: Throwable => Seq.empty[MvMetadata] }
-          val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
-          meta.sourceTables.flatMap { qn =>
-            val short = qn.split("\\.").last
-            byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> MvCatalog.mvIdentity(m))
-          }.toMap
+      profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
+        RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
+          val schemas = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
+          val identityMap: Map[String, String] = {
+            val all: Seq[MvMetadata] =
+              try MvCatalog.list(spark)
+              catch { case _: Throwable => Seq.empty[MvMetadata] }
+            val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
+            meta.sourceTables.flatMap { qn =>
+              val short = qn.split("\\.").last
+              byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> MvCatalog.mvIdentity(m))
+            }.toMap
+          }
+          val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
+          (schemas, identityMap, fp)
         }
-        val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
-        (schemas, identityMap, fp)
       }
     if (freshFingerprint != meta.sourceSchemaFingerprint) {
       emitEnd("schema_drift", meta.refreshTypeName, stagingDeltas.size)
@@ -1035,14 +1085,22 @@ case class RefreshMaterializedViewCommand(
       var stmtCounter = 0
       try {
         assembled.statements.foreach { sql =>
-          val kind = RefreshPerf.classify(sql, "")
-          RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
-            RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+          val kind     = RefreshPerf.classify(sql, "")
+          val sqlBytes = sql.length
+          profile.timeStep(
+            "execute_refresh_sql_stmt",
+            s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
+          ) {
+            RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
+              RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+            }
           }
           stmtCounter += 1
         }
-        RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr)
+        profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
+          RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
+            postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr)
+          }
         }
         emitEnd("full_refresh_executed", "FULL_REFRESH", stagingDeltas.size)
       } catch {
@@ -1084,43 +1142,48 @@ case class RefreshMaterializedViewCommand(
     val cachedInitialLoadSql =
       meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).getOrElse("")
     val compileCacheHit = cachedCompiledSql.isDefined
-    val compiled = RefreshPerf.timePhase(
-      refreshId,
-      viewLabel,
-      "compile",
+    val compiled = profile.timeStep(
+      "generate_refresh_sql.compile",
       s"compile_cache_hit=$compileCacheHit"
     ) {
-      cachedCompiledSql match {
-        case Some(sql) =>
-          org.openivm.spark.compiler.CompiledRefresh(
-            refreshType = meta.refreshType,
-            refreshTypeName = meta.refreshTypeName,
-            sql = sql,
-            initialLoadSql = cachedInitialLoadSql
-          )
-        case None =>
-          val compiler = OpenIvmCompilers.forSession(spark)
-          val fresh = compiler.compile(
-            CompileRequest(
-              viewName = name.table,
-              viewSql = meta.querySql,
-              sources = compileSchemas,
-              sourceQualifiedNames = shortToQual
+      RefreshPerf.timePhase(
+        refreshId,
+        viewLabel,
+        "compile",
+        s"compile_cache_hit=$compileCacheHit"
+      ) {
+        cachedCompiledSql match {
+          case Some(sql) =>
+            org.openivm.spark.compiler.CompiledRefresh(
+              refreshType = meta.refreshType,
+              refreshTypeName = meta.refreshTypeName,
+              sql = sql,
+              initialLoadSql = cachedInitialLoadSql
             )
-          )
-          if (fresh.sql.nonEmpty) {
-            val backfilled = meta.properties ++
-              MvMetadata.compiledProperties(fresh.sql, fresh.initialLoadSql)
-            try MvCatalog.updateProperties(spark, name, backfilled)
-            catch {
-              case t: Throwable =>
-                logWarning(
-                  s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
-                    s"${t.getClass.getName}: ${t.getMessage}"
-                )
+          case None =>
+            val compiler = OpenIvmCompilers.forSession(spark)
+            val fresh = compiler.compile(
+              CompileRequest(
+                viewName = name.table,
+                viewSql = meta.querySql,
+                sources = compileSchemas,
+                sourceQualifiedNames = shortToQual
+              )
+            )
+            if (fresh.sql.nonEmpty) {
+              val backfilled = meta.properties ++
+                MvMetadata.compiledProperties(fresh.sql, fresh.initialLoadSql)
+              try MvCatalog.updateProperties(spark, name, backfilled)
+              catch {
+                case t: Throwable =>
+                  logWarning(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
+                      s"${t.getClass.getName}: ${t.getMessage}"
+                  )
+              }
             }
-          }
-          fresh
+            fresh
+        }
       }
     }
 
@@ -1147,35 +1210,37 @@ case class RefreshMaterializedViewCommand(
       // pending staging deltas get a real view; tables with no pending deltas
       // get an empty view so that multi-source compiled SQL (e.g. UNION DISTINCT
       // across two tables) can reference all delta views without a NOT_FOUND error.
-      RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
-        for (qualTable <- meta.sourceTables) {
-          val schema      = freshSchemas(qualTable)
-          val tableDeltas = byTable.getOrElse(qualTable, Seq.empty)
-          val viewSql     = StagingDeltaView.buildSourceDeltaViewSql(qualTable, schema, tableDeltas)
-          spark.sql(viewSql)
-          tempViewShortNames += qualTable.split("\\.").last
+      profile.timeStep("metadata_pre_sql", "phase=register_views") {
+        RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
+          for (qualTable <- meta.sourceTables) {
+            val schema      = freshSchemas(qualTable)
+            val tableDeltas = byTable.getOrElse(qualTable, Seq.empty)
+            val viewSql     = StagingDeltaView.buildSourceDeltaViewSql(qualTable, schema, tableDeltas)
+            spark.sql(viewSql)
+            tempViewShortNames += qualTable.split("\\.").last
 
-          if (diagnosticsEnabled) {
-            val short = qualTable.split("\\.").last
-            try {
-              val counts = spark
-                .sql(s"""SELECT
+            if (diagnosticsEnabled) {
+              val short = qualTable.split("\\.").last
+              try {
+                val counts = spark
+                  .sql(s"""SELECT
                         |  COUNT(*) AS total,
                         |  COUNT(CASE WHEN `openivm_multiplicity` > 0 THEN 1 END) AS pos,
                         |  COUNT(CASE WHEN `openivm_multiplicity` < 0 THEN 1 END) AS neg
                         |FROM `openivm_delta_$short`""".stripMargin)
-                .head()
-              logInfo(
-                s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
-                  s"deltas=${tableDeltas.size} total=${counts.getLong(0)} " +
-                  s"pos=${counts.getLong(1)} neg=${counts.getLong(2)}"
-              )
-            } catch {
-              case t: Throwable =>
+                  .head()
                 logInfo(
                   s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
-                    s"error='${t.getClass.getSimpleName}: ${t.getMessage}'"
+                    s"deltas=${tableDeltas.size} total=${counts.getLong(0)} " +
+                    s"pos=${counts.getLong(1)} neg=${counts.getLong(2)}"
                 )
+              } catch {
+                case t: Throwable =>
+                  logInfo(
+                    s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
+                      s"error='${t.getClass.getSimpleName}: ${t.getMessage}'"
+                  )
+              }
             }
           }
         }
@@ -1190,29 +1255,34 @@ case class RefreshMaterializedViewCommand(
         if (meta.refreshType == RefreshTypeCode.AggregateHaving) dataTableId(name)
         else name
 
-      val rewritten = RefreshPerf.timePhase(refreshId, viewLabel, "rewrite") {
-        SparkRefreshRewriter.rewrite(
-          compiledSql = compiled.sql,
-          mvName = mergeTargetId,
-          mvLocation = meta.location,
-          viewLogicalName = name.table,
-          sourceTempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap,
-          viewDeltaPath = viewDeltaPath,
-          postProcess = LptsSparkDialect.translate,
-          // Pass the user-facing column list for each source so the rewriter can
-          // expand DuckDB-style `SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)`
-          // into an explicit column list (Spark 3.5 does not support that syntax).
-          sourceSchemas = freshSchemas.map { case (qual, schema) =>
-            qual.split("\\.").last -> schema.fieldNames.toSeq
-          },
-          // Pass the short → qualified source name map so the rewriter can
-          // expand `memory.main.<short>` to the fully-qualified Spark name
-          // when the user's view body referenced a Hive-qualified table.
-          // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
-          // Spark would resolve `<short>` against the current_schema.
-          sourceQualifiedNames = shortToQual,
-          mvVersionBeforeRefresh = Some(meta.lastVersion)
-        )
+      val rewritten = profile.timeStep(
+        "generate_refresh_sql.assembly",
+        s"compiled_sql_bytes=${compiled.sql.length}"
+      ) {
+        RefreshPerf.timePhase(refreshId, viewLabel, "rewrite") {
+          SparkRefreshRewriter.rewrite(
+            compiledSql = compiled.sql,
+            mvName = mergeTargetId,
+            mvLocation = meta.location,
+            viewLogicalName = name.table,
+            sourceTempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap,
+            viewDeltaPath = viewDeltaPath,
+            postProcess = LptsSparkDialect.translate,
+            // Pass the user-facing column list for each source so the rewriter can
+            // expand DuckDB-style `SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)`
+            // into an explicit column list (Spark 3.5 does not support that syntax).
+            sourceSchemas = freshSchemas.map { case (qual, schema) =>
+              qual.split("\\.").last -> schema.fieldNames.toSeq
+            },
+            // Pass the short → qualified source name map so the rewriter can
+            // expand `memory.main.<short>` to the fully-qualified Spark name
+            // when the user's view body referenced a Hive-qualified table.
+            // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
+            // Spark would resolve `<short>` against the current_schema.
+            sourceQualifiedNames = shortToQual,
+            mvVersionBeforeRefresh = Some(meta.lastVersion)
+          )
+        }
       }
 
       var cleanupMeta           = meta
@@ -1285,9 +1355,15 @@ case class RefreshMaterializedViewCommand(
         }
         def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
           advanceStmtCounterPast(stmtIdx)
-          val kind = RefreshPerf.classify(sql, viewDeltaPath)
-          RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
-            RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+          val kind     = RefreshPerf.classify(sql, viewDeltaPath)
+          val sqlBytes = sql.length
+          profile.timeStep(
+            "execute_refresh_sql_stmt",
+            s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
+          ) {
+            RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
+              RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+            }
           }
         }
         def executeSql(sql: String): Unit = {
@@ -1297,6 +1373,11 @@ case class RefreshMaterializedViewCommand(
         def logSkippedDeleteMerge(stmtIdx: Int): Unit = {
           advanceStmtCounterPast(stmtIdx)
           RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, "merge_skipped", 0L)
+          profile.appendStep(
+            "execute_refresh_sql_stmt",
+            s"statement=${stmtIdx + 1};stmt_kind=merge_skipped",
+            0L
+          )
         }
 
         if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
@@ -1340,6 +1421,11 @@ case class RefreshMaterializedViewCommand(
                       "view_delta_ctas",
                       elapsedMs,
                       extra = Some(s"fused='true' rows=$rowCount")
+                    )
+                    profile.appendStep(
+                      "execute_refresh_sql_stmt",
+                      s"statement=1;stmt_kind=view_delta_ctas;fused=true;rows=$rowCount",
+                      elapsedMs
                     )
                     fusedScratchView = Some(scratchView)
                     Some(scratchView)
@@ -1393,6 +1479,11 @@ case class RefreshMaterializedViewCommand(
               viewLabel,
               "fallback",
               "outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'"
+            )
+            profile.appendStep(
+              "fallback",
+              "outcome=simple_projection_full_refresh;reason=conflicting_signed_rows",
+              0L
             )
             val fullRefreshMeta = meta.copy(
               refreshType = RefreshTypeCode.FullRefresh,
@@ -1470,8 +1561,13 @@ case class RefreshMaterializedViewCommand(
             val q         = col.replace("`", "``")
             val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
             val idx       = stmtCounter.getAndIncrement()
-            RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
-              RetryPolicy.DeltaConflicts.execute { spark.sql(deleteSql).collect() }
+            profile.timeStep(
+              "execute_refresh_sql_stmt",
+              s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
+            ) {
+              RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
+                RetryPolicy.DeltaConflicts.execute { spark.sql(deleteSql).collect() }
+              }
             }
           }
         }
@@ -1502,28 +1598,30 @@ case class RefreshMaterializedViewCommand(
         // (which matches `base_table` exactly against the downstream's
         // `meta.sourceTables`) finds it.
         if (cleanupMeta.emitsCascadeViewDelta && fusedScratchView.isEmpty) {
-          RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
-            val mvShortName = name.identifier
-            val triggerKeys: Set[String] = MvCatalog
-              .list(spark)
-              .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
-              .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
-              .toSet
-            val keysToRecord =
-              if (triggerKeys.isEmpty) Set(viewNameStr) // record under our own name even with no downstream yet
-              else triggerKeys
-            val txnTs = new Timestamp(System.currentTimeMillis())
-            keysToRecord.foreach { triggerKey =>
-              StagingCatalog.record(
-                spark,
-                StagingDelta(
-                  baseTable = triggerKey,
-                  opType = StagingDelta.OpTypes.MvViewDelta,
-                  stagingPath = viewDeltaPath,
-                  txnTs = txnTs,
-                  consumedBy = Seq.empty
+          profile.timeStep("metadata_post_sql", "phase=record_cascade") {
+            RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
+              val mvShortName = name.identifier
+              val triggerKeys: Set[String] = MvCatalog
+                .list(spark)
+                .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
+                .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
+                .toSet
+              val keysToRecord =
+                if (triggerKeys.isEmpty) Set(viewNameStr) // record under our own name even with no downstream yet
+                else triggerKeys
+              val txnTs = new Timestamp(System.currentTimeMillis())
+              keysToRecord.foreach { triggerKey =>
+                StagingCatalog.record(
+                  spark,
+                  StagingDelta(
+                    baseTable = triggerKey,
+                    opType = StagingDelta.OpTypes.MvViewDelta,
+                    stagingPath = viewDeltaPath,
+                    txnTs = txnTs,
+                    consumedBy = Seq.empty
+                  )
                 )
-              )
+              }
             }
           }
         }
@@ -1547,8 +1645,10 @@ case class RefreshMaterializedViewCommand(
           )
       }
 
-      RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-        postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr)
+      profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
+        RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
+          postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr)
+        }
       }
       emitEnd(
         if (spFullRefreshFallback) "simple_projection_full_refresh_fallback"

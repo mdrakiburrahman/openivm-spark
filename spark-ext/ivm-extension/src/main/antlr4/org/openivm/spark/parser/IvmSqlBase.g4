@@ -1,7 +1,7 @@
 /*
  * Top-of-grammar ANTLR4 file for the OpenIVM Spark extension.
  *
- * Adds three productions to Spark's surface SQL:
+ * Adds four productions to Spark's surface SQL:
  *
  *   CREATE MATERIALIZED VIEW <multipart_identifier>
  *     [USING <provider>] [<table_clauses>] AS <query>
@@ -10,8 +10,10 @@
  *
  *   DROP MATERIALIZED VIEW [IF EXISTS] <multipart_identifier>
  *
+ *   SHOW OPENIVM REFRESH PROFILE
+ *
  * The grammar is invoked only when `IvmParser.parsePlan` sees a statement
- * whose head matches one of the three forms above; otherwise the input is
+ * whose head matches one of the four forms above; otherwise the input is
  * delegated to Spark's own parser unchanged.
  *
  * Notes:
@@ -36,6 +38,7 @@ ivmStatement
     : createMaterializedView
     | refreshMaterializedView
     | dropMaterializedView
+    | showOpenivmRefreshProfile
     ;
 
 createMaterializedView
@@ -52,6 +55,10 @@ refreshMaterializedView
 
 dropMaterializedView
     : DROP MATERIALIZED VIEW (IF EXISTS)? multipartIdentifier
+    ;
+
+showOpenivmRefreshProfile
+    : SHOW OPENIVM REFRESH PROFILE
     ;
 
 queryBody
@@ -90,7 +97,7 @@ identifier
 
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
-    | AS  | BY  | DROP   | REFRESH
+    | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -106,6 +113,9 @@ AS            : [Aa][Ss];
 BY            : [Bb][Yy];
 PARTITIONED   : [Pp][Aa][Rr][Tt][Ii][Tt][Ii][Oo][Nn][Ee][Dd];
 TBLPROPERTIES : [Tt][Bb][Ll][Pp][Rr][Oo][Pp][Ee][Rr][Tt][Ii][Ee][Ss];
+SHOW          : [Ss][Hh][Oo][Ww];
+OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
+PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
 
 EQ            : '=' | '==';
 

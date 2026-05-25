@@ -9,6 +9,7 @@ import org.apache.spark.sql.catalyst.trees.Origin
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
 
@@ -54,6 +55,11 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
     val ifExists = ctx.IF() != null
     DropMaterializedViewCommand(name, ifExists)
   }
+
+  override def visitShowOpenivmRefreshProfile(
+      ctx: IvmSqlBaseParser.ShowOpenivmRefreshProfileContext
+  ): AnyRef =
+    ShowRefreshProfileCommand()
 
   // -------------------------------------------------------------------------
   // Helpers

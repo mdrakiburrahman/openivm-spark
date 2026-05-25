@@ -1,13 +1,18 @@
 package org.openivm.spark.parser
 
+import java.io.File
+import java.util.UUID
+
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.types.{IntegerType, LongType, StringType, TimestampType}
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -34,7 +39,9 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       .config("spark.ui.enabled", "false")
       .config(
         "spark.sql.warehouse.dir",
-        System.getProperty("java.io.tmpdir") + "/ivm-parser-spec-warehouse"
+        new File(
+          s"target/test-warehouse-ivm-parser-${UUID.randomUUID().toString.take(8)}"
+        ).getCanonicalPath
       )
       .getOrCreate()
   }
@@ -128,7 +135,32 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
-  // Test 5 — passthrough for ordinary SQL
+  // Test 5 — SHOW OPENIVM REFRESH PROFILE
+  // ---------------------------------------------------------------------------
+  describe("SHOW OPENIVM REFRESH PROFILE") {
+    it("parses to ShowRefreshProfileCommand with the DuckDB-compatible schema") {
+      val plan = spark.sessionState.sqlParser.parsePlan("SHOW OPENIVM REFRESH PROFILE")
+      plan shouldBe a[ShowRefreshProfileCommand]
+      plan.output.map(attr => (attr.name, attr.dataType, attr.nullable)) shouldBe Seq(
+        ("refresh_id", StringType, false),
+        ("view_name", StringType, false),
+        ("profile_timestamp", TimestampType, false),
+        ("step_order", IntegerType, false),
+        ("step_name", StringType, false),
+        ("duration_ms", LongType, false),
+        ("detail", StringType, false)
+      )
+    }
+
+    it("rejects optional clauses") {
+      an[ParseException] should be thrownBy {
+        spark.sessionState.sqlParser.parsePlan("SHOW OPENIVM REFRESH PROFILE WHERE step_order > 0")
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 6 — passthrough for ordinary SQL
   // ---------------------------------------------------------------------------
   describe("Passthrough") {
     it("delegates SELECT 1 to Spark's own parser unchanged") {

@@ -170,7 +170,8 @@ class PerfTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAfterAll 
           }
         }.toSet
         refreshIds.size shouldBe 1
-        refreshIds.head should fullyMatch regex "[0-9a-f-]{36}"
+        // refresh_id is shaped `<view>_<nanotime>` (see RefreshProfile.start).
+        refreshIds.head should fullyMatch regex "[A-Za-z0-9_.]+_\\d+"
       }
     }
 

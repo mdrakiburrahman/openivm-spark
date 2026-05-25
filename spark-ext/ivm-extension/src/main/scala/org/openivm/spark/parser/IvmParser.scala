@@ -7,6 +7,7 @@ import org.antlr.v4.runtime.CharStreams
 import org.antlr.v4.runtime.CommonTokenStream
 import org.antlr.v4.runtime.RecognitionException
 import org.antlr.v4.runtime.Recognizer
+import org.antlr.v4.runtime.Token
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -21,14 +22,14 @@ import org.openivm.spark.parser.gen.IvmSqlBaseLexer
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
 
 /**
- * Spark [[ParserInterface]] wrapper that handles the three OpenIVM materialized-view
- * DDL statements and delegates everything else to Spark's own parser.
+ * Spark [[ParserInterface]] wrapper that handles the OpenIVM materialized-view
+ * DDL/profile statements and delegates everything else to Spark's own parser.
  *
  * Routing decision in [[parsePlan]]:
  *  - If the SQL text starts (after stripping leading whitespace / SQL comments) with
- *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, or
- *    `DROP MATERIALIZED VIEW` (case-insensitive) → parsed by [[IvmSqlBaseParser]] /
- *    [[IvmAstBuilder]].
+ *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`,
+ *    `DROP MATERIALIZED VIEW`, or `SHOW OPENIVM REFRESH PROFILE`
+ *    (case-insensitive) → parsed by [[IvmSqlBaseParser]] / [[IvmAstBuilder]].
  *  - Everything else → [[delegate]].
  *
  * All methods other than [[parsePlan]] delegate to [[delegate]] unchanged.
@@ -74,7 +75,7 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
 
   /**
    * Returns true if [[sqlText]] (after stripping any leading whitespace and SQL comments)
-   * starts with one of the three IVM keywords.
+   * starts with one of the IVM statement heads.
    *
    * Two regex passes:
    *  1. Strip a run of leading whitespace / single-line (`-- ...`) / block (`/* ... */`)
@@ -113,6 +114,13 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
     })
 
     val tree = parser.ivmStatement()
+    if (parseError.isEmpty && tokenStream.LA(1) != Token.EOF) {
+      val token = tokenStream.LT(1)
+      parseError = Some(
+        s"extraneous input '${token.getText}' expecting <EOF> " +
+          s"(line ${token.getLine}, pos ${token.getCharPositionInLine})"
+      )
+    }
 
     parseError match {
       case Some(errorMsg) =>
@@ -138,10 +146,13 @@ private object IvmParser {
 
   /**
    * Case-insensitive check that the (already stripped) text begins with one of the
-   * three IVM statement keywords.
+   * IVM statement heads.
    */
   val IvmKeyword: Pattern = Pattern.compile(
-    "\\A(?:create|refresh|drop)\\s+materialized\\s+view\\b",
+    "\\A(?:" +
+      "(?:create|refresh|drop)\\s+materialized\\s+view|" +
+      "show\\s+openivm\\s+refresh\\s+profile" +
+      ")\\b",
     Pattern.CASE_INSENSITIVE
   )
 }

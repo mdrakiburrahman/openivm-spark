@@ -59,6 +59,19 @@ object FeatureGate {
     */
   val FuseScratchEnabledKey: String = "spark.openivm.fuseScratch.enabled"
 
+  /** Capture per-step refresh + create profile rows into the RocksDB
+    * `refresh_profile` column family ([[RefreshProfileCatalog]]).
+    *
+    * Default OFF — production paths pay zero overhead. The ivm-bench
+    * spark-openivm container flips this ON via `spark-defaults.conf.tmpl`
+    * parameterized off `OPENIVM_PROFILE_REFRESH=1` so benchmark runs always
+    * collect telemetry while normal users get the silent-fast-path default.
+    *
+    * Read via `SHOW OPENIVM REFRESH PROFILE` (mirrors DuckDB-OpenIVM's
+    * `SELECT * FROM openivm_refresh_profile`).
+    */
+  val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -79,6 +92,12 @@ object FeatureGate {
 
   def fuseScratchEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = true)
+
+  def profileRefreshEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, ProfileRefreshKey, default = false)
+
+  def profileRefreshEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, ProfileRefreshKey, default = false)
 
   /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled. */
   def buildMvDataTblProperties(spark: SparkSession): Seq[String] = {
