@@ -143,11 +143,19 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
       logInfo(s"[openivm-perf] refresh_id='$refreshId' view='$view' phase='$phase'$extra")
     }
 
-  def logStmt(refreshId: String, view: String, stmtIdx: Int, stmtKind: String, elapsedMs: Long): Unit =
+  def logStmt(
+      refreshId: String,
+      view: String,
+      stmtIdx: Int,
+      stmtKind: String,
+      elapsedMs: Long,
+      extra: Option[String] = None
+  ): Unit =
     if (enabled) {
+      val tail = extra.filter(_.nonEmpty).map(" " + _).getOrElse("")
       logInfo(
         s"[openivm-perf] refresh_id='$refreshId' view='$view' phase='stmt' " +
-          s"stmt_idx=$stmtIdx stmt_kind='$stmtKind' elapsed_ms=$elapsedMs"
+          s"stmt_idx=$stmtIdx stmt_kind='$stmtKind' elapsed_ms=$elapsedMs$tail"
       )
     }
 
@@ -1129,8 +1137,9 @@ case class RefreshMaterializedViewCommand(
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
-    val byTable            = stagingDeltas.groupBy(_.baseTable)
-    val tempViewShortNames = scala.collection.mutable.ArrayBuffer[String]()
+    val byTable                          = stagingDeltas.groupBy(_.baseTable)
+    val tempViewShortNames               = scala.collection.mutable.ArrayBuffer[String]()
+    var fusedScratchView: Option[String] = None
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -1215,6 +1224,30 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
+      // Eligibility for the scratch-CTAS fuse fast path: SIMPLE_PROJECTION
+      // MVs whose short name does not appear in any other MV's `sourceTables`
+      // (i.e. they have no current downstream consumer) write the per-refresh
+      // view-delta to a Delta scratch table that is then consumed exactly
+      // once by the INSERT INTO mv_data (and, in the negative-row case, the
+      // value-equality DELETE MERGE). Materialising that scratch as a
+      // cached DataFrame + temp view skips the per-table Delta commit
+      // overhead and the second on-disk read.
+      def hasNoDownstreamConsumer: Boolean = {
+        val mvShortName = name.identifier
+        !MvCatalog
+          .list(spark)
+          .exists(other =>
+            metaName(other.name) != metaName(name) &&
+              other.sourceTables.exists(_.split("\\.").last == mvShortName)
+          )
+      }
+
+      val fuseEligible =
+        FeatureGate.fuseScratchEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.SimpleProjection &&
+          rewritten.statements.nonEmpty &&
+          hasNoDownstreamConsumer
+
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
 
@@ -1267,14 +1300,89 @@ case class RefreshMaterializedViewCommand(
         }
 
         if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
-          executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
-          logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
+          // ── Scratch-CTAS fuse fast path ────────────────────────────────────
+          //
+          // openivm emits stmt[0] as `CREATE OR REPLACE TABLE delta.\`<path>\`
+          // USING DELTA AS WITH … SELECT … openivm_multiplicity FROM …` and
+          // stmt[1] as `INSERT INTO mv SELECT … FROM delta.\`<path>\` …`
+          // (the value-equality DELETE MERGE is stmt[2] when negatives exist).
+          //
+          // For leaf MVs (no downstream consumer), the scratch is consumed
+          // exactly once or twice on-disk. Materialising it as a cached
+          // DataFrame + temp view skips the per-table Delta commit overhead
+          // AND keeps subsequent reads in-memory. The cascade record block
+          // is skipped because there is no on-disk path to record — safe
+          // because a downstream MV created later does its own initial CTAS.
+          val fusedView: Option[String] =
+            if (fuseEligible)
+              SparkRefreshRewriter
+                .extractViewDeltaCtasBody(
+                  SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head),
+                  viewDeltaPath
+                )
+                .flatMap { selectBody =>
+                  val scratchView = s"openivm_scratch_${java.util.UUID.randomUUID().toString.replace("-", "_")}"
+                  try {
+                    val t0 = System.nanoTime()
+                    val df = spark.sql(selectBody)
+                    df.cache()
+                    df.createOrReplaceTempView(scratchView)
+                    // Force materialisation so the cache holds the rows before
+                    // any negative-row probe / INSERT read. count() is the
+                    // cheapest force-eval action that respects the cache.
+                    val rowCount  = df.count()
+                    val elapsedMs = (System.nanoTime() - t0) / 1000000L
+                    advanceStmtCounterPast(0)
+                    RefreshPerf.logStmt(
+                      refreshId,
+                      viewLabel,
+                      0,
+                      "view_delta_ctas",
+                      elapsedMs,
+                      extra = Some(s"fused='true' rows=$rowCount")
+                    )
+                    fusedScratchView = Some(scratchView)
+                    Some(scratchView)
+                  } catch {
+                    case t: Throwable =>
+                      // Best-effort cleanup and fall through to the on-disk path
+                      try spark.catalog.dropTempView(scratchView)
+                      catch { case _: Throwable => () }
+                      logInfo(
+                        s"[openivm-mv] refresh view='${sqlIdent(name)}' fused_fallback='${t.getClass.getSimpleName}: ${t.getMessage}'"
+                      )
+                      None
+                  }
+                }
+            else None
+
+          // Negative-row + conflict probes operate against either the cached
+          // temp view (fuse) or the on-disk scratch (existing path).
+          lazy val hasNegativesHere: Boolean = fusedView match {
+            case Some(view) =>
+              spark
+                .sql(
+                  s"SELECT 1 FROM `$view` WHERE `openivm_multiplicity` < 0 LIMIT 1"
+                )
+                .head(1)
+                .nonEmpty
+            case None => hasSimpleProjectionDeletes
+          }
+
+          if (fusedView.isEmpty) {
+            executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
+            logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
+          }
 
           val usesValueEqualityDeleteMerge =
             rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
           val hasConflictingRows =
-            usesValueEqualityDeleteMerge && hasSimpleProjectionDeletes &&
-              hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+            usesValueEqualityDeleteMerge && hasNegativesHere && {
+              fusedView match {
+                case Some(view) => hasConflictingFusedRows(spark, mergeTargetId, view)
+                case None       => hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+              }
+            }
           if (hasConflictingRows) {
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
@@ -1309,7 +1417,7 @@ case class RefreshMaterializedViewCommand(
               val stmtIdx = 1 + idx
               val sql     = SparkRefreshRewriter.stripExecutionMarker(stmt)
               val skipDeleteMerge =
-                SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+                SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNegativesHere
 
               if (skipDeleteMerge) {
                 logInfo(
@@ -1318,7 +1426,12 @@ case class RefreshMaterializedViewCommand(
                 )
                 logSkippedDeleteMerge(stmtIdx)
               } else {
-                executeSqlAt(sql, stmtIdx)
+                val sqlForExec = fusedView match {
+                  case Some(view) =>
+                    SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, view)
+                  case None => sql
+                }
+                executeSqlAt(sqlForExec, stmtIdx)
               }
             }
           }
@@ -1388,7 +1501,7 @@ case class RefreshMaterializedViewCommand(
         // becomes a separate trigger key so `StagingCatalog.collectFor`
         // (which matches `base_table` exactly against the downstream's
         // `meta.sourceTables`) finds it.
-        if (cleanupMeta.emitsCascadeViewDelta) {
+        if (cleanupMeta.emitsCascadeViewDelta && fusedScratchView.isEmpty) {
           RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
             val mvShortName = name.identifier
             val triggerKeys: Set[String] = MvCatalog
@@ -1447,6 +1560,16 @@ case class RefreshMaterializedViewCommand(
       IvmDmlInterceptorRule.bypass.set(false)
       tempViewShortNames.foreach { n =>
         try spark.sql(StagingDeltaView.dropSourceDeltaViewSql(n))
+        catch { case _: Throwable => () }
+      }
+      fusedScratchView.foreach { view =>
+        try {
+          // Unpersist the cached scratch DataFrame before dropping the temp
+          // view so the SparkSession's cache manager releases storage
+          // memory immediately rather than waiting for GC.
+          spark.catalog.uncacheTable(view)
+        } catch { case _: Throwable => () }
+        try spark.catalog.dropTempView(view)
         catch { case _: Throwable => () }
       }
     }
@@ -1553,6 +1676,28 @@ case class RefreshMaterializedViewCommand(
       .sql(
         s"""SELECT 1
            |FROM delta.`$escapedPath`
+           |GROUP BY $colList
+           |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
+           |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0
+           |LIMIT 1""".stripMargin
+      )
+      .head(1)
+      .nonEmpty
+  }
+
+  /** Same as [[hasConflictingSimpleProjectionRows]] but reads from a cached
+    * temp view (the scratch-CTAS fuse fast path).
+    */
+  private def hasConflictingFusedRows(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      scratchView: String
+  ): Boolean = {
+    val colList = simpleProjectionUserCols(spark, targetId).mkString(", ")
+    spark
+      .sql(
+        s"""SELECT 1
+           |FROM `$scratchView`
            |GROUP BY $colList
            |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
            |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0

@@ -76,6 +76,44 @@ object SparkRefreshRewriter {
   private[spark] def stripExecutionMarker(sql: String): String =
     sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
 
+  /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
+    * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
+    * body that follows the `AS` keyword. Used by the SimpleProjection fuse
+    * optimization in `MaterializedViewCommands.refresh` to swap the on-disk
+    * scratch Delta write for an in-memory cached temp view.
+    *
+    * Returns `None` if `stmt` is not a view-delta CTAS for `viewDeltaPath`
+    * (e.g. a MERGE, INSERT, or some other CTAS pointing at a different path).
+    */
+  private[spark] def extractViewDeltaCtasBody(stmt: String, viewDeltaPath: String): Option[String] = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val literalPath = java.util.regex.Pattern.quote(escapedPath)
+    val ctasRe =
+      ("(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+delta\\.`" + literalPath +
+        "`\\s+USING\\s+DELTA\\s+AS\\s+(.+)$").r
+    ctasRe.findFirstMatchIn(stripExecutionMarker(stmt)).map(_.group(1).trim)
+  }
+
+  /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
+    * `` `<tempViewName>` ``. Anchored on the exact escaped path (the path is
+    * UUID-suffixed so this is functionally safe) but uses a literal-quoted
+    * regex so SQL operators in the path can't escape the substitution. Used
+    * by the SimpleProjection fuse path to rewrite stmt[1] (INSERT) and
+    * stmt[2] (MERGE) to read from a cached temp view instead of the on-disk
+    * scratch Delta table.
+    */
+  private[spark] def substituteViewDeltaPath(
+      sql: String,
+      viewDeltaPath: String,
+      tempViewName: String
+  ): String = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val literalRef  = "delta.`" + escapedPath + "`"
+    val re          = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(literalRef))
+    val replacement = java.util.regex.Matcher.quoteReplacement(s"`$tempViewName`")
+    re.matcher(sql).replaceAll(replacement)
+  }
+
   /** Rewrite the openivm-emitted multi-statement refresh SQL into Spark-
     * executable statements.
     *
