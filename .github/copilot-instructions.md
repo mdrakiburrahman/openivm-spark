@@ -165,3 +165,16 @@ spark-shell \
 
 The feature gate defaults to `false`, so the jar is opt-in even when on the
 classpath.
+
+## Robust CI in ivm-bench
+
+To ensure PR CI is robust and not flaky, follow this process:
+
+1. Push up code into the PR branch
+2. Monitor the PR for CI failures, for example: https://github.com/mdrakiburrahman/ivm-bench/pull/29
+3. Go download logs
+4. Triage failure
+5. Fix (even if it's not due to openivm-spark, fix it in ivm-bench). If in openivm-spark, triage, fix code, push.
+6. Run green
+7. Once green CI, push up **FIVE SENTINEL COMMITS** one after another into the repo to fire CI
+8. Must run green 5 times back to back. If any failure, repeat from Step 3.
