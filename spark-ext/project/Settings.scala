@@ -109,6 +109,7 @@ object Settings {
       "-Dspark.databricks.delta.stats.collect=false",
       "-Dspark.databricks.delta.optimizeWrite.enabled=false",
       "-Dspark.databricks.delta.autoCompact.enabled=false",
+      "-Dspark.openivm.delta.autoCompact=false",
       // Plan-string truncation noise — `SparkStringUtils` warns on every truncation.
       // Tests do not care about plan toString output; raise the limit so the warn
       // never fires (belt + suspenders with the log4j2 silencer in

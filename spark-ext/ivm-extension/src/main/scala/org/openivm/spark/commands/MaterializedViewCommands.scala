@@ -143,17 +143,20 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
       logInfo(s"[openivm-perf] refresh_id='$refreshId' view='$view' phase='$phase'$extra")
     }
 
+  def logStmt(refreshId: String, view: String, stmtIdx: Int, stmtKind: String, elapsedMs: Long): Unit =
+    if (enabled) {
+      logInfo(
+        s"[openivm-perf] refresh_id='$refreshId' view='$view' phase='stmt' " +
+          s"stmt_idx=$stmtIdx stmt_kind='$stmtKind' elapsed_ms=$elapsedMs"
+      )
+    }
+
   def timeStmt[A](refreshId: String, view: String, stmtIdx: Int, stmtKind: String)(body: => A): A = {
     val t0 = System.nanoTime()
     try body
     finally {
       val elapsedMs = (System.nanoTime() - t0) / 1000000L
-      if (enabled) {
-        logInfo(
-          s"[openivm-perf] refresh_id='$refreshId' view='$view' phase='stmt' " +
-            s"stmt_idx=$stmtIdx stmt_kind='$stmtKind' elapsed_ms=$elapsedMs"
-        )
-      }
+      logStmt(refreshId, view, stmtIdx, stmtKind, elapsedMs)
     }
   }
 
@@ -822,9 +825,13 @@ case class CreateMaterializedViewCommand(
       else
         org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
-    val escaped = location.replace("'", "\\'")
+    val escaped  = location.replace("'", "\\'")
+    val tblProps = FeatureGate.buildMvDataTblProperties(spark)
+    val tblPropsClause =
+      if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val initSql =
-      s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA LOCATION '$escaped' AS $viewBodySql"
+      s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
+        s"${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       spark.sql(initSql)
@@ -1236,16 +1243,31 @@ case class RefreshMaterializedViewCommand(
         // across all statements executed by this refresh (rewritten + any
         // fallback + count-monoid cleanup).
         val stmtCounter = new java.util.concurrent.atomic.AtomicInteger(0)
-        def executeSql(sql: String): Unit = {
-          val idx  = stmtCounter.getAndIncrement()
+        def advanceStmtCounterPast(stmtIdx: Int): Unit = {
+          var done = false
+          while (!done) {
+            val current = stmtCounter.get()
+            done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
+          }
+        }
+        def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+          advanceStmtCounterPast(stmtIdx)
           val kind = RefreshPerf.classify(sql, viewDeltaPath)
-          RefreshPerf.timeStmt(refreshId, viewLabel, idx, kind) {
+          RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
             RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
           }
         }
+        def executeSql(sql: String): Unit = {
+          val idx = stmtCounter.getAndIncrement()
+          executeSqlAt(sql, idx)
+        }
+        def logSkippedDeleteMerge(stmtIdx: Int): Unit = {
+          advanceStmtCounterPast(stmtIdx)
+          RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, "merge_skipped", 0L)
+        }
 
         if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
-          executeSql(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head))
+          executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
           logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
 
           val usesValueEqualityDeleteMerge =
@@ -1283,8 +1305,9 @@ case class RefreshMaterializedViewCommand(
             fullRefresh.statements.foreach(executeSql)
             deletePathIfExists(viewDeltaPath)
           } else {
-            rewritten.statements.tail.foreach { stmt =>
-              val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+            rewritten.statements.tail.zipWithIndex.foreach { case (stmt, idx) =>
+              val stmtIdx = 1 + idx
+              val sql     = SparkRefreshRewriter.stripExecutionMarker(stmt)
               val skipDeleteMerge =
                 SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
 
@@ -1293,8 +1316,9 @@ case class RefreshMaterializedViewCommand(
                   s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                     "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
                 )
+                logSkippedDeleteMerge(stmtIdx)
               } else {
-                executeSql(sql)
+                executeSqlAt(sql, stmtIdx)
               }
             }
           }
@@ -1309,8 +1333,9 @@ case class RefreshMaterializedViewCommand(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                   "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
               )
+              logSkippedDeleteMerge(idx)
             } else {
-              executeSql(sql)
+              executeSqlAt(sql, idx)
               // After any CTAS that wrote to the view-delta path, log a diagnostic
               // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
               // rows. Gated by OPENIVM_REFRESH_DIAGNOSTICS=1.
