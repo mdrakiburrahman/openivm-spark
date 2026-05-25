@@ -757,7 +757,14 @@ object SparkRefreshRewriter {
     *
     * After rewrite:
     * {{{
-    *   INSERT INTO <mv> SELECT <user_cols> FROM delta.<viewDeltaPath> WHERE `openivm_multiplicity` > 0
+    *   INSERT INTO <mv> SELECT <user_cols>
+    *   FROM (
+    *     SELECT <user_cols>, CAST(`openivm_multiplicity` AS BIGINT) AS __openivm_expand_mult
+    *     FROM delta.<viewDeltaPath>
+    *     WHERE `openivm_multiplicity` > 0
+    *   ) __openivm_expand_src
+    *   LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), __openivm_expand_src.__openivm_expand_mult))
+    *     __openivm_expand_lv AS __openivm_expand_idx
     *
     *   MERGE INTO <mv> AS v
     *   USING (SELECT <user_cols> FROM delta.<viewDeltaPath> WHERE `openivm_multiplicity` < 0) AS d
@@ -765,10 +772,22 @@ object SparkRefreshRewriter {
     *   WHEN MATCHED THEN DELETE
     * }}}
     *
+    * Multiplicity expansion (`LATERAL VIEW EXPLODE(SEQUENCE(...))`) is the
+    * Spark-side equivalent of openivm's `generate_series(1, mul::BIGINT)`. It is
+    * required when an upstream cascade compaction collapses K duplicate input
+    * rows into a single view-delta row with `openivm_multiplicity = ±K` — the
+    * MV must end up with K physical copies. Without expansion, the INSERT side
+    * would silently drop `K - 1` copies per such tuple (the original
+    * `fact_watches` MV-over-MV bug — `.research/OPENIVM-BUG.md`).
+    *
     * OpenIVM limitation: this MERGE uses value-equality which is non-deterministic
-    * when the MV contains duplicate rows (Delta MERGE will delete ALL matching
-    * copies). SIMPLE_PROJECTION MVs over sources with duplicate rows are not
-    * fully supported in this MVP. See RESEARCH.md §12 risk 8.
+    * when the MV contains a non-`|mult|`-equal number of duplicate rows
+    * (Delta MERGE `WHEN MATCHED THEN DELETE` deletes ALL matching copies).
+    * In the supported workloads the MV has exactly `K = |mult|` copies of each
+    * projected tuple, so over-deletion does not happen; if you build an MV
+    * shape where this invariant is violated, consider the FULL_REFRESH
+    * fallback (triggered by `hasConflictingSimpleProjectionRows`) or open an
+    * issue. See RESEARCH.md §12 risk 8.
     */
   private def rewriteSimpleProjectionDataInsert(
       stmt: String,
@@ -807,12 +826,33 @@ object SparkRefreshRewriter {
 
     val colList = userCols.mkString(", ")
 
-    // 1. INSERT: assert positive-multiplicity rows into the MV
+    // 1. INSERT: assert positive-multiplicity rows into the MV.
+    //
+    // Each view-delta row carries `openivm_multiplicity` which is the *count*
+    // of physical copies the cascade compaction collapsed. openivm's
+    // DuckDB-side reference implementation replicates each row using
+    // `generate_series(1, mul::BIGINT)` (refresh_compiler.cpp:813-820). Spark
+    // has no `generate_series`; the equivalent idiom is
+    //
+    //   LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), mult)) ...
+    //
+    // The positive-multiplicity filter MUST stay inside the inner subquery so
+    // that `SEQUENCE(1, n)` is never evaluated with `n <= 0` — Spark's
+    // `SEQUENCE` defaults step to -1 when stop<start and returns the
+    // descending `[1, 0]` / `[1, 0, -1]` etc., which would over-insert.
+    // Helper aliases are prefixed `__openivm_expand_` to make collisions with
+    // user-visible column names effectively impossible.
     val insertSql =
       s"""|INSERT INTO $mv
           |SELECT $colList
-          |FROM $deltaRef
-          |WHERE `openivm_multiplicity` > 0""".stripMargin
+          |FROM (
+          |  SELECT $colList, CAST(`openivm_multiplicity` AS BIGINT) AS __openivm_expand_mult
+          |  FROM $deltaRef
+          |  WHERE `openivm_multiplicity` > 0
+          |) __openivm_expand_src
+          |LATERAL VIEW EXPLODE(
+          |  SEQUENCE(CAST(1 AS BIGINT), __openivm_expand_src.__openivm_expand_mult)
+          |) __openivm_expand_lv AS __openivm_expand_idx""".stripMargin
 
     // 2. MERGE (DELETE-only): retract negative-multiplicity rows from the MV
     val onCondition = userCols
