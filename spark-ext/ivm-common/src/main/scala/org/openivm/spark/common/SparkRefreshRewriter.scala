@@ -175,7 +175,14 @@ object SparkRefreshRewriter {
           case StatementKind.MvMerge =>
             Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.SimpleProjectionDataInsert =>
-            rewriteSimpleProjectionDataInsert(stmt, viewLogicalName, mvName, viewDeltaPath)
+            rewriteSimpleProjectionDataInsert(
+              stmt,
+              viewLogicalName,
+              mvName,
+              mvLocation,
+              viewDeltaPath,
+              mvVersionBeforeRefresh
+            )
           case StatementKind.ScalarUpdate =>
             Seq(rewriteScalarUpdate(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.ScalarDeleteMv =>
@@ -778,61 +785,106 @@ object SparkRefreshRewriter {
     s
   }
 
-  // ── Statement C (SIMPLE_PROJECTION): INSERT + retraction MERGE ───────────
+  // ── Statement C (SIMPLE_PROJECTION): bag-correct view-delta apply ─────────
 
-  /** Rewrites the SIMPLE_PROJECTION data-INSERT statement into two Spark
-    * statements:
+  /** Rewrites the SIMPLE_PROJECTION view-delta apply (statement C of the SP
+    * refresh program) into a Spark-executable **bag-correct** 3-statement
+    * sequence.
     *
-    *   1. INSERT — asserts rows with positive multiplicity into the MV.
-    *   2. MERGE (DELETE-only) — retracts rows with negative multiplicity from
-    *      the MV using value-equality `IS NOT DISTINCT FROM` conditions.
-    *
-    * The openivm-emitted Statement C has the form:
+    * Input (single statement, DuckDB-target):
     * {{{
     *   INSERT INTO openivm_data_<view> SELECT <user_cols>
     *   FROM openivm_delta_<view>, generate_series(1, openivm_multiplicity::BIGINT)
     *   WHERE openivm_timestamp > '<ts>'::TIMESTAMP AND openivm_multiplicity > 0
     * }}}
     *
-    * After rewrite:
-    * {{{
-    *   INSERT INTO <mv> SELECT <user_cols>
-    *   FROM (
-    *     SELECT <user_cols>, CAST(`openivm_multiplicity` AS BIGINT) AS __openivm_expand_mult
-    *     FROM delta.<viewDeltaPath>
-    *     WHERE `openivm_multiplicity` > 0
-    *   ) __openivm_expand_src
-    *   LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), __openivm_expand_src.__openivm_expand_mult))
-    *     __openivm_expand_lv AS __openivm_expand_idx
+    * Output (three Spark statements, returned in execution order):
     *
+    * Statement A — consolidate the view-delta into one net row per
+    * `(user_cols)` group (mirroring DuckDB's `openivm_net` CTE at
+    * `.temp/openivm/src/upsert/refresh_compiler.cpp:825-826`):
+    * {{{
+    *   CREATE OR REPLACE TEMPORARY VIEW `openivm_sp_net_<view>` AS
+    *     SELECT <user_cols>, SUM(CAST(`openivm_multiplicity` AS BIGINT)) AS __openivm_net
+    *     FROM delta.<viewDeltaPath>
+    *     GROUP BY <user_cols>
+    *     HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) != 0
+    * }}}
+    *
+    * Statement B — MERGE-DELETE all MV rows matching any negative-net group.
+    * Delta `WHEN MATCHED THEN DELETE` deletes ALL matching MV rows per source
+    * row by design here — this is the **over-delete** that Statement C
+    * compensates for. Marked with `SimpleProjectionDeleteMergeMarker` so the
+    * dispatcher can skip it when the view-delta has no negative-multiplicity
+    * rows.
+    * {{{
+    *   /*OPENIVM_SIMPLE_PROJECTION_DELETE_MERGE*/
     *   MERGE INTO <mv> AS v
-    *   USING (SELECT <user_cols> FROM delta.<viewDeltaPath> WHERE `openivm_multiplicity` < 0) AS d
+    *   USING (SELECT <user_cols> FROM `openivm_sp_net_<view>` WHERE __openivm_net < 0) AS d
     *   ON v.<c1> IS NOT DISTINCT FROM d.<c1> AND ...
     *   WHEN MATCHED THEN DELETE
     * }}}
     *
-    * Multiplicity expansion (`LATERAL VIEW EXPLODE(SEQUENCE(...))`) is the
-    * Spark-side equivalent of openivm's `generate_series(1, mul::BIGINT)`. It is
-    * required when an upstream cascade compaction collapses K duplicate input
-    * rows into a single view-delta row with `openivm_multiplicity = ±K` — the
-    * MV must end up with K physical copies. Without expansion, the INSERT side
-    * would silently drop `K - 1` copies per such tuple (the original
-    * `fact_watches` MV-over-MV bug — `.research/OPENIVM-BUG.md`).
+    * Statement C — INSERT the bag-correct count for every affected group:
+    *   - For groups with `_net > 0`: insert `_net` copies (positive-side
+    *     INSERT, equivalent to DuckDB's
+    *     `INSERT … FROM openivm_net, generate_series(1, _net)` at
+    *     `refresh_compiler.cpp:854-860`).
+    *   - For groups with `_net < 0`: re-INSERT `max(0, _cur + _net)` copies
+    *     where `_cur` is the **pre-DELETE** MV bag-count for the group, read
+    *     via Delta time travel `delta.<mvLocation> VERSION AS OF <V>`. This
+    *     restores the `(_cur - |_net|)` copies that Statement B over-deleted.
     *
-    * OpenIVM limitation: this MERGE uses value-equality which is non-deterministic
-    * when the MV contains a non-`|mult|`-equal number of duplicate rows
-    * (Delta MERGE `WHEN MATCHED THEN DELETE` deletes ALL matching copies).
-    * In the supported workloads the MV has exactly `K = |mult|` copies of each
-    * projected tuple, so over-deletion does not happen; if you build an MV
-    * shape where this invariant is violated, consider the FULL_REFRESH
-    * fallback (triggered by `hasConflictingSimpleProjectionRows`) or open an
-    * issue. See RESEARCH.md §12 risk 8.
+    * Reference DuckDB-side `rowid + ROW_NUMBER()` per-group delete
+    * (`refresh_compiler.cpp:828-852`) is functionally equivalent: it removes
+    * exactly `|_net|` copies per group. Spark Delta has no exposed `rowid`
+    * usable in a MERGE/DELETE predicate, so we instead over-delete and
+    * replenish from a Delta-time-travel snapshot of the MV taken at
+    * `mvVersionBeforeRefresh` — the version visible at refresh start, which
+    * is the pre-DELETE state because no other statements in the SP refresh
+    * program touch `<mv>` between refresh-start and Statement B.
+    *
+    * Bag-correctness guarantee: for every `(user_cols)` group `g`, letting
+    * `cur_g` be the pre-refresh MV bag-count and `net_g` be the delta net,
+    *   - `net_g >  0` → MV ends with `cur_g + net_g` copies of `g`
+    *                   (DELETE skips `g`, INSERT adds `net_g` new copies).
+    *   - `net_g <  0` → MV ends with `max(0, cur_g + net_g)` copies of `g`
+    *                   (DELETE removes all `cur_g` copies, INSERT adds
+    *                   `max(0, cur_g + net_g)` back).
+    *   - `net_g == 0` → MV unchanged.
+    *
+    * Failure mode this fixes: when an upstream cascade compaction (or even
+    * the initial CREATE, which inserts each source row independently) leaves
+    * the MV with N value-equal copies of a tuple, and a subsequent
+    * incremental refresh retracts ONLY M < N of those source rows (delta
+    * carries `_net = -M`), the pre-fix value-equality
+    * `MERGE … WHEN MATCHED THEN DELETE` removed ALL N copies, leaving
+    * `N - M` MV rows missing. This was the SF=10 `gold.fact_holdings
+    * diff=18` failure shape and the `fact_watches` SF=3 failure documented
+    * in `.research/OPENIVM-BUG.md`. See `SimpleProjectionBagDeleteSpec`
+    * for the unit-scale regression coverage.
+    *
+    * Multiplicity expansion via `LATERAL VIEW EXPLODE(SEQUENCE(...))` is the
+    * Spark-side equivalent of openivm's `generate_series(1, mul::BIGINT)`
+    * (`refresh_compiler.cpp:813-820, 854-860`). The positive-multiplicity
+    * filter MUST stay inside the inner subquery so that `SEQUENCE(1, n)` is
+    * never evaluated with `n <= 0` — Spark's `SEQUENCE` defaults step to
+    * `-1` when `stop < start` and returns the descending `[1, 0]` /
+    * `[1, 0, -1]` etc., which would over-insert.
+    *
+    * If `mvVersionBeforeRefresh` is `None`, falls back to reading the
+    * post-DELETE MV state (which yields `_cur = 0` for every retracted
+    * group, so the bag-replenish becomes a no-op — i.e. the pre-fix
+    * over-delete behaviour). All in-tree callers pass `Some(meta.lastVersion)`
+    * from [[org.openivm.spark.commands.MaterializedViewCommands]].
     */
   private def rewriteSimpleProjectionDataInsert(
       stmt: String,
       viewLogicalName: String,
       mvName: TableIdentifier,
-      viewDeltaPath: String
+      mvLocation: String,
+      viewDeltaPath: String,
+      mvVersionBeforeRefresh: Option[Long]
   ): Seq[String] = {
     val mv          = backtickMvName(mvName)
     val escapedPath = viewDeltaPath.replace("`", "``")
@@ -864,51 +916,83 @@ object SparkRefreshRewriter {
     if (userCols.isEmpty) return Nil
 
     val colList = userCols.mkString(", ")
+    // Unique-per-MV temp view name. `viewLogicalName` is the short MV name
+    // (`TableIdentifier.table`), normally a bare ident; backtick-escaped at
+    // the use site to be safe.
+    val netView           = s"openivm_sp_net_$viewLogicalName"
+    val netViewBackticked = s"`${netView.replace("`", "``")}`"
 
-    // 1. INSERT: assert positive-multiplicity rows into the MV.
-    //
-    // Each view-delta row carries `openivm_multiplicity` which is the *count*
-    // of physical copies the cascade compaction collapsed. openivm's
-    // DuckDB-side reference implementation replicates each row using
-    // `generate_series(1, mul::BIGINT)` (refresh_compiler.cpp:813-820). Spark
-    // has no `generate_series`; the equivalent idiom is
-    //
-    //   LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), mult)) ...
-    //
-    // The positive-multiplicity filter MUST stay inside the inner subquery so
-    // that `SEQUENCE(1, n)` is never evaluated with `n <= 0` — Spark's
-    // `SEQUENCE` defaults step to -1 when stop<start and returns the
-    // descending `[1, 0]` / `[1, 0, -1]` etc., which would over-insert.
-    // Helper aliases are prefixed `__openivm_expand_` to make collisions with
-    // user-visible column names effectively impossible.
-    val insertSql =
-      s"""|INSERT INTO $mv
-          |SELECT $colList
-          |FROM (
-          |  SELECT $colList, CAST(`openivm_multiplicity` AS BIGINT) AS __openivm_expand_mult
-          |  FROM $deltaRef
-          |  WHERE `openivm_multiplicity` > 0
-          |) __openivm_expand_src
-          |LATERAL VIEW EXPLODE(
-          |  SEQUENCE(CAST(1 AS BIGINT), __openivm_expand_src.__openivm_expand_mult)
-          |) __openivm_expand_lv AS __openivm_expand_idx""".stripMargin
+    // NULL-safe value-equality (mirrors DuckDB's `IS NOT DISTINCT FROM`)
+    val nullSafeEq = (lhs: String, rhs: String) =>
+      userCols.map(c => s"$lhs.$c IS NOT DISTINCT FROM $rhs.$c").mkString(" AND ")
 
-    // 2. MERGE (DELETE-only): retract negative-multiplicity rows from the MV
-    val onCondition = userCols
-      .map(c => s"v.$c IS NOT DISTINCT FROM d.$c")
-      .mkString(" AND ")
+    // ─── Statement A: consolidate the view-delta into one net row per group ───
+    val createNetView =
+      s"""|CREATE OR REPLACE TEMPORARY VIEW $netViewBackticked AS
+          |SELECT $colList,
+          |       SUM(CAST(`openivm_multiplicity` AS BIGINT)) AS __openivm_net
+          |FROM $deltaRef
+          |GROUP BY $colList
+          |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) != 0""".stripMargin
+
+    // ─── Statement B: MERGE-DELETE all MV rows in any negative-net group ───
+    // This deletes ALL matching copies (Delta MERGE semantics), which
+    // over-deletes when MV has more value-equal copies than |_net|.
+    // Statement C compensates by re-inserting the bag-correct count.
     val deleteMergeSql = markSimpleProjectionDeleteMerge(
       s"""|MERGE INTO $mv AS v
           |USING (
           |  SELECT $colList
-          |  FROM $deltaRef
-          |  WHERE `openivm_multiplicity` < 0
+          |  FROM $netViewBackticked
+          |  WHERE __openivm_net < 0
           |) AS d
-          |ON $onCondition
+          |ON ${nullSafeEq("v", "d")}
           |WHEN MATCHED THEN DELETE""".stripMargin
     )
 
-    Seq(insertSql, deleteMergeSql)
+    // ─── Statement C: bag-correct INSERT ───
+    // Combines:
+    //   • positive-net groups → insert `_net` copies (no over-delete to undo).
+    //   • negative-net groups → insert `max(0, _cur + _net)` copies, where
+    //                            `_cur` is the **pre-DELETE** MV bag-count
+    //                            read via Delta time travel.
+    val escapedMvLocation = mvLocation.replace("`", "``")
+    val mvSnapshotRef = mvVersionBeforeRefresh match {
+      case Some(v) => s"delta.`$escapedMvLocation` VERSION AS OF $v"
+      case None    => s"delta.`$escapedMvLocation`"
+    }
+    val mvUserCols  = userCols.map(c => s"v.$c").mkString(", ")
+    val aliasMvCols = userCols.map(c => s"v.$c AS $c").mkString(", ")
+
+    val insertSql =
+      s"""|INSERT INTO $mv
+          |SELECT $colList
+          |FROM (
+          |  SELECT ${userCols.map(c => s"n.$c AS $c").mkString(", ")},
+          |    CASE
+          |      WHEN n.__openivm_net > 0 THEN n.__openivm_net
+          |      WHEN n.__openivm_net < 0
+          |        THEN GREATEST(
+          |               CAST(0 AS BIGINT),
+          |               COALESCE(a.__openivm_cur, CAST(0 AS BIGINT)) + n.__openivm_net
+          |             )
+          |      ELSE CAST(0 AS BIGINT)
+          |    END AS __openivm_to_insert
+          |  FROM $netViewBackticked n
+          |  LEFT JOIN (
+          |    SELECT $aliasMvCols, COUNT(*) AS __openivm_cur
+          |    FROM $mvSnapshotRef v
+          |    JOIN $netViewBackticked n2
+          |      ON n2.__openivm_net < 0 AND ${nullSafeEq("v", "n2")}
+          |    GROUP BY $mvUserCols
+          |  ) a ON ${nullSafeEq("n", "a")}
+          |) __openivm_src
+          |LATERAL VIEW EXPLODE(
+          |  SEQUENCE(CAST(1 AS BIGINT), __openivm_src.__openivm_to_insert)
+          |) __openivm_lv AS __openivm_idx
+          |WHERE __openivm_src.__openivm_to_insert > 0""".stripMargin
+
+    Seq(createNetView, deleteMergeSql, insertSql)
   }
 
   // ── SIMPLE_AGGREGATE Statements C/D/E rewrite (ScalarUpdate) ─────────────

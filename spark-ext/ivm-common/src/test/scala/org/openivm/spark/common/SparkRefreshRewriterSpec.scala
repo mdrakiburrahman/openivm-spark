@@ -507,17 +507,43 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         mvLocation = mvLocation,
         viewLogicalName = viewLogicalName,
         sourceTempViews = Map("users" -> "openivm_delta_users"),
-        viewDeltaPath = viewDeltaPath
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(42L)
       )
 
-      rewritten.statements should have size 3
+      // 4 surviving statements:
+      //   0. view-delta CTAS (CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` …)
+      //   1. CREATE OR REPLACE TEMPORARY VIEW `openivm_sp_net_mv_r` (consolidate net per cols)
+      //   2. MERGE INTO `mydb`.`mv_r` … WHEN MATCHED THEN DELETE  ← marked
+      //   3. INSERT INTO `mydb`.`mv_r` …  (bag-correct INSERT)
+      rewritten.statements should have size 4
       SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements.head) shouldBe false
       SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(1)) shouldBe false
       SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(2)) shouldBe true
+      SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(3)) shouldBe false
 
+      // Stmt 1: net-consolidation TEMP VIEW
+      val netView = rewritten.statements(1)
+      netView should startWith("CREATE OR REPLACE TEMPORARY VIEW `openivm_sp_net_mv_r`")
+      netView should include("SUM(CAST(`openivm_multiplicity` AS BIGINT)) AS __openivm_net")
+      netView should include(s"FROM delta.`$viewDeltaPath`")
+      netView should include("HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) != 0")
+
+      // Stmt 2: MERGE-DELETE — now sources from the net view, not raw delta
       val deleteMerge = SparkRefreshRewriter.stripExecutionMarker(rewritten.statements(2))
       deleteMerge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
-      deleteMerge should include("WHERE `openivm_multiplicity` < 0")
+      deleteMerge should include("FROM `openivm_sp_net_mv_r`")
+      deleteMerge should include("WHERE __openivm_net < 0")
+      deleteMerge should include("WHEN MATCHED THEN DELETE")
+
+      // Stmt 3: bag-correct INSERT — reads pre-DELETE MV state via Delta time travel,
+      // re-inserts `max(0, _cur + _net)` copies per over-deleted group.
+      val bagInsert = rewritten.statements(3)
+      bagInsert should startWith("INSERT INTO `mydb`.`mv_r`")
+      bagInsert should include(s"FROM delta.`$mvLocation` VERSION AS OF 42 v")
+      bagInsert should include("COALESCE(a.__openivm_cur, CAST(0 AS BIGINT)) + n.__openivm_net")
+      bagInsert should include("LATERAL VIEW EXPLODE(")
+      bagInsert should include("WHERE __openivm_src.__openivm_to_insert > 0")
     }
   }
 
