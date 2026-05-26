@@ -12,6 +12,8 @@
  *
  *   SHOW OPENIVM REFRESH PROFILE
  *
+ *   SHOW OPENIVM QUERY LOG
+ *
  * The grammar is invoked only when `IvmParser.parsePlan` sees a statement
  * whose head matches one of the four forms above; otherwise the input is
  * delegated to Spark's own parser unchanged.
@@ -39,6 +41,7 @@ ivmStatement
     | refreshMaterializedView
     | dropMaterializedView
     | showOpenivmRefreshProfile
+    | showOpenivmQueryLog
     ;
 
 createMaterializedView
@@ -59,6 +62,10 @@ dropMaterializedView
 
 showOpenivmRefreshProfile
     : SHOW OPENIVM REFRESH PROFILE
+    ;
+
+showOpenivmQueryLog
+    : SHOW OPENIVM QUERY LOG
     ;
 
 queryBody
@@ -98,6 +105,7 @@ identifier
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
+    | QUERY | LOG
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -116,6 +124,8 @@ TBLPROPERTIES : [Tt][Bb][Ll][Pp][Rr][Oo][Pp][Ee][Rr][Tt][Ii][Ee][Ss];
 SHOW          : [Ss][Hh][Oo][Ww];
 OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
 PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
+QUERY         : [Qq][Uu][Ee][Rr][Yy];
+LOG           : [Ll][Oo][Gg];
 
 EQ            : '=' | '==';
 

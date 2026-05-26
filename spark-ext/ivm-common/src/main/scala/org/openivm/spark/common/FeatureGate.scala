@@ -72,6 +72,24 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
+  /** Capture every SQL statement actually executed by a CREATE / REFRESH
+    * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
+    * family ([[RefreshSqlLogCatalog]]).
+    *
+    * Default OFF — production paths pay only a microsecond-per-statement
+    * inline cost when the gate is OFF (a NoOp recorder is returned).
+    *
+    * The ivm-bench spark-openivm container flips this ON via
+    * `spark-defaults.conf.tmpl` parameterised off `OPENIVM_QUERY_LOG=1` so
+    * benchmark runs always collect the full per-MV SQL trace while normal
+    * users get the silent-fast-path default.
+    *
+    * Read via `SHOW OPENIVM QUERY LOG`. The catalog row's `refresh_id`
+    * matches the corresponding `RefreshProfileCatalog` row so the two are
+    * joinable.
+    */
+  val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -98,6 +116,12 @@ object FeatureGate {
 
   def profileRefreshEnabled(conf: SparkConf): Boolean =
     boolConf(conf, ProfileRefreshKey, default = false)
+
+  def queryLogEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)
+
+  def queryLogEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, QueryLogEnabledKey, default = false)
 
   /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled. */
   def buildMvDataTblProperties(spark: SparkSession): Seq[String] = {

@@ -9,6 +9,7 @@ import org.apache.spark.sql.catalyst.trees.Origin
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ShowQueryLogCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
@@ -60,6 +61,11 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       ctx: IvmSqlBaseParser.ShowOpenivmRefreshProfileContext
   ): AnyRef =
     ShowRefreshProfileCommand()
+
+  override def visitShowOpenivmQueryLog(
+      ctx: IvmSqlBaseParser.ShowOpenivmQueryLogContext
+  ): AnyRef =
+    ShowQueryLogCommand()
 
   // -------------------------------------------------------------------------
   // Helpers

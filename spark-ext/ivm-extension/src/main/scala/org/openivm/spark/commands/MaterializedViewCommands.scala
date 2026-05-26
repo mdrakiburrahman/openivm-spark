@@ -448,15 +448,33 @@ case class CreateMaterializedViewCommand(
 
     val createT0 = System.nanoTime()
     val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
-    try runCreate(spark, profile)
+    val sqlLog =
+      RefreshSqlLog.start(spark, profile.refreshId, metaName(name), RefreshSqlLog.ModeCreate)
+    // Record the user-supplied CREATE-MV body up front. Not executed by us
+    // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
+    // because it's the verbatim user query.
+    sqlLog.record(
+      category = "original_query",
+      stmtOrder = -1,
+      attemptIdx = 0,
+      stmtKind = "select",
+      sql = originalQueryText,
+      durationMs = -1L
+    )
+    try runCreate(spark, profile, sqlLog)
     finally {
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
       profile.flush()
+      sqlLog.flush()
     }
   }
 
-  private def runCreate(spark: SparkSession, profile: RefreshProfile): Seq[Row] = {
+  private def runCreate(
+      spark: SparkSession,
+      profile: RefreshProfile,
+      sqlLog: RefreshSqlLog
+  ): Seq[Row] = {
     import MvCommandHelper._
 
     profile.timeStep("create_mv_system_tables", "scope=mv_and_staging") {
@@ -865,7 +883,20 @@ case class CreateMaterializedViewCommand(
         "create_mv_initial_load",
         s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${initSql.length}"
       ) {
-        spark.sql(initSql)
+        val t0 = System.nanoTime()
+        try {
+          spark.sql(initSql)
+        } finally {
+          val ms = (System.nanoTime() - t0) / 1000000L
+          sqlLog.record(
+            category = "initial_load_ctas",
+            stmtOrder = 0,
+            attemptIdx = 0,
+            stmtKind = RefreshPerf.classify(initSql, ""),
+            sql = initSql,
+            durationMs = ms
+          )
+        }
       }
 
       // For AGGREGATE_HAVING we additionally create the user-facing Spark VIEW
@@ -889,10 +920,23 @@ case class CreateMaterializedViewCommand(
           val colList = userOutputCols
             .map(c => s"`${c.replace("`", "``")}`")
             .mkString(", ")
-          spark.sql(
+          val viewSql =
             s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
               s"SELECT $colList FROM ${sqlIdent(dataIdent)} WHERE ($pred)"
-          )
+          val t0 = System.nanoTime()
+          try {
+            spark.sql(viewSql)
+          } finally {
+            val ms = (System.nanoTime() - t0) / 1000000L
+            sqlLog.record(
+              category = "aggregate_having_view",
+              stmtOrder = 1,
+              attemptIdx = 0,
+              stmtKind = "ddl",
+              sql = viewSql,
+              durationMs = ms
+            )
+          }
         }
       }
 
@@ -947,6 +991,11 @@ case class RefreshMaterializedViewCommand(
     val threadName = Thread.currentThread().getName
     val profile    = RefreshProfile.start(spark, viewMeta, RefreshProfile.Mode.Refresh)
     val refreshId  = profile.refreshId
+    val sqlLog     = RefreshSqlLog.start(spark, refreshId, viewMeta, RefreshSqlLog.ModeRefresh)
+    // A query-log-only monotonic counter. Independent of the perf
+    // `stmtCounter` so source-delta registrations, count-monoid cleanup,
+    // post-cleanup, and drop-cleanup get clean sequential row ids.
+    val qlogOrder = new java.util.concurrent.atomic.AtomicInteger(0)
     profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
     RefreshPerf.emit(refreshId, viewLabel, "start", s"thread='$threadName'")
 
@@ -965,6 +1014,7 @@ case class RefreshMaterializedViewCommand(
         totalMs
       )
       profile.flush()
+      sqlLog.flush()
     }
 
     val meta = MvCatalog
@@ -979,6 +1029,15 @@ case class RefreshMaterializedViewCommand(
 
     val viewNameStr      = metaName(name)
     val sourceWatermarks = meta.sourceWatermarks
+
+    // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
+    // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
+    // and record_cascade trigger-key resolution).  A RocksDB prefix scan
+    // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
+    // and reuse.  Defensive try/catch matches the original call sites.
+    lazy val allMvsCached: Seq[MvMetadata] =
+      try MvCatalog.list(spark)
+      catch { case _: Throwable => Seq.empty[MvMetadata] }
 
     if (
       meta.refreshType != RefreshTypeCode.FullRefresh &&
@@ -1014,6 +1073,20 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
+    // Once we know we'll be doing real work, record the user-supplied CREATE-MV
+    // body as the leading row of this refresh's query log. Not executed by us
+    // (stmt_order = -1, duration_ms = -1) but invaluable for the benchmarker
+    // because it pins "what the user asked for" alongside "what we actually ran"
+    // in a single refresh-id folder.
+    sqlLog.record(
+      category = "original_query",
+      stmtOrder = -1,
+      attemptIdx = 0,
+      stmtKind = "select",
+      sql = meta.querySql,
+      durationMs = -1L
+    )
+
     logInfo(
       s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
         s"pending_deltas=${stagingDeltas.size} source_tables=${meta.sourceTables.mkString(",")}"
@@ -1038,9 +1111,7 @@ case class RefreshMaterializedViewCommand(
         RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
           val schemas = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
           val identityMap: Map[String, String] = {
-            val all: Seq[MvMetadata] =
-              try MvCatalog.list(spark)
-              catch { case _: Throwable => Seq.empty[MvMetadata] }
+            val all                             = allMvsCached
             val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
             meta.sourceTables.flatMap { qn =>
               val short = qn.split("\\.").last
@@ -1087,19 +1158,33 @@ case class RefreshMaterializedViewCommand(
         assembled.statements.foreach { sql =>
           val kind     = RefreshPerf.classify(sql, "")
           val sqlBytes = sql.length
+          val qOrder   = qlogOrder.getAndIncrement()
           profile.timeStep(
             "execute_refresh_sql_stmt",
             s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
           ) {
             RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
-              RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+              RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                val t0 = System.nanoTime()
+                try {
+                  val r  = spark.sql(sql).collect()
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
+                  r
+                } catch {
+                  case t: Throwable =>
+                    val ms = (System.nanoTime() - t0) / 1000000L
+                    sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
+                    throw t
+                }
+              }
             }
           }
           stmtCounter += 1
         }
         profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
           RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-            postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr)
+            postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr, sqlLog, qlogOrder)
           }
         }
         emitEnd("full_refresh_executed", "FULL_REFRESH", stagingDeltas.size)
@@ -1203,6 +1288,12 @@ case class RefreshMaterializedViewCommand(
     val byTable                          = stagingDeltas.groupBy(_.baseTable)
     val tempViewShortNames               = scala.collection.mutable.ArrayBuffer[String]()
     var fusedScratchView: Option[String] = None
+    // Phase A — universal temp-view cache.  Names of openivm-emitted
+    // CREATE [OR REPLACE] TEMP[ORARY] VIEW statements that the pre-pass
+    // determined have ≥ 2 downstream references in the same refresh program
+    // and therefore benefit from being cached in-memory.  Populated and
+    // uncached symmetrically; cleanup runs in the finally block below.
+    val cachedAuxTempViews = scala.collection.mutable.ListBuffer[String]()
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -1216,7 +1307,20 @@ case class RefreshMaterializedViewCommand(
             val schema      = freshSchemas(qualTable)
             val tableDeltas = byTable.getOrElse(qualTable, Seq.empty)
             val viewSql     = StagingDeltaView.buildSourceDeltaViewSql(qualTable, schema, tableDeltas)
-            spark.sql(viewSql)
+            val t0          = System.nanoTime()
+            try {
+              spark.sql(viewSql)
+            } finally {
+              val ms = (System.nanoTime() - t0) / 1000000L
+              sqlLog.record(
+                category = "register_source_delta",
+                stmtOrder = qlogOrder.getAndIncrement(),
+                attemptIdx = 0,
+                stmtKind = "temp_view",
+                sql = viewSql,
+                durationMs = ms
+              )
+            }
             tempViewShortNames += qualTable.split("\\.").last
 
             if (diagnosticsEnabled) {
@@ -1294,6 +1398,36 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
+      // ── Phase A: universal temp-view cache pre-pass ───────────────────
+      //
+      // openivm-emitted refresh programs frequently include a CREATE TEMP
+      // VIEW that is read by ≥ 2 subsequent statements (e.g. WINDOW_PARTITION
+      // and AGGREGATE_GROUP both emit a heavy SELECT temp view consumed by a
+      // MERGE + an INSERT INTO cascade-delta + a view-delta CTAS).  Spark
+      // temp views are query aliases — each reader re-plans and re-evaluates
+      // the upstream join/window.  Caching that temp view after creation
+      // collapses N evaluations into 1 + N reads of an InMemoryRelation.
+      //
+      // Pre-pass: walk rewritten.statements once, extract every CREATE [OR
+      // REPLACE] TEMP[ORARY] VIEW <name> and count references to <name> in
+      // later statements.  Names referenced ≥ 2 times go into the cache set;
+      // cache fires after the corresponding CREATE in `executeSqlAt`.
+      val cacheableTempViews: Set[String] = {
+        val createPat = """(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY|TEMP)\s+VIEW\s+`?(\w+)`?""".r
+        val stmts     = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
+        val viewIdxByName: Seq[(String, Int)] = stmts.zipWithIndex.flatMap { case (sql, idx) =>
+          createPat.findFirstMatchIn(sql).map(m => m.group(1) -> idx).toList
+        }
+        viewIdxByName.collect {
+          case (name, idx) if {
+                val refRe    = ("(?i)(?<![\\w`])`?" + java.util.regex.Pattern.quote(name) + "`?(?![\\w`])").r
+                val refCount = stmts.drop(idx + 1).map(s => refRe.findAllMatchIn(s).size).sum
+                refCount >= 2
+              } =>
+            name
+        }.toSet
+      }
+
       // Eligibility for the scratch-CTAS fuse fast path: SIMPLE_PROJECTION
       // MVs whose short name does not appear in any other MV's `sourceTables`
       // (i.e. they have no current downstream consumer) write the per-refresh
@@ -1304,8 +1438,7 @@ case class RefreshMaterializedViewCommand(
       // overhead and the second on-disk read.
       def hasNoDownstreamConsumer: Boolean = {
         val mvShortName = name.identifier
-        !MvCatalog
-          .list(spark)
+        !allMvsCached
           .exists(other =>
             metaName(other.name) != metaName(name) &&
               other.sourceTables.exists(_.split("\\.").last == mvShortName)
@@ -1353,18 +1486,79 @@ case class RefreshMaterializedViewCommand(
             done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
           }
         }
+        // Phase A: after a CREATE [OR REPLACE] TEMP[ORARY] VIEW <name>
+        // statement runs, if <name> appears in `cacheableTempViews` (i.e.
+        // the pre-pass found ≥ 2 later references), eagerly cache the view
+        // so subsequent readers share an InMemoryRelation rather than
+        // re-evaluating the upstream query graph.  Force materialization
+        // with a count(): CACHE TABLE in Spark 3.5 is eager-by-default but
+        // count() guarantees materialization before the next read.
+        val createTempViewRe =
+          """(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY|TEMP)\s+VIEW\s+`?(\w+)`?""".r
+        def maybeCacheTempView(sql: String): Unit = {
+          if (cacheableTempViews.isEmpty) return
+          createTempViewRe.findFirstMatchIn(sql).foreach { m =>
+            val viewName = m.group(1)
+            if (cacheableTempViews.contains(viewName) && !cachedAuxTempViews.contains(viewName)) {
+              val t0 = System.nanoTime()
+              try {
+                spark.catalog.cacheTable(viewName)
+                val rows      = spark.table(viewName).count()
+                val elapsedMs = (System.nanoTime() - t0) / 1000000L
+                cachedAuxTempViews += viewName
+                profile.appendStep(
+                  "cache_temp_view",
+                  s"name=$viewName;rows=$rows",
+                  elapsedMs
+                )
+              } catch {
+                case t: Throwable =>
+                  // Best-effort cache; on failure leave the view uncached so
+                  // downstream readers fall back to live evaluation.  Drop
+                  // any partial cache state.
+                  try spark.catalog.uncacheTable(viewName)
+                  catch { case _: Throwable => () }
+                  val elapsedMs = (System.nanoTime() - t0) / 1000000L
+                  profile.appendStep(
+                    "cache_temp_view",
+                    s"name=$viewName;error=${t.getClass.getSimpleName}",
+                    elapsedMs
+                  )
+              }
+            }
+          }
+        }
         def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
           val sqlBytes = sql.length
+          val qOrder   = qlogOrder.getAndIncrement()
           profile.timeStep(
             "execute_refresh_sql_stmt",
             s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
           ) {
             RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
-              RetryPolicy.DeltaConflicts.execute { spark.sql(sql).collect() }
+              RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                val t0 = System.nanoTime()
+                try {
+                  val r  = spark.sql(sql).collect()
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
+                  r
+                } catch {
+                  case t: Throwable =>
+                    val ms = (System.nanoTime() - t0) / 1000000L
+                    sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
+                    throw t
+                }
+              }
             }
           }
+          // Phase A: if this statement created a temp view that the pre-pass
+          // determined is read by ≥ 2 subsequent statements, cache it eagerly
+          // so the downstream readers consume an InMemoryRelation rather than
+          // re-evaluating the upstream join/window per read.
+          maybeCacheTempView(sql)
         }
         def executeSql(sql: String): Unit = {
           val idx = stmtCounter.getAndIncrement()
@@ -1426,6 +1620,14 @@ case class RefreshMaterializedViewCommand(
                       "execute_refresh_sql_stmt",
                       s"statement=1;stmt_kind=view_delta_ctas;fused=true;rows=$rowCount",
                       elapsedMs
+                    )
+                    sqlLog.record(
+                      category = "fused_view_delta_select",
+                      stmtOrder = qlogOrder.getAndIncrement(),
+                      attemptIdx = 0,
+                      stmtKind = "view_delta_ctas",
+                      sql = selectBody,
+                      durationMs = elapsedMs
                     )
                     fusedScratchView = Some(scratchView)
                     Some(scratchView)
@@ -1561,12 +1763,40 @@ case class RefreshMaterializedViewCommand(
             val q         = col.replace("`", "``")
             val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
             val idx       = stmtCounter.getAndIncrement()
+            val qOrder    = qlogOrder.getAndIncrement()
             profile.timeStep(
               "execute_refresh_sql_stmt",
               s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
             ) {
               RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
-                RetryPolicy.DeltaConflicts.execute { spark.sql(deleteSql).collect() }
+                RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                  val t0 = System.nanoTime()
+                  try {
+                    val r  = spark.sql(deleteSql).collect()
+                    val ms = (System.nanoTime() - t0) / 1000000L
+                    sqlLog.record(
+                      "count_monoid_cleanup",
+                      qOrder,
+                      attempt - 1,
+                      "delete",
+                      deleteSql,
+                      ms
+                    )
+                    r
+                  } catch {
+                    case t: Throwable =>
+                      val ms = (System.nanoTime() - t0) / 1000000L
+                      sqlLog.record(
+                        "count_monoid_cleanup",
+                        qOrder,
+                        attempt - 1,
+                        "delete",
+                        deleteSql,
+                        ms
+                      )
+                      throw t
+                  }
+                }
               }
             }
           }
@@ -1601,8 +1831,7 @@ case class RefreshMaterializedViewCommand(
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val mvShortName = name.identifier
-              val triggerKeys: Set[String] = MvCatalog
-                .list(spark)
+              val triggerKeys: Set[String] = allMvsCached
                 .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
                 .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
                 .toSet
@@ -1647,7 +1876,7 @@ case class RefreshMaterializedViewCommand(
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
         RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr)
+          postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr, sqlLog, qlogOrder)
         }
       }
       emitEnd(
@@ -1659,7 +1888,31 @@ case class RefreshMaterializedViewCommand(
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)
       tempViewShortNames.foreach { n =>
-        try spark.sql(StagingDeltaView.dropSourceDeltaViewSql(n))
+        val dropSql = StagingDeltaView.dropSourceDeltaViewSql(n)
+        val t0      = System.nanoTime()
+        try {
+          spark.sql(dropSql)
+        } catch { case _: Throwable => () }
+        finally {
+          val ms = (System.nanoTime() - t0) / 1000000L
+          sqlLog.record(
+            category = "drop_cleanup",
+            stmtOrder = qlogOrder.getAndIncrement(),
+            attemptIdx = 0,
+            stmtKind = "drop",
+            sql = dropSql,
+            durationMs = ms
+          )
+        }
+      }
+      // Phase A cleanup: release Spark cache storage for every aux temp
+      // view we promoted to InMemoryRelation during this refresh.  The
+      // openivm-emitted DROP VIEW statements at the end of the refresh
+      // program drop the catalog entry, but they do not unpersist a
+      // cached RDD — uncacheTable() is required here so the storage
+      // memory is returned immediately rather than waiting on GC.
+      cachedAuxTempViews.foreach { view =>
+        try spark.catalog.uncacheTable(view)
         catch { case _: Throwable => () }
       }
       fusedScratchView.foreach { view =>
@@ -1672,6 +1925,11 @@ case class RefreshMaterializedViewCommand(
         try spark.catalog.dropTempView(view)
         catch { case _: Throwable => () }
       }
+      // emitEnd() above already flushed sqlLog, but drop_cleanup rows
+      // are appended after that flush (this finally block runs after the
+      // try-body returns). A second flush is required so those rows land
+      // in RocksDB before SHOW OPENIVM QUERY LOG observes the lifecycle.
+      sqlLog.flush()
     }
 
     Seq.empty
@@ -1849,7 +2107,9 @@ case class RefreshMaterializedViewCommand(
       name: TableIdentifier,
       meta: MvMetadata,
       stagingDeltas: Seq[StagingDelta],
-      viewNameStr: String
+      viewNameStr: String,
+      sqlLog: RefreshSqlLog = RefreshSqlLog.NoOp,
+      qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0)
   ): Unit = {
     import MvCommandHelper._
     val newVersion =
@@ -1877,12 +2137,33 @@ case class RefreshMaterializedViewCommand(
         val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
         val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
         val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
-        spark
-          .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
-          .write
-          .format("delta")
-          .mode("overwrite")
-          .save(triggerPath)
+        // The actual write goes through the DataFrame API (Delta needs the
+        // `.write.format("delta")…save(triggerPath)` shape, not `spark.sql`).
+        // Synthesize an INSERT OVERWRITE representation so the query log
+        // captures the user-readable intent.
+        val syntheticSql =
+          s"-- synthetic representation of postRefreshCleanup trigger write\n" +
+            s"INSERT OVERWRITE delta.`$triggerPath`\n" +
+            s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0"
+        val t0 = System.nanoTime()
+        try {
+          spark
+            .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .save(triggerPath)
+        } finally {
+          val ms = (System.nanoTime() - t0) / 1000000L
+          sqlLog.record(
+            category = "post_cleanup_stage",
+            stmtOrder = qlogOrder.getAndIncrement(),
+            attemptIdx = 0,
+            stmtKind = "insert_overwrite",
+            sql = syntheticSql,
+            durationMs = ms
+          )
+        }
 
         val txnTs = new Timestamp(System.currentTimeMillis())
         downstreamSourceKeys.foreach { sourceKey =>
