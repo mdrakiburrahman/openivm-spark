@@ -264,6 +264,112 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  // ── 4b. DELETE-only MERGE source dedup (Cartesian-on-NULLs fix) ───────────
+  describe("MERGE USING source deduplication on NULL-safe DELETE merges") {
+    it("wraps the USING source with SELECT DISTINCT on the ON-clause key columns") {
+      val nullSafeMergeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, openivm_multiplicity)
+          |SELECT region, openivm_multiplicity FROM memory.main.openivm_delta_sales
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_mv_r AS v USING openivm_delta_mv_r AS _d
+          |ON _d.openivm_left_key IS NOT DISTINCT FROM openivm_data_mv_r.openivm_left_key
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_mv_r SELECT region FROM memory.main.sales;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = nullSafeMergeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("WHEN MATCHED THEN DELETE")).get
+      // Source is wrapped in SELECT DISTINCT on the ON-clause key column.
+      mergeStmt should include("SELECT DISTINCT openivm_left_key FROM")
+      // NULL-safe predicate is preserved unchanged.
+      mergeStmt should include("IS NOT DISTINCT FROM")
+      // Alias of the USING source is preserved.
+      mergeStmt should include regex "AS _d\\s+ON"
+    }
+
+    it("dedupes composite-key MERGE source on every ON-clause key column") {
+      val compositeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, openivm_multiplicity)
+          |SELECT region, openivm_multiplicity FROM memory.main.openivm_delta_sales
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_mv_r AS v USING openivm_delta_mv_r AS _d
+          |ON _d.openivm_left_key IS NOT DISTINCT FROM openivm_data_mv_r.openivm_left_key
+          |AND _d.region IS NOT DISTINCT FROM openivm_data_mv_r.region
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_mv_r SELECT region FROM memory.main.sales;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = compositeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("WHEN MATCHED THEN DELETE")).get
+      // DISTINCT covers BOTH key columns referenced by the ON clause.
+      mergeStmt should (include("openivm_left_key") and include("region"))
+      mergeStmt should include regex "SELECT DISTINCT (openivm_left_key, region|region, openivm_left_key) FROM"
+    }
+
+    it("leaves UPDATE/INSERT MERGEs untouched (only DELETE-only MERGEs are deduped)") {
+      // The 7-statement input's MERGE has UPDATE+INSERT clauses on `refresh_cte` —
+      // dedup must not apply, because non-key source columns are referenced
+      // in WHEN MATCHED THEN UPDATE / WHEN NOT MATCHED THEN INSERT.
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = sevenStatementInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("MERGE INTO")).get
+      // No `SELECT DISTINCT` injection on a MERGE that has WHEN MATCHED UPDATE.
+      mergeStmt should include("WHEN MATCHED THEN UPDATE")
+      mergeStmt should not include "_openivm_dedup_src"
+    }
+
+    it("does not dedupe MERGEs whose ON clause does not use IS NOT DISTINCT FROM") {
+      // A defensive test: MERGE with plain `=` semantics is left alone.
+      val plainEqInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, openivm_multiplicity)
+          |SELECT region, openivm_multiplicity FROM memory.main.openivm_delta_sales
+          |WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |MERGE INTO openivm_data_mv_r AS v USING openivm_delta_mv_r AS _d
+          |ON _d.openivm_left_key = openivm_data_mv_r.openivm_left_key
+          |WHEN MATCHED THEN DELETE;
+          |INSERT INTO openivm_data_mv_r SELECT region FROM memory.main.sales;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = plainEqInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements.find(_.contains("WHEN MATCHED THEN DELETE")).get
+      mergeStmt should not include "_openivm_dedup_src"
+      mergeStmt should not include "SELECT DISTINCT"
+    }
+  }
+
   // ── 5. openivm_delta_mv_r → delta.`<viewDeltaPath>` ───────────────────────
   describe("view-delta identifier rewrite in statement C") {
     it("rewrites openivm_delta_mv_r (the per-refresh CTAS sink) to delta.`<viewDeltaPath>`") {

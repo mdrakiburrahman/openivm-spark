@@ -210,7 +210,8 @@ object SparkRefreshRewriter {
       // schemas supplied by the caller.
       val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
       val withAliasFixup     = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
-      RewrittenRefresh(withAliasFixup.map(postProcess))
+      val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
+      RewrittenRefresh(withDedupedSource.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
     }
@@ -2060,6 +2061,125 @@ object SparkRefreshRewriter {
         val fixedBody = body.replace(mvDot, alias + ".")
         stmt.substring(0, bodyStart) + fixedBody
       case None => stmt
+    }
+  }
+
+  /** Dedupe the USING source of a DELETE-only MERGE whose ON clause uses
+    * `IS NOT DISTINCT FROM` predicates.
+    *
+    * Why: OpenIVM emits MERGE statements like
+    *   {{{
+    *     MERGE INTO openivm_data_<v> AS v
+    *     USING openivm_delta_<v> AS _d
+    *     ON _d.openivm_left_key IS NOT DISTINCT FROM v.openivm_left_key
+    *     WHEN MATCHED THEN DELETE
+    *   }}}
+    * to retract MV rows whose hidden join-key column matches any key in the
+    * view-delta. The predicate is intentionally NULL-safe — openivm packs all
+    * LEFT/FULL OUTER dangling rows under a NULL key, and they must all be
+    * recomputed when the right-side delta touches the NULL group (see
+    * .temp/openivm/docs/operators/full-outer-join.md:61).
+    *
+    * The problem is **duplicate keys in the source**: if the view-delta has
+    * many rows sharing the same key value (e.g. 200 NULL-keyed rows for the
+    * LEFT-dangling group, or a hot non-NULL key duplicated many times), the
+    * MERGE join with the MV's same-keyed rows produces an N×M intermediate
+    * — a Cartesian explosion that overflows Spark's broadcast cap (8 GiB) and
+    * fails with `Cannot broadcast the table that is larger than 8.0 GiB`.
+    *
+    * The fix is to wrap the USING source with a `SELECT DISTINCT <key_cols>
+    * FROM (<orig_source>)` projection. This:
+    *   1. Preserves the NULL-safe `IS NOT DISTINCT FROM` semantic openivm
+    *      requires (NULL still matches NULL — once).
+    *   2. Removes the duplicate-key amplification (one source row per
+    *      affected key).
+    *   3. Gives Spark accurate row-count statistics for the MERGE join
+    *      planning.
+    *
+    * Triggers only when:
+    *   - statement is a MERGE INTO the rewritten MV target
+    *   - the only WHEN clause is `WHEN MATCHED THEN DELETE` (no
+    *     INSERT/UPDATE branches that would reference non-key source columns)
+    *   - the ON clause contains at least one `IS NOT DISTINCT FROM`
+    *
+    * Safe no-op otherwise.
+    */
+  private def deduplicateNullSafeMergeSource(stmt: String, mvName: TableIdentifier): String = {
+    val mvSqlName = backtickMvName(mvName)
+
+    // Detect MERGE INTO <mv> [AS] <alias> USING <source> [AS] <usingAlias> ON <pred> WHEN <when-body>
+    // Use paren-aware parsing for the source so subquery `(…)` forms are
+    // captured correctly.
+    val headerRe = ("(?is)\\bMERGE\\s+INTO\\s+" +
+      java.util.regex.Pattern.quote(mvSqlName) +
+      "(?:\\s+AS)?\\s+\"?(\\w+)\"?\\s+USING\\s+").r
+
+    headerRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val afterUsing = m.end
+        // Find the source token: either `(<paren-balanced>)` or a non-whitespace token.
+        val srcEnd =
+          if (afterUsing < stmt.length && stmt(afterUsing) == '(') {
+            val close = findMatchingCloseParen(stmt, afterUsing)
+            if (close < 0) return stmt
+            close + 1
+          } else {
+            // Match up to whitespace, but respect backticked identifiers like delta.`<path>`
+            var i          = afterUsing
+            var inBacktick = false
+            while (i < stmt.length && (inBacktick || !Character.isWhitespace(stmt(i)))) {
+              if (stmt(i) == '`') inBacktick = !inBacktick
+              i += 1
+            }
+            i
+          }
+        val source = stmt.substring(afterUsing, srcEnd)
+
+        // Parse "[AS] <alias> ON <on-predicate> WHEN <when-body>"
+        val tailRe = """(?is)^\s*(?:AS\s+)?(\w+)\s+ON\s+(.+?)\s+WHEN\s+""".r
+        val tailMatch = tailRe.findFirstMatchIn(stmt.substring(srcEnd)) match {
+          case Some(tm) => tm
+          case None     => return stmt
+        }
+        val usingAlias     = tailMatch.group(1)
+        val onPredicate    = tailMatch.group(2)
+        val onPredicateEnd = srcEnd + tailMatch.end(2)
+        val whenBodyStart  = srcEnd + tailMatch.end - "WHEN ".length
+        val whenBody       = stmt.substring(whenBodyStart)
+
+        // Gate 1: NULL-safe predicate is the trigger we care about.
+        if (!onPredicate.toUpperCase.contains("IS NOT DISTINCT FROM")) return stmt
+
+        // Gate 2: only DELETE WHEN clauses (no INSERT/UPDATE that would need
+        // non-key source columns).  Look at the WHEN-body up to the next
+        // semicolon (or end-of-statement); reject if it contains INSERT or
+        // UPDATE.
+        val whenBodyUpper = whenBody.toUpperCase
+        if (whenBodyUpper.contains("INSERT") || whenBodyUpper.contains("UPDATE")) return stmt
+
+        // Extract the columns referenced via the USING alias in the ON clause.
+        // Match `<alias>.<col>` where col is either an unquoted identifier or
+        // a backticked identifier.
+        val aliasColRe = ("(?i)\\b" + java.util.regex.Pattern.quote(usingAlias) +
+          "\\s*\\.\\s*(`[^`]+`|\\w+)").r
+        val keyCols = aliasColRe.findAllMatchIn(onPredicate).map(_.group(1)).toList.distinct
+        if (keyCols.isEmpty) return stmt
+
+        // Build the deduped source.  Wrap the original source in a derived
+        // table that selects DISTINCT on just the key columns referenced by
+        // the ON clause.  The original source may be a bare table reference
+        // (`delta.\`<path>\``), a backticked identifier, or a parenthesized
+        // subquery — `SELECT DISTINCT … FROM <source>` works for all three.
+        // (For a paren-wrapped subquery, the wrapping parens are preserved by
+        // `source` substring.)
+        val dedupedSource = s"(SELECT DISTINCT ${keyCols.mkString(", ")} FROM $source AS _openivm_dedup_src)"
+
+        // Rebuild the statement: original head up to USING, dedupedSource,
+        // " AS <usingAlias> ON ", onPredicate, trailing.
+        val head     = stmt.substring(0, afterUsing)
+        val trailing = stmt.substring(onPredicateEnd)
+        s"$head$dedupedSource AS $usingAlias ON $onPredicate$trailing"
     }
   }
 }
