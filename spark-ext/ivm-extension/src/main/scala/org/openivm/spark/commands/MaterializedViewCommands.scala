@@ -977,7 +977,18 @@ case class RefreshMaterializedViewCommand(
     val lockT0 = System.nanoTime()
     RefreshMutex.withLock(metaName(name)) {
       val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-      runUnderLock(spark, lockAcqMs)
+      // Clone the SparkSession so every refresh gets its own temp-view
+      // namespace.  Concurrent refresh waves (e.g. TpcDiSpec's
+      // `runWaveParallel`) routinely register session-global
+      // `openivm_delta_<source>` temp views; without isolation, sibling MVs
+      // racing through CREATE OR REPLACE TEMP VIEW + DROP VIEW can yank or
+      // replace a temp view mid-MERGE in another refresh, surfacing as
+      // `[TABLE_OR_VIEW_NOT_FOUND] openivm_delta_<source>` or returning
+      // rows from the wrong refresh's deltas.  `cloneSession` copies
+      // SessionState (temp catalog, SQLConf, registered extensions) but
+      // shares SparkContext and table cache, so the cost is microseconds
+      // per refresh.
+      runUnderLock(org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark), lockAcqMs)
     }
   }
 
@@ -1288,12 +1299,6 @@ case class RefreshMaterializedViewCommand(
     val byTable                          = stagingDeltas.groupBy(_.baseTable)
     val tempViewShortNames               = scala.collection.mutable.ArrayBuffer[String]()
     var fusedScratchView: Option[String] = None
-    // Phase A — universal temp-view cache.  Names of openivm-emitted
-    // CREATE [OR REPLACE] TEMP[ORARY] VIEW statements that the pre-pass
-    // determined have ≥ 2 downstream references in the same refresh program
-    // and therefore benefit from being cached in-memory.  Populated and
-    // uncached symmetrically; cleanup runs in the finally block below.
-    val cachedAuxTempViews = scala.collection.mutable.ListBuffer[String]()
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -1398,36 +1403,6 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
-      // ── Phase A: universal temp-view cache pre-pass ───────────────────
-      //
-      // openivm-emitted refresh programs frequently include a CREATE TEMP
-      // VIEW that is read by ≥ 2 subsequent statements (e.g. WINDOW_PARTITION
-      // and AGGREGATE_GROUP both emit a heavy SELECT temp view consumed by a
-      // MERGE + an INSERT INTO cascade-delta + a view-delta CTAS).  Spark
-      // temp views are query aliases — each reader re-plans and re-evaluates
-      // the upstream join/window.  Caching that temp view after creation
-      // collapses N evaluations into 1 + N reads of an InMemoryRelation.
-      //
-      // Pre-pass: walk rewritten.statements once, extract every CREATE [OR
-      // REPLACE] TEMP[ORARY] VIEW <name> and count references to <name> in
-      // later statements.  Names referenced ≥ 2 times go into the cache set;
-      // cache fires after the corresponding CREATE in `executeSqlAt`.
-      val cacheableTempViews: Set[String] = {
-        val createPat = """(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY|TEMP)\s+VIEW\s+`?(\w+)`?""".r
-        val stmts     = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
-        val viewIdxByName: Seq[(String, Int)] = stmts.zipWithIndex.flatMap { case (sql, idx) =>
-          createPat.findFirstMatchIn(sql).map(m => m.group(1) -> idx).toList
-        }
-        viewIdxByName.collect {
-          case (name, idx) if {
-                val refRe    = ("(?i)(?<![\\w`])`?" + java.util.regex.Pattern.quote(name) + "`?(?![\\w`])").r
-                val refCount = stmts.drop(idx + 1).map(s => refRe.findAllMatchIn(s).size).sum
-                refCount >= 2
-              } =>
-            name
-        }.toSet
-      }
-
       // Eligibility for the scratch-CTAS fuse fast path: SIMPLE_PROJECTION
       // MVs whose short name does not appear in any other MV's `sourceTables`
       // (i.e. they have no current downstream consumer) write the per-refresh
@@ -1486,48 +1461,6 @@ case class RefreshMaterializedViewCommand(
             done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
           }
         }
-        // Phase A: after a CREATE [OR REPLACE] TEMP[ORARY] VIEW <name>
-        // statement runs, if <name> appears in `cacheableTempViews` (i.e.
-        // the pre-pass found ≥ 2 later references), eagerly cache the view
-        // so subsequent readers share an InMemoryRelation rather than
-        // re-evaluating the upstream query graph.  Force materialization
-        // with a count(): CACHE TABLE in Spark 3.5 is eager-by-default but
-        // count() guarantees materialization before the next read.
-        val createTempViewRe =
-          """(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY|TEMP)\s+VIEW\s+`?(\w+)`?""".r
-        def maybeCacheTempView(sql: String): Unit = {
-          if (cacheableTempViews.isEmpty) return
-          createTempViewRe.findFirstMatchIn(sql).foreach { m =>
-            val viewName = m.group(1)
-            if (cacheableTempViews.contains(viewName) && !cachedAuxTempViews.contains(viewName)) {
-              val t0 = System.nanoTime()
-              try {
-                spark.catalog.cacheTable(viewName)
-                val rows      = spark.table(viewName).count()
-                val elapsedMs = (System.nanoTime() - t0) / 1000000L
-                cachedAuxTempViews += viewName
-                profile.appendStep(
-                  "cache_temp_view",
-                  s"name=$viewName;rows=$rows",
-                  elapsedMs
-                )
-              } catch {
-                case t: Throwable =>
-                  // Best-effort cache; on failure leave the view uncached so
-                  // downstream readers fall back to live evaluation.  Drop
-                  // any partial cache state.
-                  try spark.catalog.uncacheTable(viewName)
-                  catch { case _: Throwable => () }
-                  val elapsedMs = (System.nanoTime() - t0) / 1000000L
-                  profile.appendStep(
-                    "cache_temp_view",
-                    s"name=$viewName;error=${t.getClass.getSimpleName}",
-                    elapsedMs
-                  )
-              }
-            }
-          }
-        }
         def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
@@ -1554,11 +1487,6 @@ case class RefreshMaterializedViewCommand(
               }
             }
           }
-          // Phase A: if this statement created a temp view that the pre-pass
-          // determined is read by ≥ 2 subsequent statements, cache it eagerly
-          // so the downstream readers consume an InMemoryRelation rather than
-          // re-evaluating the upstream join/window per read.
-          maybeCacheTempView(sql)
         }
         def executeSql(sql: String): Unit = {
           val idx = stmtCounter.getAndIncrement()
@@ -1904,16 +1832,6 @@ case class RefreshMaterializedViewCommand(
             durationMs = ms
           )
         }
-      }
-      // Phase A cleanup: release Spark cache storage for every aux temp
-      // view we promoted to InMemoryRelation during this refresh.  The
-      // openivm-emitted DROP VIEW statements at the end of the refresh
-      // program drop the catalog entry, but they do not unpersist a
-      // cached RDD — uncacheTable() is required here so the storage
-      // memory is returned immediately rather than waiting on GC.
-      cachedAuxTempViews.foreach { view =>
-        try spark.catalog.uncacheTable(view)
-        catch { case _: Throwable => () }
       }
       fusedScratchView.foreach { view =>
         try {
