@@ -223,6 +223,40 @@ private[commands] object MvCommandHelper {
   }
 
   /**
+   * Best-effort cleanup of a stale, non-Delta MV location before CREATE.
+   *
+   * Background: `CREATE TABLE ... USING DELTA LOCATION '<path>'` fails with
+   * `DELTA_CREATE_TABLE_WITH_NON_EMPTY_LOCATION` when `<path>` already
+   * contains files but lacks a `_delta_log/` subdirectory. This happens
+   * when a previous CREATE attempt aborted mid-flight (e.g. driver OOM
+   * during the initial-load CTAS write, leaving Parquet files behind but
+   * no Delta log). Dbt then retries the CREATE for many minutes (24
+   * retries × 60s) and every retry hits the same error because the dir
+   * is still non-empty.
+   *
+   * mvLocation is always under `<warehouse>/_ivm/views/`, which is an
+   * openivm-managed namespace, so it is safe to wipe any stray files
+   * that pre-date a Delta commit. If the dir has `_delta_log/` we leave
+   * it alone — that's a legitimate Delta table and Delta's own
+   * idempotency takes over.
+   */
+  def cleanupStaleMvLocation(spark: SparkSession, location: String): Unit = {
+    try {
+      val path  = new Path(location)
+      val hconf = spark.sparkContext.hadoopConfiguration
+      val fs    = path.getFileSystem(hconf)
+      if (!fs.exists(path)) return
+      val deltaLog = new Path(path, "_delta_log")
+      if (fs.exists(deltaLog)) return
+      val children = fs.listStatus(path)
+      if (children == null || children.isEmpty) return
+      fs.delete(path, true)
+    } catch {
+      case _: Throwable => ()
+    }
+  }
+
+  /**
    * Analyze `querySql` in the current session and return
    * (qualifiedNames, qualifiedSchemas, compileSchemas, shortToQualMap).
    *
@@ -550,7 +584,20 @@ case class CreateMaterializedViewCommand(
           val expected    = spark.sql(originalQueryText)
           val userCols    = expected.columns.toSeq
           val initialLoad = spark.sql(translatedInitialLoadSql).selectExpr(userCols.map(c => s"`$c`"): _*)
-          initialLoad.exceptAll(expected).head(1).isEmpty && expected.exceptAll(initialLoad).head(1).isEmpty
+          // Order-independent multiset equality via (COUNT(*), SUM(xxhash64(*))) digest.
+          // EXCEPT ALL of two large window bags OOMs the driver at benchmark scale
+          // (see SF=175 OAT failure where stage at MaterializedViewCommands.scala:553
+          // throws SparkOutOfMemoryError); this single-pass aggregation is O(scan).
+          // Any ULP-level float drift (e.g. STDDEV/AVG over DOUBLE rewritten by LPTS)
+          // still produces a different xxhash64 so the mismatch demotion still fires.
+          val colsExpr = userCols.map(c => s"`$c`").mkString(", ")
+          def digest(df: org.apache.spark.sql.DataFrame): (Long, Long) = {
+            val row = df
+              .selectExpr("COUNT(*) AS __ivm_cnt", s"COALESCE(SUM(xxhash64($colsExpr)), 0L) AS __ivm_hash")
+              .head()
+            (row.getLong(0), row.getLong(1))
+          }
+          digest(initialLoad) == digest(expected)
         } catch {
           case _: Throwable => false
         }
@@ -877,6 +924,12 @@ case class CreateMaterializedViewCommand(
     val initSql =
       s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
         s"${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
+    // Wipe stray files from a previous aborted CREATE so Delta's
+    // "non-empty location, not a Delta table" check does not fail dbt
+    // retries after an OOM-aborted initial load (see exp-000 SF=100
+    // forensics — trades_history failed 24× over 87 minutes because the
+    // location had non-Delta Parquet from a prior partial write).
+    cleanupStaleMvLocation(spark, location)
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       profile.timeStep(
