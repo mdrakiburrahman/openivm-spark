@@ -153,6 +153,9 @@ conventions:
 - Always try to parallelize tasks using subagents and isolated docker containers and delegating
   tasks to agents per container so we can get things done faster.
 
+- Under **NO CIRCUMSTANCE** should an existing queries ability to incrementalize be regressed to a `FULL_REFRESH`, 
+  specially when adding new feature. This is an extremely critical regression and must be avoided.
+
 ## Activation outside tests
 
 ```bash

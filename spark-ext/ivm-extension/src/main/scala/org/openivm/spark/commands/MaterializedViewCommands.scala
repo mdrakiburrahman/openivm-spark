@@ -588,16 +588,50 @@ case class CreateMaterializedViewCommand(
           // EXCEPT ALL of two large window bags OOMs the driver at benchmark scale
           // (see SF=175 OAT failure where stage at MaterializedViewCommands.scala:553
           // throws SparkOutOfMemoryError); this single-pass aggregation is O(scan).
-          // Any ULP-level float drift (e.g. STDDEV/AVG over DOUBLE rewritten by LPTS)
-          // still produces a different xxhash64 so the mismatch demotion still fires.
-          val colsExpr = userCols.map(c => s"`$c`").mkString(", ")
+          //
+          // FP-tolerant column expression: openivm's LPTS rewrite of STDDEV/VARIANCE
+          // over DOUBLE re-derives the aggregate via the "naive variance" identity
+          // sqrt((Σx² − (Σx)²/n)/(n−1)) rather than Spark's Welford evaluator, which
+          // produces values that differ at the ULP level (decimals 14+) from the
+          // straight-through user-query evaluation. Both formulas are mathematically
+          // equivalent and the per-row downstream MERGE/recompute is unaffected, so
+          // the initial-load equality check normalises numeric columns to a canonical
+          // DOUBLE with 4 decimal places of precision before hashing — well above
+          // ULP drift, well below the magnitude of any structural mismatch (wrong
+          // formula, off-by-one grouping, missing rows would drift > 10⁻⁴ and still
+          // get caught). The CAST → DOUBLE normalisation also defends against the
+          // case where one side produces DECIMAL(_,6) (because of an explicit ROUND
+          // in the body) and the other side produces DOUBLE (e.g. an unrounded LAG
+          // intermediate) — xxhash64 hashes bytes, not values, so types must agree
+          // before hashing. INT / STRING / DATE columns continue to be hashed
+          // byte-exactly. NULLs are preserved (xxhash64(NULL)=0 on both sides).
+          import org.apache.spark.sql.types._
+          val schemaTypes = expected.schema.fields.map(f => f.name -> f.dataType).toMap
+          val colsExpr = userCols
+            .map { c =>
+              schemaTypes.get(c) match {
+                case Some(DoubleType) | Some(FloatType) | Some(_: DecimalType) =>
+                  s"round(CAST(`$c` AS DOUBLE), 4)"
+                case _ => s"`$c`"
+              }
+            }
+            .mkString(", ")
           def digest(df: org.apache.spark.sql.DataFrame): (Long, Long) = {
             val row = df
               .selectExpr("COUNT(*) AS __ivm_cnt", s"COALESCE(SUM(xxhash64($colsExpr)), 0L) AS __ivm_hash")
               .head()
             (row.getLong(0), row.getLong(1))
           }
-          digest(initialLoad) == digest(expected)
+          val initDigest = digest(initialLoad)
+          val userDigest = digest(expected)
+          val isEqual    = initDigest == userDigest
+          if (!isEqual) {
+            logError(
+              s"[openivm-mv-debug] view='${sqlIdent(name)}' init_digest=$initDigest user_digest=$userDigest " +
+                s"cols_expr='$colsExpr'"
+            )
+          }
+          isEqual
         } catch {
           case _: Throwable => false
         }

@@ -148,23 +148,6 @@ class OpenIvmCompiler private (
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
-    sb ++= "SET openivm_target_dialect='spark';\n"
-    sb ++= "SET openivm_compile_only=true;\n"
-    sb ++= "SET openivm_enable_view_matching=false;\n"
-    // Force-emit the AGGREGATE_GROUP / AGGREGATE_HAVING retract companion to
-    // openivm_delta_<view> even when no downstream MV is registered in this
-    // ephemeral DuckDB subprocess. Without this, openivm produces an
-    // additive-only view-delta that breaks downstream cascade for COUNT(*),
-    // MIN/MAX, DISTINCT etc. See openivm refresh_sql.cpp:has_downstream.
-    sb ++= "SET openivm_force_view_delta_cascade=true;\n"
-    // openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
-    // ("feat: emit openivm_delta_<view> from recompute paths") extends the
-    // same cascade-delta contract to WINDOW_PARTITION / GROUP_RECOMPUTE by
-    // snapshotting old/new rows around the recompute and appending `-1/+1`
-    // rows into openivm_delta_<view>. Enable it for every compile so depth-2
-    // MV-over-MV chains consume the new signed view-delta instead of falling
-    // back to FULL_REFRESH via `non_cascade_upstream`.
-    sb ++= "SET openivm_emit_cascade_delta_for_recompute=true;\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -179,10 +162,10 @@ class OpenIvmCompiler private (
     for ((_, ddl)       <- tableDdls) sb ++= s"$ddl;\n"
     // ── Spark-only function shims ──
     //
-    // openivm_compile_only=true means DuckDB only parses + binds the MV body;
-    // it does not execute the functions. openivm's LPTS serializer INLINES the
-    // macro body into the emitted refresh SQL, so collision-prone and
-    // arity-mismatched Spark built-ins use a pre-pass
+    // compile_only=true in the CompileFacts payload means DuckDB only parses +
+    // binds the MV body; it does not execute the functions. openivm's LPTS
+    // serializer INLINES the macro body into the emitted refresh SQL, so
+    // collision-prone and arity-mismatched Spark built-ins use a pre-pass
     // (`renameSparkFunctionShimCalls`) to rename the user call to
     // `__sparkfn_*` before DuckDB sees it, and a post-pass
     // (`LptsSparkDialect.rewriteSparkFunctionInlinings`) to recover Spark's
@@ -192,7 +175,21 @@ class OpenIvmCompiler private (
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
-    sb ++= s"PRAGMA compile_refresh('${escapeSql(req.viewName)}');\n"
+    // openivm_compile_with_facts replaces the three deleted PRAGMAs
+    // (openivm_target_dialect / openivm_compile_only / openivm_force_view_delta_cascade)
+    // plus their consolidated `emit_cascade_delta_for_recompute` driver with a
+    // single CompileFacts JSON payload. The function is non-mutating: every
+    // refresh statement is returned in `sql` rows (one per top-level
+    // statement) without touching aux state.
+    //
+    // - target_dialect="spark":         emit Spark/Delta SQL (was openivm_target_dialect).
+    // - compile_only=true:              preserve inclusion-exclusion terms for empty
+    //                                   compile-time deltas + skip aux-state mutation.
+    // - force_view_delta_cascade=true:  always emit openivm_delta_<view> cascade rows
+    //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
+    //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
+    //                                   MV-over-MV chains never fall back to FULL_REFRESH.
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(OpenIvmCompiler.SparkCompileFactsJson)}');\n"
     sb.toString
   }
 
@@ -299,15 +296,25 @@ class OpenIvmCompiler private (
   }
 
   private def parseCompileResult(stdout: String, viewName: String, stderr: String): CompiledRefresh = {
-    stdout.linesIterator.find(_.contains("\"refresh_type\"")) match {
-      case None =>
-        val hint = if (stderr.nonEmpty) s"\nCLI stderr:\n$stderr" else ""
-        throw new OpenIvmCompileException(
-          s"PRAGMA compile_refresh('$viewName') produced no result$hint",
-          null
-        )
-      case Some(line) => parseRefreshLine(line)
+    // openivm_compile_with_facts is a table function that returns ONE ROW
+    // PER TOP-LEVEL STATEMENT in the refresh program. Each row has the
+    // same `refresh_type` / `refresh_type_name`; the `sql` payload is one
+    // statement (already terminated with `;`). Concatenate all rows in
+    // `stmt_order` to recover the full refresh SQL program that the
+    // refresh-time loop expects.
+    val rows = stdout.linesIterator.collect {
+      case line if line.contains("\"refresh_type\"") => parseRefreshLine(line)
+    }.toVector
+    if (rows.isEmpty) {
+      val hint = if (stderr.nonEmpty) s"\nCLI stderr:\n$stderr" else ""
+      throw new OpenIvmCompileException(
+        s"openivm_compile_with_facts('$viewName', ...) produced no result$hint",
+        null
+      )
     }
+    val head = rows.head
+    val sql  = rows.iterator.map(_.sql).mkString("\n")
+    head.copy(sql = sql)
   }
 
   /** Reads `<tmpDir>/openivm_compiled_queries_<viewName>.sql` and extracts the
@@ -416,6 +423,27 @@ class OpenIvmCompiler private (
 }
 
 object OpenIvmCompiler {
+
+  /** JSON payload threaded into `openivm_compile_with_facts(view, facts)` for
+    * every spark-ext compile call. Mirrors the three deleted PRAGMA flags
+    * (`openivm_target_dialect`, `openivm_compile_only`, `openivm_force_view_delta_cascade`)
+    * plus the consolidated `emit_cascade_delta_for_recompute` driver:
+    *
+    *   - `target_dialect="spark"`        — emit Spark/Delta SQL.
+    *   - `compile_only=true`             — preserve inclusion-exclusion terms
+    *     when delta tables are empty and skip aux-state mutation (so the
+    *     ephemeral DuckDB :memory: process never runs `CREATE OR REPLACE
+    *     TABLE openivm_*_aux_<view>`).
+    *   - `force_view_delta_cascade=true` — always emit signed `openivm_delta_<view>`
+    *     companion rows for AGGREGATE_GROUP / AGGREGATE_HAVING /
+    *     WINDOW_PARTITION / GROUP_RECOMPUTE so downstream MVs at depth 2 see
+    *     a real cascade delta and never fall back to FULL_REFRESH.
+    *
+    * Embedded into SQL via [[buildScript]] inside single quotes; only
+    * single-quote escape is required and is handled by `escapeSql`.
+    */
+  private[compiler] val SparkCompileFactsJson: String =
+    """{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}"""
 
   /** Isolation strategy for the underlying DuckDB runtime. */
   sealed trait Isolation

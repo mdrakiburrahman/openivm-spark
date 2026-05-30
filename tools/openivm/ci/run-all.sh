@@ -72,7 +72,7 @@ ln -sfn "${TS}" "${LOG_ROOT}/latest"
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
-if [[ ! -d "${OPENIVM_DIR}/.git" ]]; then
+if [[ ! -e "${OPENIVM_DIR}/.git" ]]; then
     cat >&2 <<EOF
 ERROR: openivm checkout not found at ${OPENIVM_DIR}
 
