@@ -1117,6 +1117,46 @@ case class RefreshMaterializedViewCommand(
     // leak to sibling refreshes or to user queries.
     spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
 
+    // Per-stmt PLAN-TIME broadcast disable for the SIMPLE_PROJECTION
+    // view-delta CTAS (refresh stmt[0]).
+    //
+    // The AQE override above only blocks runtime PROMOTION of joins to
+    // broadcast based on post-shuffle stats. Catalyst's `JoinSelection`
+    // strategy independently selects broadcast at PLAN TIME using row-count
+    // estimates derived from compressed Parquet stats. For a multi-table
+    // join over an openivm view body that includes SCD2 range joins (e.g.
+    // `CAST(d.dt AS TIMESTAMP) BETWEEN s.effective_timestamp AND
+    // s.end_timestamp`), Catalyst's plan-time estimate of an intermediate
+    // relation can be tiny (file-size-derived) while the actual row count
+    // explodes through the SCD2 multiplicity at execution. The resulting
+    // BroadcastExchange then exceeds Spark's hard-coded 8 GiB build cap
+    // (`BroadcastExchangeExec.scala:166`) and the refresh fails with
+    // `Cannot broadcast the table that is larger than 8.0 GiB: <N> GiB`.
+    //
+    // We must NOT globally disable plan-time broadcast — WINDOW_PARTITION
+    // and AGGREGATE_GROUP INSERT MERGE patterns intentionally rely on a
+    // broadcast of the small `SELECT DISTINCT keys FROM openivm_affected_v`
+    // side. Disabling that would shuffle the full MV (~GiB at SF>=100) on
+    // every refresh and OOM the driver. So this disable is narrowly scoped
+    // to the SIMPLE_PROJECTION refresh's stmt[0] CTAS only, applied at both
+    // the fused fast path AND the on-disk CTAS fallback (the two sites in
+    // this function that execute the view-delta CTAS).
+    //
+    // The conf must remain set across the DataFrame action (`.cache()` +
+    // `.count()` on the fused path, `.collect()` on the on-disk path), not
+    // just construction — Catalyst plans lazily inside the action.
+    def withPlanTimeBroadcastDisabledForViewDeltaCtas[A](body: => A): A = {
+      val key  = "spark.sql.autoBroadcastJoinThreshold"
+      val prev = scala.util.Try(spark.conf.get(key)).toOption
+      spark.conf.set(key, "-1")
+      try body
+      finally
+        prev match {
+          case Some(v) => spark.conf.set(key, v)
+          case None    => spark.conf.unset(key)
+        }
+    }
+
     val refreshT0  = System.nanoTime()
     val viewLabel  = sqlIdent(name)
     val viewMeta   = metaName(name)
@@ -1648,13 +1688,15 @@ case class RefreshMaterializedViewCommand(
                   val scratchView = s"openivm_scratch_${java.util.UUID.randomUUID().toString.replace("-", "_")}"
                   try {
                     val t0 = System.nanoTime()
-                    val df = spark.sql(selectBody)
-                    df.cache()
-                    df.createOrReplaceTempView(scratchView)
-                    // Force materialisation so the cache holds the rows before
-                    // any negative-row probe / INSERT read. count() is the
-                    // cheapest force-eval action that respects the cache.
-                    val rowCount  = df.count()
+                    val rowCount = withPlanTimeBroadcastDisabledForViewDeltaCtas {
+                      val d = spark.sql(selectBody)
+                      d.cache()
+                      d.createOrReplaceTempView(scratchView)
+                      // Force materialisation so the cache holds the rows before
+                      // any negative-row probe / INSERT read. count() is the
+                      // cheapest force-eval action that respects the cache.
+                      d.count()
+                    }
                     val elapsedMs = (System.nanoTime() - t0) / 1000000L
                     advanceStmtCounterPast(0)
                     RefreshPerf.logStmt(
@@ -1707,7 +1749,9 @@ case class RefreshMaterializedViewCommand(
           }
 
           if (fusedView.isEmpty) {
-            executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
+            withPlanTimeBroadcastDisabledForViewDeltaCtas {
+              executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
+            }
             logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
           }
 
