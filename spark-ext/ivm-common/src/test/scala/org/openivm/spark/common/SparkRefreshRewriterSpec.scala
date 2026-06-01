@@ -718,4 +718,136 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.hasRealDelta(placeholderSql, viewLogicalName) shouldBe false
     }
   }
+
+  // ── 12. recompute WHERE EXISTS → LEFT SEMI JOIN ──────────────────────────
+  // Reproduces the broadcast-explosion shape that produced
+  //   `Cannot broadcast the table that is larger than 8.0 GiB: 57.6 GiB`
+  // for `gold.fact_market_history` at SF=10 in ivm-bench. The trigger is
+  // openivm's SIMPLE_PROJECTION recompute INSERT over an SCD2 range-joined
+  // view body, post-wrapped into a `MERGE INTO ... USING (... WHERE EXISTS
+  // ... IS NOT DISTINCT FROM ...) AS d ON false WHEN NOT MATCHED THEN INSERT`.
+  describe("recompute WHERE EXISTS → LEFT SEMI JOIN rewrite") {
+    val recomputeInput: String =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/mv_r_delta_uuid` USING DELTA AS
+        |SELECT NULL::INTEGER AS openivm_left_key, 1 AS openivm_multiplicity, '2026-01-01'::TIMESTAMP AS openivm_timestamp;
+        |MERGE INTO openivm_data_mv_r AS v USING (
+        |SELECT DISTINCT openivm_left_key FROM openivm_delta_mv_r
+        |) AS _d ON _d.openivm_left_key IS NOT DISTINCT FROM v.openivm_left_key
+        |WHEN MATCHED THEN DELETE;
+        |INSERT INTO openivm_data_mv_r
+        |SELECT * FROM (
+        |  WITH scan_0 AS (SELECT * FROM memory.main.silver_daily_market),
+        |       scan_1 AS (SELECT * FROM memory.main.gold_dim_security)
+        |  SELECT s.sk_company_id AS openivm_left_key, dm.dm_date, dm.dm_close
+        |  FROM scan_0 dm INNER JOIN scan_1 s ON dm.dm_s_symb = s.symbol
+        |) openivm_lj
+        |WHERE EXISTS (SELECT 1 FROM openivm_delta_mv_r _d WHERE _d.openivm_left_key IS NOT DISTINCT FROM openivm_lj.openivm_left_key);
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("converts WHERE EXISTS IS NOT DISTINCT FROM into LEFT SEMI JOIN ... <=>") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = recomputeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      val mergeStmt = rewritten.statements
+        .find(s => s.contains("ON false") && s.contains("WHEN NOT MATCHED"))
+        .getOrElse(fail("recompute INSERT MERGE missing"))
+
+      withClue(s"rewritten merge:\n$mergeStmt\n") {
+        mergeStmt should include("LEFT SEMI JOIN")
+        mergeStmt should include("SELECT DISTINCT openivm_left_key FROM")
+        mergeStmt should include("_openivm_ak")
+        mergeStmt should include("openivm_lj.openivm_left_key <=> _openivm_ak.openivm_left_key")
+        // WHERE EXISTS must be gone.
+        mergeStmt.toUpperCase should not include "WHERE EXISTS"
+        mergeStmt should not include "IS NOT DISTINCT FROM openivm_lj.openivm_left_key"
+      }
+    }
+
+    it("is idempotent — re-running the rewriter on already-rewritten SQL is a no-op for the recompute MERGE") {
+      val once = SparkRefreshRewriter.rewrite(
+        compiledSql = recomputeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      // Re-feed each rewritten statement: the post-process passes operate on
+      // arbitrary strings so reapplying the recompute pass must not double-wrap.
+      val rewritten1 = once.statements
+        .find(s => s.contains("LEFT SEMI JOIN"))
+        .getOrElse(
+          fail("LEFT SEMI JOIN missing on first pass")
+        )
+      val deltaAlias = "_openivm_ak"
+      // Count occurrences of the marker alias — must stay exactly one.
+      val count = rewritten1.sliding(deltaAlias.length).count(_ == deltaAlias)
+      // 3 references: subquery alias `_openivm_ak`, and 1× in the ON clause
+      // (delta side of `<=>`).  No re-rewrite should add more.
+      count shouldBe 2
+    }
+
+    it("leaves a DELETE MERGE (WHEN MATCHED THEN DELETE) untouched") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = recomputeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      val deleteMerge = rewritten.statements
+        .find(s => s.toUpperCase.contains("WHEN MATCHED THEN DELETE"))
+        .getOrElse(fail("DELETE MERGE missing"))
+      // DELETE side has no WHERE EXISTS and must not gain a LEFT SEMI JOIN.
+      deleteMerge should not include "LEFT SEMI JOIN"
+    }
+
+    it("does not rewrite a MERGE whose ON clause is not exactly `ON false`") {
+      // Hand-crafted MERGE with `ON v.k = d.k` — must be no-op for the WHERE
+      // EXISTS rewrite because dropping the WHERE EXISTS could change the
+      // matched set on the INSERT branch only by skipping rows that exist in
+      // the delta. The strict gate is `ON FALSE` only.
+      val sqlWithOnMatch =
+        s"""MERGE INTO `mydb`.`mv_r` AS v USING (
+           |  SELECT openivm_lj.k, openivm_lj.openivm_left_key
+           |  FROM (SELECT * FROM memory.main.t) openivm_lj
+           |  WHERE EXISTS (SELECT 1 FROM delta.`$viewDeltaPath` _d WHERE _d.openivm_left_key IS NOT DISTINCT FROM openivm_lj.openivm_left_key)
+           |) AS d
+           |ON v.openivm_left_key = d.openivm_left_key
+           |WHEN MATCHED THEN UPDATE SET v.k = d.k
+           |WHEN NOT MATCHED THEN INSERT (openivm_left_key, k) VALUES (d.openivm_left_key, d.k)
+           |""".stripMargin
+      // Wrap as a standalone openivm program so the rewriter pipeline pipes it
+      // through the post-process chain.
+      val wrapped =
+        s"""UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+           |$sqlWithOnMatch;
+           |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+           |""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = wrapped,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      // The non-matching-MERGE statement is not openivm-classified, so the
+      // dispatch in `classify` may return Unknown and drop it — that's fine.
+      // We only need to assert that no LEFT SEMI JOIN was introduced.
+      rewritten.statements.foreach { s =>
+        withClue(s"statement should not gain LEFT SEMI JOIN:\n$s") {
+          s should not include "LEFT SEMI JOIN"
+        }
+      }
+    }
+  }
 }

@@ -218,7 +218,9 @@ object SparkRefreshRewriter {
       val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
       val withAliasFixup     = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
-      RewrittenRefresh(withDedupedSource.map(postProcess))
+      val withSemiJoinRewrite =
+        withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
+      RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
     }
@@ -2265,5 +2267,315 @@ object SparkRefreshRewriter {
         val trailing = stmt.substring(onPredicateEnd)
         s"$head$dedupedSource AS $usingAlias ON $onPredicate$trailing"
     }
+  }
+
+  /** Rewrites a recompute-INSERT MERGE whose source body filters via
+    * `WHERE EXISTS (SELECT 1 FROM <ref> _d WHERE _d.<col> IS NOT DISTINCT FROM
+    * <outer>.<col> [AND …])` into a `LEFT SEMI JOIN (SELECT DISTINCT <cols>
+    * FROM <ref>) _openivm_ak ON <outer>.<col> <=> _openivm_ak.<col>` shape.
+    *
+    * Why this rewrite exists
+    * -----------------------
+    * openivm's SIMPLE_PROJECTION (and AGGREGATE_GROUP+has_minmax) recompute
+    * INSERT shape is, post-rewrite:
+    * {{{
+    *   MERGE INTO delta.`<mvLocation>` AS v
+    *   USING ( SELECT openivm_lj.<cols>, openivm_lj.openivm_left_key
+    *           FROM (<full openivm view body, CTE-chained>) openivm_lj
+    *           WHERE EXISTS (SELECT 1 FROM delta.`<viewDeltaPath>` _d
+    *                         WHERE _d.openivm_left_key IS NOT DISTINCT FROM
+    *                               openivm_lj.openivm_left_key)
+    *         ) AS d
+    *   ON false
+    *   WHEN NOT MATCHED THEN INSERT (...) VALUES (d....)
+    * }}}
+    *
+    * When the view body has joins that range-expand (e.g. SCD2 timestamp
+    * ranges) Catalyst cannot push the correlated `WHERE EXISTS … IS NOT
+    * DISTINCT FROM` filter through the CTE chain into the source scans, so
+    * it materialises the FULL view-body join first and then filters. The
+    * resulting intermediate can overflow Spark's hard-coded 8 GiB
+    * BroadcastExchangeExec cap (observed: 57.6 GiB at SF=10 for
+    * `gold.fact_market_history`'s SCD2 daily-market × dim-security range
+    * join with only ~2.4k affected keys in the delta).
+    *
+    * Rewriting to `LEFT SEMI JOIN (SELECT DISTINCT …)` engages Catalyst's
+    * `PushDownLeftSemiAntiJoin` rule, which DOES push the semi-join through
+    * the view body's joins, pruning the SCD2 range join to only affected
+    * rows.  `<=>` (EqualNullSafe) preserves the NULL-safe matching of
+    * `IS NOT DISTINCT FROM` and is recognised as an equi-join key by
+    * `ExtractEquiJoinKeys` (no broadcast-cap escalation).  `SELECT DISTINCT`
+    * gives Catalyst accurate row-count statistics for the build side.
+    *
+    * Cardinality preservation
+    * ------------------------
+    * `LEFT SEMI JOIN (SELECT DISTINCT k FROM X) ON o.k <=> i.k` is
+    * row-by-row equivalent to `WHERE EXISTS (SELECT 1 FROM X WHERE x.k IS
+    * NOT DISTINCT FROM o.k)`:
+    *
+    *   - outer-side duplicates are preserved (semi-join is left-side bounded);
+    *   - inner-side duplicates do not amplify outer rows (semi-join, not inner);
+    *   - NULL outer keys still match NULL inner keys exactly once (`<=>`).
+    *
+    * The `DISTINCT` is technically redundant under LEFT SEMI semantics but
+    * is kept for build-side stat accuracy and to keep the equivalence proof
+    * trivial if the semi-join were ever lowered to an inner-join form by a
+    * downstream optimisation.
+    *
+    * Strict gating (see `tryParseExistsKeyPredicates` for predicate shape):
+    *   - statement is `MERGE INTO … USING (…) AS <alias> ON FALSE WHEN NOT
+    *     MATCHED THEN INSERT` (DELETE / UPDATE / non-`ON FALSE` merges are
+    *     out of scope — they already have their own dedupe path);
+    *   - source body's outermost WHERE clause is **exactly** one `EXISTS
+    *     (SELECT 1 FROM <ref> _d WHERE <preds>)` (no other conjuncts);
+    *   - every predicate inside the EXISTS body is `_d.<col> IS NOT
+    *     DISTINCT FROM <outer_alias>.<col>` joined by AND (no other ops, no
+    *     OR, no functions, no constants);
+    *   - `<ref>` is a single source ref (table or `delta.`<path>``, optional
+    *     `AS _d` / bare `_d`), no joins inside the EXISTS subquery.
+    *
+    * Safe no-op otherwise.  Idempotent: the rewrite removes the `WHERE
+    * EXISTS … IS NOT DISTINCT FROM` shape, so a second pass cannot re-fire.
+    */
+  private def rewriteRecomputeWhereExistsAsAffectedKeysJoin(stmt: String): String = {
+    // Detect a MERGE statement whose USING body we may need to rewrite.
+    // Match `MERGE INTO <target> [AS] <alias> USING (` paren-aware.
+    val mergeHeaderRe = "(?is)\\bMERGE\\s+INTO\\s+".r
+    val mergeHeader   = mergeHeaderRe.findFirstMatchIn(stmt).getOrElse(return stmt)
+
+    // Skip the target (could be `delta.`<path>`` or backticked multi-part).
+    // Walk until we hit `USING\s*(` at depth=0 from the MERGE token.
+    val mergeHeaderEnd = mergeHeader.end
+    val usingOpenIdx   = findMergeUsingOpenParen(stmt, mergeHeaderEnd).getOrElse(return stmt)
+    val closeIdx       = findMatchingCloseParen(stmt, usingOpenIdx)
+    if (closeIdx < 0) return stmt
+
+    // Tail must be `AS <alias> ON false WHEN NOT MATCHED ...` — explicitly
+    // require `ON false` so we never strip an active match predicate.
+    val tail    = stmt.substring(closeIdx + 1)
+    val tailRe  = "(?is)^\\s*(?:AS\\s+)?\\w+\\s+ON\\s+(?:FALSE|\\(\\s*FALSE\\s*\\))\\s+WHEN\\s+NOT\\s+MATCHED\\b".r
+    val matched = tailRe.findFirstMatchIn(tail)
+    if (matched.isEmpty) return stmt
+
+    val source          = stmt.substring(usingOpenIdx + 1, closeIdx)
+    val rewrittenSource = rewriteSourceWhereExistsAsSemiJoin(source).getOrElse(return stmt)
+    stmt.substring(0, usingOpenIdx + 1) + rewrittenSource + stmt.substring(closeIdx)
+  }
+
+  /** Locate the `(` of `... USING (` starting at `from`, paren-aware. Skips
+    * over any nested parens that might appear in the MERGE target (none today,
+    * but `delta.`<path>`` could contain `(`-shaped chars in some FS paths).
+    * Returns the index of the `(` or None if no USING is found at depth 0.
+    */
+  private def findMergeUsingOpenParen(stmt: String, from: Int): Option[Int] = {
+    var depth = 0
+    var i     = from
+    while (i < stmt.length) {
+      stmt.charAt(i) match {
+        case '\'' => i = consumeSqlSingleQuoted(stmt, i)
+        case '`'  =>
+          // Skip backticked identifier
+          i += 1
+          while (i < stmt.length && stmt.charAt(i) != '`') i += 1
+          if (i < stmt.length) i += 1
+        case '('                                                       => depth += 1; i += 1
+        case ')'                                                       => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(stmt, i, "USING") =>
+          // Find the next `(` at this depth, skipping whitespace.
+          var j = i + "USING".length
+          while (j < stmt.length && Character.isWhitespace(stmt.charAt(j))) j += 1
+          if (j < stmt.length && stmt.charAt(j) == '(') return Some(j)
+          // Not a parenthesised USING source — out of scope.
+          return None
+        case _ => i += 1
+      }
+    }
+    None
+  }
+
+  /** Locate and rewrite an outermost (depth=0 within `source`) `WHERE EXISTS
+    * (SELECT 1 FROM <ref> _d WHERE <key_preds>)` clause into a `LEFT SEMI
+    * JOIN (SELECT DISTINCT <cols> FROM <ref>) _openivm_ak ON …` clause
+    * attached to the immediately-preceding FROM-clause tail.
+    *
+    * Returns None on any deviation from the strict shape (so the caller no-ops).
+    */
+  private def rewriteSourceWhereExistsAsSemiJoin(source: String): Option[String] = {
+    // Find the WHERE keyword at depth 0 inside the source body.
+    val whereStart = findTopLevelSqlKeyword(source, 0, source.length, "WHERE").getOrElse(return None)
+
+    // The clause must start with `WHERE` followed by `EXISTS (`. Nothing else
+    // is allowed (no conjuncts before or after EXISTS).
+    val afterWhere = skipWhitespace(source, whereStart + "WHERE".length)
+    if (!startsWithSqlKeyword(source, afterWhere, "EXISTS")) return None
+    val afterExists = skipWhitespace(source, afterWhere + "EXISTS".length)
+    if (afterExists >= source.length || source.charAt(afterExists) != '(') return None
+
+    val existsClose = findMatchingCloseParen(source, afterExists)
+    if (existsClose < 0) return None
+
+    // After the EXISTS subquery's `)`, only whitespace is allowed (no
+    // trailing `AND …` / `OR …` / `GROUP BY …` / `LIMIT …` / etc.).
+    val afterExistsClose = skipWhitespace(source, existsClose + 1)
+    if (afterExistsClose != source.length) return None
+
+    val existsBody = source.substring(afterExists + 1, existsClose)
+    val parsed     = tryParseExistsKeyPredicates(existsBody).getOrElse(return None)
+
+    // Build the LEFT SEMI JOIN form.
+    val deltaAlias   = "_openivm_ak"
+    val distinctCols = parsed.predicates.map(_.innerCol).distinct
+    val distinctList = distinctCols.mkString(", ")
+    val joinPredicate = parsed.predicates
+      .map(p => s"${p.outerAlias}.${p.outerCol} <=> $deltaAlias.${p.innerCol}")
+      .mkString(" AND ")
+    val semiJoinClause =
+      s"LEFT SEMI JOIN (SELECT DISTINCT $distinctList FROM ${parsed.fromRef}) $deltaAlias ON $joinPredicate"
+
+    // Splice: replace `[whitespace] WHERE EXISTS (…)` with `[space]<semiJoin>`.
+    // Use a single space separator so the previous FROM-clause tail (e.g. an
+    // alias) gets a clean break before `LEFT SEMI JOIN`.
+    val head = source.substring(0, whereStart).stripTrailing()
+    Some(s"$head $semiJoinClause")
+  }
+
+  /** A single null-safe key predicate from an `EXISTS` WHERE clause.
+    * E.g. `_d.openivm_left_key IS NOT DISTINCT FROM openivm_lj.openivm_left_key`.
+    */
+  private case class ExistsKeyPredicate(
+      innerAlias: String,
+      innerCol: String,
+      outerAlias: String,
+      outerCol: String
+  )
+
+  /** Parsed shape of `SELECT 1 FROM <ref> [AS] <innerAlias> WHERE <p1> AND <p2> …`
+    * where every `<pn>` is `<innerAlias>.<col> IS NOT DISTINCT FROM
+    * <outerAlias>.<col>` (or the symmetric reversed form).
+    */
+  private case class ParsedExistsBody(
+      fromRef: String,
+      innerAlias: String,
+      predicates: Seq[ExistsKeyPredicate]
+  )
+
+  private def tryParseExistsKeyPredicates(body: String): Option[ParsedExistsBody] = {
+    // Must start with `SELECT 1 FROM <ref> [AS] <alias> WHERE <preds>`.
+    val headerRe = "(?is)^\\s*SELECT\\s+1\\s+FROM\\s+".r
+    val header   = headerRe.findFirstMatchIn(body).getOrElse(return None)
+    val refStart = header.end
+
+    // Tokenise the FROM ref: a single source until whitespace, but respect
+    // backticked identifiers and `delta.`<path>`` forms which embed
+    // back-ticked path segments that can contain `:`, `/`, etc.
+    val refEnd = scanSqlTableRef(body, refStart)
+    if (refEnd <= refStart) return None
+    val fromRef = body.substring(refStart, refEnd)
+
+    // After ref: optional `AS`, then required alias word.
+    var i = skipWhitespace(body, refEnd)
+    if (startsWithSqlKeyword(body, i, "AS")) {
+      i = skipWhitespace(body, i + "AS".length)
+    }
+    val aliasStart = i
+    while (i < body.length && isSqlIdentifierPart(body.charAt(i))) i += 1
+    if (i == aliasStart) return None
+    val innerAlias = body.substring(aliasStart, i)
+
+    // Then required `WHERE`.
+    i = skipWhitespace(body, i)
+    if (!startsWithSqlKeyword(body, i, "WHERE")) return None
+    i = skipWhitespace(body, i + "WHERE".length)
+
+    val predsText = body.substring(i).trim
+    val preds     = splitTopLevelAnd(predsText)
+    if (preds.isEmpty) return None
+
+    val parsedPreds = preds.flatMap { p =>
+      parseIsNotDistinctFrom(p, innerAlias)
+    }
+    if (parsedPreds.length != preds.length) return None
+    Some(ParsedExistsBody(fromRef, innerAlias, parsedPreds))
+  }
+
+  /** Parse `<a>.<col> IS NOT DISTINCT FROM <b>.<col>` (or its reverse).
+    * Returns the predicate with the inner side identified by `innerAlias`.
+    * Rejects anything else.
+    */
+  private def parseIsNotDistinctFrom(text: String, innerAlias: String): Option[ExistsKeyPredicate] = {
+    val re =
+      "(?is)^\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s+IS\\s+NOT\\s+DISTINCT\\s+FROM\\s+(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*$".r
+    re.findFirstMatchIn(text).flatMap { m =>
+      val lhsAlias = stripBackticks(m.group(1))
+      val lhsCol   = m.group(2)
+      val rhsAlias = stripBackticks(m.group(3))
+      val rhsCol   = m.group(4)
+      if (lhsAlias == innerAlias && rhsAlias != innerAlias) {
+        Some(ExistsKeyPredicate(lhsAlias, lhsCol, rhsAlias, rhsCol))
+      } else if (rhsAlias == innerAlias && lhsAlias != innerAlias) {
+        Some(ExistsKeyPredicate(rhsAlias, rhsCol, lhsAlias, lhsCol))
+      } else None
+    }
+  }
+
+  private def stripBackticks(s: String): String =
+    if (s.startsWith("`") && s.endsWith("`")) s.substring(1, s.length - 1).replace("``", "`")
+    else s
+
+  /** Split a SQL predicate text on top-level `AND` (depth=0, case-insensitive,
+    * word-boundary aware). Empty input yields Nil.
+    */
+  private def splitTopLevelAnd(text: String): Seq[String] = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    var depth = 0
+    var i     = 0
+    var start = 0
+    while (i < text.length) {
+      text.charAt(i) match {
+        case '\'' => i = consumeSqlSingleQuoted(text, i)
+        case '`' =>
+          i += 1
+          while (i < text.length && text.charAt(i) != '`') i += 1
+          if (i < text.length) i += 1
+        case '(' => depth += 1; i += 1
+        case ')' => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(text, i, "AND") =>
+          parts += text.substring(start, i).trim
+          i += "AND".length
+          start = i
+        case _ => i += 1
+      }
+    }
+    val tail = text.substring(start).trim
+    if (tail.nonEmpty) parts += tail
+    parts.toSeq.filter(_.nonEmpty)
+  }
+
+  /** Scan a single SQL table reference starting at `start`. Handles
+    * dotted identifiers, backticked segments (`delta.`<path>``), and stops
+    * at the first un-backticked whitespace (so a following alias / keyword
+    * is not consumed). Returns the end index (exclusive).
+    */
+  private def scanSqlTableRef(text: String, start: Int): Int = {
+    var i          = start
+    var inBacktick = false
+    while (i < text.length) {
+      val c = text.charAt(i)
+      if (c == '`') {
+        inBacktick = !inBacktick
+        i += 1
+      } else if (!inBacktick && Character.isWhitespace(c)) {
+        return i
+      } else {
+        i += 1
+      }
+    }
+    i
+  }
+
+  private def skipWhitespace(text: String, from: Int): Int = {
+    var i = from
+    while (i < text.length && Character.isWhitespace(text.charAt(i))) i += 1
+    i
   }
 }
