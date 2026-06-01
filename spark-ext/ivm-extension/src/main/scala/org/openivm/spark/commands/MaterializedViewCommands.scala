@@ -1783,10 +1783,19 @@ case class RefreshMaterializedViewCommand(
               "outcome=simple_projection_full_refresh;reason=conflicting_signed_rows",
               0L
             )
+            // Fallback recomputes the MV body via INSERT OVERWRITE. We deliberately
+            // do NOT override `_ivm_emits_cascade_view_delta` to false here, and we
+            // do NOT delete the view-delta path stmt[0] just wrote. The fallback is
+            // about the MV's OWN bag (the bag-correct rewriter mishandles mixed-sign
+            // rows), not about the upstream→downstream cascade. stmt[0]'s view-delta
+            // CTAS is openivm's per-tuple Δ(MV) and is bag-correct for downstream
+            // consumers (which only read the cascade view-delta path, never the MV
+            // body directly). Wiping it here was the silver.holdings_history →
+            // gold.fact_holdings IVM correctness bug: downstream saw deltas=0 even
+            // though the source had real change.
             val fullRefreshMeta = meta.copy(
               refreshType = RefreshTypeCode.FullRefresh,
-              refreshTypeName = "FULL_REFRESH",
-              properties = meta.properties ++ MvMetadata.cascadeViewDeltaProperties(false)
+              refreshTypeName = "FULL_REFRESH"
             )
             val fullRefresh = SparkMergeAssembler.assemble(
               AssemblyInput(
@@ -1800,7 +1809,6 @@ case class RefreshMaterializedViewCommand(
             cleanupMeta = fullRefreshMeta
             spFullRefreshFallback = true
             fullRefresh.statements.foreach(executeSql)
-            deletePathIfExists(viewDeltaPath)
           } else {
             rewritten.statements.tail.zipWithIndex.foreach { case (stmt, idx) =>
               val stmtIdx = 1 + idx

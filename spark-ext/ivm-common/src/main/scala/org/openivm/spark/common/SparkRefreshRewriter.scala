@@ -126,6 +126,29 @@ object SparkRefreshRewriter {
     tailRe.findFirstMatchIn(tail).isDefined
   }
 
+  /** True iff `sql` is any `MERGE INTO …` statement (after stripping our
+    * execution marker). Used by `MaterializedViewCommands` to wrap *every*
+    * openivm-emitted MERGE in a per-statement plan-time broadcast disable
+    * scope.
+    *
+    * Why broader than `isRecomputeInsertMerge`: openivm-emitted MERGEs
+    * include not just the `ON FALSE WHEN NOT MATCHED INSERT` recompute shape
+    * but also `WHEN MATCHED THEN DELETE` (SIMPLE_PROJECTION delete-merge)
+    * and `WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT` (aggregate
+    * upsert). Any of those can hit Spark's 8 GiB `BroadcastExchangeExec`
+    * cap when Delta's MERGE rewrite plus DPP-style subquery broadcasts
+    * combine on a SCD2-shaped MV body — even when the USING source itself
+    * is tiny (e.g. `SELECT DISTINCT key FROM <view_deltas>`), because
+    * Delta's "find affected target files" subquery may materialise the
+    * outer view body for `IS NOT DISTINCT FROM` matching.
+    *
+    * Used only as a gating predicate; never mutates `sql`.
+    */
+  private[spark] def isMergeStatement(sql: String): Boolean = {
+    val stripped = stripExecutionMarker(sql)
+    "(?is)^\\s*MERGE\\s+INTO\\s+".r.findFirstMatchIn(stripped).isDefined
+  }
+
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse
