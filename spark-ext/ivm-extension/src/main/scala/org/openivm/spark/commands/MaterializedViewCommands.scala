@@ -1117,8 +1117,7 @@ case class RefreshMaterializedViewCommand(
     // leak to sibling refreshes or to user queries.
     spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
 
-    // Per-stmt PLAN-TIME broadcast disable for the SIMPLE_PROJECTION
-    // view-delta CTAS (refresh stmt[0]).
+    // Per-stmt PLAN-TIME broadcast disable.
     //
     // The AQE override above only blocks runtime PROMOTION of joins to
     // broadcast based on post-shuffle stats. Catalyst's `JoinSelection`
@@ -1133,19 +1132,23 @@ case class RefreshMaterializedViewCommand(
     // (`BroadcastExchangeExec.scala:166`) and the refresh fails with
     // `Cannot broadcast the table that is larger than 8.0 GiB: <N> GiB`.
     //
-    // We must NOT globally disable plan-time broadcast — WINDOW_PARTITION
-    // and AGGREGATE_GROUP INSERT MERGE patterns intentionally rely on a
-    // broadcast of the small `SELECT DISTINCT keys FROM openivm_affected_v`
-    // side. Disabling that would shuffle the full MV (~GiB at SF>=100) on
-    // every refresh and OOM the driver. So this disable is narrowly scoped
-    // to the SIMPLE_PROJECTION refresh's stmt[0] CTAS only, applied at both
-    // the fused fast path AND the on-disk CTAS fallback (the two sites in
-    // this function that execute the view-delta CTAS).
+    // We must NOT globally disable plan-time broadcast — small-side
+    // broadcast for DELETE MERGEs (whose source is a `SELECT DISTINCT
+    // openivm_left_key FROM <view_deltas>` tiny relation) is a desirable
+    // optimisation. So this disable is narrowly scoped to the two
+    // statement shapes that actually wrap the full MV body:
+    //
+    //   (a) the view-delta CTAS (refresh stmt[0]) — fused fast path AND
+    //       on-disk CTAS fallback;
+    //   (b) every openivm-emitted recompute INSERT MERGE
+    //       (`MERGE INTO … USING (… <full view body> …) AS d ON false
+    //       WHEN NOT MATCHED THEN INSERT`) — used by SIMPLE_PROJECTION,
+    //       AGGREGATE_GROUP, WINDOW_PARTITION, GROUP_RECOMPUTE, etc.
     //
     // The conf must remain set across the DataFrame action (`.cache()` +
     // `.count()` on the fused path, `.collect()` on the on-disk path), not
     // just construction — Catalyst plans lazily inside the action.
-    def withPlanTimeBroadcastDisabledForViewDeltaCtas[A](body: => A): A = {
+    def withPlanTimeBroadcastDisabled[A](body: => A): A = {
       val key  = "spark.sql.autoBroadcastJoinThreshold"
       val prev = scala.util.Try(spark.conf.get(key)).toOption
       spark.conf.set(key, "-1")
@@ -1688,7 +1691,7 @@ case class RefreshMaterializedViewCommand(
                   val scratchView = s"openivm_scratch_${java.util.UUID.randomUUID().toString.replace("-", "_")}"
                   try {
                     val t0 = System.nanoTime()
-                    val rowCount = withPlanTimeBroadcastDisabledForViewDeltaCtas {
+                    val rowCount = withPlanTimeBroadcastDisabled {
                       val d = spark.sql(selectBody)
                       d.cache()
                       d.createOrReplaceTempView(scratchView)
@@ -1749,7 +1752,7 @@ case class RefreshMaterializedViewCommand(
           }
 
           if (fusedView.isEmpty) {
-            withPlanTimeBroadcastDisabledForViewDeltaCtas {
+            withPlanTimeBroadcastDisabled {
               executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
             }
             logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
@@ -1817,7 +1820,13 @@ case class RefreshMaterializedViewCommand(
                     SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, view)
                   case None => sql
                 }
-                executeSqlAt(sqlForExec, stmtIdx)
+                if (SparkRefreshRewriter.isRecomputeInsertMerge(sqlForExec)) {
+                  withPlanTimeBroadcastDisabled {
+                    executeSqlAt(sqlForExec, stmtIdx)
+                  }
+                } else {
+                  executeSqlAt(sqlForExec, stmtIdx)
+                }
               }
             }
           }
@@ -1834,7 +1843,13 @@ case class RefreshMaterializedViewCommand(
               )
               logSkippedDeleteMerge(idx)
             } else {
-              executeSqlAt(sql, idx)
+              if (SparkRefreshRewriter.isRecomputeInsertMerge(sql)) {
+                withPlanTimeBroadcastDisabled {
+                  executeSqlAt(sql, idx)
+                }
+              } else {
+                executeSqlAt(sql, idx)
+              }
               // After any CTAS that wrote to the view-delta path, log a diagnostic
               // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
               // rows. Gated by OPENIVM_REFRESH_DIAGNOSTICS=1.

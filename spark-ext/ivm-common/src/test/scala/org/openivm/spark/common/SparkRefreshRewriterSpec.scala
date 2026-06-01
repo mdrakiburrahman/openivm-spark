@@ -850,4 +850,96 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       }
     }
   }
+
+  // ── 12. isRecomputeInsertMerge — recompute INSERT MERGE detector ─────────
+  describe("isRecomputeInsertMerge") {
+    it("detects the bench-shape MERGE … USING (…) AS d ON FALSE WHEN NOT MATCHED THEN INSERT") {
+      val sql =
+        """MERGE INTO delta.`s3://w/mv` AS v
+          |USING (WITH scan_0 AS (SELECT * FROM x) SELECT * FROM scan_0) AS d
+          |ON false
+          |WHEN NOT MATCHED THEN INSERT (a) VALUES (d.a)""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe true
+    }
+
+    it("detects the ON (FALSE) parenthesised variant") {
+      val sql =
+        """MERGE INTO `db`.`mv` AS v
+          |USING (SELECT * FROM x) AS d
+          |ON (FALSE)
+          |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe true
+    }
+
+    it("detects the WHEN NOT MATCHED AND <pred> THEN INSERT tail variant") {
+      val sql =
+        """MERGE INTO delta.`/p` AS v
+          |USING (SELECT a FROM s) AS d
+          |ON FALSE
+          |WHEN NOT MATCHED AND d.a IS NOT NULL THEN INSERT (a) VALUES (d.a)""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe true
+    }
+
+    it("survives a leading SQL block comment before MERGE INTO") {
+      val sql =
+        """/* openivm:stmt=2 */ MERGE INTO `db`.`mv` v
+          |USING (SELECT 1 AS a) AS d
+          |ON FALSE
+          |WHEN NOT MATCHED THEN INSERT (a) VALUES (d.a)""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe true
+    }
+
+    it("is paren-aware: parens inside the USING source body don't fool the matcher") {
+      val sql =
+        """MERGE INTO `db`.`mv` v
+          |USING (SELECT a, (b + c) AS bc, COUNT(*) AS n FROM s GROUP BY a, (b + c)) AS d
+          |ON FALSE
+          |WHEN NOT MATCHED THEN INSERT (a, bc, n) VALUES (d.a, d.bc, d.n)""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe true
+    }
+
+    it("returns false for a non-MERGE statement (CTAS / INSERT / UPDATE / DELETE)") {
+      SparkRefreshRewriter.isRecomputeInsertMerge(
+        "CREATE OR REPLACE TABLE delta.`/p` USING DELTA AS SELECT 1"
+      ) shouldBe false
+      SparkRefreshRewriter.isRecomputeInsertMerge(
+        "INSERT INTO `db`.`mv` SELECT * FROM s"
+      ) shouldBe false
+      SparkRefreshRewriter.isRecomputeInsertMerge(
+        "UPDATE `db`.`mv` SET a = 1 WHERE b = 2"
+      ) shouldBe false
+      SparkRefreshRewriter.isRecomputeInsertMerge(
+        "DELETE FROM `db`.`mv` WHERE a = 1"
+      ) shouldBe false
+    }
+
+    it("returns false for a real equi-merge (ON <key> = <key>, not ON FALSE)") {
+      val sql =
+        """MERGE INTO `db`.`mv` v
+          |USING (SELECT a, b FROM s) AS d
+          |ON v.a = d.a
+          |WHEN MATCHED THEN UPDATE SET b = d.b
+          |WHEN NOT MATCHED THEN INSERT (a, b) VALUES (d.a, d.b)""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
+    }
+
+    it("returns false for a delete-merge (WHEN MATCHED first, not WHEN NOT MATCHED)") {
+      val sql =
+        """MERGE INTO `db`.`mv` v
+          |USING (SELECT DISTINCT k FROM s) AS d
+          |ON v.k IS NOT DISTINCT FROM d.k
+          |WHEN MATCHED THEN DELETE""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
+    }
+
+    it("returns false for a MERGE whose USING source is not parenthesised (e.g. a CTE reference)") {
+      val sql =
+        """WITH cte AS (SELECT * FROM s)
+          |MERGE INTO `db`.`mv` v
+          |USING cte d
+          |ON FALSE
+          |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+      SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
+    }
+  }
 }

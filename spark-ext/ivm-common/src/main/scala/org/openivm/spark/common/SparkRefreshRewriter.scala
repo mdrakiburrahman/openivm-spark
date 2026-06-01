@@ -76,6 +76,56 @@ object SparkRefreshRewriter {
   private[spark] def stripExecutionMarker(sql: String): String =
     sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
 
+  /** Detect the openivm-emitted **recompute INSERT MERGE** shape:
+    *
+    * {{{
+    *   MERGE INTO <target> [AS] <alias>
+    *   USING ( ... <recompute body> ... ) AS <alias>
+    *   ON FALSE
+    *   WHEN NOT MATCHED [AND ...] THEN INSERT ...
+    * }}}
+    *
+    * This shape is used by every refresh path that needs to recompute and
+    * re-insert *all* affected rows for the current delta — including
+    * `SIMPLE_PROJECTION`, `AGGREGATE_GROUP`, `WINDOW_PARTITION`,
+    * `GROUP_RECOMPUTE`, and DuckLake variants. The USING source typically
+    * wraps openivm's full view body (or a subset of it) inside a deeply
+    * nested CTE chain, and Catalyst's plan-time `JoinSelection` can pick a
+    * BroadcastHashJoin for one of those inner joins based on
+    * file-size-derived stats that under-estimate the actual row count
+    * (notably SCD2 range joins amplify the intermediate by
+    * `versions × dates`).
+    *
+    * Callers use this predicate to gate a per-statement
+    * `spark.sql.autoBroadcastJoinThreshold = -1` override so that Catalyst
+    * falls back to `ShuffledHashJoinExec` / `SortMergeJoinExec`, neither of
+    * which can trip Spark's hard 8 GiB `BroadcastExchangeExec` cap.
+    *
+    * Paren-aware: skips parens, backticks, and single-quoted strings inside
+    * the target identifier and the USING source body so a `(` inside a
+    * `delta.`<path>`` qualifier or inside a string literal can't fool the
+    * matcher.
+    *
+    * Returns false for:
+    *   - non-MERGE statements (CTAS, INSERT, UPDATE, DELETE, …);
+    *   - MERGEs whose USING source isn't parenthesised;
+    *   - MERGEs whose ON clause is anything other than literal `FALSE`
+    *     (e.g. a real equi-merge predicate);
+    *   - MERGEs whose first matched clause is `WHEN MATCHED` (delete /
+    *     update merges).
+    */
+  private[spark] def isRecomputeInsertMerge(sql: String): Boolean = {
+    val stripped     = stripExecutionMarker(sql)
+    val mergeHeader  = "(?is)\\bMERGE\\s+INTO\\s+".r.findFirstMatchIn(stripped).getOrElse(return false)
+    val usingOpenIdx = findMergeUsingOpenParen(stripped, mergeHeader.end).getOrElse(return false)
+    val closeIdx     = findMatchingCloseParen(stripped, usingOpenIdx)
+    if (closeIdx < 0) return false
+    val tail = stripped.substring(closeIdx + 1)
+    val tailRe =
+      "(?is)^\\s*(?:AS\\s+)?\\w+\\s+ON\\s+(?:FALSE|\\(\\s*FALSE\\s*\\))\\s+WHEN\\s+NOT\\s+MATCHED\\b".r
+    tailRe.findFirstMatchIn(tail).isDefined
+  }
+
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse
