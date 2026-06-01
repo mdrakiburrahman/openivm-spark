@@ -1083,6 +1083,40 @@ case class RefreshMaterializedViewCommand(
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
+    // Refresh-scoped AQE broadcast cap.
+    //
+    // openivm-emitted recompute programs (SIMPLE_PROJECTION view-delta CTAS,
+    // GROUP_RECOMPUTE / AGGREGATE_GROUP INSERT MERGE, WINDOW_PARTITION refresh)
+    // compose long CTE chains over multi-table joins. Catalyst's plan-time
+    // estimates for these chains are derived from compressed Parquet file sizes
+    // and don't account for row-expansion through SCD2 range joins, count
+    // monoids, or LEFT SEMI / LEFT OUTER joins that may not push down through
+    // the chain.
+    //
+    // With AQE enabled, the runtime post-shuffle stats for an intermediate
+    // stage can come back well under `spark.sql.autoBroadcastJoinThreshold`
+    // (100 MiB in the bench config). AQE then PROMOTES the next join to
+    // BroadcastHashJoin. When the upstream operator materialises that
+    // intermediate, the actual relation exceeds Spark's hard-coded 8 GiB
+    // BroadcastExchangeExec cap and the whole refresh fails with
+    // `Cannot broadcast the table that is larger than 8.0 GiB: <N> GiB`.
+    // dbt-spark-livy's `retry_all` retries the same deterministic failure
+    // for hours, making it look "flaky" while it's actually a plan pathology.
+    //
+    // We disable AQE's runtime broadcast PROMOTION for the refresh scope
+    // (sets `spark.sql.adaptive.autoBroadcastJoinThreshold` to -1) while
+    // preserving the plan-time `spark.sql.autoBroadcastJoinThreshold` so the
+    // WINDOW_PARTITION / AGGREGATE_GROUP MERGE patterns that depend on a
+    // genuinely-small-side broadcast at plan time still get one. Net effect:
+    // Catalyst's initial cost-based plan stays intact, but AQE will not
+    // escalate a join to broadcast at runtime based on post-shuffle stats
+    // from an openivm CTE chain whose true row count it can't predict.
+    //
+    // Scope: `spark` here is the per-refresh cloneSession (see entry point
+    // above), so this override applies only to this refresh and does not
+    // leak to sibling refreshes or to user queries.
+    spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
+
     val refreshT0  = System.nanoTime()
     val viewLabel  = sqlIdent(name)
     val viewMeta   = metaName(name)
