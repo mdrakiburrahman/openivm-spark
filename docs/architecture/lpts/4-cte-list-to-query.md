@@ -547,13 +547,13 @@ Sources:
 
 ## Where openivm-spark intercepts
 openivm-spark invokes OpenIVM through a DuckDB CLI script.
-That script sets:
+That script passes Spark as a per-call CompileFacts key:
 
-```sql
-SET openivm_target_dialect='spark';
+```json
+{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}
 ```
 
-Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:144-152`.
+Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:144-195`.
 The LPTS output is therefore close to Spark SQL.
 It is not necessarily executable by Spark 3.5 / Delta Lake 3.2.
 openivm-spark runs `LptsSparkDialect.translate` as a string post-pass.

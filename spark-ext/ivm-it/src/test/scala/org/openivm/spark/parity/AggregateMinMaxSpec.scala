@@ -23,8 +23,9 @@ import java.util.UUID
   * `(has_minmax && !insert_only)` at refresh-emit time
   * (`refresh_compiler.cpp:372-387`).
   *
-  * With `openivm_compile_only=true` the empty compile-time delta tables make
-  * `ResolveDeltaFastPathFlags` (`refresh_delta_fast_paths.cpp:80-126`) pick
+  * With `compile_only=true` in the CompileFacts JSON the empty compile-time
+  * delta tables make `ResolveDeltaFastPathFlags`
+  * (`refresh_delta_fast_paths.cpp:80-126`) pick
   * `insert_only=true`, which would otherwise emit a MERGE that consolidates
   * per-group via `min(col)`/`max(col)`. That MERGE produces wrong values once
   * a delete or update of the current min/max arrives at refresh time.

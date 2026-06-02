@@ -178,10 +178,11 @@ class RecomputeSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   //
   //   TODO(P6f-B): The openivm DuckDB-side compiler currently fails to
   //   produce a refresh plan for this 3-way self-join shape when invoked via
-  //   `PRAGMA compile_refresh('rc_market_rollup')` — the bridge throws
-  //   `OpenIvmCompileException: ... produced no result`.  The view body is
-  //   accepted by Spark's analyzer (so the bidirectional EXCEPT ALL would
-  //   work) but the MV CREATE fails before any data ever lands in the MV.
+  //   `openivm_compile_with_facts('rc_market_rollup', '...')` — the bridge
+  //   throws `OpenIvmCompileException: ... produced no result`.  The view
+  //   body is accepted by Spark's analyzer (so the bidirectional EXCEPT ALL
+  //   would work) but the MV CREATE fails before any data ever lands in the
+  //   MV.
   //   This is a deficiency in the spark-ext openivm bridge for this specific
   //   shape, not a Spark-side limitation.  Re-enable once the compile-time
   //   bridge can plan the 3-term self-join with `add_months` (or interval)

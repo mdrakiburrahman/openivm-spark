@@ -50,7 +50,7 @@ In current code, `LPTS_emit(...)` is a useful architectural shorthand.
 The concrete OpenIVM call sites invoke LPTS pipeline functions:
 
 ```cpp
-SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+SqlDialect dialect = facts.target_dialect;
 auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
 auto cte_list = AstToCteList(*ast, dialect);
 view_query = cte_list->ToQuery(true, output_names);
@@ -59,11 +59,9 @@ view_query = cte_list->ToQuery(true, output_names);
 Source landmarks:
 
 - `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:144-196`
-  builds the DuckDB script.
-- `.temp/openivm/src/openivm_extension.cpp:239-246` registers
-  `openivm_target_dialect`.
-- `.temp/openivm/src/upsert/refresh.cpp:593-739` implements
-  `PRAGMA compile_refresh`.
+  builds the DuckDB script, embeds the Spark CompileFacts JSON, and calls `openivm_compile_with_facts`.
+- `.temp/openivm/src/include/compile_facts.hpp` defines the per-call CompileFacts payload.
+- `.temp/openivm/src/upsert/refresh.cpp` implements the compile table-function path.
 - `.temp/lpts/src/lpts_pipeline.cpp:2500-2503` implements
   `LogicalPlanToAst`.
 - `.temp/lpts/src/lpts_pipeline.cpp:3220-3223` implements
@@ -137,28 +135,24 @@ The Spark JVM is only the caller.
 
 OpenIVM owns the IVM classification and delta-plan generation.
 For openivm-spark it is used in compile-only mode.
-The Scala script sets:
+The Scala script loads the extension, keeps only the remaining session-scoped knobs,
+and sends Spark-specific facts as one JSON payload:
 
 ```sql
 LOAD '/opt/openivm/openivm.duckdb_extension';
-SET openivm_target_dialect='spark';
-SET openivm_compile_only=true;
-SET openivm_enable_view_matching=false;
-SET openivm_force_view_delta_cascade=true;
-SET openivm_emit_cascade_delta_for_recompute=true;
 SET openivm_minmax_incremental=false;
 SET openivm_files_path='<compiler scratch directory>';
+-- source CREATE TABLE statements and Spark function shims follow
+CREATE OR REPLACE MATERIALIZED VIEW <view_name> AS <body>;
+SELECT * FROM openivm_compile_with_facts(
+  '<view_name>',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 
-Source: `OpenIvmCompiler.scala:149-176`.
-
-Then it registers empty DuckDB source tables, creates the DuckDB MV, and calls:
-
-```sql
-PRAGMA compile_refresh('<view_name>');
-```
-
-Source: `OpenIvmCompiler.scala:177-195`.
+Source: `OpenIvmCompiler.scala:149-195`.
+The JSON keys select the Spark dialect, keep the compile side effect-free, and force cascade-delta emission for
+Spark's depth-2 MV-over-MV support.
 
 OpenIVM returns one row with:
 
@@ -214,7 +208,7 @@ Source: `.temp/lpts/src/lpts_helpers.cpp:9-23`.
 
 | Boundary | Caller | Callee | Payload | Return |
 | --- | --- | --- | --- | --- |
-| Spark -> OpenIVM | openivm-spark | DuckDB CLI + OpenIVM | `PRAGMA compile_refresh(view_name)` after registering `sources_schemas` | JSON-lines row |
+| Spark -> OpenIVM | openivm-spark | DuckDB CLI + OpenIVM | `openivm_compile_with_facts(view_name, facts_json)` after registering source schemas | JSON-lines row |
 | OpenIVM -> LPTS | openivm | LPTS pipeline | `LPTS_emit(rewritten_plan, dialect='spark', options={...})` | SQL string |
 | LPTS -> OpenIVM | LPTS | openivm | serialized CTE SQL | string |
 | OpenIVM -> Spark | openivm | openivm-spark | `refresh_type`, `refresh_type_name`, `sql` plus sidecar initial-load SQL | `CompiledRefresh` |
@@ -223,7 +217,7 @@ The user-facing compact form is:
 
 ```text
 openivm-spark -> openivm:
-  PRAGMA compile_refresh(view_name, sources_schemas)
+  openivm_compile_with_facts(view_name, facts_json) with source schemas registered as DuckDB tables
 
 openivm -> LPTS:
   LPTS_emit(rewritten_plan, dialect='spark', options={...})
@@ -235,22 +229,22 @@ openivm -> openivm-spark:
   { refresh_type, sql, initial_load_sql }
 ```
 
-The exact OpenIVM PRAGMA currently takes the view name as its single SQL
-argument.
-The `sources_schemas` part is represented by the DuckDB tables that
-openivm-spark creates in the ephemeral CLI session before the PRAGMA runs.
+The OpenIVM table function takes the view name and the CompileFacts JSON as its
+SQL arguments.
+The source-schema part is represented by the DuckDB tables that openivm-spark
+creates in the ephemeral CLI session before the table function runs.
 
 ## 8.4 The dialect contract
 
-openivm-spark requests:
+openivm-spark requests Spark output through the CompileFacts payload:
 
-```sql
-SET openivm_target_dialect='spark';
+```json
+{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}
 ```
 
-OpenIVM reads that setting and passes the parsed dialect into LPTS.
-Source: `.temp/openivm/src/core/sql_utils.cpp:14-20` and
-`.temp/openivm/src/core/parser.cpp:301-305`.
+OpenIVM reads that per-call key and passes the parsed dialect into LPTS.
+Source: `.temp/openivm/src/include/compile_facts.hpp` and the compile table-function path in
+`.temp/openivm/src/upsert/refresh.cpp`.
 
 The contract is intentionally pragmatic:
 
@@ -451,7 +445,7 @@ sequenceDiagram
   Spark->>Spark: strip db.orders to orders
   Spark->>Duck: CREATE TABLE orders (...)
   Spark->>Duck: CREATE MATERIALIZED VIEW mv AS SELECT ... FROM orders
-  Spark->>OIVM: PRAGMA compile_refresh('mv')
+  Spark->>OIVM: openivm_compile_with_facts('mv', facts_json)
   OIVM->>LPTS: serialize plan with Spark dialect
   LPTS-->>OIVM: SQL referencing memory.main.orders
   OIVM-->>Spark: compiled SQL JSON
@@ -614,7 +608,7 @@ section.
 
 ### 8.12.1 DuckDB cannot bind Spark SQL
 
-Symptom: `PRAGMA compile_refresh` never returns a result row.
+Symptom: `openivm_compile_with_facts` never returns a result row.
 Likely causes:
 
 - a qualified Spark table name was not stripped before compile;

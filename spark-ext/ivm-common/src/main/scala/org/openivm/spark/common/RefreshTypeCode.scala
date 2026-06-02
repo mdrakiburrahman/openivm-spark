@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 /** RefreshType enum values mirrored from openivm/src/include/core/openivm_constants.hpp.
-  * Matches the int values emitted by `PRAGMA compile_refresh`.
+  * Matches the int values emitted by `openivm_compile_with_facts`.
   */
 object RefreshTypeCode {
   val AggregateGroup   = 0
@@ -29,7 +29,7 @@ object RefreshTypeCode {
     *
     * Enabled for:
     *   - **AGGREGATE_GROUP / AGGREGATE_HAVING** (with
-    *     `openivm_force_view_delta_cascade=true`): openivm adds the per-key
+    *     `force_view_delta_cascade=true`): openivm adds the per-key
     *     retract+add companions in `refresh_sql.cpp` so the view-delta carries
     *     SIGNED multiset semantics. Downstream COUNT(*)/DISTINCT cascade works.
     *   - **SIMPLE_PROJECTION**: openivm's `GenerateRefreshSQL` always
@@ -38,14 +38,13 @@ object RefreshTypeCode {
     *     into the per-refresh view-delta path. Downstream SIMPLE_PROJECTION
     *     / AGGREGATE_GROUP cascade picks up the +1/-1 rows directly.
     *   - **WINDOW_PARTITION / GROUP_RECOMPUTE** (with
-    *     `openivm_emit_cascade_delta_for_recompute=true`, added in
-    *     openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
-    *     "feat: emit openivm_delta_<view> from recompute paths"): openivm
+    *     `force_view_delta_cascade=true`, which is what openivm-spark always
+    *     sets in its CompileFacts payload): openivm
     *     snapshots the affected pre-refresh rows plus the recomputed
     *     post-refresh rows before mutating `openivm_data_<view>`, then appends
     *     them as `-1/+1` rows into `openivm_delta_<view>`. The old
     *     `WINDOW_PARTITION / GROUP_RECOMPUTE do not cascade` explanation is now
-    *     obsolete once that pragma is enabled in the compiler prologue.
+    *     obsolete once `force_view_delta_cascade=true` is set in CompileFacts.
     *
     * SIMPLE_AGGREGATE (1) is intentionally EXCLUDED. The openivm compile-only
     * mode does not emit a snapshot companion (refresh_sql.cpp build_snapshot_companion)

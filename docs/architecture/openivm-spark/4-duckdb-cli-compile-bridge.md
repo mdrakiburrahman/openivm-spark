@@ -19,19 +19,22 @@ It spawns a fresh DuckDB CLI subprocess with:
 The default CLI path is `/opt/openivm/duckdb`.
 The default extension path is `/opt/openivm/openivm.duckdb_extension`.
 The script starts by loading that extension.
-It then configures OpenIVM for Spark-target code generation.
+It sets the remaining compiler session knobs that are still session scoped.
 It registers empty DuckDB tables that match the Spark source schemas.
 It registers Spark function shim macros.
 It creates a temporary DuckDB materialized view from the Spark MV body.
-Finally it invokes:
+Finally it invokes the per-call compile table function with Spark CompileFacts:
 ```sql
-PRAGMA compile_refresh('<viewName>');
+SELECT * FROM openivm_compile_with_facts(
+  '<viewName>',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 DuckDB is launched with `-jsonlines`.
 That means each result row is printed as a single JSON object on its own line.
 Most setup statements produce no useful row.
 `CREATE MATERIALIZED VIEW` may print a status row.
-The row that matters is the final `compile_refresh` row.
+The row that matters is the final `openivm_compile_with_facts` row.
 It has at least these fields:
 ```json
 {"refresh_type":0,"refresh_type_name":"AGGREGATE_GROUP","sql":"..."}
@@ -68,7 +71,7 @@ one that loads and executes the extension.
 The `duckdb_jdbc` dependency is still pinned.
 That pin exists for class-loader and ABI alignment with the DuckDB version used
 by OpenIVM.
-It is not the query-execution path for `PRAGMA compile_refresh`.
+It is not the query-execution path for the compiler table function.
 The dependency file says this directly:
 ```scala
 // spark-ext/project/Dependencies.scala:7-10
@@ -86,9 +89,9 @@ DUCKDB_JDBC_VERSION=1.5.2.1
 ```
 The parity spec that exercises this path is
 `CompileRefreshSpec`.
-It is a Spark-side port of `openivm/test/sql/compile_refresh.test`.
+It is a Spark-side port of OpenIVM's compile-entry regression coverage.
 It asserts that the bridge returns the same structural information expected from
-OpenIVM's `PRAGMA compile_refresh` path.
+OpenIVM's `openivm_compile_with_facts` path.
 The spec documents the extension dependency:
 ```scala
 // spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/CompileRefreshSpec.scala:23-25
@@ -195,51 +198,39 @@ rather than accessed through a separate compiler daemon.
 `ChildProcess` is reserved for future work.
 Passing it throws `NotImplementedError`.
 ---
-## 4. Full OpenIVM PRAGMA and setting contract
+## 4. CompileFacts and remaining DuckDB setting contract
 The script body is assembled in `buildScript()`.
 The relevant source range is `OpenIvmCompiler.scala:149-195`.
-The script uses DuckDB `SET` syntax for OpenIVM settings and `PRAGMA` for the
-final compile call.
-Architecturally these settings are the OpenIVM PRAGMA contract for Spark
-compilation.
+Spark-specific compiler facts are passed to OpenIVM as one JSON argument to the
+compile table function, not as DuckDB session settings.
 A representative script begins like this:
 ```sql
 LOAD '/opt/openivm/openivm.duckdb_extension';
-SET openivm_target_dialect='spark';
-SET openivm_compile_only=true;
-SET openivm_enable_view_matching=false;
-SET openivm_force_view_delta_cascade=true;
-SET openivm_emit_cascade_delta_for_recompute=true;
 SET openivm_minmax_incremental=false;
 SET openivm_files_path='<tmpDir>';
-```
-The same contract is often written in PRAGMA form:
-```sql
-LOAD '/opt/openivm/openivm.duckdb_extension';
-PRAGMA openivm_target_dialect='spark';
-PRAGMA openivm_compile_only=true;
-PRAGMA openivm_enable_view_matching=false;
-PRAGMA openivm_force_view_delta_cascade=true;
-PRAGMA openivm_emit_cascade_delta_for_recompute=true;
-PRAGMA openivm_minmax_incremental=false;
-PRAGMA openivm_files_path='<tmpDir>';
+CREATE TABLE <source> (...);
+CREATE OR REPLACE MATERIALIZED VIEW <view> AS <body>;
+SELECT * FROM openivm_compile_with_facts(
+  '<view>',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 The table below is the center of the compile bridge contract.
-| Step | Statement | Meaning for OpenIVM | Why Spark sets it this way |
+| Step | Statement or payload | Meaning for OpenIVM | Why Spark sets it this way |
 | ---: | --- | --- | --- |
-| 1 | `LOAD '<extensionPath>';` | Loads the native OpenIVM DuckDB extension into the fresh CLI process. Without this statement DuckDB does not know `CREATE MATERIALIZED VIEW` in the OpenIVM sense and does not expose `PRAGMA compile_refresh`. | Spark never links the extension into the JVM. Loading it in the subprocess keeps native state isolated and ensures the extension is loaded by the ABI-matched CLI shipped in the dev image. |
-| 2 | `openivm_target_dialect='spark'` | Selects OpenIVM's Spark/LPTS output dialect for the generated refresh program. It changes emitted identifier quoting, table qualification, merge syntax, and other dialect details. | The next stage is `SparkRefreshRewriter`, not DuckDB execution. The bridge therefore asks OpenIVM to get as close to Spark SQL as it can before Spark-side rewriting handles remaining gaps. |
-| 3 | `openivm_compile_only=true` | Tells OpenIVM to compile and emit the refresh program without executing refresh DML. The MV body is parsed and bound, but the runtime maintenance operation is not run. | Spark owns all persistent data. Compile-only mode lets DuckDB classify the query and produce SQL while guaranteeing the compile subprocess cannot mutate Spark Delta tables. |
-| 4 | `openivm_enable_view_matching=false` | Disables OpenIVM view matching in the ephemeral DuckDB session. The compiler plans exactly the MV body supplied by Spark instead of attempting to reuse matching views registered in DuckDB. | The subprocess is intentionally minimal and short-lived. Spark's catalog is authoritative, so DuckDB-side view matching would be incomplete at best and misleading at worst. |
-| 5 | `openivm_force_view_delta_cascade=true` | Forces OpenIVM to emit a signed `openivm_delta_<view>` companion for aggregate refreshes even when the ephemeral compiler session does not know about downstream MVs. This affects paths such as `AGGREGATE_GROUP` and `AGGREGATE_HAVING`. | Spark supports MV-over-MV chains up to depth 2. The upstream refresh must materialize a view delta so the downstream MV can consume it later, even though that downstream view is not present in the compile-only DuckDB process. |
-| 6 | `openivm_emit_cascade_delta_for_recompute=true` | Extends the same cascade-delta contract to recompute-style paths. For paths such as `WINDOW_PARTITION` and `GROUP_RECOMPUTE`, OpenIVM snapshots old and new rows and emits signed `-1/+1` rows into `openivm_delta_<view>`. | Without this, a downstream MV over a recomputed upstream view cannot see the upstream changes incrementally. Spark would have to demote the downstream refresh to `FULL_REFRESH`; this setting preserves the depth-2 cascade design. |
-| 7 | `openivm_minmax_incremental=false` | Disables OpenIVM's grouped MIN/MAX fast path that assumes the compile-time delta contents are sufficient to decide insert-only maintenance. The compiler instead emits affected-groups delete-and-recompute SQL. | The compile subprocess registers empty tables and empty deltas. Choosing a fast path from those empty deltas would be wrong for real Spark refreshes where deletes or updates may remove the current minimum or maximum. |
-| 8 | `openivm_files_path='<tmpDir>'` | Directs OpenIVM to write sidecar compiled-query files to the compiler-owned directory. The bridge later reads `openivm_compiled_queries_<viewName>.sql` from that location. | The JSON row contains the refresh program, but the initial-load query is extracted from the sidecar file. The directory is per compile, then deleted in `finally`, so compiles do not share sidecar state. |
+| 1 | `LOAD '<extensionPath>';` | Loads the native OpenIVM DuckDB extension into the fresh CLI process. Without this statement DuckDB does not know `CREATE MATERIALIZED VIEW` in the OpenIVM sense and does not expose `openivm_compile_with_facts`. | Spark never links the extension into the JVM. Loading it in the subprocess keeps native state isolated and ensures the extension is loaded by the ABI-matched CLI shipped in the dev image. |
+| 2 | `target_dialect="spark"` | Selects OpenIVM's Spark/LPTS output dialect for the generated refresh program. It changes emitted identifier quoting, table qualification, merge syntax, and other dialect details. | The next stage is `SparkRefreshRewriter`, not DuckDB execution. The bridge therefore asks OpenIVM to get as close to Spark SQL as it can before Spark-side rewriting handles remaining gaps. |
+| 3 | `compile_only=true` | Tells OpenIVM to compile and emit the refresh program without executing refresh DML. The MV body is parsed and bound, but the runtime maintenance operation is not run. | Spark owns all persistent data. Compile-only mode lets DuckDB classify the query and produce SQL while guaranteeing the compile subprocess cannot mutate Spark Delta tables. |
+| 4 | `force_view_delta_cascade=true` | Forces OpenIVM to emit signed `openivm_delta_<view>` companion rows for aggregate and recompute-style paths, including `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, `WINDOW_PARTITION`, and `GROUP_RECOMPUTE`. | Spark supports MV-over-MV chains up to depth 2. The upstream refresh must materialize a view delta so the downstream MV can consume it later, even though that downstream view is not present in the compile-only DuckDB process. |
+| 5 | `SET openivm_minmax_incremental=false` | Disables OpenIVM's grouped MIN/MAX fast path that assumes the compile-time delta contents are sufficient to decide insert-only maintenance. The compiler instead emits affected-groups delete-and-recompute SQL. | The compile subprocess registers empty tables and empty deltas. Choosing a fast path from those empty deltas would be wrong for real Spark refreshes where deletes or updates may remove the current minimum or maximum. |
+| 6 | `SET openivm_files_path='<tmpDir>'` | Directs OpenIVM to write sidecar compiled-query files to the compiler-owned directory. The bridge later reads `openivm_compiled_queries_<viewName>.sql` from that location. | The JSON row contains the refresh program, but the initial-load query is extracted from the sidecar file. The directory is per compile, then deleted in `finally`, so compiles do not share sidecar state. |
+| 7 | `CREATE TABLE`, shim macros, and `CREATE MATERIALIZED VIEW` | Gives DuckDB enough schema and function information to parse and bind the Spark MV body before compilation. | The compiler session is empty and short-lived; all source metadata must be reconstructed from Spark's analyzed plan. |
+| 8 | `SELECT * FROM openivm_compile_with_facts('<view>', '<facts_json>')` | Invokes the per-call OpenIVM compiler entry point and returns the JSON-lines row containing `refresh_type`, `refresh_type_name`, and `sql`. | The CompileFacts JSON is passed as a single argument; no global session state is touched for dialect, compile-only mode, or cascade behavior, so concurrent compiles cannot interfere via leaked flags. |
 ### 4.1 Contract notes
-The table above is intentionally exhaustive.
-The settings are emitted before source tables, macros, and the MV definition.
-They must be kept together because OpenIVM chooses refresh shape, cascade output,
-and sidecar files during the final `PRAGMA compile_refresh` call.
+The table above is intentionally exhaustive for the Spark CompileFacts payload and the remaining session settings.
+The facts are embedded in the final table-function call instead of being emitted as `SET` or `PRAGMA` statements.
+The remaining settings are emitted before source tables, macros, and the MV definition because OpenIVM chooses MIN/MAX
+shape and sidecar files during the final `openivm_compile_with_facts` call.
 ---
 ## 5. Source schema synthesis
 OpenIVM cannot classify an MV body unless DuckDB can bind every referenced
@@ -465,11 +456,11 @@ sequenceDiagram
     Compiler->>PB: new ProcessBuilder(cliPath, ":memory:", "-jsonlines")
     PB->>CLI: start process
     Compiler->>CLI: stdin: LOAD extension
-    Compiler->>CLI: stdin: OpenIVM settings / PRAGMAs
+    Compiler->>CLI: stdin: remaining OpenIVM settings
     Compiler->>CLI: stdin: CREATE TABLE source stubs
     Compiler->>CLI: stdin: Spark function shim macros
     Compiler->>CLI: stdin: CREATE MATERIALIZED VIEW AS <viewSql>
-    Compiler->>CLI: stdin: PRAGMA compile_refresh('<viewName>')
+    Compiler->>CLI: stdin: SELECT * FROM openivm_compile_with_facts('<viewName>', factsJson)
     CLI-->>Compiler: stdout JSON line: status rows
     CLI-->>Compiler: stdout JSON line: {refresh_type, refresh_type_name, sql}
     CLI-->>Compiler: stderr diagnostics if any
@@ -493,17 +484,15 @@ val req = CompileRequest(
 The relevant DuckDB setup is:
 ```sql
 LOAD '/opt/openivm/openivm.duckdb_extension';
-SET openivm_target_dialect='spark';
-SET openivm_compile_only=true;
-SET openivm_enable_view_matching=false;
-SET openivm_force_view_delta_cascade=true;
-SET openivm_emit_cascade_delta_for_recompute=true;
 SET openivm_minmax_incremental=false;
 SET openivm_files_path='<compile-files-dir>';
 CREATE TABLE t (k INTEGER, v INTEGER);
 CREATE OR REPLACE MATERIALIZED VIEW mv_t_sum AS
   SELECT k, SUM(v) AS sum_v FROM t GROUP BY k;
-PRAGMA compile_refresh('mv_t_sum');
+SELECT * FROM openivm_compile_with_facts(
+  'mv_t_sum',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 The CLI first prints a status JSON object:
 ```json
@@ -722,7 +711,7 @@ When debugging the compile bridge, check these items in order.
    `[openivm-mv]` demotion record.
 9. If initial load falls back to the user query, inspect the sidecar SQL for
    unsupported constructs such as `rowid`.
-10. If MV-over-MV cascade fails, verify the force-cascade settings were present
+10. If MV-over-MV cascade fails, verify the `force_view_delta_cascade=true` CompileFacts key was present
     in the compile script.
 ---
 ## 12. Key source references
@@ -731,7 +720,7 @@ When debugging the compile bridge, check these items in order.
 - `OpenIvmCompiler.scala:37-38` — `OpenIvmCompileException`.
 - `OpenIvmCompiler.scala:69-98` — `compile()` orchestration.
 - `OpenIvmCompiler.scala:112-142` — Spark type to DuckDB type mapping.
-- `OpenIvmCompiler.scala:149-195` — script and OpenIVM setting contract.
+- `OpenIvmCompiler.scala:149-195` — script and CompileFacts contract.
 - `OpenIvmCompiler.scala:267-299` — CLI subprocess and pipe handling.
 - `OpenIvmCompiler.scala:301-370` — JSON-lines result parsing.
 - `OpenIvmCompiler.scala:324-349` — initial-load sidecar parsing.
@@ -740,6 +729,6 @@ When debugging the compile bridge, check these items in order.
 - `SparkFunctionShimSql.scala:23-50` — arity-aware rename rules.
 - `Dependencies.scala:7-11` — DuckDB JDBC ABI pin and CLI note.
 - `pins.env:27-28` — DuckDB JDBC version pin.
-- `CompileRefreshSpec.scala:9-55` — parity spec for `compile_refresh`.
+- `CompileRefreshSpec.scala:9-55` — parity spec for the compiler bridge.
 - `MaterializedViewCommands.scala:359-392` — CREATE-time demotion to
   `FULL_REFRESH` after `OpenIvmCompileException`.

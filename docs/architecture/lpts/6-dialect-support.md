@@ -8,8 +8,8 @@ The important takeaway is deliberately simple:
 LPTS has a small built-in dialect enum, not a pluggable dialect object.
 Dialect behavior is implemented by helper functions and `if (dialect == ...)`
 branches while serializing the AST and CTE list.
-OpenIVM reads its own `openivm_target_dialect` setting and forwards that enum
-to LPTS whenever it turns a logical plan into SQL.
+OpenIVM reads `target_dialect` from the per-call CompileFacts JSON and forwards
+that enum to LPTS whenever it turns a logical plan into SQL.
 `openivm-spark` asks for `spark`, then runs a final string post-processor for
 remaining DuckDB/OpenIVM tokens that LPTS does not own.
 
@@ -27,8 +27,8 @@ remaining DuckDB/OpenIVM tokens that LPTS does not own.
 | Window-frame Spark checks | `.temp/lpts/src/lpts_pipeline.cpp:780-812` |
 | CTE serialization | `.temp/lpts/src/cte_nodes.cpp:82-93`, `.temp/lpts/src/cte_nodes.cpp:372-389` |
 | Set operation serialization | `.temp/lpts/src/cte_nodes.cpp:245-284` |
-| OpenIVM target setting | `.temp/openivm/src/openivm_extension.cpp:239-246` |
-| OpenIVM target read helper | `.temp/openivm/src/core/sql_utils.cpp:14-20` |
+| OpenIVM CompileFacts surface | `.temp/openivm/src/include/compile_facts.hpp` |
+| OpenIVM compile table-function path | `.temp/openivm/src/upsert/refresh.cpp` |
 | OpenIVM CREATE-time LPTS call | `.temp/openivm/src/core/parser.cpp:301-305` |
 | OpenIVM refresh LPTS call | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873` |
 | OpenIVM insert-rule LPTS calls | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146` |
@@ -197,18 +197,17 @@ syntax, and type names still come from DuckDB logical types.
 
 Spark is the dialect most relevant to this repository.
 `openivm-spark` runs OpenIVM inside a DuckDB CLI subprocess and asks OpenIVM to
-emit Spark-targeted refresh SQL:
+emit Spark-targeted refresh SQL through the CompileFacts JSON:
 
 ```scala
-sb ++= "SET openivm_target_dialect='spark';\n"
+private[compiler] val SparkCompileFactsJson: String =
+  "{\"target_dialect\":\"spark\",\"compile_only\":true,\"force_view_delta_cascade\":true}"
 ```
 
-Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:149-176`.
+Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:426-447`.
 
-That setting eventually becomes `SqlDialect::SPARK` inside OpenIVM.
-OpenIVM registers the setting at `.temp/openivm/src/openivm_extension.cpp:239-246`
-and reads it through `ReadOpenIvmTargetDialect` at
-`.temp/openivm/src/core/sql_utils.cpp:14-20`.
+That facts key eventually becomes `SqlDialect::SPARK` inside OpenIVM.
+OpenIVM defines the CompileFacts surface at `.temp/openivm/src/include/compile_facts.hpp`.
 When OpenIVM calls LPTS for CREATE-time view SQL or refresh-time delta SQL, it
 passes that dialect into both phases:
 
@@ -314,18 +313,17 @@ SET lpts_dialect = 'postgres';
 SET lpts_dialect = 'spark';
 ```
 
-for direct LPTS, and:
+for direct LPTS.
 
-```sql
-SET openivm_target_dialect = 'spark';
+For OpenIVM refresh SQL generation, the dialect is a per-call CompileFacts key:
+
+```json
+{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}
 ```
 
-for OpenIVM refresh SQL generation.
-
 The direct LPTS setting is registered in `.temp/lpts/src/lpts_extension.cpp:286-292`.
-The OpenIVM setting is registered in `.temp/openivm/src/openivm_extension.cpp:239-246`.
-Both settings parse through the same LPTS `ParseSqlDialect` function.
-OpenIVM's wrapper is `.temp/openivm/src/core/sql_utils.cpp:14-20`.
+The OpenIVM CompileFacts surface is defined in `.temp/openivm/src/include/compile_facts.hpp`.
+Both paths parse through LPTS's dialect parser.
 
 Therefore a new dialect requires code changes:
 add a new enum value, parse it, and teach every dialect-sensitive serializer
@@ -369,34 +367,19 @@ last parser-compatibility pass.
 
 ## 7. Dialect targeting in OpenIVM
 
-OpenIVM registers an extension option named `openivm_target_dialect`.
-The source comment says it is forwarded to `LogicalPlanToAst` and `AstToCteList`
-at every refresh-SQL generation call site.
+OpenIVM now receives the target dialect through the per-call CompileFacts JSON
+passed to `openivm_compile_with_facts`.
 Valid values are `duckdb`, `postgres`, and `spark`.
-The default is `duckdb`.
-Source: `.temp/openivm/src/openivm_extension.cpp:239-246`.
+The default schema version is 1, and unsupported schema versions are rejected.
+The CompileFacts surface is defined in `.temp/openivm/src/include/compile_facts.hpp`.
 
-The read helper is tiny:
-
-```cpp
-SqlDialect ReadOpenIvmTargetDialect(ClientContext &context) {
-    Value dialect_val;
-    if (context.TryGetCurrentSetting("openivm_target_dialect", dialect_val) && !dialect_val.IsNull()) {
-        return ParseSqlDialect(dialect_val.GetValue<string>());
-    }
-    return SqlDialect::DUCKDB;
-}
-```
-
-Source: `.temp/openivm/src/core/sql_utils.cpp:14-20`.
-
-The Scala bridge sets the target before compiling the MV:
+The Scala bridge passes Spark facts when compiling the MV:
 
 ```sql
-SET openivm_target_dialect='spark';
-SET openivm_compile_only=true;
-...
-PRAGMA compile_refresh('<view>');
+SELECT * FROM openivm_compile_with_facts(
+  '<view>',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 
 Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:149-195`.
@@ -404,10 +387,10 @@ Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIv
 From there the flow is:
 
 1. Spark extension receives a materialized-view compile request.
-2. `OpenIvmCompiler.buildScript` writes `SET openivm_target_dialect='spark'`.
-3. The DuckDB CLI loads OpenIVM and parses the setting.
-4. OpenIVM's `PRAGMA compile_refresh` resolves the view and builds refresh SQL.
-5. Each LPTS call reads `ReadOpenIvmTargetDialect`.
+2. `OpenIvmCompiler.buildScript` embeds the Spark CompileFacts JSON in the table-function call.
+3. The DuckDB CLI loads OpenIVM and creates the source stubs and MV.
+4. `openivm_compile_with_facts` resolves the view, parses the CompileFacts payload, and builds refresh SQL.
+5. Each LPTS call uses the per-call target dialect.
 6. OpenIVM passes `SqlDialect::SPARK` into `LogicalPlanToAst`.
 7. OpenIVM passes the same enum into `AstToCteList`.
 8. `CteList::ToQuery(...)` serializes CTE SQL using Spark quoting and mappings.
@@ -418,15 +401,15 @@ Important call sites:
 
 | OpenIVM phase | Dialect hand-off |
 |---|---|
-| CREATE MATERIALIZED VIEW stored query generation | `.temp/openivm/src/core/parser.cpp:301-305` |
+| CompileFacts payload | `.temp/openivm/src/include/compile_facts.hpp` |
 | Refresh delta plan serialization | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873` |
 | Insert-rule delta serialization | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146` |
-| Compile-only entry point comment | `.temp/openivm/src/upsert/refresh.cpp:592-609` |
+| Compile table-function path | `.temp/openivm/src/upsert/refresh.cpp` |
 
-Some docs call this a PRAGMA-style target setting.
-In the code path used here it is a DuckDB extension option set with `SET`.
-`PRAGMA compile_refresh` then consumes the setting indirectly by reading the
-current session option.
+Older docs described this as a PRAGMA-style target setting.
+In the code path used here, the CompileFacts JSON is passed as a single argument
+to `openivm_compile_with_facts`; no global session state is touched, so
+concurrent compiles cannot interfere via leaked flags.
 
 ## 8. Adding a new dialect
 
@@ -579,14 +562,15 @@ Existing examples:
 ### Step 12: Wire OpenIVM if refresh SQL should target it
 
 OpenIVM uses the LPTS enum directly.
-After LPTS can parse the dialect string, OpenIVM can usually read it through
-`ReadOpenIvmTargetDialect` without a separate enum.
-Still update the registration text in `.temp/openivm/src/openivm_extension.cpp:239-246`.
+After LPTS can parse the dialect string, thread the new value through the
+CompileFacts validation and parser.
 Then test:
 
 ```sql
-SET openivm_target_dialect = '<new>';
-PRAGMA compile_refresh('mv_name');
+SELECT * FROM openivm_compile_with_facts(
+  'mv_name',
+  '{"target_dialect":"<new>","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 
 Look at CREATE-time LPTS, refresh-time LPTS, and insert-rule LPTS call sites.

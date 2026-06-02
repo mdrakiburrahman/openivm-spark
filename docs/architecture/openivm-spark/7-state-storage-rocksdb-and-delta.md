@@ -607,7 +607,7 @@ flowchart TD
 
     X -- Incremental --> AA[Load _ivm_compiled_sql\nfrom properties CF]
     AA --> AB{Cache hit?}
-    AB -- no --> AC[DuckDB CLI compile_refresh]
+    AB -- no --> AC[DuckDB CLI openivm_compile_with_facts]
     AC --> AD[MvCatalog.updateProperties\nbackfill compile cache]
     AB -- yes --> AE[Reconstruct CompiledRefresh]
     AD --> AE

@@ -194,9 +194,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
   // ── Test 5: SPARK dialect identifier quoting ──────────────────────────────
   //
-  // With openivm_target_dialect='spark' set by the CLI script, OpenIVM
-  // compiles SIMPLE_PROJECTION via the lpts pipeline, which uses fully-
-  // qualified `catalog.schema.table` identifiers in the generated SQL.
+  // With `target_dialect="spark"` set in the CompileFacts JSON payload,
+  // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
+  // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
   // Current output backtick-quotes each identifier segment, so the delta-scan
   // CTE should reference the staged source as `` `memory`.`main`.`...` ``.
 

@@ -131,7 +131,7 @@ The compiler returns `CompiledRefresh`.
 - `initialLoadSql`
 Source:
 - `OpenIvmCompiler.scala:10-16`
-The compiler bridge parses OpenIVM's JSON-lines output from `PRAGMA compile_refresh`.
+The compiler bridge parses OpenIVM's JSON-lines output from `openivm_compile_with_facts`.
 Source:
 - `OpenIvmCompiler.scala:301-310`
 - `OpenIvmCompiler.scala:351-370`

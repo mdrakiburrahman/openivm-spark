@@ -10,8 +10,10 @@ import java.io.File
 import java.util.UUID
 
 /** Depth-2 cascade regression for a WINDOW_PARTITION upstream after openivm
-  * `4471f4e929fd3b21ac55ea0c47249d4716853c98` added
-  * `openivm_emit_cascade_delta_for_recompute`.
+  * `4471f4e929fd3b21ac55ea0c47249d4716853c98` started emitting
+  * `openivm_delta_<view>` from recompute paths whenever
+  * `force_view_delta_cascade=true` is set in the CompileFacts payload (which
+  * openivm-spark always sets).
   */
 class ChainedWindowPartitionCascadeSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
 

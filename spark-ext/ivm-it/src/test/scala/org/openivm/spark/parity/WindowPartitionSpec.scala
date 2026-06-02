@@ -32,7 +32,8 @@ import java.util.UUID
   * }}}
   *
   * With openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` and
-  * `openivm_emit_cascade_delta_for_recompute=true`, WINDOW_PARTITION now ALSO
+  * `force_view_delta_cascade=true` (which openivm-spark always sets in its
+  * CompileFacts payload), WINDOW_PARTITION now ALSO
   * emits an `INSERT INTO openivm_delta_<view>` companion: openivm snapshots
   * the affected pre-refresh rows into `openivm_old_<view>`, the recomputed
   * post-refresh rows into `openivm_new_<view>`, refreshes

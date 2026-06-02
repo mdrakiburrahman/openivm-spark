@@ -162,7 +162,7 @@ If the demotion reason is `compile_failed` and DuckDB upstream can compile the
 same body, continue.
 That usually means the Spark bridge sent DuckDB SQL that it could not bind.
 Common causes are missing Spark function shims and Spark-only syntax that was not
-normalized before `PRAGMA compile_refresh`.
+normalized before `openivm_compile_with_facts`.
 If there is no demotion reason but `refreshTypeName` is `FULL_REFRESH`, treat
 that as a bug in observability and route the details through Chapter 11.
 Do not widen `FULL_REFRESH` to make a failing parity spec pass.
@@ -281,19 +281,21 @@ OPENIVM_LOG_LEVEL=DEBUG ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.
 ```
 Then inspect the newest test log directory:
 ```bash
-grep -R "compile_refresh\|duckdb\|raw stdout\|raw stderr" .logs/test-*/fork-*.log
+grep -R "openivm_compile_with_facts\|duckdb\|raw stdout\|raw stderr" .logs/test-*/fork-*.log
 ```
 The goal is to find the DuckDB CLI script, raw stdout, and raw stderr.
 The compile bridge builds a script shaped like this:
 ```sql
 LOAD '.../openivm.duckdb_extension';
-SET openivm_compile_only=true;
 SET openivm_minmax_incremental=false;
 SET openivm_files_path='...';
 CREATE TABLE base (...);
 CREATE OR REPLACE MACRO ...;
 CREATE OR REPLACE MATERIALIZED VIEW mv AS <normalized user SQL>;
-PRAGMA compile_refresh('mv');
+SELECT * FROM openivm_compile_with_facts(
+  'mv',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 ```
 Compare that script with the hand-run DuckDB reproduction from the general
 workflow below.
@@ -455,7 +457,7 @@ FROM orders
 ```
 Spark accepts the function.
 DuckDB does not have Spark's `unix_timestamp(string, format)` signature.
-The DuckDB CLI errors during `PRAGMA compile_refresh`.
+The DuckDB CLI errors during `openivm_compile_with_facts`.
 openivm-spark records `compile_failed` and demotes to `FULL_REFRESH`.
 This is a bridge gap.
 The bridge must let DuckDB bind a compile-only equivalent while preserving Spark
@@ -600,18 +602,20 @@ Use this workflow for every parity-gap PR.
    in `beforeAll`.
    Use bidirectional `EXCEPT ALL` as the oracle unless Gap C applies.
 2. Confirm that DuckDB does IVM.
-   Run a tiny DuckDB session with `PRAGMA compile_refresh`.
+   Run a tiny DuckDB session with `openivm_compile_with_facts`.
    The script should register only the minimal source DDL and MV body.
    Verify that the returned refresh type is not `FULL_REFRESH`.
    Save the refresh type and a compact SQL excerpt for the PR description.
    A skeleton script is:
    ```sql
    LOAD '/opt/openivm/openivm.duckdb_extension';
-   SET openivm_compile_only=true;
    CREATE TABLE base(id INTEGER, amount DECIMAL(10,2));
    CREATE OR REPLACE MATERIALIZED VIEW mv AS
    SELECT id, SUM(amount) AS total FROM base GROUP BY id;
-   PRAGMA compile_refresh('mv');
+   SELECT * FROM openivm_compile_with_facts(
+     'mv',
+     '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+   );
    ```
 3. Identify the failure layer.
    Use the six-step diagnostic walk.
@@ -655,7 +659,7 @@ Use this workflow for every parity-gap PR.
 ## Filing checklist for a parity-gap PR
 Include this checklist in the PR description.
 - [ ] Repro spec exists.
-- [ ] DuckDB-side IVM verified with `PRAGMA compile_refresh`.
+- [ ] DuckDB-side IVM verified with `openivm_compile_with_facts`.
 - [ ] Refresh type screenshot or text excerpt is attached.
 - [ ] Fix is minimally invasive.
 - [ ] No demotion path was widened.

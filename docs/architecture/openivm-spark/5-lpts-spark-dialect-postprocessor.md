@@ -5,7 +5,7 @@
 
 ## Role
 
-OpenIVM emits refresh SQL through LPTS with `openivm_target_dialect='spark'`.
+OpenIVM emits refresh SQL through LPTS with `target_dialect="spark"` in the CompileFacts JSON.
 That "LPTS-Spark" dialect is close to Spark SQL, but it is not directly
 executable by Spark 3.5 / Delta Lake 3.2.
 
@@ -42,8 +42,8 @@ is applied to each kept statement at the end of that rewriter
 ## Compile bridge context
 
 `OpenIvmCompiler` builds a DuckDB CLI script that loads the OpenIVM extension,
-sets `openivm_target_dialect='spark'`, creates empty source tables, creates a
-DuckDB materialized view, and runs `PRAGMA compile_refresh`
+passes the Spark CompileFacts JSON, creates empty source tables, creates a
+DuckDB materialized view, and runs `openivm_compile_with_facts`
 (`OpenIvmCompiler.scala:144-196`).
 
 The CLI result is read from JSON-lines stdout and decoded into
@@ -297,7 +297,7 @@ SELECT region FROM sales WHERE amount > 0
 
 Why: DuckDB only sees short temporary tables. The implementation uses tracked
 qualified names, sorts longest first, and rewrites `<db>.<table>` to `<table>`
-so `PRAGMA compile_refresh` can bind. Unit examples cover no-op, multi-source,
+so `openivm_compile_with_facts` can bind. Unit examples cover no-op, multi-source,
 case-insensitive, and 3-part-name cases (`OpenIvmCompilerSpec.scala:373-421`).
 
 ### Half 2: `rewriteMemoryMainPrefix` before Spark execution

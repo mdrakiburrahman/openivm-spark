@@ -14,7 +14,8 @@ import java.util.UUID
   * == Why the view body must be portable to both DuckDB and Spark ==
   *
   * openivm-spark sends every `CREATE MATERIALIZED VIEW … AS <view body>` to a
-  * DuckDB-CLI process (`PRAGMA compile_refresh(...)`) for classification, and
+  * DuckDB-CLI process (`openivm_compile_with_facts(view, facts_json)`) for
+  * classification, and
   * Spark executes the same view body when re-evaluating it for full-refresh
   * fallback or for the bidirectional `EXCEPT ALL` correctness check.
   *

@@ -20,8 +20,9 @@ import java.util.UUID
   *   - UNION over aggregates
   *
   * With openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` and
-  * `openivm_emit_cascade_delta_for_recompute=true`, GROUP_RECOMPUTE emits an
-  * extended affected-groups program:
+  * `force_view_delta_cascade=true` (which is what openivm-spark always sets
+  * in its CompileFacts payload), GROUP_RECOMPUTE emits an extended
+  * affected-groups program:
   *
   *   1. `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS
   *        SELECT DISTINCT <keys> FROM (<delta-substituted view query>);`

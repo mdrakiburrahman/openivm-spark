@@ -1545,7 +1545,7 @@ sequenceDiagram
     Spark->>Parser: parse CREATE MATERIALIZED VIEW
     Parser->>Cmd: CreateMaterializedViewCommand
     Cmd->>Compiler: CompileRequest(viewName, viewSql, source schemas)
-    Compiler->>DuckDB: PRAGMA compile_refresh
+    Compiler->>DuckDB: openivm_compile_with_facts
     DuckDB-->>Compiler: refreshType=AGGREGATE_GROUP + compiled SQL
     Compiler->>LPTS: translate DuckDB-ish SQL to Spark-ish SQL fragments
     Cmd->>Catalog: persist metadata + _ivm_compiled_sql + watermarks

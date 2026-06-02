@@ -708,7 +708,7 @@ Checklist:
 5. Add an `AstFlattener::FlattenNode` case.
 6. Add or reuse a `CteNode` renderer in `cte_nodes.hpp/cpp`.
 7. Test DuckDB dialect first.
-8. Test Spark dialect with `openivm_target_dialect='spark'`.
+8. Test Spark dialect with `target_dialect="spark"` in the CompileFacts JSON.
 9. Add an `openivm-spark` parity test if Spark execution is expected to work.
 
 Rules of thumb:

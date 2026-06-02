@@ -7,7 +7,7 @@ import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
 
-/** Output of `PRAGMA compile_refresh`. */
+/** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
@@ -38,8 +38,8 @@ final case class CompileRequest(
 final class OpenIvmCompileException(message: String, cause: Throwable) extends RuntimeException(message, cause)
 
 /** DuckDB CLI bridge that loads the OpenIVM extension and translates a Spark
-  * materialized-view definition into a refresh-SQL program via
-  * `PRAGMA compile_refresh`.
+  * materialized-view definition into a refresh-SQL program via the
+  * `openivm_compile_with_facts(view_name, facts_json)` table function.
   *
   * Each [[compile]] call spawns an independent `duckdb :memory: -jsonlines`
   * subprocess, so multiple threads can compile concurrently without any shared
@@ -57,7 +57,8 @@ class OpenIvmCompiler private (
 
   /** Translates `req.viewSql` into a [[CompiledRefresh]] by registering empty
     * source tables, creating a temporary materialized view, invoking
-    * `PRAGMA compile_refresh`, and tearing down the ephemeral DuckDB process.
+    * `openivm_compile_with_facts`, and tearing down the ephemeral DuckDB
+    * process.
     *
     * Each call spawns a fresh `duckdb :memory:` subprocess, so calls from
     * concurrent threads proceed in parallel without contention.
@@ -175,14 +176,13 @@ class OpenIvmCompiler private (
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
-    // openivm_compile_with_facts replaces the three deleted PRAGMAs
-    // (openivm_target_dialect / openivm_compile_only / openivm_force_view_delta_cascade)
-    // plus their consolidated `emit_cascade_delta_for_recompute` driver with a
-    // single CompileFacts JSON payload. The function is non-mutating: every
-    // refresh statement is returned in `sql` rows (one per top-level
-    // statement) without touching aux state.
+    // openivm_compile_with_facts is the per-call compile entry point. It
+    // takes the view name plus a JSON CompileFacts payload and returns one
+    // row per top-level refresh statement without mutating openivm aux
+    // state. The CompileFacts surface is documented in
+    // `openivm/src/include/compile_facts.hpp`.
     //
-    // - target_dialect="spark":         emit Spark/Delta SQL (was openivm_target_dialect).
+    // - target_dialect="spark":         emit Spark/Delta SQL.
     // - compile_only=true:              preserve inclusion-exclusion terms for empty
     //                                   compile-time deltas + skip aux-state mutation.
     // - force_view_delta_cascade=true:  always emit openivm_delta_<view> cascade rows
@@ -200,8 +200,9 @@ class OpenIvmCompiler private (
     * dbt-style workload references tables as `<db>.<table>` the resulting
     * SQL flows into the DuckDB compiler subprocess, which only has the short
     * tables registered (`CREATE TABLE <table> (...)`). Without this rewrite,
-    * `PRAGMA compile_refresh` fails with `Catalog Error: Table with name
-    * "<db>.<table>" does not exist because schema "<db>" does not exist.`
+    * `openivm_compile_with_facts` fails with `Catalog Error: Table with
+    * name "<db>.<table>" does not exist because schema "<db>" does not
+    * exist.`
     *
     * Implementation: word-boundary regex, longest qualified name first so a
     * 3-part `catalog.db.table` substring doesn't get half-rewritten. The
@@ -425,9 +426,9 @@ class OpenIvmCompiler private (
 object OpenIvmCompiler {
 
   /** JSON payload threaded into `openivm_compile_with_facts(view, facts)` for
-    * every spark-ext compile call. Mirrors the three deleted PRAGMA flags
-    * (`openivm_target_dialect`, `openivm_compile_only`, `openivm_force_view_delta_cascade`)
-    * plus the consolidated `emit_cascade_delta_for_recompute` driver:
+    * every spark-ext compile call. See
+    * `openivm/src/include/compile_facts.hpp` for the full CompileFacts
+    * surface.
     *
     *   - `target_dialect="spark"`        — emit Spark/Delta SQL.
     *   - `compile_only=true`             — preserve inclusion-exclusion terms

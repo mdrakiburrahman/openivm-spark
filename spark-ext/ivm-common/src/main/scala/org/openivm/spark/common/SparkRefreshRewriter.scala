@@ -307,7 +307,7 @@ object SparkRefreshRewriter {
     case object ViewDeltaInsert extends StatementKind
 
     /** AGGREGATE_GROUP / AGGREGATE_HAVING **retract companion** that openivm
-      * emits when `openivm_force_view_delta_cascade=true` (or when a downstream
+      * emits when `force_view_delta_cascade=true` (or when a downstream
       * MV is registered in native mode). Shape:
       *
       *   INSERT INTO openivm_delta_<view> (cols)
@@ -362,9 +362,10 @@ object SparkRefreshRewriter {
 
     /** Recompute-cascade snapshot of the PRE-refresh MV rows.
       *
-      * When openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98`
-      * (`openivm_emit_cascade_delta_for_recompute=true`) is enabled, both
-      * WINDOW_PARTITION and GROUP_RECOMPUTE emit
+      * When openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` is enabled
+      * and CompileFacts has `force_view_delta_cascade=true` (which
+      * openivm-spark always sets), both WINDOW_PARTITION and
+      * GROUP_RECOMPUTE emit
       * `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS SELECT … FROM openivm_data_<view> …`.
       * Spark must keep this pinned to the pre-refresh MV contents, so we rewrite
       * it to a TEMPORARY VIEW over `delta.<mvLocation> VERSION AS OF <pre-refresh-version>`.
@@ -455,7 +456,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDrop
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
-      // emitted when `openivm_force_view_delta_cascade=true`) from the main
+      // emitted when `force_view_delta_cascade=true`) from the main
       // view-delta CTAS.  Both target `openivm_delta_<view>`.  The companion is
       // an APPEND of synthesized retract rows; its SELECT body references the
       // delta-view itself in the FROM clause (`FROM openivm_delta_<view> d
@@ -558,7 +559,7 @@ object SparkRefreshRewriter {
   private def stripTimestampPredicate(sql: String): String = {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
-    // emitted by openivm when `openivm_force_view_delta_cascade=true`).
+    // emitted by openivm when `force_view_delta_cascade=true`).
     val qcol = "(?:\\w+\\.)?openivm_timestamp"
     // Case 1: standalone `WHERE openivm_timestamp OP '...'::TIMESTAMP`
     val standalone = ("(?i)\\s+WHERE\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP").r
@@ -750,7 +751,7 @@ object SparkRefreshRewriter {
   }
 
   /** Rewrite the AGGREGATE_GROUP / AGGREGATE_HAVING retract companion INSERT
-    * (emitted by openivm when `openivm_force_view_delta_cascade=true`):
+    * (emitted by openivm when `force_view_delta_cascade=true`):
     *
     *   INSERT INTO openivm_delta_<view> (cols)
     *   SELECT d.<key>, 0, …, -1
@@ -2123,7 +2124,7 @@ object SparkRefreshRewriter {
     }
     // Filter out openivm-internal bookkeeping INSERTs that don't carry actual
     // delta semantics:
-    //   - AGGREGATE_GROUP retract/add companions (`openivm_force_view_delta_cascade=true`):
+    //   - AGGREGATE_GROUP retract/add companions (`force_view_delta_cascade=true`):
     //     SELECT body references `openivm_delta_<view>` in the FROM clause
     //     (self-join). The main delta-query CTAS reads from a CTE alias.
     //   - compact_delta_view post-processing (emitted when has_downstream=true):

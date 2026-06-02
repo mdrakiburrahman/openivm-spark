@@ -158,7 +158,7 @@ class AggregateNonAdditiveSpec extends AnyFunSpec with Matchers with BeforeAndAf
 
   // openivm test/sql/aggregate.test §LIST aggregate (aggna_list_events) — ordered LIST<INT>
   // TODO(P6f-AggregateSpec): openivm's DuckDB compile path does not know about
-  // Spark's `collect_list` function — `PRAGMA compile_refresh('aggna_mv_user_items')`
+  // Spark's `collect_list` function — `openivm_compile_with_facts('aggna_mv_user_items', ...)`
   // returns "Catalog Error: Scalar Function with name collect_list does not
   // exist". The Spark-side rewrite needs to either route LIST aggregates to
   // FULL_REFRESH at CREATE time or translate `collect_list`→`list` (DuckDB) and

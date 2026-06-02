@@ -696,18 +696,20 @@ case class CreateMaterializedViewCommand(
     // demotion, but the reason changed in openivm
     // `4471f4e929fd3b21ac55ea0c47249d4716853c98`
     // ("feat: emit openivm_delta_<view> from recompute paths"). With
-    // `openivm_emit_cascade_delta_for_recompute=true`,
-    // `CompileWindowRecompute()` now snapshots the affected pre-refresh rows and
-    // recomputed post-refresh rows before mutating `openivm_data_<view>`, then
-    // appends them as `-1/+1` rows into `openivm_delta_<view>`. The PRIMARY
-    // execution shape is still the partition-scoped DELETE+INSERT that refreshes
-    // this MV in place; the new view-delta exists so downstream MV-over-MV chains
-    // can consume the recompute incrementally. The rewriter therefore handles
-    // both pieces: the direct DELETE/INSERT plus the auxiliary cascade delta.
+    // `force_view_delta_cascade=true` in CompileFacts (which openivm-spark
+    // always sets), `CompileWindowRecompute()` now snapshots the affected
+    // pre-refresh rows and recomputed post-refresh rows before mutating
+    // `openivm_data_<view>`, then appends them as `-1/+1` rows into
+    // `openivm_delta_<view>`. The PRIMARY execution shape is still the
+    // partition-scoped DELETE+INSERT that refreshes this MV in place; the
+    // new view-delta exists so downstream MV-over-MV chains can consume the
+    // recompute incrementally. The rewriter therefore handles both pieces:
+    // the direct DELETE/INSERT plus the auxiliary cascade delta.
     //
     // GROUP_RECOMPUTE (RefreshType 6) likewise stopped being a "no view-delta"
-    // exception once the same pragma is enabled. `CompileGroupRecompute()` still
-    // materialises the affected-key set and refreshes the MV by DELETEing and
+    // exception once that CompileFacts flag is set. `CompileGroupRecompute()`
+    // still materialises the affected-key set and refreshes the MV by
+    // DELETEing and
     // re-INSERTing those groups, but openivm now also snapshots the old/new group
     // rows and emits a signed `INSERT INTO openivm_delta_<view>` companion. That
     // extra delta is not the authoritative local refresh mechanism — it is the
@@ -1882,7 +1884,7 @@ case class RefreshMaterializedViewCommand(
               // statement shapes that wrap the full MV body, matching the
               // intent documented at `withPlanTimeBroadcastDisabled` above:
               //   (a) the view-delta CTAS (refresh stmt[0]) emitted by openivm
-              //       under `openivm_force_view_delta_cascade=true` for
+              //       under `force_view_delta_cascade=true` for
               //       JOIN_DELTA / AGGREGATE_GROUP / WINDOW_PARTITION / GROUP_RECOMPUTE
               //       cascade producers — this is the on-disk
               //       `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING

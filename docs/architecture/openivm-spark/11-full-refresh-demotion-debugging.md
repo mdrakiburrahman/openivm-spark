@@ -8,7 +8,7 @@ A materialized view has two classifications that are easy to conflate.
 
 1. The DuckDB/OpenIVM compiler returns a `CompiledRefresh`:
    `refreshType`, `refreshTypeName`, `sql`, and `initialLoadSql`.
-   That shape is emitted by `PRAGMA compile_refresh` and decoded by
+   That shape is emitted by `openivm_compile_with_facts` and decoded by
    `OpenIvmCompiler.parseRefreshLine`.
 2. The Spark extension persists an effective type in `MvMetadata`.
    The persisted type controls CREATE-time storage, REFRESH-time assembly,
@@ -112,7 +112,7 @@ flowchart TD
   B --> C[collectSourceSchemas]
   C --> D[DuckDB CLI bridge]
   D --> E[CREATE MATERIALIZED VIEW in DuckDB]
-  E --> F[PRAGMA compile_refresh]
+  E --> F[openivm_compile_with_facts]
   F --> G{Compiler returns JSON?}
   G -- no --> H[FULL_REFRESH: compile_failed]
   G -- yes --> I[CompiledRefresh refresh_type]
@@ -601,9 +601,9 @@ The compile-failed log emit site is
 
 The bridge spawns `duckdb :memory: -jsonlines`; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:267-299`.
-It builds a script with the extension load, OpenIVM settings, source `CREATE
-TABLE` DDL, Spark function shims, `CREATE MATERIALIZED VIEW`, and `PRAGMA
-compile_refresh`; see
+It builds a script with the extension load, remaining OpenIVM settings, source `CREATE
+TABLE` DDL, Spark function shims, `CREATE MATERIALIZED VIEW`, and the
+`openivm_compile_with_facts` table-function call; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:144-196`.
 
 Replay that shape manually:
@@ -611,12 +611,8 @@ Replay that shape manually:
 ```bash
 /opt/openivm/duckdb :memory: -jsonlines <<'SQL'
 LOAD '/opt/openivm/openivm.duckdb_extension';
-SET openivm_target_dialect='spark';
-SET openivm_compile_only=true;
-SET openivm_enable_view_matching=false;
-SET openivm_force_view_delta_cascade=true;
-SET openivm_emit_cascade_delta_for_recompute=true;
 SET openivm_minmax_incremental=false;
+SET openivm_files_path='<compile-files-dir>';
 
 CREATE TABLE src(id INTEGER, amount INTEGER, ts TIMESTAMP);
 
@@ -626,7 +622,10 @@ CREATE OR REPLACE MACRO regexp_like(s, p) AS regexp_matches(s, p);
 CREATE OR REPLACE MATERIALIZED VIEW mv_debug AS
 SELECT id, amount FROM src;
 
-PRAGMA compile_refresh('mv_debug');
+SELECT * FROM openivm_compile_with_facts(
+  'mv_debug',
+  '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+);
 SQL
 ```
 

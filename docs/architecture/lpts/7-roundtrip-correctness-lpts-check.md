@@ -462,7 +462,7 @@ For a new openivm-spark parity spec, a practical workflow is:
 2. Reduce it to the smallest DuckDB schema and data that exercises the operator.
 3. Run `PRAGMA lpts_check` in DuckDB with the default dialect.
 4. Run again with `SET lpts_dialect='spark'`.
-5. Use OpenIVM `PRAGMA compile_refresh` to see the refresh program.
+5. Use OpenIVM `openivm_compile_with_facts` to see the refresh program.
 6. Run the actual openivm-spark Scala parity spec against Spark/Delta.
 The Spark-dialect LPTS check is an early warning.
 It is not the final Spark contract.
