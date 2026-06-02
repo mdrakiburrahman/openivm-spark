@@ -1760,11 +1760,20 @@ case class RefreshMaterializedViewCommand(
 
           val usesValueEqualityDeleteMerge =
             rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
+          // Wrap the negative-row + conflict probes in the same plan-time
+          // broadcast-disable scope as the CTAS that materialised their input.
+          // The `fusedView` lineage is the full CTAS body (SCD2 source joins);
+          // if Spark's storage layer evicts that cache, these probes re-execute
+          // the SCD2 joins and can broadcast-explode. For the on-disk path
+          // (None branch) the input is the materialised `delta.\`<viewDeltaPath>\``
+          // table — broadcast-safe but cheap to wrap anyway.
           val hasConflictingRows =
-            usesValueEqualityDeleteMerge && hasNegativesHere && {
-              fusedView match {
-                case Some(view) => hasConflictingFusedRows(spark, mergeTargetId, view)
-                case None       => hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+            usesValueEqualityDeleteMerge && withPlanTimeBroadcastDisabled {
+              hasNegativesHere && {
+                fusedView match {
+                  case Some(view) => hasConflictingFusedRows(spark, mergeTargetId, view)
+                  case None       => hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
+                }
               }
             }
           if (hasConflictingRows) {
@@ -1808,7 +1817,14 @@ case class RefreshMaterializedViewCommand(
             )
             cleanupMeta = fullRefreshMeta
             spFullRefreshFallback = true
-            fullRefresh.statements.foreach(executeSql)
+            // The fallback's INSERT OVERWRITE recomputes the FULL MV body
+            // via the same SCD2-shaped joins as the view-delta CTAS, just
+            // on the full sources (not deltas). It can broadcast-explode
+            // identically. Wrap the whole fallback program in a plan-time
+            // broadcast disable scope.
+            withPlanTimeBroadcastDisabled {
+              fullRefresh.statements.foreach(executeSql)
+            }
           } else {
             rewritten.statements.tail.zipWithIndex.foreach { case (stmt, idx) =>
               val stmtIdx = 1 + idx
@@ -1828,7 +1844,18 @@ case class RefreshMaterializedViewCommand(
                     SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, view)
                   case None => sql
                 }
-                if (SparkRefreshRewriter.isRecomputeInsertMerge(sqlForExec)) {
+                // Wrap EVERY openivm-emitted MERGE in the SIMPLE_PROJECTION
+                // tail (not just the recompute INSERT MERGE). The value-equality
+                // DELETE MERGE (`WHEN MATCHED THEN DELETE`) on a SCD2-shaped
+                // MV body (e.g. `gold.fact_market_history` joining
+                // `daily_market` × `dim_security` on
+                // `CAST(dm_date AS TIMESTAMP) BETWEEN effective_timestamp
+                // AND end_timestamp`) is rewritten by Delta into a plan that
+                // builds an "affected target files" probe on the outer view
+                // body, which trips Spark's 8 GiB `BroadcastExchangeExec`
+                // cap. See `SparkRefreshRewriter.isMergeStatement` for the
+                // full rationale.
+                if (SparkRefreshRewriter.isMergeStatement(sqlForExec)) {
                   withPlanTimeBroadcastDisabled {
                     executeSqlAt(sqlForExec, stmtIdx)
                   }
@@ -1851,7 +1878,32 @@ case class RefreshMaterializedViewCommand(
               )
               logSkippedDeleteMerge(idx)
             } else {
-              if (SparkRefreshRewriter.isRecomputeInsertMerge(sql)) {
+              // Apply the per-statement plan-time broadcast disable to BOTH
+              // statement shapes that wrap the full MV body, matching the
+              // intent documented at `withPlanTimeBroadcastDisabled` above:
+              //   (a) the view-delta CTAS (refresh stmt[0]) emitted by openivm
+              //       under `openivm_force_view_delta_cascade=true` for
+              //       JOIN_DELTA / AGGREGATE_GROUP / WINDOW_PARTITION / GROUP_RECOMPUTE
+              //       cascade producers — this is the on-disk
+              //       `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING
+              //       DELTA AS WITH … <multi-source view-delta join> …` shape;
+              //   (b) every openivm-emitted MERGE (recompute INSERT MERGE,
+              //       value-equality DELETE MERGE, aggregate UPSERT MERGE).
+              //
+              // Without (a), a JOIN_DELTA MV over a SCD2-shaped join (e.g.
+              // `gold.fact_market_history` joining `daily_market` × `dim_security`
+              // on `CAST(dm_date AS TIMESTAMP) BETWEEN effective_timestamp
+              // AND end_timestamp`) explodes through SCD2 multiplicity at
+              // execution and trips Spark's 8 GiB BroadcastExchangeExec cap —
+              // a deterministic failure that `dbt-spark-livy`'s `retry_all`
+              // then loops on for hours.
+              //
+              // Without (b), Delta's MERGE rewrite (specifically its
+              // "find affected target files" subquery) can broadcast the
+              // outer view body even when the USING source itself is tiny.
+              val isViewDeltaCtas =
+                SparkRefreshRewriter.extractViewDeltaCtasBody(stmt, viewDeltaPath).isDefined
+              if (SparkRefreshRewriter.isMergeStatement(sql) || isViewDeltaCtas) {
                 withPlanTimeBroadcastDisabled {
                   executeSqlAt(sql, idx)
                 }
