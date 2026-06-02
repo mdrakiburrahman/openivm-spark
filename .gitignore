@@ -10,6 +10,7 @@ hs_err_pid*
 target/
 out/
 .logs/
+.bsp/
 
 # Safety net: never commit Delta / Parquet / Spark-warehouse artefacts that
 # might leak into the test-resources tree (e.g. from an extractor or test
