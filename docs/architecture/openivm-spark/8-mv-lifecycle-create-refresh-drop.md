@@ -468,13 +468,93 @@ Source:
 - `MaterializedViewCommands.scala:1027-1028`
 Retry is therefore around each statement. Retry is not around the whole refresh. If statement 3 fails, statement 3 is retried. The staging snapshot is not recollected for each retry.
 ### 2.9 Simple-projection forced full recompute branch
-Simple projection has a REFRESH-time safety branch. The first statement is executed. Then the command checks whether value-equality delete merge would conflict with signed rows.
+Simple projection has a REFRESH-time safety branch. The first statement
+(stmt[0], the view-delta CTAS) is executed under the per-statement plan-time
+broadcast disable (see §2.9b). Then the command checks whether value-equality
+delete-merge would conflict with signed rows by running two probes
+(`hasNegativesHere`, `hasConflictingSimpleProjectionRows`) — both probes also
+run inside the broadcast-disable scope so the SCD2-shaped CTAS lineage cannot
+broadcast-explode if the cache evicts the fused view.
 Source:
-- `MaterializedViewCommands.scala:1030-1037`
-If conflicting signed rows exist, REFRESH logs `simple_projection_full_refresh`. It assembles and executes a one-off `FULL_REFRESH` for that refresh. It deletes the partial view-delta path.
+- `MaterializedViewCommands.scala:1745-1780`
+If conflicting signed rows exist, REFRESH logs
+`outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'`
+and assembles a one-off `FULL_REFRESH` (`SparkMergeAssembler.assemble` with
+`refreshType = FullRefresh`), executing its `INSERT OVERWRITE` statements
+inside another `withPlanTimeBroadcastDisabled` scope.
 Source:
-- `MaterializedViewCommands.scala:1038-1059`
-This is the current forced full-refresh branch in REFRESH. It is separate from schema-fingerprint mismatch.
+- `MaterializedViewCommands.scala:1781-1829`
+
+**Cascade-preservation invariant.** The fallback deliberately does **not**:
+- override `_ivm_emits_cascade_view_delta` to `false`, and
+- delete the view-delta path that stmt[0] just wrote.
+
+stmt[0]'s view-delta CTAS is openivm's raw per-tuple Δ(MV) and is
+bag-correct for downstream consumers (which read the cascade view-delta
+path, never the MV body directly). The fallback only fixes the MV's *own*
+bag — the bag-correct rewriter's `net + replenish` strategy can mis-apply
+mixed-sign rows on the local MV, but Δ(MV) is unaffected. Wiping the
+cascade evidence here was the
+`silver.holdings_history → gold.fact_holdings` correctness bug fixed by
+commit `56d91e9`: downstream MVs saw `deltas=0` even though the source
+had real change.
+
+This branch is separate from the CREATE-time `simple_projection_no_apply`
+demotion documented in chapter 11 §3.2 — here metadata stays
+`SIMPLE_PROJECTION` and only this refresh is forced to recompute.
+
+### 2.9b Refresh-scoped broadcast disables
+
+openivm-emitted recompute programs compose long CTE chains over multi-table
+joins. Catalyst's plan-time row-count estimates for these chains are derived
+from compressed Parquet file sizes and don't account for row expansion
+through SCD2 range joins, count monoids, or LEFT SEMI / LEFT OUTER joins
+that may not push down through the chain. Without protection, the resulting
+broadcast exchanges exceed Spark's hard-coded 8 GiB
+`BroadcastExchangeExec` cap and the refresh fails deterministically — which
+`dbt-spark-livy`'s `retry_all` then loops on for hours, masquerading as
+flakiness.
+
+REFRESH installs two complementary defences inside the cloned session
+scope (so neither leaks to sibling refreshes or user queries):
+
+**AQE runtime promotion cap (whole-refresh scope).** REFRESH sets
+`spark.sql.adaptive.autoBroadcastJoinThreshold = -1` on the cloned session
+for the entire refresh. This blocks AQE from PROMOTING a join to broadcast
+at runtime based on post-shuffle stats from an openivm CTE chain whose true
+row count it cannot predict. Plan-time
+`spark.sql.autoBroadcastJoinThreshold` is left untouched so genuinely
+small-side broadcasts that Catalyst chooses at plan time (e.g. the
+`SELECT DISTINCT key FROM <view_deltas>` USING source of a delete-merge)
+still happen.
+Source: `MaterializedViewCommands.scala:1120`.
+
+**Plan-time per-statement broadcast disable (targeted).** The helper
+`withPlanTimeBroadcastDisabled` saves and restores
+`spark.sql.autoBroadcastJoinThreshold` around a body, setting it to `-1`
+only while a specific high-risk action executes. The conf must remain set
+across the DataFrame action (`.cache()` + `.count()` on the fused path,
+`.collect()` on the on-disk path), not just construction, because
+Catalyst plans lazily inside the action.
+Source: `MaterializedViewCommands.scala:1153-1163`.
+
+It is applied narrowly to the statement shapes that wrap the *full MV body*:
+- the SIMPLE_PROJECTION view-delta CTAS (both fused fast path and on-disk
+  CTAS fallback);
+- the negative-row + conflict probes that read from the fused CTAS lineage;
+- the SIMPLE_PROJECTION fallback's `INSERT OVERWRITE` statements;
+- every openivm-emitted MERGE in the SIMPLE_PROJECTION tail (gated by
+  `SparkRefreshRewriter.isMergeStatement`);
+- in the non-SIMPLE_PROJECTION path, every openivm-emitted MERGE and every
+  view-delta CTAS for the active `viewDeltaPath` (gated by
+  `isMergeStatement` or `extractViewDeltaCtasBody`).
+
+The ordinary persisted `FULL_REFRESH` path (`refreshType = FullRefresh`
+at metadata read time, before any rewrite) is **not** wrapped: that path
+executes the user's original query directly via `INSERT OVERWRITE` and does
+not go through the openivm CTE chains that motivated the wraps.
+Source: `MaterializedViewCommands.scala:1860-1863`, `:1906-1911`,
+`:1696`, `:1757`, `:1773`, `:1827-1828`.
 ### 2.10 Count-monoid cleanup
 For count-monoid refresh types, REFRESH deletes rows whose count column has reached zero.
 Affected types are:
@@ -605,14 +685,17 @@ flowchart TD
     O -- no --> T[Load _ivm_compiled_sql or compile and back-fill]
     T --> U[Create openivm_delta_source temp views]
     U --> V[SparkRefreshRewriter.rewrite]
-    V --> W[Execute rewritten statements sequentially]
-    W --> X{retryable conflict?}
-    X -- yes and attempts left --> W
-    X -- final failure --> Y[Delete partial viewDeltaPath; throw rewritten SQL]
-    X -- success --> Z{simple projection signed-row conflict?}
-    Z -- yes --> AA[Force one-off FULL_REFRESH recompute]
-    Z -- no --> AB[Count-monoid zero-row cleanup]
-    AA --> AB
+    V --> V1{SIMPLE_PROJECTION?}
+    V1 -- yes --> V2["Execute stmt[0] view-delta CTAS under withPlanTimeBroadcastDisabled"]
+    V2 --> Z{conflicting signed rows? probes under broadcast-disable}
+    Z -- yes --> AA[Force one-off FULL_REFRESH recompute under broadcast-disable. Preserve viewDeltaPath and cascade meta.]
+    Z -- no --> W2[Execute tail statements via RetryPolicy. Wrap each MERGE in broadcast-disable.]
+    V1 -- no --> W[Execute rewritten statements via RetryPolicy. Wrap each MERGE or matching view-delta CTAS in broadcast-disable.]
+    W --> X{any final failure?}
+    W2 --> X
+    AA --> X
+    X -- yes --> Y[Delete partial viewDeltaPath; throw rewritten SQL]
+    X -- no --> AB[Count-monoid zero-row cleanup]
     AB --> AC{emitsCascadeViewDelta?}
     AC -- yes --> AD[Record MV_VIEW_DELTA staging rows]
     AC -- no --> AE[No cascade row]

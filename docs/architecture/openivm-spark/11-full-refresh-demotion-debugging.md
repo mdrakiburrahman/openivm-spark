@@ -213,6 +213,15 @@ Recovery:
 
 ### 3.2 `simple_projection_no_apply`
 
+> **Not the same as REFRESH-time `simple_projection_full_refresh`.** This
+> section covers the **CREATE-time** demotion that persists
+> `refreshTypeName = FULL_REFRESH` in `MvMetadata` for every subsequent
+> REFRESH. The runtime `outcome='simple_projection_full_refresh'
+> reason='conflicting_signed_rows'` log line is a **per-refresh** safety
+> fallback — metadata stays `SIMPLE_PROJECTION`, the next refresh attempts
+> the incremental path again, and the already-written cascade view-delta
+> is preserved for downstream consumers. See chapter 8 §2.9 for that path.
+
 User SQL class that can trigger it:
 
 ```sql

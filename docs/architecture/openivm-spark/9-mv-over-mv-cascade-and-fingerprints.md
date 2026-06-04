@@ -698,3 +698,11 @@ For MV-over-MV, the upstream MV already computed the sign.
 8. Keep trigger-only rows separate from signed cascade deltas.
 9. Remember `_openivm/tables/.../rocksdb` is catalog state, not the Delta payload.
 10. Remember `_ivm/view_deltas/...` is the signed cascade payload.
+11. A REFRESH-time SIMPLE_PROJECTION fallback to a local FULL_REFRESH must
+    preserve the already-written view-delta path AND the persisted
+    `_ivm_emits_cascade_view_delta` metadata. The fallback fixes only the
+    upstream MV's own bag (the bag-correct rewriter mis-applies mixed-sign
+    rows on the local MV body); stmt[0]'s view-delta CTAS is still openivm's
+    bag-correct Δ(MV) for downstream consumers. Wiping it caused the
+    `silver.holdings_history → gold.fact_holdings` cascade bug (fixed by
+    commit `56d91e9`); see chapter 8 §2.9.

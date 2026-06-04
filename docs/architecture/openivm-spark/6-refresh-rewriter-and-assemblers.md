@@ -185,13 +185,20 @@ This is why the number of surviving Spark statements is often smaller than the
 OpenIVM docstring statement count.
 ## 7. Post-dispatch passes
 
-After shape-specific rewriting, the rewriter applies two generic passes and one
-caller-supplied pass:
+After shape-specific rewriting, the rewriter applies four generic passes and one
+caller-supplied pass, in this order:
 1. `expandSelectStarExcept` for DuckDB-style column exclusion.
 2. `fixMergeAliasRefs` for Spark/Delta merge alias compatibility.
-3. `postProcess`, usually `LptsSparkDialect.translate`.
+3. `deduplicateNullSafeMergeSource` to fold duplicate `IS NOT DISTINCT FROM`
+   conjuncts that some openivm shapes emit twice over the same merge source.
+4. `rewriteRecomputeWhereExistsAsAffectedKeysJoin` — converts the strict
+   "recompute INSERT MERGE … `WHERE EXISTS (SELECT 1 FROM <ref> _d
+   WHERE _d.<col> IS NOT DISTINCT FROM <outer>.<col> …)`" shape into a
+   `LEFT SEMI JOIN (SELECT DISTINCT <cols> FROM <ref>) _d ON …` form. See
+   section §15 below for the full rationale and applicability conditions.
+5. `postProcess`, usually `LptsSparkDialect.translate`.
 
-Source: `SparkRefreshRewriter.scala:173-175`.
+Source: `SparkRefreshRewriter.scala:291-296`.
 The result is then wrapped in `RewrittenRefresh`.
 
 ## 8. StatementKind enumeration and assembler mapping
@@ -805,7 +812,99 @@ VALUES
 This is produced by `rewriteMvMerge`.
 Source: `SparkRefreshRewriter.scala:693-740`.
 
-## 14. Practical reading checklist
+## 14. Broadcast-disable gating predicates
+
+`SparkRefreshRewriter` exposes three shape-detection helpers used by
+`MaterializedViewCommands` to gate per-statement plan-time broadcast disables
+around openivm-emitted SQL. None of them mutate the input string; all return
+booleans (or, for `extractViewDeltaCtasBody`, an `Option[String]`).
+
+### 14.1 `isRecomputeInsertMerge(sql)`
+Recognises the specific `MERGE INTO <target> USING (<full view body>) AS d
+ON FALSE WHEN NOT MATCHED THEN INSERT …` shape used by SIMPLE_PROJECTION,
+AGGREGATE_GROUP, WINDOW_PARTITION, GROUP_RECOMPUTE, and DuckLake recompute
+paths. Paren-aware so a `(` inside a `delta.`<path>`` qualifier or string
+literal cannot fool the matcher. Returns false for non-MERGE statements,
+non-parenthesised USING sources, non-`ON FALSE` predicates, and any MERGE
+whose first matched clause is `WHEN MATCHED` (delete / update merges).
+Source: `SparkRefreshRewriter.scala:117-127`.
+
+### 14.2 `isMergeStatement(sql)`
+Strictly broader than `isRecomputeInsertMerge`: true iff `sql` begins (after
+the execution-marker strip) with `MERGE INTO …`. Used by current callers
+because openivm-emitted MERGEs include not just the `ON FALSE WHEN NOT MATCHED
+INSERT` recompute shape but also `WHEN MATCHED THEN DELETE` (SIMPLE_PROJECTION
+delete-merge) and `WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT`
+(aggregate upsert). Any of those can trip Spark's 8 GiB
+`BroadcastExchangeExec` cap on a SCD2-shaped MV body — even when the USING
+source itself is tiny — because Delta's MERGE rewrite synthesises a
+"find affected target files" subquery that may materialise the outer view
+body for `IS NOT DISTINCT FROM` matching. Source:
+`SparkRefreshRewriter.scala:147-150`.
+
+### 14.3 `extractViewDeltaCtasBody(stmt, viewDeltaPath)`
+Returns the `SELECT` body of `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>`
+USING DELTA AS …` (whitespace-tolerant, case-insensitive on keywords) iff the
+statement is a view-delta CTAS for that exact path. Used both for the
+SIMPLE_PROJECTION fuse fast path (swapping the on-disk CTAS for a cached temp
+view) and as a side-channel detector telling the runner "this stmt is the
+view-delta CTAS — wrap it in plan-time broadcast disable." Source:
+`SparkRefreshRewriter.scala:161-168`.
+
+## 15. The `WHERE EXISTS → LEFT SEMI JOIN` rewrite
+
+### 15.1 Why this rewrite exists
+GROUP_RECOMPUTE / WINDOW_PARTITION / multi-source SIMPLE_PROJECTION refresh
+programs emit a recompute INSERT MERGE whose USING source body ends in
+`WHERE EXISTS (SELECT 1 FROM <ref> _d WHERE _d.<col> IS NOT DISTINCT FROM
+<outer>.<col> [AND …])` for the per-key "affected" filter. Under
+null-tolerant `IS NOT DISTINCT FROM` equality (and especially when the outer
+body contains SCD2 range joins or multi-key composite predicates) Catalyst
+cannot reliably push the correlated EXISTS down through the CTE chain, and
+the resulting BroadcastNestedLoopJoin / BroadcastHashJoin on the lifted
+subquery can exceed Spark's hard-coded 8 GiB `BroadcastExchangeExec` cap.
+
+The rewrite engages Catalyst's join-strategy path (which respects
+`spark.sql.autoBroadcastJoinThreshold = -1` and the AQE broadcast cap) so
+the affected-keys filter executes as a `ShuffledHashJoinExec` /
+`SortMergeJoinExec` instead.
+
+### 15.2 Equivalence
+`LEFT SEMI JOIN (SELECT DISTINCT k FROM X) ON o.k <=> i.k` is row-by-row
+equivalent to `WHERE EXISTS (SELECT 1 FROM X WHERE x.k IS NOT DISTINCT FROM
+o.k)` because `<=>` is the operator form of `IS NOT DISTINCT FROM` and
+LEFT SEMI preserves outer-row identity (no duplication, no projection
+change). The `DISTINCT` is technically redundant under LEFT SEMI semantics
+but is kept defensively to keep the build side small.
+
+### 15.3 Applicability conditions
+The rewrite is strict and only fires when **all** of these hold:
+- the source body is a recompute INSERT MERGE matched by
+  `isRecomputeInsertMerge`;
+- the USING source body's outermost `WHERE` clause is **exactly** one
+  `EXISTS (...)` clause with no conjuncts before or after EXISTS;
+- the EXISTS body is a single-relation scan `SELECT 1 FROM <ref> _d
+  WHERE <key_preds>` (no joins, no GROUP BY, no aggregation);
+- every predicate inside the EXISTS body is
+  `_d.<col> IS NOT DISTINCT FROM <outer>.<col>`;
+- the EXISTS subquery uses `_d` as the alias (either explicit `AS _d` or
+  bare `_d`).
+
+If any condition fails the input is returned unchanged, so a non-matching
+program is never silently mis-rewritten. The output no longer matches the
+EXISTS shape, so a second pass cannot re-fire.
+
+### 15.4 Source locations
+- Pipeline step: `SparkRefreshRewriter.scala:294-296`.
+- Top-level rewrite entry: `rewriteRecomputeWhereExistsAsAffectedKeysJoin`
+  at `SparkRefreshRewriter.scala:2414-2437`.
+- WHERE-clause locator + splice: `rewriteSourceWhereExistsAsSemiJoin` at
+  `SparkRefreshRewriter.scala:2477-2514`.
+- Key-predicate parser: `tryParseExistsKeyPredicates` at
+  `SparkRefreshRewriter.scala:2536-2573` and `parseIsNotDistinctFrom` at
+  `SparkRefreshRewriter.scala:2579-2593`.
+
+## 16. Practical reading checklist
 When debugging a refresh rewrite, do not start by asking only "what
 `RefreshType` is this?"
 
@@ -818,6 +917,11 @@ Ask these questions instead:
 6. Which surviving statements still need `postProcess` dialect translation?
 7. Did `hasRealDelta` see a real `INSERT INTO openivm_delta_<view>`?
 8. Does metadata say this MV emits cascade view deltas?
+9. Is the surviving statement gated by `isMergeStatement` or
+   `extractViewDeltaCtasBody` so the runner wraps it in plan-time
+   broadcast disable?
+10. Did `rewriteRecomputeWhereExistsAsAffectedKeysJoin` fire (look for
+    `LEFT SEMI JOIN (SELECT DISTINCT` in the final SQL)?
 
 This workflow matches the code path and prevents the common mistake of treating
 `RefreshType` as the Spark rewrite dispatch key.
