@@ -1,84 +1,45 @@
 #!/bin/bash
+# ============================================================================
+# contrib/bootstrap-dev-env.sh — full developer-host bootstrap.
 #
+#   Bootstraps a Linux Devbox host idempotently.
+#   If your Devbox restarts, rerun this script.
 #
-#       Bootstraps a Linux Devbox host idempotently.
-#       If your Devbox restarts, rerun this script.
-#
-# ---------------------------------------------------------------------------------------
-#
+# All reusable helpers live in contrib/common.sh; this file only orchestrates
+# the dev-relevant sequence (interactive logins, WSL path-stripping, etc.).
+# CI uses contrib/bootstrap-ci.sh which is a Docker-only subset.
+# ============================================================================
+set -euo pipefail
 
-DOCKER_VERSION="5:27.5.1-1~ubuntu.24.04~noble"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${SCRIPT_DIR}/common.sh"
 
-PACKAGES=""
-if ! command -v jq &> /dev/null; then PACKAGES="$PACKAGES jq"; fi
-if [ ! -z "$PACKAGES" ]; then
-    echo "Packages $PACKAGES not found - installing..."
-    sudo apt-get update 2>&1 > /dev/null
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $PACKAGES 2>&1 > /dev/null
-fi
+# 1. Passwordless sudo — every subsequent step shells out to `sudo`.
+cmn_ensure_passwordless_sudo
 
-if ! [ -x "$(command -v docker)" ]; then
-  echo "docker is not installed on your devbox, installing..."
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-  sudo add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-  sudo apt-get update -q
-  sudo apt-get install -y apt-transport-https ca-certificates curl
-  sudo apt-get install -y --allow-downgrades docker-ce="$DOCKER_VERSION" docker-ce-cli="$DOCKER_VERSION" containerd.io
-else
-  echo "docker is already installed."
-fi
+# 2. Strip WSL-mounted Windows paths so we don't accidentally pick up the
+#    Windows az / gh executables (slower and don't share state with the
+#    Linux-side dev image).
+export PATH="$(cmn_strip_windows_paths)"
 
-sudo mkdir -p /etc/docker
-echo '{"max-concurrent-downloads": 32}' | sudo tee /etc/docker/daemon.json > /dev/null
+# 3. Apt-side basics.
+cmn_ensure_jq
 
-echo "docker is installed, restarting..."
-sudo systemctl restart docker
+# 4. Docker — install if missing, configure daemon, restart only on change.
+cmn_ensure_docker
+cmn_configure_docker_daemon
+cmn_kill_running_containers
 
-sudo chmod 666 /var/run/docker.sock
-docker container ls
-docker ps -q | xargs -r docker kill
+# 5. Azure CLI (devbox uses ~/.azure for openivm-spark image push/pull tests).
+cmn_ensure_az_cli
+cmn_ensure_az_login
 
-# Remove Windows paths from PATH to avoid using Windows az CLI
-# This allows us to mount ~/.azure from WSL.
-#
-export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "/mnt/c" | tr '\n' ':' | sed 's/:$//')
-AZ_PATH=$(which az 2>/dev/null)
-if [[ -z "$AZ_PATH" || "$AZ_PATH" == *"/mnt/c"* ]]; then
-  echo "Native Linux Azure CLI not found, installing..."
-  curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-  export PATH="$HOME/bin:$PATH"
-  [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
-else
-  echo "Native Linux Azure CLI already installed at: $AZ_PATH"
-fi
+# 6. GitHub CLI.
+cmn_ensure_gh_cli
+cmn_ensure_gh_login
 
-az account get-access-token --query "expiresOn" -o tsv >/dev/null 2>&1
-if [[ $? -ne 0 ]]; then
-    echo "az is not logged in, logging in..."
-    az login >/dev/null
-fi
-
-if ! [ -x "$(command -v gh)" ]; then
-  (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-    && sudo mkdir -p -m 755 /etc/apt/keyrings \
-    && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && sudo apt update \
-    && sudo apt install gh -y
-else
-  echo "GitHub CLI is already installed."
-fi
-
-if ! gh auth status >/dev/null 2>&1; then
-    echo "gh is not logged in, running 'gh auth login'..."
-    gh auth login
-else
-    echo "GitHub CLI is already logged in as: $(gh api user --jq .login 2>/dev/null || echo unknown)"
-fi
-
-echo "Docker: $(docker --version)"
+echo
+echo "Docker:     $(docker --version)"
 echo "GitHub CLI: $(gh --version | head -1)"
-echo "Azure CLI: $(az --version | head -1)"
+echo "Azure CLI:  $(az --version | head -1)"

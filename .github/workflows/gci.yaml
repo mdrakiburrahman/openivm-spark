@@ -1,0 +1,71 @@
+name: gci
+
+on:
+  pull_request:
+    branches: [main]
+
+# Cancel any in-flight gci run for the same PR when a new commit lands.
+concurrency:
+  group: gci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: dev.sh verify (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # under GitHub's 6-hour hard limit
+
+    env:
+      # 4-vCPU GH runner — cap forked-test JVMs to 2 (1 fork per 2 vCPU is
+      # the published recommendation in spark-ext/dev/dev.sh).
+      OPENIVM_TEST_FORKS: "2"
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # pins-sync runs `git merge-base --is-ancestor` against pinned
+          # commits, so we need the full graph (not a shallow clone).
+          fetch-depth: 0
+
+      - name: Free up disk space (~25 GB)
+        # The ubuntu-latest image ships ~14 GB free, which is tight for the
+        # multi-stage spark-openivm docker build + sbt caches. Strip the
+        # Android SDK / .NET / Haskell / large-apt-packages we never touch.
+        # Leave docker-images=false: we WANT the docker layer cache intact.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Bootstrap CI host (jq + docker + daemon config)
+        run: ./contrib/bootstrap-ci.sh
+
+      - name: Show host capacity
+        run: |
+          echo "── cpu ─────────────────────────────"
+          nproc
+          echo "── memory ──────────────────────────"
+          free -h
+          echo "── disk ────────────────────────────"
+          df -h /
+
+      - name: dev.sh verify (lint + compile + assembly + all suites)
+        run: ./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=${OPENIVM_TEST_FORKS}
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.run_id }}
+          path: .logs/
+          if-no-files-found: ignore
+          retention-days: 14
