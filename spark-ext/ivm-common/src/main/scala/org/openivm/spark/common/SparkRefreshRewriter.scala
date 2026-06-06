@@ -267,15 +267,19 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.GroupRecomputeAffectedCreate =>
-            Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName))
+            Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
             Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+          case StatementKind.CurrentSnapshotCreate =>
+            Seq(rewriteCurrentSnapshotCreate(stmt))
           case StatementKind.OldSnapshotCreate =>
             Seq(rewriteOldSnapshotCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.NewSnapshotCreate =>
             Seq(rewriteNewSnapshotCreate(stmt))
           case StatementKind.SnapshotDataInsert =>
             Seq(rewriteSnapshotDataInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.CurrentSnapshotDrop =>
+            Seq(rewriteCurrentSnapshotDrop(viewLogicalName))
           case StatementKind.SnapshotDrop =>
             Seq(rewriteSnapshotDrop(stmt, viewLogicalName))
           case StatementKind.Unknown => Nil
@@ -360,6 +364,14 @@ object SparkRefreshRewriter {
       * `DROP TABLE IF EXISTS openivm_affected_<view>` → `DROP VIEW IF EXISTS …`. */
     case object GroupRecomputeAffectedDrop extends StatementKind
 
+    /** Current-diff recompute snapshot of the full post-refresh query result.
+      *
+      * OpenIVM emits `openivm_current_<view>` before `openivm_affected_<view>`
+      * for current-diff GROUP_RECOMPUTE plans such as HAVING CTEs.
+      */
+    case object CurrentSnapshotCreate extends StatementKind
+    case object CurrentSnapshotDrop   extends StatementKind
+
     /** Recompute-cascade snapshot of the PRE-refresh MV rows.
       *
       * When openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` is enabled
@@ -423,6 +435,7 @@ object SparkRefreshRewriter {
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
     val upper            = stmt.toUpperCase.trim
     val affectedKeysName = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val currentName      = s"OPENIVM_CURRENT_${viewLogicalName.toUpperCase}"
     val oldSnapshotName  = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
     val newSnapshotName  = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
     val compactName      = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
@@ -442,6 +455,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $currentName")) {
+      StatementKind.CurrentSnapshotCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $oldSnapshotName")) {
       StatementKind.OldSnapshotCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $newSnapshotName")) {
@@ -449,6 +464,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
+    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $currentName")) {
+      StatementKind.CurrentSnapshotDrop
     } else if (
       upper.startsWith(s"DROP TABLE IF EXISTS $oldSnapshotName") ||
       upper.startsWith(s"DROP TABLE IF EXISTS $newSnapshotName")
@@ -1746,6 +1763,15 @@ object SparkRefreshRewriter {
     s
   }
 
+  /** Rewrites the current-diff full-query snapshot into a Spark TEMPORARY VIEW. */
+  private def rewriteCurrentSnapshotCreate(stmt: String): String = {
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
   /** Rewrites the pragma-gated `openivm_new_<view>` snapshot create into a
     * Spark TEMPORARY VIEW. The query itself stays live because it only depends
     * on stable source staging / base tables during the current refresh.
@@ -1773,6 +1799,9 @@ object SparkRefreshRewriter {
       java.util.regex.Matcher.quoteReplacement(s"INSERT INTO ${backtickMvName(mvName)}")
     )
   }
+
+  private def rewriteCurrentSnapshotDrop(viewLogicalName: String): String =
+    s"DROP VIEW IF EXISTS `openivm_current_$viewLogicalName`"
 
   /** Rewrites `DROP TABLE IF EXISTS openivm_old_<view>` / `openivm_new_<view>`
     * to `DROP VIEW IF EXISTS …` matching the TEMPORARY VIEW materialisation.
@@ -1829,13 +1858,24 @@ object SparkRefreshRewriter {
     */
   private def rewriteGroupRecomputeAffectedCreate(
       stmt: String,
-      viewLogicalName: String
+      viewLogicalName: String,
+      mvLocation: String,
+      mvVersionBeforeRefresh: Option[Long]
   ): String = {
-    val _ = viewLogicalName // captured by the SQL itself; reserved for future use
+    val escapedLocation = mvLocation.replace("`", "``")
+    val snapshotTable = mvVersionBeforeRefresh match {
+      case Some(version) => s"delta.`$escapedLocation` VERSION AS OF $version"
+      case None          => s"delta.`$escapedLocation`"
+    }
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) +
+      "\\b").r
+
     var s = rewriteCreateOrReplaceTempTableAsView(stmt)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteExcludeAsExcept(s)
+    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(snapshotTable))
     s
   }
 

@@ -687,6 +687,44 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "DROP VIEW IF EXISTS `openivm_new_mv_r`"
       )
     }
+
+    it("keeps current-diff recompute helpers and pins the affected diff to the pre-refresh MV snapshot") {
+      val currentDiffInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |CREATE OR REPLACE TEMP TABLE openivm_current_mv_r AS
+          |SELECT region, total FROM memory.main.sales;
+          |CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
+          |SELECT DISTINCT region
+          |FROM (
+          |  (SELECT * FROM openivm_current_mv_r EXCEPT ALL SELECT * FROM openivm_data_mv_r)
+          |  UNION ALL
+          |  (SELECT * FROM openivm_data_mv_r EXCEPT ALL SELECT * FROM openivm_current_mv_r)
+          |) openivm_changed;
+          |DROP TABLE IF EXISTS openivm_affected_mv_r;
+          |DROP TABLE IF EXISTS openivm_current_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = currentDiffInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L)
+      )
+
+      rewritten.statements should have size 4
+      rewritten.statements.head should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_current_mv_r")
+      rewritten.statements.head should include("`sales`")
+      rewritten.statements(1) should include(s"delta.`$mvLocation` VERSION AS OF 7")
+      rewritten.statements(1) should not include "openivm_data_mv_r"
+      rewritten.statements.takeRight(2) shouldBe Seq(
+        "DROP VIEW IF EXISTS `openivm_affected_mv_r`",
+        "DROP VIEW IF EXISTS `openivm_current_mv_r`"
+      )
+    }
   }
 
   // ── 11. hasRealDelta detection ───────────────────────────────────────────
