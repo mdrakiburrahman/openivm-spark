@@ -12,8 +12,13 @@
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
 #   openivm-test            Run upstream openivm sqllogictest suite.
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
-#                           branches in pins.env and warn if local HEAD has
-#                           drifted from the pinned COMMIT.
+#                           pinned COMMITs in pins.env. The pin is
+#                           authoritative — pins-sync does NOT pull
+#                           origin/<BRANCH> to its latest tip. If the worktree
+#                           has uncommitted work, unpushed commits, or an
+#                           in-progress git operation, pin enforcement is
+#                           skipped (a soft warning is emitted instead of
+#                           clobbering local changes).
 #   pins-fix                Commit + push uncommitted changes across
 #                           openivm-spark + .temp/{openivm,lpts,ivm-bench}
 #                           (refuses to push to main/master), then rewrite
@@ -175,15 +180,39 @@ cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
 
+# Returns 0 if a git op (rebase/merge/cherry-pick/bisect) is in progress in $1.
+_pins_sync_git_op_in_progress() {
+    local dest="$1"
+    local gitdir
+    gitdir="$(git -C "$dest" rev-parse --git-dir 2>/dev/null || echo '')"
+    [[ -z "$gitdir" ]] && return 1
+    # rev-parse --git-dir is relative to $dest's cwd; resolve absolute.
+    if [[ "$gitdir" != /* ]]; then gitdir="$dest/$gitdir"; fi
+    [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" \
+       || -f "$gitdir/MERGE_HEAD"   || -f "$gitdir/CHERRY_PICK_HEAD" \
+       || -f "$gitdir/BISECT_LOG" ]]
+}
+
 # Ensure $REPO_ROOT/.temp/{openivm,lpts,ivm-bench} are cloned on the branches
-# declared in pins.env, then compare each local HEAD against the pinned COMMIT.
+# declared in pins.env, then enforce each local HEAD to match the pinned COMMIT.
+#
+# The pin is AUTHORITATIVE. pins-sync does NOT pull origin/<branch> to its
+# latest tip — that would silently move the developer worktree off the SHA the
+# docker build is actually using.
 #
 #   * If the working copy is missing, clone fresh on the pinned branch.
 #   * If the working copy exists, fetch origin and switch to the pinned branch
 #     (creating a local tracking branch if needed).
 #   * If the repo/branch does not exist remotely, abort with a hard error.
-#   * After alignment, log per-repo whether HEAD == pin; emit a WARNING for
-#     each repo that has drifted. Drift is non-fatal (exit 0).
+#   * Verify the pinned commit is reachable locally AND is an ancestor of
+#     origin/<branch> (a commit-from-a-different-branch in pins.env is a hard
+#     error, not a silent reset).
+#   * If HEAD != pin and the worktree is clean (no uncommitted changes, no
+#     unpushed commits, no in-progress git op), `git reset --hard` to the pin.
+#   * If HEAD != pin and the worktree has local work, emit a soft WARNING and
+#     SKIP enforcement (do not destroy WIP). Drift is non-fatal (exit 0).
+#   * NOTE: `pins-fix` refuses to push to main/master, so for BRANCH=main pins
+#     the bump workflow is: edit pins.env manually, then run pins-sync.
 cmd_pins_sync() {
     local temp_dir="$REPO_ROOT/.temp"
     mkdir -p "$temp_dir"
@@ -244,6 +273,17 @@ cmd_pins_sync() {
             local current_branch
             current_branch="$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || echo '')"
             if [[ "$current_branch" != "$branch" ]]; then
+                # Refuse to switch branches if there is unsaved work — `git
+                # checkout` would either fail or carry dirty changes onto the
+                # new branch, both of which are surprising. Caller can stash
+                # or commit and re-run.
+                if [[ -n "$(git -C "$dest" status --porcelain --untracked-files=all)" ]]; then
+                    echo "[pins-sync]   ⚠ WARNING: .temp/$name has uncommitted/untracked changes;"
+                    echo "[pins-sync]              skipping branch switch from '${current_branch:-<detached>}' → '$branch'"
+                    echo "[pins-sync]              stash or commit them, then re-run pins-sync"
+                    drift=1
+                    continue
+                fi
                 echo "[pins-sync]   switching from '${current_branch:-<detached>}' → '$branch'"
                 if git -C "$dest" show-ref --verify --quiet "refs/heads/$branch"; then
                     if ! git -C "$dest" checkout --quiet "$branch"; then
@@ -258,15 +298,19 @@ cmd_pins_sync() {
                 fi
             fi
 
-            # Fast-forward the local branch to origin/<branch> so we iterate
-            # on the latest code rather than a stale local snapshot. Use
-            # --ff-only to surface any divergence (e.g. local commits or a
-            # dirty working tree blocking the merge) as a hard error rather
-            # than silently leaving HEAD behind origin.
-            echo "[pins-sync]   pulling origin/$branch (ff-only) ..."
-            if ! git -C "$dest" pull --ff-only --quiet origin "$branch"; then
-                echo "[pins-sync] FATAL: 'git pull --ff-only origin $branch' failed in .temp/$name" >&2
-                echo "[pins-sync]        local branch has diverged or working tree is dirty." >&2
+            # ── enforce pin (the pin is authoritative — do NOT pull-to-tip) ──
+            # 1. The pinned commit must actually exist locally after fetch.
+            if ! git -C "$dest" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+                echo "[pins-sync] FATAL: pinned commit $commit not present in .temp/$name" >&2
+                echo "[pins-sync]        (commit not reachable on origin/$branch — bad pins.env?)" >&2
+                exit 1
+            fi
+            # 2. The pinned commit must be a real ancestor of origin/<branch>;
+            #    otherwise pins.env is referencing a commit from an unrelated
+            #    branch and a silent `reset --hard` would be dangerous.
+            if ! git -C "$dest" merge-base --is-ancestor "$commit" "origin/$branch" 2>/dev/null; then
+                echo "[pins-sync] FATAL: pinned commit $commit is not an ancestor of origin/$branch in .temp/$name" >&2
+                echo "[pins-sync]        (pins.env COMMIT does not belong to BRANCH — refusing to reset)" >&2
                 exit 1
             fi
         fi
@@ -274,12 +318,37 @@ cmd_pins_sync() {
         local head
         head="$(git -C "$dest" rev-parse HEAD)"
         if [[ "$head" == "$commit" ]]; then
-            echo "[pins-sync]   ✓ HEAD matches pin ($head)"
+            echo "[pins-sync]   ✓ HEAD at pin ($head)"
         else
-            echo "[pins-sync]   ⚠ WARNING: HEAD has drifted from pin"
-            echo "[pins-sync]     HEAD = $head"
-            echo "[pins-sync]     pin  = $commit"
-            drift=1
+            # HEAD differs from pin. Preserve any local work; only reset when
+            # the worktree is completely clean (no dirty tracked files, no
+            # untracked files, no unpushed commits, no in-progress git op).
+            local dirty=0 ahead=0
+            if [[ -n "$(git -C "$dest" status --porcelain --untracked-files=all)" ]]; then
+                dirty=1
+            fi
+            ahead="$(git -C "$dest" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
+            local op_in_progress=0
+            if _pins_sync_git_op_in_progress "$dest"; then
+                op_in_progress=1
+            fi
+
+            if [[ "$dirty" -eq 1 || "$ahead" -gt 0 || "$op_in_progress" -eq 1 ]]; then
+                echo "[pins-sync]   ⚠ WARNING: .temp/$name has local work; pin enforcement skipped"
+                echo "[pins-sync]              (dirty=$dirty, unpushed=$ahead, op-in-progress=$op_in_progress)"
+                echo "[pins-sync]              HEAD = $head"
+                echo "[pins-sync]              pin  = $commit"
+                echo "[pins-sync]              use pins-fix to push your changes (non-main/master branches),"
+                echo "[pins-sync]              or stash + reset manually before re-running pins-sync"
+                drift=1
+            else
+                echo "[pins-sync]   re-pointing $branch → pin ($commit)"
+                if ! git -C "$dest" reset --hard --quiet "$commit"; then
+                    echo "[pins-sync] FATAL: 'git reset --hard $commit' failed in .temp/$name" >&2
+                    exit 1
+                fi
+                echo "[pins-sync]   ✓ HEAD at pin ($commit)"
+            fi
         fi
     done
 
