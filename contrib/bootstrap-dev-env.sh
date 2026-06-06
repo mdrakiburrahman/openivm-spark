@@ -8,7 +8,6 @@
 #
 
 DOCKER_VERSION="5:27.5.1-1~ubuntu.24.04~noble"
-TERRAFORM_VERSION="1.9.8"
 
 PACKAGES=""
 if ! command -v jq &> /dev/null; then PACKAGES="$PACKAGES jq"; fi
