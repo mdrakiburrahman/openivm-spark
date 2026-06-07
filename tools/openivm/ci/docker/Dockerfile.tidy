@@ -1,0 +1,36 @@
+# Mirrors the tidy-check job of duckdb/extension-ci-tools @ v1.5.2:
+#   runs-on: ubuntu-24.04
+#   env: CC=gcc, CXX=g++, GEN=ninja, TIDY_THREADS=4
+#   apt: ninja-build clang-tidy
+#   pip3: pybind11[global] --break-system-packages
+# `make tidy-check` runs `cmake -DCLANG_TIDY=1 -DDISABLE_UNITY=1 -S duckdb -B build/tidy`
+# then `python3 duckdb/scripts/run-clang-tidy.py 'src/.*/' -j 4`.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CC=gcc
+ENV CXX=g++
+ENV GEN=ninja
+ENV TIDY_THREADS=4
+
+RUN apt-get update -y -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        ca-certificates \
+        git \
+        ninja-build \
+        cmake \
+        clang-tidy \
+        gcc \
+        g++ \
+        make \
+        python3 \
+        python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+        'pybind11[global]'
+
+RUN git config --global --add safe.directory "*"
+
+WORKDIR /work

@@ -4,3 +4,22 @@
 
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
+.temp
+.research/
+.scratch
+target/
+out/
+.logs/
+.bsp/
+
+# Safety net: never commit Delta / Parquet / Spark-warehouse artefacts that
+# might leak into the test-resources tree (e.g. from an extractor or test
+# misconfiguration). The legitimate TPC-DI fixtures under
+# spark-ext/ivm-it/src/test/resources/tpcdi/ are CSVs + DDL/SQL/TSV text
+# files only.
+**/_delta_log/
+**/_commits/
+*.parquet
+*.crc
+**/.extractor-warehouse/
+**/.extractor-coverage-warehouse/

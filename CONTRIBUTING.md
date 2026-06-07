@@ -45,6 +45,12 @@
    chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
    ```
 
+1. (Optional but recommended) Enable passwordless sudo so `dev.sh` helpers never block on a prompt:
+
+   ```bash
+   echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-$USER-nopasswd >/dev/null && sudo chmod 0440 /etc/sudoers.d/90-$USER-nopasswd
+   ```
+
 1. Install recommended developer tooling (optional):
 
    ```bash

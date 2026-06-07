@@ -1,0 +1,5 @@
+tx_id,tx_name,tx_rate
+US1,U.S. Income Tax Bracket for the poor,0.15
+US2,U.S. Income Tax Bracket for the huddled masses,0.275
+US3,U.S. Income Tax Bracket for the masses,0.305
+US4,U.S. Income Tax Bracket for the well to do,0.355

@@ -1,0 +1,1 @@
+employeeid STRING,managerid STRING,employeefirstname STRING,employeelastname STRING,employeemi STRING,employeejobcode STRING,employeebranch STRING,employeeoffice STRING,employeephone STRING
