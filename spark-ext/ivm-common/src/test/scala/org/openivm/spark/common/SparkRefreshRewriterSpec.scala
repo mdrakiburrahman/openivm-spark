@@ -54,6 +54,32 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
       |""".stripMargin
 
+  private val currentSimpleProjectionInput: String =
+    """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+      |INSERT INTO openivm_delta_mv_r (name, age, openivm_multiplicity, openivm_timestamp)
+      |SELECT name, age, openivm_multiplicity, openivm_timestamp
+      |FROM memory.main.openivm_delta_users
+      |WHERE openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP;
+      |WITH openivm_net AS (
+      |  SELECT name, age, SUM(openivm_multiplicity) AS _net
+      |  FROM openivm_delta_mv_r
+      |  WHERE openivm_timestamp > '2026-05-16 10:00:55'::TIMESTAMP
+      |  GROUP BY name, age
+      |  HAVING SUM(openivm_multiplicity) != 0
+      |), openivm_delete_net AS (SELECT * FROM openivm_net WHERE _net < 0),
+      |openivm_delete_rows AS (SELECT v.rowid FROM openivm_data_mv_r v JOIN openivm_delete_net d ON v.name IS NOT DISTINCT FROM d.name AND v.age IS NOT DISTINCT FROM d.age)
+      |DELETE FROM openivm_data_mv_r USING openivm_delete_rows d WHERE openivm_data_mv_r.rowid = d.rowid;
+      |WITH openivm_net AS (
+      |  SELECT name, age, SUM(openivm_multiplicity) AS _net
+      |  FROM openivm_delta_mv_r
+      |  WHERE openivm_timestamp > '2026-05-16 10:00:55'::TIMESTAMP
+      |  GROUP BY name, age
+      |  HAVING SUM(openivm_multiplicity) != 0
+      |) INSERT INTO openivm_data_mv_r SELECT name, age FROM openivm_net, generate_series(1, openivm_net._net::BIGINT) WHERE openivm_net._net > 0;
+      |DELETE FROM openivm_delta_mv_r;
+      |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+      |""".stripMargin
+
   // ── 1. Statement splitter: keep only B and C ──────────────────────────────
   describe("splitStatements + rewrite") {
     it("reduces the 7-statement openivm program to 2 surviving Spark statements") {
@@ -544,6 +570,27 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       bagInsert should include("COALESCE(a.__openivm_cur, CAST(0 AS BIGINT)) + n.__openivm_net")
       bagInsert should include("LATERAL VIEW EXPLODE(")
       bagInsert should include("WHERE __openivm_src.__openivm_to_insert > 0")
+    }
+
+    it("recognizes current openivm_net SIMPLE_PROJECTION apply statements") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = currentSimpleProjectionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(42L)
+      )
+
+      rewritten.statements should have size 4
+      rewritten.statements.head should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath` USING DELTA AS")
+      rewritten.statements(1) should startWith("CREATE OR REPLACE TEMPORARY VIEW `openivm_sp_net_mv_r`")
+      SparkRefreshRewriter.isSimpleProjectionDeleteMerge(rewritten.statements(2)) shouldBe true
+      rewritten.statements(3) should startWith("INSERT INTO `mydb`.`mv_r`")
+      rewritten.statements(3) should include(s"FROM delta.`$mvLocation` VERSION AS OF 42 v")
+      rewritten.statements.exists(_.contains("openivm_delete_rows")) shouldBe false
+      rewritten.statements.exists(_.contains("rowid")) shouldBe false
     }
   }
 

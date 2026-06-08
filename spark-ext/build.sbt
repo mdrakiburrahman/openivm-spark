@@ -12,6 +12,10 @@
 import Dependencies._
 import Settings._
 
+val openIvmExtensionPath =
+  sys.env.getOrElse("OPENIVM_EXTENSION_PATH", "/opt/openivm/openivm.duckdb_extension")
+val openIvmCliPath = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
+
 ThisBuild / scalaVersion := "2.12.17"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "org.openivm"
@@ -61,7 +65,10 @@ lazy val ivmExtension = (project in file("ivm-extension"))
     Antlr4 / antlr4GenVisitor  := true
   )
   .settings(
-    Test / envVars += ("OPENIVM_EXTENSION_PATH" -> "/opt/openivm/openivm.duckdb_extension")
+    Test / envVars ++= Map(
+      "OPENIVM_EXTENSION_PATH" -> openIvmExtensionPath,
+      "OPENIVM_CLI_PATH"       -> openIvmCliPath
+    )
   )
 
 lazy val ivmIt = (project in file("ivm-it"))
