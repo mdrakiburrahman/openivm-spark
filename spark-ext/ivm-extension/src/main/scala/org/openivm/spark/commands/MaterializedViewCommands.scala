@@ -514,7 +514,10 @@ case class CreateMaterializedViewCommand(
     profile.timeStep("create_mv_system_tables", "scope=mv_and_staging") {
       MvCatalog.ensureTables(spark)
       StagingCatalog.ensureTables(spark)
+      CdfWatermarkCatalog.ensureTables(spark)
     }
+
+    val propagation = ChangePropagationFactory.forSession(spark)
 
     // Existence guard
     MvCatalog.lookup(spark, name) match {
@@ -530,6 +533,13 @@ case class CreateMaterializedViewCommand(
     // Resolve source schemas
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       collectSourceSchemas(spark, originalQueryText)
+
+    // Validate that every source is configured correctly for the active
+    // change-propagation mode (e.g. under CDF mode: requires
+    // `delta.enableChangeDataFeed = true` on every source).  Fails fast at
+    // CREATE so users see a clear error before paying for the openivm
+    // compile + initial CTAS.
+    propagation.validateSources(spark, qualNames)
 
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
     val analyzed       = spark.sql(originalQueryText).queryExecution.analyzed
@@ -907,11 +917,12 @@ case class CreateMaterializedViewCommand(
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) Map.empty[String, String]
       else MvMetadata.compiledProperties(compiled.sql, compiled.initialLoadSql)
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
-    // REFRESH ignores any staging rows that pre-date this MV (otherwise we'd
-    // double-apply upstream view-deltas this MV already absorbed via the CTAS).
-    // See `StagingCatalog.currentWatermarks` + `StagingCatalog.collectFor`.
-    val watermarks     = StagingCatalog.currentWatermarks(spark, qualNames)
-    val watermarkProps = MvMetadata.watermarkProperties(watermarks)
+    // REFRESH ignores any staging rows / Delta versions that pre-date this MV
+    // (otherwise we'd double-apply upstream view-deltas this MV already
+    // absorbed via the CTAS).  Encoded opaquely so the same property key
+    // round-trips both `intercept`-mode timestamps and `cdf`-mode versions.
+    val watermarks     = propagation.currentWatermarks(spark, qualNames)
+    val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
     val allProps =
       properties ++ baseProps ++ countProp ++ havingProp ++ cascadeDeltaProps ++
         compiledProps ++ watermarkProps
@@ -1205,7 +1216,8 @@ case class RefreshMaterializedViewCommand(
       }
 
     val viewNameStr      = metaName(name)
-    val sourceWatermarks = meta.sourceWatermarks
+    val propagation      = ChangePropagationFactory.forSession(spark)
+    val sourceWatermarks = meta.changeWatermarks
 
     // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
     // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
@@ -1218,7 +1230,7 @@ case class RefreshMaterializedViewCommand(
 
     if (
       meta.refreshType != RefreshTypeCode.FullRefresh &&
-      !StagingCatalog.hasPendingDeltas(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
+      !propagation.hasPendingChanges(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
     ) {
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
@@ -1228,9 +1240,9 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
-    val stagingDeltas = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
+    val changeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
       RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
-        StagingCatalog.collectFor(
+        propagation.collectChanges(
           spark,
           viewNameStr,
           meta.sourceTables,
@@ -1241,7 +1253,7 @@ case class RefreshMaterializedViewCommand(
 
     // Defensive backstop: the cheap existence probe above and the full collect
     // can diverge if another refresh consumes the same rows before we collect.
-    if (meta.refreshType != RefreshTypeCode.FullRefresh && stagingDeltas.isEmpty) {
+    if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
           "outcome='no_pending_deltas'"
@@ -1266,17 +1278,17 @@ case class RefreshMaterializedViewCommand(
 
     logInfo(
       s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
-        s"pending_deltas=${stagingDeltas.size} source_tables=${meta.sourceTables.mkString(",")}"
+        s"pending_deltas=${changeBatches.size} source_tables=${meta.sourceTables.mkString(",")}"
     )
     RefreshPerf.emit(
       refreshId,
       viewLabel,
       "deltas_resolved",
-      s"refresh_type='${meta.refreshTypeName}' pending_deltas=${stagingDeltas.size}"
+      s"refresh_type='${meta.refreshTypeName}' pending_deltas=${changeBatches.size}"
     )
     profile.appendStep(
       "generate_refresh_sql.dispatch",
-      s"refresh_type=${meta.refreshTypeName};pending_deltas=${stagingDeltas.size}",
+      s"refresh_type=${meta.refreshTypeName};pending_deltas=${changeBatches.size}",
       0L
     )
 
@@ -1300,7 +1312,7 @@ case class RefreshMaterializedViewCommand(
         }
       }
     if (freshFingerprint != meta.sourceSchemaFingerprint) {
-      emitEnd("schema_drift", meta.refreshTypeName, stagingDeltas.size)
+      emitEnd("schema_drift", meta.refreshTypeName, changeBatches.size)
       throw new AnalysisException(
         "INCOMPATIBLE_VIEW_SCHEMA_CHANGE",
         Map(
@@ -1361,13 +1373,13 @@ case class RefreshMaterializedViewCommand(
         }
         profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
           RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-            postRefreshCleanup(spark, name, meta, stagingDeltas, viewNameStr, sqlLog, qlogOrder)
+            postRefreshCleanup(spark, name, meta, changeBatches, viewNameStr, sqlLog, qlogOrder)
           }
         }
-        emitEnd("full_refresh_executed", "FULL_REFRESH", stagingDeltas.size)
+        emitEnd("full_refresh_executed", "FULL_REFRESH", changeBatches.size)
       } catch {
         case t: Throwable =>
-          emitEnd("full_refresh_failed", "FULL_REFRESH", stagingDeltas.size)
+          emitEnd("full_refresh_failed", "FULL_REFRESH", changeBatches.size)
           val sqlSnippet = assembled.statements.mkString(";\n---\n")
           throw new RuntimeException(
             s"Full refresh of '${sqlIdent(name)}' failed: ${t.getMessage}\nAssembled SQL:\n$sqlSnippet",
@@ -1462,7 +1474,7 @@ case class RefreshMaterializedViewCommand(
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
-    val byTable                          = stagingDeltas.groupBy(_.baseTable)
+    val byTable                          = changeBatches.groupBy(_.baseTable)
     val tempViewShortNames               = scala.collection.mutable.ArrayBuffer[String]()
     var fusedScratchView: Option[String] = None
 
@@ -1475,23 +1487,25 @@ case class RefreshMaterializedViewCommand(
       profile.timeStep("metadata_pre_sql", "phase=register_views") {
         RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
           for (qualTable <- meta.sourceTables) {
-            val schema      = freshSchemas(qualTable)
-            val tableDeltas = byTable.getOrElse(qualTable, Seq.empty)
-            val viewSql     = StagingDeltaView.buildSourceDeltaViewSql(qualTable, schema, tableDeltas)
-            val t0          = System.nanoTime()
-            try {
-              spark.sql(viewSql)
-            } finally {
-              val ms = (System.nanoTime() - t0) / 1000000L
-              sqlLog.record(
-                category = "register_source_delta",
-                stmtOrder = qlogOrder.getAndIncrement(),
-                attemptIdx = 0,
-                stmtKind = "temp_view",
-                sql = viewSql,
-                durationMs = ms
-              )
-            }
+            val schema       = freshSchemas(qualTable)
+            val tableBatches = byTable.getOrElse(qualTable, Seq.empty)
+            val t0           = System.nanoTime()
+            val viewSql =
+              try {
+                propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+              } finally {
+                val ms = (System.nanoTime() - t0) / 1000000L
+                sqlLog.record(
+                  category = "register_source_delta",
+                  stmtOrder = qlogOrder.getAndIncrement(),
+                  attemptIdx = 0,
+                  stmtKind = "temp_view",
+                  sql = propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches),
+                  durationMs = ms
+                )
+              }
+            // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
+            val _ = viewSql
             tempViewShortNames += qualTable.split("\\.").last
 
             if (diagnosticsEnabled) {
@@ -1506,7 +1520,7 @@ case class RefreshMaterializedViewCommand(
                   .head()
                 logInfo(
                   s"[openivm-mv-diag] refresh view='${sqlIdent(name)}' source_delta source='$qualTable' " +
-                    s"deltas=${tableDeltas.size} total=${counts.getLong(0)} " +
+                    s"deltas=${tableBatches.size} total=${counts.getLong(0)} " +
                     s"pos=${counts.getLong(1)} neg=${counts.getLong(2)}"
                 )
               } catch {
@@ -1997,7 +2011,10 @@ case class RefreshMaterializedViewCommand(
         // becomes a separate trigger key so `StagingCatalog.collectFor`
         // (which matches `base_table` exactly against the downstream's
         // `meta.sourceTables`) finds it.
-        if (cleanupMeta.emitsCascadeViewDelta && fusedScratchView.isEmpty) {
+        // Only matters for the intercept mode: under CDF the downstream MV
+        // discovers our update via the MV data table's own change feed, so
+        // there is no need to write an MV_VIEW_DELTA staging row.
+        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta && fusedScratchView.isEmpty) {
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val mvShortName = name.identifier
@@ -2032,7 +2049,7 @@ case class RefreshMaterializedViewCommand(
           emitEnd(
             "incremental_failed",
             meta.refreshTypeName,
-            stagingDeltas.size
+            changeBatches.size
           )
           val sqlSnippet = rewritten.statements.zipWithIndex
             .map { case (s, i) => s"[${i + 1}] ${SparkRefreshRewriter.stripExecutionMarker(s)}" }
@@ -2046,14 +2063,14 @@ case class RefreshMaterializedViewCommand(
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
         RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          postRefreshCleanup(spark, name, cleanupMeta, stagingDeltas, viewNameStr, sqlLog, qlogOrder)
+          postRefreshCleanup(spark, name, cleanupMeta, changeBatches, viewNameStr, sqlLog, qlogOrder)
         }
       }
       emitEnd(
         if (spFullRefreshFallback) "simple_projection_full_refresh_fallback"
         else "incremental_executed",
         if (spFullRefreshFallback) "FULL_REFRESH" else meta.refreshTypeName,
-        stagingDeltas.size
+        changeBatches.size
       )
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)
@@ -2232,7 +2249,7 @@ case class RefreshMaterializedViewCommand(
     *
     * For every other tracked MV that lists `name` as a source table, this
     * method ensures the downstream MV's next REFRESH does not short-circuit
-    * on the `stagingDeltas.isEmpty` guard at the top of [[runUnderLock]].
+    * on the `changeBatches.isEmpty` guard at the top of [[runUnderLock]].
     *
     * Two paths depending on `meta.emitsCascadeViewDelta`:
     *
@@ -2266,27 +2283,30 @@ case class RefreshMaterializedViewCommand(
       spark: SparkSession,
       name: TableIdentifier,
       meta: MvMetadata,
-      stagingDeltas: Seq[StagingDelta],
+      changeBatches: Seq[ChangeBatch],
       viewNameStr: String,
       sqlLog: RefreshSqlLog = RefreshSqlLog.NoOp,
       qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0)
   ): Unit = {
     import MvCommandHelper._
+    val propagation = ChangePropagationFactory.forSession(spark)
     val newVersion =
       DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
     MvCatalog.advance(spark, name, newVersion)
 
-    val consumedPaths = stagingDeltas.map(_.stagingPath)
-    StagingCatalog.markConsumed(spark, viewNameStr, consumedPaths)
+    propagation.markConsumed(spark, viewNameStr, changeBatches)
 
     val allMvs = MvCatalog.list(spark)
     val viewsByTable = allMvs
       .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
       .groupBy(_._1)
       .map { case (t, pairs) => t -> pairs.map(_._2) }
-    StagingCatalog.pruneFullyConsumed(spark, viewsByTable)
+    propagation.pruneConsumed(spark, viewsByTable)
 
-    if (!meta.emitsCascadeViewDelta) {
+    // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
+    // the downstream MV's next REFRESH naturally sees the new MV-data Delta
+    // version via its own [[CdfChangePropagation.hasPendingChanges]] probe.
+    if (propagation.requiresDmlInterception && !meta.emitsCascadeViewDelta) {
       val upstreamShortName = name.identifier
       val downstreamSourceKeys = allMvs
         .filterNot(m => metaName(m.name) == viewNameStr)
@@ -2426,10 +2446,19 @@ case class DropMaterializedViewCommand(
         //
         // Also delete the per-MV view-delta namespace on disk so view-delta
         // Delta paths from previous refreshes are gone.
-        val mvQual  = metaName(name)
-        val mvShort = name.identifier
-        StagingCatalog.removeForBaseTable(spark, mvQual)
-        if (mvShort != mvQual) StagingCatalog.removeForBaseTable(spark, mvShort)
+        val mvQual      = metaName(name)
+        val mvShort     = name.identifier
+        val propagation = ChangePropagationFactory.forSession(spark)
+        propagation.removeForBaseTable(spark, mvQual)
+        if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
+        // Also evict any CDF watermark rows scoped to this MV instance.  These
+        // are independent of intercept-mode staging rows and are pruned even
+        // if the active mode is `intercept` (defensive cleanup so a later
+        // mode flip never re-uses stale watermarks).
+        CdfWatermarkCatalog.removeForView(spark, mvQual)
+        if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
+        CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
+        if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
 
         val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
         val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")

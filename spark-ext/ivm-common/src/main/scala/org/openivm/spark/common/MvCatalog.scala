@@ -47,6 +47,11 @@ final case class MvMetadata(
     * skip staging rows that pre-date this MV's CREATE (otherwise a newly
     * created downstream MV would double-apply upstream view-deltas it has
     * already absorbed via its initial CTAS).
+    *
+    * Only `TxnTs`-encoded values (the intercept-mode default) round-trip to
+    * `Timestamp`.  CDF-mode `DeltaVersion` values are silently skipped here
+    * because nothing inside the intercept path consumes them.  Use
+    * [[changeWatermarks]] for the mode-agnostic form.
     */
   def sourceWatermarks: Map[String, Timestamp] =
     properties.iterator
@@ -54,6 +59,28 @@ final case class MvMetadata(
       .flatMap { case (k, v) =>
         val src = k.stripPrefix(MvMetadata.WatermarkKeyPrefix)
         scala.util.Try(Timestamp.valueOf(v)).toOption.map(ts => src -> ts)
+      }
+      .toMap
+
+  /** Decode `_ivm_watermark:<src>=<value>` properties into a mode-agnostic
+    * per-source watermark map.  Each value is dispatched to
+    * [[ChangeWatermark.decodeDeltaVersion]] first (recognises the `v:` prefix
+    * emitted by `CdfChangePropagation`) and then falls back to
+    * [[ChangeWatermark.decodeTxnTs]] (the historical `Timestamp.toString`
+    * shape emitted by the intercept path).  Values that decode to neither are
+    * dropped — that is the safe default because the consumer
+    * (`ChangePropagation`) handles a missing watermark by treating the source
+    * as fully unconsumed.
+    */
+  def changeWatermarks: Map[String, ChangeWatermark] =
+    properties.iterator
+      .filter(_._1.startsWith(MvMetadata.WatermarkKeyPrefix))
+      .flatMap { case (k, v) =>
+        val src = k.stripPrefix(MvMetadata.WatermarkKeyPrefix)
+        ChangeWatermark
+          .decodeDeltaVersion(v)
+          .orElse(ChangeWatermark.decodeTxnTs(v))
+          .map(src -> _)
       }
       .toMap
 
@@ -104,6 +131,14 @@ object MvMetadata {
   def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
     watermarks.map { case (src, ts) => s"$WatermarkKeyPrefix$src" -> ts.toString }
 
+  /** Build the property-map entries from a mode-agnostic
+    * [[ChangeWatermark]] map.  Encodes the watermark per
+    * [[ChangeWatermark.encode]] so the active [[ChangePropagation]] can
+    * decode it back without inspecting any other persisted property.
+    */
+  def changeWatermarkProperties(watermarks: Map[String, ChangeWatermark]): Map[String, String] =
+    watermarks.map { case (src, wm) => s"$WatermarkKeyPrefix$src" -> wm.encode }
+
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
@@ -126,7 +161,7 @@ object MvCatalog {
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  private val IndexColumnFamilies = Seq("mv_index", "source_to_mvs", "table_index")
+  private val IndexColumnFamilies = IndexDbColumnFamilies.All
   private val PerMvColumnFamilies = Seq("meta", "properties", "consumed")
 
   private val MvIndexCf     = "mv_index"

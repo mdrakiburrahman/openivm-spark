@@ -1,0 +1,243 @@
+package org.openivm.spark.parity
+
+import org.openivm.spark.parity.base.IvmParitySpecBase
+
+/** Delete-heavy and DML-edge slice of the openivm `inner_join.test` parity
+  * port: net-zero INSERT+DELETE batches, INNER-JOIN NULL-key exclusion,
+  * self-join cascading delete, JOIN + filter on both sides, JOIN + DISTINCT
+  * delete semantics, and constant-rowset JOIN with batched INSERT/DELETE/UPDATE.
+  * See [[InnerJoinInsertSpec]] for the multi-table, CROSS-JOIN, and
+  * unmatched-key scenarios.
+  */
+abstract class InnerJoinDeleteScenarios extends IvmParitySpecBase("inner-join-delete") {
+  self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  // ============================================================================
+  // (4) mv_join_nz — INSERT + DELETE same row in one batch (net zero delta).
+  //     Mirrors openivm lines 372–469.
+  // ============================================================================
+
+  describe("(4) mv_join_nz — INSERT+DELETE same row in one batch (net-zero delta)") {
+    it("batched INSERT followed by DELETE of the same row before refresh produces no MV change") {
+      sql("CREATE TABLE IF NOT EXISTS jn_left_nz (id INT, val STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS jn_right_nz (id INT, amount INT) USING DELTA")
+      sql("INSERT INTO jn_left_nz VALUES (1, 'a'), (2, 'b')")
+      sql("INSERT INTO jn_right_nz VALUES (1, 100), (2, 200)")
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_join_nz AS " +
+          "SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id"
+      )
+
+      val viewBody =
+        "SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id"
+
+      refreshMv("mv_join_nz")
+      assertMvCorrect("mv_join_nz", viewBody)
+
+      // INSERT + DELETE same 999 row before refresh — net zero
+      sql("INSERT INTO jn_right_nz VALUES (1, 999)")
+      sql("DELETE FROM jn_right_nz WHERE id = 1 AND amount = 999")
+      refreshMv("mv_join_nz")
+      assertMvCorrect("mv_join_nz", viewBody)
+
+      // Insert new row for id=3 (no left match) + delete id=2 from right — batched
+      sql("INSERT INTO jn_right_nz VALUES (3, 300)")
+      sql("DELETE FROM jn_right_nz WHERE id = 2")
+      refreshMv("mv_join_nz")
+      assertMvCorrect("mv_join_nz", viewBody)
+    }
+  }
+
+  // ============================================================================
+  // (5) mv_join_null — NULL join keys never match in INNER JOIN.
+  //     Mirrors openivm lines 471–561.
+  // ============================================================================
+
+  describe("(5) mv_join_null — NULL join keys (INNER JOIN equality is NULL-rejecting)") {
+    it("rows with NULL join keys are excluded from INNER JOIN under all DML mutations") {
+      sql("CREATE TABLE IF NOT EXISTS jn_left_null (id INT, name STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS jn_right_null (id INT, score INT) USING DELTA")
+      sql("INSERT INTO jn_left_null VALUES (1, 'a'), (NULL, 'b'), (3, 'c')")
+      sql("INSERT INTO jn_right_null VALUES (1, 10), (NULL, 20), (3, 30)")
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_join_null AS " +
+          "SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id"
+      )
+
+      val viewBody =
+        "SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id"
+
+      refreshMv("mv_join_null")
+      assertMvCorrect("mv_join_null", viewBody)
+
+      // Insert another NULL on right — still no NULL matches in INNER JOIN
+      sql("INSERT INTO jn_right_null VALUES (NULL, 99)")
+      refreshMv("mv_join_null")
+      assertMvCorrect("mv_join_null", viewBody)
+
+      // Delete NULL row from left — MV stays bag-equal (NULLs were never joined)
+      sql("DELETE FROM jn_left_null WHERE id IS NULL")
+      refreshMv("mv_join_null")
+      assertMvCorrect("mv_join_null", viewBody)
+    }
+  }
+
+  // ============================================================================
+  // (6) mv_reports — self-join (employee / manager).
+  //     Mirrors openivm lines 563–652.
+  // ============================================================================
+
+  describe("(6) mv_reports — self-join: people aliased twice as employees and managers") {
+    it("self-join cascades: deleting a manager removes all rows reporting to them") {
+      sql(
+        "CREATE TABLE IF NOT EXISTS people (id INT, name STRING, manager_id INT) USING DELTA"
+      )
+      sql(
+        "INSERT INTO people VALUES (1, 'Alice', NULL), (2, 'Bob', 1), (3, 'Charlie', 1), (4, 'Diana', 2)"
+      )
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_reports AS " +
+          "SELECT e.name AS employee, m.name AS manager " +
+          "FROM people e INNER JOIN people m ON e.manager_id = m.id"
+      )
+
+      val viewBody =
+        "SELECT e.name AS employee, m.name AS manager " +
+          "FROM people e INNER JOIN people m ON e.manager_id = m.id"
+
+      assertMvCorrect("mv_reports", viewBody)
+
+      // Insert new person who reports to Charlie
+      sql("INSERT INTO people VALUES (5, 'Eve', 3)")
+      refreshMv("mv_reports")
+      assertMvCorrect("mv_reports", viewBody)
+
+      // Delete a manager — cascades to their reports disappearing
+      sql("DELETE FROM people WHERE id = 1")
+      refreshMv("mv_reports")
+      assertMvCorrect("mv_reports", viewBody)
+
+      // Insert the manager back + a new report simultaneously
+      sql("INSERT INTO people VALUES (1, 'Alice', NULL), (6, 'Frank', 1)")
+      refreshMv("mv_reports")
+      assertMvCorrect("mv_reports", viewBody)
+    }
+  }
+
+  // ============================================================================
+  // (8) mv_expensive_sales — JOIN + FILTER. Mirrors openivm lines 783–852.
+  // ============================================================================
+
+  describe("(8) mv_expensive_sales — JOIN + WHERE filter on joined columns") {
+    it("filter is preserved across batched DML on both sides") {
+      sql(
+        "CREATE TABLE IF NOT EXISTS jf_products (id INT, name STRING, price INT) USING DELTA"
+      )
+      sql("CREATE TABLE IF NOT EXISTS jf_sales (product_id INT, qty INT) USING DELTA")
+      sql(
+        "INSERT INTO jf_products VALUES (1, 'Widget', 10), (2, 'Gadget', 50), (3, 'Doohickey', 5)"
+      )
+      sql("INSERT INTO jf_sales VALUES (1, 100), (2, 20), (3, 200), (1, 50)")
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_expensive_sales AS " +
+          "SELECT p.name, s.qty, p.price " +
+          "FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id " +
+          "WHERE p.price > 8"
+      )
+
+      val viewBody =
+        "SELECT p.name, s.qty, p.price " +
+          "FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id " +
+          "WHERE p.price > 8"
+
+      assertMvCorrect("mv_expensive_sales", viewBody)
+
+      // Insert sale for cheap product (filtered out) + expensive product
+      sql("INSERT INTO jf_sales VALUES (3, 10), (2, 5)")
+      refreshMv("mv_expensive_sales")
+      assertMvCorrect("mv_expensive_sales", viewBody)
+
+      // Delete from both sides simultaneously (batched)
+      sql("DELETE FROM jf_sales WHERE product_id = 1 AND qty = 100")
+      sql("DELETE FROM jf_products WHERE id = 3")
+      refreshMv("mv_expensive_sales")
+      assertMvCorrect("mv_expensive_sales", viewBody)
+    }
+  }
+
+  // ============================================================================
+  // (9) mv_unique_tags — JOIN + DISTINCT. Mirrors openivm lines 854–919.
+  // ============================================================================
+
+  describe("(9) mv_unique_tags — JOIN + DISTINCT collapses duplicates") {
+    it("DISTINCT semantics preserved: duplicate INSERTs don't grow MV; full-key DELETE removes the row") {
+      sql("CREATE TABLE IF NOT EXISTS jd_tags (item_id INT, tag STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS jd_items (id INT, name STRING) USING DELTA")
+      sql("INSERT INTO jd_items VALUES (1, 'Foo'), (2, 'Bar')")
+      sql("INSERT INTO jd_tags VALUES (1, 'hot'), (1, 'new'), (2, 'hot'), (2, 'hot')")
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_unique_tags AS " +
+          "SELECT DISTINCT i.name, t.tag " +
+          "FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id"
+      )
+
+      val viewBody =
+        "SELECT DISTINCT i.name, t.tag " +
+          "FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id"
+
+      assertMvCorrect("mv_unique_tags", viewBody)
+
+      // Insert duplicate tag (shouldn't change DISTINCT result)
+      sql("INSERT INTO jd_tags VALUES (1, 'hot')")
+      refreshMv("mv_unique_tags")
+      assertMvCorrect("mv_unique_tags", viewBody)
+
+      // Delete all 'hot' tags for Bar — (Bar, hot) should disappear
+      sql("DELETE FROM jd_tags WHERE item_id = 2")
+      refreshMv("mv_unique_tags")
+      assertMvCorrect("mv_unique_tags", viewBody)
+    }
+  }
+
+  // ============================================================================
+  // (12) mv_const_unnest_join — constant-rowset under a join aggregate.
+  //      Mirrors openivm lines 1011–1067.
+  // ============================================================================
+
+  describe("(12) mv_const_unnest_join — constant rowset JOINed against base table under aggregate") {
+    it("batched INSERT+DELETE+UPDATE before a single refresh yields a correct aggregate") {
+      sql("CREATE TABLE IF NOT EXISTS unnest_stock (s_id INT, qty INT) USING DELTA")
+      sql("INSERT INTO unnest_stock VALUES (1, 5), (2, 55), (3, 120)")
+
+      // DuckDB: (SELECT unnest([10, 50, 100]) AS threshold) t
+      // Spark : (VALUES (10), (50), (100)) AS t(threshold)
+      sql(
+        "CREATE MATERIALIZED VIEW mv_const_unnest_join AS " +
+          "SELECT t.threshold, COUNT(*) AS above_cnt " +
+          "FROM (VALUES (10), (50), (100)) AS t(threshold) " +
+          "JOIN unnest_stock s ON s.qty >= t.threshold " +
+          "GROUP BY t.threshold"
+      )
+
+      val viewBody =
+        "SELECT t.threshold, COUNT(*) AS above_cnt " +
+          "FROM (VALUES (10), (50), (100)) AS t(threshold) " +
+          "JOIN unnest_stock s ON s.qty >= t.threshold " +
+          "GROUP BY t.threshold"
+
+      assertMvCorrect("mv_const_unnest_join", viewBody)
+
+      // Batched DML stress (INSERT + DELETE + UPDATE on overlapping rows) → one refresh
+      sql("INSERT INTO unnest_stock VALUES (4, 80)")
+      sql("DELETE FROM unnest_stock WHERE s_id = 1")
+      sql("UPDATE unnest_stock SET qty = 8 WHERE s_id = 3")
+      refreshMv("mv_const_unnest_join")
+      assertMvCorrect("mv_const_unnest_join", viewBody)
+    }
+  }
+}

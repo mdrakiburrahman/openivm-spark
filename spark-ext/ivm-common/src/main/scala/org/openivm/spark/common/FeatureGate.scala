@@ -90,6 +90,26 @@ object FeatureGate {
     */
   val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
 
+  /** Change-propagation mode for tracking what changed on base tables since
+    * the last refresh.
+    *
+    *  - `intercept` (default) — install the Catalyst resolution rule
+    *    [[org.openivm.spark.analyzer.IvmDmlInterceptorRule]] so every
+    *    INSERT / DELETE / UPDATE / MERGE / OVERWRITE on a tracked base table
+    *    tees its change rows to a per-DML staging Delta directory and a
+    *    RocksDB row in [[StagingCatalog]].
+    *  - `cdf` — do not intercept; read Delta Change Data Feed
+    *    (`readChangeFeed = true`) on every tracked source at refresh time.
+    *    Requires `delta.enableChangeDataFeed = true` on every base table the
+    *    user creates an MV over (enforced at CREATE time with a clear
+    *    error). Backing Delta tables of MVs are auto-created with the same
+    *    table property so MV-over-MV cascade continues to work end-to-end.
+    *
+    * Mutually exclusive at session scope.  Default `intercept` preserves
+    * backwards-compatibility for every existing user / test.
+    */
+  val ChangeFeedModeKey: String = "spark.openivm.changeFeed.mode"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -123,12 +143,20 @@ object FeatureGate {
   def queryLogEnabled(conf: SparkConf): Boolean =
     boolConf(conf, QueryLogEnabledKey, default = false)
 
+  def changeFeedMode(spark: SparkSession): ChangeFeedMode =
+    ChangeFeedMode.fromSession(spark)
+
+  def changeFeedMode(conf: SparkConf): ChangeFeedMode =
+    ChangeFeedMode.fromConf(conf)
+
   /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled. */
   def buildMvDataTblProperties(spark: SparkSession): Seq[String] = {
     val props = scala.collection.mutable.ArrayBuffer.empty[String]
     if (deletionVectorsEnabled(spark)) props += "'delta.enableDeletionVectors' = 'true'"
     if (optimizeWriteEnabled(spark)) props += "'delta.autoOptimize.optimizeWrite' = 'true'"
     if (autoCompactEnabled(spark)) props += "'delta.autoOptimize.autoCompact' = 'true'"
+    if (ChangePropagationFactory.forSession(spark).requiresMvCdf)
+      props += "'delta.enableChangeDataFeed' = 'true'"
     props.toSeq
   }
 }
