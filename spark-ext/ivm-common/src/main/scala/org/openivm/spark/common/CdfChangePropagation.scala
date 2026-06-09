@@ -1,0 +1,257 @@
+package org.openivm.spark.common
+
+import io.delta.tables.DeltaTable
+import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.types.StructType
+import org.slf4j.LoggerFactory
+
+/**
+ * [[ChangePropagation]] implementation that reads Delta Change Data Feed
+ * (`spark.read.format("delta").option("readChangeFeed","true")...`) for
+ * every tracked source at refresh time.
+ *
+ * Writers other than this Spark extension can update the base tables — we
+ * never intercept DML; we always re-derive the change set from the Delta
+ * log's CDF rows between the last persisted version and the current
+ * version.
+ *
+ * Per-(view, source) last-consumed Delta version is tracked in
+ * [[CdfWatermarkCatalog]].
+ */
+final class CdfChangePropagation extends ChangePropagation {
+
+  private val log = LoggerFactory.getLogger(getClass)
+
+  override def mode: ChangeFeedMode = ChangeFeedMode.Cdf
+
+  override val requiresDmlInterception: Boolean = false
+  override val requiresMvCdf: Boolean           = true
+
+  override def validateSources(spark: SparkSession, sources: Seq[String]): Unit = {
+    val missing = sources.distinct.flatMap { src =>
+      val enabled =
+        try CdfChangePropagation.tableHasCdf(spark, src)
+        catch {
+          case t: Throwable =>
+            log.warn(s"[openivm-cdf] could not read table properties for $src: ${t.getMessage}")
+            true
+        }
+      if (enabled) None else Some(src)
+    }
+    if (missing.nonEmpty) {
+      val missingList = missing.mkString(", ")
+      val msg =
+        s"openivm-spark: changeFeed.mode = 'cdf' requires every source Delta " +
+          s"table to have 'delta.enableChangeDataFeed' = 'true', but the following " +
+          s"sources do NOT: [$missingList]. " +
+          s"Fix: ALTER TABLE <table> SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
+      throw new AnalysisException("_LEGACY_ERROR_TEMP_2273", Map("message" -> msg))
+    }
+  }
+
+  override def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, ChangeWatermark] =
+    sources.distinct.flatMap { src =>
+      CdfChangePropagation.tableLatestVersion(spark, src).map(v => src -> ChangeWatermark.DeltaVersion(v))
+    }.toMap
+
+  override def hasPendingChanges(
+      spark: SparkSession,
+      viewName: String,
+      sources: Seq[String],
+      persisted: Map[String, ChangeWatermark]
+  ): Boolean = {
+    val effective = effectivePersistedVersions(spark, viewName, sources, persisted)
+    sources.distinct.exists { src =>
+      val currentOpt   = CdfChangePropagation.tableLatestVersion(spark, src)
+      val persistedVer = effective.get(src)
+      currentOpt match {
+        case None => false
+        case Some(cur) =>
+          persistedVer match {
+            case Some(p) => cur > p
+            case None    => true
+          }
+      }
+    }
+  }
+
+  override def collectChanges(
+      spark: SparkSession,
+      viewName: String,
+      sources: Seq[String],
+      persisted: Map[String, ChangeWatermark]
+  ): Seq[ChangeBatch] = {
+    val effective = effectivePersistedVersions(spark, viewName, sources, persisted)
+    sources.distinct.flatMap { src =>
+      val currentOpt = CdfChangePropagation.tableLatestVersion(spark, src)
+      currentOpt.flatMap { cur =>
+        val from = effective.getOrElse(src, -1L)
+        if (cur > from) Some(CdfChangeBatch(src, startVersionExclusive = from, endVersionInclusive = cur))
+        else None
+      }
+    }
+  }
+
+  override def buildSourceDeltaViewSql(
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch]
+  ): String = {
+    val short    = sourceTable.split("\\.").last
+    val viewName = s"`openivm_delta_$short`"
+    val cols     = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
+
+    val cdfBatch = batches.collectFirst { case b: CdfChangeBatch => b }
+
+    cdfBatch match {
+      case Some(b) =>
+        val from = b.startVersionExclusive + 1L
+        val to   = b.endVersionInclusive
+        val tbl  = sourceTable.replace("'", "''")
+        s"""-- registered via DataFrame API: readChangeFeed startingVersion=$from endingVersion=$to
+           |-- equivalent SQL form retained for diagnostic logs only:
+           |CREATE OR REPLACE TEMP VIEW $viewName AS
+           |SELECT $cols,
+           |       CAST(`_commit_timestamp` AS TIMESTAMP) AS openivm_timestamp,
+           |       CASE
+           |         WHEN `_change_type` IN ('insert', 'update_postimage') THEN CAST(1 AS INT)
+           |         WHEN `_change_type` IN ('delete', 'update_preimage')  THEN CAST(-1 AS INT)
+           |       END AS openivm_multiplicity
+           |FROM table_changes('$tbl', $from, $to)
+           |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
+
+      case None =>
+        val nullCols = sourceSchema.fieldNames.map(n => s"NULL AS `${n.replace("`", "``")}`").mkString(", ")
+        s"""CREATE OR REPLACE TEMP VIEW $viewName AS
+           |SELECT $cols, CURRENT_TIMESTAMP() AS openivm_timestamp, CAST(0 AS INT) AS openivm_multiplicity
+           |FROM (SELECT $nullCols) WHERE 1=0""".stripMargin
+    }
+  }
+
+  override def registerSourceDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch]
+  ): String = {
+    val short    = sourceTable.split("\\.").last
+    val viewName = s"openivm_delta_$short"
+
+    val cdfBatch = batches.collectFirst { case b: CdfChangeBatch => b }
+
+    cdfBatch match {
+      case Some(b) =>
+        val from = b.startVersionExclusive + 1L
+        val to   = b.endVersionInclusive
+        val raw =
+          spark.read
+            .format("delta")
+            .option("readChangeFeed", "true")
+            .option("startingVersion", from)
+            .option("endingVersion", to)
+            .table(sourceTable)
+
+        val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
+        val transformedAlias = s"_openivm_cdf_raw_$short"
+        raw.createOrReplaceTempView(transformedAlias)
+        val sql = s"""CREATE OR REPLACE TEMP VIEW `$viewName` AS
+                     |SELECT $userCols,
+                     |       CAST(`_commit_timestamp` AS TIMESTAMP) AS openivm_timestamp,
+                     |       CASE
+                     |         WHEN `_change_type` IN ('insert', 'update_postimage') THEN CAST(1 AS INT)
+                     |         WHEN `_change_type` IN ('delete', 'update_preimage')  THEN CAST(-1 AS INT)
+                     |       END AS openivm_multiplicity
+                     |FROM `$transformedAlias`
+                     |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
+        spark.sql(sql)
+        sql
+
+      case None =>
+        val sql = buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
+        spark.sql(sql)
+        sql
+    }
+  }
+
+  override def markConsumed(spark: SparkSession, viewName: String, batches: Seq[ChangeBatch]): Unit =
+    batches.foreach {
+      case b: CdfChangeBatch => CdfWatermarkCatalog.put(spark, viewName, b.baseTable, b.endVersionInclusive)
+      case _                 => ()
+    }
+
+  override def pruneConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = ()
+
+  override def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
+    CdfWatermarkCatalog.removeForBaseTable(spark, baseTable)
+
+  /**
+   * Per-(view, source) last-consumed Delta version: prefer the value
+   * persisted in [[CdfWatermarkCatalog]] (carries cross-refresh state),
+   * fall back to the value captured at MV CREATE time (carried in
+   * `persisted`), and finally to "no version persisted" (consume everything
+   * since the start).
+   */
+  private def effectivePersistedVersions(
+      spark: SparkSession,
+      viewName: String,
+      sources: Seq[String],
+      persisted: Map[String, ChangeWatermark]
+  ): Map[String, Long] = {
+    CdfWatermarkCatalog.ensureTables(spark)
+    sources.distinct.flatMap { src =>
+      val live = CdfWatermarkCatalog.get(spark, viewName, src)
+      val seed = persisted.get(src).collect { case ChangeWatermark.DeltaVersion(v) => v }
+      (live, seed) match {
+        case (Some(l), Some(s)) => Some(src -> math.max(l, s))
+        case (Some(l), None)    => Some(src -> l)
+        case (None, Some(s))    => Some(src -> s)
+        case (None, None)       => None
+      }
+    }.toMap
+  }
+}
+
+object CdfChangePropagation {
+
+  /**
+   * `true` when the Delta table identified by `name` has
+   * `delta.enableChangeDataFeed` set to `true`.  Names are resolved through
+   * Spark's catalog: bare names are looked up in the active database, and
+   * `db.table` is resolved via [[DeltaTable.forName]].  Returns `false` when
+   * the table cannot be resolved (caller handles that as a "missing source"
+   * upstream).
+   */
+  def tableHasCdf(spark: SparkSession, name: String): Boolean = {
+    val identifier = CatalystSqlParser.parseTableIdentifier(name)
+    val resolved = identifier.database match {
+      case Some(_) => name
+      case None    => name
+    }
+    val df =
+      try spark.sql(s"SHOW TBLPROPERTIES ${quoteForCatalog(resolved)}")
+      catch { case _: Throwable => return false }
+    val rows = df.collect()
+    rows.exists { row =>
+      val k = row.getAs[String]("key")
+      val v = row.getAs[String]("value")
+      k != null && k.equalsIgnoreCase("delta.enableChangeDataFeed") &&
+      v != null && v.trim.equalsIgnoreCase("true")
+    }
+  }
+
+  /** Current Delta `version` of `name`, or `None` if the table cannot be loaded as Delta. */
+  def tableLatestVersion(spark: SparkSession, name: String): Option[Long] = {
+    val resolved = name
+    try {
+      val dt   = DeltaTable.forName(spark, resolved)
+      val hist = dt.history(1).collect()
+      hist.headOption.map(_.getAs[Long]("version"))
+    } catch {
+      case _: Throwable => None
+    }
+  }
+
+  private def quoteForCatalog(name: String): String =
+    name.split("\\.").map(p => s"`${p.replace("`", "``")}`").mkString(".")
+}

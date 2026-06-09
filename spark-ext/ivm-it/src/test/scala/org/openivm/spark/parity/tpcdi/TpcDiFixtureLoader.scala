@@ -33,15 +33,28 @@ object TpcDiFixtureLoader {
   /** Cold backfill of every `tpcdi.<t>` source table. Bypasses the IVM
     * DML interceptor (no MVs exist yet — nothing to stage). Creates the
     * `tpcdi` database if absent.
+    *
+    * Pass `enableCdf = true` to set `delta.enableChangeDataFeed = true` on
+    * every materialised source so the CDF-mode change-propagation path can
+    * resolve them (no-op for intercept mode).
     */
-  def loadBase(spark: SparkSession): Unit = {
+  def loadBase(spark: SparkSession, enableCdf: Boolean = false): Unit = {
     spark.sql("CREATE DATABASE IF NOT EXISTS tpcdi")
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       val tables = listFixtureTables("base")
       tables.foreach { tname =>
-        val df = readFixture(spark, "base", tname)
-        df.write.format("delta").mode("overwrite").saveAsTable(s"tpcdi.$tname")
+        val df     = readFixture(spark, "base", tname)
+        val writer = df.write.format("delta").mode("overwrite")
+        val withCdf =
+          if (enableCdf) writer.option("delta.enableChangeDataFeed", "true")
+          else writer
+        withCdf.saveAsTable(s"tpcdi.$tname")
+        if (enableCdf) {
+          spark
+            .sql(s"ALTER TABLE tpcdi.$tname SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
+            .collect()
+        }
       }
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)

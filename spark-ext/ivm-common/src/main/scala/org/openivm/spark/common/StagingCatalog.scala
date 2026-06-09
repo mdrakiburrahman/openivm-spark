@@ -72,7 +72,7 @@ object StagingDelta {
 /** RocksDB-backed catalog for DML staging records. */
 object StagingCatalog {
 
-  private val IndexDbColumnFamilies = Seq("mv_index", "source_to_mvs", "table_index")
+  private val IndexDbColumnFamilies = org.openivm.spark.common.IndexDbColumnFamilies.All
   private val MvDbColumnFamilies    = Seq("meta", "properties", "consumed")
   private val BaseDbColumnFamilies  = Seq("staging")
 
