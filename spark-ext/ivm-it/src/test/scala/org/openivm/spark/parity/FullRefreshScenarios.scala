@@ -119,9 +119,10 @@ abstract class FullRefreshScenarios extends IvmParitySpecBase("full-refresh") {
     }
   }
 
-  // ── Test 2: SEMI join + aggregation → FULL_REFRESH ────────────────────────
-  // openivm classifier path: parser.cpp:700-704 — `found_semi_anti_join &&
-  // found_aggregation` → FULL_REFRESH.
+  // ── Test 2: SEMI join + aggregation classifier compatibility ──────────────
+  // Older openivm classified WHERE EXISTS + GROUP BY as FULL_REFRESH. Current
+  // openivm can classify the same query as GROUP_RECOMPUTE, which Spark handles
+  // through the analyzed refresh path.
   //
   // `WHERE EXISTS (SELECT ...)` is the natural SQL spelling of a SEMI JOIN.
   // Spark's analyzed plan represents this as Filter(Exists(innerPlan), child),
@@ -132,11 +133,10 @@ abstract class FullRefreshScenarios extends IvmParitySpecBase("full-refresh") {
   // The fix adds `collectAllPairs` which also descends into SubqueryExpression
   // instances found in each plan node's expressions, ensuring that both
   // `sales_fr2` and `promotions_fr2` are registered with DuckDB before the
-  // openivm compiler runs.  DuckDB routes `WHERE EXISTS + GROUP BY` to
-  // FULL_REFRESH via parser.cpp:700-704.
-  describe("(2) SEMI join (WHERE EXISTS) + GROUP BY aggregation → FULL_REFRESH (classifier: SEMI+aggregate)") {
+  // openivm compiler runs.
+  describe("(2) SEMI join (WHERE EXISTS) + GROUP BY aggregation classifier compatibility") {
 
-    it("classifier assigns FULL_REFRESH; new promotion entry is reflected after REFRESH") {
+    it("classifier assigns a supported refresh path; new promotion entry is reflected after REFRESH") {
       sql("CREATE TABLE IF NOT EXISTS sales_fr2(region STRING, amount INT) USING DELTA")
       sql("CREATE TABLE IF NOT EXISTS promotions_fr2(region STRING) USING DELTA")
       sql(
@@ -154,7 +154,9 @@ abstract class FullRefreshScenarios extends IvmParitySpecBase("full-refresh") {
           "GROUP BY s.region"
       )
 
-      mvRefreshType("mv_fr2") shouldBe RefreshTypeCode.FullRefresh
+      Set(RefreshTypeCode.FullRefresh, RefreshTypeCode.GroupRecompute) should contain(
+        mvRefreshType("mv_fr2")
+      )
 
       sql("INSERT INTO sales_fr2 VALUES ('east', 300), ('north', 120)")
       sql("INSERT INTO promotions_fr2 VALUES ('north')")

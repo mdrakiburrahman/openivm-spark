@@ -983,21 +983,27 @@ object SparkRefreshRewriter {
     val escapedPath = viewDeltaPath.replace("`", "``")
     val deltaRef    = s"delta.`$escapedPath`"
 
-    // Extract user columns from "INSERT INTO openivm_data_<view> SELECT <cols> FROM openivm_delta_<view>"
-    val selectRe = ("(?is)\\bINSERT\\s+INTO\\s+openivm_data_" +
+    // Extract user columns from the SIMPLE_PROJECTION apply statement. Older
+    // openivm emitted FROM openivm_delta_<view> directly; current openivm first
+    // materialises an openivm_net CTE and inserts from that net relation.
+    val insertSelectPrefix = "(?is)\\bINSERT\\s+INTO\\s+openivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) +
-      "\\b\\s+SELECT\\s+(.*?)\\s*\\bFROM\\s+(?:`?openivm_delta_" +
-      java.util.regex.Pattern.quote(viewLogicalName) +
-      "`?)").r
+      "\\b\\s+SELECT\\s+(.*?)\\s*\\bFROM\\s+"
+    val selectRes = Seq(
+      (insertSelectPrefix + "(?:`?openivm_delta_" +
+        java.util.regex.Pattern.quote(viewLogicalName) +
+        "`?)").r,
+      (insertSelectPrefix + "(?:`?openivm_net`?)\\b").r
+    )
 
-    val userCols: Seq[String] = selectRe.findFirstMatchIn(stmt) match {
+    val userCols: Seq[String] = selectRes.view.flatMap(_.findFirstMatchIn(stmt)).headOption match {
       case None => Nil
       case Some(m) =>
         m.group(1)
           .split(",")
           .map(_.trim)
           .map { col =>
-            // Normalise DuckDB double-quoted identifiers: "name" → `name`
+            // Normalise DuckDB double-quoted identifiers: "name" -> `name`
             if (col.startsWith("\"") && col.endsWith("\""))
               s"`${col.substring(1, col.length - 1)}`"
             else
