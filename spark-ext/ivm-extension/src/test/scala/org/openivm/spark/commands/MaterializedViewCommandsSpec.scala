@@ -423,10 +423,10 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   // ---------------------------------------------------------------------------
-  // Test 13 — SIMPLE_PROJECTION demotes when refresh SQL has no data apply step
+  // Test 13 — SIMPLE_PROJECTION remains incremental with openivm_net data apply step
   // ---------------------------------------------------------------------------
-  describe("(13) SIMPLE_PROJECTION demotes when rewrite emits no data apply statement") {
-    it("falls back to FULL_REFRESH for a VALUES-join projection whose incremental SQL only emits view-delta rows") {
+  describe("(13) SIMPLE_PROJECTION stays incremental when rewrite emits openivm_net data apply") {
+    it("uses SIMPLE_PROJECTION for a VALUES-join projection whose current OpenIVM SQL emits data apply rows") {
       spark.sql(
         "CREATE TABLE IF NOT EXISTS sales_t13_value_customers(id INT, credit STRING, last_name STRING) USING DELTA"
       )
@@ -441,9 +441,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t13_value_join AS $viewBody")
 
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t13_value_join")).get
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      meta.refreshTypeName shouldBe "FULL_REFRESH"
-      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe false
+      meta.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      meta.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe true
 
       val expectedCreate = spark.sql(viewBody)
       val mvCreate       = spark.table("mv_t13_value_join").select("id", "last_name", "priority")
