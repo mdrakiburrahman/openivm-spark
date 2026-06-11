@@ -3,6 +3,7 @@ name: gci
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel any in-flight gci run for the same PR when a new commit lands.
 concurrency:
