@@ -39,7 +39,12 @@ cmn_ensure_az_login
 cmn_ensure_gh_cli
 cmn_ensure_gh_login
 
+# 7. Terraform — used by contrib/deploy-gh-runner.sh to provision the
+#    self-hosted Azure runner stack (see contrib/terraform/github-runner/).
+cmn_ensure_terraform
+
 echo
 echo "Docker:     $(docker --version)"
 echo "GitHub CLI: $(gh --version | head -1)"
 echo "Azure CLI:  $(az --version | head -1)"
+echo "Terraform:  $(terraform version | head -1)"

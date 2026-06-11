@@ -23,3 +23,16 @@ out/
 *.crc
 **/.extractor-warehouse/
 **/.extractor-coverage-warehouse/
+
+# Local secrets (deploy-gh-runner.sh sources this). Use .env.example as the
+# template and never commit a populated .env.
+.env
+
+# Terraform state, lock files, and user-supplied tfvars for any module under
+# contrib/terraform/. The wrapper dirs also carry their own .gitignore, but
+# include them here so accidental copies elsewhere are still ignored.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json

@@ -26,6 +26,7 @@ fi
 
 CMN_DOCKER_VERSION="${CMN_DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
 CMN_DOCKER_DAEMON_JSON='{"max-concurrent-downloads": 32}'
+CMN_TERRAFORM_VERSION="${CMN_TERRAFORM_VERSION:-1.9.8}"
 
 # ── tiny utilities ──────────────────────────────────────────────────────────
 
@@ -163,6 +164,28 @@ cmn_ensure_az_login() {
     fi
     cmn_log common "az not logged in — running 'az login'..."
     az login >/dev/null
+}
+
+# ── terraform ───────────────────────────────────────────────────────────────
+
+cmn_ensure_terraform() {
+    if cmn_has terraform; then
+        cmn_log common "terraform already installed ($(terraform version | head -1))"
+        return 0
+    fi
+    cmn_log common "installing terraform v${CMN_TERRAFORM_VERSION}..."
+    sudo apt-get update -qq
+    cmn_apt_install gnupg software-properties-common curl
+    local key
+    key="$(mktemp)"
+    curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$key"
+    sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg "$key"
+    rm -f "$key"
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+        | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+    sudo apt-get update -qq
+    sudo apt-get install -y --allow-downgrades "terraform=${CMN_TERRAFORM_VERSION}-*" >/dev/null
+    cmn_log common "terraform installed ($(terraform version | head -1))"
 }
 
 # ── github cli ──────────────────────────────────────────────────────────────
