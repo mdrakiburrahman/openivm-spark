@@ -12,8 +12,10 @@
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
 #   openivm-test            Run upstream openivm sqllogictest suite.
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
-#                           pinned COMMITs in pins.env. The pin is
-#                           authoritative — pins-sync does NOT pull
+#                           pinned COMMITs in pins.env, and shallow-clone the
+#                           read-only .temp/{spark,delta} upstream references
+#                           (--depth 1) at their pinned release tags. The pin
+#                           is authoritative — pins-sync does NOT pull
 #                           origin/<BRANCH> to its latest tip. If the worktree
 #                           has uncommitted work, unpushed commits, or an
 #                           in-progress git operation, pin enforcement is
@@ -213,6 +215,13 @@ _pins_sync_git_op_in_progress() {
 #     SKIP enforcement (do not destroy WIP). Drift is non-fatal (exit 0).
 #   * NOTE: `pins-fix` refuses to push to main/master, so for BRANCH=main pins
 #     the bump workflow is: edit pins.env manually, then run pins-sync.
+#
+# After the three dev repos, pins-sync also materialises the read-only upstream
+# references .temp/{spark,delta} — shallow (--depth 1) clones of the exact
+# Spark/Delta release the IVM extension builds against, pinned by release tag +
+# commit SHA. These are reference-only (never fetched on the happy path, never
+# ancestry-enforced since a shallow clone has no history, never touched by
+# pins-fix); a clean HEAD != pin triggers a re-clone, a dirty one a soft WARNING.
 cmd_pins_sync() {
     local temp_dir="$REPO_ROOT/.temp"
     mkdir -p "$temp_dir"
@@ -348,6 +357,98 @@ cmd_pins_sync() {
                     exit 1
                 fi
                 echo "[pins-sync]   ✓ HEAD at pin ($commit)"
+            fi
+        fi
+    done
+
+    # ── read-only upstream references (Spark / Delta) ──────────────────────
+    # These are NOT repos we develop or push to — they are shallow (--depth 1)
+    # checkouts of the exact Spark/Delta release the IVM extension builds
+    # against, kept under .temp for local source reference. They are pinned by
+    # an immutable release tag + its commit SHA, so (unlike the dev repos
+    # above) we do NOT fetch on the happy path and do NOT run full-history
+    # ancestry enforcement (a shallow clone has no history). They are also
+    # intentionally absent from `pins-fix` — nothing is ever pushed upstream.
+    local ref_entries=(
+        "spark|SPARK_REPO|SPARK_REF|SPARK_COMMIT"
+        "delta|DELTA_REPO|DELTA_REF|DELTA_COMMIT"
+    )
+    for entry in "${ref_entries[@]}"; do
+        IFS='|' read -r name repo_var ref_var commit_var <<< "$entry"
+        local repo="${!repo_var}"
+        local ref="${!ref_var}"
+        local commit="${!commit_var}"
+        local dest="$temp_dir/$name"
+
+        echo
+        echo "[pins-sync] ── $name (read-only reference, --depth 1) ──"
+        echo "[pins-sync]   repo   = $repo"
+        echo "[pins-sync]   ref    = $ref"
+        echo "[pins-sync]   pin    = $commit"
+
+        if [[ ! -d "$dest/.git" ]]; then
+            if [[ -e "$dest" ]]; then
+                echo "[pins-sync] FATAL: $dest exists but is not a git checkout" >&2
+                exit 1
+            fi
+            echo "[pins-sync]   shallow-cloning into .temp/$name ..."
+            if ! git clone --depth 1 --branch "$ref" "$repo" "$dest"; then
+                echo "[pins-sync] FATAL: failed to clone $repo @ $ref" >&2
+                echo "[pins-sync]        verify the repository and tag exist remotely." >&2
+                exit 1
+            fi
+            local head
+            head="$(git -C "$dest" rev-parse HEAD)"
+            if [[ "$head" != "$commit" ]]; then
+                echo "[pins-sync] FATAL: $ref resolved to $head, expected pinned $commit in .temp/$name" >&2
+                echo "[pins-sync]        (${ref_var} and ${commit_var} disagree in pins.env)" >&2
+                exit 1
+            fi
+            echo "[pins-sync]   ✓ HEAD at pin ($head)"
+        else
+            echo "[pins-sync]   already cloned at .temp/$name"
+            local current_remote
+            current_remote="$(git -C "$dest" remote get-url origin 2>/dev/null || echo '')"
+            if [[ -n "$current_remote" && "$current_remote" != "$repo" ]]; then
+                echo "[pins-sync]   WARNING: origin remote mismatch"
+                echo "[pins-sync]     local  = $current_remote"
+                echo "[pins-sync]     pinned = $repo"
+            fi
+
+            # Release SHAs are immutable, so an existing checkout at the pin
+            # needs only a rev-parse — no fetch (keeps `verify` fast).
+            local head
+            head="$(git -C "$dest" rev-parse HEAD)"
+            if [[ "$head" == "$commit" ]]; then
+                echo "[pins-sync]   ✓ HEAD at pin ($head)"
+            else
+                # HEAD != pin (e.g. someone bumped SPARK_REF/COMMIT). Re-clone
+                # when the worktree is clean; never clobber local edits.
+                local dirty=0
+                if [[ -n "$(git -C "$dest" status --porcelain --untracked-files=all)" ]]; then
+                    dirty=1
+                fi
+                if [[ "$dirty" -eq 1 ]]; then
+                    echo "[pins-sync]   ⚠ WARNING: .temp/$name HEAD != pin and has local changes; skipping re-clone"
+                    echo "[pins-sync]              HEAD = $head"
+                    echo "[pins-sync]              pin  = $commit"
+                    echo "[pins-sync]              remove .temp/$name and re-run pins-sync to refresh"
+                    drift=1
+                else
+                    echo "[pins-sync]   re-cloning .temp/$name → $ref ($commit)"
+                    rm -rf "$dest"
+                    if ! git clone --depth 1 --branch "$ref" "$repo" "$dest"; then
+                        echo "[pins-sync] FATAL: failed to re-clone $repo @ $ref" >&2
+                        exit 1
+                    fi
+                    head="$(git -C "$dest" rev-parse HEAD)"
+                    if [[ "$head" != "$commit" ]]; then
+                        echo "[pins-sync] FATAL: $ref resolved to $head, expected pinned $commit in .temp/$name" >&2
+                        echo "[pins-sync]        (${ref_var} and ${commit_var} disagree in pins.env)" >&2
+                        exit 1
+                    fi
+                    echo "[pins-sync]   ✓ HEAD at pin ($head)"
+                fi
             fi
         fi
     done
@@ -512,7 +613,7 @@ cmd_pins_sync() {
 
     echo
     if [[ "$drift" -eq 0 ]]; then
-        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits, the ivm-bench Dockerfile ARGs agree with pins.env, AND OPENIVM_SPARK_COMMIT matches origin."
+        echo "[pins-sync] ✓ All 3 repos are on their pinned branches AND match their pinned commits, the spark/delta reference checkouts match their pinned commits, the ivm-bench Dockerfile ARGs agree with pins.env, AND OPENIVM_SPARK_COMMIT matches origin."
     else
         echo "[pins-sync] ⚠ Drift detected — see WARNINGs above (HEAD drift, Dockerfile ARG mismatch, and/or OPENIVM_SPARK_COMMIT origin mismatch)."
     fi

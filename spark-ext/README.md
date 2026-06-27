@@ -19,7 +19,7 @@ spark-ext/
 └── dev/
     ├── dev            # single entry-point CLI wrapper (build, test, verify, shell, …)
     ├── docker/        # multi-stage Dockerfile + docker-compose.yml
-    └── pins.env       # pinned SHAs of openivm / lpts / ivm-bench forks
+    └── pins.env       # pinned SHAs of openivm / lpts / ivm-bench forks + spark / delta refs
 ```
 
 ## Supported RefreshTypes
@@ -52,7 +52,7 @@ following subcommands:
 
 ```bash
 ./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
-./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench}, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
+./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench} + shallow .temp/{spark,delta} refs, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
 ./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
@@ -68,9 +68,11 @@ following subcommands:
 
 `verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
 missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and
-aligning each to its pinned branch), then lints, compiles, assembles the fat
-jar, and runs every unit + integration + parity suite in a single sbt JVM.
-Wall-clock on the reference 32-core / 124 GiB host is ~40 minutes end-to-end.
+aligning each to its pinned branch, plus shallow-cloning the read-only
+`.temp/{spark,delta}` upstream references at their pinned release tags), then
+lints, compiles, assembles the fat jar, and runs every unit + integration +
+parity suite in a single sbt JVM. Wall-clock on the reference 32-core / 124 GiB
+host is ~40 minutes end-to-end.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned
