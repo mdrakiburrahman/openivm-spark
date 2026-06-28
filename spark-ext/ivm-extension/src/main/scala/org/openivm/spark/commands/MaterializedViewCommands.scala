@@ -1162,34 +1162,42 @@ case class RefreshMaterializedViewCommand(
     // `.count()` on the fused path, `.collect()` on the on-disk path), not
     // just construction — Catalyst plans lazily inside the action.
     def withPlanTimeBroadcastDisabled[A](body: => A): A = {
-      val key          = "spark.sql.autoBroadcastJoinThreshold"
-      val adaptiveKey  = "spark.sql.adaptive.autoBroadcastJoinThreshold"
-      val prev         = spark.conf.getOption(key)
-      val prevAdaptive = spark.conf.getOption(adaptiveKey)
-      spark.conf.set(key, "-1")
-      // Plan-time broadcast is off (above), but let AQE convert the small-side
-      // SCD2 dimension sort-merge joins to broadcast-hash joins at RUNTIME,
-      // keyed on the ACTUAL materialised shuffle size. This is safe against the
-      // 8 GiB explosion (AQE measures the exploding intermediate as large and
-      // keeps the sort-merge join) and is result-invariant — it only changes
-      // the join strategy. Gated by `spark.openivm.refresh.adaptiveBroadcast.*`.
-      // See `FeatureGate.AdaptiveBroadcastEnabledKey` for the full rationale.
+      val key         = "spark.sql.autoBroadcastJoinThreshold"
+      val adaptiveKey = "spark.sql.adaptive.autoBroadcastJoinThreshold"
+      val sessionStatic =
+        spark.conf.getOption(key).flatMap(v => scala.util.Try(v.toLong).toOption)
+
+      val overrides = scala.collection.mutable.LinkedHashMap.empty[String, String]
+      // (1) Disable PLAN-TIME broadcast: Catalyst under-estimates the SCD2
+      // multiplicity and would auto-broadcast a relation that explodes past the
+      // 8 GiB build cap at execution.
+      overrides += (key -> "-1")
+      // (2) But let AQE convert the small-side SCD2 dimension sort-merge joins
+      // to broadcast-hash joins at RUNTIME, keyed on the ACTUAL materialised
+      // shuffle size — safe against the explosion (AQE measures the exploding
+      // intermediate as large and keeps the sort-merge join). Result-invariant.
+      // Gated by `spark.openivm.refresh.adaptiveBroadcast.*`.
       if (FeatureGate.adaptiveBroadcastEnabled(spark)) {
-        val sessionStatic = prev.flatMap(v => scala.util.Try(v.toLong).toOption)
-        val budget        = FeatureGate.adaptiveBroadcastThresholdBytes(spark.sparkContext.getConf, sessionStatic)
-        spark.conf.set(adaptiveKey, budget.toString)
+        overrides += (adaptiveKey ->
+          FeatureGate.adaptiveBroadcastThresholdBytes(spark.sparkContext.getConf, sessionStatic).toString)
       }
+      // (3) Runtime-filter (bloom / semi-join) pushdown: every IVM view-delta is
+      // a union of delta-rule terms, one of which is `FULL_SOURCE ⋈ Δdimension`
+      // (e.g. `gold.fact_market_history` scanning the whole `daily_market`
+      // against the handful of changed `dim_security` rows). A runtime filter
+      // built from the tiny Δ side prunes the full-source scan to the affected
+      // keys — the dominant SF10 cost. Result-invariant (an exact/superset
+      // filter), gated by `spark.openivm.refresh.runtimeFilter.*`.
+      overrides ++= FeatureGate.runtimeFilterConfOverrides(spark)
+
+      val prev = overrides.keys.map(k => k -> spark.conf.getOption(k)).toList
+      overrides.foreach { case (k, v) => spark.conf.set(k, v) }
       try body
-      finally {
-        prev match {
-          case Some(v) => spark.conf.set(key, v)
-          case None    => spark.conf.unset(key)
+      finally
+        prev.foreach {
+          case (k, Some(v)) => spark.conf.set(k, v)
+          case (k, None)    => spark.conf.unset(k)
         }
-        prevAdaptive match {
-          case Some(v) => spark.conf.set(adaptiveKey, v)
-          case None    => spark.conf.unset(adaptiveKey)
-        }
-      }
     }
 
     val refreshT0  = System.nanoTime()

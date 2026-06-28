@@ -157,6 +157,20 @@ object FeatureGate {
   /** Fallback AQE broadcast budget (100 MiB) — 80x under Spark's 8 GiB cap. */
   val AdaptiveBroadcastDefaultBytes: Long = 104857600L
 
+  /** Enable runtime-filter (bloom / semi-join) pushdown for the SCD2 view-delta
+    * joins. Every IVM view-delta is a union of delta-rule terms, and the
+    * `FULL_SOURCE ⋈ Δdimension` term scans the entire source table against the
+    * handful of changed dimension rows — the dominant SF10 cost (e.g.
+    * `gold.fact_market_history` scanning all of `daily_market`). A runtime
+    * filter built from the tiny Δ side prunes that scan to the affected keys.
+    * Result-invariant (an exact/superset filter never drops matching rows).
+    * Spark's runtime filters are OFF by default; this turns them on (and lowers
+    * the application-side scan-size threshold so they fire on SF10-scale source
+    * tables) only for the wrapped refresh statements. Flip OFF via
+    * `spark.openivm.refresh.runtimeFilter.enabled=false`.
+    */
+  val RuntimeFilterEnabledKey: String = "spark.openivm.refresh.runtimeFilter.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -209,6 +223,30 @@ object FeatureGate {
     if (explicit > 0) explicit
     else sessionStaticBytes.filter(_ > 0).getOrElse(AdaptiveBroadcastDefaultBytes)
   }
+
+  def runtimeFilterEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RuntimeFilterEnabledKey, default = true)
+
+  def runtimeFilterEnabled(spark: SparkSession): Boolean =
+    runtimeFilterEnabled(spark.sparkContext.getConf)
+
+  /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
+    * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
+    * application-side threshold is lowered from Spark's 10 GiB default so the
+    * filter fires on SF10-scale source scans; the creation-side default
+    * (10 MiB) still restricts it to joins whose build side is the tiny delta.
+    */
+  def runtimeFilterConfOverrides(conf: SparkConf): Map[String, String] =
+    if (!runtimeFilterEnabled(conf)) Map.empty
+    else
+      Map(
+        "spark.sql.optimizer.runtime.bloomFilter.enabled"                          -> "true",
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB",
+        "spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled"              -> "true"
+      )
+
+  def runtimeFilterConfOverrides(spark: SparkSession): Map[String, String] =
+    runtimeFilterConfOverrides(spark.sparkContext.getConf)
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)

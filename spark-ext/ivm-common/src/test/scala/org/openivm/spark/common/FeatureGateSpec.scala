@@ -42,4 +42,18 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.adaptiveBroadcastThresholdBytes(conf, sessionStaticBytes = Some(50L)) shouldBe 50L
     }
   }
+
+  describe("FeatureGate.runtimeFilterConfOverrides") {
+    it("enables bloom + semi-join pushdown by default and lowers the scan-size threshold") {
+      val o = FeatureGate.runtimeFilterConfOverrides(new SparkConf(false))
+      o("spark.sql.optimizer.runtime.bloomFilter.enabled") shouldBe "true"
+      o("spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled") shouldBe "true"
+      o("spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold") shouldBe "1MB"
+    }
+
+    it("is empty when the gate is flipped off") {
+      val conf = new SparkConf(false).set(FeatureGate.RuntimeFilterEnabledKey, "false")
+      FeatureGate.runtimeFilterConfOverrides(conf) shouldBe empty
+    }
+  }
 }
