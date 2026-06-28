@@ -25,6 +25,27 @@ jobs:
       OPENIVM_TEST_FORKS: "24"
 
     steps:
+      - name: Reclaim workspace from root-owned Docker artifacts (self-hosted)
+        # dev.sh verify runs Docker containers (as root) that bind-mount the
+        # repo read-write and create target/ + global-logging files owned by
+        # root. On this persistent self-hosted runner a cancelled or failed
+        # prior run (concurrency: cancel-in-progress) leaves those root-owned
+        # files behind, and the next actions/checkout's `git clean -ffdx` /
+        # rmdir runs as the unprivileged runner user and dies with EACCES (e.g.
+        # spark-ext/target/global-logging). Reclaim ownership first so checkout
+        # can always reset the workspace. Best-effort; this step never fails.
+        shell: bash
+        run: |
+          set -uo pipefail
+          ws="${GITHUB_WORKSPACE:-$PWD}"
+          [ -d "$ws" ] || exit 0
+          if sudo -n true 2>/dev/null; then
+            sudo chown -R "$(id -u):$(id -g)" "$ws" || true
+          else
+            docker run --rm -v "$ws:/ws" alpine:3 \
+              chown -R "$(id -u):$(id -g)" /ws || true
+          fi
+
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
