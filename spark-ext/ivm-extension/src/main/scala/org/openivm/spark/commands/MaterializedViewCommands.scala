@@ -1571,23 +1571,33 @@ case class RefreshMaterializedViewCommand(
         if (meta.refreshType == RefreshTypeCode.AggregateHaving) dataTableId(name)
         else name
 
-      // Workload-aware insert-only fast path. When DeltaCommitClassifier proves
-      // every changed source's commits since its watermark are append-only, no
-      // existing source row changes, so (SIMPLE_PROJECTION is row-wise) no
-      // existing MV row changes either — openivm's view-delta is purely net-new
-      // rows. We can then INSERT the view-delta and SKIP the DELETE + recompute
-      // tail, which otherwise deletes+recomputes the entire LEFT-JOIN-key group
-      // (e.g. a whole `sk_company_id`) for a few appended fact rows — a near-FULL
-      // recompute. Conservative: a non-CDF batch, a classification failure, or
-      // any delete/update/overwrite keeps the general signed-delta program.
-      lazy val batchInsertOnly: Boolean =
-        meta.refreshType != RefreshTypeCode.FullRefresh && {
-          val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
-          cdfBatches.nonEmpty && cdfBatches.forall { b =>
-            try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.InsertOnly
-            catch { case _: Throwable => false }
-          }
+      // Workload-aware insert-only fast path. For a SIMPLE_PROJECTION on the
+      // recompute path (DELETE by openivm_left_key + recompute), when this batch
+      // changes NO existing MV row, openivm's view-delta is purely net-new rows,
+      // so the correct refresh is to INSERT the view-delta and SKIP the DELETE +
+      // recompute tail — which otherwise deletes+recomputes the entire
+      // LEFT-JOIN-key group (e.g. a whole `sk_company_id`) for a few appended
+      // fact rows, a near-FULL recompute.
+      //
+      // "Changes no existing MV row" is proven by THREE conditions, checked at
+      // the use site:
+      //   (1) the view-delta has no negative multiplicities (`!hasNegativesHere`)
+      //       — an INNER-side DELETE/UPDATE retracts rows ⇒ negatives;
+      //   (2) no changed source is on the NULL-producing side of an outer join
+      //       (`!batchTouchesOuterNullableSource`) — an insert there re-affects
+      //       existing rows (NULL→value) which openivm does NOT emit as a negative;
+      //   (3) no source was overwritten/replaced (`!batchHasReplace`) — a REPLACE
+      //       invalidates incremental semantics wholesale.
+      // The classifier is consulted ONLY for (3); a MERGE/append commit (e.g. a
+      // dimension MV refreshing) does not block the fast path, because the
+      // view-delta sign (1) is the authoritative signal for the FACT.
+      lazy val batchHasReplace: Boolean = {
+        val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+        cdfBatches.isEmpty || cdfBatches.exists { b =>
+          try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.Replace
+          catch { case _: Throwable => true }
         }
+      }
 
       // True when a changed source is on the NULL-producing (optional) side of an
       // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
@@ -1864,7 +1874,7 @@ case class RefreshMaterializedViewCommand(
           // general program. stmt[0] still runs, so cascade view-deltas are intact.
           val insertOnlyInsertSql: Option[String] =
             if (
-              !batchInsertOnly || batchTouchesOuterNullableSource || hasNegativesHere ||
+              batchHasReplace || batchTouchesOuterNullableSource || hasNegativesHere ||
               // Only the recompute path (openivm_left_key DELETE + recompute) needs
               // this. Value-equality SIMPLE_PROJECTION MVs already handle insert-only
               // optimally via their no-negative-rows DELETE-skip + EXPLODE INSERT, so
@@ -1968,7 +1978,7 @@ case class RefreshMaterializedViewCommand(
             RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='insert_only_simple_projection'")
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                "outcome='insert_only_simple_projection' reason='classifier_insert_only' " +
+                "outcome='insert_only_simple_projection' reason='additive_view_delta' " +
                 s"skipped_tail_stmts=${rewritten.statements.size - 1}"
             )
             withPlanTimeBroadcastDisabled {
