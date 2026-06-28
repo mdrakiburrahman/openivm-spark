@@ -26,17 +26,29 @@ jobs:
 
     steps:
       - name: Reclaim workspace from root-owned Docker artifacts (self-hosted)
-        # dev.sh verify runs Docker containers (as root) that bind-mount the
-        # repo read-write and create target/ + global-logging files owned by
-        # root. On this persistent self-hosted runner a cancelled or failed
-        # prior run (concurrency: cancel-in-progress) leaves those root-owned
-        # files behind, and the next actions/checkout's `git clean -ffdx` /
-        # rmdir runs as the unprivileged runner user and dies with EACCES (e.g.
-        # spark-ext/target/global-logging). Reclaim ownership first so checkout
-        # can always reset the workspace. Best-effort; this step never fails.
+        # dev.sh verify runs a root Docker container that bind-mounts the repo
+        # read-write and writes target/ + global-logging + test-warehouse files
+        # as root. On this persistent self-hosted runner those survive between
+        # jobs, and the next actions/checkout's `git clean -ffdx` / rmdir runs as
+        # the unprivileged runner user and dies with EACCES (e.g.
+        # spark-ext/ivm-it/target/streams).
+        #
+        # Crucially, when a prior run is cancelled mid-verify (concurrency:
+        # cancel-in-progress), GitHub SIGKILLs the `docker compose run` client
+        # but the daemon keeps the sbt container (and its forked test JVMs)
+        # ALIVE — an orphan that keeps writing fresh root-owned files. A plain
+        # chown then races it and loses. So: force-remove every running
+        # container FIRST (the runner executes one job at a time, so all are
+        # orphans — same idea as dev.sh PRE_CLEAN), THEN reclaim ownership, so
+        # checkout can always reset the tree. Best-effort; this step never fails.
         shell: bash
         run: |
           set -uo pipefail
+          running="$(docker ps -q 2>/dev/null || true)"
+          if [ -n "$running" ]; then
+            # shellcheck disable=SC2086
+            docker rm -f $running || true
+          fi
           ws="${GITHUB_WORKSPACE:-$PWD}"
           [ -d "$ws" ] || exit 0
           if sudo -n true 2>/dev/null; then
