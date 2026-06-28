@@ -1654,9 +1654,25 @@ case class RefreshMaterializedViewCommand(
               RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                 val t0 = System.nanoTime()
                 try {
-                  val r  = spark.sql(sql).collect()
+                  val df = spark.sql(sql)
+                  val r  = df.collect()
                   val ms = (System.nanoTime() - t0) / 1000000L
                   sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
+                  // Diagnostic-only physical-plan capture (FeatureGate default OFF).
+                  // After the timer + reusing the executed plan, so zero overhead
+                  // unless explicitly enabled for a diagnostic refresh.
+                  if (sqlLog.isActive && FeatureGate.explainCaptureEnabled(spark)) {
+                    try
+                      sqlLog.record(
+                        "explain_formatted",
+                        qOrder,
+                        attempt - 1,
+                        kind,
+                        df.queryExecution.explainString(org.apache.spark.sql.execution.FormattedMode),
+                        0L
+                      )
+                    catch { case _: Throwable => () }
+                  }
                   r
                 } catch {
                   case t: Throwable =>

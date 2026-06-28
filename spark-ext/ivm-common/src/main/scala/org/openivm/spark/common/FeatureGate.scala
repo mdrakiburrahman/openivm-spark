@@ -90,6 +90,14 @@ object FeatureGate {
     */
   val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
 
+  /** Capture a Spark `EXPLAIN FORMATTED` physical plan per executed refresh
+    * statement, recorded alongside the SQL in the query log. Default OFF so it
+    * never adds planning/formatting overhead to a benchmark run — enable it
+    * (together with the query log) only for a diagnostic refresh when you need
+    * to see broadcast-vs-sort-merge join choices and scan sizes.
+    */
+  val ExplainCaptureKey: String = "spark.openivm.explain.capture"
+
   /** Change-propagation mode for tracking what changed on base tables since
     * the last refresh.
     *
@@ -142,6 +150,9 @@ object FeatureGate {
 
   def queryLogEnabled(conf: SparkConf): Boolean =
     boolConf(conf, QueryLogEnabledKey, default = false)
+
+  def explainCaptureEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)
