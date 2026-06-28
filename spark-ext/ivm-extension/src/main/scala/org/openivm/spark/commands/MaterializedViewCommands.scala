@@ -1571,6 +1571,45 @@ case class RefreshMaterializedViewCommand(
         if (meta.refreshType == RefreshTypeCode.AggregateHaving) dataTableId(name)
         else name
 
+      // Workload-aware insert-only fast path. When DeltaCommitClassifier proves
+      // every changed source's commits since its watermark are append-only, no
+      // existing source row changes, so (SIMPLE_PROJECTION is row-wise) no
+      // existing MV row changes either — openivm's view-delta is purely net-new
+      // rows. We can then INSERT the view-delta and SKIP the DELETE + recompute
+      // tail, which otherwise deletes+recomputes the entire LEFT-JOIN-key group
+      // (e.g. a whole `sk_company_id`) for a few appended fact rows — a near-FULL
+      // recompute. Conservative: a non-CDF batch, a classification failure, or
+      // any delete/update/overwrite keeps the general signed-delta program.
+      lazy val batchInsertOnly: Boolean =
+        meta.refreshType != RefreshTypeCode.FullRefresh && {
+          val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+          cdfBatches.nonEmpty && cdfBatches.forall { b =>
+            try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.InsertOnly
+            catch { case _: Throwable => false }
+          }
+        }
+
+      // True when a changed source is on the NULL-producing (optional) side of an
+      // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
+      // (e.g. a previously NULL-extended left row gains a right match), which
+      // openivm handles via the DELETE + recompute and which a plain insert of
+      // the view-delta would get wrong. Conservative: any RIGHT/FULL join (whose
+      // nullable side is harder to pin down by name) disables the fast path.
+      lazy val batchTouchesOuterNullableSource: Boolean = {
+        val body = meta.querySql
+        if ("(?i)(RIGHT|FULL)\\s+(OUTER\\s+)?JOIN".r.findFirstIn(body).isDefined) true
+        else {
+          val nullable =
+            "(?i)LEFT\\s+(?:OUTER\\s+)?JOIN\\s+`?\"?([\\w.]+)`?\"?".r
+              .findAllMatchIn(body)
+              .map(_.group(1).split("\\.").last.toLowerCase)
+              .toSet
+          nullable.nonEmpty && changeBatches.exists { b =>
+            nullable.contains(b.baseTable.split("\\.").last.toLowerCase)
+          }
+        }
+      }
+
       val rewritten = profile.timeStep(
         "generate_refresh_sql.assembly",
         s"compiled_sql_bytes=${compiled.sql.length}"
@@ -1817,6 +1856,47 @@ case class RefreshMaterializedViewCommand(
             logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
           }
 
+          // Insert-only fast path SQL (see `batchInsertOnly`). Built only for a
+          // proven append-only batch: the view-delta (already materialised by
+          // stmt[0] / the fuse) is purely net-new rows, so the correct refresh is
+          // to INSERT them (multiplicity-expanded) and skip the DELETE +
+          // company-recompute. `None` (e.g. schema mismatch) falls back to the
+          // general program. stmt[0] still runs, so cascade view-deltas are intact.
+          val insertOnlyInsertSql: Option[String] =
+            if (
+              !batchInsertOnly || batchTouchesOuterNullableSource || hasNegativesHere ||
+              // Only the recompute path (openivm_left_key DELETE + recompute) needs
+              // this. Value-equality SIMPLE_PROJECTION MVs already handle insert-only
+              // optimally via their no-negative-rows DELETE-skip + EXPLODE INSERT, so
+              // leave them (and their telemetry) untouched.
+              rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
+            ) None
+            else
+              try {
+                val src = fusedView match {
+                  case Some(view) => s"`$view`"
+                  case None       => s"delta.`${viewDeltaPath.replace("`", "``")}`"
+                }
+                val deltaCols =
+                  (fusedView match {
+                    case Some(view) => spark.table(view)
+                    case None       => spark.read.format("delta").load(viewDeltaPath)
+                  }).columns.toSet
+                val mvCols = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
+                if (
+                  deltaCols.contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains)
+                ) {
+                  val colList = mvCols.map(c => s"`$c`").mkString(", ")
+                  Some(
+                    s"""|INSERT INTO ${sqlIdent(mergeTargetId)} ($colList)
+                        |SELECT $colList FROM $src
+                        |LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), CAST(`openivm_multiplicity` AS BIGINT)))
+                        |  _ivm_lv AS _ivm_i
+                        |WHERE `openivm_multiplicity` > 0""".stripMargin
+                  )
+                } else None
+              } catch { case _: Throwable => None }
+
           val usesValueEqualityDeleteMerge =
             rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
           // Wrap the negative-row + conflict probes in the same plan-time
@@ -1883,6 +1963,16 @@ case class RefreshMaterializedViewCommand(
             // broadcast disable scope.
             withPlanTimeBroadcastDisabled {
               fullRefresh.statements.foreach(executeSql)
+            }
+          } else if (insertOnlyInsertSql.isDefined) {
+            RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='insert_only_simple_projection'")
+            logInfo(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                "outcome='insert_only_simple_projection' reason='classifier_insert_only' " +
+                s"skipped_tail_stmts=${rewritten.statements.size - 1}"
+            )
+            withPlanTimeBroadcastDisabled {
+              executeSqlAt(insertOnlyInsertSql.get, 1)
             }
           } else {
             rewritten.statements.tail.zipWithIndex.foreach { case (stmt, idx) =>
