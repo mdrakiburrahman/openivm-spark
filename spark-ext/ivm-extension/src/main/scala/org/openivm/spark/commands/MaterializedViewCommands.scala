@@ -1162,15 +1162,34 @@ case class RefreshMaterializedViewCommand(
     // `.count()` on the fused path, `.collect()` on the on-disk path), not
     // just construction — Catalyst plans lazily inside the action.
     def withPlanTimeBroadcastDisabled[A](body: => A): A = {
-      val key  = "spark.sql.autoBroadcastJoinThreshold"
-      val prev = scala.util.Try(spark.conf.get(key)).toOption
+      val key          = "spark.sql.autoBroadcastJoinThreshold"
+      val adaptiveKey  = "spark.sql.adaptive.autoBroadcastJoinThreshold"
+      val prev         = spark.conf.getOption(key)
+      val prevAdaptive = spark.conf.getOption(adaptiveKey)
       spark.conf.set(key, "-1")
+      // Plan-time broadcast is off (above), but let AQE convert the small-side
+      // SCD2 dimension sort-merge joins to broadcast-hash joins at RUNTIME,
+      // keyed on the ACTUAL materialised shuffle size. This is safe against the
+      // 8 GiB explosion (AQE measures the exploding intermediate as large and
+      // keeps the sort-merge join) and is result-invariant — it only changes
+      // the join strategy. Gated by `spark.openivm.refresh.adaptiveBroadcast.*`.
+      // See `FeatureGate.AdaptiveBroadcastEnabledKey` for the full rationale.
+      if (FeatureGate.adaptiveBroadcastEnabled(spark)) {
+        val sessionStatic = prev.flatMap(v => scala.util.Try(v.toLong).toOption)
+        val budget        = FeatureGate.adaptiveBroadcastThresholdBytes(spark.sparkContext.getConf, sessionStatic)
+        spark.conf.set(adaptiveKey, budget.toString)
+      }
       try body
-      finally
+      finally {
         prev match {
           case Some(v) => spark.conf.set(key, v)
           case None    => spark.conf.unset(key)
         }
+        prevAdaptive match {
+          case Some(v) => spark.conf.set(adaptiveKey, v)
+          case None    => spark.conf.unset(adaptiveKey)
+        }
+      }
     }
 
     val refreshT0  = System.nanoTime()

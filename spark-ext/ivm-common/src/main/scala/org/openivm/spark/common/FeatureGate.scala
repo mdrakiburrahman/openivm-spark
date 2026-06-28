@@ -118,6 +118,45 @@ object FeatureGate {
     */
   val ChangeFeedModeKey: String = "spark.openivm.changeFeed.mode"
 
+  /** Let Adaptive Query Execution broadcast the small side of the SCD2
+    * view-delta joins at RUNTIME, even while plan-time broadcast stays disabled.
+    *
+    * The refresh statements that wrap the full MV body — the view-delta CTAS
+    * (refresh stmt[0]) and the recompute INSERT MERGEs — disable PLAN-TIME
+    * broadcast (`spark.sql.autoBroadcastJoinThreshold=-1`) because Catalyst
+    * under-estimates the SCD2 multiplicity: it would auto-broadcast a relation
+    * it thinks is tiny but that explodes past Spark's hard 8 GiB build cap at
+    * execution. That blanket disable, however, is inherited by AQE's adaptive
+    * threshold, so every equi+range SCD2 dimension join falls back to a
+    * sort-merge join that needlessly shuffles the full dimension against the
+    * (always-small) incremental delta — the dominant cost of the heavy
+    * `gold.fact_*` MVs.
+    *
+    * When this gate is ON (default) the disable scope instead raises
+    * `spark.sql.adaptive.autoBroadcastJoinThreshold` to a runtime-safe budget
+    * (see [[AdaptiveBroadcastThresholdKey]]). AQE then converts the small-side
+    * sort-merge joins to broadcast-hash joins using the **actual** materialized
+    * shuffle size — which can never broadcast the genuinely-large exploding
+    * intermediate (it measures it large and keeps the sort-merge join). The
+    * join result is identical, so this is a pure execution speed-up guarded by
+    * the parity suite. Flip OFF via
+    * `spark.openivm.refresh.adaptiveBroadcast.enabled=false` to fall back to the
+    * fully-disabled, sort-merge-only behaviour. Requires AQE
+    * (`spark.sql.adaptive.enabled=true`, the Spark 3.5 default).
+    */
+  val AdaptiveBroadcastEnabledKey: String = "spark.openivm.refresh.adaptiveBroadcast.enabled"
+
+  /** Explicit byte budget for the AQE runtime broadcast described at
+    * [[AdaptiveBroadcastEnabledKey]]. `-1` (default) means "inherit the
+    * session's configured `spark.sql.autoBroadcastJoinThreshold` when positive,
+    * else fall back to 100 MiB" — keeping the operator's stated broadcast
+    * appetite but routing it through the runtime-safe AQE path.
+    */
+  val AdaptiveBroadcastThresholdKey: String = "spark.openivm.refresh.adaptiveBroadcast.thresholdBytes"
+
+  /** Fallback AQE broadcast budget (100 MiB) — 80x under Spark's 8 GiB cap. */
+  val AdaptiveBroadcastDefaultBytes: Long = 104857600L
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -153,6 +192,23 @@ object FeatureGate {
 
   def explainCaptureEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)
+
+  def adaptiveBroadcastEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, AdaptiveBroadcastEnabledKey, default = true)
+
+  def adaptiveBroadcastEnabled(spark: SparkSession): Boolean =
+    adaptiveBroadcastEnabled(spark.sparkContext.getConf)
+
+  /** Resolve the AQE runtime-broadcast byte budget. An explicit
+    * [[AdaptiveBroadcastThresholdKey]] > 0 wins; otherwise inherit the supplied
+    * session static broadcast threshold when positive; otherwise fall back to
+    * [[AdaptiveBroadcastDefaultBytes]].
+    */
+  def adaptiveBroadcastThresholdBytes(conf: SparkConf, sessionStaticBytes: Option[Long]): Long = {
+    val explicit = scala.util.Try(conf.getLong(AdaptiveBroadcastThresholdKey, -1L)).getOrElse(-1L)
+    if (explicit > 0) explicit
+    else sessionStaticBytes.filter(_ > 0).getOrElse(AdaptiveBroadcastDefaultBytes)
+  }
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)
