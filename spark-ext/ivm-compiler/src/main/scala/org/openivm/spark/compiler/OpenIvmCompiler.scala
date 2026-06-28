@@ -29,8 +29,42 @@ final case class CompileRequest(
     viewName: String,
     viewSql: String,
     sources: Map[String, StructType],
-    sourceQualifiedNames: Map[String, String] = Map.empty
+    sourceQualifiedNames: Map[String, String] = Map.empty,
+    facts: WorkloadFacts = WorkloadFacts()
 )
+
+/** The `WorkloadFacts` payload threaded into `openivm_compile_with_facts(view,
+  * facts_json)`. A v2 superset of the original three-field CompileFacts; openivm
+  * ignores unknown keys, so every field is optional and forward-compatible
+  * (`openivm/src/include/compile_facts.hpp`).
+  *
+  *   - `compileOnly`           — DuckDB only parses/binds the MV body; preserves
+  *     inclusion-exclusion terms for empty compile-time deltas and skips
+  *     aux-state mutation.
+  *   - `forceViewDeltaCascade` — always emit `openivm_delta_<view>` cascade rows
+  *     so depth-2 MV-over-MV chains never fall back to FULL_REFRESH.
+  *   - `assumeInsertOnly`      — set true ONLY when a Delta-commit classifier has
+  *     PROVEN this batch is append-only; re-enables the insert-only fast paths
+  *     (skip aggregate/projection delete, MIN/MAX GREATEST/LEAST) that
+  *     `compileOnly` otherwise disables. Defaults false — identical to v1.
+  */
+final case class WorkloadFacts(
+    targetDialect: String = "spark",
+    compileOnly: Boolean = true,
+    forceViewDeltaCascade: Boolean = true,
+    assumeInsertOnly: Boolean = false,
+    schemaVersion: Int = 2
+) {
+
+  /** Canonical, whitespace-free JSON matching openivm's hand-rolled substring
+    * parser (`ParseFactsJson` in `compile_facts.cpp`). */
+  def toJson: String = {
+    def b(x: Boolean): String = if (x) "true" else "false"
+    s"""{"schema_version":$schemaVersion,"target_dialect":"$targetDialect",""" +
+      s""""compile_only":${b(compileOnly)},"force_view_delta_cascade":${b(forceViewDeltaCascade)},""" +
+      s""""assume_insert_only":${b(assumeInsertOnly)}}"""
+  }
+}
 
 /** Wraps DuckDB CLI errors surfaced by the OpenIVM compiler bridge.
   * The DuckDB error text is preserved verbatim in `getMessage`.
@@ -154,9 +188,14 @@ class OpenIvmCompiler private (
     // compile-time delta tables and picks the insert-only MERGE fast path
     // (refresh_delta_fast_paths.cpp:80-126), which silently produces wrong
     // values once a delete or update of the current min/max arrives at refresh
-    // time. The fast path can be re-enabled later by analysing the staged delta
-    // contents before invoking the compiler.
-    sb ++= "SET openivm_minmax_incremental=false;\n"
+    // time. EXCEPTION: when the caller's WorkloadFacts proves the batch is
+    // append-only (`assumeInsertOnly`), the MIN/MAX fast path is safe and the
+    // facts re-enable it — so we must NOT force it off here, or the bridge SET
+    // would override the proven-safe fast path (read after compile in
+    // refresh_delta_fast_paths.cpp).
+    if (!req.facts.assumeInsertOnly) {
+      sb ++= "SET openivm_minmax_incremental=false;\n"
+    }
     sb ++= s"SET openivm_files_path='${escapeSql(tmpDir.toAbsolutePath.toString)}';\n"
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
@@ -189,7 +228,7 @@ class OpenIvmCompiler private (
     //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
     //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
     //                                   MV-over-MV chains never fall back to FULL_REFRESH.
-    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(OpenIvmCompiler.SparkCompileFactsJson)}');\n"
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(req.facts.toJson)}');\n"
     sb.toString
   }
 
@@ -424,27 +463,6 @@ class OpenIvmCompiler private (
 }
 
 object OpenIvmCompiler {
-
-  /** JSON payload threaded into `openivm_compile_with_facts(view, facts)` for
-    * every spark-ext compile call. See
-    * `openivm/src/include/compile_facts.hpp` for the full CompileFacts
-    * surface.
-    *
-    *   - `target_dialect="spark"`        — emit Spark/Delta SQL.
-    *   - `compile_only=true`             — preserve inclusion-exclusion terms
-    *     when delta tables are empty and skip aux-state mutation (so the
-    *     ephemeral DuckDB :memory: process never runs `CREATE OR REPLACE
-    *     TABLE openivm_*_aux_<view>`).
-    *   - `force_view_delta_cascade=true` — always emit signed `openivm_delta_<view>`
-    *     companion rows for AGGREGATE_GROUP / AGGREGATE_HAVING /
-    *     WINDOW_PARTITION / GROUP_RECOMPUTE so downstream MVs at depth 2 see
-    *     a real cascade delta and never fall back to FULL_REFRESH.
-    *
-    * Embedded into SQL via [[buildScript]] inside single quotes; only
-    * single-quote escape is required and is handled by `escapeSql`.
-    */
-  private[compiler] val SparkCompileFactsJson: String =
-    """{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}"""
 
   /** Isolation strategy for the underlying DuckDB runtime. */
   sealed trait Isolation
