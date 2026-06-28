@@ -123,7 +123,9 @@ object Settings {
       // parent-JVM -D's into forks). Falls back to /tmp/openivm-test-logs
       // when sbt was launched without dev.sh.
       s"-Dopenivm.test.log.dir=${sys.props.getOrElse("openivm.test.log.dir", "/tmp/openivm-test-logs")}"
-    )
+    ) ++ Seq("openivm.golden.print").flatMap { key =>
+      sys.props.get(key).map(value => s"-D$key=$value")
+    }
   )
 
   val assemblySettings: Seq[Def.Setting[_]] = Seq(
