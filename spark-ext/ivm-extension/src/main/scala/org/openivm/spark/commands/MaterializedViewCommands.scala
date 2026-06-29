@@ -1518,7 +1518,7 @@ case class RefreshMaterializedViewCommand(
                 viewSql = meta.querySql,
                 sources = compileSchemas,
                 sourceQualifiedNames = shortToQual,
-facts = statsFacts.copy(
+                facts = statsFacts.copy(
                   deltaShape = sourceDeltaShape,
                   fkRelations = constraintFacts.fkRelations,
                   uniqueKeys = constraintFacts.uniqueKeys
@@ -1675,6 +1675,36 @@ facts = statsFacts.copy(
         }
       }
 
+      lazy val selectiveBroadcastTables: Seq[SparkRefreshRewriter.SelectiveBroadcastTable] =
+        if (!FeatureGate.selectiveBroadcastEnabled(spark)) Seq.empty
+        else {
+          val key = "spark.sql.autoBroadcastJoinThreshold"
+          val thresholdBytes = FeatureGate.adaptiveBroadcastThresholdBytes(
+            spark.sparkContext.getConf,
+            spark.conf.getOption(key).flatMap(v => scala.util.Try(v.toLong).toOption)
+          )
+          val stats = SparkDeltaStatsService.forRefresh()
+          freshSchemas.keys.toSeq.flatMap { qualifiedName =>
+            scala.util.Try(stats.statsFor(spark, qualifiedName)).toOption.flatMap { sourceStats =>
+              val sizeBytes = sourceStats.tableStats.sizeBytes
+              if (sizeBytes <= thresholdBytes)
+                Some(
+                  SparkRefreshRewriter.SelectiveBroadcastTable(
+                    shortName = qualifiedName.split("\\.").last,
+                    qualifiedName = qualifiedName,
+                    sizeBytes = sizeBytes
+                  )
+                )
+              else None
+            }
+          }
+        }
+
+      def refreshPostProcess(sql: String): String = {
+        val translated = LptsSparkDialect.translate(sql)
+        SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
+      }
+
       val rewritten = profile.timeStep(
         "generate_refresh_sql.assembly",
         s"compiled_sql_bytes=${compiled.sql.length}"
@@ -1687,7 +1717,7 @@ facts = statsFacts.copy(
             viewLogicalName = name.table,
             sourceTempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap,
             viewDeltaPath = viewDeltaPath,
-            postProcess = LptsSparkDialect.translate,
+            postProcess = refreshPostProcess,
             // Pass the user-facing column list for each source so the rewriter can
             // expand DuckDB-style `SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)`
             // into an explicit column list (Spark 3.5 does not support that syntax).

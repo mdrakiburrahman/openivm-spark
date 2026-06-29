@@ -56,4 +56,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.runtimeFilterConfOverrides(conf) shouldBe empty
     }
   }
+
+  describe("FeatureGate.selectiveBroadcastEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.selectiveBroadcastEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.selectiveBroadcastEnabled(
+        new SparkConf(false).set(FeatureGate.SelectiveBroadcastEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }

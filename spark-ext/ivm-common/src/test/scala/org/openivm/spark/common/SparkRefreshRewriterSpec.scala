@@ -686,6 +686,32 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("selective broadcast hint injection") {
+    it("adds a BROADCAST hint only for proven-small join-side aliases") {
+      val sql =
+        """SELECT f.id, d.name
+          |FROM `db`.`fact_sales` AS f
+          |JOIN `db`.`dim_customer` d ON f.customer_id = d.id
+          |JOIN `db`.`dim_large` l ON f.large_id = l.id""".stripMargin
+      val hinted = SparkRefreshRewriter.injectSelectiveBroadcastHints(
+        sql,
+        Seq(SparkRefreshRewriter.SelectiveBroadcastTable("dim_customer", "db.dim_customer", 1024L))
+      )
+
+      hinted should include("SELECT /*+ BROADCAST(d) */ f.id")
+      hinted should not include "BROADCAST(l)"
+    }
+
+    it("leaves non-join statements unchanged even when a table is small") {
+      val sql = "SELECT id FROM `db`.`dim_customer`"
+
+      SparkRefreshRewriter.injectSelectiveBroadcastHints(
+        sql,
+        Seq(SparkRefreshRewriter.SelectiveBroadcastTable("dim_customer", "db.dim_customer", 1024L))
+      ) shouldBe sql
+    }
+  }
+
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {

@@ -157,6 +157,13 @@ object FeatureGate {
   /** Fallback AQE broadcast budget (100 MiB) — 80x under Spark's 8 GiB cap. */
   val AdaptiveBroadcastDefaultBytes: Long = 104857600L
 
+  /** Add explicit Spark SQL `BROADCAST` hints for refresh join sides whose
+    * backing Delta table size is known to be small. Default OFF: the refresh
+    * executor still disables plan-time auto-broadcast as the safe baseline, and
+    * this gate only opts proven-small relations back into broadcast by hint.
+    */
+  val SelectiveBroadcastEnabledKey: String = "spark.openivm.refresh.selectiveBroadcast.enabled"
+
   /** Enable runtime-filter (bloom / semi-join) pushdown for the SCD2 view-delta
     * joins. Every IVM view-delta is a union of delta-rule terms, and the
     * `FULL_SOURCE ⋈ Δdimension` term scans the entire source table against the
@@ -212,6 +219,12 @@ object FeatureGate {
 
   def adaptiveBroadcastEnabled(spark: SparkSession): Boolean =
     adaptiveBroadcastEnabled(spark.sparkContext.getConf)
+
+  def selectiveBroadcastEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SelectiveBroadcastEnabledKey, default = false)
+
+  def selectiveBroadcastEnabled(spark: SparkSession): Boolean =
+    selectiveBroadcastEnabled(spark.sparkContext.getConf)
 
   /** Resolve the AQE runtime-broadcast byte budget. An explicit
     * [[AdaptiveBroadcastThresholdKey]] > 0 wins; otherwise inherit the supplied

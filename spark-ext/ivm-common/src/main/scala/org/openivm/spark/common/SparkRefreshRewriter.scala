@@ -46,6 +46,8 @@ final case class RewrittenRefresh(statements: Seq[String])
   */
 object SparkRefreshRewriter {
 
+  final case class SelectiveBroadcastTable(shortName: String, qualifiedName: String, sizeBytes: Long)
+
   /** Per-rewrite map of short source-table name → fully-qualified Spark name.
     *
     * Populated at the top of [[rewrite]] from the caller's
@@ -75,6 +77,33 @@ object SparkRefreshRewriter {
 
   private[spark] def stripExecutionMarker(sql: String): String =
     sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
+
+  private[spark] def injectSelectiveBroadcastHints(
+      sql: String,
+      tables: Seq[SelectiveBroadcastTable]
+  ): String = {
+    if (tables.isEmpty || !"(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined) sql
+    else {
+      val names = tables.flatMap(t => Seq(t.shortName, t.qualifiedName)).map(normalizeSqlIdentifier).toSet
+      val edits = selectKeywordOffsets(sql).flatMap { selectIdx =>
+        val blockEnd = selectBlockEnd(sql, selectIdx)
+        val block    = sql.substring(selectIdx, blockEnd)
+        val aliases  = broadcastAliasesInBlock(block, names)
+        if (aliases.isEmpty) None
+        else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${aliases.mkString(", ")}) */")
+      }
+      if (edits.isEmpty) sql
+      else {
+        val out  = new StringBuilder(sql)
+        var bias = 0
+        edits.foreach { case (idx, hint) =>
+          out.insert(idx + bias, hint)
+          bias += hint.length
+        }
+        out.toString()
+      }
+    }
+  }
 
   /** Detect the openivm-emitted **recompute INSERT MERGE** shape:
     *
@@ -2697,5 +2726,144 @@ object SparkRefreshRewriter {
     var i = from
     while (i < text.length && Character.isWhitespace(text.charAt(i))) i += 1
     i
+  }
+
+  private def normalizeSqlIdentifier(value: String): String =
+    value
+      .split("\\.")
+      .map(_.trim.stripPrefix("`").stripSuffix("`"))
+      .filter(_.nonEmpty)
+      .mkString(".")
+      .toLowerCase
+
+  private def broadcastAliasesInBlock(block: String, broadcastNames: Set[String]): Seq[String] = {
+    val keywords = Set(
+      "ON",
+      "WHERE",
+      "JOIN",
+      "LEFT",
+      "RIGHT",
+      "FULL",
+      "INNER",
+      "OUTER",
+      "CROSS",
+      "GROUP",
+      "ORDER",
+      "HAVING",
+      "LIMIT",
+      "UNION",
+      "WHEN",
+      "USING"
+    )
+    val aliases = scala.collection.mutable.ArrayBuffer[String]()
+    scanSql(block) { (idx, _, depth) =>
+      if (depth == 0 && (isKeywordAt(block, idx, "FROM") || isKeywordAt(block, idx, "JOIN"))) {
+        val keywordEnd = idx + (if (isKeywordAt(block, idx, "FROM")) "FROM".length else "JOIN".length)
+        val refStart   = skipWhitespace(block, keywordEnd)
+        if (refStart < block.length && block.charAt(refStart) != '(') {
+          val refEnd   = scanSqlTableRef(block, refStart)
+          val relation = normalizeSqlIdentifier(block.substring(refStart, refEnd).replaceAll("\\s+", ""))
+          val short    = relation.split("\\.").lastOption.getOrElse(relation)
+          var aliasAt  = skipWhitespace(block, refEnd)
+          if (isKeywordAt(block, aliasAt, "AS")) aliasAt = skipWhitespace(block, aliasAt + "AS".length)
+          val aliasEnd = scanBareToken(block, aliasAt)
+          val alias =
+            if (aliasEnd > aliasAt) block.substring(aliasAt, aliasEnd)
+            else short
+          if (
+            (broadcastNames.contains(relation) || broadcastNames.contains(short)) &&
+            !keywords.contains(alias.toUpperCase)
+          ) aliases += alias
+        }
+      }
+    }
+    aliases.toVector.distinct.sortBy(_.toLowerCase)
+  }
+
+  private def scanBareToken(text: String, start: Int): Int = {
+    var i = start
+    while (i < text.length && (Character.isLetterOrDigit(text.charAt(i)) || text.charAt(i) == '_')) i += 1
+    i
+  }
+
+  private def isKeywordAt(sql: String, idx: Int, keyword: String): Boolean =
+    idx >= 0 &&
+      idx + keyword.length <= sql.length &&
+      sql.regionMatches(true, idx, keyword, 0, keyword.length) &&
+      isWordBoundary(sql, idx - 1) &&
+      isWordBoundary(sql, idx + keyword.length)
+
+  private def selectKeywordOffsets(sql: String): Seq[Int] = {
+    val offsets = scala.collection.mutable.ArrayBuffer[Int]()
+    scanSql(sql) { (idx, c, _) =>
+      if (
+        (c == 'S' || c == 's') &&
+        sql.regionMatches(true, idx, "SELECT", 0, "SELECT".length) &&
+        isWordBoundary(sql, idx - 1) &&
+        isWordBoundary(sql, idx + "SELECT".length)
+      ) offsets += idx
+    }
+    offsets.toSeq
+  }
+
+  private def selectBlockEnd(sql: String, selectIdx: Int): Int = {
+    val depths     = depthBeforeOffsets(sql, Set(selectIdx))
+    val startDepth = depths.getOrElse(selectIdx, 0)
+    var end        = sql.length
+    scanSql(sql, selectIdx + "SELECT".length) { (idx, c, depthBefore) =>
+      if (end == sql.length && c == ')' && depthBefore <= startDepth) end = idx
+    }
+    end
+  }
+
+  private def depthBeforeOffsets(sql: String, offsets: Set[Int]): Map[Int, Int] = {
+    val found = scala.collection.mutable.Map[Int, Int]()
+    scanSql(sql) { (idx, _, depthBefore) =>
+      if (offsets.contains(idx)) found += idx -> depthBefore
+    }
+    found.toMap
+  }
+
+  private def isWordBoundary(sql: String, idx: Int): Boolean =
+    idx < 0 || idx >= sql.length || !Character.isLetterOrDigit(sql.charAt(idx)) && sql.charAt(idx) != '_'
+
+  private def scanSql(sql: String, start: Int = 0)(f: (Int, Char, Int) => Unit): Unit = {
+    var depth = 0
+    var i     = 0
+    while (i < sql.length) {
+      val c = sql.charAt(i)
+      if (i >= start) f(i, c, depth)
+      c match {
+        case '\'' =>
+          i += 1
+          var done = false
+          while (i < sql.length && !done) {
+            if (sql.charAt(i) == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 2
+            else if (sql.charAt(i) == '\'') {
+              done = true
+              i += 1
+            } else i += 1
+          }
+        case '`' =>
+          i += 1
+          while (i < sql.length && sql.charAt(i) != '`') i += 1
+          if (i < sql.length) i += 1
+        case '-' if i + 1 < sql.length && sql.charAt(i + 1) == '-' =>
+          i += 2
+          while (i < sql.length && sql.charAt(i) != '\n') i += 1
+        case '/' if i + 1 < sql.length && sql.charAt(i + 1) == '*' =>
+          i += 2
+          while (i + 1 < sql.length && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) i += 1
+          if (i + 1 < sql.length) i += 2
+        case '(' =>
+          depth += 1
+          i += 1
+        case ')' =>
+          depth = math.max(0, depth - 1)
+          i += 1
+        case _ =>
+          i += 1
+      }
+    }
   }
 }
