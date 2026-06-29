@@ -120,6 +120,12 @@ class SparkDeltaStatsServiceSpec extends AnyFunSpec with BeforeAndAfterAll with 
       initial.files.map(_.numRecords).sum shouldBe 4L
       initial.files.flatMap(_.partitionValues.get("region")).toSet shouldBe Set("east", "west")
       service.statsFor(spark, tableName) should be theSameInstanceAs initial
+      val workloadFacts = service.workloadFactsFor(spark, Seq(tableName))
+      workloadFacts.tableStats(tableName).rowCount should contain(4L)
+      workloadFacts.tableStats(tableName).partitionColumns shouldBe Seq("region")
+      workloadFacts.columnStats(s"$tableName.id").ndv should contain(4L)
+      workloadFacts.columnStats(s"$tableName.id").rowCount should contain(4L)
+      workloadFacts.columnStats(s"$tableName.amount").min should contain("10.0")
 
       spark.sql(s"DELETE FROM $tableName WHERE id = 2L")
 

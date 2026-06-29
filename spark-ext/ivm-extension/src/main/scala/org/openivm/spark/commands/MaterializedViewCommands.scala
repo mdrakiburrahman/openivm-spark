@@ -23,7 +23,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
-import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler, WorkloadFacts}
+import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
@@ -555,7 +555,8 @@ case class CreateMaterializedViewCommand(
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
     val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
-    val workloadFacts = WorkloadFacts(
+    val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
+    val workloadFacts = statsFacts.copy(
       fkRelations = constraintFacts.fkRelations,
       uniqueKeys = constraintFacts.uniqueKeys
     )
@@ -1508,13 +1509,16 @@ case class RefreshMaterializedViewCommand(
           case None =>
             val compiler        = OpenIvmCompilers.forSession(spark)
             val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+            val statsFacts = SparkDeltaStatsService
+              .forRefresh()
+              .workloadFactsFor(spark, meta.sourceTables, changeBatches)
             val fresh = compiler.compile(
               CompileRequest(
                 viewName = name.table,
                 viewSql = meta.querySql,
                 sources = compileSchemas,
                 sourceQualifiedNames = shortToQual,
-                facts = WorkloadFacts(
+facts = statsFacts.copy(
                   deltaShape = sourceDeltaShape,
                   fkRelations = constraintFacts.fkRelations,
                   uniqueKeys = constraintFacts.uniqueKeys

@@ -64,6 +64,25 @@ final class SparkDeltaStatsService {
       )
     }
 
+  def workloadFactsFor(spark: SparkSession, sourceTables: Seq[String]): WorkloadFacts =
+    WorkloadFacts.fromSourceStats(
+      sourceTables.distinct.flatMap(table => scala.util.Try(statsFor(spark, table)).toOption)
+    )
+
+  def workloadFactsFor(
+      spark: SparkSession,
+      sourceTables: Seq[String],
+      changeBatches: Seq[ChangeBatch]
+  ): WorkloadFacts =
+    workloadFactsFor(spark, sourceTables).copy(deltaStats = deltaStatsFor(spark, changeBatches))
+
+  def deltaStatsFor(spark: SparkSession, changeBatches: Seq[ChangeBatch]): Map[String, WorkloadDeltaStats] =
+    changeBatches
+      .groupBy(_.baseTable)
+      .flatMap { case (table, batches) =>
+        deltaStatsForTable(spark, table, batches).map(table -> _)
+      }
+
   def clear(): Unit =
     cache.synchronized {
       cache.clear()
@@ -83,6 +102,45 @@ object SparkDeltaStatsService {
   )
 
   def forRefresh(): SparkDeltaStatsService = new SparkDeltaStatsService
+
+  private def deltaStatsForTable(
+      spark: SparkSession,
+      table: String,
+      batches: Seq[ChangeBatch]
+  ): Option[WorkloadDeltaStats] = {
+    val stagedStats = batches
+      .collect { case StagingChangeBatch(_, deltas, _) =>
+        deltas
+      }
+      .flatten
+      .flatMap(delta => scala.util.Try(readStats(spark, delta.stagingPath)).toOption)
+
+    if (stagedStats.nonEmpty) {
+      val files = stagedStats.flatMap(_.files)
+      Some(
+        WorkloadFacts
+          .deltaStatsFromFiles(files)
+          .copy(sizeBytes = Some(stagedStats.map(_.tableStats.sizeBytes).sum))
+      )
+    } else {
+      val cdfAddFiles = batches.collect { case b: CdfChangeBatch =>
+        scala.util.Try(cdfAddedFiles(spark, b)).getOrElse(Seq.empty)
+      }.flatten
+      if (cdfAddFiles.nonEmpty) Some(WorkloadFacts.deltaStatsFromFiles(cdfAddFiles.map(fileStat)))
+      else None
+    }
+  }
+
+  private def cdfAddedFiles(spark: SparkSession, batch: CdfChangeBatch): Seq[AddFile] = {
+    val log = resolveDeltaTable(spark, batch.baseTable).log
+    log
+      .getChanges(batch.startVersionExclusive + 1L, failOnDataLoss = false)
+      .filter(_._1 <= batch.endVersionInclusive)
+      .flatMap { case (_, actions) =>
+        actions.collect { case add: AddFile if add.dataChange => add }
+      }
+      .toVector
+  }
 
   private def readStats(spark: SparkSession, tableNameOrPath: String): SourceStats = {
     val resolved = resolveDeltaTable(spark, tableNameOrPath)

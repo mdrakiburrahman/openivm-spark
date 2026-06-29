@@ -6,7 +6,7 @@ import java.util.Comparator
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, UniqueKey}
+import org.openivm.spark.common.WorkloadFacts
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -33,77 +33,6 @@ final case class CompileRequest(
     sourceQualifiedNames: Map[String, String] = Map.empty,
     facts: WorkloadFacts = WorkloadFacts()
 )
-
-/** The `WorkloadFacts` payload threaded into `openivm_compile_with_facts(view,
-  * facts_json)`. A v2 superset of the original three-field CompileFacts; openivm
-  * ignores unknown keys, so every field is optional and forward-compatible
-  * (`openivm/src/include/compile_facts.hpp`).
-  *
-  *   - `compileOnly`           — DuckDB only parses/binds the MV body; preserves
-  *     inclusion-exclusion terms for empty compile-time deltas and skips
-  *     aux-state mutation.
-  *   - `forceViewDeltaCascade` — always emit `openivm_delta_<view>` cascade rows
-  *     so depth-2 MV-over-MV chains never fall back to FULL_REFRESH.
-  *   - `assumeInsertOnly`      — set true ONLY when a Delta-commit classifier has
-  *     PROVEN this batch is append-only; re-enables the insert-only fast paths
-  *     (skip aggregate/projection delete, MIN/MAX GREATEST/LEAST) that
-  *     `compileOnly` otherwise disables. Defaults false — identical to v1.
-  *   - `deltaShape`           — per-source Delta batch shape as proven by the
-  *     Delta commit classifier. Empty by default; openivm treats missing facts
-  *     as the conservative general path.
-  *   - `fkRelations` / `uniqueKeys` — trusted declaration-registry facts.
-  *     Defaults empty, so existing compile behaviour is unchanged until openivm
-  *     consumes them.
-  */
-final case class WorkloadFacts(
-    targetDialect: String = "spark",
-    compileOnly: Boolean = true,
-    forceViewDeltaCascade: Boolean = true,
-    assumeInsertOnly: Boolean = false,
-    deltaShape: Map[String, DeltaShape] = Map.empty,
-    fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
-    uniqueKeys: Seq[UniqueKey] = Seq.empty,
-    schemaVersion: Int = 2
-) {
-
-  /** Canonical, whitespace-free JSON matching openivm's hand-rolled substring
-    * parser (`ParseFactsJson` in `compile_facts.cpp`). */
-  def toJson: String = {
-    def b(x: Boolean): String      = if (x) "true" else "false"
-    def q(x: String): String       = "\"" + escapeJson(x) + "\""
-    def a(xs: Seq[String]): String = xs.map(q).mkString("[", ",", "]")
-    val fks = fkRelations
-      .map { fk =>
-        s"""{"child_table":${q(fk.childTable)},"child_columns":${a(fk.childColumns)},""" +
-          s""""parent_table":${q(fk.parentTable)},"parent_columns":${a(fk.parentColumns)},"rely":${b(fk.rely)}}"""
-      }
-      .mkString("[", ",", "]")
-    val uniques = uniqueKeys
-      .map(key => s"""{"table":${q(key.table)},"columns":${a(key.columns)},"rely":${b(key.rely)}}""")
-      .mkString("[", ",", "]")
-    val shapes = deltaShape.toSeq
-      .sortBy(_._1)
-      .map { case (table, shape) => s"${q(table)}:${q(shape.compileFactValue)}" }
-      .mkString("{", ",", "}")
-    val insertOnly = b(assumeInsertOnly)
-    s"""{"schema_version":$schemaVersion,"target_dialect":"$targetDialect",""" +
-      s""""compile_only":${b(compileOnly)},"force_view_delta_cascade":${b(forceViewDeltaCascade)},""" +
-      s""""assume_insert_only":$insertOnly,"delta_shape":$shapes,"fk_relations":$fks,"unique_keys":$uniques}"""
-  }
-
-  private def escapeJson(raw: String): String =
-    raw.flatMap {
-      case '"'              => "\\\""
-      case '\\'             => "\\\\"
-      case '\b'             => "\\b"
-      case '\f'             => "\\f"
-      case '\n'             => "\\n"
-      case '\r'             => "\\r"
-      case '\t'             => "\\t"
-      case c if c.isControl => f"\\u${c.toInt}%04x"
-      case c                => c.toString
-    }
-}
 
 /** Wraps DuckDB CLI errors surfaced by the OpenIVM compiler bridge.
   * The DuckDB error text is preserved verbatim in `getMessage`.
