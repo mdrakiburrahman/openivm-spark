@@ -650,7 +650,9 @@ object SparkRefreshRewriter {
   private[common] def pruneUnchangedDeltaUnionTerms(sql: String, deltaShape: Map[String, DeltaShape]): String = {
     val unchanged = deltaShape.collect { case (table, DeltaShape.Unchanged) => shortTableName(table).toLowerCase }.toSet
     val changed   = deltaShape.collect { case (table, shape) if shape != DeltaShape.Unchanged => shortTableName(table) }
-    if (unchanged.isEmpty || changed.isEmpty) sql
+    val enabled =
+      sys.props.get("openivm.refresh.emptyDeltaSkip").orElse(sys.env.get("OPENIVM_EMPTY_DELTA_SKIP")).contains("true")
+    if (!enabled || unchanged.isEmpty || changed.isEmpty) sql
     else pruneUnionTermsInSql(sql, unchanged)
   }
 
