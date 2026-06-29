@@ -204,6 +204,16 @@ object FeatureGate {
     */
   val Scd2RangeAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeAccel.enabled"
 
+  /** Enable bounded recompute for top-K ROW_NUMBER/RANK WINDOW_PARTITION MVs.
+    *
+    * Default OFF: when opted in, eligible top-K ranking refreshes replace the
+    * openivm whole-partition recompute INSERT with a Spark-side equivalent that
+    * ranks only the affected partition's bounded candidate set. This is a
+    * result-invariant execution rewrite; ineligible shapes keep the existing
+    * incremental WINDOW_PARTITION program rather than demoting to FULL_REFRESH.
+    */
+  val BoundedRankEnabledKey: String = "spark.openivm.refresh.boundedRank.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -286,6 +296,12 @@ object FeatureGate {
 
   def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
     scd2RangeAccelEnabled(spark.sparkContext.getConf)
+
+  def boundedRankEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, BoundedRankEnabledKey, default = false)
+
+  def boundedRankEnabled(spark: SparkSession): Boolean =
+    boundedRankEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The

@@ -2153,6 +2153,14 @@ case class RefreshMaterializedViewCommand(
             else None
           val windowSuffixSafe =
             windowSuffixInsertSql.isDefined && windowSuffixBatchIsStrictSuffix(spark, meta, mergeTargetId)
+          val boundedRankInsertSql: Option[String] =
+            if (
+              !windowSuffixSafe &&
+              !propagation.requiresDmlInterception &&
+              FeatureGate.boundedRankEnabled(spark) &&
+              meta.refreshType == RefreshTypeCode.WindowPartition
+            ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
+            else None
 
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
@@ -2164,6 +2172,10 @@ case class RefreshMaterializedViewCommand(
               windowSuffixSafe && isWindowPartitionDeleteSql(sql, mergeTargetId)
             val skipWindowPartitionInsert =
               windowSuffixSafe && isWindowPartitionInsertSql(sql, mergeTargetId)
+            val skipBoundedRankAux =
+              boundedRankInsertSql.isDefined && isWindowPartitionAuxSql(sql, mergeTargetId)
+            val replaceWithBoundedRankInsert =
+              boundedRankInsertSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
 
             if (skipDeleteMerge) {
               logInfo(
@@ -2183,6 +2195,17 @@ case class RefreshMaterializedViewCommand(
               )
               withPlanTimeBroadcastDisabled {
                 executeSqlAt(windowSuffixInsertSql.get, idx)
+              }
+            } else if (skipBoundedRankAux) {
+              logSkippedWindowStmt(idx, "bounded_rank_aux_skipped")
+            } else if (replaceWithBoundedRankInsert) {
+              RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='bounded_rank_topk'")
+              logInfo(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                  "outcome='bounded_rank_topk' reason='topk_rank_partition_recompute'"
+              )
+              withPlanTimeBroadcastDisabled {
+                executeSqlAt(boundedRankInsertSql.get, idx)
               }
             } else {
               // Apply the per-statement plan-time broadcast disable to BOTH
@@ -2540,6 +2563,15 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowSuffixShape(sourceShort: String, partitionCols: Seq[String], orderCol: String)
 
+  private case class BoundedRankShape(
+      sourceShort: String,
+      partitionCols: Seq[String],
+      orderCol: String,
+      orderDirection: String,
+      rankFunction: String,
+      limit: Int
+  )
+
   private def buildWindowSuffixInsertSql(
       spark: SparkSession,
       meta: MvMetadata,
@@ -2651,6 +2683,55 @@ case class RefreshMaterializedViewCommand(
       } catch { case _: Throwable => false }
     }
 
+  private def buildBoundedRankInsertSql(
+      spark: SparkSession,
+      meta: MvMetadata,
+      targetId: TableIdentifier
+  ): Option[String] =
+    boundedRankShape(meta).flatMap { shape =>
+      try {
+        val mvCols     = spark.table(MvCommandHelper.sqlIdent(targetId)).columns.toSeq
+        val sourceCols = spark.table(meta.sourceTables.head).columns.toSeq
+        if (
+          mvCols.nonEmpty &&
+          sourceCols.nonEmpty &&
+          shape.partitionCols.nonEmpty &&
+          (shape.partitionCols :+ shape.orderCol).forall(c => sourceCols.exists(_.equalsIgnoreCase(c)))
+        ) {
+          val targetRef   = MvCommandHelper.sqlIdent(targetId)
+          val sourceRef   = quoteIdentPath(meta.sourceTables.head)
+          val colList     = mvCols.map(quoteCol).mkString(", ")
+          val sourceList  = sourceCols.map(quoteCol).mkString(", ")
+          val partList    = shape.partitionCols.map(quoteCol).mkString(", ")
+          val orderExpr   = s"${quoteCol(shape.orderCol)} ${shape.orderDirection}"
+          val deltaRef    = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
+          val baseMatch   = partitionMatch("openivm_base", "a", shape.partitionCols)
+          val resultMatch = partitionMatch("openivm_bounded", "a", shape.partitionCols)
+          replaceWindowSuffixSource(meta.querySql, "bounded_source").map { boundedBody =>
+            s"""|INSERT INTO $targetRef ($colList)
+                |WITH affected AS (
+                |  SELECT DISTINCT $partList
+                |  FROM $deltaRef
+                |  WHERE `openivm_multiplicity` != 0
+                |),
+                |bounded_source AS (
+                |  SELECT $sourceList
+                |  FROM (
+                |    SELECT openivm_base.*,
+                |           ${shape.rankFunction}() OVER (PARTITION BY $partList ORDER BY $orderExpr) AS `__openivm_bound_rank`
+                |    FROM $sourceRef openivm_base
+                |    WHERE EXISTS (SELECT 1 FROM affected a WHERE $baseMatch)
+                |  ) openivm_ranked
+                |  WHERE `__openivm_bound_rank` <= ${shape.limit}
+                |)
+                |SELECT $colList
+                |FROM ($boundedBody) openivm_bounded
+                |WHERE EXISTS (SELECT 1 FROM affected a WHERE $resultMatch)""".stripMargin
+          }
+        } else None
+      } catch { case _: Throwable => None }
+    }
+
   private def windowSuffixShape(meta: MvMetadata): Option[WindowSuffixShape] = {
     val sql = meta.querySql
     if (
@@ -2684,6 +2765,52 @@ case class RefreshMaterializedViewCommand(
     }
   }
 
+  private def boundedRankShape(meta: MvMetadata): Option[BoundedRankShape] = {
+    val sql = meta.querySql
+    if (meta.sourceTables.size != 1 || "(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined) return None
+
+    val rankRe =
+      """(?is)\b(ROW_NUMBER|RANK)\s*\(\s*\)\s+OVER\s*\((.*?)\)\s+AS\s+(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)""".r
+    val rankMatches = rankRe.findAllMatchIn(sql).toVector
+    if (rankMatches.isEmpty) return None
+
+    val parsed = rankMatches.flatMap { hit =>
+      val spec = hit.group(2).trim
+      val m = "(?is)\\bPARTITION\\s+BY\\s+(.+?)\\s+ORDER\\s+BY\\s+(.+?)(?:\\bROWS\\b|\\bRANGE\\b|$)".r
+        .findFirstMatchIn(spec)
+      m.flatMap { specHit =>
+        val parts = splitIdentifierList(specHit.group(1))
+        val order = parseSingleOrderKey(specHit.group(2))
+        order.map { case (col, dir) =>
+          (hit.group(1).toUpperCase(java.util.Locale.ROOT), parts, col, dir, stripSqlIdent(hit.group(3)))
+        }
+      }
+    }
+    if (parsed.size != rankMatches.size) return None
+
+    val (fn, parts, orderCol, orderDir, alias) = parsed.head
+    val sameWindow = parsed.forall { case (f, p, o, d, a) =>
+      f == fn && p == parts && o == orderCol && d == orderDir && a == alias
+    }
+    if (!sameWindow || parts.isEmpty) return None
+
+    val aliasPattern         = java.util.regex.Pattern.quote(alias)
+    val backtickAliasPattern = java.util.regex.Pattern.quote(s"`$alias`")
+    val limitRe              = (s"(?is)(?:`?$aliasPattern`?|$backtickAliasPattern)\\s*<=\\s*(\\d+)").r
+    limitRe.findFirstMatchIn(sql).flatMap { m =>
+      scala.util.Try(m.group(1).toInt).toOption.filter(_ > 0).map { limit =>
+        BoundedRankShape(
+          sourceShort = meta.sourceTables.head.split("\\.").last,
+          partitionCols = parts,
+          orderCol = orderCol,
+          orderDirection = orderDir,
+          rankFunction = if (fn == "ROW_NUMBER") "RANK" else fn,
+          limit = limit
+        )
+      }
+    }
+  }
+
   private def splitIdentifierList(csv: String): Seq[String] =
     csv
       .split(",")
@@ -2691,6 +2818,29 @@ case class RefreshMaterializedViewCommand(
       .filter(s => s.matches("[A-Za-z_][A-Za-z0-9_]*\\s*(?i:ASC)?"))
       .map(_.replaceAll("(?i)\\s+ASC\\s*$", ""))
       .toSeq
+
+  private def parseSingleOrderKey(orderSql: String): Option[(String, String)] = {
+    val parts = orderSql.split(",").map(_.trim).filter(_.nonEmpty)
+    if (parts.length != 1) None
+    else {
+      val raw   = parts.head
+      val upper = raw.toUpperCase(java.util.Locale.ROOT)
+      if (upper.contains(" NULLS ")) None
+      else {
+        val direction =
+          if (upper.endsWith(" DESC")) "DESC"
+          else "ASC"
+        val col = raw.replaceAll("(?i)\\s+(ASC|DESC)\\s*$", "").trim.stripPrefix("`").stripSuffix("`")
+        if (col.matches("[A-Za-z_][A-Za-z0-9_]*")) Some(col -> direction) else None
+      }
+    }
+  }
+
+  private def stripSqlIdent(ident: String): String =
+    ident.trim.stripPrefix("`").stripSuffix("`")
+
+  private def quoteIdentPath(path: String): String =
+    path.split("\\.").map(quoteCol).mkString(".")
 
   private def partitionMatch(leftAlias: String, rightAlias: String, partitionCols: Seq[String]): String =
     partitionCols
