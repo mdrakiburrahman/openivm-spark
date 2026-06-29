@@ -151,8 +151,10 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   describe("per-source delta_shape empty-delta term pruning") {
     it("drops UNION ALL join terms whose selected source delta is UNCHANGED") {
-      val input =
-        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+      System.setProperty("openivm.refresh.emptyDeltaSkip", "true")
+      try {
+        val input =
+          """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
           |WITH join_delta AS (
           |  SELECT f.region_id, p.name, f.amount, f.openivm_multiplicity
           |  FROM memory.main.openivm_delta_fact_sales f
@@ -179,25 +181,26 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
           |""".stripMargin
 
-      val rewritten = SparkRefreshRewriter.rewrite(
-        compiledSql = input,
-        mvName = mvName,
-        mvLocation = mvLocation,
-        viewLogicalName = viewLogicalName,
-        sourceTempViews = Map.empty,
-        viewDeltaPath = viewDeltaPath,
-        deltaShape = Map(
-          "default.fact_sales"  -> DeltaShape.InsertOnly,
-          "default.dim_product" -> DeltaShape.Unchanged,
-          "default.dim_region"  -> DeltaShape.Unchanged
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.Unchanged,
+            "default.dim_region"  -> DeltaShape.Unchanged
+          )
         )
-      )
 
-      val stmt = rewritten.statements.head
-      stmt should include("`openivm_delta_fact_sales`")
-      stmt should not include "openivm_delta_dim_product"
-      stmt should not include "openivm_delta_dim_region"
-      stmt.split("(?i)UNION\\s+ALL").length shouldBe 1
+        val stmt = rewritten.statements.head
+        stmt should include("`openivm_delta_fact_sales`")
+        stmt should not include "openivm_delta_dim_product"
+        stmt should not include "openivm_delta_dim_region"
+        stmt.split("(?i)UNION\\s+ALL").length shouldBe 1
+      } finally System.clearProperty("openivm.refresh.emptyDeltaSkip")
     }
   }
 
