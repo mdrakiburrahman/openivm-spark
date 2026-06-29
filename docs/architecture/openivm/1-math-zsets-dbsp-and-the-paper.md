@@ -35,15 +35,11 @@ ______________________________________________________________________
 A normal SQL bag is a multiset.
 It maps each tuple to a **non-negative** multiplicity:
 
-$$
-B : U \to \mathbb{N}
-$$
+$$ B : U \to \mathbb{N} $$
 
 A **Z-set** generalizes that to integer multiplicities:
 
-$$
-S : U \to \mathbb{Z}
-$$
+$$ S : U \to \mathbb{Z} $$
 
 Where:
 
@@ -75,27 +71,19 @@ I will use these operations throughout:
 
 Pointwise addition means:
 
-$$
-(S \oplus T)(x) = S(x) + T(x)
-$$
+$$ (S \oplus T)(x) = S(x) + T(x) $$
 
 So if:
 
-$$
-S((1, A)) = 1
-$$
+$$ S((1, A)) = 1 $$
 
 and:
 
-$$
-T((1, A)) = -1
-$$
+$$ T((1, A)) = -1 $$
 
 then:
 
-$$
-(S \oplus T)((1, A)) = 0
-$$
+$$ (S \oplus T)((1, A)) = 0 $$
 
 The row cancels.
 Implementation usually suppresses zero rows.
@@ -135,26 +123,20 @@ ______________________________________________________________________
 
 A static table is a Z-set:
 
-$$
-S : U \to \mathbb{Z}
-$$
+$$ S : U \to \mathbb{Z} $$
 
 A stream is a sequence of changes to that table.
 DBSP and differential dataflow add a **time index**.
 A simple model is:
 
-$$
-\Delta S : T \to (U \to \mathbb{Z})
-$$
+$$ \Delta S : T \to (U \to \mathbb{Z}) $$
 
 Read that as:
 
 > At each logical time `t`, the stream contains a Z-set of tuple changes.
 > Equivalently:
 
-$$
-\Delta S_t : U \to \mathbb{Z}
-$$
+$$ \Delta S_t : U \to \mathbb{Z} $$
 
 Where $\Delta S_t(x)$ is the change in tuple `x` at time `t`.
 This is the phrase from the prompt:
@@ -181,9 +163,7 @@ This is the phrase from the prompt:
 
 If a stream gives us changes over time, the current table is the accumulated sum:
 
-$$
-S_t = \bigoplus_{\tau \le t} \Delta S_\tau
-$$
+$$ S_t = \bigoplus_{\tau \le t} \Delta S_\tau $$
 
 This is the database version of integration.
 A delta is a derivative.
@@ -211,22 +191,16 @@ Let:
 - $\oplus$ be Z-set addition.
   Then incremental view maintenance wants:
 
-$$
-V(D \oplus \Delta D) = V(D) \oplus V^\Delta(D, \Delta D)
-$$
+$$ V(D \oplus \Delta D) = V(D) \oplus V^\Delta(D, \Delta D) $$
 
 The prompt writes this as:
 
-$$
-V'(D + \Delta D) = V(D) \oplus V'(D, \Delta D)
-$$
+$$ V'(D + \Delta D) = V(D) \oplus V'(D, \Delta D) $$
 
 I will use $V^\Delta$ for the delta function to avoid overloading the prime on both sides.
 The delta function is defined by:
 
-$$
-V^\Delta(D, \Delta D) = V(D \oplus \Delta D) \ominus V(D)
-$$
+$$ V^\Delta(D, \Delta D) = V(D \oplus \Delta D) \ominus V(D) $$
 
 So the refresh algorithm is:
 
@@ -252,15 +226,11 @@ ______________________________________________________________________
 
 An operator `L` is linear over Z-sets when:
 
-$$
-L(A \oplus B) = L(A) \oplus L(B)
-$$
+$$ L(A \oplus B) = L(A) \oplus L(B) $$
 
 For a linear view:
 
-$$
-V^\Delta(D, \Delta D) = V(\Delta D)
-$$
+$$ V^\Delta(D, \Delta D) = V(\Delta D) $$
 
 That is the best case.
 You do not need the old state.
@@ -303,9 +273,7 @@ OpenIVM classifies projection-only views as `SIMPLE_PROJECTION` when it finds pr
 A deterministic filter is linear.
 For predicate `p`:
 
-$$
-\sigma_p(A \oplus B) = \sigma_p(A) \oplus \sigma_p(B)
-$$
+$$ \sigma_p(A \oplus B) = \sigma_p(A) \oplus \sigma_p(B) $$
 
 Rows that fail `p` map to zero.
 Rows that pass preserve their signed weight.
@@ -318,11 +286,7 @@ The checker rejects volatile expressions in filters because a non-deterministic 
 `UNION ALL` is Z-set addition.
 So it is linear by definition:
 
-$$
-(A_1 \oplus B_1) \cup_{\text{all}} (A_2 \oplus B_2)
-=
-(A_1 \cup_{\text{all}} A_2) \oplus (B_1 \cup_{\text{all}} B_2)
-$$
+$$ (A_1 \oplus B_1) \cup_{\text{all}} (A_2 \oplus B_2) = (A_1 \cup_{\text{all}} A_2) \oplus (B_1 \cup_{\text{all}} B_2) $$
 
 In practical SQL, this means deltas from both branches can be concatenated.
 
@@ -331,15 +295,11 @@ In practical SQL, this means deltas from both branches can be concatenated.
 Grouped `SUM` is additive when the delta carries signed multiplicity.
 For group key `g` and value column `x`:
 
-$$
-\Delta sum_g = \sum_{r \in \Delta R, key(r)=g} weight(r) \cdot x(r)
-$$
+$$ \Delta sum_g = \sum_{r \in \Delta R, key(r)=g} weight(r) \cdot x(r) $$
 
 Grouped `COUNT` is also additive if we store the current count:
 
-$$
-\Delta count_g = \sum_{r \in \Delta R, key(r)=g} weight(r)
-$$
+$$ \Delta count_g = \sum_{r \in \Delta R, key(r)=g} weight(r) $$
 
 OpenIVM records supported aggregate names in the checker, including `count`, `sum`, `avg`, `min`, `max`, variance, list, and boolean aggregates:
 
@@ -361,48 +321,23 @@ It is linear in the right input if the left input is fixed.
 But it is not linear in both inputs together because both sides can change at once.
 For two inputs:
 
-$$
-(R \oplus \Delta R) \bowtie (S \oplus \Delta S)
-$$
+$$ (R \oplus \Delta R) \bowtie (S \oplus \Delta S) $$
 
 Expand it like a binomial:
 
-$$
-(R \bowtie S)
-\oplus (R \bowtie \Delta S)
-\oplus (\Delta R \bowtie S)
-\oplus (\Delta R \bowtie \Delta S)
-$$
+$$ (R \bowtie S) \oplus (R \bowtie \Delta S) \oplus (\Delta R \bowtie S) \oplus (\Delta R \bowtie \Delta S) $$
 
 Subtract the old view:
 
-$$
-R \bowtie S
-$$
+$$ R \bowtie S $$
 
 The delta is:
 
-$$
-V^\Delta((R,S),(\Delta R,\Delta S))
-=
-(R \bowtie \Delta S)
-\oplus
-(\Delta R \bowtie S)
-\oplus
-(\Delta R \bowtie \Delta S)
-$$
+$$ V^\Delta((R,S),(\Delta R,\Delta S)) = (R \bowtie \Delta S) \oplus (\Delta R \bowtie S) \oplus (\Delta R \bowtie \Delta S) $$
 
 The prompt's single-symbol form is:
 
-$$
-V^\Delta(D, \Delta D)
-=
-(D \bowtie \Delta D)
-\oplus
-(\Delta D \bowtie D)
-\oplus
-(\Delta D \bowtie \Delta D)
-$$
+$$ V^\Delta(D, \Delta D) = (D \bowtie \Delta D) \oplus (\Delta D \bowtie D) \oplus (\Delta D \bowtie \Delta D) $$
 
 That is the textbook old-base version.
 
@@ -413,9 +348,7 @@ The current base already includes the pending delta.
 The join rule therefore uses inclusion-exclusion signs to avoid overcounting.
 The code comment says the combined multiplicity is:
 
-$$
-(-1)^{k-1} \cdot \prod_i w_i
-$$
+$$ (-1)^{k-1} \cdot \prod_i w_i $$
 
 Where `k` is the number of delta-side leaves in the term.
 The implementation comment explains why:
@@ -437,55 +370,30 @@ ______________________________________________________________________
 
 For an n-way join:
 
-$$
-R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n
-$$
+$$ R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n $$
 
 The new state is:
 
-$$
-(R_1 \oplus \Delta R_1)
-\bowtie
-(R_2 \oplus \Delta R_2)
-\bowtie
-\cdots
-\bowtie
-(R_n \oplus \Delta R_n)
-$$
+$$ (R_1 \oplus \Delta R_1) \bowtie (R_2 \oplus \Delta R_2) \bowtie \cdots \bowtie (R_n \oplus \Delta R_n) $$
 
 The product expansion has `2^n` terms.
 One term is the old view:
 
-$$
-R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n
-$$
+$$ R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n $$
 
 The other `2^n - 1` terms contain at least one delta input.
 With old-base scans, all non-empty delta-subset terms are positive.
 With OpenIVM's current-base scans, the contribution for a non-empty subset $S \subseteq {1..n}$ is:
 
-$$
-sign(S) = (-1)^{|S|-1}
-$$
+$$ sign(S) = (-1)^{|S|-1} $$
 
 and:
 
-$$
-term(S)
-=
-\left(\bowtie_{i \in S} \Delta R_i\right)
-\bowtie
-\left(\bowtie_{j \notin S} R_j\right)
-$$
+$$ term(S) = \left(\bowtie_{i \in S} \Delta R_i\right) \bowtie \left(\bowtie_{j \notin S} R_j\right) $$
 
 So the delta is:
 
-$$
-V^\Delta
-=
-\bigoplus_{\emptyset \ne S \subseteq \{1,\ldots,n\}}
-(-1)^{|S|-1} \cdot term(S)
-$$
+$$ V^\Delta = \bigoplus_{\emptyset \ne S \subseteq \{1,\ldots,n\}} (-1)^{|S|-1} \cdot term(S) $$
 
 This is the Möbius function of the subset lattice.
 For the subset lattice ordered by inclusion, the relevant sign alternates by subset size.
@@ -494,39 +402,23 @@ For the subset lattice ordered by inclusion, the relevant sign alternates by sub
 
 For three relations:
 
-$$
-R \bowtie S \bowtie T
-$$
+$$ R \bowtie S \bowtie T $$
 
 OpenIVM's current-base inclusion-exclusion form is:
 
-$$
-+\Delta R \bowtie S \bowtie T
-$$
+$$ +\Delta R \bowtie S \bowtie T $$
 
-$$
-+R \bowtie \Delta S \bowtie T
-$$
+$$ +R \bowtie \Delta S \bowtie T $$
 
-$$
-+R \bowtie S \bowtie \Delta T
-$$
+$$ +R \bowtie S \bowtie \Delta T $$
 
-$$
--\Delta R \bowtie \Delta S \bowtie T
-$$
+$$ -\Delta R \bowtie \Delta S \bowtie T $$
 
-$$
--\Delta R \bowtie S \bowtie \Delta T
-$$
+$$ -\Delta R \bowtie S \bowtie \Delta T $$
 
-$$
--R \bowtie \Delta S \bowtie \Delta T
-$$
+$$ -R \bowtie \Delta S \bowtie \Delta T $$
 
-$$
-+\Delta R \bowtie \Delta S \bowtie \Delta T
-$$
+$$ +\Delta R \bowtie \Delta S \bowtie \Delta T $$
 
 The signs are:
 
@@ -553,58 +445,26 @@ The Möbius sign is about **basis conversion**.
 It converts from a product over current relations to a delta relative to the old product.
 For two relations:
 
-$$
-R_{\text{now}} = R_{\text{old}} \oplus \Delta R
-$$
+$$ R_{\text{now}} = R_{\text{old}} \oplus \Delta R $$
 
-$$
-S_{\text{now}} = S_{\text{old}} \oplus \Delta S
-$$
+$$ S_{\text{now}} = S_{\text{old}} \oplus \Delta S $$
 
 The current-base formula is:
 
-$$
-\Delta R \bowtie S_{\text{now}}
-\oplus
-R_{\text{now}} \bowtie \Delta S
-\ominus
-\Delta R \bowtie \Delta S
-$$
+$$ \Delta R \bowtie S_{\text{now}} \oplus R_{\text{now}} \bowtie \Delta S \ominus \Delta R \bowtie \Delta S $$
 
 Expand it:
 
-$$
-\Delta R \bowtie (S_{\text{old}} \oplus \Delta S)
-\oplus
-(R_{\text{old}} \oplus \Delta R) \bowtie \Delta S
-\ominus
-\Delta R \bowtie \Delta S
-$$
+$$ \Delta R \bowtie (S_{\text{old}} \oplus \Delta S) \oplus (R_{\text{old}} \oplus \Delta R) \bowtie \Delta S \ominus \Delta R \bowtie \Delta S $$
 
 Now distribute:
 
-$$
-\Delta R \bowtie S_{\text{old}}
-\oplus
-\Delta R \bowtie \Delta S
-\oplus
-R_{\text{old}} \bowtie \Delta S
-\oplus
-\Delta R \bowtie \Delta S
-\ominus
-\Delta R \bowtie \Delta S
-$$
+$$ \Delta R \bowtie S_{\text{old}} \oplus \Delta R \bowtie \Delta S \oplus R_{\text{old}} \bowtie \Delta S \oplus \Delta R \bowtie \Delta S \ominus \Delta R \bowtie \Delta S $$
 
 One duplicate $\Delta R \bowtie \Delta S$ remains, which is exactly the textbook delta term.
 So the current-base formula equals:
 
-$$
-\Delta R \bowtie S_{\text{old}}
-\oplus
-R_{\text{old}} \bowtie \Delta S
-\oplus
-\Delta R \bowtie \Delta S
-$$
+$$ \Delta R \bowtie S_{\text{old}} \oplus R_{\text{old}} \bowtie \Delta S \oplus \Delta R \bowtie \Delta S $$
 
 ## Same result. Different implementation basis.
 
@@ -620,15 +480,11 @@ Some require recomputation.
 
 `AVG(x)` is not directly additive:
 
-$$
-avg(A \oplus B) \ne avg(A) \oplus avg(B)
-$$
+$$ avg(A \oplus B) \ne avg(A) \oplus avg(B) $$
 
 But it decomposes into two additive pieces:
 
-$$
-avg(x) = \frac{sum(x)}{count(x)}
-$$
+$$ avg(x) = \frac{sum(x)}{count(x)} $$
 
 So OpenIVM can maintain hidden sum and count columns, then derive the visible average.
 The compiler detects decomposed aggregate types, including `avg`, `stddev`, and variance forms:
@@ -687,9 +543,7 @@ ______________________________________________________________________
 
 `DISTINCT` looks non-linear:
 
-$$
-DISTINCT(R) = \{x \mid count_R(x) > 0\}
-$$
+$$ DISTINCT(R) = \{x \mid count_R(x) > 0\} $$
 
 The threshold at zero is the hard part.
 If tuple `x` has count `2` and one copy is deleted, it should remain visible.
@@ -904,21 +758,15 @@ ______________________________________________________________________
 
 Source:
 
-$$
-R = \{(1,A): 1, (2,B): 2\}
-$$
+$$ R = \{(1,A): 1, (2,B): 2\} $$
 
 Delta:
 
-$$
-\Delta R = \{(1,A): -1, (3,C): 1\}
-$$
+$$ \Delta R = \{(1,A): -1, (3,C): 1\} $$
 
 New state:
 
-$$
-R \oplus \Delta R = \{(2,B): 2, (3,C): 1\}
-$$
+$$ R \oplus \Delta R = \{(2,B): 2, (3,C): 1\} $$
 
 The `(1,A)` row has multiplicity zero after cancellation, so it is removed.
 View:
@@ -930,9 +778,7 @@ SELECT key FROM R;
 This projection is linear.
 So:
 
-$$
-V^\Delta(\Delta R) = V(\Delta R)
-$$
+$$ V^\Delta(\Delta R) = V(\Delta R) $$
 
 ### 12.1 Source state
 
@@ -952,23 +798,15 @@ $$
 
 The equality holds:
 
-$$
-V(R) \oplus V^\Delta(\Delta R) = V(R \oplus \Delta R)
-$$
+$$ V(R) \oplus V^\Delta(\Delta R) = V(R \oplus \Delta R) $$
 
 Expanded:
 
-$$
-\{1:1, 2:2\} \oplus \{1:-1, 3:1\}
-=
-\{2:2, 3:1\}
-$$
+$$ \{1:1, 2:2\} \oplus \{1:-1, 3:1\} = \{2:2, 3:1\} $$
 
 And:
 
-$$
-V(R \oplus \Delta R) = \{2:2, 3:1\}
-$$
+$$ V(R \oplus \Delta R) = \{2:2, 3:1\} $$
 
 So the incremental refresh is correct.
 
@@ -1075,9 +913,7 @@ ______________________________________________________________________
 
 OpenIVM's math is compact:
 
-$$
-S : U \to \mathbb{Z}
-$$
+$$ S : U \to \mathbb{Z} $$
 
 A table is a signed bag.
 A transaction is a signed bag.
@@ -1085,9 +921,7 @@ A stream is a time-indexed sequence of signed bags.
 A view is a function over signed bags.
 Refresh compiles this equation:
 
-$$
-V(D \oplus \Delta D) = V(D) \oplus V^\Delta(D, \Delta D)
-$$
+$$ V(D \oplus \Delta D) = V(D) \oplus V^\Delta(D, \Delta D) $$
 
 Linear operators pass deltas through.
 Joins expand like products.

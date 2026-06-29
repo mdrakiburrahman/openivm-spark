@@ -4,9 +4,9 @@
 Three stages, idempotent:
   1. math fix  - backtick-wrapped LaTeX / math-Unicode renders as code on GitHub,
                  not math; rewrite those spans to inline $...$ and Unicode->LaTeX.
-  2. math norm - inside $...$ / $$...$$, map MathJax-unsupported commands to
-                 supported ones (\\Join -> \\bowtie) and wrap multi-letter
-                 subscripts in \\text{} so they stay upright (now/old/all).
+  2. math norm - inside `$…$`/`$$…$$`: collapse multi-line `$$` blocks to a
+                 single line (GitHub mis-renders split blocks), map unsupported
+                 commands (\\Join->\\bowtie), wrap word subscripts in \\text{}.
   3. format    - mdformat-gfm, with $$...$$ and $...$ protected so the formatter
                  never mangles them. Fenced code (mermaid, sql, ascii) is preserved.
 
@@ -42,6 +42,10 @@ def _norm_one(m):
     body = m.group(0)
     for bad, good in UNSUPPORTED_CMD.items():
         body = body.replace(bad, good)
+    if body.startswith("$$"):  # collapse multi-line $$ blocks; GitHub mis-renders them
+        inner = body[2:-2].strip()
+        inner = re.sub(r"\s+", " ", inner)
+        body = f"$$ {inner} $$"
     return WORD_SUB.sub(r"_{\\text{\1}}", body)
 
 

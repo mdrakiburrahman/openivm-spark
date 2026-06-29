@@ -64,9 +64,9 @@ git symbolic-ref --short HEAD
 ```
 
 Stage 1 backtick-math → `$…$` (Unicode→LaTeX, `_word`→`_{word}`, table pipes
-`\|`); stage 2 math-norm inside `$…$`/`$$…$$` (MathJax-unsupported `\Join`→
-`\bowtie`, multi-letter subscripts `_{now}`→`_{\text{now}}`); stage 3
-mdformat-gfm with math/code protected.
+`\|`); stage 2 math-norm inside `$…$`/`$$…$$` (collapse multi-line `$$` blocks
+to one line — GitHub mis-renders split blocks; `\Join`→`\bowtie`; `_{now}`→
+`_{\text{now}}`); stage 3 mdformat-gfm with math/code protected.
 
 ## PHASE 2 — Verify
 
@@ -76,6 +76,7 @@ $PY .github/skills/docs-markdown-lint/mdlint.py --check docs/architecture   # ex
 grep -rc '```mermaid' docs/architecture | awk -F: '{s+=$2} END{print s}'    # unchanged
 ! grep -rnP '`[^`]*(\\[a-z]+|⊕|⋈|Δ)[^`]*`' docs/architecture                # no backtick-math
 ! grep -rn '\\Join' docs/architecture                                       # use \bowtie
+! grep -rnE '^\$\$$' docs/architecture                                      # block math single-line
 ! grep -rnP '_\{[A-Za-z]{2,}\}' docs/architecture                           # word subs wrapped \text
 ! grep -rn 'MDLM\|MDLINTMATH' docs/architecture                              # no token leaks
 ```
