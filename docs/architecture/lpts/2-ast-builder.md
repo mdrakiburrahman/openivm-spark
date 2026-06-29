@@ -96,24 +96,24 @@ The header lists the current hierarchy from `AstGetNode` through `AstDelimJoinNo
 
 Important nodes for this chapter are:
 
-| Conceptual role | Actual AST class | Source |
-|---|---|---|
-| Table reference / scan | `AstGetNode` | `.temp/lpts/src/include/lpts_ast.hpp:66-95` |
-| WHERE wrapper | `AstFilterNode` | `.temp/lpts/src/include/lpts_ast.hpp:97-114` |
-| SELECT list / computed columns | `AstProjectNode` | `.temp/lpts/src/include/lpts_ast.hpp:116-135` |
-| GROUP BY + aggregates | `AstAggregateNode` | `.temp/lpts/src/include/lpts_ast.hpp:137-159` |
-| Join | `AstJoinNode` | `.temp/lpts/src/include/lpts_ast.hpp:161-183` |
-| UNION | `AstUnionNode` | `.temp/lpts/src/include/lpts_ast.hpp:185-203` |
-| EXCEPT / INTERSECT | `AstSetOperationNode` | `.temp/lpts/src/include/lpts_ast.hpp:205-224` |
-| ORDER BY | `AstOrderNode` | `.temp/lpts/src/include/lpts_ast.hpp:246-263` |
-| LIMIT / OFFSET | `AstLimitNode` | `.temp/lpts/src/include/lpts_ast.hpp:265-288` |
-| TOP N | `AstTopNNode` | `.temp/lpts/src/include/lpts_ast.hpp:290-310` |
-| DISTINCT | `AstDistinctNode` | `.temp/lpts/src/include/lpts_ast.hpp:312-327` |
-| Materialized CTE wrapper | `AstMaterializedCteNode` | `.temp/lpts/src/include/lpts_ast.hpp:329-347` |
-| CTE reference | `AstCteRefNode` | `.temp/lpts/src/include/lpts_ast.hpp:349-367` |
-| Recursive CTE | `AstRecursiveCteNode` | `.temp/lpts/src/include/lpts_ast.hpp:369-392` |
-| Correlation scan | `AstDelimGetNode` | `.temp/lpts/src/include/lpts_ast.hpp:394-415` |
-| Decorrelated subquery join | `AstDelimJoinNode` | `.temp/lpts/src/include/lpts_ast.hpp:417-442` |
+| Conceptual role                | Actual AST class         | Source                                        |
+| ------------------------------ | ------------------------ | --------------------------------------------- |
+| Table reference / scan         | `AstGetNode`             | `.temp/lpts/src/include/lpts_ast.hpp:66-95`   |
+| WHERE wrapper                  | `AstFilterNode`          | `.temp/lpts/src/include/lpts_ast.hpp:97-114`  |
+| SELECT list / computed columns | `AstProjectNode`         | `.temp/lpts/src/include/lpts_ast.hpp:116-135` |
+| GROUP BY + aggregates          | `AstAggregateNode`       | `.temp/lpts/src/include/lpts_ast.hpp:137-159` |
+| Join                           | `AstJoinNode`            | `.temp/lpts/src/include/lpts_ast.hpp:161-183` |
+| UNION                          | `AstUnionNode`           | `.temp/lpts/src/include/lpts_ast.hpp:185-203` |
+| EXCEPT / INTERSECT             | `AstSetOperationNode`    | `.temp/lpts/src/include/lpts_ast.hpp:205-224` |
+| ORDER BY                       | `AstOrderNode`           | `.temp/lpts/src/include/lpts_ast.hpp:246-263` |
+| LIMIT / OFFSET                 | `AstLimitNode`           | `.temp/lpts/src/include/lpts_ast.hpp:265-288` |
+| TOP N                          | `AstTopNNode`            | `.temp/lpts/src/include/lpts_ast.hpp:290-310` |
+| DISTINCT                       | `AstDistinctNode`        | `.temp/lpts/src/include/lpts_ast.hpp:312-327` |
+| Materialized CTE wrapper       | `AstMaterializedCteNode` | `.temp/lpts/src/include/lpts_ast.hpp:329-347` |
+| CTE reference                  | `AstCteRefNode`          | `.temp/lpts/src/include/lpts_ast.hpp:349-367` |
+| Recursive CTE                  | `AstRecursiveCteNode`    | `.temp/lpts/src/include/lpts_ast.hpp:369-392` |
+| Correlation scan               | `AstDelimGetNode`        | `.temp/lpts/src/include/lpts_ast.hpp:394-415` |
+| Decorrelated subquery join     | `AstDelimJoinNode`       | `.temp/lpts/src/include/lpts_ast.hpp:417-442` |
 
 Phase 2 is what turns these into SQL `SELECT` statements.
 
@@ -131,34 +131,34 @@ Its comment says children must already be processed and `column_map` is updated 
 
 Every handled switch case in this checkout is listed below.
 
-| `LogicalOperatorType` case | Actual AST node emitted | What is captured |
-|---|---|---|
-| `LOGICAL_GET` | `AstGetNode` | catalog/schema/table, scan columns, generated CTE names, pushdown filters (`.temp/lpts/src/lpts_pipeline.cpp:1249-1444`) |
-| `LOGICAL_FILTER` | `AstFilterNode` | filter expressions serialized via `ExpressionToAliasedString` (`.temp/lpts/src/lpts_pipeline.cpp:1448-1454`) |
-| `LOGICAL_WINDOW` | `AstProjectNode` | child pass-through columns plus window-function expressions (`.temp/lpts/src/lpts_pipeline.cpp:1458-1500`) |
-| `LOGICAL_PROJECTION` | `AstProjectNode` or pass-through `nullptr` | SELECT-list expressions and output CTE names; skips compressed internal projections (`.temp/lpts/src/lpts_pipeline.cpp:1504-1615`) |
-| `LOGICAL_UNNEST` | `AstProjectNode` | child columns plus `UNNEST(...)` outputs (`.temp/lpts/src/lpts_pipeline.cpp:1619-1643`) |
-| `LOGICAL_AGGREGATE_AND_GROUP_BY` | `AstAggregateNode` | group expressions, grouping sets clause, aggregate expressions, output CTE names (`.temp/lpts/src/lpts_pipeline.cpp:1647-1820`) |
-| `LOGICAL_COMPARISON_JOIN` | `AstJoinNode` | comparison predicates, join type, output CTE names, MARK-join expression (`.temp/lpts/src/lpts_pipeline.cpp:1824-1881`) |
-| `LOGICAL_ANY_JOIN` | `AstJoinNode` | opaque arbitrary ON predicate (`.temp/lpts/src/lpts_pipeline.cpp:1885-1903`) |
-| `LOGICAL_CROSS_PRODUCT` | `AstJoinNode` | synthetic `(TRUE)` join condition (`.temp/lpts/src/lpts_pipeline.cpp:1906-1913`) |
-| `LOGICAL_UNION` | `AstUnionNode` | `UNION`/`UNION ALL` flag and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1917-1929`) |
-| `LOGICAL_EXCEPT` | `AstSetOperationNode` | `EXCEPT`/`EXCEPT ALL` and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1932-1946`) |
-| `LOGICAL_INTERSECT` | `AstSetOperationNode` | `INTERSECT`/`INTERSECT ALL` and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1932-1946`) |
-| `LOGICAL_ORDER_BY` | `AstOrderNode` | order expressions plus direction, pass-through output names (`.temp/lpts/src/lpts_pipeline.cpp:1950-1972`) |
-| `LOGICAL_LIMIT` | `AstLimitNode` | constant or expression limit/offset and scalar-dependency flags (`.temp/lpts/src/lpts_pipeline.cpp:1976-2005`) |
-| `LOGICAL_TOP_N` | `AstTopNNode` | fused ORDER BY + constant limit/offset (`.temp/lpts/src/lpts_pipeline.cpp:2009-2031`) |
-| `LOGICAL_DISTINCT` | `AstDistinctNode` | pass-through output column names (`.temp/lpts/src/lpts_pipeline.cpp:2035-2041`) |
-| `LOGICAL_INSERT` | `AstInsertNode` | target table and conflict action (`.temp/lpts/src/lpts_pipeline.cpp:2045-2047`) |
-| `LOGICAL_DUMMY_SCAN` | `AstGetNode` | one-row `(SELECT 1)` source for scalar constants (`.temp/lpts/src/lpts_pipeline.cpp:2051-2062`) |
-| `LOGICAL_EMPTY_RESULT` | `AstGetNode` | zero-row `(SELECT 1)` source with `WHERE false` (`.temp/lpts/src/lpts_pipeline.cpp:2066-2083`) |
-| `LOGICAL_CHUNK_GET` | `AstGetNode` | materialized constant rows rendered as `(VALUES ...)` (`.temp/lpts/src/lpts_pipeline.cpp:2087-2133`) |
-| `LOGICAL_EXPRESSION_GET` | `AstGetNode` | `VALUES` clause expressions rendered as `(VALUES ...)` (`.temp/lpts/src/lpts_pipeline.cpp:2137-2171`) |
-| `LOGICAL_CTE_REF` | `AstCteRefNode` | reference to a materialized or recursive CTE body (`.temp/lpts/src/lpts_pipeline.cpp:2175-2207`) |
-| `LOGICAL_MATERIALIZED_CTE` | `AstMaterializedCteNode` | wrapper preserving body-before-use ordering (`.temp/lpts/src/lpts_pipeline.cpp:2211-2218`) |
-| `LOGICAL_DELIM_GET` | `AstDelimGetNode` | duplicate-eliminated correlation keys (`.temp/lpts/src/lpts_pipeline.cpp:2222-2254`) |
-| `LOGICAL_DELIM_JOIN` | `AstDelimJoinNode` | decorrelated subquery join with delim-get metadata (`.temp/lpts/src/lpts_pipeline.cpp:2258-2378`) |
-| `LOGICAL_DEPENDENT_JOIN` | `AstDelimJoinNode` | same path as `LOGICAL_DELIM_JOIN` (`.temp/lpts/src/lpts_pipeline.cpp:2262-2378`) |
+| `LogicalOperatorType` case       | Actual AST node emitted                    | What is captured                                                                                                                   |
+| -------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `LOGICAL_GET`                    | `AstGetNode`                               | catalog/schema/table, scan columns, generated CTE names, pushdown filters (`.temp/lpts/src/lpts_pipeline.cpp:1249-1444`)           |
+| `LOGICAL_FILTER`                 | `AstFilterNode`                            | filter expressions serialized via `ExpressionToAliasedString` (`.temp/lpts/src/lpts_pipeline.cpp:1448-1454`)                       |
+| `LOGICAL_WINDOW`                 | `AstProjectNode`                           | child pass-through columns plus window-function expressions (`.temp/lpts/src/lpts_pipeline.cpp:1458-1500`)                         |
+| `LOGICAL_PROJECTION`             | `AstProjectNode` or pass-through `nullptr` | SELECT-list expressions and output CTE names; skips compressed internal projections (`.temp/lpts/src/lpts_pipeline.cpp:1504-1615`) |
+| `LOGICAL_UNNEST`                 | `AstProjectNode`                           | child columns plus `UNNEST(...)` outputs (`.temp/lpts/src/lpts_pipeline.cpp:1619-1643`)                                            |
+| `LOGICAL_AGGREGATE_AND_GROUP_BY` | `AstAggregateNode`                         | group expressions, grouping sets clause, aggregate expressions, output CTE names (`.temp/lpts/src/lpts_pipeline.cpp:1647-1820`)    |
+| `LOGICAL_COMPARISON_JOIN`        | `AstJoinNode`                              | comparison predicates, join type, output CTE names, MARK-join expression (`.temp/lpts/src/lpts_pipeline.cpp:1824-1881`)            |
+| `LOGICAL_ANY_JOIN`               | `AstJoinNode`                              | opaque arbitrary ON predicate (`.temp/lpts/src/lpts_pipeline.cpp:1885-1903`)                                                       |
+| `LOGICAL_CROSS_PRODUCT`          | `AstJoinNode`                              | synthetic `(TRUE)` join condition (`.temp/lpts/src/lpts_pipeline.cpp:1906-1913`)                                                   |
+| `LOGICAL_UNION`                  | `AstUnionNode`                             | `UNION`/`UNION ALL` flag and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1917-1929`)                              |
+| `LOGICAL_EXCEPT`                 | `AstSetOperationNode`                      | `EXCEPT`/`EXCEPT ALL` and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1932-1946`)                                 |
+| `LOGICAL_INTERSECT`              | `AstSetOperationNode`                      | `INTERSECT`/`INTERSECT ALL` and left-derived output names (`.temp/lpts/src/lpts_pipeline.cpp:1932-1946`)                           |
+| `LOGICAL_ORDER_BY`               | `AstOrderNode`                             | order expressions plus direction, pass-through output names (`.temp/lpts/src/lpts_pipeline.cpp:1950-1972`)                         |
+| `LOGICAL_LIMIT`                  | `AstLimitNode`                             | constant or expression limit/offset and scalar-dependency flags (`.temp/lpts/src/lpts_pipeline.cpp:1976-2005`)                     |
+| `LOGICAL_TOP_N`                  | `AstTopNNode`                              | fused ORDER BY + constant limit/offset (`.temp/lpts/src/lpts_pipeline.cpp:2009-2031`)                                              |
+| `LOGICAL_DISTINCT`               | `AstDistinctNode`                          | pass-through output column names (`.temp/lpts/src/lpts_pipeline.cpp:2035-2041`)                                                    |
+| `LOGICAL_INSERT`                 | `AstInsertNode`                            | target table and conflict action (`.temp/lpts/src/lpts_pipeline.cpp:2045-2047`)                                                    |
+| `LOGICAL_DUMMY_SCAN`             | `AstGetNode`                               | one-row `(SELECT 1)` source for scalar constants (`.temp/lpts/src/lpts_pipeline.cpp:2051-2062`)                                    |
+| `LOGICAL_EMPTY_RESULT`           | `AstGetNode`                               | zero-row `(SELECT 1)` source with `WHERE false` (`.temp/lpts/src/lpts_pipeline.cpp:2066-2083`)                                     |
+| `LOGICAL_CHUNK_GET`              | `AstGetNode`                               | materialized constant rows rendered as `(VALUES ...)` (`.temp/lpts/src/lpts_pipeline.cpp:2087-2133`)                               |
+| `LOGICAL_EXPRESSION_GET`         | `AstGetNode`                               | `VALUES` clause expressions rendered as `(VALUES ...)` (`.temp/lpts/src/lpts_pipeline.cpp:2137-2171`)                              |
+| `LOGICAL_CTE_REF`                | `AstCteRefNode`                            | reference to a materialized or recursive CTE body (`.temp/lpts/src/lpts_pipeline.cpp:2175-2207`)                                   |
+| `LOGICAL_MATERIALIZED_CTE`       | `AstMaterializedCteNode`                   | wrapper preserving body-before-use ordering (`.temp/lpts/src/lpts_pipeline.cpp:2211-2218`)                                         |
+| `LOGICAL_DELIM_GET`              | `AstDelimGetNode`                          | duplicate-eliminated correlation keys (`.temp/lpts/src/lpts_pipeline.cpp:2222-2254`)                                               |
+| `LOGICAL_DELIM_JOIN`             | `AstDelimJoinNode`                         | decorrelated subquery join with delim-get metadata (`.temp/lpts/src/lpts_pipeline.cpp:2258-2378`)                                  |
+| `LOGICAL_DEPENDENT_JOIN`         | `AstDelimJoinNode`                         | same path as `LOGICAL_DELIM_JOIN` (`.temp/lpts/src/lpts_pipeline.cpp:2262-2378`)                                                   |
 
 Anything not in that table reaches the default branch and throws `NotImplementedException("AstBuilder: operator ... is not yet implemented")` (`.temp/lpts/src/lpts_pipeline.cpp:2381-2383`).
 
@@ -449,11 +449,11 @@ AstProjectNode
 
 A compact operator-to-AST mapping for the example is:
 
-| logical node | builder case | AST node | output names |
-|---|---|---|---|
-| `LOGICAL_GET` | scan registration | `AstGetNode` | `t0_a`, `t0_b` |
-| `LOGICAL_FILTER` | condition wrapper | `AstFilterNode` | pass-through `t0_a`, `t0_b` |
-| `LOGICAL_PROJECTION` | SELECT list | `AstProjectNode` | `t1_a` |
+| logical node         | builder case      | AST node         | output names                |
+| -------------------- | ----------------- | ---------------- | --------------------------- |
+| `LOGICAL_GET`        | scan registration | `AstGetNode`     | `t0_a`, `t0_b`              |
+| `LOGICAL_FILTER`     | condition wrapper | `AstFilterNode`  | pass-through `t0_a`, `t0_b` |
+| `LOGICAL_PROJECTION` | SELECT list       | `AstProjectNode` | `t1_a`                      |
 
 Phase 2 would then flatten that AST into CTEs such as:
 

@@ -32,140 +32,140 @@ spark-openivm/
 └── sources/                    # raw input data directories
 ```
 
-| Area | Live count | Comment |
-| --- | --- | --- |
-| `_openivm/tables/` | 31 | Tracked source/base table RocksDB state; this live run has 31, not 39+. |
-| `_openivm/mvs/` | 49 | One per materialized view. |
-| `_openivm/index/rocksdb/` | 91 | Global catalog SST files. |
-| `_ivm/view_deltas/` | 14 | Cascade delta namespaces. |
-| `sources/` | 19 | Raw input directories. |
+| Area                      | Live count | Comment                                                                 |
+| ------------------------- | ---------- | ----------------------------------------------------------------------- |
+| `_openivm/tables/`        | 31         | Tracked source/base table RocksDB state; this live run has 31, not 39+. |
+| `_openivm/mvs/`           | 49         | One per materialized view.                                              |
+| `_openivm/index/rocksdb/` | 91         | Global catalog SST files.                                               |
+| `_ivm/view_deltas/`       | 14         | Cascade delta namespaces.                                               |
+| `sources/`                | 19         | Raw input directories.                                                  |
 
 ### `sources/` listing
 
-| source directory | parquet files | total files incl. CRC |
-| --- | --- | --- |
-| audit | 1 | 2 |
-| batch1_customer_mgmt | 1 | 2 |
-| batch1_date | 1 | 2 |
-| batch1_finwire | 1 | 2 |
-| batch1_hr | 1 | 2 |
-| batch1_industry | 1 | 2 |
-| batch1_status_type | 1 | 2 |
-| batch1_tax_rate | 1 | 2 |
-| batch1_trade_history | 1 | 2 |
-| batch1_trade_type | 1 | 2 |
-| staging_account | 3 | 6 |
-| staging_batch_date | 3 | 6 |
-| staging_cash_transaction | 3 | 6 |
-| staging_customer | 3 | 6 |
-| staging_daily_market | 3 | 6 |
-| staging_holding_history | 3 | 6 |
-| staging_prospect | 3 | 6 |
-| staging_trade | 3 | 6 |
-| staging_watch_history | 3 | 6 |
+| source directory         | parquet files | total files incl. CRC |
+| ------------------------ | ------------- | --------------------- |
+| audit                    | 1             | 2                     |
+| batch1_customer_mgmt     | 1             | 2                     |
+| batch1_date              | 1             | 2                     |
+| batch1_finwire           | 1             | 2                     |
+| batch1_hr                | 1             | 2                     |
+| batch1_industry          | 1             | 2                     |
+| batch1_status_type       | 1             | 2                     |
+| batch1_tax_rate          | 1             | 2                     |
+| batch1_trade_history     | 1             | 2                     |
+| batch1_trade_type        | 1             | 2                     |
+| staging_account          | 3             | 6                     |
+| staging_batch_date       | 3             | 6                     |
+| staging_cash_transaction | 3             | 6                     |
+| staging_customer         | 3             | 6                     |
+| staging_daily_market     | 3             | 6                     |
+| staging_holding_history  | 3             | 6                     |
+| staging_prospect         | 3             | 6                     |
+| staging_trade            | 3             | 6                     |
+| staging_watch_history    | 3             | 6                     |
 
 ## Base64 decode table for `_openivm/tables/`
 
 Generated programmatically with `base64.urlsafe_b64decode(segment + padding)` and `len(glob("rocksdb/*.sst"))`.
 
-| safePathSegment | Decoded `db.table` | Layer | num SST files |
-| --- | --- | --- | --- |
-| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` | bronze | 4 |
-| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | `bronze.brokerage_daily_market` | bronze | 4 |
-| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk` | `bronze.brokerage_holding_history` | bronze | 4 |
-| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ` | `bronze.brokerage_trade` | bronze | 4 |
-| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5` | `bronze.brokerage_watch_history` | bronze | 4 |
-| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210` | `bronze.crm_customer_mgmt` | bronze | 4 |
-| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q` | `bronze.syndicated_prospect` | bronze | 4 |
-| `Z29sZC5kaW1fYWNjb3VudA` | `gold.dim_account` | gold | 4 |
-| `Z29sZC5kaW1fY3VzdG9tZXI` | `gold.dim_customer` | gold | 4 |
-| `Z29sZC5kaW1fc2VjdXJpdHk` | `gold.dim_security` | gold | 4 |
-| `Z29sZC5kaW1fdHJhZGU` | `gold.dim_trade` | gold | 4 |
-| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z` | `gold.fact_cash_transactions` | gold | 4 |
-| `Z29sZC5mYWN0X3RyYWRl` | `gold.fact_trade` | gold | 4 |
-| `Z29sZC5mYWN0X3dhdGNoZXM` | `gold.fact_watches` | gold | 4 |
-| `c2lsdmVyLmFjY291bnRz` | `silver.accounts` | silver | 4 |
-| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z` | `silver.cash_transactions` | silver | 4 |
-| `c2lsdmVyLmN1c3RvbWVycw` | `silver.customers` | silver | 4 |
-| `c2lsdmVyLmRhaWx5X21hcmtldA` | `silver.daily_market` | silver | 4 |
-| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk` | `silver.holdings_history` | silver | 4 |
-| `c2lsdmVyLnRyYWRlcw` | `silver.trades` | silver | 4 |
-| `c2lsdmVyLnRyYWRlc19oaXN0b3J5` | `silver.trades_history` | silver | 4 |
-| `c2lsdmVyLndhdGNoZXM` | `silver.watches` | silver | 4 |
-| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ` | `silver.watches_history` | silver | 4 |
-| `dHBjZGkuc3RhZ2luZ19hY2NvdW50` | `tpcdi.staging_account` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ19jYXNoX3RyYW5zYWN0aW9u` | `tpcdi.staging_cash_transaction` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ19jdXN0b21lcg` | `tpcdi.staging_customer` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ` | `tpcdi.staging_daily_market` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ19ob2xkaW5nX2hpc3Rvcnk` | `tpcdi.staging_holding_history` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ19wcm9zcGVjdA` | `tpcdi.staging_prospect` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ190cmFkZQ` | `tpcdi.staging_trade` | tpcdi | 4 |
-| `dHBjZGkuc3RhZ2luZ193YXRjaF9oaXN0b3J5` | `tpcdi.staging_watch_history` | tpcdi | 4 |
+| safePathSegment                                | Decoded `db.table`                  | Layer  | num SST files |
+| ---------------------------------------------- | ----------------------------------- | ------ | ------------- |
+| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` | bronze | 4             |
+| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ`      | `bronze.brokerage_daily_market`     | bronze | 4             |
+| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk`  | `bronze.brokerage_holding_history`  | bronze | 4             |
+| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ`               | `bronze.brokerage_trade`            | bronze | 4             |
+| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5`     | `bronze.brokerage_watch_history`    | bronze | 4             |
+| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210`             | `bronze.crm_customer_mgmt`          | bronze | 4             |
+| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q`          | `bronze.syndicated_prospect`        | bronze | 4             |
+| `Z29sZC5kaW1fYWNjb3VudA`                       | `gold.dim_account`                  | gold   | 4             |
+| `Z29sZC5kaW1fY3VzdG9tZXI`                      | `gold.dim_customer`                 | gold   | 4             |
+| `Z29sZC5kaW1fc2VjdXJpdHk`                      | `gold.dim_security`                 | gold   | 4             |
+| `Z29sZC5kaW1fdHJhZGU`                          | `gold.dim_trade`                    | gold   | 4             |
+| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z`         | `gold.fact_cash_transactions`       | gold   | 4             |
+| `Z29sZC5mYWN0X3RyYWRl`                         | `gold.fact_trade`                   | gold   | 4             |
+| `Z29sZC5mYWN0X3dhdGNoZXM`                      | `gold.fact_watches`                 | gold   | 4             |
+| `c2lsdmVyLmFjY291bnRz`                         | `silver.accounts`                   | silver | 4             |
+| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z`             | `silver.cash_transactions`          | silver | 4             |
+| `c2lsdmVyLmN1c3RvbWVycw`                       | `silver.customers`                  | silver | 4             |
+| `c2lsdmVyLmRhaWx5X21hcmtldA`                   | `silver.daily_market`               | silver | 4             |
+| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk`              | `silver.holdings_history`           | silver | 4             |
+| `c2lsdmVyLnRyYWRlcw`                           | `silver.trades`                     | silver | 4             |
+| `c2lsdmVyLnRyYWRlc19oaXN0b3J5`                 | `silver.trades_history`             | silver | 4             |
+| `c2lsdmVyLndhdGNoZXM`                          | `silver.watches`                    | silver | 4             |
+| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ`               | `silver.watches_history`            | silver | 4             |
+| `dHBjZGkuc3RhZ2luZ19hY2NvdW50`                 | `tpcdi.staging_account`             | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ19jYXNoX3RyYW5zYWN0aW9u`     | `tpcdi.staging_cash_transaction`    | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ19jdXN0b21lcg`               | `tpcdi.staging_customer`            | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ`          | `tpcdi.staging_daily_market`        | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ19ob2xkaW5nX2hpc3Rvcnk`      | `tpcdi.staging_holding_history`     | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ19wcm9zcGVjdA`               | `tpcdi.staging_prospect`            | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ190cmFkZQ`                   | `tpcdi.staging_trade`               | tpcdi  | 4             |
+| `dHBjZGkuc3RhZ2luZ193YXRjaF9oaXN0b3J5`         | `tpcdi.staging_watch_history`       | tpcdi  | 4             |
 
 ### `_openivm/tables/` layer counts
 
-| Layer | tracked table dirs |
-| --- | --- |
-| bronze | 7 |
-| gold | 7 |
-| silver | 9 |
-| tpcdi | 8 |
+| Layer  | tracked table dirs |
+| ------ | ------------------ |
+| bronze | 7                  |
+| gold   | 7                  |
+| silver | 9                  |
+| tpcdi  | 8                  |
 
 ## MV inventory and refresh metadata
 
 Per-MV RocksDB stores under `_openivm/mvs/<safe>/rocksdb/` contain `refresh_type_name`. This host lacks `ldb`/`sst_dump`, so the table scans SST string payloads for the persisted refresh type names.
 
-| MV | Layer | code | refresh type | Delta rows | MV parquet files | MV SST files | view-delta dirs |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `bronze.brokerage_cash_transaction` | bronze | 2 | SIMPLE_PROJECTION | 3621 | 3 | 4 | 2 |
-| `bronze.brokerage_daily_market` | bronze | 2 | SIMPLE_PROJECTION | 12830 | 3 | 4 | 2 |
-| `bronze.brokerage_holding_history` | bronze | 2 | SIMPLE_PROJECTION | 3626 | 3 | 4 | 2 |
-| `bronze.brokerage_trade` | bronze | 2 | SIMPLE_PROJECTION | 3912 | 3 | 4 | 2 |
-| `bronze.brokerage_trade_history` | bronze | 2 | SIMPLE_PROJECTION | 9822 | 1 | 3 | 0 |
-| `bronze.brokerage_watch_history` | bronze | 2 | SIMPLE_PROJECTION | 9003 | 3 | 4 | 2 |
-| `bronze.crm_customer_mgmt` | bronze | 2 | SIMPLE_PROJECTION | 150 | 5 | 4 | 2 |
-| `bronze.finwire_company` | bronze | 2 | SIMPLE_PROJECTION | 7 | 1 | 3 | 0 |
-| `bronze.finwire_financial` | bronze | 2 | SIMPLE_PROJECTION | 1007 | 1 | 3 | 0 |
-| `bronze.finwire_security` | bronze | 2 | SIMPLE_PROJECTION | 11 | 1 | 3 | 0 |
-| `bronze.hr_employee` | bronze | 2 | SIMPLE_PROJECTION | 150 | 1 | 3 | 0 |
-| `bronze.reference_date` | bronze | 2 | SIMPLE_PROJECTION | 260 | 1 | 3 | 0 |
-| `bronze.reference_industry` | bronze | 2 | SIMPLE_PROJECTION | 2 | 1 | 3 | 0 |
-| `bronze.reference_status_type` | bronze | 2 | SIMPLE_PROJECTION | 1 | 1 | 3 | 0 |
-| `bronze.reference_tax_rate` | bronze | 2 | SIMPLE_PROJECTION | 4 | 1 | 3 | 0 |
-| `bronze.reference_trade_type` | bronze | 2 | SIMPLE_PROJECTION | 1 | 1 | 3 | 0 |
-| `bronze.syndicated_prospect` | bronze | 2 | SIMPLE_PROJECTION | 152 | 3 | 4 | 2 |
-| `gold.broker_performance` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.customer_concentration` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.daily_market_pulse` | gold | 3 | FULL_REFRESH | 27 | 3 | 4 | 0 |
-| `gold.dim_account` | gold | 3 | FULL_REFRESH | 6 | 3 | 4 | 0 |
-| `gold.dim_broker` | gold | 2 | SIMPLE_PROJECTION | 150 | 1 | 3 | 0 |
-| `gold.dim_company` | gold | 2 | SIMPLE_PROJECTION | 0 | 1 | 3 | 0 |
-| `gold.dim_customer` | gold | 5 | WINDOW_PARTITION | 81 | 3 | 4 | 2 |
-| `gold.dim_date` | gold | 2 | SIMPLE_PROJECTION | 260 | 1 | 3 | 0 |
-| `gold.dim_security` | gold | 3 | FULL_REFRESH | 0 | 3 | 3 | 0 |
-| `gold.dim_trade` | gold | 2 | SIMPLE_PROJECTION | 0 | 3 | 5 | 2 |
-| `gold.fact_cash_balances` | gold | 3 | FULL_REFRESH | 48 | 3 | 4 | 0 |
-| `gold.fact_cash_transactions` | gold | 3 | FULL_REFRESH | 48 | 3 | 4 | 0 |
-| `gold.fact_holdings` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.fact_market_history` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.fact_trade` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.fact_watches` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `gold.market_volatility` | gold | 5 | WINDOW_PARTITION | 5172 | 3 | 4 | 0 |
-| `gold.trade_volume_stats` | gold | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `silver.accounts` | silver | 5 | WINDOW_PARTITION | 133 | 3 | 4 | 2 |
-| `silver.cash_transactions` | silver | 3 | FULL_REFRESH | 10857 | 3 | 4 | 0 |
-| `silver.companies` | silver | 5 | WINDOW_PARTITION | 0 | 1 | 3 | 0 |
-| `silver.customers` | silver | 5 | WINDOW_PARTITION | 81 | 3 | 4 | 2 |
-| `silver.daily_market` | silver | 5 | WINDOW_PARTITION | 25667 | 5 | 4 | 2 |
-| `silver.date` | silver | 2 | SIMPLE_PROJECTION | 260 | 1 | 3 | 0 |
-| `silver.employees` | silver | 2 | SIMPLE_PROJECTION | 150 | 1 | 3 | 0 |
-| `silver.financials` | silver | 5 | WINDOW_PARTITION | 1007 | 1 | 3 | 0 |
-| `silver.holdings_history` | silver | 3 | FULL_REFRESH | 0 | 3 | 5 | 0 |
-| `silver.securities` | silver | 5 | WINDOW_PARTITION | 11 | 1 | 3 | 0 |
-| `silver.trades` | silver | 5 | WINDOW_PARTITION | 0 | 3 | 5 | 2 |
-| `silver.trades_history` | silver | 5 | WINDOW_PARTITION | 0 | 3 | 5 | 2 |
-| `silver.watches` | silver | 3 | FULL_REFRESH | 15 | 3 | 4 | 0 |
-| `silver.watches_history` | silver | 3 | FULL_REFRESH | 15 | 3 | 4 | 0 |
+| MV                                  | Layer  | code | refresh type      | Delta rows | MV parquet files | MV SST files | view-delta dirs |
+| ----------------------------------- | ------ | ---- | ----------------- | ---------- | ---------------- | ------------ | --------------- |
+| `bronze.brokerage_cash_transaction` | bronze | 2    | SIMPLE_PROJECTION | 3621       | 3                | 4            | 2               |
+| `bronze.brokerage_daily_market`     | bronze | 2    | SIMPLE_PROJECTION | 12830      | 3                | 4            | 2               |
+| `bronze.brokerage_holding_history`  | bronze | 2    | SIMPLE_PROJECTION | 3626       | 3                | 4            | 2               |
+| `bronze.brokerage_trade`            | bronze | 2    | SIMPLE_PROJECTION | 3912       | 3                | 4            | 2               |
+| `bronze.brokerage_trade_history`    | bronze | 2    | SIMPLE_PROJECTION | 9822       | 1                | 3            | 0               |
+| `bronze.brokerage_watch_history`    | bronze | 2    | SIMPLE_PROJECTION | 9003       | 3                | 4            | 2               |
+| `bronze.crm_customer_mgmt`          | bronze | 2    | SIMPLE_PROJECTION | 150        | 5                | 4            | 2               |
+| `bronze.finwire_company`            | bronze | 2    | SIMPLE_PROJECTION | 7          | 1                | 3            | 0               |
+| `bronze.finwire_financial`          | bronze | 2    | SIMPLE_PROJECTION | 1007       | 1                | 3            | 0               |
+| `bronze.finwire_security`           | bronze | 2    | SIMPLE_PROJECTION | 11         | 1                | 3            | 0               |
+| `bronze.hr_employee`                | bronze | 2    | SIMPLE_PROJECTION | 150        | 1                | 3            | 0               |
+| `bronze.reference_date`             | bronze | 2    | SIMPLE_PROJECTION | 260        | 1                | 3            | 0               |
+| `bronze.reference_industry`         | bronze | 2    | SIMPLE_PROJECTION | 2          | 1                | 3            | 0               |
+| `bronze.reference_status_type`      | bronze | 2    | SIMPLE_PROJECTION | 1          | 1                | 3            | 0               |
+| `bronze.reference_tax_rate`         | bronze | 2    | SIMPLE_PROJECTION | 4          | 1                | 3            | 0               |
+| `bronze.reference_trade_type`       | bronze | 2    | SIMPLE_PROJECTION | 1          | 1                | 3            | 0               |
+| `bronze.syndicated_prospect`        | bronze | 2    | SIMPLE_PROJECTION | 152        | 3                | 4            | 2               |
+| `gold.broker_performance`           | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.customer_concentration`       | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.daily_market_pulse`           | gold   | 3    | FULL_REFRESH      | 27         | 3                | 4            | 0               |
+| `gold.dim_account`                  | gold   | 3    | FULL_REFRESH      | 6          | 3                | 4            | 0               |
+| `gold.dim_broker`                   | gold   | 2    | SIMPLE_PROJECTION | 150        | 1                | 3            | 0               |
+| `gold.dim_company`                  | gold   | 2    | SIMPLE_PROJECTION | 0          | 1                | 3            | 0               |
+| `gold.dim_customer`                 | gold   | 5    | WINDOW_PARTITION  | 81         | 3                | 4            | 2               |
+| `gold.dim_date`                     | gold   | 2    | SIMPLE_PROJECTION | 260        | 1                | 3            | 0               |
+| `gold.dim_security`                 | gold   | 3    | FULL_REFRESH      | 0          | 3                | 3            | 0               |
+| `gold.dim_trade`                    | gold   | 2    | SIMPLE_PROJECTION | 0          | 3                | 5            | 2               |
+| `gold.fact_cash_balances`           | gold   | 3    | FULL_REFRESH      | 48         | 3                | 4            | 0               |
+| `gold.fact_cash_transactions`       | gold   | 3    | FULL_REFRESH      | 48         | 3                | 4            | 0               |
+| `gold.fact_holdings`                | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.fact_market_history`          | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.fact_trade`                   | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.fact_watches`                 | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `gold.market_volatility`            | gold   | 5    | WINDOW_PARTITION  | 5172       | 3                | 4            | 0               |
+| `gold.trade_volume_stats`           | gold   | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `silver.accounts`                   | silver | 5    | WINDOW_PARTITION  | 133        | 3                | 4            | 2               |
+| `silver.cash_transactions`          | silver | 3    | FULL_REFRESH      | 10857      | 3                | 4            | 0               |
+| `silver.companies`                  | silver | 5    | WINDOW_PARTITION  | 0          | 1                | 3            | 0               |
+| `silver.customers`                  | silver | 5    | WINDOW_PARTITION  | 81         | 3                | 4            | 2               |
+| `silver.daily_market`               | silver | 5    | WINDOW_PARTITION  | 25667      | 5                | 4            | 2               |
+| `silver.date`                       | silver | 2    | SIMPLE_PROJECTION | 260        | 1                | 3            | 0               |
+| `silver.employees`                  | silver | 2    | SIMPLE_PROJECTION | 150        | 1                | 3            | 0               |
+| `silver.financials`                 | silver | 5    | WINDOW_PARTITION  | 1007       | 1                | 3            | 0               |
+| `silver.holdings_history`           | silver | 3    | FULL_REFRESH      | 0          | 3                | 5            | 0               |
+| `silver.securities`                 | silver | 5    | WINDOW_PARTITION  | 11         | 1                | 3            | 0               |
+| `silver.trades`                     | silver | 5    | WINDOW_PARTITION  | 0          | 3                | 5            | 2               |
+| `silver.trades_history`             | silver | 5    | WINDOW_PARTITION  | 0          | 3                | 5            | 2               |
+| `silver.watches`                    | silver | 3    | FULL_REFRESH      | 15         | 3                | 4            | 0               |
+| `silver.watches_history`            | silver | 3    | FULL_REFRESH      | 15         | 3                | 4            | 0               |
 
 ## Representative materialized views
 
@@ -194,18 +194,18 @@ Metadata(id: be784291-c304-4291-8f00-f20fcae5c5f0, name: None, description: None
 
 Schema fields:
 
-| field | type | nullable | metadata |
-| --- | --- | --- | --- |
-| dm_date | date | True | {} |
-| dm_s_symb | string | True | {} |
-| dm_close | double | True | {} |
-| dm_high | double | True | {} |
-| dm_low | double | True | {} |
-| dm_vol | integer | True | {} |
-| fifty_two_week_low | double | True | {"__autoGeneratedAlias": "true"} |
-| fifty_two_week_high | double | True | {"__autoGeneratedAlias": "true"} |
-| fifty_two_week_low_date | date | True | {"__autoGeneratedAlias": "true"} |
-| fifty_two_week_high_date | date | True | {"__autoGeneratedAlias": "true"} |
+| field                    | type    | nullable | metadata                           |
+| ------------------------ | ------- | -------- | ---------------------------------- |
+| dm_date                  | date    | True     | {}                                 |
+| dm_s_symb                | string  | True     | {}                                 |
+| dm_close                 | double  | True     | {}                                 |
+| dm_high                  | double  | True     | {}                                 |
+| dm_low                   | double  | True     | {}                                 |
+| dm_vol                   | integer | True     | {}                                 |
+| fifty_two_week_low       | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| fifty_two_week_high      | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| fifty_two_week_low_date  | date    | True     | {"\_\_autoGeneratedAlias": "true"} |
+| fifty_two_week_high_date | date    | True     | {"\_\_autoGeneratedAlias": "true"} |
 
 `dt.to_pandas().head(10)` output:
 
@@ -226,10 +226,10 @@ Schema fields:
 
 Corresponding source/base state:
 
-| base/source | safe segment | _openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
-| --- | --- | --- | --- | --- | --- | --- |
-| `bronze.brokerage_daily_market` | `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | True | 4 | 2 | 2 | 0 |
-| `tpcdi.staging_daily_market` | `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ` | True | 4 | 0 | 0 | 2 |
+| base/source                     | safe segment                              | \_openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
+| ------------------------------- | ----------------------------------------- | -------------- | --------- | --------------- | ------------------ | ------------------------ |
+| `bronze.brokerage_daily_market` | `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | True           | 4         | 2               | 2                  | 0                        |
+| `tpcdi.staging_daily_market`    | `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ`     | True           | 4         | 0               | 0                  | 2                        |
 
 ### `gold.market_volatility`
 
@@ -254,22 +254,22 @@ Metadata(id: 05ea3d15-8176-4f04-b3da-b89dd82526b1, name: None, description: None
 
 Schema fields:
 
-| field | type | nullable | metadata |
-| --- | --- | --- | --- |
-| dm_s_symb | string | True | {} |
-| trading_days | long | True | {"__autoGeneratedAlias": "true"} |
-| avg_daily_return | double | True | {"__autoGeneratedAlias": "true"} |
-| return_volatility | double | True | {"__autoGeneratedAlias": "true"} |
-| avg_intraday_range | double | True | {"__autoGeneratedAlias": "true"} |
-| max_intraday_range | double | True | {"__autoGeneratedAlias": "true"} |
-| total_volume | long | True | {"__autoGeneratedAlias": "true"} |
-| avg_volume | double | True | {"__autoGeneratedAlias": "true"} |
-| volume_volatility | double | True | {"__autoGeneratedAlias": "true"} |
-| unique_trading_dates | long | True | {"__autoGeneratedAlias": "true"} |
-| volatility_z_score | double | True | {"__autoGeneratedAlias": "true"} |
-| pct_market_volume | double | True | {"__autoGeneratedAlias": "true"} |
-| rank_by_volatility | integer | True | {"__autoGeneratedAlias": "true"} |
-| rank_by_volume | integer | True | {"__autoGeneratedAlias": "true"} |
+| field                | type    | nullable | metadata                           |
+| -------------------- | ------- | -------- | ---------------------------------- |
+| dm_s_symb            | string  | True     | {}                                 |
+| trading_days         | long    | True     | {"\_\_autoGeneratedAlias": "true"} |
+| avg_daily_return     | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| return_volatility    | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| avg_intraday_range   | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| max_intraday_range   | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| total_volume         | long    | True     | {"\_\_autoGeneratedAlias": "true"} |
+| avg_volume           | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| volume_volatility    | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| unique_trading_dates | long    | True     | {"\_\_autoGeneratedAlias": "true"} |
+| volatility_z_score   | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| pct_market_volume    | double  | True     | {"\_\_autoGeneratedAlias": "true"} |
+| rank_by_volatility   | integer | True     | {"\_\_autoGeneratedAlias": "true"} |
+| rank_by_volume       | integer | True     | {"\_\_autoGeneratedAlias": "true"} |
 
 `dt.to_pandas().head(10)` output:
 
@@ -290,9 +290,9 @@ Schema fields:
 
 Corresponding source/base state:
 
-| base/source | safe segment | _openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
-| --- | --- | --- | --- | --- | --- | --- |
-| `silver.daily_market` | `c2lsdmVyLmRhaWx5X21hcmtldA` | True | 4 | 2 | 5 | 0 |
+| base/source           | safe segment                 | \_openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
+| --------------------- | ---------------------------- | -------------- | --------- | --------------- | ------------------ | ------------------------ |
+| `silver.daily_market` | `c2lsdmVyLmRhaWx5X21hcmtldA` | True           | 4         | 2               | 5                  | 0                        |
 
 ### `gold.fact_cash_transactions`
 
@@ -317,14 +317,14 @@ Metadata(id: 478a34cd-ef4d-4963-aab1-1931dd979f72, name: None, description: None
 
 Schema fields:
 
-| field | type | nullable | metadata |
-| --- | --- | --- | --- |
-| sk_customer_id | string | True | {} |
-| sk_account_id | string | True | {} |
-| sk_transaction_date | date | True | {} |
-| transaction_timestamp | timestamp | True | {} |
-| amount | double | True | {} |
-| description | string | True | {} |
+| field                 | type      | nullable | metadata |
+| --------------------- | --------- | -------- | -------- |
+| sk_customer_id        | string    | True     | {}       |
+| sk_account_id         | string    | True     | {}       |
+| sk_transaction_date   | date      | True     | {}       |
+| transaction_timestamp | timestamp | True     | {}       |
+| amount                | double    | True     | {}       |
+| description           | string    | True     | {}       |
 
 `dt.to_pandas().head(10)` output:
 
@@ -345,29 +345,29 @@ Schema fields:
 
 Corresponding source/base state:
 
-| base/source | safe segment | _openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
-| --- | --- | --- | --- | --- | --- | --- |
-| `silver.cash_transactions` | `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z` | True | 4 | 0 | 0 | 0 |
-| `gold.dim_account` | `Z29sZC5kaW1fYWNjb3VudA` | True | 4 | 0 | 0 | 0 |
+| base/source                | safe segment                       | \_openivm dir? | SST files | view-delta dirs | view-delta parquet | base staging INSERT dirs |
+| -------------------------- | ---------------------------------- | -------------- | --------- | --------------- | ------------------ | ------------------------ |
+| `silver.cash_transactions` | `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z` | True           | 4         | 0               | 0                  | 0                        |
+| `gold.dim_account`         | `Z29sZC5kaW1fYWNjb3VudA`           | True           | 4         | 0               | 0                  | 0                        |
 
 ### Suggested examples from the prompt
 
-| MV | Delta table? | rows | observation |
-| --- | --- | --- | --- |
-| `gold.dim_security` | True | 0 | empty Delta MV table |
-| `gold.fact_watches` | True | 0 | empty Delta MV table |
-| `silver.customers` | True | 81 | 81 rows; `to_pandas()` fails on far-future SCD timestamps, DuckDB reads the parquet payload |
+| MV                  | Delta table? | rows | observation                                                                                 |
+| ------------------- | ------------ | ---- | ------------------------------------------------------------------------------------------- |
+| `gold.dim_security` | True         | 0    | empty Delta MV table                                                                        |
+| `gold.fact_watches` | True         | 0    | empty Delta MV table                                                                        |
+| `silver.customers`  | True         | 81   | 81 rows; `to_pandas()` fails on far-future SCD timestamps, DuckDB reads the parquet payload |
 
 ## Hive metastore `.db` directories
 
 The `.db` entries are Spark/Hive database directories, not DuckDB database files. They are empty directories in this live warehouse.
 
-| path | is directory? | is file? | entries |
-| --- | --- | --- | --- |
-| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/bronze.db` | True | False | 0 |
-| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/silver.db` | True | False | 0 |
-| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/gold.db` | True | False | 0 |
-| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/tpcdi.db` | True | False | 0 |
+| path                                                                                    | is directory? | is file? | entries |
+| --------------------------------------------------------------------------------------- | ------------- | -------- | ------- |
+| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/bronze.db` | True          | False    | 0       |
+| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/silver.db` | True          | False    | 0       |
+| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/gold.db`   | True          | False    | 0       |
+| `/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/tpcdi.db`  | True          | False    | 0       |
 
 Requested DuckDB probe and real output:
 
@@ -376,6 +376,7 @@ import duckdb
 con = duckdb.connect('/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/gold.db', read_only=True)
 print(con.sql('SHOW TABLES').fetchall())
 ```
+
 ```text
 IOException: IO Error: Could not read from file "/home/mdrrahman/openivm-spark/.temp/ivm-bench/mount/results/3/spark-openivm/gold.db": Is a directory
 ```
@@ -555,124 +556,124 @@ flowchart LR
 
 ### Dependency edge table
 
-| from | to |
-| --- | --- |
-| `sources/batch1_finwire` | `bronze.finwire_financial` |
-| `sources/batch1_finwire` | `bronze.finwire_security` |
-| `sources/batch1_finwire` | `bronze.finwire_company` |
-| `sources/batch1_industry` | `bronze.reference_industry` |
-| `sources/batch1_date` | `bronze.reference_date` |
-| `sources/batch1_trade_type` | `bronze.reference_trade_type` |
-| `sources/batch1_status_type` | `bronze.reference_status_type` |
-| `sources/batch1_tax_rate` | `bronze.reference_tax_rate` |
-| `sources/staging_holding_history` | `bronze.brokerage_holding_history` |
-| `sources/staging_daily_market` | `bronze.brokerage_daily_market` |
-| `sources/staging_watch_history` | `bronze.brokerage_watch_history` |
-| `sources/staging_cash_transaction` | `bronze.brokerage_cash_transaction` |
-| `sources/staging_trade` | `bronze.brokerage_trade` |
-| `sources/batch1_trade_history` | `bronze.brokerage_trade_history` |
-| `sources/batch1_hr` | `bronze.hr_employee` |
-| `sources/staging_prospect` | `bronze.syndicated_prospect` |
-| `sources/batch1_customer_mgmt` | `bronze.crm_customer_mgmt` |
-| `sources/staging_account` | `bronze.crm_customer_mgmt` |
-| `sources/staging_customer` | `bronze.crm_customer_mgmt` |
-| `silver.trades` | `gold.fact_trade` |
-| `gold.dim_trade` | `gold.fact_trade` |
-| `gold.dim_account` | `gold.fact_trade` |
-| `gold.dim_security` | `gold.fact_trade` |
-| `silver.holdings_history` | `gold.fact_holdings` |
-| `gold.dim_trade` | `gold.fact_holdings` |
-| `gold.dim_account` | `gold.fact_holdings` |
-| `gold.dim_security` | `gold.fact_holdings` |
-| `silver.trades_history` | `gold.dim_trade` |
-| `silver.cash_transactions` | `gold.fact_cash_transactions` |
-| `gold.dim_account` | `gold.fact_cash_transactions` |
-| `silver.accounts` | `gold.dim_account` |
-| `gold.dim_customer` | `gold.dim_account` |
-| `gold.dim_broker` | `gold.dim_account` |
-| `silver.daily_market` | `gold.fact_market_history` |
-| `gold.dim_security` | `gold.fact_market_history` |
-| `work.wrk_company_financials` | `gold.fact_market_history` |
-| `silver.securities` | `gold.dim_security` |
-| `gold.dim_company` | `gold.dim_security` |
-| `silver.companies` | `gold.dim_company` |
-| `silver.date` | `gold.dim_date` |
-| `silver.employees` | `gold.dim_broker` |
-| `silver.watches` | `gold.fact_watches` |
-| `gold.dim_customer` | `gold.fact_watches` |
-| `gold.dim_security` | `gold.fact_watches` |
-| `silver.customers` | `gold.dim_customer` |
-| `bronze.syndicated_prospect` | `gold.dim_customer` |
-| `gold.fact_cash_transactions` | `gold.fact_cash_balances` |
-| `gold.fact_trade` | `gold.trade_volume_stats` |
-| `gold.dim_security` | `gold.trade_volume_stats` |
-| `gold.fact_watches` | `gold.trade_volume_stats` |
-| `gold.fact_trade` | `gold.customer_concentration` |
-| `gold.dim_security` | `gold.customer_concentration` |
-| `gold.fact_watches` | `gold.customer_concentration` |
-| `silver.daily_market` | `gold.daily_market_pulse` |
-| `gold.fact_trade` | `gold.daily_market_pulse` |
-| `silver.daily_market` | `gold.market_volatility` |
-| `gold.fact_trade` | `gold.broker_performance` |
-| `gold.dim_broker` | `gold.broker_performance` |
-| `gold.fact_cash_transactions` | `gold.broker_performance` |
-| `silver.watches_history` | `silver.watches` |
-| `bronze.reference_date` | `silver.date` |
-| `bronze.brokerage_watch_history` | `silver.watches_history` |
-| `silver.securities` | `silver.watches_history` |
-| `bronze.finwire_financial` | `silver.financials` |
-| `silver.companies` | `silver.financials` |
-| `bronze.brokerage_holding_history` | `silver.holdings_history` |
-| `silver.trades` | `silver.holdings_history` |
-| `bronze.crm_customer_mgmt` | `silver.accounts` |
-| `bronze.reference_tax_rate` | `silver.accounts` |
-| `bronze.brokerage_trade` | `silver.trades_history` |
-| `bronze.brokerage_trade_history` | `silver.trades_history` |
-| `bronze.reference_trade_type` | `silver.trades_history` |
-| `bronze.reference_status_type` | `silver.trades_history` |
-| `bronze.hr_employee` | `silver.employees` |
-| `bronze.brokerage_cash_transaction` | `silver.cash_transactions` |
-| `silver.accounts` | `silver.cash_transactions` |
-| `silver.trades_history` | `silver.trades` |
-| `bronze.finwire_company` | `silver.companies` |
-| `bronze.reference_status_type` | `silver.companies` |
-| `bronze.reference_industry` | `silver.companies` |
-| `bronze.finwire_security` | `silver.securities` |
-| `silver.companies` | `silver.securities` |
-| `bronze.brokerage_daily_market` | `silver.daily_market` |
-| `bronze.crm_customer_mgmt` | `silver.customers` |
-| `bronze.reference_tax_rate` | `silver.customers` |
-| `silver.financials` | `work.wrk_company_financials` |
-| `gold.dim_company` | `work.wrk_company_financials` |
+| from                                | to                                  |
+| ----------------------------------- | ----------------------------------- |
+| `sources/batch1_finwire`            | `bronze.finwire_financial`          |
+| `sources/batch1_finwire`            | `bronze.finwire_security`           |
+| `sources/batch1_finwire`            | `bronze.finwire_company`            |
+| `sources/batch1_industry`           | `bronze.reference_industry`         |
+| `sources/batch1_date`               | `bronze.reference_date`             |
+| `sources/batch1_trade_type`         | `bronze.reference_trade_type`       |
+| `sources/batch1_status_type`        | `bronze.reference_status_type`      |
+| `sources/batch1_tax_rate`           | `bronze.reference_tax_rate`         |
+| `sources/staging_holding_history`   | `bronze.brokerage_holding_history`  |
+| `sources/staging_daily_market`      | `bronze.brokerage_daily_market`     |
+| `sources/staging_watch_history`     | `bronze.brokerage_watch_history`    |
+| `sources/staging_cash_transaction`  | `bronze.brokerage_cash_transaction` |
+| `sources/staging_trade`             | `bronze.brokerage_trade`            |
+| `sources/batch1_trade_history`      | `bronze.brokerage_trade_history`    |
+| `sources/batch1_hr`                 | `bronze.hr_employee`                |
+| `sources/staging_prospect`          | `bronze.syndicated_prospect`        |
+| `sources/batch1_customer_mgmt`      | `bronze.crm_customer_mgmt`          |
+| `sources/staging_account`           | `bronze.crm_customer_mgmt`          |
+| `sources/staging_customer`          | `bronze.crm_customer_mgmt`          |
+| `silver.trades`                     | `gold.fact_trade`                   |
+| `gold.dim_trade`                    | `gold.fact_trade`                   |
+| `gold.dim_account`                  | `gold.fact_trade`                   |
+| `gold.dim_security`                 | `gold.fact_trade`                   |
+| `silver.holdings_history`           | `gold.fact_holdings`                |
+| `gold.dim_trade`                    | `gold.fact_holdings`                |
+| `gold.dim_account`                  | `gold.fact_holdings`                |
+| `gold.dim_security`                 | `gold.fact_holdings`                |
+| `silver.trades_history`             | `gold.dim_trade`                    |
+| `silver.cash_transactions`          | `gold.fact_cash_transactions`       |
+| `gold.dim_account`                  | `gold.fact_cash_transactions`       |
+| `silver.accounts`                   | `gold.dim_account`                  |
+| `gold.dim_customer`                 | `gold.dim_account`                  |
+| `gold.dim_broker`                   | `gold.dim_account`                  |
+| `silver.daily_market`               | `gold.fact_market_history`          |
+| `gold.dim_security`                 | `gold.fact_market_history`          |
+| `work.wrk_company_financials`       | `gold.fact_market_history`          |
+| `silver.securities`                 | `gold.dim_security`                 |
+| `gold.dim_company`                  | `gold.dim_security`                 |
+| `silver.companies`                  | `gold.dim_company`                  |
+| `silver.date`                       | `gold.dim_date`                     |
+| `silver.employees`                  | `gold.dim_broker`                   |
+| `silver.watches`                    | `gold.fact_watches`                 |
+| `gold.dim_customer`                 | `gold.fact_watches`                 |
+| `gold.dim_security`                 | `gold.fact_watches`                 |
+| `silver.customers`                  | `gold.dim_customer`                 |
+| `bronze.syndicated_prospect`        | `gold.dim_customer`                 |
+| `gold.fact_cash_transactions`       | `gold.fact_cash_balances`           |
+| `gold.fact_trade`                   | `gold.trade_volume_stats`           |
+| `gold.dim_security`                 | `gold.trade_volume_stats`           |
+| `gold.fact_watches`                 | `gold.trade_volume_stats`           |
+| `gold.fact_trade`                   | `gold.customer_concentration`       |
+| `gold.dim_security`                 | `gold.customer_concentration`       |
+| `gold.fact_watches`                 | `gold.customer_concentration`       |
+| `silver.daily_market`               | `gold.daily_market_pulse`           |
+| `gold.fact_trade`                   | `gold.daily_market_pulse`           |
+| `silver.daily_market`               | `gold.market_volatility`            |
+| `gold.fact_trade`                   | `gold.broker_performance`           |
+| `gold.dim_broker`                   | `gold.broker_performance`           |
+| `gold.fact_cash_transactions`       | `gold.broker_performance`           |
+| `silver.watches_history`            | `silver.watches`                    |
+| `bronze.reference_date`             | `silver.date`                       |
+| `bronze.brokerage_watch_history`    | `silver.watches_history`            |
+| `silver.securities`                 | `silver.watches_history`            |
+| `bronze.finwire_financial`          | `silver.financials`                 |
+| `silver.companies`                  | `silver.financials`                 |
+| `bronze.brokerage_holding_history`  | `silver.holdings_history`           |
+| `silver.trades`                     | `silver.holdings_history`           |
+| `bronze.crm_customer_mgmt`          | `silver.accounts`                   |
+| `bronze.reference_tax_rate`         | `silver.accounts`                   |
+| `bronze.brokerage_trade`            | `silver.trades_history`             |
+| `bronze.brokerage_trade_history`    | `silver.trades_history`             |
+| `bronze.reference_trade_type`       | `silver.trades_history`             |
+| `bronze.reference_status_type`      | `silver.trades_history`             |
+| `bronze.hr_employee`                | `silver.employees`                  |
+| `bronze.brokerage_cash_transaction` | `silver.cash_transactions`          |
+| `silver.accounts`                   | `silver.cash_transactions`          |
+| `silver.trades_history`             | `silver.trades`                     |
+| `bronze.finwire_company`            | `silver.companies`                  |
+| `bronze.reference_status_type`      | `silver.companies`                  |
+| `bronze.reference_industry`         | `silver.companies`                  |
+| `bronze.finwire_security`           | `silver.securities`                 |
+| `silver.companies`                  | `silver.securities`                 |
+| `bronze.brokerage_daily_market`     | `silver.daily_market`               |
+| `bronze.crm_customer_mgmt`          | `silver.customers`                  |
+| `bronze.reference_tax_rate`         | `silver.customers`                  |
+| `silver.financials`                 | `work.wrk_company_financials`       |
+| `gold.dim_company`                  | `work.wrk_company_financials`       |
 
 ## Cascade evidence
 
 No `_openivm/tables/<safe>/staging/MV_VIEW_DELTA/` directories exist in this snapshot; every `_openivm/tables/<safe>/` directory contains only `rocksdb/`. The cascade evidence is the physical `_ivm/view_deltas/<upstream>/<uuid>/` Delta tables plus consumed view-delta paths stored in downstream MV RocksDB SSTs.
 
-| view_deltas namespace | decoded emitter | delta dirs | parquet files | downstream MVs by lineage |
-| --- | --- | --- | --- | --- |
-| `bronze_brokerage_cash_transaction` | `bronze.brokerage_cash_transaction` | 2 | 2 | `silver.cash_transactions` |
-| `bronze_brokerage_daily_market` | `bronze.brokerage_daily_market` | 2 | 2 | `silver.daily_market` |
-| `bronze_brokerage_holding_history` | `bronze.brokerage_holding_history` | 2 | 2 | `silver.holdings_history` |
-| `bronze_brokerage_trade` | `bronze.brokerage_trade` | 2 | 2 | `silver.trades_history` |
-| `bronze_brokerage_watch_history` | `bronze.brokerage_watch_history` | 2 | 2 | `silver.watches_history` |
-| `bronze_crm_customer_mgmt` | `bronze.crm_customer_mgmt` | 2 | 4 | `silver.accounts`, `silver.customers` |
-| `bronze_syndicated_prospect` | `bronze.syndicated_prospect` | 2 | 2 | `gold.dim_customer` |
-| `gold_dim_customer` | `gold.dim_customer` | 2 | 4 | `gold.dim_account`, `gold.fact_watches` |
-| `gold_dim_trade` | `gold.dim_trade` | 2 | 2 | `gold.fact_trade`, `gold.fact_holdings` |
-| `silver_accounts` | `silver.accounts` | 2 | 4 | `gold.dim_account`, `silver.cash_transactions` |
-| `silver_customers` | `silver.customers` | 2 | 4 | `gold.dim_customer` |
-| `silver_daily_market` | `silver.daily_market` | 2 | 5 | `gold.fact_market_history`, `gold.daily_market_pulse`, `gold.market_volatility` |
-| `silver_trades` | `silver.trades` | 2 | 2 | `gold.fact_trade`, `silver.holdings_history` |
-| `silver_trades_history` | `silver.trades_history` | 2 | 2 | `gold.dim_trade`, `silver.trades` |
+| view_deltas namespace               | decoded emitter                     | delta dirs | parquet files | downstream MVs by lineage                                                       |
+| ----------------------------------- | ----------------------------------- | ---------- | ------------- | ------------------------------------------------------------------------------- |
+| `bronze_brokerage_cash_transaction` | `bronze.brokerage_cash_transaction` | 2          | 2             | `silver.cash_transactions`                                                      |
+| `bronze_brokerage_daily_market`     | `bronze.brokerage_daily_market`     | 2          | 2             | `silver.daily_market`                                                           |
+| `bronze_brokerage_holding_history`  | `bronze.brokerage_holding_history`  | 2          | 2             | `silver.holdings_history`                                                       |
+| `bronze_brokerage_trade`            | `bronze.brokerage_trade`            | 2          | 2             | `silver.trades_history`                                                         |
+| `bronze_brokerage_watch_history`    | `bronze.brokerage_watch_history`    | 2          | 2             | `silver.watches_history`                                                        |
+| `bronze_crm_customer_mgmt`          | `bronze.crm_customer_mgmt`          | 2          | 4             | `silver.accounts`, `silver.customers`                                           |
+| `bronze_syndicated_prospect`        | `bronze.syndicated_prospect`        | 2          | 2             | `gold.dim_customer`                                                             |
+| `gold_dim_customer`                 | `gold.dim_customer`                 | 2          | 4             | `gold.dim_account`, `gold.fact_watches`                                         |
+| `gold_dim_trade`                    | `gold.dim_trade`                    | 2          | 2             | `gold.fact_trade`, `gold.fact_holdings`                                         |
+| `silver_accounts`                   | `silver.accounts`                   | 2          | 4             | `gold.dim_account`, `silver.cash_transactions`                                  |
+| `silver_customers`                  | `silver.customers`                  | 2          | 4             | `gold.dim_customer`                                                             |
+| `silver_daily_market`               | `silver.daily_market`               | 2          | 5             | `gold.fact_market_history`, `gold.daily_market_pulse`, `gold.market_volatility` |
+| `silver_trades`                     | `silver.trades`                     | 2          | 2             | `gold.fact_trade`, `silver.holdings_history`                                    |
+| `silver_trades_history`             | `silver.trades_history`             | 2          | 2             | `gold.dim_trade`, `silver.trades`                                               |
 
 Consumed-delta strings visible in downstream MV RocksDB:
 
-| downstream MV | view-delta paths visible in SST strings |
-| --- | --- |
-| `silver.customers` | `file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/9d2f537b-ce65-4845-9c80-9c070b62185d`<br>`qfile:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/9d2f537b-ce65-4845-9c80-9c070b62185d`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/00469758-d477-42f8-b9e6-ff1e930e628f`<br>`qfile:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/00469758-d477-42f8-b9e6-ff1e930e628f` |
-| `gold.market_volatility` | `file:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/c2c150ac-d948-42c9-bd8a-4ea8c7fce352`<br>`lfile:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/c2c150ac-d948-42c9-bd8a-4ea8c7fce352`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/d9d8111c-a997-43f0-89e3-8702169db0fb`<br>`lfile:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/d9d8111c-a997-43f0-89e3-8702169db0fb` |
-| `gold.dim_customer` | `file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_syndicated_prospect/9a9c1541-db83-4065-b971-ddbc2a3f1239`<br>`ifile:/data/processed/spark-openivm/_ivm/view_deltas/silver_customers/0f746945-f7c9-46a6-b574-584a70b7b117`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_syndicated_prospect/0d6ce252-dca0-4376-b054-e084af4d93f6`<br>`ifile:/data/processed/spark-openivm/_ivm/view_deltas/silver_customers/14ce5a5c-15e0-4525-a465-89089b2399c1` |
+| downstream MV            | view-delta paths visible in SST strings                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `silver.customers`       | `file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/9d2f537b-ce65-4845-9c80-9c070b62185d`<br>`qfile:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/9d2f537b-ce65-4845-9c80-9c070b62185d`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/00469758-d477-42f8-b9e6-ff1e930e628f`<br>`qfile:/data/processed/spark-openivm/_ivm/view_deltas/bronze_crm_customer_mgmt/00469758-d477-42f8-b9e6-ff1e930e628f` |
+| `gold.market_volatility` | `file:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/c2c150ac-d948-42c9-bd8a-4ea8c7fce352`<br>`lfile:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/c2c150ac-d948-42c9-bd8a-4ea8c7fce352`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/d9d8111c-a997-43f0-89e3-8702169db0fb`<br>`lfile:/data/processed/spark-openivm/_ivm/view_deltas/silver_daily_market/d9d8111c-a997-43f0-89e3-8702169db0fb`                     |
+| `gold.dim_customer`      | `file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_syndicated_prospect/9a9c1541-db83-4065-b971-ddbc2a3f1239`<br>`ifile:/data/processed/spark-openivm/_ivm/view_deltas/silver_customers/0f746945-f7c9-46a6-b574-584a70b7b117`<br>`file:/data/processed/spark-openivm/_ivm/view_deltas/bronze_syndicated_prospect/0d6ce252-dca0-4376-b054-e084af4d93f6`<br>`ifile:/data/processed/spark-openivm/_ivm/view_deltas/silver_customers/14ce5a5c-15e0-4525-a465-89089b2399c1`             |
 
 This is the real bronze → silver → gold cascade: upstream MV refreshes write signed Delta dumps under `_ivm/view_deltas`, and downstream MVs mark those dumps consumed after applying them.
 
@@ -733,111 +734,111 @@ This is the real bronze → silver → gold cascade: upstream MV refreshes write
 
 ### Derived timing metrics
 
-| batch | full_refresh flag | engine duration s | dbt run duration s | MVs | engine s/MV | dbt s/MV |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | True | 298.86042523384094 | 219.75 | 49 | 6.10 | 4.48 |
-| 2 | False | 119.66208338737488 | 100.16 | 49 | 2.44 | 2.04 |
-| 3 | False | 128.60096836090088 | 109.63 | 49 | 2.62 | 2.24 |
+| batch | full_refresh flag | engine duration s  | dbt run duration s | MVs | engine s/MV | dbt s/MV |
+| ----- | ----------------- | ------------------ | ------------------ | --- | ----------- | -------- |
+| 1     | True              | 298.86042523384094 | 219.75             | 49  | 6.10        | 4.48     |
+| 2     | False             | 119.66208338737488 | 100.16             | 49  | 2.44        | 2.04     |
+| 3     | False             | 128.60096836090088 | 109.63             | 49  | 2.62        | 2.24     |
 
 ### Slowest MVs in batch 1
 
-| model | execution_time_s | status |
-| --- | --- | --- |
-| `dim_customer` | 42.723 | success |
-| `dim_company` | 38.352 | success |
-| `securities` | 38.189 | success |
-| `financials` | 36.843 | success |
-| `market_volatility` | 36.649 | success |
-| `cash_transactions` | 36.635 | success |
-| `trades_history` | 35.154 | success |
-| `dim_broker` | 35.106 | success |
-| `dim_date` | 33.601 | success |
-| `finwire_company` | 32.764 | success |
+| model               | execution_time_s | status  |
+| ------------------- | ---------------- | ------- |
+| `dim_customer`      | 42.723           | success |
+| `dim_company`       | 38.352           | success |
+| `securities`        | 38.189           | success |
+| `financials`        | 36.843           | success |
+| `market_volatility` | 36.649           | success |
+| `cash_transactions` | 36.635           | success |
+| `trades_history`    | 35.154           | success |
+| `dim_broker`        | 35.106           | success |
+| `dim_date`          | 33.601           | success |
+| `finwire_company`   | 32.764           | success |
 
 ### Slowest MVs in batch 2
 
-| model | execution_time_s | status |
-| --- | --- | --- |
-| `trades_history` | 28.225 | success |
-| `companies` | 28.138 | success |
-| `market_volatility` | 26.604 | success |
-| `dim_customer` | 23.926 | success |
-| `customers` | 20.676 | success |
-| `date` | 20.649 | success |
-| `employees` | 20.649 | success |
-| `cash_transactions` | 19.061 | success |
-| `crm_customer_mgmt` | 16.253 | success |
-| `finwire_company` | 16.136 | success |
+| model               | execution_time_s | status  |
+| ------------------- | ---------------- | ------- |
+| `trades_history`    | 28.225           | success |
+| `companies`         | 28.138           | success |
+| `market_volatility` | 26.604           | success |
+| `dim_customer`      | 23.926           | success |
+| `customers`         | 20.676           | success |
+| `date`              | 20.649           | success |
+| `employees`         | 20.649           | success |
+| `cash_transactions` | 19.061           | success |
+| `crm_customer_mgmt` | 16.253           | success |
+| `finwire_company`   | 16.136           | success |
 
 ### Slowest MVs in batch 3
 
-| model | execution_time_s | status |
-| --- | --- | --- |
-| `employees` | 31.212 | success |
-| `date` | 31.210 | success |
-| `companies` | 31.187 | success |
-| `trades_history` | 29.744 | success |
-| `dim_customer` | 28.284 | success |
-| `cash_transactions` | 25.107 | success |
-| `market_volatility` | 25.085 | success |
-| `accounts` | 22.194 | success |
-| `dim_trade` | 22.154 | success |
-| `dim_broker` | 20.640 | success |
+| model               | execution_time_s | status  |
+| ------------------- | ---------------- | ------- |
+| `employees`         | 31.212           | success |
+| `date`              | 31.210           | success |
+| `companies`         | 31.187           | success |
+| `trades_history`    | 29.744           | success |
+| `dim_customer`      | 28.284           | success |
+| `cash_transactions` | 25.107           | success |
+| `market_volatility` | 25.085           | success |
+| `accounts`          | 22.194           | success |
+| `dim_trade`         | 22.154           | success |
+| `dim_broker`        | 20.640           | success |
 
 ### Validation and container stats
 
 | batch | models_checked | failures | duration_s | status |
-| --- | --- | --- | --- | --- |
-| 1 | 49 | 0 | 283.283 | passed |
-| 2 | 49 | 0 | 287.319 | passed |
-| 3 | 49 | 0 | 288.02 | passed |
+| ----- | -------------- | -------- | ---------- | ------ |
+| 1     | 49             | 0        | 283.283    | passed |
+| 2     | 49             | 0        | 287.319    | passed |
+| 3     | 49             | 0        | 288.02     | passed |
 
-| container | samples | avg CPU % | max CPU % | avg mem MB | max mem MB | last net in MB | last net out MB |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| dbt-server | 99 | 0.00 | 0.01 | 251.9 | 363.5 | 5.241 | 4.761 |
-| mssql-metastore | 99 | 0.01 | 0.02 | 2422.7 | 2482.4 | 41.067 | 52.63 |
-| spark-openivm | 99 | 0.24 | 0.42 | 6482.4 | 8828.6 | 56.312 | 44.695 |
+| container       | samples | avg CPU % | max CPU % | avg mem MB | max mem MB | last net in MB | last net out MB |
+| --------------- | ------- | --------- | --------- | ---------- | ---------- | -------------- | --------------- |
+| dbt-server      | 99      | 0.00      | 0.01      | 251.9      | 363.5      | 5.241          | 4.761           |
+| mssql-metastore | 99      | 0.01      | 0.02      | 2422.7     | 2482.4     | 41.067         | 52.63           |
+| spark-openivm   | 99      | 0.24      | 0.42      | 6482.4     | 8828.6     | 56.312         | 44.695          |
 
 ## Summary tables
 
 ### Number of MVs per layer
 
-| Layer | MV count |
-| --- | --- |
-| bronze | 17 |
-| gold | 18 |
-| silver | 14 |
+| Layer  | MV count |
+| ------ | -------- |
+| bronze | 17       |
+| gold   | 18       |
+| silver | 14       |
 
 ### Refresh types observed
 
-| refresh code | refresh type | count |
-| --- | --- | --- |
-| 2 | SIMPLE_PROJECTION | 23 |
-| 3 | FULL_REFRESH | 16 |
-| 5 | WINDOW_PARTITION | 10 |
+| refresh code | refresh type      | count |
+| ------------ | ----------------- | ----- |
+| 2            | SIMPLE_PROJECTION | 23    |
+| 3            | FULL_REFRESH      | 16    |
+| 5            | WINDOW_PARTITION  | 10    |
 
 ### FULL_REFRESH MVs
 
 These are the MVs whose persisted metadata reports `FULL_REFRESH` (code 3). This probe cannot distinguish inherent full-refresh classification from demotion reason fields; it identifies the active full-refresh maintenance paths in this warehouse.
 
-| MV | layer | rows | lineage source fan-in |
-| --- | --- | --- | --- |
-| `gold.broker_performance` | gold | 0 | 3 |
-| `gold.customer_concentration` | gold | 0 | 3 |
-| `gold.daily_market_pulse` | gold | 27 | 2 |
-| `gold.dim_account` | gold | 6 | 3 |
-| `gold.dim_security` | gold | 0 | 2 |
-| `gold.fact_cash_balances` | gold | 48 | 1 |
-| `gold.fact_cash_transactions` | gold | 48 | 2 |
-| `gold.fact_holdings` | gold | 0 | 4 |
-| `gold.fact_market_history` | gold | 0 | 3 |
-| `gold.fact_trade` | gold | 0 | 4 |
-| `gold.fact_watches` | gold | 0 | 3 |
-| `gold.trade_volume_stats` | gold | 0 | 3 |
-| `silver.cash_transactions` | silver | 10857 | 2 |
-| `silver.holdings_history` | silver | 0 | 2 |
-| `silver.watches` | silver | 15 | 1 |
-| `silver.watches_history` | silver | 15 | 2 |
+| MV                            | layer  | rows  | lineage source fan-in |
+| ----------------------------- | ------ | ----- | --------------------- |
+| `gold.broker_performance`     | gold   | 0     | 3                     |
+| `gold.customer_concentration` | gold   | 0     | 3                     |
+| `gold.daily_market_pulse`     | gold   | 27    | 2                     |
+| `gold.dim_account`            | gold   | 6     | 3                     |
+| `gold.dim_security`           | gold   | 0     | 2                     |
+| `gold.fact_cash_balances`     | gold   | 48    | 1                     |
+| `gold.fact_cash_transactions` | gold   | 48    | 2                     |
+| `gold.fact_holdings`          | gold   | 0     | 4                     |
+| `gold.fact_market_history`    | gold   | 0     | 3                     |
+| `gold.fact_trade`             | gold   | 0     | 4                     |
+| `gold.fact_watches`           | gold   | 0     | 3                     |
+| `gold.trade_volume_stats`     | gold   | 0     | 3                     |
+| `silver.cash_transactions`    | silver | 10857 | 2                     |
+| `silver.holdings_history`     | silver | 0     | 2                     |
+| `silver.watches`              | silver | 15    | 1                     |
+| `silver.watches_history`      | silver | 15    | 2                     |
 
 ## Inline reproducible probe script
 
@@ -903,55 +904,54 @@ python3 probe_tpcdi_openivm_warehouse.py /path/to/spark-openivm
 
 ## Appendix: complete MV row-count inventory
 
-| MV | refresh type | rows | parquet files |
-| --- | --- | --- | --- |
-| `bronze.brokerage_cash_transaction` | SIMPLE_PROJECTION | 3621 | 3 |
-| `bronze.brokerage_daily_market` | SIMPLE_PROJECTION | 12830 | 3 |
-| `bronze.brokerage_holding_history` | SIMPLE_PROJECTION | 3626 | 3 |
-| `bronze.brokerage_trade` | SIMPLE_PROJECTION | 3912 | 3 |
-| `bronze.brokerage_trade_history` | SIMPLE_PROJECTION | 9822 | 1 |
-| `bronze.brokerage_watch_history` | SIMPLE_PROJECTION | 9003 | 3 |
-| `bronze.crm_customer_mgmt` | SIMPLE_PROJECTION | 150 | 5 |
-| `bronze.finwire_company` | SIMPLE_PROJECTION | 7 | 1 |
-| `bronze.finwire_financial` | SIMPLE_PROJECTION | 1007 | 1 |
-| `bronze.finwire_security` | SIMPLE_PROJECTION | 11 | 1 |
-| `bronze.hr_employee` | SIMPLE_PROJECTION | 150 | 1 |
-| `bronze.reference_date` | SIMPLE_PROJECTION | 260 | 1 |
-| `bronze.reference_industry` | SIMPLE_PROJECTION | 2 | 1 |
-| `bronze.reference_status_type` | SIMPLE_PROJECTION | 1 | 1 |
-| `bronze.reference_tax_rate` | SIMPLE_PROJECTION | 4 | 1 |
-| `bronze.reference_trade_type` | SIMPLE_PROJECTION | 1 | 1 |
-| `bronze.syndicated_prospect` | SIMPLE_PROJECTION | 152 | 3 |
-| `gold.broker_performance` | FULL_REFRESH | 0 | 3 |
-| `gold.customer_concentration` | FULL_REFRESH | 0 | 3 |
-| `gold.daily_market_pulse` | FULL_REFRESH | 27 | 3 |
-| `gold.dim_account` | FULL_REFRESH | 6 | 3 |
-| `gold.dim_broker` | SIMPLE_PROJECTION | 150 | 1 |
-| `gold.dim_company` | SIMPLE_PROJECTION | 0 | 1 |
-| `gold.dim_customer` | WINDOW_PARTITION | 81 | 3 |
-| `gold.dim_date` | SIMPLE_PROJECTION | 260 | 1 |
-| `gold.dim_security` | FULL_REFRESH | 0 | 3 |
-| `gold.dim_trade` | SIMPLE_PROJECTION | 0 | 3 |
-| `gold.fact_cash_balances` | FULL_REFRESH | 48 | 3 |
-| `gold.fact_cash_transactions` | FULL_REFRESH | 48 | 3 |
-| `gold.fact_holdings` | FULL_REFRESH | 0 | 3 |
-| `gold.fact_market_history` | FULL_REFRESH | 0 | 3 |
-| `gold.fact_trade` | FULL_REFRESH | 0 | 3 |
-| `gold.fact_watches` | FULL_REFRESH | 0 | 3 |
-| `gold.market_volatility` | WINDOW_PARTITION | 5172 | 3 |
-| `gold.trade_volume_stats` | FULL_REFRESH | 0 | 3 |
-| `silver.accounts` | WINDOW_PARTITION | 133 | 3 |
-| `silver.cash_transactions` | FULL_REFRESH | 10857 | 3 |
-| `silver.companies` | WINDOW_PARTITION | 0 | 1 |
-| `silver.customers` | WINDOW_PARTITION | 81 | 3 |
-| `silver.daily_market` | WINDOW_PARTITION | 25667 | 5 |
-| `silver.date` | SIMPLE_PROJECTION | 260 | 1 |
-| `silver.employees` | SIMPLE_PROJECTION | 150 | 1 |
-| `silver.financials` | WINDOW_PARTITION | 1007 | 1 |
-| `silver.holdings_history` | FULL_REFRESH | 0 | 3 |
-| `silver.securities` | WINDOW_PARTITION | 11 | 1 |
-| `silver.trades` | WINDOW_PARTITION | 0 | 3 |
-| `silver.trades_history` | WINDOW_PARTITION | 0 | 3 |
-| `silver.watches` | FULL_REFRESH | 15 | 3 |
-| `silver.watches_history` | FULL_REFRESH | 15 | 3 |
-
+| MV                                  | refresh type      | rows  | parquet files |
+| ----------------------------------- | ----------------- | ----- | ------------- |
+| `bronze.brokerage_cash_transaction` | SIMPLE_PROJECTION | 3621  | 3             |
+| `bronze.brokerage_daily_market`     | SIMPLE_PROJECTION | 12830 | 3             |
+| `bronze.brokerage_holding_history`  | SIMPLE_PROJECTION | 3626  | 3             |
+| `bronze.brokerage_trade`            | SIMPLE_PROJECTION | 3912  | 3             |
+| `bronze.brokerage_trade_history`    | SIMPLE_PROJECTION | 9822  | 1             |
+| `bronze.brokerage_watch_history`    | SIMPLE_PROJECTION | 9003  | 3             |
+| `bronze.crm_customer_mgmt`          | SIMPLE_PROJECTION | 150   | 5             |
+| `bronze.finwire_company`            | SIMPLE_PROJECTION | 7     | 1             |
+| `bronze.finwire_financial`          | SIMPLE_PROJECTION | 1007  | 1             |
+| `bronze.finwire_security`           | SIMPLE_PROJECTION | 11    | 1             |
+| `bronze.hr_employee`                | SIMPLE_PROJECTION | 150   | 1             |
+| `bronze.reference_date`             | SIMPLE_PROJECTION | 260   | 1             |
+| `bronze.reference_industry`         | SIMPLE_PROJECTION | 2     | 1             |
+| `bronze.reference_status_type`      | SIMPLE_PROJECTION | 1     | 1             |
+| `bronze.reference_tax_rate`         | SIMPLE_PROJECTION | 4     | 1             |
+| `bronze.reference_trade_type`       | SIMPLE_PROJECTION | 1     | 1             |
+| `bronze.syndicated_prospect`        | SIMPLE_PROJECTION | 152   | 3             |
+| `gold.broker_performance`           | FULL_REFRESH      | 0     | 3             |
+| `gold.customer_concentration`       | FULL_REFRESH      | 0     | 3             |
+| `gold.daily_market_pulse`           | FULL_REFRESH      | 27    | 3             |
+| `gold.dim_account`                  | FULL_REFRESH      | 6     | 3             |
+| `gold.dim_broker`                   | SIMPLE_PROJECTION | 150   | 1             |
+| `gold.dim_company`                  | SIMPLE_PROJECTION | 0     | 1             |
+| `gold.dim_customer`                 | WINDOW_PARTITION  | 81    | 3             |
+| `gold.dim_date`                     | SIMPLE_PROJECTION | 260   | 1             |
+| `gold.dim_security`                 | FULL_REFRESH      | 0     | 3             |
+| `gold.dim_trade`                    | SIMPLE_PROJECTION | 0     | 3             |
+| `gold.fact_cash_balances`           | FULL_REFRESH      | 48    | 3             |
+| `gold.fact_cash_transactions`       | FULL_REFRESH      | 48    | 3             |
+| `gold.fact_holdings`                | FULL_REFRESH      | 0     | 3             |
+| `gold.fact_market_history`          | FULL_REFRESH      | 0     | 3             |
+| `gold.fact_trade`                   | FULL_REFRESH      | 0     | 3             |
+| `gold.fact_watches`                 | FULL_REFRESH      | 0     | 3             |
+| `gold.market_volatility`            | WINDOW_PARTITION  | 5172  | 3             |
+| `gold.trade_volume_stats`           | FULL_REFRESH      | 0     | 3             |
+| `silver.accounts`                   | WINDOW_PARTITION  | 133   | 3             |
+| `silver.cash_transactions`          | FULL_REFRESH      | 10857 | 3             |
+| `silver.companies`                  | WINDOW_PARTITION  | 0     | 1             |
+| `silver.customers`                  | WINDOW_PARTITION  | 81    | 3             |
+| `silver.daily_market`               | WINDOW_PARTITION  | 25667 | 5             |
+| `silver.date`                       | SIMPLE_PROJECTION | 260   | 1             |
+| `silver.employees`                  | SIMPLE_PROJECTION | 150   | 1             |
+| `silver.financials`                 | WINDOW_PARTITION  | 1007  | 1             |
+| `silver.holdings_history`           | FULL_REFRESH      | 0     | 3             |
+| `silver.securities`                 | WINDOW_PARTITION  | 11    | 1             |
+| `silver.trades`                     | WINDOW_PARTITION  | 0     | 3             |
+| `silver.trades_history`             | WINDOW_PARTITION  | 0     | 3             |
+| `silver.watches`                    | FULL_REFRESH      | 15    | 3             |
+| `silver.watches_history`            | FULL_REFRESH      | 15    | 3             |

@@ -23,7 +23,7 @@ The most important debugging artifact is the persisted compile cache:
 family, not in a file.  When a refresh behaves differently than expected,
 this property is the exact OpenIVM program that Spark rewrites and executes.
 
----
+______________________________________________________________________
 
 ## 7.1 Why two state systems
 
@@ -42,22 +42,22 @@ downstream MV can consume.  That state is columnar and can be large.  Spark
 must be able to scan, join, MERGE, and time-travel it.  Delta Lake fits that
 shape.
 
-| State class | Backing store | Why |
-|---|---|---|
-| MV catalog index | RocksDB | Point lookups by MV name and source table. |
-| Per-MV metadata | RocksDB | Small strings and maps, updated at CREATE and REFRESH. |
-| Staging index | RocksDB | Fast append and prefix scan by `(txnTs, stagingPath)`. |
-| Consumed markers | RocksDB | Idempotency guard, one key per consumed staging path per MV. |
-| MV rows | Delta | Spark SQL target for CTAS, MERGE, UPDATE, DELETE, INSERT OVERWRITE. |
-| Base-table staged rows | Delta | Captured DML rows can be scanned as `delta.` paths. |
-| Per-refresh view deltas | Delta | Downstream MV refresh reads signed rows as tabular input. |
+| State class             | Backing store | Why                                                                 |
+| ----------------------- | ------------- | ------------------------------------------------------------------- |
+| MV catalog index        | RocksDB       | Point lookups by MV name and source table.                          |
+| Per-MV metadata         | RocksDB       | Small strings and maps, updated at CREATE and REFRESH.              |
+| Staging index           | RocksDB       | Fast append and prefix scan by `(txnTs, stagingPath)`.              |
+| Consumed markers        | RocksDB       | Idempotency guard, one key per consumed staging path per MV.        |
+| MV rows                 | Delta         | Spark SQL target for CTAS, MERGE, UPDATE, DELETE, INSERT OVERWRITE. |
+| Base-table staged rows  | Delta         | Captured DML rows can be scanned as `delta.` paths.                 |
+| Per-refresh view deltas | Delta         | Downstream MV refresh reads signed rows as tabular input.           |
 
 This is not a generic streaming state store.  It is a Spark SQL extension that
 needs to survive across commands and drivers.  RocksDB gives a compact local
 catalog.  Delta gives Spark-native data files.  The two are deliberately joined
 by paths: RocksDB stores the path, Delta stores the rows at that path.
 
----
+______________________________________________________________________
 
 ## 7.2 On-disk layout
 
@@ -97,24 +97,24 @@ trigger tables used to wake FullRefresh-demoted downstream MVs.
 
 ### Path inventory and lifecycle
 
-| Path | Purpose | Producer | Consumer | Lifecycle |
-|---|---|---|---|---|
-| `_openivm/index/rocksdb` | Global catalog index. | `MvCatalog.ensureTables`, `MvCatalog.upsert`, `StagingCatalog.record`. | `MvCatalog.lookup/list/viewsForSource`, `StagingCatalog.openTrackedMvDb`. | Created on first catalog access; retained for warehouse lifetime. |
-| `_openivm/index/rocksdb` CF `mv_index` | MV name → per-MV RocksDB path. | `MvCatalog.upsert`. | `MvCatalog.lookup`, `StagingCatalog.markConsumed`. | Entry removed by `MvCatalog.remove` on DROP MV. |
-| `_openivm/index/rocksdb` CF `source_to_mvs` | Dependency edge from source table to MV. | `MvCatalog.upsert`. | DML interception and cascade cleanup. | Edges rewritten on MV upsert; deleted on DROP MV. |
-| `_openivm/index/rocksdb` CF `table_index` | Base table name → per-table RocksDB path. | `StagingCatalog.record`. | `StagingCatalog.removeForBaseTable`. | Rows remain until table cleanup or explicit remove. |
-| `_openivm/mvs/<safe>/rocksdb` | Per-MV metadata database. | `MvCatalog.upsert`. | `RefreshMaterializedViewCommand`. | Removed by `MvCatalog.remove`; also closed in registry. |
-| `_openivm/mvs/<safe>/rocksdb` CF `meta` | Fixed metadata keys for `MvMetadata`. | `MvCatalog.writeMetadata`. | `MvCatalog.readMetadata`. | Updated at CREATE and when `last_version` advances. |
-| `_openivm/mvs/<safe>/rocksdb` CF `properties` | User and internal TBLPROPERTIES. | `MvCatalog.rewriteProperties`. | Refresh path, count cleanup, compile cache, watermarks. | Rewritten atomically as a map. |
-| `_openivm/mvs/<safe>/rocksdb` CF `consumed` | Per-MV consumed staging paths. | `StagingCatalog.markConsumed`. | `StagingCatalog.collectFor`, `hasPendingDeltas`, `pruneFullyConsumed`. | Tombstone-like empty values; rows deleted only when all dependent MVs consumed. |
-| `_openivm/tables/<safe>/rocksdb` | Per-source staging index database. | `StagingCatalog.record`. | `StagingCatalog.collectFor`. | Created on first captured DML for a table. |
-| `_openivm/tables/<safe>/rocksdb` CF `staging` | Pending staging delta index. | DML interception and MV cascade record. | Refresh collect path. | Rows pruned when all dependent MVs consumed them. |
-| `_openivm/triggers/<safe>/<uuid>` | Empty Delta trigger for non-cascade upstreams. | `postRefreshCleanup`. | Downstream FullRefresh-demoted MV only observes presence. | No central GC besides DROP/pruning paths. |
-| `_ivm/views/<db>/<mvname>` | Physical materialized view Delta table. | `CREATE MATERIALIZED VIEW`, refresh rewrite. | User queries and future refreshes. | Deleted on DROP MV. |
-| `_ivm/staging/<safe-table>/<op>/<ts>` | Captured base-table DML rows. | `StagedDmlNode` or `DeltaStagingExec`. | `StagingDeltaView.buildSourceDeltaViewSql`. | Data files may outlive index rows; index pruning is separate from file cleanup. |
-| `_ivm/view_deltas/<safe>/<uuid>` | Persisted signed MV output delta for cascade. | `SparkRefreshRewriter` CTAS and companion appends. | Downstream `MV_VIEW_DELTA` staging rows. | Namespace deleted on DROP MV; failed refresh path best-effort deletes partial table. |
+| Path                                          | Purpose                                        | Producer                                                               | Consumer                                                                  | Lifecycle                                                                            |
+| --------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `_openivm/index/rocksdb`                      | Global catalog index.                          | `MvCatalog.ensureTables`, `MvCatalog.upsert`, `StagingCatalog.record`. | `MvCatalog.lookup/list/viewsForSource`, `StagingCatalog.openTrackedMvDb`. | Created on first catalog access; retained for warehouse lifetime.                    |
+| `_openivm/index/rocksdb` CF `mv_index`        | MV name → per-MV RocksDB path.                 | `MvCatalog.upsert`.                                                    | `MvCatalog.lookup`, `StagingCatalog.markConsumed`.                        | Entry removed by `MvCatalog.remove` on DROP MV.                                      |
+| `_openivm/index/rocksdb` CF `source_to_mvs`   | Dependency edge from source table to MV.       | `MvCatalog.upsert`.                                                    | DML interception and cascade cleanup.                                     | Edges rewritten on MV upsert; deleted on DROP MV.                                    |
+| `_openivm/index/rocksdb` CF `table_index`     | Base table name → per-table RocksDB path.      | `StagingCatalog.record`.                                               | `StagingCatalog.removeForBaseTable`.                                      | Rows remain until table cleanup or explicit remove.                                  |
+| `_openivm/mvs/<safe>/rocksdb`                 | Per-MV metadata database.                      | `MvCatalog.upsert`.                                                    | `RefreshMaterializedViewCommand`.                                         | Removed by `MvCatalog.remove`; also closed in registry.                              |
+| `_openivm/mvs/<safe>/rocksdb` CF `meta`       | Fixed metadata keys for `MvMetadata`.          | `MvCatalog.writeMetadata`.                                             | `MvCatalog.readMetadata`.                                                 | Updated at CREATE and when `last_version` advances.                                  |
+| `_openivm/mvs/<safe>/rocksdb` CF `properties` | User and internal TBLPROPERTIES.               | `MvCatalog.rewriteProperties`.                                         | Refresh path, count cleanup, compile cache, watermarks.                   | Rewritten atomically as a map.                                                       |
+| `_openivm/mvs/<safe>/rocksdb` CF `consumed`   | Per-MV consumed staging paths.                 | `StagingCatalog.markConsumed`.                                         | `StagingCatalog.collectFor`, `hasPendingDeltas`, `pruneFullyConsumed`.    | Tombstone-like empty values; rows deleted only when all dependent MVs consumed.      |
+| `_openivm/tables/<safe>/rocksdb`              | Per-source staging index database.             | `StagingCatalog.record`.                                               | `StagingCatalog.collectFor`.                                              | Created on first captured DML for a table.                                           |
+| `_openivm/tables/<safe>/rocksdb` CF `staging` | Pending staging delta index.                   | DML interception and MV cascade record.                                | Refresh collect path.                                                     | Rows pruned when all dependent MVs consumed them.                                    |
+| `_openivm/triggers/<safe>/<uuid>`             | Empty Delta trigger for non-cascade upstreams. | `postRefreshCleanup`.                                                  | Downstream FullRefresh-demoted MV only observes presence.                 | No central GC besides DROP/pruning paths.                                            |
+| `_ivm/views/<db>/<mvname>`                    | Physical materialized view Delta table.        | `CREATE MATERIALIZED VIEW`, refresh rewrite.                           | User queries and future refreshes.                                        | Deleted on DROP MV.                                                                  |
+| `_ivm/staging/<safe-table>/<op>/<ts>`         | Captured base-table DML rows.                  | `StagedDmlNode` or `DeltaStagingExec`.                                 | `StagingDeltaView.buildSourceDeltaViewSql`.                               | Data files may outlive index rows; index pruning is separate from file cleanup.      |
+| `_ivm/view_deltas/<safe>/<uuid>`              | Persisted signed MV output delta for cascade.  | `SparkRefreshRewriter` CTAS and companion appends.                     | Downstream `MV_VIEW_DELTA` staging rows.                                  | Namespace deleted on DROP MV; failed refresh path best-effort deletes partial table. |
 
----
+______________________________________________________________________
 
 ## 7.3 Safe path segment encoding
 
@@ -141,10 +141,10 @@ def unsafe(s):
 
 Examples from the live TPC-DI warehouse:
 
-| Encoded directory | Decoded name |
-|---|---|
-| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ` | `bronze.brokerage_trade` |
-| `c2lsdmVyLmN1c3RvbWVycw` | `silver.customers` |
+| Encoded directory                 | Decoded name              |
+| --------------------------------- | ------------------------- |
+| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ`  | `bronze.brokerage_trade`  |
+| `c2lsdmVyLmN1c3RvbWVycw`          | `silver.customers`        |
 | `Z29sZC5kYWlseV9tYXJrZXRfcHVsc2U` | `gold.daily_market_pulse` |
 
 Do not confuse this with the older `replace(".", "_")` safe name used by
@@ -152,7 +152,7 @@ some Delta paths, such as `_ivm/view_deltas/<safe>/<uuid>` and
 `_ivm/staging/<safe-table>/<op>/<ts>`.  RocksDB catalog directories are
 base64url.  View-delta and DML-staging Delta paths are string-sanitized.
 
----
+______________________________________________________________________
 
 ## 7.4 RocksDB column-family schemas
 
@@ -164,11 +164,11 @@ via `encodeLongBE`.
 
 ### Shared global index: `_openivm/index/rocksdb`
 
-| RocksDB instance | CF | Key schema | Value schema | Producer | Consumer |
-|---|---|---|---|---|---|
-| `_openivm/index/rocksdb` | `mv_index` | `<db.mv>` UTF-8 | per-MV RocksDB absolute path UTF-8 | `MvCatalog.upsert` (`MvCatalog.scala:430-449`) | `MvCatalog.lookup/list`, `StagingCatalog.openTrackedMvDb` |
-| `_openivm/index/rocksdb` | `source_to_mvs` | composite(`sourceTable`, `mvName`) | empty bytes | `MvCatalog.upsert` (`MvCatalog.scala:430-442`) | `MvCatalog.viewsForSource`, `postRefreshCleanup` |
-| `_openivm/index/rocksdb` | `table_index` | `<db.table>` UTF-8 | per-table RocksDB absolute path UTF-8 | `StagingCatalog.record` (`StagingCatalog.scala:169-180`) | `StagingCatalog.removeForBaseTable` |
+| RocksDB instance         | CF              | Key schema                         | Value schema                          | Producer                                                 | Consumer                                                  |
+| ------------------------ | --------------- | ---------------------------------- | ------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------- |
+| `_openivm/index/rocksdb` | `mv_index`      | `<db.mv>` UTF-8                    | per-MV RocksDB absolute path UTF-8    | `MvCatalog.upsert` (`MvCatalog.scala:430-449`)           | `MvCatalog.lookup/list`, `StagingCatalog.openTrackedMvDb` |
+| `_openivm/index/rocksdb` | `source_to_mvs` | composite(`sourceTable`, `mvName`) | empty bytes                           | `MvCatalog.upsert` (`MvCatalog.scala:430-442`)           | `MvCatalog.viewsForSource`, `postRefreshCleanup`          |
+| `_openivm/index/rocksdb` | `table_index`   | `<db.table>` UTF-8                 | per-table RocksDB absolute path UTF-8 | `StagingCatalog.record` (`StagingCatalog.scala:169-180`) | `StagingCatalog.removeForBaseTable`                       |
 
 The important correction is `source_to_mvs`: it is not stored as a JSON set.
 The set is represented by one composite key per edge.  Prefix scanning by the
@@ -176,19 +176,19 @@ source name reconstructs the dependent MV list.
 
 ### Per-MV database: `_openivm/mvs/<safe>/rocksdb`
 
-| RocksDB instance | CF | Key schema | Value schema | Producer | Consumer |
-|---|---|---|---|---|---|
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `name` | serialized MV name UTF-8 | `MvCatalog.writeMetadata` | `MvCatalog.readMetadata` |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `query_sql` | original MV body UTF-8 | CREATE MV | Refresh compile fallback, FullRefresh path |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `refresh_type` | integer as UTF-8 | CREATE MV | Refresh path dispatch |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `refresh_type_name` | string UTF-8 | CREATE MV | Logging, compile-cache reconstruction |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `last_version` | Delta version as UTF-8 long | `MvCatalog.advance` | Time-travel old snapshot rewrite, drift checks |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `source_tables` | composite UTF-8 parts | CREATE MV | DML collection, source temp views |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `source_schema_fingerprint` | SHA-256 hex UTF-8 | CREATE MV | REFRESH schema-drift guard |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `location` | MV Delta path UTF-8 | CREATE MV | Refresh target path, DROP MV |
-| `_openivm/mvs/<safe>/rocksdb` | `meta` | `created_at` | epoch millis as UTF-8 long | CREATE MV | Metadata listing and migration compatibility |
-| `_openivm/mvs/<safe>/rocksdb` | `properties` | property key UTF-8 | property value UTF-8 | `MvCatalog.rewriteProperties` | Refresh path and debugging |
-| `_openivm/mvs/<safe>/rocksdb` | `consumed` | staging path UTF-8 | empty bytes | `StagingCatalog.markConsumed` | `collectFor`, `hasPendingDeltas`, `pruneFullyConsumed` |
+| RocksDB instance              | CF           | Key schema                  | Value schema                | Producer                      | Consumer                                               |
+| ----------------------------- | ------------ | --------------------------- | --------------------------- | ----------------------------- | ------------------------------------------------------ |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `name`                      | serialized MV name UTF-8    | `MvCatalog.writeMetadata`     | `MvCatalog.readMetadata`                               |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `query_sql`                 | original MV body UTF-8      | CREATE MV                     | Refresh compile fallback, FullRefresh path             |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `refresh_type`              | integer as UTF-8            | CREATE MV                     | Refresh path dispatch                                  |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `refresh_type_name`         | string UTF-8                | CREATE MV                     | Logging, compile-cache reconstruction                  |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `last_version`              | Delta version as UTF-8 long | `MvCatalog.advance`           | Time-travel old snapshot rewrite, drift checks         |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `source_tables`             | composite UTF-8 parts       | CREATE MV                     | DML collection, source temp views                      |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `source_schema_fingerprint` | SHA-256 hex UTF-8           | CREATE MV                     | REFRESH schema-drift guard                             |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `location`                  | MV Delta path UTF-8         | CREATE MV                     | Refresh target path, DROP MV                           |
+| `_openivm/mvs/<safe>/rocksdb` | `meta`       | `created_at`                | epoch millis as UTF-8 long  | CREATE MV                     | Metadata listing and migration compatibility           |
+| `_openivm/mvs/<safe>/rocksdb` | `properties` | property key UTF-8          | property value UTF-8        | `MvCatalog.rewriteProperties` | Refresh path and debugging                             |
+| `_openivm/mvs/<safe>/rocksdb` | `consumed`   | staging path UTF-8          | empty bytes                 | `StagingCatalog.markConsumed` | `collectFor`, `hasPendingDeltas`, `pruneFullyConsumed` |
 
 The `consumed` CF is deliberately per MV.  That makes the idempotency question
 local: "has this MV already applied this path?"  The per-table staging index can
@@ -196,8 +196,8 @@ then delete a row only after all dependent MVs have a matching consumed marker.
 
 ### Per-source database: `_openivm/tables/<safe>/rocksdb`
 
-| RocksDB instance | CF | Key schema | Value schema | Producer | Consumer |
-|---|---|---|---|---|---|
+| RocksDB instance                 | CF        | Key schema                                         | Value schema        | Producer                                                                                  | Consumer                                                         |
+| -------------------------------- | --------- | -------------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | `_openivm/tables/<safe>/rocksdb` | `staging` | composite(big-endian `txnTsMillis`, `stagingPath`) | composite(`opType`) | `IvmDmlInterceptorRule` → `StagedDmlNode` or `DeltaStagingExec` → `StagingCatalog.record` | `RefreshMaterializedViewCommand` via `StagingCatalog.collectFor` |
 
 `StagingCatalog.record` builds the key at `StagingCatalog.scala:157-160`.
@@ -205,7 +205,7 @@ then delete a row only after all dependent MVs have a matching consumed marker.
 A per-source watermark can reject old rows.  A per-MV `consumed` marker can
 reject already-applied rows.  The remaining rows are sorted by transaction time.
 
----
+______________________________________________________________________
 
 ## 7.5 `MvMetadata` and well-known properties
 
@@ -228,31 +228,31 @@ final case class MvMetadata(
 
 ### Case-class fields
 
-| Field | Type | Stored in | Producer | Consumer | Refresh paths that read it |
-|---|---|---|---|---|---|
-| `name` | `TableIdentifier` | per-MV `meta/name` | CREATE MV (`MaterializedViewCommands.scala:683-694`) | SQL identifier helpers, DROP, refresh logging | All paths |
-| `querySql` | `String` | per-MV `meta/query_sql` | CREATE MV | FullRefresh assembler; lazy compile fallback | FullRefresh; incremental cache miss |
-| `refreshType` | `Int` | per-MV `meta/refresh_type` | CREATE MV classifier | Refresh dispatch; cascade capability fallback | All paths |
-| `refreshTypeName` | `String` | per-MV `meta/refresh_type_name` | CREATE MV classifier | Logging; cached compile reconstruction | All paths |
-| `lastVersion` | `Long` | per-MV `meta/last_version` | CREATE initializes `-1`; `MvCatalog.advance` updates | Rewriter old-snapshot time travel; metadata listing | Incremental recompute cascade; all paths advance it |
-| `sourceTables` | `Seq[String]` | per-MV `meta/source_tables` composite bytes | Source analysis at CREATE | DML collect, schema drift, temp view registration | All paths except no-op short-circuit details |
-| `sourceSchemaFingerprint` | `String` | per-MV `meta/source_schema_fingerprint` | `MvCatalog.schemaFingerprint` | Refresh drift guard | All paths before execution |
-| `location` | `String` | per-MV `meta/location` | `MvCommandHelper.mvLocation` | Delta target path, FullRefresh, DROP | All executable refresh paths |
-| `createdAt` | `Timestamp` | per-MV `meta/created_at` epoch millis | CREATE MV | Metadata display/migration; not a refresh decision | None directly |
-| `properties` | `Map[String,String]` | per-MV `properties` CF | User TBLPROPERTIES plus internal keys | Many targeted consumers | Depends on key; see below |
+| Field                     | Type                 | Stored in                                   | Producer                                             | Consumer                                            | Refresh paths that read it                          |
+| ------------------------- | -------------------- | ------------------------------------------- | ---------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------- |
+| `name`                    | `TableIdentifier`    | per-MV `meta/name`                          | CREATE MV (`MaterializedViewCommands.scala:683-694`) | SQL identifier helpers, DROP, refresh logging       | All paths                                           |
+| `querySql`                | `String`             | per-MV `meta/query_sql`                     | CREATE MV                                            | FullRefresh assembler; lazy compile fallback        | FullRefresh; incremental cache miss                 |
+| `refreshType`             | `Int`                | per-MV `meta/refresh_type`                  | CREATE MV classifier                                 | Refresh dispatch; cascade capability fallback       | All paths                                           |
+| `refreshTypeName`         | `String`             | per-MV `meta/refresh_type_name`             | CREATE MV classifier                                 | Logging; cached compile reconstruction              | All paths                                           |
+| `lastVersion`             | `Long`               | per-MV `meta/last_version`                  | CREATE initializes `-1`; `MvCatalog.advance` updates | Rewriter old-snapshot time travel; metadata listing | Incremental recompute cascade; all paths advance it |
+| `sourceTables`            | `Seq[String]`        | per-MV `meta/source_tables` composite bytes | Source analysis at CREATE                            | DML collect, schema drift, temp view registration   | All paths except no-op short-circuit details        |
+| `sourceSchemaFingerprint` | `String`             | per-MV `meta/source_schema_fingerprint`     | `MvCatalog.schemaFingerprint`                        | Refresh drift guard                                 | All paths before execution                          |
+| `location`                | `String`             | per-MV `meta/location`                      | `MvCommandHelper.mvLocation`                         | Delta target path, FullRefresh, DROP                | All executable refresh paths                        |
+| `createdAt`               | `Timestamp`          | per-MV `meta/created_at` epoch millis       | CREATE MV                                            | Metadata display/migration; not a refresh decision  | None directly                                       |
+| `properties`              | `Map[String,String]` | per-MV `properties` CF                      | User TBLPROPERTIES plus internal keys                | Many targeted consumers                             | Depends on key; see below                           |
 
 ### Well-known property keys
 
-| Property key | Value type | Producer | Consumer | Refresh paths that read it |
-|---|---|---|---|---|
-| `_ivm_group_keys` | comma-separated column list | CREATE MV (`MaterializedViewCommands.scala:654`) | Refresh assembler/count cleanup helpers | AggregateGroup, AggregateHaving, GroupRecompute when grouping metadata is needed |
-| `_ivm_count_col` | column name | CREATE MV from user `COUNT(*)` alias (`MaterializedViewCommands.scala:655`) | `countMonoidColumn` fallback (`MaterializedViewCommands.scala:1327-1351`) | AggregateGroup, AggregateHaving, DistinctIncremental cleanup |
-| `_ivm_having_pred` | SQL predicate | CREATE MV for AggregateHaving (`MaterializedViewCommands.scala:656`) | Data-table/user-view split and refresh targeting | AggregateHaving |
-| `_ivm_emits_cascade_view_delta` | boolean string | `MvMetadata.cascadeViewDeltaProperties` (`MvCatalog.scala:107-109`) | `MvMetadata.emitsCascadeViewDelta` (`MvCatalog.scala:65-73`) | MV-over-MV cascade decisions |
-| `_ivm_compiled_sql` | full OpenIVM refresh SQL string | CREATE MV compile cache (`MaterializedViewCommands.scala:658-664`) or refresh backfill | Cached incremental refresh (`MaterializedViewCommands.scala:908-918`) | Incremental paths only; absent for FullRefresh |
-| `_ivm_compiled_initial_load_sql` | OpenIVM initial-load SQL string | CREATE MV compile cache | Cached `CompiledRefresh` reconstruction | Incremental paths; used with `_ivm_compiled_sql` |
-| `_ivm_watermark:<source>` | `Timestamp.toString` | CREATE MV, before initial CTAS (`MaterializedViewCommands.scala:665-670`) | `meta.sourceWatermarks` and `StagingCatalog.collectFor` | All paths that collect staging deltas |
-| user TBLPROPERTIES | string | `CREATE MATERIALIZED VIEW ... TBLPROPERTIES` | Preserved and available for future behavior | Only if a future path reads them |
+| Property key                     | Value type                      | Producer                                                                               | Consumer                                                                  | Refresh paths that read it                                                       |
+| -------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `_ivm_group_keys`                | comma-separated column list     | CREATE MV (`MaterializedViewCommands.scala:654`)                                       | Refresh assembler/count cleanup helpers                                   | AggregateGroup, AggregateHaving, GroupRecompute when grouping metadata is needed |
+| `_ivm_count_col`                 | column name                     | CREATE MV from user `COUNT(*)` alias (`MaterializedViewCommands.scala:655`)            | `countMonoidColumn` fallback (`MaterializedViewCommands.scala:1327-1351`) | AggregateGroup, AggregateHaving, DistinctIncremental cleanup                     |
+| `_ivm_having_pred`               | SQL predicate                   | CREATE MV for AggregateHaving (`MaterializedViewCommands.scala:656`)                   | Data-table/user-view split and refresh targeting                          | AggregateHaving                                                                  |
+| `_ivm_emits_cascade_view_delta`  | boolean string                  | `MvMetadata.cascadeViewDeltaProperties` (`MvCatalog.scala:107-109`)                    | `MvMetadata.emitsCascadeViewDelta` (`MvCatalog.scala:65-73`)              | MV-over-MV cascade decisions                                                     |
+| `_ivm_compiled_sql`              | full OpenIVM refresh SQL string | CREATE MV compile cache (`MaterializedViewCommands.scala:658-664`) or refresh backfill | Cached incremental refresh (`MaterializedViewCommands.scala:908-918`)     | Incremental paths only; absent for FullRefresh                                   |
+| `_ivm_compiled_initial_load_sql` | OpenIVM initial-load SQL string | CREATE MV compile cache                                                                | Cached `CompiledRefresh` reconstruction                                   | Incremental paths; used with `_ivm_compiled_sql`                                 |
+| `_ivm_watermark:<source>`        | `Timestamp.toString`            | CREATE MV, before initial CTAS (`MaterializedViewCommands.scala:665-670`)              | `meta.sourceWatermarks` and `StagingCatalog.collectFor`                   | All paths that collect staging deltas                                            |
+| user TBLPROPERTIES               | string                          | `CREATE MATERIALIZED VIEW ... TBLPROPERTIES`                                           | Preserved and available for future behavior                               | Only if a future path reads them                                                 |
 
 There is no persisted `demotion_reason` field in the current RocksDB schema.
 Demotion reasons are logged during CREATE (`classifyReason`) but not written as
@@ -274,7 +274,7 @@ captured before initial CTAS so a newly-created downstream MV does not consume
 staging rows it already absorbed in its initial load.  At refresh time,
 `StagingCatalog.collectFor` rejects staging rows with `txnTs <= watermark`.
 
----
+______________________________________________________________________
 
 ## 7.6 The `_ivm_compiled_sql` cache
 
@@ -346,11 +346,10 @@ Read `_ivm_compiled_sql` when:
 
 The property is the exact pre-rewrite program.  Compare it with the Spark log
 statements emitted around refresh execution and with `SparkRefreshRewriter`'s
-statement classifiers.  If `_ivm_compiled_sql` has no `INSERT INTO
-openivm_delta_<view>`, no cascade-usable view delta can be produced for that
+statement classifiers.  If `_ivm_compiled_sql` has no `INSERT INTO openivm_delta_<view>`, no cascade-usable view delta can be produced for that
 refresh path.
 
----
+______________________________________________________________________
 
 ## 7.7 Delta tables under `_ivm/`
 
@@ -372,13 +371,13 @@ def mvLocation(spark: SparkSession, id: TableIdentifier): String = {
 The schema is the MV result schema plus whatever hidden OpenIVM bookkeeping
 columns are required by the selected refresh type.  Examples include:
 
-| Hidden column | Where it appears | Purpose |
-|---|---|---|
-| `openivm_count_star` | Aggregate count-monoid data tables | Keeps rows until a cleanup DELETE removes zero-count groups. |
-| `openivm_distinct_count` | DISTINCT-as-aggregate paths | Same cleanup role for distinct rows. |
-| `openivm_left_key` | Outer/semi/anti join support paths | Tracks unmatched-side state. |
-| `openivm_multiplicity` | Delta temp views and persisted view deltas | Signed multiset delta, +1/-1. |
-| `openivm_timestamp` | Temporary source delta views, sometimes CTAS rewrite paths | Logical timestamp filter compatibility; often synthesized or stripped. |
+| Hidden column            | Where it appears                                           | Purpose                                                                |
+| ------------------------ | ---------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `openivm_count_star`     | Aggregate count-monoid data tables                         | Keeps rows until a cleanup DELETE removes zero-count groups.           |
+| `openivm_distinct_count` | DISTINCT-as-aggregate paths                                | Same cleanup role for distinct rows.                                   |
+| `openivm_left_key`       | Outer/semi/anti join support paths                         | Tracks unmatched-side state.                                           |
+| `openivm_multiplicity`   | Delta temp views and persisted view deltas                 | Signed multiset delta, +1/-1.                                          |
+| `openivm_timestamp`      | Temporary source delta views, sometimes CTAS rewrite paths | Logical timestamp filter compatibility; often synthesized or stripped. |
 
 The column generators are distributed across the compile bridge output and the
 Spark rewrite layer.  On the Spark side, `StagingDeltaView` synthesizes
@@ -395,14 +394,14 @@ DML staging Delta tables hold captured rows from a base-table operation.
 The row schema is the source table schema, without `openivm_*` columns.
 `StagingDeltaView` adds multiplicity at refresh time:
 
-| Op type | Multiplicity in temp view |
-|---|---:|
-| `INSERT` | `+1` |
-| `OVERWRITE` | `+1` |
-| `UPDATE_AFTER` | `+1` |
-| `DELETE` | `-1` |
-| `UPDATE_BEFORE` | `-1` |
-| `MERGE_SRC` | currently ignored / empty fallback |
+| Op type         |                Multiplicity in temp view |
+| --------------- | ---------------------------------------: |
+| `INSERT`        |                                     `+1` |
+| `OVERWRITE`     |                                     `+1` |
+| `UPDATE_AFTER`  |                                     `+1` |
+| `DELETE`        |                                     `-1` |
+| `UPDATE_BEFORE` |                                     `-1` |
+| `MERGE_SRC`     |       currently ignored / empty fallback |
 | `MV_VIEW_DELTA` | preserve upstream `openivm_multiplicity` |
 
 `StagedDmlNode.writeStagingDelta` writes these Delta tables for pre/post-DML
@@ -443,16 +442,16 @@ paths it also aliases `CURRENT_TIMESTAMP` as `openivm_timestamp`
 Lifecycle:
 
 1. Incremental refresh picks a fresh UUID path.
-2. Rewritten SQL writes signed rows to that path.
-3. If the MV emits cascade deltas, `StagingCatalog.record` records an
+1. Rewritten SQL writes signed rows to that path.
+1. If the MV emits cascade deltas, `StagingCatalog.record` records an
    `MV_VIEW_DELTA` row pointing at the path.
-4. Downstream refresh reads the path through `StagingDeltaView`.
-5. DROP MV deletes the whole per-MV `view_deltas/<safe>` namespace
+1. Downstream refresh reads the path through `StagingDeltaView`.
+1. DROP MV deletes the whole per-MV `view_deltas/<safe>` namespace
    (`MaterializedViewCommands.scala:1407-1413`).
-6. A failed refresh best-effort deletes the partial path
+1. A failed refresh best-effort deletes the partial path
    (`MaterializedViewCommands.scala:1156-1160`).
 
----
+______________________________________________________________________
 
 ## 7.8 Multi-process RocksDB locking
 
@@ -502,7 +501,7 @@ The relevant code is `OpenIvmRocksDB.scala:358-395`.
 Prefix scans are special: in multi-process mode they materialize the result into
 a `Vector` before the handle closes (`OpenIvmRocksDB.scala:411-430`).
 
----
+______________________________________________________________________
 
 ## 7.9 State write-path diagram
 
@@ -568,7 +567,7 @@ Write path invariants:
   visible only before or after the base-table mutation.
 - The RocksDB staging index is the durable pointer to the Delta staging table.
 
----
+______________________________________________________________________
 
 ## 7.10 State read-path diagram
 
@@ -640,7 +639,7 @@ Read path invariants:
 - `pruneFullyConsumed` deletes staging index rows only after every dependent MV
   has a consumed marker.
 
----
+______________________________________________________________________
 
 ## 7.11 Live TPC-DI exploration
 
@@ -652,93 +651,93 @@ The following numbers come from the existing warehouse:
 
 ### `_openivm/tables/*`
 
-| safe_name | decoded_name | num_sst_files | total_size_kb |
-|---|---|---:|---:|
-| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ` | `bronze.brokerage_trade` | 4 | 91.2 |
-| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5` | `bronze.brokerage_watch_history` | 4 | 91.4 |
-| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` | 4 | 91.5 |
-| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | `bronze.brokerage_daily_market` | 4 | 91.4 |
-| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk` | `bronze.brokerage_holding_history` | 4 | 91.5 |
-| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210` | `bronze.crm_customer_mgmt` | 4 | 91.2 |
-| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q` | `bronze.syndicated_prospect` | 4 | 91.3 |
-| `Z29sZC5kaW1fY3VzdG9tZXI` | `gold.dim_customer` | 4 | 84.9 |
-| `Z29sZC5kaW1fYWNjb3VudA` | `gold.dim_account` | 4 | 84.9 |
-| `Z29sZC5kaW1fc2VjdXJpdHk` | `gold.dim_security` | 4 | 85.0 |
-| `Z29sZC5kaW1fdHJhZGU` | `gold.dim_trade` | 4 | 84.9 |
-| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z` | `gold.fact_cash_transactions` | 4 | 85.3 |
-| `Z29sZC5mYWN0X3RyYWRl` | `gold.fact_trade` | 4 | 84.9 |
-| `Z29sZC5mYWN0X3dhdGNoZXM` | `gold.fact_watches` | 4 | 85.0 |
-| `c2lsdmVyLmFjY291bnRz` | `silver.accounts` | 4 | 90.9 |
-| `c2lsdmVyLmN1c3RvbWVycw` | `silver.customers` | 4 | 91.0 |
-| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z` | `silver.cash_transactions` | 4 | 85.2 |
-| `c2lsdmVyLmRhaWx5X21hcmtldA` | `silver.daily_market` | 4 | 91.1 |
-| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk` | `silver.holdings_history` | 4 | 85.2 |
-| `c2lsdmVyLnRyYWRlc19oaXN0b3J5` | `silver.trades_history` | 4 | 91.1 |
-| `c2lsdmVyLnRyYWRlcw` | `silver.trades` | 4 | 84.8 |
-| `c2lsdmVyLndhdGNoZXM` | `silver.watches` | 4 | 84.9 |
-| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ` | `silver.watches_history` | 4 | 85.1 |
-| `dHBjZGkuc3RhZ2luZ190cmFkZQ` | `tpcdi.staging_trade` | 4 | 90.9 |
-| `dHBjZGkuc3RhZ2luZ193YXRjaF9oaXN0b3J5` | `tpcdi.staging_watch_history` | 4 | 91.1 |
-| `dHBjZGkuc3RhZ2luZ19hY2NvdW50` | `tpcdi.staging_account` | 4 | 90.9 |
-| `dHBjZGkuc3RhZ2luZ19jYXNoX3RyYW5zYWN0aW9u` | `tpcdi.staging_cash_transaction` | 4 | 91.2 |
-| `dHBjZGkuc3RhZ2luZ19jdXN0b21lcg` | `tpcdi.staging_customer` | 4 | 91.0 |
-| `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ` | `tpcdi.staging_daily_market` | 4 | 91.1 |
-| `dHBjZGkuc3RhZ2luZ19ob2xkaW5nX2hpc3Rvcnk` | `tpcdi.staging_holding_history` | 4 | 91.2 |
-| `dHBjZGkuc3RhZ2luZ19wcm9zcGVjdA` | `tpcdi.staging_prospect` | 4 | 91.0 |
+| safe_name                                      | decoded_name                        | num_sst_files | total_size_kb |
+| ---------------------------------------------- | ----------------------------------- | ------------: | ------------: |
+| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ`               | `bronze.brokerage_trade`            |             4 |          91.2 |
+| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5`     | `bronze.brokerage_watch_history`    |             4 |          91.4 |
+| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` |             4 |          91.5 |
+| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ`      | `bronze.brokerage_daily_market`     |             4 |          91.4 |
+| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk`  | `bronze.brokerage_holding_history`  |             4 |          91.5 |
+| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210`             | `bronze.crm_customer_mgmt`          |             4 |          91.2 |
+| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q`          | `bronze.syndicated_prospect`        |             4 |          91.3 |
+| `Z29sZC5kaW1fY3VzdG9tZXI`                      | `gold.dim_customer`                 |             4 |          84.9 |
+| `Z29sZC5kaW1fYWNjb3VudA`                       | `gold.dim_account`                  |             4 |          84.9 |
+| `Z29sZC5kaW1fc2VjdXJpdHk`                      | `gold.dim_security`                 |             4 |          85.0 |
+| `Z29sZC5kaW1fdHJhZGU`                          | `gold.dim_trade`                    |             4 |          84.9 |
+| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z`         | `gold.fact_cash_transactions`       |             4 |          85.3 |
+| `Z29sZC5mYWN0X3RyYWRl`                         | `gold.fact_trade`                   |             4 |          84.9 |
+| `Z29sZC5mYWN0X3dhdGNoZXM`                      | `gold.fact_watches`                 |             4 |          85.0 |
+| `c2lsdmVyLmFjY291bnRz`                         | `silver.accounts`                   |             4 |          90.9 |
+| `c2lsdmVyLmN1c3RvbWVycw`                       | `silver.customers`                  |             4 |          91.0 |
+| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z`             | `silver.cash_transactions`          |             4 |          85.2 |
+| `c2lsdmVyLmRhaWx5X21hcmtldA`                   | `silver.daily_market`               |             4 |          91.1 |
+| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk`              | `silver.holdings_history`           |             4 |          85.2 |
+| `c2lsdmVyLnRyYWRlc19oaXN0b3J5`                 | `silver.trades_history`             |             4 |          91.1 |
+| `c2lsdmVyLnRyYWRlcw`                           | `silver.trades`                     |             4 |          84.8 |
+| `c2lsdmVyLndhdGNoZXM`                          | `silver.watches`                    |             4 |          84.9 |
+| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ`               | `silver.watches_history`            |             4 |          85.1 |
+| `dHBjZGkuc3RhZ2luZ190cmFkZQ`                   | `tpcdi.staging_trade`               |             4 |          90.9 |
+| `dHBjZGkuc3RhZ2luZ193YXRjaF9oaXN0b3J5`         | `tpcdi.staging_watch_history`       |             4 |          91.1 |
+| `dHBjZGkuc3RhZ2luZ19hY2NvdW50`                 | `tpcdi.staging_account`             |             4 |          90.9 |
+| `dHBjZGkuc3RhZ2luZ19jYXNoX3RyYW5zYWN0aW9u`     | `tpcdi.staging_cash_transaction`    |             4 |          91.2 |
+| `dHBjZGkuc3RhZ2luZ19jdXN0b21lcg`               | `tpcdi.staging_customer`            |             4 |          91.0 |
+| `dHBjZGkuc3RhZ2luZ19kYWlseV9tYXJrZXQ`          | `tpcdi.staging_daily_market`        |             4 |          91.1 |
+| `dHBjZGkuc3RhZ2luZ19ob2xkaW5nX2hpc3Rvcnk`      | `tpcdi.staging_holding_history`     |             4 |          91.2 |
+| `dHBjZGkuc3RhZ2luZ19wcm9zcGVjdA`               | `tpcdi.staging_prospect`            |             4 |          91.0 |
 
 ### `_openivm/mvs/*`
 
-| safe_name | decoded_name | num_sst_files | total_size_kb |
-|---|---|---:|---:|
-| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ` | `bronze.brokerage_trade` | 4 | 171.9 |
-| `YnJvbnplLmJyb2tlcmFnZV90cmFkZV9oaXN0b3J5` | `bronze.brokerage_trade_history` | 3 | 142.7 |
-| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5` | `bronze.brokerage_watch_history` | 4 | 171.3 |
-| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` | 4 | 171.3 |
-| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | `bronze.brokerage_daily_market` | 4 | 171.5 |
-| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk` | `bronze.brokerage_holding_history` | 4 | 171.4 |
-| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210` | `bronze.crm_customer_mgmt` | 4 | 184.8 |
-| `YnJvbnplLmZpbndpcmVfY29tcGFueQ` | `bronze.finwire_company` | 3 | 144.1 |
-| `YnJvbnplLmZpbndpcmVfZmluYW5jaWFs` | `bronze.finwire_financial` | 3 | 145.3 |
-| `YnJvbnplLmZpbndpcmVfc2VjdXJpdHk` | `bronze.finwire_security` | 3 | 144.7 |
-| `YnJvbnplLmhyX2VtcGxveWVl` | `bronze.hr_employee` | 3 | 143.1 |
-| `YnJvbnplLnJlZmVyZW5jZV90YXhfcmF0ZQ` | `bronze.reference_tax_rate` | 3 | 142.6 |
-| `YnJvbnplLnJlZmVyZW5jZV90cmFkZV90eXBl` | `bronze.reference_trade_type` | 3 | 142.7 |
-| `YnJvbnplLnJlZmVyZW5jZV9kYXRl` | `bronze.reference_date` | 3 | 144.2 |
-| `YnJvbnplLnJlZmVyZW5jZV9pbmR1c3RyeQ` | `bronze.reference_industry` | 3 | 142.6 |
-| `YnJvbnplLnJlZmVyZW5jZV9zdGF0dXNfdHlwZQ` | `bronze.reference_status_type` | 3 | 142.6 |
-| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q` | `bronze.syndicated_prospect` | 4 | 173.0 |
-| `Z29sZC50cmFkZV92b2x1bWVfc3RhdHM` | `gold.trade_volume_stats` | 5 | 145.3 |
-| `Z29sZC5icm9rZXJfcGVyZm9ybWFuY2U` | `gold.broker_performance` | 5 | 145.3 |
-| `Z29sZC5jdXN0b21lcl9jb25jZW50cmF0aW9u` | `gold.customer_concentration` | 5 | 145.2 |
-| `Z29sZC5kYWlseV9tYXJrZXRfcHVsc2U` | `gold.daily_market_pulse` | 4 | 159.3 |
-| `Z29sZC5kaW1fY29tcGFueQ` | `gold.dim_company` | 3 | 134.0 |
-| `Z29sZC5kaW1fY3VzdG9tZXI` | `gold.dim_customer` | 4 | 166.4 |
-| `Z29sZC5kaW1fYWNjb3VudA` | `gold.dim_account` | 4 | 158.3 |
-| `Z29sZC5kaW1fYnJva2Vy` | `gold.dim_broker` | 3 | 132.3 |
-| `Z29sZC5kaW1fZGF0ZQ` | `gold.dim_date` | 3 | 132.9 |
-| `Z29sZC5kaW1fc2VjdXJpdHk` | `gold.dim_security` | 3 | 130.8 |
-| `Z29sZC5kaW1fdHJhZGU` | `gold.dim_trade` | 5 | 145.9 |
-| `Z29sZC5mYWN0X21hcmtldF9oaXN0b3J5` | `gold.fact_market_history` | 5 | 144.6 |
-| `Z29sZC5mYWN0X2Nhc2hfYmFsYW5jZXM` | `gold.fact_cash_balances` | 4 | 158.3 |
-| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z` | `gold.fact_cash_transactions` | 4 | 158.5 |
-| `Z29sZC5mYWN0X2hvbGRpbmdz` | `gold.fact_holdings` | 5 | 144.7 |
-| `Z29sZC5mYWN0X3RyYWRl` | `gold.fact_trade` | 5 | 144.6 |
-| `Z29sZC5mYWN0X3dhdGNoZXM` | `gold.fact_watches` | 5 | 144.4 |
-| `Z29sZC5tYXJrZXRfdm9sYXRpbGl0eQ` | `gold.market_volatility` | 4 | 178.1 |
-| `c2lsdmVyLmFjY291bnRz` | `silver.accounts` | 4 | 175.5 |
-| `c2lsdmVyLmN1c3RvbWVycw` | `silver.customers` | 4 | 175.6 |
-| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z` | `silver.cash_transactions` | 4 | 158.4 |
-| `c2lsdmVyLmNvbXBhbmllcw` | `silver.companies` | 3 | 145.2 |
-| `c2lsdmVyLmRhaWx5X21hcmtldA` | `silver.daily_market` | 4 | 172.0 |
-| `c2lsdmVyLmRhdGU` | `silver.date` | 3 | 144.0 |
-| `c2lsdmVyLmVtcGxveWVlcw` | `silver.employees` | 3 | 143.2 |
-| `c2lsdmVyLmZpbmFuY2lhbHM` | `silver.financials` | 3 | 135.4 |
-| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk` | `silver.holdings_history` | 5 | 144.3 |
-| `c2lsdmVyLnNlY3VyaXRpZXM` | `silver.securities` | 3 | 134.7 |
-| `c2lsdmVyLnRyYWRlc19oaXN0b3J5` | `silver.trades_history` | 5 | 159.9 |
-| `c2lsdmVyLnRyYWRlcw` | `silver.trades` | 5 | 146.0 |
-| `c2lsdmVyLndhdGNoZXM` | `silver.watches` | 4 | 158.3 |
-| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ` | `silver.watches_history` | 4 | 158.4 |
+| safe_name                                      | decoded_name                        | num_sst_files | total_size_kb |
+| ---------------------------------------------- | ----------------------------------- | ------------: | ------------: |
+| `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ`               | `bronze.brokerage_trade`            |             4 |         171.9 |
+| `YnJvbnplLmJyb2tlcmFnZV90cmFkZV9oaXN0b3J5`     | `bronze.brokerage_trade_history`    |             3 |         142.7 |
+| `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5`     | `bronze.brokerage_watch_history`    |             4 |         171.3 |
+| `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` |             4 |         171.3 |
+| `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ`      | `bronze.brokerage_daily_market`     |             4 |         171.5 |
+| `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk`  | `bronze.brokerage_holding_history`  |             4 |         171.4 |
+| `YnJvbnplLmNybV9jdXN0b21lcl9tZ210`             | `bronze.crm_customer_mgmt`          |             4 |         184.8 |
+| `YnJvbnplLmZpbndpcmVfY29tcGFueQ`               | `bronze.finwire_company`            |             3 |         144.1 |
+| `YnJvbnplLmZpbndpcmVfZmluYW5jaWFs`             | `bronze.finwire_financial`          |             3 |         145.3 |
+| `YnJvbnplLmZpbndpcmVfc2VjdXJpdHk`              | `bronze.finwire_security`           |             3 |         144.7 |
+| `YnJvbnplLmhyX2VtcGxveWVl`                     | `bronze.hr_employee`                |             3 |         143.1 |
+| `YnJvbnplLnJlZmVyZW5jZV90YXhfcmF0ZQ`           | `bronze.reference_tax_rate`         |             3 |         142.6 |
+| `YnJvbnplLnJlZmVyZW5jZV90cmFkZV90eXBl`         | `bronze.reference_trade_type`       |             3 |         142.7 |
+| `YnJvbnplLnJlZmVyZW5jZV9kYXRl`                 | `bronze.reference_date`             |             3 |         144.2 |
+| `YnJvbnplLnJlZmVyZW5jZV9pbmR1c3RyeQ`           | `bronze.reference_industry`         |             3 |         142.6 |
+| `YnJvbnplLnJlZmVyZW5jZV9zdGF0dXNfdHlwZQ`       | `bronze.reference_status_type`      |             3 |         142.6 |
+| `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q`          | `bronze.syndicated_prospect`        |             4 |         173.0 |
+| `Z29sZC50cmFkZV92b2x1bWVfc3RhdHM`              | `gold.trade_volume_stats`           |             5 |         145.3 |
+| `Z29sZC5icm9rZXJfcGVyZm9ybWFuY2U`              | `gold.broker_performance`           |             5 |         145.3 |
+| `Z29sZC5jdXN0b21lcl9jb25jZW50cmF0aW9u`         | `gold.customer_concentration`       |             5 |         145.2 |
+| `Z29sZC5kYWlseV9tYXJrZXRfcHVsc2U`              | `gold.daily_market_pulse`           |             4 |         159.3 |
+| `Z29sZC5kaW1fY29tcGFueQ`                       | `gold.dim_company`                  |             3 |         134.0 |
+| `Z29sZC5kaW1fY3VzdG9tZXI`                      | `gold.dim_customer`                 |             4 |         166.4 |
+| `Z29sZC5kaW1fYWNjb3VudA`                       | `gold.dim_account`                  |             4 |         158.3 |
+| `Z29sZC5kaW1fYnJva2Vy`                         | `gold.dim_broker`                   |             3 |         132.3 |
+| `Z29sZC5kaW1fZGF0ZQ`                           | `gold.dim_date`                     |             3 |         132.9 |
+| `Z29sZC5kaW1fc2VjdXJpdHk`                      | `gold.dim_security`                 |             3 |         130.8 |
+| `Z29sZC5kaW1fdHJhZGU`                          | `gold.dim_trade`                    |             5 |         145.9 |
+| `Z29sZC5mYWN0X21hcmtldF9oaXN0b3J5`             | `gold.fact_market_history`          |             5 |         144.6 |
+| `Z29sZC5mYWN0X2Nhc2hfYmFsYW5jZXM`              | `gold.fact_cash_balances`           |             4 |         158.3 |
+| `Z29sZC5mYWN0X2Nhc2hfdHJhbnNhY3Rpb25z`         | `gold.fact_cash_transactions`       |             4 |         158.5 |
+| `Z29sZC5mYWN0X2hvbGRpbmdz`                     | `gold.fact_holdings`                |             5 |         144.7 |
+| `Z29sZC5mYWN0X3RyYWRl`                         | `gold.fact_trade`                   |             5 |         144.6 |
+| `Z29sZC5mYWN0X3dhdGNoZXM`                      | `gold.fact_watches`                 |             5 |         144.4 |
+| `Z29sZC5tYXJrZXRfdm9sYXRpbGl0eQ`               | `gold.market_volatility`            |             4 |         178.1 |
+| `c2lsdmVyLmFjY291bnRz`                         | `silver.accounts`                   |             4 |         175.5 |
+| `c2lsdmVyLmN1c3RvbWVycw`                       | `silver.customers`                  |             4 |         175.6 |
+| `c2lsdmVyLmNhc2hfdHJhbnNhY3Rpb25z`             | `silver.cash_transactions`          |             4 |         158.4 |
+| `c2lsdmVyLmNvbXBhbmllcw`                       | `silver.companies`                  |             3 |         145.2 |
+| `c2lsdmVyLmRhaWx5X21hcmtldA`                   | `silver.daily_market`               |             4 |         172.0 |
+| `c2lsdmVyLmRhdGU`                              | `silver.date`                       |             3 |         144.0 |
+| `c2lsdmVyLmVtcGxveWVlcw`                       | `silver.employees`                  |             3 |         143.2 |
+| `c2lsdmVyLmZpbmFuY2lhbHM`                      | `silver.financials`                 |             3 |         135.4 |
+| `c2lsdmVyLmhvbGRpbmdzX2hpc3Rvcnk`              | `silver.holdings_history`           |             5 |         144.3 |
+| `c2lsdmVyLnNlY3VyaXRpZXM`                      | `silver.securities`                 |             3 |         134.7 |
+| `c2lsdmVyLnRyYWRlc19oaXN0b3J5`                 | `silver.trades_history`             |             5 |         159.9 |
+| `c2lsdmVyLnRyYWRlcw`                           | `silver.trades`                     |             5 |         146.0 |
+| `c2lsdmVyLndhdGNoZXM`                          | `silver.watches`                    |             4 |         158.3 |
+| `c2lsdmVyLndhdGNoZXNfaGlzdG9yeQ`               | `silver.watches_history`            |             4 |         158.4 |
 
 ### Delta MV sample: `bronze.brokerage_trade`
 
@@ -750,30 +749,30 @@ _ivm/views/bronze/brokerage_trade
 
 Schema:
 
-| column | type | nullable |
-|---|---|---|
-| `t_id` | `BIGINT` | `YES` |
-| `t_dts` | `TIMESTAMP WITH TIME ZONE` | `YES` |
-| `t_st_id` | `VARCHAR` | `YES` |
-| `t_tt_id` | `VARCHAR` | `YES` |
-| `t_is_cash` | `TINYINT` | `YES` |
-| `t_s_symb` | `VARCHAR` | `YES` |
-| `t_qty` | `INTEGER` | `YES` |
-| `t_bid_price` | `DOUBLE` | `YES` |
-| `t_ca_id` | `BIGINT` | `YES` |
-| `t_exec_name` | `VARCHAR` | `YES` |
-| `t_trade_price` | `DOUBLE` | `YES` |
-| `t_chrg` | `DOUBLE` | `YES` |
-| `t_comm` | `DOUBLE` | `YES` |
-| `t_tax` | `DOUBLE` | `YES` |
+| column          | type                       | nullable |
+| --------------- | -------------------------- | -------- |
+| `t_id`          | `BIGINT`                   | `YES`    |
+| `t_dts`         | `TIMESTAMP WITH TIME ZONE` | `YES`    |
+| `t_st_id`       | `VARCHAR`                  | `YES`    |
+| `t_tt_id`       | `VARCHAR`                  | `YES`    |
+| `t_is_cash`     | `TINYINT`                  | `YES`    |
+| `t_s_symb`      | `VARCHAR`                  | `YES`    |
+| `t_qty`         | `INTEGER`                  | `YES`    |
+| `t_bid_price`   | `DOUBLE`                   | `YES`    |
+| `t_ca_id`       | `BIGINT`                   | `YES`    |
+| `t_exec_name`   | `VARCHAR`                  | `YES`    |
+| `t_trade_price` | `DOUBLE`                   | `YES`    |
+| `t_chrg`        | `DOUBLE`                   | `YES`    |
+| `t_comm`        | `DOUBLE`                   | `YES`    |
+| `t_tax`         | `DOUBLE`                   | `YES`    |
 
 Head, first eight columns:
 
-| t_id | t_dts | t_st_id | t_tt_id | t_is_cash | t_s_symb | t_qty | t_bid_price |
-|---|---|---|---|---|---|---|---|
-| `372221` | `2017-07-09 21:56:25+00:00` | `SBMT` | `TLS` | `0` | `AAAAAAAAAAAACPT` | `6454` | `2.97` |
-| `372101` | `2017-07-08 00:57:49+00:00` | `SBMT` | `TLS` | `0` | `AAAAAAAAAAAABFV` | `5225` | `4.06` |
-| `0` | `2012-07-07 00:02:34+00:00` | `CMPT` | `TMB` | `0` | `AAAAAAAAAAAACQP` | `2939` | `9.57` |
+| t_id     | t_dts                       | t_st_id | t_tt_id | t_is_cash | t_s_symb          | t_qty  | t_bid_price |
+| -------- | --------------------------- | ------- | ------- | --------- | ----------------- | ------ | ----------- |
+| `372221` | `2017-07-09 21:56:25+00:00` | `SBMT`  | `TLS`   | `0`       | `AAAAAAAAAAAACPT` | `6454` | `2.97`      |
+| `372101` | `2017-07-08 00:57:49+00:00` | `SBMT`  | `TLS`   | `0`       | `AAAAAAAAAAAABFV` | `5225` | `4.06`      |
+| `0`      | `2012-07-07 00:02:34+00:00` | `CMPT`  | `TMB`   | `0`       | `AAAAAAAAAAAACQP` | `2939` | `9.57`      |
 
 ### Delta MV sample: `silver.customers`
 
@@ -785,28 +784,28 @@ _ivm/views/silver/customers
 
 Schema excerpt:
 
-| column | type | nullable |
-|---|---|---|
-| `action_type` | `VARCHAR` | `YES` |
-| `status` | `VARCHAR` | `YES` |
-| `customer_id` | `BIGINT` | `YES` |
-| `account_id` | `BIGINT` | `YES` |
-| `tax_id` | `VARCHAR` | `YES` |
-| `gender` | `VARCHAR` | `YES` |
-| `tier` | `INTEGER` | `YES` |
-| `dob` | `DATE` | `YES` |
-| `last_name` | `VARCHAR` | `YES` |
-| `first_name` | `VARCHAR` | `YES` |
-| `middle_name` | `VARCHAR` | `YES` |
-| `openivm_left_key` | `VARCHAR` | `YES` |
+| column             | type      | nullable |
+| ------------------ | --------- | -------- |
+| `action_type`      | `VARCHAR` | `YES`    |
+| `status`           | `VARCHAR` | `YES`    |
+| `customer_id`      | `BIGINT`  | `YES`    |
+| `account_id`       | `BIGINT`  | `YES`    |
+| `tax_id`           | `VARCHAR` | `YES`    |
+| `gender`           | `VARCHAR` | `YES`    |
+| `tier`             | `INTEGER` | `YES`    |
+| `dob`              | `DATE`    | `YES`    |
+| `last_name`        | `VARCHAR` | `YES`    |
+| `first_name`       | `VARCHAR` | `YES`    |
+| `middle_name`      | `VARCHAR` | `YES`    |
+| `openivm_left_key` | `VARCHAR` | `YES`    |
 
 Head, first eight columns:
 
-| action_type | status | customer_id | account_id | tax_id | gender | tier | dob |
-|---|---|---|---|---|---|---|---|
-| `NEW` | `Active` | `4739` | `` | `016-32-5107` | `M` | `3` | `1983-06-21` |
-| `NEW` | `Active` | `4728` | `` | `031-80-9744` | `` | `3` | `1933-04-19` |
-| `UPDCUST` | `Active` | `` | `` | `` | `` | `` | `` |
+| action_type | status   | customer_id | account_id | tax_id        | gender | tier | dob          |
+| ----------- | -------- | ----------- | ---------- | ------------- | ------ | ---- | ------------ |
+| `NEW`       | `Active` | `4739`      | \`\`       | `016-32-5107` | `M`    | `3`  | `1983-06-21` |
+| `NEW`       | `Active` | `4728`      | \`\`       | `031-80-9744` | \`\`   | `3`  | `1933-04-19` |
+| `UPDCUST`   | `Active` | \`\`        | \`\`       | \`\`          | \`\`   | \`\` | \`\`         |
 
 ### Delta MV sample: `gold.daily_market_pulse`
 
@@ -818,26 +817,26 @@ _ivm/views/gold/daily_market_pulse
 
 Schema excerpt:
 
-| column | type | nullable |
-|---|---|---|
-| `dm_date` | `DATE` | `YES` |
-| `num_records` | `BIGINT` | `YES` |
-| `active_symbols` | `BIGINT` | `YES` |
-| `total_volume` | `BIGINT` | `YES` |
-| `avg_close_price` | `DOUBLE` | `YES` |
-| `close_dispersion` | `DOUBLE` | `YES` |
-| `market_low` | `DOUBLE` | `YES` |
-| `market_high` | `DOUBLE` | `YES` |
-| `avg_intraday_spread` | `DOUBLE` | `YES` |
-| `rank_by_volume` | `INTEGER` | `YES` |
+| column                | type      | nullable |
+| --------------------- | --------- | -------- |
+| `dm_date`             | `DATE`    | `YES`    |
+| `num_records`         | `BIGINT`  | `YES`    |
+| `active_symbols`      | `BIGINT`  | `YES`    |
+| `total_volume`        | `BIGINT`  | `YES`    |
+| `avg_close_price`     | `DOUBLE`  | `YES`    |
+| `close_dispersion`    | `DOUBLE`  | `YES`    |
+| `market_low`          | `DOUBLE`  | `YES`    |
+| `market_high`         | `DOUBLE`  | `YES`    |
+| `avg_intraday_spread` | `DOUBLE`  | `YES`    |
+| `rank_by_volume`      | `INTEGER` | `YES`    |
 
 Head, first eight columns:
 
-| dm_date | num_records | active_symbols | total_volume | avg_close_price | close_dispersion | market_low | market_high |
-|---|---|---|---|---|---|---|---|
-| `2015-07-12` | `1724` | `1724` | `881459032080` | `490.5302784222737` | `295.420618` | `1.1` | `1456.37` |
-| `2015-07-11` | `1724` | `1724` | `873608557952` | `506.9888167053365` | `293.688921` | `0.34` | `1481.42` |
-| `2015-07-06` | `1724` | `1724` | `852098086633` | `486.55004060324916` | `290.080455` | `0.98` | `1469.79` |
+| dm_date      | num_records | active_symbols | total_volume   | avg_close_price      | close_dispersion | market_low | market_high |
+| ------------ | ----------- | -------------- | -------------- | -------------------- | ---------------- | ---------- | ----------- |
+| `2015-07-12` | `1724`      | `1724`         | `881459032080` | `490.5302784222737`  | `295.420618`     | `1.1`      | `1456.37`   |
+| `2015-07-11` | `1724`      | `1724`         | `873608557952` | `506.9888167053365`  | `293.688921`     | `0.34`     | `1481.42`   |
+| `2015-07-06` | `1724`      | `1724`         | `852098086633` | `486.55004060324916` | `290.080455`     | `0.98`     | `1469.79`   |
 
 ### Persisted view-delta sample
 
@@ -849,25 +848,25 @@ _ivm/view_deltas/bronze_brokerage_cash_transaction/eec59711-e110-4e41-a39f-e8383
 
 Schema:
 
-| column | type | nullable |
-|---|---|---|
-| `ct_ca_id` | `BIGINT` | `YES` |
-| `ct_dts` | `TIMESTAMP WITH TIME ZONE` | `YES` |
-| `ct_amt` | `DOUBLE` | `YES` |
-| `ct_name` | `VARCHAR` | `YES` |
-| `openivm_multiplicity` | `INTEGER` | `YES` |
+| column                 | type                       | nullable |
+| ---------------------- | -------------------------- | -------- |
+| `ct_ca_id`             | `BIGINT`                   | `YES`    |
+| `ct_dts`               | `TIMESTAMP WITH TIME ZONE` | `YES`    |
+| `ct_amt`               | `DOUBLE`                   | `YES`    |
+| `ct_name`              | `VARCHAR`                  | `YES`    |
+| `openivm_multiplicity` | `INTEGER`                  | `YES`    |
 
 Rows:
 
-| ct_ca_id | ct_dts | ct_amt | ct_name | openivm_multiplicity |
-|---|---|---|---|---|
-| `2491` | `2017-07-09 10:02:43+00:00` | `-9204.27` | `UhmPrvMHxBAaAqugXnssPCIKEuJeROkJBfFIXOsPwqGGVpRYMK` | `1` |
+| ct_ca_id | ct_dts                      | ct_amt     | ct_name                                              | openivm_multiplicity |
+| -------- | --------------------------- | ---------- | ---------------------------------------------------- | -------------------- |
+| `2491`   | `2017-07-09 10:02:43+00:00` | `-9204.27` | `UhmPrvMHxBAaAqugXnssPCIKEuJeROkJBfFIXOsPwqGGVpRYMK` | `1`                  |
 
 This confirms the current physical note above: the persisted file has the sign
 column, while the transaction timestamp is represented by the RocksDB
 `StagingDelta.txnTs` that points at this path.
 
----
+______________________________________________________________________
 
 ## 7.12 Reproducibility recipe
 
@@ -1046,7 +1045,7 @@ val txnMillis = RocksDBCodec.decodeLongBE(parts.head)
 val stagingPath = RocksDBCodec.fromUtf8(parts(1))
 ```
 
----
+______________________________________________________________________
 
 ## 7.13 Sharp edges
 
@@ -1073,7 +1072,7 @@ RocksDB requires a local filesystem path and calls `RocksDBCodec.requireLocalPat
 When comparing `MvMetadata.location` with a local path, strip the `file:` scheme
 or normalize with `new File(new URI(loc))`.
 
----
+______________________________________________________________________
 
 ## 7.14 Mental model summary
 

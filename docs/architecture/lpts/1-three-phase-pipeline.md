@@ -199,10 +199,10 @@ It is the only phase that concatenates the final full SQL statement.
 This separation lets contributors debug one boundary at a time:
 
 1. logical plan;
-2. AST;
-3. CTE list;
-4. emitted SQL;
-5. round-trip correctness.
+1. AST;
+1. CTE list;
+1. emitted SQL;
+1. round-trip correctness.
 
 ## 5. Phase 1 details: AstBuilder
 
@@ -265,14 +265,14 @@ Source: `src/lpts_pipeline.cpp:3028-3045`.
 
 The common mappings are direct:
 
-| AST node | CTE node |
-|---|---|
-| `AstGetNode` | `GetNode` |
-| `AstFilterNode` | `FilterNode` |
-| `AstProjectNode` | `ProjectNode` |
-| `AstAggregateNode` | `AggregateNode` |
-| `AstJoinNode` | `JoinNode` |
-| `AstUnionNode` | `UnionNode` |
+| AST node              | CTE node              |
+| --------------------- | --------------------- |
+| `AstGetNode`          | `GetNode`             |
+| `AstFilterNode`       | `FilterNode`          |
+| `AstProjectNode`      | `ProjectNode`         |
+| `AstAggregateNode`    | `AggregateNode`       |
+| `AstJoinNode`         | `JoinNode`            |
+| `AstUnionNode`        | `UnionNode`           |
 | `AstSetOperationNode` | `CteSetOperationNode` |
 
 Source: `src/lpts_pipeline.cpp:3046-3124`.
@@ -583,9 +583,9 @@ It asks: how do we print this ordered CTE program in the requested dialect?
 Debugging should follow that same order:
 
 1. inspect DuckDB's logical plan;
-2. inspect the AST with `PRAGMA print_ast` or `print_ast_query`;
-3. inspect generated SQL with `PRAGMA lpts` or `lpts_query`;
-4. validate results with `PRAGMA lpts_check`.
+1. inspect the AST with `PRAGMA print_ast` or `print_ast_query`;
+1. inspect generated SQL with `PRAGMA lpts` or `lpts_query`;
+1. validate results with `PRAGMA lpts_check`.
 
 Source for entry points: `src/lpts_extension.cpp:100-231`.
 

@@ -52,15 +52,15 @@ An empty profile table often just means profiling was not enabled.
 
 ## 9.3 Column-by-column reference
 
-| Column | Type | Meaning | Source evidence |
-|---|---|---|---|
-| `refresh_id` | `VARCHAR` | Unique logical profile id. For refreshes it is `<view>_<steady_clock_ns>`; for CREATE MV it is `<view>_create_mv_<steady_clock_ns>`. | `openivm/src/upsert/refresh.cpp:44-46`, `openivm/src/core/parser_ddl.cpp:38-46` |
-| `view_name` | `VARCHAR` | Materialized view name being created or refreshed. | inserted at `openivm/src/upsert/refresh.cpp:84-88` and `openivm/src/core/parser_ddl.cpp:80-85` |
-| `profile_timestamp` | `TIMESTAMP DEFAULT current_timestamp` | Wall-clock insertion timestamp assigned by DuckDB when each row is written. | DDL at `openivm/src/openivm_extension.cpp:268-271` |
-| `step_order` | `INTEGER` | Zero-based sequence number within one `refresh_id`. | `next_step++` at `openivm/src/upsert/refresh.cpp:60,67` and `openivm/src/core/parser_ddl.cpp:56,63` |
-| `step_name` | `VARCHAR` | Logical step label such as `acquire_locks`, `generate_refresh_sql`, `execute_refresh_sql_stmt`, or `total_refresh`. | writes at `openivm/src/upsert/refresh.cpp:84-88` |
-| `duration_ms` | `BIGINT` | Elapsed milliseconds for that step, measured with `std::chrono::steady_clock`. | `openivm/src/upsert/refresh.cpp:53-60`; CREATE path at `openivm/src/core/parser_ddl.cpp:49-56` |
-| `detail` | `VARCHAR` | Free-form payload. This is where statement counts, SQL sizes, refresh type names, and SQL previews appear. | `openivm/src/upsert/refresh.cpp:174-176`, `237-240`, `249-250` |
+| Column              | Type                                  | Meaning                                                                                                                              | Source evidence                                                                                     |
+| ------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `refresh_id`        | `VARCHAR`                             | Unique logical profile id. For refreshes it is `<view>_<steady_clock_ns>`; for CREATE MV it is `<view>_create_mv_<steady_clock_ns>`. | `openivm/src/upsert/refresh.cpp:44-46`, `openivm/src/core/parser_ddl.cpp:38-46`                     |
+| `view_name`         | `VARCHAR`                             | Materialized view name being created or refreshed.                                                                                   | inserted at `openivm/src/upsert/refresh.cpp:84-88` and `openivm/src/core/parser_ddl.cpp:80-85`      |
+| `profile_timestamp` | `TIMESTAMP DEFAULT current_timestamp` | Wall-clock insertion timestamp assigned by DuckDB when each row is written.                                                          | DDL at `openivm/src/openivm_extension.cpp:268-271`                                                  |
+| `step_order`        | `INTEGER`                             | Zero-based sequence number within one `refresh_id`.                                                                                  | `next_step++` at `openivm/src/upsert/refresh.cpp:60,67` and `openivm/src/core/parser_ddl.cpp:56,63` |
+| `step_name`         | `VARCHAR`                             | Logical step label such as `acquire_locks`, `generate_refresh_sql`, `execute_refresh_sql_stmt`, or `total_refresh`.                  | writes at `openivm/src/upsert/refresh.cpp:84-88`                                                    |
+| `duration_ms`       | `BIGINT`                              | Elapsed milliseconds for that step, measured with `std::chrono::steady_clock`.                                                       | `openivm/src/upsert/refresh.cpp:53-60`; CREATE path at `openivm/src/core/parser_ddl.cpp:49-56`      |
+| `detail`            | `VARCHAR`                             | Free-form payload. This is where statement counts, SQL sizes, refresh type names, and SQL previews appear.                           | `openivm/src/upsert/refresh.cpp:174-176`, `237-240`, `249-250`                                      |
 
 Important negative verification: there are no separate columns named `timestamp`, `mv_name`, `refresh_type`, `plan_duration_ms`, `exec_duration_ms`, or `rows_processed`.
 Those concepts can be derived only indirectly.
@@ -95,24 +95,24 @@ That path writes `create_*` step names into the same table and uses the same ret
 
 The exact steps depend on view shape and settings, but these are common in the current source.
 
-| Phase | Step name | What it means | Source |
-|---|---|---|---|
-| refresh | `acquire_locks` | Per-view and per-delta-table locks were acquired. | `openivm/src/upsert/refresh.cpp:118-137` |
-| planning | `generate_refresh_sql.context` | Context and catalog/schema setup. | `openivm/src/upsert/refresh_sql.cpp:247-276` |
-| planning | `generate_refresh_sql.metadata_lookup` | MV metadata, delta tables, and target storage lookup. | `openivm/src/upsert/refresh_sql.cpp:329` |
-| planning | `generate_refresh_sql.qualify_sources` | Source qualification / query text preparation. | `openivm/src/upsert/refresh_sql.cpp:337` |
-| planning | `generate_refresh_sql.recovery_check` | Recovery-state check before generating SQL. | `openivm/src/upsert/refresh_sql.cpp:351` |
-| planning | `generate_refresh_sql.column_metadata` | Target column metadata collection. | `openivm/src/upsert/refresh_sql.cpp:457` |
-| planning | `generate_refresh_sql.delta_fast_paths` | Insert-only/delete-skipping/min-max fast-path decision. | `openivm/src/upsert/refresh_sql.cpp:474` |
-| planning | `generate_refresh_sql.dispatch` | Strategy-specific compiler dispatch. | `openivm/src/upsert/refresh_sql.cpp:407,684` |
-| planning | `generate_refresh_sql.compute_delta_plan` | Incremental delta logical plan construction. | `openivm/src/upsert/refresh_sql.cpp:860` |
-| planning | `generate_refresh_sql.lpts` | LogicalPlanToString serialization. | `openivm/src/upsert/refresh_sql.cpp:873` |
-| planning | `generate_refresh_sql.assembly` | Final SQL assembly. | `openivm/src/upsert/refresh_sql.cpp:1045` |
-| planning | `generate_refresh_sql` | Aggregate SQL generation elapsed time. | `openivm/src/upsert/refresh.cpp:164-176` |
-| execution | `execute_refresh_sql_stmt` | One generated SQL statement, only when profiling is enabled. | `openivm/src/upsert/refresh.cpp:223-244` |
-| execution | `execute_refresh_sql` | Total refresh SQL execution time. | `openivm/src/upsert/refresh.cpp:248-250` |
-| history | `record_refresh_history` | Learned cost-model history write, when adaptive estimate exists. | `openivm/src/upsert/refresh.cpp:316-343` |
-| total | `total_refresh` | End-to-end refresh time from profiler construction. | `openivm/src/upsert/refresh.cpp:70-72,344-345` |
+| Phase     | Step name                                 | What it means                                                    | Source                                         |
+| --------- | ----------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------- |
+| refresh   | `acquire_locks`                           | Per-view and per-delta-table locks were acquired.                | `openivm/src/upsert/refresh.cpp:118-137`       |
+| planning  | `generate_refresh_sql.context`            | Context and catalog/schema setup.                                | `openivm/src/upsert/refresh_sql.cpp:247-276`   |
+| planning  | `generate_refresh_sql.metadata_lookup`    | MV metadata, delta tables, and target storage lookup.            | `openivm/src/upsert/refresh_sql.cpp:329`       |
+| planning  | `generate_refresh_sql.qualify_sources`    | Source qualification / query text preparation.                   | `openivm/src/upsert/refresh_sql.cpp:337`       |
+| planning  | `generate_refresh_sql.recovery_check`     | Recovery-state check before generating SQL.                      | `openivm/src/upsert/refresh_sql.cpp:351`       |
+| planning  | `generate_refresh_sql.column_metadata`    | Target column metadata collection.                               | `openivm/src/upsert/refresh_sql.cpp:457`       |
+| planning  | `generate_refresh_sql.delta_fast_paths`   | Insert-only/delete-skipping/min-max fast-path decision.          | `openivm/src/upsert/refresh_sql.cpp:474`       |
+| planning  | `generate_refresh_sql.dispatch`           | Strategy-specific compiler dispatch.                             | `openivm/src/upsert/refresh_sql.cpp:407,684`   |
+| planning  | `generate_refresh_sql.compute_delta_plan` | Incremental delta logical plan construction.                     | `openivm/src/upsert/refresh_sql.cpp:860`       |
+| planning  | `generate_refresh_sql.lpts`               | LogicalPlanToString serialization.                               | `openivm/src/upsert/refresh_sql.cpp:873`       |
+| planning  | `generate_refresh_sql.assembly`           | Final SQL assembly.                                              | `openivm/src/upsert/refresh_sql.cpp:1045`      |
+| planning  | `generate_refresh_sql`                    | Aggregate SQL generation elapsed time.                           | `openivm/src/upsert/refresh.cpp:164-176`       |
+| execution | `execute_refresh_sql_stmt`                | One generated SQL statement, only when profiling is enabled.     | `openivm/src/upsert/refresh.cpp:223-244`       |
+| execution | `execute_refresh_sql`                     | Total refresh SQL execution time.                                | `openivm/src/upsert/refresh.cpp:248-250`       |
+| history   | `record_refresh_history`                  | Learned cost-model history write, when adaptive estimate exists. | `openivm/src/upsert/refresh.cpp:316-343`       |
+| total     | `total_refresh`                           | End-to-end refresh time from profiler construction.              | `openivm/src/upsert/refresh.cpp:70-72,344-345` |
 
 ## 9.6 Why `openivm_refresh_profile` is empty on the Spark side
 
@@ -148,16 +148,16 @@ The DuckDB compile subprocess is ephemeral, and its profile table is not a Spark
 The current Spark source emits operational log lines with the prefix `[openivm-mv]`.
 The emit sites found by `grep -rn "logInfo.*refresh" spark-ext/` and related `logError`/`logWarning` searches are below.
 
-| Event in logs | Example fields | Level | Source |
-|---|---|---|---|
-| compile failure demotion | `compiled_refresh_type='COMPILE_FAILED' effective_refresh_type='FULL_REFRESH' reason='compile_failed' cause=...` | ERROR | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:378-386` |
-| classification / demotion decision | `compiled_refresh_type`, `effective_refresh_type`, `reason`, `emits_cascade_view_delta` | INFO or ERROR | `MaterializedViewCommands.scala:630-638` |
-| no pending deltas | `refresh_type`, `outcome='no_pending_deltas'` | INFO | `MaterializedViewCommands.scala:796-805`, `817-821` |
-| refresh has pending deltas | `refresh_type`, `pending_deltas`, `source_tables` | INFO | `MaterializedViewCommands.scala:824-827` |
-| compile cache backfill failure | exception class and message | WARN | `MaterializedViewCommands.scala:920-939` |
-| rewritten statement text | `stmt[i]=<Spark SQL preview>` | INFO | `MaterializedViewCommands.scala:1017-1026` |
-| simple projection fallback | `outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'` | INFO | `MaterializedViewCommands.scala:1030-1042` |
-| skipped simple projection delete merge | `outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'` | INFO | `MaterializedViewCommands.scala:1061-1070`, `1077-1086` |
+| Event in logs                          | Example fields                                                                                                   | Level         | Source                                                                                                     |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------- |
+| compile failure demotion               | `compiled_refresh_type='COMPILE_FAILED' effective_refresh_type='FULL_REFRESH' reason='compile_failed' cause=...` | ERROR         | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:378-386` |
+| classification / demotion decision     | `compiled_refresh_type`, `effective_refresh_type`, `reason`, `emits_cascade_view_delta`                          | INFO or ERROR | `MaterializedViewCommands.scala:630-638`                                                                   |
+| no pending deltas                      | `refresh_type`, `outcome='no_pending_deltas'`                                                                    | INFO          | `MaterializedViewCommands.scala:796-805`, `817-821`                                                        |
+| refresh has pending deltas             | `refresh_type`, `pending_deltas`, `source_tables`                                                                | INFO          | `MaterializedViewCommands.scala:824-827`                                                                   |
+| compile cache backfill failure         | exception class and message                                                                                      | WARN          | `MaterializedViewCommands.scala:920-939`                                                                   |
+| rewritten statement text               | `stmt[i]=<Spark SQL preview>`                                                                                    | INFO          | `MaterializedViewCommands.scala:1017-1026`                                                                 |
+| simple projection fallback             | `outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'`                                      | INFO          | `MaterializedViewCommands.scala:1030-1042`                                                                 |
+| skipped simple projection delete merge | `outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'`                                        | INFO          | `MaterializedViewCommands.scala:1061-1070`, `1077-1086`                                                    |
 
 The assemblers under `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/*Assembler.scala` do not currently emit log lines themselves.
 They return `AssembledRefresh` objects to `RefreshMaterializedViewCommand`, which logs the final rewritten statements before execution.
@@ -167,23 +167,23 @@ They return `AssembledRefresh` objects to `RefreshMaterializedViewCommand`, whic
 The requested names are useful as a desired structured vocabulary, but they are not present as literal log events in this checkout.
 This matters because a parser that greps for `refresh_step=compile_start` will return no rows today.
 
-| Requested event | Current status | Closest current evidence |
-|---|---|---|
-| `compile_start` | not emitted | CREATE-time classification line after compile; cache-miss compile path at `MaterializedViewCommands.scala:920-941` has no timing log |
-| `compile_end` | not emitted | same classification line includes `compiled_refresh_type` |
-| `compile_duration_ms` | not emitted | measure externally or add instrumentation around `compiler.compile(...)` |
-| `collect_staging_start` | not emitted | refresh entry calls `StagingCatalog.collectFor` at `MaterializedViewCommands.scala:807-812` |
-| `collect_staging_end` | not emitted | subsequent log line reports `pending_deltas=${stagingDeltas.size}` at `MaterializedViewCommands.scala:824-827` |
-| `rows_collected` | not emitted | only number of staging delta records is logged as `pending_deltas`; row counts inside Delta paths are not logged |
-| `rewrite_start` | not emitted | `SparkRefreshRewriter.rewrite(...)` happens before statement logs; no explicit timer |
-| `rewrite_end` | not emitted | `stmt[i]` lines show the rewritten output exists |
-| `execute_stmt` | partially emitted | `stmt[i]=...` logs the statement text before execution, but not a start/end marker |
-| `stmt_duration_ms` | not emitted | use Spark SQL/job metrics or add a timer around `executeSql` |
-| `mark_consumed_start` / `mark_consumed_end` | not emitted | cleanup calls `StagingCatalog.markConsumed` at `MaterializedViewCommands.scala:1273-1274` |
-| `emits_cascade_view_delta` | emitted at CREATE/classification | `MaterializedViewCommands.scala:626-638` |
-| `demotion_reason` | field is named `reason`, not `demotion_reason` | `MaterializedViewCommands.scala:597-638` |
-| `refresh_type_name` | emitted as `compiled_refresh_type`, `effective_refresh_type`, or refresh-time `refresh_type` | `MaterializedViewCommands.scala:632-634`, `800-827` |
-| `refresh_type_code` | not emitted | persisted in `MvMetadata.refreshType`, enum in `RefreshTypeCode.scala:6-18` |
+| Requested event                             | Current status                                                                               | Closest current evidence                                                                                                             |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `compile_start`                             | not emitted                                                                                  | CREATE-time classification line after compile; cache-miss compile path at `MaterializedViewCommands.scala:920-941` has no timing log |
+| `compile_end`                               | not emitted                                                                                  | same classification line includes `compiled_refresh_type`                                                                            |
+| `compile_duration_ms`                       | not emitted                                                                                  | measure externally or add instrumentation around `compiler.compile(...)`                                                             |
+| `collect_staging_start`                     | not emitted                                                                                  | refresh entry calls `StagingCatalog.collectFor` at `MaterializedViewCommands.scala:807-812`                                          |
+| `collect_staging_end`                       | not emitted                                                                                  | subsequent log line reports `pending_deltas=${stagingDeltas.size}` at `MaterializedViewCommands.scala:824-827`                       |
+| `rows_collected`                            | not emitted                                                                                  | only number of staging delta records is logged as `pending_deltas`; row counts inside Delta paths are not logged                     |
+| `rewrite_start`                             | not emitted                                                                                  | `SparkRefreshRewriter.rewrite(...)` happens before statement logs; no explicit timer                                                 |
+| `rewrite_end`                               | not emitted                                                                                  | `stmt[i]` lines show the rewritten output exists                                                                                     |
+| `execute_stmt`                              | partially emitted                                                                            | `stmt[i]=...` logs the statement text before execution, but not a start/end marker                                                   |
+| `stmt_duration_ms`                          | not emitted                                                                                  | use Spark SQL/job metrics or add a timer around `executeSql`                                                                         |
+| `mark_consumed_start` / `mark_consumed_end` | not emitted                                                                                  | cleanup calls `StagingCatalog.markConsumed` at `MaterializedViewCommands.scala:1273-1274`                                            |
+| `emits_cascade_view_delta`                  | emitted at CREATE/classification                                                             | `MaterializedViewCommands.scala:626-638`                                                                                             |
+| `demotion_reason`                           | field is named `reason`, not `demotion_reason`                                               | `MaterializedViewCommands.scala:597-638`                                                                                             |
+| `refresh_type_name`                         | emitted as `compiled_refresh_type`, `effective_refresh_type`, or refresh-time `refresh_type` | `MaterializedViewCommands.scala:632-634`, `800-827`                                                                                  |
+| `refresh_type_code`                         | not emitted                                                                                  | persisted in `MvMetadata.refreshType`, enum in `RefreshTypeCode.scala:6-18`                                                          |
 
 ## 9.9 Where Spark logs land
 
@@ -236,15 +236,15 @@ Observed lines:
 Because this checkout does not emit explicit Spark start/end/duration markers, the table below separates measured log timestamps from unavailable timings.
 The relative time origin is the classification log line at `11:44:29.580`.
 
-| Step | Started at (ms) | Ended at (ms) | Duration (ms) | Evidence |
-|---|---:|---:|---:|---|
-| compile | n/a | 0 | n/a | classification line appears after compile and reports `AGGREGATE_GROUP` |
-| collect_staging | n/a | 1469 | n/a | pending-delta line at `11:44:31.049` |
-| rewrite | n/a | 1491 | n/a | first statement line at `11:44:31.071` |
-| execute_stmt_1 | n/a | n/a | n/a | only `stmt[0]=...` text is logged before execution |
-| execute_stmt_2 | n/a | n/a | n/a | only `stmt[1]=...` text is logged before execution |
-| execute_stmt_3 | n/a | n/a | n/a | only `stmt[2]=...` text is logged before execution |
-| mark_consumed | n/a | n/a | n/a | cleanup is not logged; source call is `MaterializedViewCommands.scala:1273-1274` |
+| Step            | Started at (ms) | Ended at (ms) | Duration (ms) | Evidence                                                                         |
+| --------------- | --------------: | ------------: | ------------: | -------------------------------------------------------------------------------- |
+| compile         |             n/a |             0 |           n/a | classification line appears after compile and reports `AGGREGATE_GROUP`          |
+| collect_staging |             n/a |          1469 |           n/a | pending-delta line at `11:44:31.049`                                             |
+| rewrite         |             n/a |          1491 |           n/a | first statement line at `11:44:31.071`                                           |
+| execute_stmt_1  |             n/a |           n/a |           n/a | only `stmt[0]=...` text is logged before execution                               |
+| execute_stmt_2  |             n/a |           n/a |           n/a | only `stmt[1]=...` text is logged before execution                               |
+| execute_stmt_3  |             n/a |           n/a |           n/a | only `stmt[2]=...` text is logged before execution                               |
+| mark_consumed   |             n/a |           n/a |           n/a | cleanup is not logged; source call is `MaterializedViewCommands.scala:1273-1274` |
 
 If you need the requested exact table with non-null durations, add explicit timers around compile, staging collection, rewrite, each `executeSql`, and `postRefreshCleanup`.
 Until then, combine `[openivm-mv]` lines with Spark SQL/job metrics for runtime.
@@ -276,29 +276,29 @@ SQL"
 
 The refresh portion of the output looked like this.
 
-| refresh_id | view_name | step_order | step_name | duration_ms | detail |
-|---|---|---:|---|---:|---|
-| `mv_sales_661448269587947` | `mv_sales` | 0 | `acquire_locks` | 0 | `1 delta locks` |
-| `mv_sales_661448269587947` | `mv_sales` | 1 | `generate_refresh_sql.context` | 0 | `cross_system=false` |
-| `mv_sales_661448269587947` | `mv_sales` | 2 | `generate_refresh_sql.metadata_lookup` | 2 | `refresh_type=AGGREGATE_GROUP; delta_tables=1; target_ducklake=false` |
-| `mv_sales_661448269587947` | `mv_sales` | 3 | `generate_refresh_sql.qualify_sources` | 0 | `query_bytes=455` |
-| `mv_sales_661448269587947` | `mv_sales` | 4 | `generate_refresh_sql.recovery_check` | 0 | empty |
-| `mv_sales_661448269587947` | `mv_sales` | 5 | `generate_refresh_sql.column_metadata` | 0 | `columns=4; list_mode=false` |
-| `mv_sales_661448269587947` | `mv_sales` | 6 | `generate_refresh_sql.delta_fast_paths` | 0 | `insert_only=true; skip_agg_delete=true; skip_proj_delete=true; minmax_incremental=true` |
-| `mv_sales_661448269587947` | `mv_sales` | 7 | `generate_refresh_sql.dispatch` | 0 | `refresh_type=AGGREGATE_GROUP; upsert_bytes=609` |
-| `mv_sales_661448269587947` | `mv_sales` | 8 | `generate_refresh_sql.compute_delta_plan` | 4 | empty |
-| `mv_sales_661448269587947` | `mv_sales` | 9 | `generate_refresh_sql.lpts` | 0 | `delta_sql_bytes=1968` |
-| `mv_sales_661448269587947` | `mv_sales` | 10 | `generate_refresh_sql.assembly` | 2 | `sql_bytes=3250; meta_post_bytes=337` |
-| `mv_sales_661448269587947` | `mv_sales` | 11 | `generate_refresh_sql` | 15 | `sql_bytes=3250, meta_pre_bytes=0, meta_post_bytes=0` |
-| `mv_sales_661448269587947` | `mv_sales` | 12 | `execute_refresh_sql_stmt` | 1 | `statement=1/7, bytes=80, sql=UPDATE openivm_views ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 13 | `execute_refresh_sql_stmt` | 26 | `statement=2/7, bytes=2018, sql=WITH scan_0 ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 14 | `execute_refresh_sql_stmt` | 3 | `statement=3/7, bytes=606, sql=WITH refresh_cte ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 15 | `execute_refresh_sql_stmt` | 0 | `statement=4/7, bytes=34, sql=DELETE FROM openivm_delta_mv_sales` |
-| `mv_sales_661448269587947` | `mv_sales` | 16 | `execute_refresh_sql_stmt` | 2 | `statement=5/7, bytes=162, sql=DELETE FROM memory.main.openivm_delta_sales ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 17 | `execute_refresh_sql_stmt` | 2 | `statement=6/7, bytes=251, sql=UPDATE openivm_delta_tables ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 18 | `execute_refresh_sql_stmt` | 1 | `statement=7/7, bytes=81, sql=UPDATE openivm_views ... false ...` |
-| `mv_sales_661448269587947` | `mv_sales` | 19 | `execute_refresh_sql` | 37 | `bytes=3250, statements=7` |
-| `mv_sales_661448269587947` | `mv_sales` | 20 | `total_refresh` | 63 | empty |
+| refresh_id                 | view_name  | step_order | step_name                                 | duration_ms | detail                                                                                   |
+| -------------------------- | ---------- | ---------: | ----------------------------------------- | ----------: | ---------------------------------------------------------------------------------------- |
+| `mv_sales_661448269587947` | `mv_sales` |          0 | `acquire_locks`                           |           0 | `1 delta locks`                                                                          |
+| `mv_sales_661448269587947` | `mv_sales` |          1 | `generate_refresh_sql.context`            |           0 | `cross_system=false`                                                                     |
+| `mv_sales_661448269587947` | `mv_sales` |          2 | `generate_refresh_sql.metadata_lookup`    |           2 | `refresh_type=AGGREGATE_GROUP; delta_tables=1; target_ducklake=false`                    |
+| `mv_sales_661448269587947` | `mv_sales` |          3 | `generate_refresh_sql.qualify_sources`    |           0 | `query_bytes=455`                                                                        |
+| `mv_sales_661448269587947` | `mv_sales` |          4 | `generate_refresh_sql.recovery_check`     |           0 | empty                                                                                    |
+| `mv_sales_661448269587947` | `mv_sales` |          5 | `generate_refresh_sql.column_metadata`    |           0 | `columns=4; list_mode=false`                                                             |
+| `mv_sales_661448269587947` | `mv_sales` |          6 | `generate_refresh_sql.delta_fast_paths`   |           0 | `insert_only=true; skip_agg_delete=true; skip_proj_delete=true; minmax_incremental=true` |
+| `mv_sales_661448269587947` | `mv_sales` |          7 | `generate_refresh_sql.dispatch`           |           0 | `refresh_type=AGGREGATE_GROUP; upsert_bytes=609`                                         |
+| `mv_sales_661448269587947` | `mv_sales` |          8 | `generate_refresh_sql.compute_delta_plan` |           4 | empty                                                                                    |
+| `mv_sales_661448269587947` | `mv_sales` |          9 | `generate_refresh_sql.lpts`               |           0 | `delta_sql_bytes=1968`                                                                   |
+| `mv_sales_661448269587947` | `mv_sales` |         10 | `generate_refresh_sql.assembly`           |           2 | `sql_bytes=3250; meta_post_bytes=337`                                                    |
+| `mv_sales_661448269587947` | `mv_sales` |         11 | `generate_refresh_sql`                    |          15 | `sql_bytes=3250, meta_pre_bytes=0, meta_post_bytes=0`                                    |
+| `mv_sales_661448269587947` | `mv_sales` |         12 | `execute_refresh_sql_stmt`                |           1 | `statement=1/7, bytes=80, sql=UPDATE openivm_views ...`                                  |
+| `mv_sales_661448269587947` | `mv_sales` |         13 | `execute_refresh_sql_stmt`                |          26 | `statement=2/7, bytes=2018, sql=WITH scan_0 ...`                                         |
+| `mv_sales_661448269587947` | `mv_sales` |         14 | `execute_refresh_sql_stmt`                |           3 | `statement=3/7, bytes=606, sql=WITH refresh_cte ...`                                     |
+| `mv_sales_661448269587947` | `mv_sales` |         15 | `execute_refresh_sql_stmt`                |           0 | `statement=4/7, bytes=34, sql=DELETE FROM openivm_delta_mv_sales`                        |
+| `mv_sales_661448269587947` | `mv_sales` |         16 | `execute_refresh_sql_stmt`                |           2 | `statement=5/7, bytes=162, sql=DELETE FROM memory.main.openivm_delta_sales ...`          |
+| `mv_sales_661448269587947` | `mv_sales` |         17 | `execute_refresh_sql_stmt`                |           2 | `statement=6/7, bytes=251, sql=UPDATE openivm_delta_tables ...`                          |
+| `mv_sales_661448269587947` | `mv_sales` |         18 | `execute_refresh_sql_stmt`                |           1 | `statement=7/7, bytes=81, sql=UPDATE openivm_views ... false ...`                        |
+| `mv_sales_661448269587947` | `mv_sales` |         19 | `execute_refresh_sql`                     |          37 | `bytes=3250, statements=7`                                                               |
+| `mv_sales_661448269587947` | `mv_sales` |         20 | `total_refresh`                           |          63 | empty                                                                                    |
 
 The same query also returned `create_*` rows for the MV creation profile, because profiling was enabled before `CREATE MATERIALIZED VIEW`.
 That is expected: CREATE and REFRESH share the same profile table but use different `refresh_id` shapes and step names.
@@ -343,17 +343,17 @@ Use Spark SQL listener/job metrics externally, or add a dedicated listener if yo
    tail -f spark-ext/.logs/test-<TS>/fork-*.log | grep --line-buffered '\[openivm-mv\]'
    ```
 
-2. Run a targeted test and capture durations from logs plus Spark job metrics.
+1. Run a targeted test and capture durations from logs plus Spark job metrics.
 
    ```bash
    ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
    grep -n '\[openivm-mv\].*refresh' spark-ext/.logs/test-<TS>/fork-*.log
    ```
 
-3. For production, configure log4j/log4j2 to emit `org.openivm.spark.commands` as structured JSON and aggregate downstream.
+1. For production, configure log4j/log4j2 to emit `org.openivm.spark.commands` as structured JSON and aggregate downstream.
    Suggested fields to extract are `view`, `refresh_type`, `compiled_refresh_type`, `effective_refresh_type`, `reason`, `emits_cascade_view_delta`, `pending_deltas`, and `stmt_index`.
 
-4. Manually time DML-to-refresh cycles in a Spark notebook.
+1. Manually time DML-to-refresh cycles in a Spark notebook.
 
    ```scala
    val t0 = System.nanoTime()
@@ -364,7 +364,7 @@ Use Spark SQL listener/job metrics externally, or add a dedicated listener if yo
    println(s"dml_ms=${(t1 - t0) / 1000000}, refresh_ms=${(t2 - t1) / 1000000}")
    ```
 
-5. For standalone DuckDB/OpenIVM, use the profile table directly.
+1. For standalone DuckDB/OpenIVM, use the profile table directly.
 
    ```sql
    SET openivm_profile_refresh=true;
@@ -462,13 +462,13 @@ chmod +x parse-openivm-refresh-log.py
 
 Example output for `aggsum_mv_batch` with current logs:
 
-| Step | Started at (ms) | Ended at (ms) | Duration (ms) |
-|---|---:|---:|---:|
-| compile/classify | 0 | 0 | n/a |
-| collect_staging | 1469 | 1469 | n/a |
-| execute_stmt_1 | 1491 | 1491 | n/a |
-| execute_stmt_2 | 1491 | 1491 | n/a |
-| execute_stmt_3 | 1491 | 1491 | n/a |
+| Step             | Started at (ms) | Ended at (ms) | Duration (ms) |
+| ---------------- | --------------: | ------------: | ------------: |
+| compile/classify |               0 |             0 |           n/a |
+| collect_staging  |            1469 |          1469 |           n/a |
+| execute_stmt_1   |            1491 |          1491 |           n/a |
+| execute_stmt_2   |            1491 |          1491 |           n/a |
+| execute_stmt_3   |            1491 |          1491 |           n/a |
 
 ## 9.15 Mermaid data flow
 
@@ -505,14 +505,14 @@ Recommended fields:
 
 Suggested insertion points are direct and low-risk.
 
-| Step | Code seam |
-|---|---|
-| compile | around `compiler.compile(...)` in CREATE and refresh cache-miss paths |
-| collect staging | around `StagingCatalog.collectFor(...)` at `MaterializedViewCommands.scala:807-812` |
-| rewrite | around `SparkRefreshRewriter.rewrite(...)` in `runUnderLock` |
-| execute statement | inside the `executeSql` wrapper at `MaterializedViewCommands.scala:1027-1028` |
-| mark consumed | around `postRefreshCleanup(...)` and `StagingCatalog.markConsumed(...)` at `MaterializedViewCommands.scala:1273-1274` |
-| cascade delta | immediately after `cleanupMeta.emitsCascadeViewDelta` is evaluated at `MaterializedViewCommands.scala:1132-1155` |
+| Step              | Code seam                                                                                                             |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| compile           | around `compiler.compile(...)` in CREATE and refresh cache-miss paths                                                 |
+| collect staging   | around `StagingCatalog.collectFor(...)` at `MaterializedViewCommands.scala:807-812`                                   |
+| rewrite           | around `SparkRefreshRewriter.rewrite(...)` in `runUnderLock`                                                          |
+| execute statement | inside the `executeSql` wrapper at `MaterializedViewCommands.scala:1027-1028`                                         |
+| mark consumed     | around `postRefreshCleanup(...)` and `StagingCatalog.markConsumed(...)` at `MaterializedViewCommands.scala:1273-1274` |
+| cascade delta     | immediately after `cleanupMeta.emitsCascadeViewDelta` is evaluated at `MaterializedViewCommands.scala:1132-1155`      |
 
 Until that instrumentation exists, treat Spark logs as control-plane evidence and Spark SQL metrics as runtime evidence.
 For DuckDB standalone refresh runtime, use `openivm_refresh_profile` directly.

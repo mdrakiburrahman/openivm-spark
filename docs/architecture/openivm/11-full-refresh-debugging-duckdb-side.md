@@ -12,11 +12,11 @@ changed the effective metadata to `FULL_REFRESH`.
 
 `FULL_REFRESH` can mean three related but different things.
 
-| Term | Where it appears | Meaning |
-|---|---|---|
-| OpenIVM classified type | `PRAGMA compile_refresh` JSON: `refresh_type_name` | The type stored in OpenIVM metadata at `CREATE MATERIALIZED VIEW` time. |
-| Full-recompute-shaped SQL | `sql` contains delete/overwrite + full `SELECT` | The generated refresh program recomputes all rows, even if the label is another type. |
-| Spark effective type | `MvMetadata.refreshTypeName` | The type openivm-spark persisted after Spark-side safety checks. |
+| Term                      | Where it appears                                   | Meaning                                                                               |
+| ------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| OpenIVM classified type   | `PRAGMA compile_refresh` JSON: `refresh_type_name` | The type stored in OpenIVM metadata at `CREATE MATERIALIZED VIEW` time.               |
+| Full-recompute-shaped SQL | `sql` contains delete/overwrite + full `SELECT`    | The generated refresh program recomputes all rows, even if the label is another type. |
+| Spark effective type      | `MvMetadata.refreshTypeName`                       | The type openivm-spark persisted after Spark-side safety checks.                      |
 
 The common bug is to see Spark metadata `FULL_REFRESH` and assume Spark demoted.
 That is only true if OpenIVM originally returned something else.
@@ -34,25 +34,25 @@ fallback under the same classified type.
 The following files in the upstream OpenIVM source are the important ones.
 Paths below are written as upstream paths, not as local scratch-checkout paths.
 
-| Source file | Why it matters |
-|---|---|
-| `src/core/incremental_checker.cpp` | Walks the optimized DuckDB logical plan and sets classifier booleans. |
-| `src/core/parser.cpp` | Converts classifier booleans into a `RefreshType`. |
-| `src/core/parser_plan_helpers.cpp` | Detects set operations, pivot, lateral/delim facts, and other plan facts. |
-| `src/include/core/openivm_constants.hpp` | Defines the `RefreshType` enum and `RefreshTypeName`. |
-| `src/rules/incremental_rewrite_rule.cpp` | Dispatches operator-specific delta rewrite rules. |
-| `src/upsert/refresh_sql.cpp` | Chooses full recompute vs incremental refresh SQL generation. |
-| `src/upsert/refresh_window.cpp` | Contains the `WINDOW_PARTITION` multi-source full-recompute fallback. |
-| `src/upsert/refresh.cpp` | Implements `PRAGMA compile_refresh`. |
+| Source file                              | Why it matters                                                            |
+| ---------------------------------------- | ------------------------------------------------------------------------- |
+| `src/core/incremental_checker.cpp`       | Walks the optimized DuckDB logical plan and sets classifier booleans.     |
+| `src/core/parser.cpp`                    | Converts classifier booleans into a `RefreshType`.                        |
+| `src/core/parser_plan_helpers.cpp`       | Detects set operations, pivot, lateral/delim facts, and other plan facts. |
+| `src/include/core/openivm_constants.hpp` | Defines the `RefreshType` enum and `RefreshTypeName`.                     |
+| `src/rules/incremental_rewrite_rule.cpp` | Dispatches operator-specific delta rewrite rules.                         |
+| `src/upsert/refresh_sql.cpp`             | Chooses full recompute vs incremental refresh SQL generation.             |
+| `src/upsert/refresh_window.cpp`          | Contains the `WINDOW_PARTITION` multi-source full-recompute fallback.     |
+| `src/upsert/refresh.cpp`                 | Implements `PRAGMA compile_refresh`.                                      |
 
 The Spark bridge source also matters when you compare the DuckDB answer with
 openivm-spark metadata.
 
-| Spark-side file | Why it matters |
-|---|---|
-| `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala` | Runs the DuckDB CLI and parses the JSON line. |
-| `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala` | Persists `refreshTypeName` and the `_ivm_compiled_sql` property. |
-| `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala` | Applies Spark-side demotion checks. |
+| Spark-side file                                                                                    | Why it matters                                                   |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala`           | Runs the DuckDB CLI and parses the JSON line.                    |
+| `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala`                     | Persists `refreshTypeName` and the `_ivm_compiled_sql` property. |
+| `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala` | Applies Spark-side demotion checks.                              |
 
 ## 3. Mermaid overview
 
@@ -87,11 +87,11 @@ The first matching condition wins.
 The main `FULL_REFRESH` cases are:
 
 1. Unsupported high-level constructs discovered before the normal classifier.
-2. A logical operator or expression that the checker marks incompatible.
-3. SEMI/ANTI joins combined with aggregation.
-4. Some SEMI/ANTI extraction failures for projection-only SEMI/ANTI views.
-5. Filtered `LIST` aggregates without group keys.
-6. The final default fallback when no specific rule matches.
+1. A logical operator or expression that the checker marks incompatible.
+1. SEMI/ANTI joins combined with aggregation.
+1. Some SEMI/ANTI extraction failures for projection-only SEMI/ANTI views.
+1. Filtered `LIST` aggregates without group keys.
+1. The final default fallback when no specific rule matches.
 
 ### 4.1 Unsupported construct pre-check
 
@@ -162,10 +162,10 @@ In openivm-spark, such a compiler failure normally appears as a Spark-side
 `compile_failed` demotion; see the Spark-side chapter.
 When debugging, distinguish:
 
-| Symptom | Likely layer |
-|---|---|
-| JSON row says `refresh_type_name="FULL_REFRESH"` | DuckDB create-time classifier. |
-| DuckDB CLI errors with `Operator type ... not supported` | DuckDB refresh-time rewrite failed. |
+| Symptom                                                                   | Likely layer                                        |
+| ------------------------------------------------------------------------- | --------------------------------------------------- |
+| JSON row says `refresh_type_name="FULL_REFRESH"`                          | DuckDB create-time classifier.                      |
+| DuckDB CLI errors with `Operator type ... not supported`                  | DuckDB refresh-time rewrite failed.                 |
 | Spark metadata says `FULL_REFRESH` and log says `reason='compile_failed'` | Spark-side demotion after DuckDB failed to compile. |
 
 ### 4.4 Final default fallback
@@ -301,11 +301,11 @@ It is a refresh-compiler fallback inside a non-full label.
 
 The practical symptom is:
 
-| Field | Value |
-|---|---|
-| JSON `refresh_type_name` | `WINDOW_PARTITION` |
-| JSON `sql` | full delete/reinsert or equivalent recompute program |
-| Spark `demotionReason` | none, unless Spark adds its own later demotion |
+| Field                    | Value                                                |
+| ------------------------ | ---------------------------------------------------- |
+| JSON `refresh_type_name` | `WINDOW_PARTITION`                                   |
+| JSON `sql`               | full delete/reinsert or equivalent recompute program |
+| Spark `demotionReason`   | none, unless Spark adds its own later demotion       |
 
 ## 7. How openivm-spark distinguishes DuckDB full refresh from Spark demotion
 
@@ -323,12 +323,12 @@ SQL under `_ivm_compiled_sql` when a non-empty compiled program is retained.
 
 Use this decision table:
 
-| Evidence | Conclusion |
-|---|---|
-| OpenIVM JSON `refresh_type_name=FULL_REFRESH`, Spark `demotionReason` absent | OpenIVM naturally emitted `FULL_REFRESH`. |
-| OpenIVM JSON incremental, Spark metadata `FULL_REFRESH`, `demotionReason` set | Spark-side demotion. |
-| OpenIVM JSON incremental, SQL is full recompute, no demotion reason | DuckDB refresh compiler fallback or force-full SQL shape. |
-| OpenIVM CLI failed, Spark log says `reason='compile_failed'` | Spark demoted because the bridge could not compile. |
+| Evidence                                                                      | Conclusion                                                |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------- |
+| OpenIVM JSON `refresh_type_name=FULL_REFRESH`, Spark `demotionReason` absent  | OpenIVM naturally emitted `FULL_REFRESH`.                 |
+| OpenIVM JSON incremental, Spark metadata `FULL_REFRESH`, `demotionReason` set | Spark-side demotion.                                      |
+| OpenIVM JSON incremental, SQL is full recompute, no demotion reason           | DuckDB refresh compiler fallback or force-full SQL shape. |
+| OpenIVM CLI failed, Spark log says `reason='compile_failed'`                  | Spark demoted because the bridge could not compile.       |
 
 Version caveat for this checkout:
 `MvMetadata` currently has no first-class `demotionReason` field.
@@ -381,11 +381,11 @@ For a grouped sum you should expect an incremental classification similar to:
 
 Interpretation:
 
-| JSON field | Meaning |
-|---|---|
-| `refresh_type` | Numeric enum ordinal from `src/include/core/openivm_constants.hpp`. |
-| `refresh_type_name` | Human-readable OpenIVM classifier label. |
-| `sql` | Refresh program generated by OpenIVM in the target dialect. |
+| JSON field          | Meaning                                                             |
+| ------------------- | ------------------------------------------------------------------- |
+| `refresh_type`      | Numeric enum ordinal from `src/include/core/openivm_constants.hpp`. |
+| `refresh_type_name` | Human-readable OpenIVM classifier label.                            |
+| `sql`               | Refresh program generated by OpenIVM in the target dialect.         |
 
 A true DuckDB-side full-refresh classifier looks like:
 
@@ -442,9 +442,9 @@ Common culprits:
 Use the source in this order:
 
 1. `parser_plan_helpers.cpp` for plan facts such as set operations and PIVOT.
-2. `incremental_checker.cpp` for operator compatibility.
-3. `parser.cpp` for the `RefreshType` selection ladder.
-4. `incremental_rewrite_rule.cpp` only if the classifier was incremental but
+1. `incremental_checker.cpp` for operator compatibility.
+1. `parser.cpp` for the `RefreshType` selection ladder.
+1. `incremental_rewrite_rule.cpp` only if the classifier was incremental but
    compile failed during refresh SQL generation.
 
 ### Step 4: decide whether to rewrite or accept full refresh
@@ -452,13 +452,13 @@ Use the source in this order:
 If you control the MV body, rewrite it into a supported operator family.
 Examples:
 
-| Unsupported shape | Possible rewrite |
-|---|---|
-| `EXCEPT ALL` used as anti-filter | Express as `LEFT ANTI JOIN` or `NOT EXISTS` if semantics allow. |
-| Volatile projection | Materialize the volatile value in a base table before creating the MV. |
-| Correlated projection subquery | Convert to an explicit join plus grouped aggregate. |
-| Recursive CTE | Precompute the recursion into a base table or scheduled staging table. |
-| Unsupported aggregate | Replace with supported aggregates or a group recompute-friendly shape. |
+| Unsupported shape                | Possible rewrite                                                       |
+| -------------------------------- | ---------------------------------------------------------------------- |
+| `EXCEPT ALL` used as anti-filter | Express as `LEFT ANTI JOIN` or `NOT EXISTS` if semantics allow.        |
+| Volatile projection              | Materialize the volatile value in a base table before creating the MV. |
+| Correlated projection subquery   | Convert to an explicit join plus grouped aggregate.                    |
+| Recursive CTE                    | Precompute the recursion into a base table or scheduled staging table. |
+| Unsupported aggregate            | Replace with supported aggregates or a group recompute-friendly shape. |
 
 If you do not control the MV body, accept `FULL_REFRESH` and tune the refresh
 cadence, batch size, and warehouse layout.
@@ -480,15 +480,15 @@ SELECT region, amount FROM sales_fr3 WHERE amount > 300
 Why it classifies as `FULL_REFRESH`:
 
 1. DuckDB parses and binds the body.
-2. The logical plan contains an `EXCEPT` set-operation node.
-3. `parser_plan_helpers.cpp` marks `has_unsupported_set_operation = true` for
+1. The logical plan contains an `EXCEPT` set-operation node.
+1. `parser_plan_helpers.cpp` marks `has_unsupported_set_operation = true` for
    `LOGICAL_EXCEPT` and `LOGICAL_INTERSECT`.
-4. `parser.cpp` combines that into `has_unsupported_incremental_construct`.
-5. The first classifier branch sets `refresh_type = RefreshType::FULL_REFRESH`.
-6. `PRAGMA compile_refresh` returns `refresh_type=3` and
+1. `parser.cpp` combines that into `has_unsupported_incremental_construct`.
+1. The first classifier branch sets `refresh_type = RefreshType::FULL_REFRESH`.
+1. `PRAGMA compile_refresh` returns `refresh_type=3` and
    `refresh_type_name="FULL_REFRESH"`.
-7. Spark persists `FULL_REFRESH` with no Spark-side demotion reason.
-8. Refresh is correct because the MV is rebuilt from the live query body.
+1. Spark persists `FULL_REFRESH` with no Spark-side demotion reason.
+1. Refresh is correct because the MV is rebuilt from the live query body.
 
 A representative compile result is:
 
@@ -512,23 +512,23 @@ The table below is a debugging map, not a formal grammar.
 It follows the order used by the checker and parser, with caveats from the
 current source.
 
-| DuckDB logical operator / family | Suggests | When `FULL_REFRESH` or full recompute enters |
-|---|---|---|
-| `LOGICAL_PROJECTION` | `SIMPLE_PROJECTION` when no aggregate dominates | Volatile functions or non-foldable `UNNEST` mark the plan incompatible. |
-| `LOGICAL_FILTER` | Preserves child family; HAVING flag over aggregate | Volatile filter expressions mark the plan incompatible. |
-| `LOGICAL_AGGREGATE_AND_GROUP_BY` | `SIMPLE_AGGREGATE`, `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, or `GROUP_RECOMPUTE` | Unsupported aggregate functions, unnormalized filtered aggregates, or no extracted group keys can force `FULL_REFRESH`. |
-| `LOGICAL_DISTINCT` | `DISTINCT_INCREMENTAL` for supported inner-distinct aux-state cases, otherwise aggregate/group paths | Top-level distinct is generally supported; extractor failure for inner distinct falls back to `GROUP_RECOMPUTE`, not usually `FULL_REFRESH`. |
-| `LOGICAL_COMPARISON_JOIN` / `LOGICAL_JOIN` / `LOGICAL_ANY_JOIN` / `LOGICAL_CROSS_PRODUCT` | Join incrementalization or projection/aggregate family over joins | Unsupported join types mark the plan incompatible; SEMI/ANTI plus aggregation is explicit `FULL_REFRESH`. |
-| `LOGICAL_JOIN` with INNER/LEFT/RIGHT/FULL OUTER | Join incrementalization; aggregate views may become group or merge paths | Practical limits and Spark-side demotions are separate; DuckDB source supports these families but can choose group recompute for non-linear aggregate cases. |
-| `LOGICAL_JOIN` with SEMI/ANTI/MARK | `SEMI_ANTI_RECOMPUTE` for extracted projection-only shapes | SEMI/ANTI plus aggregation is `FULL_REFRESH`; extractor failure can be `FULL_REFRESH`. |
-| `LOGICAL_DEPENDENT_JOIN` / `LOGICAL_DELIM_JOIN` | Delim/dependent rewrite or group recompute for correlated shapes | Some lateral/correlated forms fail extraction or later Spark execution; unhandled forms can become `FULL_REFRESH` or compile failure. |
-| `LOGICAL_WINDOW` | `WINDOW_PARTITION` | Single-source partition recompute is OK; multi-source lineage gaps keep the label but emit full-recompute-shaped SQL. |
-| `LOGICAL_TOP_N` / `LOGICAL_LIMIT` / `LOGICAL_ORDER_BY` | `TOP_K` or top-k wrapper over child | Non-column ORDER BY marks incompatible; Spark currently demotes top-k to `FULL_REFRESH`. |
-| `LOGICAL_UNION` | Preserves or combines child family | Volatile union expressions mark incompatible; unsupported set operations are `INTERSECT` and `EXCEPT`, not `UNION ALL`. |
-| `LOGICAL_INTERSECT` / `LOGICAL_EXCEPT` | none | `parser_plan_helpers.cpp` marks unsupported set operation, then parser selects `FULL_REFRESH`. |
-| `LOGICAL_MATERIALIZED_CTE` | Inherit the inlined/consumer family | Non-inlinable or recursive-like CTE shapes can expose unsupported operators and fall back. |
-| `LOGICAL_RECURSIVE_CTE` or any unknown operator | none | Falls into the checker default branch and becomes incompatible, therefore `FULL_REFRESH`. |
-| Constant nodes (`DUMMY_SCAN`, `CHUNK_GET`, `EXPRESSION_GET`) | Infrastructure / constants | Supported as leaves; not a reason for full refresh by themselves. |
+| DuckDB logical operator / family                                                          | Suggests                                                                                             | When `FULL_REFRESH` or full recompute enters                                                                                                                 |
+| ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `LOGICAL_PROJECTION`                                                                      | `SIMPLE_PROJECTION` when no aggregate dominates                                                      | Volatile functions or non-foldable `UNNEST` mark the plan incompatible.                                                                                      |
+| `LOGICAL_FILTER`                                                                          | Preserves child family; HAVING flag over aggregate                                                   | Volatile filter expressions mark the plan incompatible.                                                                                                      |
+| `LOGICAL_AGGREGATE_AND_GROUP_BY`                                                          | `SIMPLE_AGGREGATE`, `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, or `GROUP_RECOMPUTE`                      | Unsupported aggregate functions, unnormalized filtered aggregates, or no extracted group keys can force `FULL_REFRESH`.                                      |
+| `LOGICAL_DISTINCT`                                                                        | `DISTINCT_INCREMENTAL` for supported inner-distinct aux-state cases, otherwise aggregate/group paths | Top-level distinct is generally supported; extractor failure for inner distinct falls back to `GROUP_RECOMPUTE`, not usually `FULL_REFRESH`.                 |
+| `LOGICAL_COMPARISON_JOIN` / `LOGICAL_JOIN` / `LOGICAL_ANY_JOIN` / `LOGICAL_CROSS_PRODUCT` | Join incrementalization or projection/aggregate family over joins                                    | Unsupported join types mark the plan incompatible; SEMI/ANTI plus aggregation is explicit `FULL_REFRESH`.                                                    |
+| `LOGICAL_JOIN` with INNER/LEFT/RIGHT/FULL OUTER                                           | Join incrementalization; aggregate views may become group or merge paths                             | Practical limits and Spark-side demotions are separate; DuckDB source supports these families but can choose group recompute for non-linear aggregate cases. |
+| `LOGICAL_JOIN` with SEMI/ANTI/MARK                                                        | `SEMI_ANTI_RECOMPUTE` for extracted projection-only shapes                                           | SEMI/ANTI plus aggregation is `FULL_REFRESH`; extractor failure can be `FULL_REFRESH`.                                                                       |
+| `LOGICAL_DEPENDENT_JOIN` / `LOGICAL_DELIM_JOIN`                                           | Delim/dependent rewrite or group recompute for correlated shapes                                     | Some lateral/correlated forms fail extraction or later Spark execution; unhandled forms can become `FULL_REFRESH` or compile failure.                        |
+| `LOGICAL_WINDOW`                                                                          | `WINDOW_PARTITION`                                                                                   | Single-source partition recompute is OK; multi-source lineage gaps keep the label but emit full-recompute-shaped SQL.                                        |
+| `LOGICAL_TOP_N` / `LOGICAL_LIMIT` / `LOGICAL_ORDER_BY`                                    | `TOP_K` or top-k wrapper over child                                                                  | Non-column ORDER BY marks incompatible; Spark currently demotes top-k to `FULL_REFRESH`.                                                                     |
+| `LOGICAL_UNION`                                                                           | Preserves or combines child family                                                                   | Volatile union expressions mark incompatible; unsupported set operations are `INTERSECT` and `EXCEPT`, not `UNION ALL`.                                      |
+| `LOGICAL_INTERSECT` / `LOGICAL_EXCEPT`                                                    | none                                                                                                 | `parser_plan_helpers.cpp` marks unsupported set operation, then parser selects `FULL_REFRESH`.                                                               |
+| `LOGICAL_MATERIALIZED_CTE`                                                                | Inherit the inlined/consumer family                                                                  | Non-inlinable or recursive-like CTE shapes can expose unsupported operators and fall back.                                                                   |
+| `LOGICAL_RECURSIVE_CTE` or any unknown operator                                           | none                                                                                                 | Falls into the checker default branch and becomes incompatible, therefore `FULL_REFRESH`.                                                                    |
+| Constant nodes (`DUMMY_SCAN`, `CHUNK_GET`, `EXPRESSION_GET`)                              | Infrastructure / constants                                                                           | Supported as leaves; not a reason for full refresh by themselves.                                                                                            |
 
 Two practical notes:
 
@@ -553,17 +553,17 @@ static const unordered_set<string> kSet = {
 
 That means, for this checkout:
 
-| Aggregate | Classification status | Refresh behavior notes |
-|---|---|---|
-| `COUNT(*)`, `COUNT(x)` | Supported | Linear aggregate path. |
-| `SUM(x)` | Supported | Linear aggregate path. |
-| `AVG(x)` | Supported | Rewritten/decomposed to sum and count helper columns. |
-| `MIN(x)`, `MAX(x)` | Supported | `found_minmax=true`; insert-only can use extrema merge when `openivm_minmax_incremental=true`; mixed deltas use group recompute. |
-| `STDDEV`, `STDDEV_SAMP`, `STDDEV_POP` | Supported in current source | Decomposed to sum, count, and sum-of-squares helper columns. |
-| `VARIANCE`, `VAR_SAMP`, `VAR_POP` | Supported in current source | Decomposed similarly; final formula is reconstructed. |
-| `LIST` | Whitelisted but non-linear | Often uses group recompute; filtered ungrouped list can become `FULL_REFRESH`. |
-| `BOOL_AND`, `BOOL_OR` | Whitelisted | Validate behavior with parity tests before assuming Spark support. |
-| `ARG_MIN`, `ARG_MAX` | Whitelisted | Treated with min/max-like caveats; mixed changes generally recompute affected groups. |
+| Aggregate                             | Classification status       | Refresh behavior notes                                                                                                           |
+| ------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `COUNT(*)`, `COUNT(x)`                | Supported                   | Linear aggregate path.                                                                                                           |
+| `SUM(x)`                              | Supported                   | Linear aggregate path.                                                                                                           |
+| `AVG(x)`                              | Supported                   | Rewritten/decomposed to sum and count helper columns.                                                                            |
+| `MIN(x)`, `MAX(x)`                    | Supported                   | `found_minmax=true`; insert-only can use extrema merge when `openivm_minmax_incremental=true`; mixed deltas use group recompute. |
+| `STDDEV`, `STDDEV_SAMP`, `STDDEV_POP` | Supported in current source | Decomposed to sum, count, and sum-of-squares helper columns.                                                                     |
+| `VARIANCE`, `VAR_SAMP`, `VAR_POP`     | Supported in current source | Decomposed similarly; final formula is reconstructed.                                                                            |
+| `LIST`                                | Whitelisted but non-linear  | Often uses group recompute; filtered ungrouped list can become `FULL_REFRESH`.                                                   |
+| `BOOL_AND`, `BOOL_OR`                 | Whitelisted                 | Validate behavior with parity tests before assuming Spark support.                                                               |
+| `ARG_MIN`, `ARG_MAX`                  | Whitelisted                 | Treated with min/max-like caveats; mixed changes generally recompute affected groups.                                            |
 
 Common aggregates that are not in the whitelist include:
 
@@ -609,12 +609,12 @@ MvCatalog.list(spark).foreach { meta =>
 
 Interpretation:
 
-| Spark metadata | Cache / reason | Diagnosis |
-|---|---|---|
-| `refreshTypeName=FULL_REFRESH` | no reason, DuckDB standalone also returns `FULL_REFRESH` | OpenIVM emitted full refresh naturally. |
-| `refreshTypeName=FULL_REFRESH` | reason `top_k`, `no_real_delta`, `compile_failed`, etc. | Spark-side demotion; use the Spark chapter. |
-| `refreshTypeName=WINDOW_PARTITION` | SQL performs full recompute | DuckDB window refresh fallback, not demotion. |
-| `refreshTypeName=AGGREGATE_GROUP` | SQL performs full recompute because `openivm_refresh_mode='full'` | Force-full SQL shape, not classifier change. |
+| Spark metadata                     | Cache / reason                                                    | Diagnosis                                     |
+| ---------------------------------- | ----------------------------------------------------------------- | --------------------------------------------- |
+| `refreshTypeName=FULL_REFRESH`     | no reason, DuckDB standalone also returns `FULL_REFRESH`          | OpenIVM emitted full refresh naturally.       |
+| `refreshTypeName=FULL_REFRESH`     | reason `top_k`, `no_real_delta`, `compile_failed`, etc.           | Spark-side demotion; use the Spark chapter.   |
+| `refreshTypeName=WINDOW_PARTITION` | SQL performs full recompute                                       | DuckDB window refresh fallback, not demotion. |
+| `refreshTypeName=AGGREGATE_GROUP`  | SQL performs full recompute because `openivm_refresh_mode='full'` | Force-full SQL shape, not classifier change.  |
 
 If `_ivm_compiled_sql` is present, open it and inspect the first statement.
 If it begins with full delete/reinsert while the type is incremental, ask why
@@ -637,17 +637,17 @@ Use this checklist before changing code.
 - [ ] Capture all source table schemas as DuckDB-compatible DDL.
 - [ ] Run standalone OpenIVM with the compile-bridge pragmas.
 - [ ] Save the JSON `refresh_type`, `refresh_type_name`, and first statements
-      of `sql`.
+  of `sql`.
 - [ ] If the JSON type is `FULL_REFRESH`, run `EXPLAIN` on the MV body.
 - [ ] Map the suspicious plan node to `incremental_checker.cpp`.
 - [ ] Map the final classifier branch in `parser.cpp`.
 - [ ] If JSON type is incremental but SQL recomputes, inspect
-      `refresh_sql.cpp` and family-specific compilers.
+  `refresh_sql.cpp` and family-specific compilers.
 - [ ] If JSON type is incremental but Spark metadata is `FULL_REFRESH`, switch
-      to the Spark-side demotion chapter.
+  to the Spark-side demotion chapter.
 - [ ] Do not widen Spark demotion to hide a DuckDB classification question.
 - [ ] Do not demote an incremental OpenIVM path merely to make a parity test
-      pass.
+  pass.
 
 ## 14. Common questions
 
@@ -729,10 +729,10 @@ Spark demotion reason, if any:
 A good report states whether the problem is:
 
 1. expected OpenIVM `FULL_REFRESH`;
-2. unexpected OpenIVM classifier fallback;
-3. OpenIVM incremental label with full-recompute-shaped SQL;
-4. Spark-side demotion after an incremental OpenIVM result;
-5. DuckDB compile failure surfaced as Spark `compile_failed`.
+1. unexpected OpenIVM classifier fallback;
+1. OpenIVM incremental label with full-recompute-shaped SQL;
+1. Spark-side demotion after an incremental OpenIVM result;
+1. DuckDB compile failure surfaced as Spark `compile_failed`.
 
 Only item 4 belongs in the Spark demotion chapter.
 Items 1 through 3 belong here.

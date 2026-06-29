@@ -10,7 +10,7 @@ A materialized view has two classifications that are easy to conflate.
    `refreshType`, `refreshTypeName`, `sql`, and `initialLoadSql`.
    That shape is emitted by `openivm_compile_with_facts` and decoded by
    `OpenIvmCompiler.parseRefreshLine`.
-2. The Spark extension persists an effective type in `MvMetadata`.
+1. The Spark extension persists an effective type in `MvMetadata`.
    The persisted type controls CREATE-time storage, REFRESH-time assembly,
    and whether downstream MV-over-MV refresh can consume a view delta.
 
@@ -23,12 +23,12 @@ The enum value for full recompute is `RefreshTypeCode.FullRefresh = 3` in
 
 A **demotion** is the moment where those two classifications diverge:
 
-| concept | example value | who chose it | consequence |
-|---|---:|---|---|
-| compiled refresh type | `AGGREGATE_GROUP` / `SIMPLE_PROJECTION` / `WINDOW_PARTITION` | OpenIVM DuckDB extension | Spark has an incremental program to inspect |
-| effective refresh type | `FULL_REFRESH` | Spark-side safety gate | Refresh recomputes from `querySql` |
-| correctness | bag-equal to live query | Spark | preserved |
-| performance | full source scan | Spark | worse than incremental |
+| concept                |                                                example value | who chose it             | consequence                                 |
+| ---------------------- | -----------------------------------------------------------: | ------------------------ | ------------------------------------------- |
+| compiled refresh type  | `AGGREGATE_GROUP` / `SIMPLE_PROJECTION` / `WINDOW_PARTITION` | OpenIVM DuckDB extension | Spark has an incremental program to inspect |
+| effective refresh type |                                               `FULL_REFRESH` | Spark-side safety gate   | Refresh recomputes from `querySql`          |
+| correctness            |                                      bag-equal to live query | Spark                    | preserved                                   |
+| performance            |                                             full source scan | Spark                    | worse than incremental                      |
 
 `FULL_REFRESH` is assembled as exactly one Spark SQL statement by
 `FullRefreshAssembler`: `INSERT OVERWRITE TABLE <mv> SELECT * FROM (<deltaSql>)`.
@@ -54,9 +54,9 @@ added `MvMetadata.demotionReason`, it should store the same string as
 `CreateMaterializedViewCommand.run` does four things before it writes metadata:
 
 1. Resolve source schemas and analyze the Spark plan.
-2. Call the DuckDB/OpenIVM compiler bridge.
-3. Run Spark-specific safety checks over the compiled program and analyzed plan.
-4. Persist the effective `refreshType` / `refreshTypeName`.
+1. Call the DuckDB/OpenIVM compiler bridge.
+1. Run Spark-specific safety checks over the compiled program and analyzed plan.
+1. Persist the effective `refreshType` / `refreshTypeName`.
 
 The compiler call is at
 `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:367-377`.
@@ -139,16 +139,16 @@ Use the reason table as a triage map. The `Reason string` column is the value
 emitted in the structured `reason='...'` log line and, on branches with a
 persisted field, the value that should be stored in `MvMetadata.demotionReason`.
 
-| Reason string | Trigger | File:line |
-|---|---|---|
-| `top_k` | Top-level `ORDER BY`, `LIMIT`, `OFFSET`, or `TAIL` wrapper is present. Spark does not maintain the OpenIVM inner-table + outer-view split for top-k in this code path. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:183-206`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-599` |
-| `simple_projection_no_apply` | OpenIVM classified `SIMPLE_PROJECTION`, but Spark's rewrite probe did not produce a data-table apply statement after the view-delta statement. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:429-451`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-600` |
-| `non_cascade_upstream:<detail>` | A source table is itself an MV whose persisted instance cannot emit a downstream-consumable `MV_VIEW_DELTA`. The only sub-tag emitted today is `non_cascade:<upstream>` (upstream MV is `FULL_REFRESH` or otherwise not cascade-capable). | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:516-559`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:601-602` |
-| `window_initial_load_mismatch` | OpenIVM classified `WINDOW_PARTITION`, but Spark-translated initial-load SQL is not bag-equal to the user query on current data. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:395-407`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:603-604` |
-| `having_pred_empty` | OpenIVM classified `AGGREGATE_HAVING`, but Spark could not extract the HAVING predicate from the analyzed `Filter(cond, Aggregate)` shape. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:245-277`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:512-515`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:609-610` |
-| `having_pred_hidden_agg` | HAVING references an aggregate or synthetic analyzer attribute that is not materialized as a data-table column. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:279-288`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:410-427`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:611-615` |
-| `no_real_delta` | The compiled SQL has no real `INSERT INTO openivm_delta_<view>` carrying source deltas; OpenIVM emitted only an empty placeholder such as `SELECT ... WHERE false`. | `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala:1868-1904`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:459-486`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:616-617` |
-| `compile_failed:<msg>` | The DuckDB CLI bridge failed before returning a `refresh_type` JSON row. Current logging uses `reason='compile_failed' cause=<msg>`; a persisted field should prefix the truncated cause. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:378-392`, `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:301-310` |
+| Reason string                   | Trigger                                                                                                                                                                                                                                   | File:line                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `top_k`                         | Top-level `ORDER BY`, `LIMIT`, `OFFSET`, or `TAIL` wrapper is present. Spark does not maintain the OpenIVM inner-table + outer-view split for top-k in this code path.                                                                    | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:183-206`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-599` |
+| `simple_projection_no_apply`    | OpenIVM classified `SIMPLE_PROJECTION`, but Spark's rewrite probe did not produce a data-table apply statement after the view-delta statement.                                                                                            | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:429-451`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-600`                                                                                                             |
+| `non_cascade_upstream:<detail>` | A source table is itself an MV whose persisted instance cannot emit a downstream-consumable `MV_VIEW_DELTA`. The only sub-tag emitted today is `non_cascade:<upstream>` (upstream MV is `FULL_REFRESH` or otherwise not cascade-capable). | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:516-559`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:601-602`                                                                                                             |
+| `window_initial_load_mismatch`  | OpenIVM classified `WINDOW_PARTITION`, but Spark-translated initial-load SQL is not bag-equal to the user query on current data.                                                                                                          | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:395-407`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:603-604`                                                                                                             |
+| `having_pred_empty`             | OpenIVM classified `AGGREGATE_HAVING`, but Spark could not extract the HAVING predicate from the analyzed `Filter(cond, Aggregate)` shape.                                                                                                | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:245-277`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:512-515`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:609-610` |
+| `having_pred_hidden_agg`        | HAVING references an aggregate or synthetic analyzer attribute that is not materialized as a data-table column.                                                                                                                           | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:279-288`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:410-427`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:611-615` |
+| `no_real_delta`                 | The compiled SQL has no real `INSERT INTO openivm_delta_<view>` carrying source deltas; OpenIVM emitted only an empty placeholder such as `SELECT ... WHERE false`.                                                                       | `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala:1868-1904`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:459-486`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:616-617`        |
+| `compile_failed:<msg>`          | The DuckDB CLI bridge failed before returning a `refresh_type` JSON row. Current logging uses `reason='compile_failed' cause=<msg>`; a persisted field should prefix the truncated cause.                                                 | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:378-392`, `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:301-310`                                                                                                                       |
 
 ### 3.1 `top_k`
 
@@ -179,11 +179,11 @@ Why Spark demotes:
 
 Expected metadata:
 
-| field | value |
-|---|---|
-| `refreshType` | `3` |
-| `refreshTypeName` | `FULL_REFRESH` |
-| `demotionReason` concept | `top_k` |
+| field                    | value          |
+| ------------------------ | -------------- |
+| `refreshType`            | `3`            |
+| `refreshTypeName`        | `FULL_REFRESH` |
+| `demotionReason` concept | `top_k`        |
 
 Expected log line:
 
@@ -216,8 +216,7 @@ Recovery:
 > **Not the same as REFRESH-time `simple_projection_full_refresh`.** This
 > section covers the **CREATE-time** demotion that persists
 > `refreshTypeName = FULL_REFRESH` in `MvMetadata` for every subsequent
-> REFRESH. The runtime `outcome='simple_projection_full_refresh'
-> reason='conflicting_signed_rows'` log line is a **per-refresh** safety
+> REFRESH. The runtime `outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'` log line is a **per-refresh** safety
 > fallback — metadata stays `SIMPLE_PROJECTION`, the next refresh attempts
 > the incremental path again, and the already-written cascade view-delta
 > is preserved for downstream consumers. See chapter 8 §2.9 for that path.
@@ -251,10 +250,10 @@ Why this matters:
 
 Expected metadata:
 
-| field | value |
-|---|---|
-| `refreshType` | `3` |
-| `refreshTypeName` | `FULL_REFRESH` |
+| field                    | value                        |
+| ------------------------ | ---------------------------- |
+| `refreshType`            | `3`                          |
+| `refreshTypeName`        | `FULL_REFRESH`               |
 | `demotionReason` concept | `simple_projection_no_apply` |
 
 Expected log line:
@@ -313,11 +312,11 @@ It includes `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, `SIMPLE_PROJECTION`,
 
 Expected metadata:
 
-| field | value |
-|---|---|
-| upstream `mv_scalar.refreshTypeName` | often `SIMPLE_AGGREGATE` |
-| downstream `mv_downstream.refreshTypeName` | `FULL_REFRESH` |
-| `demotionReason` concept | `non_cascade_upstream:non_cascade:<source>` |
+| field                                      | value                                       |
+| ------------------------------------------ | ------------------------------------------- |
+| upstream `mv_scalar.refreshTypeName`       | often `SIMPLE_AGGREGATE`                    |
+| downstream `mv_downstream.refreshTypeName` | `FULL_REFRESH`                              |
+| `demotionReason` concept                   | `non_cascade_upstream:non_cascade:<source>` |
 
 Expected log line:
 
@@ -486,8 +485,7 @@ JOIN orders o
 ```
 
 Some multi-source shapes compile to a program that contains only an empty
-placeholder insert into `openivm_delta_<view>`, for example `SELECT ... WHERE
-false`. Spark treats that as "no real delta" because replaying the program would
+placeholder insert into `openivm_delta_<view>`, for example `SELECT ... WHERE false`. Spark treats that as "no real delta" because replaying the program would
 not update the MV after source changes. The detector is
 `SparkRefreshRewriter.hasRealDelta`; see
 `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala:1868-1904`.
@@ -572,11 +570,11 @@ MvCatalog.list(spark).foreach { meta =>
 
 Interpretation:
 
-| observation | meaning |
-|---|---|
-| cache contains an incremental program with `openivm_delta_<view>` | MV was kept incremental |
-| cache is absent and `refreshTypeName = FULL_REFRESH` | current code suppressed cache because incremental SQL is unused |
-| cache or assembled SQL says `INSERT OVERWRITE TABLE` | you are on the full-refresh path |
+| observation                                                       | meaning                                                         |
+| ----------------------------------------------------------------- | --------------------------------------------------------------- |
+| cache contains an incremental program with `openivm_delta_<view>` | MV was kept incremental                                         |
+| cache is absent and `refreshTypeName = FULL_REFRESH`              | current code suppressed cache because incremental SQL is unused |
+| cache or assembled SQL says `INSERT OVERWRITE TABLE`              | you are on the full-refresh path                                |
 
 The absence of `_ivm_compiled_sql` for full refreshes is intentional in this
 checkout; see
@@ -610,8 +608,7 @@ The compile-failed log emit site is
 
 The bridge spawns `duckdb :memory: -jsonlines`; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:267-299`.
-It builds a script with the extension load, remaining OpenIVM settings, source `CREATE
-TABLE` DDL, Spark function shims, `CREATE MATERIALIZED VIEW`, and the
+It builds a script with the extension load, remaining OpenIVM settings, source `CREATE TABLE` DDL, Spark function shims, `CREATE MATERIALIZED VIEW`, and the
 `openivm_compile_with_facts` table-function call; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:144-196`.
 
@@ -669,13 +666,13 @@ Generic exceptions are wrapped as DuckDB CLI errors at
 
 Common operator-facing causes:
 
-| cause | symptom | recovery |
-|---|---|---|
+| cause                             | symptom                                                                | recovery                                                                                            |
+| --------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Spark function has no DuckDB shim | DuckDB binder says function does not exist or has no matching overload | Add a macro in `OpenIvmCompiler.sparkFunctionShimsPrologue` and a pre/post rewrite if names collide |
-| Spark syntax is not DuckDB syntax | DuckDB parser error near a Spark-only construct | Normalize in `normalizeSparkSqlForDuckdb` or constrain MV SQL to the dialect intersection |
-| LPTS emits SQL Spark cannot parse | CREATE succeeds, but rewrite or initial-load check fails later | Add an `LptsSparkDialect` translation and a parity spec |
-| Unsupported Spark type | `NotImplementedError` from `sparkToDuckdbType` | Add a type mapping if DuckDB can represent it, otherwise reject with a clear user error |
-| CLI or extension missing | build-time path error | Check `OPENIVM_EXTENSION_PATH` and `OPENIVM_CLI_PATH` |
+| Spark syntax is not DuckDB syntax | DuckDB parser error near a Spark-only construct                        | Normalize in `normalizeSparkSqlForDuckdb` or constrain MV SQL to the dialect intersection           |
+| LPTS emits SQL Spark cannot parse | CREATE succeeds, but rewrite or initial-load check fails later         | Add an `LptsSparkDialect` translation and a parity spec                                             |
+| Unsupported Spark type            | `NotImplementedError` from `sparkToDuckdbType`                         | Add a type mapping if DuckDB can represent it, otherwise reject with a clear user error             |
+| CLI or extension missing          | build-time path error                                                  | Check `OPENIVM_EXTENSION_PATH` and `OPENIVM_CLI_PATH`                                               |
 
 The current shim prologue includes `regexp_like`, `to_date`, `to_timestamp`,
 `date_format`, and a fallback `last_value` shim; see
@@ -696,26 +693,25 @@ the process on timeout, and include exit code in `OpenIvmCompileException`.
 
 ### 5.3 Recovery loop
 
-1. Reproduce the compiler script manually with `/opt/openivm/duckdb :memory:
-   -jsonlines`.
-2. Add the smallest shim or normalization that lets DuckDB parse and bind the
+1. Reproduce the compiler script manually with `/opt/openivm/duckdb :memory: -jsonlines`.
+1. Add the smallest shim or normalization that lets DuckDB parse and bind the
    MV body.
-3. Add a compiler unit test or parity spec for the exact SQL shape.
-4. `DROP MATERIALIZED VIEW` and re-`CREATE MATERIALIZED VIEW`; CREATE-time
+1. Add a compiler unit test or parity spec for the exact SQL shape.
+1. `DROP MATERIALIZED VIEW` and re-`CREATE MATERIALIZED VIEW`; CREATE-time
    metadata will not be rewritten by only refreshing the old MV.
-5. Confirm the log line changes from `reason='compile_failed'` to either
+1. Confirm the log line changes from `reason='compile_failed'` to either
    `reason='kept'` or a later, more specific Spark-side demotion reason.
 
 ## 6. Reading demotion evidence as tables
 
 A useful debug report looks like this:
 
-| mv | compiled_refresh_type | effective_refresh_type | reason | compiled_cache | refresh_plan |
-|---|---|---|---|---|---|
-| `mv_top3` | `SIMPLE_PROJECTION` | `FULL_REFRESH` | `top_k` | absent | `INSERT OVERWRITE TABLE` |
-| `mv_h2` | `AGGREGATE_HAVING` | `FULL_REFRESH` | `having_pred_hidden_agg` | absent | `INSERT OVERWRITE TABLE` |
-| `mv_join` | `AGGREGATE_GROUP` | `FULL_REFRESH` | `no_real_delta` | absent | `INSERT OVERWRITE TABLE` |
-| `mv_region_sum` | `AGGREGATE_GROUP` | `AGGREGATE_GROUP` | `kept` | present | `MERGE INTO` plus view-delta CTAS |
+| mv              | compiled_refresh_type | effective_refresh_type | reason                   | compiled_cache | refresh_plan                      |
+| --------------- | --------------------- | ---------------------- | ------------------------ | -------------- | --------------------------------- |
+| `mv_top3`       | `SIMPLE_PROJECTION`   | `FULL_REFRESH`         | `top_k`                  | absent         | `INSERT OVERWRITE TABLE`          |
+| `mv_h2`         | `AGGREGATE_HAVING`    | `FULL_REFRESH`         | `having_pred_hidden_agg` | absent         | `INSERT OVERWRITE TABLE`          |
+| `mv_join`       | `AGGREGATE_GROUP`     | `FULL_REFRESH`         | `no_real_delta`          | absent         | `INSERT OVERWRITE TABLE`          |
+| `mv_region_sum` | `AGGREGATE_GROUP`     | `AGGREGATE_GROUP`      | `kept`                   | present        | `MERGE INTO` plus view-delta CTAS |
 
 How to fill each column:
 
@@ -764,14 +760,14 @@ MV layout cannot preserve top-k semantics incrementally.
 When filing or debugging a demotion, capture these artifacts:
 
 1. The exact `CREATE MATERIALIZED VIEW` SQL.
-2. The source table DDLs as Spark sees them.
-3. The `MvCatalog` row: name, `refreshType`, `refreshTypeName`, source tables,
+1. The source table DDLs as Spark sees them.
+1. The `MvCatalog` row: name, `refreshType`, `refreshTypeName`, source tables,
    and properties.
-4. The CREATE-time `[openivm-mv]` log line.
-5. The compiled SQL from `OpenIvmCompiler.compile`, if compilation succeeds.
-6. The full-refresh assembled SQL if `refreshTypeName = FULL_REFRESH`.
-7. A bidirectional `EXCEPT ALL` correctness check against the original query.
-8. A note saying whether the view is over base tables only or over upstream MVs.
+1. The CREATE-time `[openivm-mv]` log line.
+1. The compiled SQL from `OpenIvmCompiler.compile`, if compilation succeeds.
+1. The full-refresh assembled SQL if `refreshTypeName = FULL_REFRESH`.
+1. A bidirectional `EXCEPT ALL` correctness check against the original query.
+1. A note saying whether the view is over base tables only or over upstream MVs.
 
 This set separates compiler failure, Spark rewrite gaps, cascade gaps, and
 expected full-refresh classifications.
@@ -781,12 +777,12 @@ expected full-refresh classifications.
 The safe pattern is:
 
 1. Add or update a parity spec that currently demotes.
-2. Assert the current `refreshTypeName` and reason so the baseline is explicit.
-3. Implement the missing compiler shim, rewrite, cascade delta, or top-k storage
+1. Assert the current `refreshTypeName` and reason so the baseline is explicit.
+1. Implement the missing compiler shim, rewrite, cascade delta, or top-k storage
    split.
-4. Change the assertion to the intended incremental type.
-5. Keep the bidirectional `EXCEPT ALL` oracle.
-6. Keep the demotion guard until the new support proves the previously unsafe
+1. Change the assertion to the intended incremental type.
+1. Keep the bidirectional `EXCEPT ALL` oracle.
+1. Keep the demotion guard until the new support proves the previously unsafe
    case is safe.
 
 Do not silently remove a demotion branch to make a benchmark faster. The code
