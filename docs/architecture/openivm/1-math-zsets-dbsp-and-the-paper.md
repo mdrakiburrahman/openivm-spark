@@ -837,7 +837,7 @@ WHEN NOT MATCHED THEN INSERT (key, count) VALUES (d.key, d.openivm_multiplicity)
 DELETE FROM mv_keys WHERE count = 0;
 ```
 
-## The real generated SQL is more careful about bag semantics, null-safe equality, hidden columns, and per-refresh staging, but the algebra is the same.
+> The real generated SQL is more careful about bag semantics, null-safe equality, hidden columns, and per-refresh staging, but the algebra is the same.
 
 ## 13. How LPTS fits into the math
 
