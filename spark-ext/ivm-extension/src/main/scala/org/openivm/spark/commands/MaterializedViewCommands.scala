@@ -1358,8 +1358,20 @@ case class RefreshMaterializedViewCommand(
 
     // -----------------------------------------------------------------------
     // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
-    // -----------------------------------------------------------------------
-    if (meta.refreshType == RefreshTypeCode.FullRefresh) {
+    // P1.2: a REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
+    // semantics for THIS batch, so route it through a full recompute (the MV
+    // stays incremental for subsequent append batches). Classifier consulted
+    // once; conservative (failure => treat as Replace).
+    lazy val replaceBatch: Boolean =
+      changeBatches.collect { case b: CdfChangeBatch => b }.exists { b =>
+        try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.Replace
+        catch { case _: Throwable => true }
+      }
+    if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
+      if (meta.refreshType != RefreshTypeCode.FullRefresh)
+        logInfo(
+          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
+        )
       val input = AssemblyInput(
         refreshType = RefreshTypeCode.FullRefresh,
         refreshTypeName = "FULL_REFRESH",
