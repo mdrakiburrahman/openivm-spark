@@ -324,9 +324,9 @@ object StagingCatalog {
           }
           toDelete
             .map { case (_, stagingPath) => stagingPath }
-            .filterNot(stagingPath => stagingPathStillTracked(spark, indexDb, stagingPath))
-            .flatMap(StagingDeltaView.CachedViewDeltaRef.decode)
-            .foreach { globalView =>
+            .flatMap(p => StagingDeltaView.CachedViewDeltaRef.decode(p).map(p -> _))
+            .filterNot { case (stagingPath, _) => stagingPathStillTracked(spark, indexDb, stagingPath) }
+            .foreach { case (_, globalView) =>
               try spark.catalog.uncacheTable(s"global_temp.$globalView")
               catch { case _: Throwable => () }
               try spark.catalog.dropGlobalTempView(globalView)
