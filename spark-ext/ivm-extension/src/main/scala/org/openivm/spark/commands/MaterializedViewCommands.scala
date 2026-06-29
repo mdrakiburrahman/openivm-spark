@@ -1524,9 +1524,10 @@ case class RefreshMaterializedViewCommand(
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
-    val byTable                          = changeBatches.groupBy(_.baseTable)
-    val tempViewShortNames               = scala.collection.mutable.ArrayBuffer[String]()
-    var fusedScratchView: Option[String] = None
+    val byTable                                 = changeBatches.groupBy(_.baseTable)
+    val tempViewShortNames                      = scala.collection.mutable.ArrayBuffer[String]()
+    var fusedScratchView: Option[String]        = None
+    var fusedScratchRecordedForCascade: Boolean = false
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -1682,28 +1683,22 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
-      // Eligibility for the scratch-CTAS fuse fast path: SIMPLE_PROJECTION
-      // MVs whose short name does not appear in any other MV's `sourceTables`
-      // (i.e. they have no current downstream consumer) write the per-refresh
-      // view-delta to a Delta scratch table that is then consumed exactly
-      // once by the INSERT INTO mv_data (and, in the negative-row case, the
-      // value-equality DELETE MERGE). Materialising that scratch as a
-      // cached DataFrame + temp view skips the per-table Delta commit
-      // overhead and the second on-disk read.
-      def hasNoDownstreamConsumer: Boolean = {
+      // Downstream MVs whose next REFRESH must consume this MV's view-delta
+      // under intercept mode.  The same set drives cascade staging and whether
+      // a fused scratch cache must outlive this refresh.
+      def downstreamSourceKeysForThisMv: Set[String] = {
         val mvShortName = name.identifier
-        !allMvsCached
-          .exists(other =>
-            metaName(other.name) != metaName(name) &&
-              other.sourceTables.exists(_.split("\\.").last == mvShortName)
-          )
+        allMvsCached
+          .filter(other => metaName(other.name) != metaName(name))
+          .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
+          .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
+          .toSet
       }
 
       val fuseEligible =
         FeatureGate.fuseScratchEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
-          rewritten.statements.nonEmpty &&
-          hasNoDownstreamConsumer
+          rewritten.statements.nonEmpty
 
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
@@ -1805,12 +1800,11 @@ case class RefreshMaterializedViewCommand(
           // stmt[1] as `INSERT INTO mv SELECT … FROM delta.\`<path>\` …`
           // (the value-equality DELETE MERGE is stmt[2] when negatives exist).
           //
-          // For leaf MVs (no downstream consumer), the scratch is consumed
-          // exactly once or twice on-disk. Materialising it as a cached
-          // DataFrame + temp view skips the per-table Delta commit overhead
-          // AND keeps subsequent reads in-memory. The cascade record block
-          // is skipped because there is no on-disk path to record — safe
-          // because a downstream MV created later does its own initial CTAS.
+          // Materialising the scratch as a cached global-temp view skips the
+          // per-table Delta commit overhead AND keeps subsequent DELETE/INSERT
+          // reads in-memory. If downstream MVs exist, the global-temp view name
+          // is recorded as an MV_VIEW_DELTA staging ref so the cascade input is
+          // still readable without writing the scratch to disk.
           val fusedView: Option[String] =
             if (fuseEligible)
               SparkRefreshRewriter
@@ -1824,12 +1818,12 @@ case class RefreshMaterializedViewCommand(
                     val t0 = System.nanoTime()
                     val rowCount = withPlanTimeBroadcastDisabled {
                       val d = spark.sql(selectBody)
-                      d.cache()
-                      d.createOrReplaceTempView(scratchView)
+                      d.createOrReplaceGlobalTempView(scratchView)
+                      spark.catalog.cacheTable(s"global_temp.$scratchView")
                       // Force materialisation so the cache holds the rows before
                       // any negative-row probe / INSERT read. count() is the
                       // cheapest force-eval action that respects the cache.
-                      d.count()
+                      spark.table(s"global_temp.$scratchView").count()
                     }
                     val elapsedMs = (System.nanoTime() - t0) / 1000000L
                     advanceStmtCounterPast(0)
@@ -1859,7 +1853,9 @@ case class RefreshMaterializedViewCommand(
                   } catch {
                     case t: Throwable =>
                       // Best-effort cleanup and fall through to the on-disk path
-                      try spark.catalog.dropTempView(scratchView)
+                      try spark.catalog.uncacheTable(s"global_temp.$scratchView")
+                      catch { case _: Throwable => () }
+                      try spark.catalog.dropGlobalTempView(scratchView)
                       catch { case _: Throwable => () }
                       logInfo(
                         s"[openivm-mv] refresh view='${sqlIdent(name)}' fused_fallback='${t.getClass.getSimpleName}: ${t.getMessage}'"
@@ -1875,7 +1871,8 @@ case class RefreshMaterializedViewCommand(
             case Some(view) =>
               spark
                 .sql(
-                  s"SELECT 1 FROM `$view` WHERE `openivm_multiplicity` < 0 LIMIT 1"
+                  s"SELECT 1 FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(view)} " +
+                    "WHERE `openivm_multiplicity` < 0 LIMIT 1"
                 )
                 .head(1)
                 .nonEmpty
@@ -1907,12 +1904,12 @@ case class RefreshMaterializedViewCommand(
             else
               try {
                 val src = fusedView match {
-                  case Some(view) => s"`$view`"
+                  case Some(view) => StagingDeltaView.CachedViewDeltaRef.sqlRef(view)
                   case None       => s"delta.`${viewDeltaPath.replace("`", "``")}`"
                 }
                 val deltaCols =
                   (fusedView match {
-                    case Some(view) => spark.table(view)
+                    case Some(view) => spark.table(s"global_temp.$view")
                     case None       => spark.read.format("delta").load(viewDeltaPath)
                   }).columns.toSet
                 val mvCols = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
@@ -2023,7 +2020,7 @@ case class RefreshMaterializedViewCommand(
               } else {
                 val sqlForExec = fusedView match {
                   case Some(view) =>
-                    SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, view)
+                    SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, s"global_temp`.`$view")
                   case None => sql
                 }
                 // Wrap EVERY openivm-emitted MERGE in the SIMPLE_PROJECTION
@@ -2180,17 +2177,17 @@ case class RefreshMaterializedViewCommand(
         // Only matters for the intercept mode: under CDF the downstream MV
         // discovers our update via the MV data table's own change feed, so
         // there is no need to write an MV_VIEW_DELTA staging row.
-        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta && fusedScratchView.isEmpty) {
+        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta) {
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
-              val mvShortName = name.identifier
-              val triggerKeys: Set[String] = allMvsCached
-                .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
-                .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
-                .toSet
+              val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
               val keysToRecord =
-                if (triggerKeys.isEmpty) Set(viewNameStr) // record under our own name even with no downstream yet
-                else triggerKeys
+                if (triggerKeys.isEmpty && fusedScratchView.isEmpty) {
+                  // Keep the legacy on-disk breadcrumb for non-fused refreshes.
+                  Set(viewNameStr)
+                } else triggerKeys
+              val stagingPathForCascade =
+                fusedScratchView.map(StagingDeltaView.CachedViewDeltaRef.encode).getOrElse(viewDeltaPath)
               val txnTs = new Timestamp(System.currentTimeMillis())
               keysToRecord.foreach { triggerKey =>
                 StagingCatalog.record(
@@ -2198,12 +2195,13 @@ case class RefreshMaterializedViewCommand(
                   StagingDelta(
                     baseTable = triggerKey,
                     opType = StagingDelta.OpTypes.MvViewDelta,
-                    stagingPath = viewDeltaPath,
+                    stagingPath = stagingPathForCascade,
                     txnTs = txnTs,
                     consumedBy = Seq.empty
                   )
                 )
               }
+              fusedScratchRecordedForCascade = fusedScratchView.isDefined && keysToRecord.nonEmpty
             }
           }
         }
@@ -2259,14 +2257,18 @@ case class RefreshMaterializedViewCommand(
         }
       }
       fusedScratchView.foreach { view =>
-        try {
-          // Unpersist the cached scratch DataFrame before dropping the temp
-          // view so the SparkSession's cache manager releases storage
-          // memory immediately rather than waiting for GC.
-          spark.catalog.uncacheTable(view)
-        } catch { case _: Throwable => () }
-        try spark.catalog.dropTempView(view)
-        catch { case _: Throwable => () }
+        if (!fusedScratchRecordedForCascade) {
+          try {
+            // Unpersist the cached scratch DataFrame before dropping the global
+            // temp view so the SparkSession's cache manager releases storage
+            // memory immediately rather than waiting for GC. When a downstream
+            // cascade staging row references it, StagingCatalog.pruneConsumed
+            // owns this cleanup after every downstream MV has consumed the row.
+            spark.catalog.uncacheTable(s"global_temp.$view")
+          } catch { case _: Throwable => () }
+          try spark.catalog.dropGlobalTempView(view)
+          catch { case _: Throwable => () }
+        }
       }
       // emitEnd() above already flushed sqlLog, but drop_cleanup rows
       // are appended after that flush (this finally block runs after the
@@ -2398,7 +2400,7 @@ case class RefreshMaterializedViewCommand(
     spark
       .sql(
         s"""SELECT 1
-           |FROM `$scratchView`
+           |FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(scratchView)}
            |GROUP BY $colList
            |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
            |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0

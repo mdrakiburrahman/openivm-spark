@@ -18,6 +18,21 @@ import org.apache.spark.sql.types.StructType
   */
 object StagingDeltaView {
 
+  object CachedViewDeltaRef {
+    private val Prefix = "openivm-cache:"
+
+    def encode(globalTempView: String): String = Prefix + globalTempView
+
+    def decode(stagingPath: String): Option[String] =
+      stagingPath.stripPrefix(Prefix) match {
+        case decoded if decoded != stagingPath && decoded.nonEmpty => Some(decoded)
+        case _                                                     => None
+      }
+
+    def sqlRef(globalTempView: String): String =
+      s"`global_temp`.`${globalTempView.replace("`", "``")}`"
+  }
+
   /** The openivm-internal TEMP VIEW name for a source table's delta. */
   def deltaViewName(sourceTable: String): String = {
     val short = sourceTable.split("\\.").last
@@ -64,9 +79,13 @@ object StagingDeltaView {
         // base-table delta entries in a multi-source UNION ALL.
         case StagingDelta.OpTypes.MvViewDelta =>
           val ts = d.txnTs.toString
+          val sourceRef = CachedViewDeltaRef
+            .decode(d.stagingPath)
+            .map(CachedViewDeltaRef.sqlRef)
+            .getOrElse(s"delta.`$escapedPath`")
           Some(
             s"""SELECT $cols, openivm_multiplicity, CAST('$ts' AS TIMESTAMP) AS openivm_timestamp
-               |FROM delta.`$escapedPath`""".stripMargin
+               |FROM $sourceRef""".stripMargin
           )
 
         case StagingDelta.OpTypes.Insert | StagingDelta.OpTypes.Overwrite | StagingDelta.OpTypes.UpdateAfter =>

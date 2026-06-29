@@ -144,6 +144,17 @@ object StagingCatalog {
       )
     }
 
+  private def stagingPathStillTracked(spark: SparkSession, indexDb: OpenIvmRocksDB, stagingPath: String): Boolean =
+    indexDb.prefixScan(TableIndexCf, Array.emptyByteArray).exists { case (_, pathBytes) =>
+      val dbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
+      Files.exists(Paths.get(dbPath)) && {
+        val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).exists { case (key, _) =>
+          decodeStagingKey(key)._2 == stagingPath
+        }
+      }
+    }
+
   def ensureTables(spark: SparkSession): Unit = {
     openIndexDb(spark)
     ()
@@ -303,14 +314,24 @@ object StagingCatalog {
             val consumedByAll = mvs.forall { mvName =>
               trackedMvDb(mvName).exists(_.get(ConsumedCf, RocksDBCodec.utf8(stagingPath)).isDefined)
             }
-            if (consumedByAll) Iterator.single(key.clone()) else Iterator.empty
+            if (consumedByAll) Iterator.single(key.clone() -> stagingPath) else Iterator.empty
           }
           .toList
 
         if (toDelete.nonEmpty) {
           baseDb.withBatch { batch =>
-            toDelete.foreach(key => OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key))
+            toDelete.foreach { case (key, _) => OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key) }
           }
+          toDelete
+            .map { case (_, stagingPath) => stagingPath }
+            .filterNot(stagingPath => stagingPathStillTracked(spark, indexDb, stagingPath))
+            .flatMap(StagingDeltaView.CachedViewDeltaRef.decode)
+            .foreach { globalView =>
+              try spark.catalog.uncacheTable(s"global_temp.$globalView")
+              catch { case _: Throwable => () }
+              try spark.catalog.dropGlobalTempView(globalView)
+              catch { case _: Throwable => () }
+            }
         }
       }
     }

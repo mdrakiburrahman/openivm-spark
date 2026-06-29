@@ -41,18 +41,18 @@ object FeatureGate {
   val DeltaOptimizeWriteKey: String         = "spark.openivm.delta.optimizeWrite"
   val DeltaAutoCompactKey: String           = "spark.openivm.delta.autoCompact"
 
-  /** Fuse `view_delta_ctas` + `insert_into` for leaf SIMPLE_PROJECTION MVs.
+  /** Fuse `view_delta_ctas` + `insert_into` for SIMPLE_PROJECTION MVs.
     *
-    * When a SIMPLE_PROJECTION MV has NO current downstream MV consumer (its
-    * short name does not appear in any other MV's `sourceTables` per
-    * `MvCatalog.list`), the per-refresh scratch Delta table that openivm
-    * emits as stmt[0] is consumed exactly once by stmt[1] (the INSERT INTO
-    * mv_data) and, optionally, stmt[2] (the value-equality delete MERGE).
+    * The per-refresh scratch Delta table that openivm emits as stmt[0] is
+    * consumed by stmt[1] (the INSERT INTO mv_data) and, optionally, stmt[2]
+    * (the value-equality delete MERGE).
     *
     * Writing the scratch to a Delta path then re-reading it costs ~2.8 s on
     * average for the TPC-DI gold layer; fusing — running stmt[0]'s SELECT
-    * as a cached DataFrame + temp view and rewriting subsequent path refs
-    * to read from the cache — saves most of that wall-clock per refresh.
+    * as a cached global-temp view and rewriting subsequent path refs to read
+    * from the cache — saves most of that wall-clock per refresh. If an
+    * intercept-mode downstream MV exists, the same cached view is recorded as
+    * the cascade input and pruned after downstream consumption.
     *
     * Default ON. Flip OFF via `spark.openivm.fuseScratch.enabled=false` to
     * fall back to the on-disk scratch path (e.g. for diagnostics).
