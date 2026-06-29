@@ -159,5 +159,12 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
       classify(table, before) shouldBe Mutating
     }
+
+    it("maps batch verdicts to compile-fact delta shapes") {
+      DeltaCommitClassifier.shapeOf(Noop) shouldBe DeltaShape.Unchanged
+      DeltaCommitClassifier.shapeOf(InsertOnly) shouldBe DeltaShape.InsertOnly
+      DeltaCommitClassifier.shapeOf(Mutating) shouldBe DeltaShape.General
+      DeltaCommitClassifier.shapeOf(Replace) shouldBe DeltaShape.General
+    }
   }
 }

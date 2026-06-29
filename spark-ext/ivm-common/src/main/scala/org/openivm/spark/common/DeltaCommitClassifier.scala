@@ -14,6 +14,21 @@ object BatchVerdict {
   case object Replace    extends BatchVerdict
 }
 
+sealed trait DeltaShape {
+  def compileFactValue: String
+}
+object DeltaShape {
+  case object InsertOnly extends DeltaShape {
+    override val compileFactValue: String = "INSERT_ONLY"
+  }
+  case object Unchanged extends DeltaShape {
+    override val compileFactValue: String = "UNCHANGED"
+  }
+  case object General extends DeltaShape {
+    override val compileFactValue: String = "GENERAL"
+  }
+}
+
 object DeltaCommitClassifier {
 
   import BatchVerdict._
@@ -31,6 +46,17 @@ object DeltaCommitClassifier {
       changes.map { case (_, actions) => classifyCommit(actions) }.foldLeft(Noop: BatchVerdict)(combine)
     }
   }
+
+  def classifyShape(spark: SparkSession, tableNameOrPath: String, lastConsumedVersion: Long): DeltaShape =
+    shapeOf(classify(spark, tableNameOrPath, lastConsumedVersion))
+
+  def shapeOf(verdict: BatchVerdict): DeltaShape =
+    verdict match {
+      case Noop       => DeltaShape.Unchanged
+      case InsertOnly => DeltaShape.InsertOnly
+      case Mutating   => DeltaShape.General
+      case Replace    => DeltaShape.General
+    }
 
   private def deltaLogFor(spark: SparkSession, tableNameOrPath: String): DeltaLog =
     if (looksLikePath(tableNameOrPath)) DeltaLog.forTable(spark, new Path(tableNameOrPath))

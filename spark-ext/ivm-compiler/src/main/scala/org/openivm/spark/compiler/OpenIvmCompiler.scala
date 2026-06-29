@@ -6,7 +6,7 @@ import java.util.Comparator
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, UniqueKey}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, UniqueKey}
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -48,6 +48,9 @@ final case class CompileRequest(
   *     PROVEN this batch is append-only; re-enables the insert-only fast paths
   *     (skip aggregate/projection delete, MIN/MAX GREATEST/LEAST) that
   *     `compileOnly` otherwise disables. Defaults false — identical to v1.
+  *   - `deltaShape`           — per-source Delta batch shape as proven by the
+  *     Delta commit classifier. Empty by default; openivm treats missing facts
+  *     as the conservative general path.
   *   - `fkRelations` / `uniqueKeys` — trusted declaration-registry facts.
   *     Defaults empty, so existing compile behaviour is unchanged until openivm
   *     consumes them.
@@ -57,6 +60,7 @@ final case class WorkloadFacts(
     compileOnly: Boolean = true,
     forceViewDeltaCascade: Boolean = true,
     assumeInsertOnly: Boolean = false,
+    deltaShape: Map[String, DeltaShape] = Map.empty,
     fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
     uniqueKeys: Seq[UniqueKey] = Seq.empty,
     schemaVersion: Int = 2
@@ -77,9 +81,14 @@ final case class WorkloadFacts(
     val uniques = uniqueKeys
       .map(key => s"""{"table":${q(key.table)},"columns":${a(key.columns)},"rely":${b(key.rely)}}""")
       .mkString("[", ",", "]")
+    val shapes = deltaShape.toSeq
+      .sortBy(_._1)
+      .map { case (table, shape) => s"${q(table)}:${q(shape.compileFactValue)}" }
+      .mkString("{", ",", "}")
+    val insertOnly = b(assumeInsertOnly)
     s"""{"schema_version":$schemaVersion,"target_dialect":"$targetDialect",""" +
       s""""compile_only":${b(compileOnly)},"force_view_delta_cascade":${b(forceViewDeltaCascade)},""" +
-      s""""assume_insert_only":${b(assumeInsertOnly)},"fk_relations":$fks,"unique_keys":$uniques}"""
+      s""""assume_insert_only":$insertOnly,"delta_shape":$shapes,"fk_relations":$fks,"unique_keys":$uniques}"""
   }
 
   private def escapeJson(raw: String): String =

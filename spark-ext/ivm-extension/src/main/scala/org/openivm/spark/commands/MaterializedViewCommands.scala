@@ -1362,6 +1362,35 @@ case class RefreshMaterializedViewCommand(
     // local — debugging will want it).
     val _ = freshMvIdentityBySource
 
+    val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+
+    lazy val cdfBatchVerdicts: Map[String, BatchVerdict] =
+      cdfChangeBatches
+        .groupBy(_.baseTable)
+        .map { case (source, batches) =>
+          val startVersion = batches.map(_.startVersionExclusive).min
+          val verdict =
+            try DeltaCommitClassifier.classify(spark, source, startVersion)
+            catch { case _: Throwable => BatchVerdict.Replace }
+          source -> verdict
+        }
+
+    def verdictForSource(source: String): Option[BatchVerdict] =
+      cdfBatchVerdicts
+        .get(source)
+        .orElse {
+          val short = source.split("\\.").last
+          cdfBatchVerdicts.collectFirst { case (candidate, verdict) if candidate.split("\\.").last == short => verdict }
+        }
+
+    lazy val sourceDeltaShape: Map[String, DeltaShape] =
+      if (cdfChangeBatches.isEmpty) Map.empty
+      else {
+        meta.sourceTables.map { source =>
+          source -> verdictForSource(source).map(DeltaCommitClassifier.shapeOf).getOrElse(DeltaShape.Unchanged)
+        }.toMap
+      }
+
     // -----------------------------------------------------------------------
     // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
     // P1.2: a REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
@@ -1369,10 +1398,7 @@ case class RefreshMaterializedViewCommand(
     // stays incremental for subsequent append batches). Classifier consulted
     // once; conservative (failure => treat as Replace).
     lazy val replaceBatch: Boolean =
-      changeBatches.collect { case b: CdfChangeBatch => b }.exists { b =>
-        try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.Replace
-        catch { case _: Throwable => true }
-      }
+      cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
     if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
       if (meta.refreshType != RefreshTypeCode.FullRefresh)
         logInfo(
@@ -1489,6 +1515,7 @@ case class RefreshMaterializedViewCommand(
                 sources = compileSchemas,
                 sourceQualifiedNames = shortToQual,
                 facts = WorkloadFacts(
+                  deltaShape = sourceDeltaShape,
                   fkRelations = constraintFacts.fkRelations,
                   uniqueKeys = constraintFacts.uniqueKeys
                 )
@@ -1615,21 +1642,13 @@ case class RefreshMaterializedViewCommand(
       // The classifier is consulted ONLY for (3); a MERGE/append commit (e.g. a
       // dimension MV refreshing) does not block the fast path, because the
       // view-delta sign (1) is the authoritative signal for the FACT.
-      lazy val batchHasReplace: Boolean = {
-        val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
-        cdfBatches.isEmpty || cdfBatches.exists { b =>
-          try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.Replace
-          catch { case _: Throwable => true }
-        }
-      }
+      lazy val batchHasReplace: Boolean =
+        sourceDeltaShape.isEmpty || cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
 
-      lazy val batchInsertOnly: Boolean = {
-        val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
-        cdfBatches.nonEmpty && cdfBatches.forall { b =>
-          try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.InsertOnly
-          catch { case _: Throwable => false }
-        }
-      }
+      lazy val batchInsertOnly: Boolean =
+        sourceDeltaShape.nonEmpty &&
+          sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
+          sourceDeltaShape.values.forall(_ != DeltaShape.General)
 
       // True when a changed source is on the NULL-producing (optional) side of an
       // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
