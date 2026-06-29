@@ -1623,6 +1623,14 @@ case class RefreshMaterializedViewCommand(
         }
       }
 
+      lazy val batchInsertOnly: Boolean = {
+        val cdfBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+        cdfBatches.nonEmpty && cdfBatches.forall { b =>
+          try DeltaCommitClassifier.classify(spark, b.baseTable, b.startVersionExclusive) == BatchVerdict.InsertOnly
+          catch { case _: Throwable => false }
+        }
+      }
+
       // True when a changed source is on the NULL-producing (optional) side of an
       // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
       // (e.g. a previously NULL-extended left row gains a right match), which
@@ -1788,6 +1796,15 @@ case class RefreshMaterializedViewCommand(
           profile.appendStep(
             "execute_refresh_sql_stmt",
             s"statement=${stmtIdx + 1};stmt_kind=merge_skipped",
+            0L
+          )
+        }
+        def logSkippedWindowStmt(stmtIdx: Int, kind: String): Unit = {
+          advanceStmtCounterPast(stmtIdx)
+          RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, kind, 0L)
+          profile.appendStep(
+            "execute_refresh_sql_stmt",
+            s"statement=${stmtIdx + 1};stmt_kind=$kind",
             0L
           )
         }
@@ -2045,10 +2062,23 @@ case class RefreshMaterializedViewCommand(
             }
           }
         } else {
+          val windowSuffixInsertSql: Option[String] =
+            if (meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly)
+              buildWindowSuffixInsertSql(spark, meta, mergeTargetId)
+            else None
+          val windowSuffixSafe =
+            windowSuffixInsertSql.isDefined && windowSuffixBatchIsStrictSuffix(spark, meta, mergeTargetId)
+
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
             val skipDeleteMerge =
               SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+            val skipWindowPartitionAux =
+              windowSuffixSafe && isWindowPartitionAuxSql(sql, mergeTargetId)
+            val skipWindowPartitionDelete =
+              windowSuffixSafe && isWindowPartitionDeleteSql(sql, mergeTargetId)
+            val skipWindowPartitionInsert =
+              windowSuffixSafe && isWindowPartitionInsertSql(sql, mergeTargetId)
 
             if (skipDeleteMerge) {
               logInfo(
@@ -2056,6 +2086,19 @@ case class RefreshMaterializedViewCommand(
                   "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
               )
               logSkippedDeleteMerge(idx)
+            } else if (skipWindowPartitionAux) {
+              logSkippedWindowStmt(idx, "window_suffix_aux_skipped")
+            } else if (skipWindowPartitionDelete) {
+              logSkippedWindowStmt(idx, "window_suffix_delete_skipped")
+            } else if (skipWindowPartitionInsert) {
+              RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_suffix_skip'")
+              logInfo(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                  "outcome='window_suffix_skip' reason='append_only_strict_suffix'"
+              )
+              withPlanTimeBroadcastDisabled {
+                executeSqlAt(windowSuffixInsertSql.get, idx)
+              }
             } else {
               // Apply the per-statement plan-time broadcast disable to BOTH
               // statement shapes that wrap the full MV body, matching the
@@ -2408,6 +2451,210 @@ case class RefreshMaterializedViewCommand(
       )
       .head(1)
       .nonEmpty
+  }
+
+  private case class WindowSuffixShape(sourceShort: String, partitionCols: Seq[String], orderCol: String)
+
+  private def buildWindowSuffixInsertSql(
+      spark: SparkSession,
+      meta: MvMetadata,
+      targetId: TableIdentifier
+  ): Option[String] =
+    windowSuffixShape(meta).flatMap { shape =>
+      try {
+        val mvCols     = spark.table(MvCommandHelper.sqlIdent(targetId)).columns.toSeq
+        val sourceCols = spark.table(meta.sourceTables.head).columns.toSeq
+        if (
+          mvCols.nonEmpty &&
+          sourceCols.nonEmpty &&
+          (shape.partitionCols :+ shape.orderCol).forall(c => mvCols.exists(_.equalsIgnoreCase(c))) &&
+          sourceCols.forall(c => mvCols.exists(_.equalsIgnoreCase(c)))
+        ) {
+          val targetRef  = MvCommandHelper.sqlIdent(targetId)
+          val colList    = mvCols.map(quoteCol).mkString(", ")
+          val sourceList = sourceCols.map(quoteCol).mkString(", ")
+          val partList   = shape.partitionCols.map(quoteCol).mkString(", ")
+          val deltaRef   = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
+          val orderCol   = quoteCol(shape.orderCol)
+          val partExists = partitionMatch("openivm_suffix", "a", shape.partitionCols)
+          val targetContextPartExists =
+            partitionMatch("openivm_target_context", "a", shape.partitionCols)
+          val maxExists = partitionMatch("openivm_suffix", "m", shape.partitionCols)
+          replaceWindowSuffixSource(meta.querySql, "context_source").map { suffixBody =>
+            s"""|INSERT INTO $targetRef ($colList)
+                |WITH affected AS (
+                |  SELECT DISTINCT $partList
+                |  FROM $deltaRef
+                |  WHERE `openivm_multiplicity` > 0
+                |),
+                |current_max AS (
+                |  SELECT $partList, MAX($orderCol) AS `openivm_max_order`
+                |  FROM $targetRef
+                |  GROUP BY $partList
+                |),
+                |context_source AS (
+                |  SELECT $sourceList
+                |  FROM $targetRef openivm_target_context
+                |  WHERE EXISTS (SELECT 1 FROM affected a WHERE $targetContextPartExists)
+                |  UNION ALL
+                |  SELECT $sourceList
+                |  FROM $deltaRef
+                |  WHERE `openivm_multiplicity` > 0
+                |)
+                |SELECT $colList
+                |FROM ($suffixBody) openivm_suffix
+                |WHERE EXISTS (SELECT 1 FROM affected a WHERE $partExists)
+                |  AND (
+                |    NOT EXISTS (SELECT 1 FROM current_max m WHERE $maxExists)
+                |    OR openivm_suffix.$orderCol > (
+                |      SELECT MAX(m.`openivm_max_order`) FROM current_max m WHERE $maxExists
+                |    )
+                |  )""".stripMargin
+          }
+        } else None
+      } catch { case _: Throwable => None }
+    }
+
+  private def windowSuffixBatchIsStrictSuffix(
+      spark: SparkSession,
+      meta: MvMetadata,
+      targetId: TableIdentifier
+  ): Boolean =
+    windowSuffixShape(meta).exists { shape =>
+      try {
+        val targetRef = MvCommandHelper.sqlIdent(targetId)
+        val deltaRef  = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
+        val partList  = shape.partitionCols.map(quoteCol).mkString(", ")
+        val orderCol  = quoteCol(shape.orderCol)
+        val maxMatch  = partitionMatch("d", "m", shape.partitionCols)
+        val hasBadSign = spark
+          .sql(
+            s"""SELECT 1
+               |FROM $deltaRef
+               |WHERE `openivm_multiplicity` IS NULL OR `openivm_multiplicity` <= 0
+               |LIMIT 1""".stripMargin
+          )
+          .head(1)
+          .nonEmpty
+        if (hasBadSign) false
+        else {
+          val badPartition = spark
+            .sql(
+              s"""|SELECT 1
+                  |FROM (
+                  |  SELECT $partList,
+                  |         MIN($orderCol) AS `openivm_min_order`,
+                  |         SUM(CASE WHEN $orderCol IS NULL THEN 1 ELSE 0 END) AS `openivm_null_orders`
+                  |  FROM $deltaRef
+                  |  WHERE `openivm_multiplicity` > 0
+                  |  GROUP BY $partList
+                  |) d
+                  |LEFT JOIN (
+                  |  SELECT $partList, MAX($orderCol) AS `openivm_max_order`
+                  |  FROM $targetRef
+                  |  GROUP BY $partList
+                  |) m
+                  |ON $maxMatch
+                  |WHERE d.`openivm_null_orders` > 0
+                  |   OR (m.`openivm_max_order` IS NOT NULL AND NOT (d.`openivm_min_order` > m.`openivm_max_order`))
+                  |LIMIT 1""".stripMargin
+            )
+            .head(1)
+            .nonEmpty
+          !badPartition
+        }
+      } catch { case _: Throwable => false }
+    }
+
+  private def windowSuffixShape(meta: MvMetadata): Option[WindowSuffixShape] = {
+    val sql = meta.querySql
+    if (
+      meta.sourceTables.size != 1 ||
+      "(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined ||
+      "(?is)\\bLEAD\\s*\\(|\\bFOLLOWING\\b|\\bROWS\\s+BETWEEN\\s+CURRENT\\s+ROW\\s+AND\\b|\\bRANGE\\s+BETWEEN\\s+CURRENT\\s+ROW\\s+AND\\b".r
+        .findFirstIn(sql)
+        .isDefined
+    ) return None
+
+    val overSpecs = "(?is)\\bOVER\\s*\\((.*?)\\)".r.findAllMatchIn(sql).map(_.group(1)).toVector
+    if (overSpecs.isEmpty) return None
+
+    val parsedSpecs = overSpecs.flatMap { spec =>
+      val m = "(?is)\\bPARTITION\\s+BY\\s+(.+?)\\s+ORDER\\s+BY\\s+(.+?)(?:\\bROWS\\b|\\bRANGE\\b|$)".r
+        .findFirstMatchIn(spec.trim)
+      m.flatMap { hit =>
+        val parts = splitIdentifierList(hit.group(1))
+        val order = splitIdentifierList(hit.group(2)).headOption
+        order.map(o => parts -> o)
+      }
+    }
+    if (parsedSpecs.size != overSpecs.size) return None
+
+    val (parts, order) = parsedSpecs.head
+    if (parts.isEmpty || parsedSpecs.exists { case (p, o) => p != parts || o != order }) None
+    else {
+      val upperOrder = order.toUpperCase(java.util.Locale.ROOT)
+      if (upperOrder.contains(" DESC") || upperOrder.contains(" NULLS ")) None
+      else Some(WindowSuffixShape(meta.sourceTables.head.split("\\.").last, parts, order.stripSuffix(" ASC").trim))
+    }
+  }
+
+  private def splitIdentifierList(csv: String): Seq[String] =
+    csv
+      .split(",")
+      .map(_.trim.stripPrefix("`").stripSuffix("`"))
+      .filter(s => s.matches("[A-Za-z_][A-Za-z0-9_]*\\s*(?i:ASC)?"))
+      .map(_.replaceAll("(?i)\\s+ASC\\s*$", ""))
+      .toSeq
+
+  private def partitionMatch(leftAlias: String, rightAlias: String, partitionCols: Seq[String]): String =
+    partitionCols
+      .map(c => s"$leftAlias.${quoteCol(c)} <=> $rightAlias.${quoteCol(c)}")
+      .mkString(" AND ")
+
+  private def quoteCol(col: String): String =
+    s"`${col.replace("`", "``")}`"
+
+  private def replaceWindowSuffixSource(sql: String, replacement: String): Option[String] = {
+    val fromRe =
+      ("(?is)\\bFROM\\s+((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)" +
+        "(\\s+(?:AS\\s+)?[A-Za-z_][A-Za-z0-9_]*)?").r
+    val matches = fromRe.findAllMatchIn(sql).toVector
+    if (matches.size != 1) None
+    else {
+      val m      = matches.head
+      val alias  = Option(m.group(2)).getOrElse("")
+      val before = sql.substring(0, m.start)
+      val after  = sql.substring(m.end)
+      Some(s"${before}FROM $replacement$alias$after")
+    }
+  }
+
+  private def isWindowPartitionAuxSql(sql: String, targetId: TableIdentifier): Boolean = {
+    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
+    val view  = targetId.table.toUpperCase(java.util.Locale.ROOT)
+    upper.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_OLD_$view") ||
+    upper.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_NEW_$view") ||
+    (upper.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
+      upper.contains(s"FROM OPENIVM_OLD_$view") &&
+      upper.contains(s"FROM OPENIVM_NEW_$view"))
+  }
+
+  private def isWindowPartitionDeleteSql(sql: String, targetId: TableIdentifier): Boolean = {
+    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
+    upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS V") &&
+    upper.contains("SELECT DISTINCT") &&
+    upper.contains("OPENIVM_DELTA_") &&
+    upper.contains("WHEN MATCHED THEN DELETE")
+  }
+
+  private def isWindowPartitionInsertSql(sql: String, targetId: TableIdentifier): Boolean = {
+    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
+    upper.startsWith(s"INSERT INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)}") &&
+    ((upper.contains("OPENIVM_RECOMPUTE") &&
+      "\\bIN\\s*\\(\\s*SELECT\\s+DISTINCT\\b".r.findFirstIn(upper).isDefined &&
+      upper.contains("OPENIVM_DELTA_")) ||
+      upper.contains(s"FROM OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}"))
   }
 
   /** Advance the MV's tracked Delta version and prune fully-consumed staging
