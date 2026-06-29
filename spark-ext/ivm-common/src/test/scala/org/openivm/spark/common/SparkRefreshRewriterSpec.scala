@@ -149,6 +149,58 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("per-source delta_shape empty-delta term pruning") {
+    it("drops UNION ALL join terms whose selected source delta is UNCHANGED") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |WITH join_delta AS (
+          |  SELECT f.region_id, p.name, f.amount, f.openivm_multiplicity
+          |  FROM memory.main.openivm_delta_fact_sales f
+          |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, p.openivm_multiplicity
+          |  FROM memory.main.fact_sales f
+          |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, r.openivm_multiplicity
+          |  FROM memory.main.fact_sales f
+          |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.openivm_delta_dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, -1 * f.openivm_multiplicity * p.openivm_multiplicity
+          |  FROM memory.main.openivm_delta_fact_sales f
+          |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |)
+          |INSERT INTO openivm_delta_mv_r (region_id, name, amount, openivm_multiplicity)
+          |SELECT * FROM join_delta;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        deltaShape = Map(
+          "default.fact_sales"  -> DeltaShape.InsertOnly,
+          "default.dim_product" -> DeltaShape.Unchanged,
+          "default.dim_region"  -> DeltaShape.Unchanged
+        )
+      )
+
+      val stmt = rewritten.statements.head
+      stmt should include("`openivm_delta_fact_sales`")
+      stmt should not include "openivm_delta_dim_product"
+      stmt should not include "openivm_delta_dim_region"
+      stmt.split("(?i)UNION\\s+ALL").length shouldBe 1
+    }
+  }
+
   // ── 4. openivm_data_mv_r → `mydb`.`mv_r` ──────────────────────────────────
   describe("MV identifier rewrite") {
     it("rewrites openivm_data_mv_r to backtick-quoted multi-part MV identifier in statement C") {

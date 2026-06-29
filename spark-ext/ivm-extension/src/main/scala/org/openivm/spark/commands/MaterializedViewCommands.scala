@@ -1384,13 +1384,33 @@ case class RefreshMaterializedViewCommand(
           cdfBatchVerdicts.collectFirst { case (candidate, verdict) if candidate.split("\\.").last == short => verdict }
         }
 
+    lazy val stagingBatchShapes: Map[String, DeltaShape] =
+      changeBatches
+        .collect { case b: StagingChangeBatch => b }
+        .map { batch =>
+          val insertOnly = batch.deltas.nonEmpty && batch.deltas.forall(_.opType == StagingDelta.OpTypes.Insert)
+          batch.baseTable -> (if (insertOnly) DeltaShape.InsertOnly else DeltaShape.General)
+        }
+        .toMap
+
+    def stagingShapeForSource(source: String): Option[DeltaShape] =
+      stagingBatchShapes
+        .get(source)
+        .orElse {
+          val short = source.split("\\.").last
+          stagingBatchShapes.collectFirst { case (candidate, shape) if candidate.split("\\.").last == short => shape }
+        }
+
     lazy val sourceDeltaShape: Map[String, DeltaShape] =
-      if (cdfChangeBatches.isEmpty) Map.empty
-      else {
+      if (cdfChangeBatches.nonEmpty) {
         meta.sourceTables.map { source =>
           source -> verdictForSource(source).map(DeltaCommitClassifier.shapeOf).getOrElse(DeltaShape.Unchanged)
         }.toMap
-      }
+      } else if (stagingBatchShapes.nonEmpty) {
+        meta.sourceTables.map { source =>
+          source -> stagingShapeForSource(source).getOrElse(DeltaShape.Unchanged)
+        }.toMap
+      } else Map.empty
 
     // -----------------------------------------------------------------------
     // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
@@ -1724,6 +1744,7 @@ case class RefreshMaterializedViewCommand(
             sourceSchemas = freshSchemas.map { case (qual, schema) =>
               qual.split("\\.").last -> schema.fieldNames.toSeq
             },
+            deltaShape = sourceDeltaShape,
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.

@@ -255,6 +255,7 @@ object SparkRefreshRewriter {
       postProcess: String => String = identity,
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
+      deltaShape: Map[String, DeltaShape] = Map.empty,
       mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -271,7 +272,7 @@ object SparkRefreshRewriter {
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath))
+            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath, deltaShape))
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -576,15 +577,185 @@ object SparkRefreshRewriter {
   private def rewriteViewDeltaInsert(
       stmt: String,
       viewLogicalName: String,
-      viewDeltaPath: String
+      viewDeltaPath: String,
+      deltaShape: Map[String, DeltaShape]
   ): String = {
     var s = stmt
+    s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
     s
+  }
+
+  /** Drop inclusion-exclusion UNION ALL arms that select a source delta proven
+    * empty for this refresh. If every arm would be dropped, keep the original
+    * SQL so the optimization is default-safe.
+    */
+  private[common] def pruneUnchangedDeltaUnionTerms(sql: String, deltaShape: Map[String, DeltaShape]): String = {
+    val unchanged = deltaShape.collect { case (table, DeltaShape.Unchanged) => shortTableName(table).toLowerCase }.toSet
+    val changed   = deltaShape.collect { case (table, shape) if shape != DeltaShape.Unchanged => shortTableName(table) }
+    if (unchanged.isEmpty || changed.isEmpty) sql
+    else pruneUnionTermsInSql(sql, unchanged)
+  }
+
+  private def shortTableName(table: String): String =
+    table.split("\\.").last.replace("`", "").replace("\"", "")
+
+  private def pruneUnionTermsInSql(sql: String, unchangedShortNames: Set[String]): String = {
+    val withNestedPruned = rewriteParenthesizedSql(sql)(inner => pruneUnionTermsInSql(inner, unchangedShortNames))
+    val terms            = splitTopLevelUnionAll(withNestedPruned)
+    if (terms.lengthCompare(2) < 0) withNestedPruned
+    else {
+      val kept = terms.filterNot(term => referencesAnyUnchangedDelta(term, unchangedShortNames))
+      if (kept.nonEmpty && kept.size < terms.size) kept.mkString(" UNION ALL ")
+      else withNestedPruned
+    }
+  }
+
+  private def referencesAnyUnchangedDelta(sql: String, unchangedShortNames: Set[String]): Boolean =
+    unchangedShortNames.exists { short =>
+      val ref = ("(?i)(?:\\b|`)openivm_delta_" + java.util.regex.Pattern.quote(short) + "(?:\\b|`)").r
+      ref.findFirstIn(sql).isDefined
+    }
+
+  private def rewriteParenthesizedSql(sql: String)(rewrite: String => String): String = {
+    val out = new StringBuilder(sql.length)
+    var i   = 0
+    while (i < sql.length) {
+      sql.charAt(i) match {
+        case '\'' =>
+          val end = copySingleQuoted(sql, i, out)
+          i = end
+        case '"' =>
+          val end = copyDelimited(sql, i, '"', out)
+          i = end
+        case '`' =>
+          val end = copyDelimited(sql, i, '`', out)
+          i = end
+        case '(' =>
+          val close = findMatchingCloseParen(sql, i)
+          if (close > i) {
+            out.append('(')
+            out.append(rewrite(sql.substring(i + 1, close)))
+            out.append(')')
+            i = close + 1
+          } else {
+            out.append(sql.charAt(i))
+            i += 1
+          }
+        case c =>
+          out.append(c)
+          i += 1
+      }
+    }
+    out.toString
+  }
+
+  private def copySingleQuoted(sql: String, start: Int, out: StringBuilder): Int = {
+    var i    = start
+    var done = false
+    while (i < sql.length && !done) {
+      out.append(sql.charAt(i))
+      if (sql.charAt(i) == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') {
+        out.append(sql.charAt(i + 1))
+        i += 2
+      } else if (sql.charAt(i) == '\'') {
+        i += 1
+        done = true
+      } else i += 1
+    }
+    i
+  }
+
+  private def copyDelimited(sql: String, start: Int, delimiter: Char, out: StringBuilder): Int = {
+    var i    = start
+    var done = false
+    while (i < sql.length && !done) {
+      out.append(sql.charAt(i))
+      if (sql.charAt(i) == delimiter) {
+        i += 1
+        done = true
+      } else i += 1
+    }
+    i
+  }
+
+  private def splitTopLevelUnionAll(sql: String): Seq[String] = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    var start = 0
+    var i     = 0
+    var depth = 0
+    while (i < sql.length) {
+      sql.charAt(i) match {
+        case '\'' => i = skipSingleQuoted(sql, i)
+        case '"'  => i = skipDelimited(sql, i, '"')
+        case '`'  => i = skipDelimited(sql, i, '`')
+        case '(' =>
+          depth += 1
+          i += 1
+        case ')' =>
+          depth = math.max(0, depth - 1)
+          i += 1
+        case _ if depth == 0 && startsWithUnionAll(sql, i) =>
+          parts += sql.substring(start, i).trim
+          i = unionAllEnd(sql, i)
+          start = i
+        case _ => i += 1
+      }
+    }
+    if (parts.nonEmpty) {
+      parts += sql.substring(start).trim
+      parts.toSeq.filter(_.nonEmpty)
+    } else Seq(sql)
+  }
+
+  private def startsWithUnionAll(sql: String, idx: Int): Boolean = {
+    val end = unionAllEnd(sql, idx)
+    end > idx && isWordBoundary(sql, idx - 1) && isWordBoundary(sql, end)
+  }
+
+  private def unionAllEnd(sql: String, idx: Int): Int = {
+    if (!regionMatchesIgnoreCase(sql, idx, "union")) idx
+    else {
+      var i = idx + "union".length
+      i = skipUnionWhitespace(sql, i)
+      if (!regionMatchesIgnoreCase(sql, i, "all")) idx
+      else i + "all".length
+    }
+  }
+
+  private def regionMatchesIgnoreCase(sql: String, idx: Int, needle: String): Boolean =
+    idx >= 0 && idx + needle.length <= sql.length && sql.regionMatches(true, idx, needle, 0, needle.length)
+
+  private def skipUnionWhitespace(sql: String, idx: Int): Int = {
+    var i = idx
+    while (i < sql.length && sql.charAt(i).isWhitespace) i += 1
+    i
+  }
+
+  private def isWordBoundary(sql: String, idx: Int): Boolean =
+    idx < 0 || idx >= sql.length || !sql.charAt(idx).isLetterOrDigit && sql.charAt(idx) != '_'
+
+  private def skipSingleQuoted(sql: String, start: Int): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      if (sql.charAt(i) == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 2
+      else if (sql.charAt(i) == '\'') return i + 1
+      else i += 1
+    }
+    sql.length
+  }
+
+  private def skipDelimited(sql: String, start: Int, delimiter: Char): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      if (sql.charAt(i) == delimiter) return i + 1
+      i += 1
+    }
+    sql.length
   }
 
   /** Strip `openivm_timestamp [op] '<ts>'::TIMESTAMP` predicates that openivm
@@ -2823,9 +2994,6 @@ object SparkRefreshRewriter {
     }
     found.toMap
   }
-
-  private def isWordBoundary(sql: String, idx: Int): Boolean =
-    idx < 0 || idx >= sql.length || !Character.isLetterOrDigit(sql.charAt(idx)) && sql.charAt(idx) != '_'
 
   private def scanSql(sql: String, start: Int = 0)(f: (Int, Char, Int) => Unit): Unit = {
     var depth = 0
