@@ -1722,7 +1722,12 @@ case class RefreshMaterializedViewCommand(
 
       def refreshPostProcess(sql: String): String = {
         val translated = LptsSparkDialect.translate(sql)
-        SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
+        val withSelectiveBroadcast =
+          SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
+        if (FeatureGate.scd2RangeAccelEnabled(spark))
+          SparkRefreshRewriter.injectScd2RangeAcceleration(withSelectiveBroadcast)
+        else
+          withSelectiveBroadcast
       }
 
       val rewritten = profile.timeStep(

@@ -190,6 +190,13 @@ object FeatureGate {
     */
   val RuntimeFilterEnabledKey: String = "spark.openivm.refresh.runtimeFilter.enabled"
 
+  /** Enable SCD-2 range-join acceleration for refresh statements. Default OFF:
+    * when opted in, the refresh SQL rewriter adds result-invariant overlap
+    * predicates for `ts BETWEEN effective_timestamp AND end_timestamp` joins
+    * whose probe side is a source delta, and broadcasts the SCD alias by hint.
+    */
+  val Scd2RangeAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeAccel.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -260,6 +267,12 @@ object FeatureGate {
 
   def runtimeFilterEnabled(spark: SparkSession): Boolean =
     runtimeFilterEnabled(spark.sparkContext.getConf)
+
+  def scd2RangeAccelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, Scd2RangeAccelEnabledKey, default = false)
+
+  def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
+    scd2RangeAccelEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The

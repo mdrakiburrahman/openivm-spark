@@ -48,6 +48,15 @@ object SparkRefreshRewriter {
 
   final case class SelectiveBroadcastTable(shortName: String, qualifiedName: String, sizeBytes: Long)
 
+  private final case class SqlRelationRef(relation: String, alias: String)
+  private final case class Scd2RangeJoin(
+      probeAlias: String,
+      probeExpr: String,
+      dimAlias: String,
+      effectiveExpr: String,
+      endExpr: String
+  )
+
   /** Per-rewrite map of short source-table name → fully-qualified Spark name.
     *
     * Populated at the top of [[rewrite]] from the caller's
@@ -101,6 +110,23 @@ object SparkRefreshRewriter {
           bias += hint.length
         }
         out.toString()
+      }
+    }
+  }
+
+  private[spark] def injectScd2RangeAcceleration(sql: String): String = {
+    if (
+      sql.contains("__openivm_scd2_range_accel__") ||
+      !"(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined ||
+      !"(?is)\\bBETWEEN\\b".r.findFirstIn(sql).isDefined
+    ) {
+      sql
+    } else {
+      val joins = scd2RangeJoins(sql)
+      if (joins.isEmpty) sql
+      else {
+        val hinted = injectBroadcastHintsForAliases(sql, joins.map(_.dimAlias).toSet)
+        injectScd2OverlapPredicates(hinted, joins)
       }
     }
   }
@@ -624,7 +650,12 @@ object SparkRefreshRewriter {
     else rewriteFullSourceCteBodies(sql, predicates)
   }
 
-  private case class SqlRelationRef(ref: String, shortName: String, alias: String, deltaSourceShortName: Option[String])
+  private case class Scd2RelationRef(
+      ref: String,
+      shortName: String,
+      alias: String,
+      deltaSourceShortName: Option[String]
+  )
 
   private case class SemiJoinPrunePredicate(sourceShortName: String, fullSourceCol: String, deltaCol: String) {
     def sql(fullSourceAlias: String): String =
@@ -632,7 +663,7 @@ object SparkRefreshRewriter {
   }
 
   private def semiJoinPrunePredicates(sql: String, changedShortNames: Set[String]): Seq[SemiJoinPrunePredicate] = {
-    val relations = collectSqlRelationRefs(sql)
+    val relations = collectScd2RelationRefs(sql)
     val byAlias = relations
       .groupBy(r => stripBackticks(r.alias))
       .flatMap { case (alias, refs) =>
@@ -660,9 +691,9 @@ object SparkRefreshRewriter {
   }
 
   private def semiJoinPrunePredicate(
-      lhs: SqlRelationRef,
+      lhs: Scd2RelationRef,
       lhsCol: String,
-      rhs: SqlRelationRef,
+      rhs: Scd2RelationRef,
       rhsCol: String,
       changedShortNames: Set[String]
   ): Option[SemiJoinPrunePredicate] = {
@@ -678,8 +709,8 @@ object SparkRefreshRewriter {
     }
   }
 
-  private def collectSqlRelationRefs(sql: String): Seq[SqlRelationRef] = {
-    val refs = scala.collection.mutable.ArrayBuffer.empty[SqlRelationRef]
+  private def collectScd2RelationRefs(sql: String): Seq[Scd2RelationRef] = {
+    val refs = scala.collection.mutable.ArrayBuffer.empty[Scd2RelationRef]
     val stop = Set(
       "ON",
       "WHERE",
@@ -718,7 +749,7 @@ object SparkRefreshRewriter {
               else short
             if (!stop(alias.toUpperCase)) {
               val deltaShort = deltaSourceShortName(short)
-              refs += SqlRelationRef(ref, short, alias, deltaShort)
+              refs += Scd2RelationRef(ref, short, alias, deltaShort)
             }
           }
         }
@@ -3091,6 +3122,95 @@ object SparkRefreshRewriter {
     i
   }
 
+  private def scd2RangeJoins(sql: String): Seq[Scd2RangeJoin] = {
+    val rangeRe =
+      ("""(?is)((?:CAST\s*\(\s*)?([A-Za-z_]\w*)\s*\.\s*(`?[A-Za-z_]\w*`?)""" +
+        """(?:\s+AS\s+(?:TIMESTAMP|DATE)\s*\))?)\s+BETWEEN\s+""" +
+        """([A-Za-z_]\w*)\s*\.\s*(`?(?:effective_timestamp|effective_ts|eff)`?)\s+AND\s+""" +
+        """\4\s*\.\s*(`?(?:end_timestamp|end_ts|endts)`?)""").r
+
+    rangeRe
+      .findAllMatchIn(sql)
+      .map { m =>
+        Scd2RangeJoin(
+          probeAlias = m.group(2),
+          probeExpr = m.group(1),
+          dimAlias = m.group(4),
+          effectiveExpr = s"${m.group(4)}.${m.group(5)}",
+          endExpr = s"${m.group(4)}.${m.group(6)}"
+        )
+      }
+      .toVector
+      .distinct
+  }
+
+  private def injectScd2OverlapPredicates(sql: String, joins: Seq[Scd2RangeJoin]): String = {
+    val relationByAlias = relationsByAlias(sql)
+    joins.zipWithIndex.foldLeft(sql) { case (current, (join, idx)) =>
+      relationByAlias.get(join.probeAlias).filter(isSourceDeltaRelation) match {
+        case None => current
+        case Some(probeRelation) =>
+          val subAlias       = s"__openivm_scd2_probe_$idx"
+          val probeExprInSub = qualifyAlias(join.probeExpr, join.probeAlias, subAlias)
+          val overlap =
+            s" /*__openivm_scd2_range_accel__*/ AND ${join.effectiveExpr} <= " +
+              s"(SELECT MAX($probeExprInSub) FROM $probeRelation AS $subAlias) AND ${join.endExpr} >= " +
+              s"(SELECT MIN($probeExprInSub) FROM $probeRelation AS $subAlias)"
+          val needle = java.util.regex.Pattern.quote(join.probeExpr) +
+            "\\s+BETWEEN\\s+" +
+            java.util.regex.Pattern.quote(join.effectiveExpr) +
+            "\\s+AND\\s+" +
+            java.util.regex.Pattern.quote(join.endExpr)
+          val rangeRe = ("(?is)" + needle).r
+          rangeRe.findFirstMatchIn(current) match {
+            case None => current
+            case Some(m) =>
+              current.substring(0, m.end) + overlap + current.substring(m.end)
+          }
+      }
+    }
+  }
+
+  private def qualifyAlias(expr: String, fromAlias: String, toAlias: String): String = {
+    val aliasDot = ("(?i)\\b" + java.util.regex.Pattern.quote(fromAlias) + "\\s*\\.").r
+    aliasDot.replaceAllIn(expr, java.util.regex.Matcher.quoteReplacement(toAlias + "."))
+  }
+
+  private def isSourceDeltaRelation(relation: String): Boolean =
+    normalizeSqlIdentifier(relation).split("\\.").lastOption.exists(_.startsWith("openivm_delta_"))
+
+  private def relationsByAlias(sql: String): Map[String, String] =
+    selectKeywordOffsets(sql)
+      .flatMap { selectIdx =>
+        val block = sql.substring(selectIdx, selectBlockEnd(sql, selectIdx))
+        relationRefsInBlock(block)
+      }
+      .map(ref => ref.alias -> ref.relation)
+      .toMap
+
+  private def relationRefsInBlock(block: String): Seq[SqlRelationRef] = {
+    val refs = scala.collection.mutable.ArrayBuffer[SqlRelationRef]()
+    scanSql(block) { (idx, _, depth) =>
+      if (depth == 0 && (isKeywordAt(block, idx, "FROM") || isKeywordAt(block, idx, "JOIN"))) {
+        val keywordEnd = idx + (if (isKeywordAt(block, idx, "FROM")) "FROM".length else "JOIN".length)
+        val refStart   = skipWhitespace(block, keywordEnd)
+        if (refStart < block.length && block.charAt(refStart) != '(') {
+          val refEnd   = scanSqlTableRef(block, refStart)
+          val relation = block.substring(refStart, refEnd).replaceAll("\\s+", "")
+          val short    = normalizeSqlIdentifier(relation).split("\\.").lastOption.getOrElse(relation)
+          var aliasAt  = skipWhitespace(block, refEnd)
+          if (isKeywordAt(block, aliasAt, "AS")) aliasAt = skipWhitespace(block, aliasAt + "AS".length)
+          val aliasEnd = scanBareToken(block, aliasAt)
+          val alias =
+            if (aliasEnd > aliasAt) block.substring(aliasAt, aliasEnd)
+            else short
+          if (!sqlClauseKeywords.contains(alias.toUpperCase)) refs += SqlRelationRef(relation, alias)
+        }
+      }
+    }
+    refs.toVector
+  }
+
   private def normalizeSqlIdentifier(value: String): String =
     value
       .split("\\.")
@@ -3099,8 +3219,8 @@ object SparkRefreshRewriter {
       .mkString(".")
       .toLowerCase
 
-  private def broadcastAliasesInBlock(block: String, broadcastNames: Set[String]): Seq[String] = {
-    val keywords = Set(
+  private val sqlClauseKeywords: Set[String] =
+    Set(
       "ON",
       "WHERE",
       "JOIN",
@@ -3118,6 +3238,32 @@ object SparkRefreshRewriter {
       "WHEN",
       "USING"
     )
+
+  private def injectBroadcastHintsForAliases(sql: String, aliases: Set[String]): String = {
+    val cleanAliases = aliases.filter(_.matches("[A-Za-z_]\\w*"))
+    if (cleanAliases.isEmpty) sql
+    else {
+      val edits = selectKeywordOffsets(sql).flatMap { selectIdx =>
+        val blockEnd     = selectBlockEnd(sql, selectIdx)
+        val block        = sql.substring(selectIdx, blockEnd)
+        val blockAliases = relationRefsInBlock(block).map(_.alias).filter(cleanAliases.contains).distinct.sorted
+        if (blockAliases.isEmpty) None
+        else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${blockAliases.mkString(", ")}) */")
+      }
+      if (edits.isEmpty) sql
+      else {
+        val out  = new StringBuilder(sql)
+        var bias = 0
+        edits.foreach { case (idx, hint) =>
+          out.insert(idx + bias, hint)
+          bias += hint.length
+        }
+        out.toString()
+      }
+    }
+  }
+
+  private def broadcastAliasesInBlock(block: String, broadcastNames: Set[String]): Seq[String] = {
     val aliases = scala.collection.mutable.ArrayBuffer[String]()
     scanSql(block) { (idx, _, depth) =>
       if (depth == 0 && (isKeywordAt(block, idx, "FROM") || isKeywordAt(block, idx, "JOIN"))) {
@@ -3135,7 +3281,7 @@ object SparkRefreshRewriter {
             else short
           if (
             (broadcastNames.contains(relation) || broadcastNames.contains(short)) &&
-            !keywords.contains(alias.toUpperCase)
+            !sqlClauseKeywords.contains(alias.toUpperCase)
           ) aliases += alias
         }
       }

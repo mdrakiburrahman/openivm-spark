@@ -838,6 +838,33 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("SCD2 range acceleration injection") {
+    it("broadcasts the SCD alias and pre-filters it to the source-delta timestamp range") {
+      val sql =
+        """SELECT f.id, d.name
+          |FROM `openivm_delta_fact_market_history` f
+          |JOIN `dim_security` d
+          |  ON f.security_id = d.security_id
+          | AND f.ts BETWEEN d.effective_timestamp AND d.end_timestamp""".stripMargin
+
+      val accelerated = SparkRefreshRewriter.injectScd2RangeAcceleration(sql)
+
+      accelerated should include("SELECT /*+ BROADCAST(d) */ f.id")
+      accelerated should include("/*__openivm_scd2_range_accel__*/")
+      accelerated should include(
+        "d.effective_timestamp <= (SELECT MAX(__openivm_scd2_probe_0.ts) FROM `openivm_delta_fact_market_history` AS __openivm_scd2_probe_0)"
+      )
+      accelerated should include(
+        "d.end_timestamp >= (SELECT MIN(__openivm_scd2_probe_0.ts) FROM `openivm_delta_fact_market_history` AS __openivm_scd2_probe_0)"
+      )
+    }
+
+    it("leaves non-SCD2 joins unchanged") {
+      val sql = "SELECT f.id FROM fact f JOIN dim d ON f.id = d.id"
+      SparkRefreshRewriter.injectScd2RangeAcceleration(sql) shouldBe sql
+    }
+  }
+
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
