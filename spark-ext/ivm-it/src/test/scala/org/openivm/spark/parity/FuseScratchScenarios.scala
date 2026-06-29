@@ -19,6 +19,12 @@ import scala.collection.mutable.ArrayBuffer
 abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
+  override protected def extraSparkConf: Map[String, String] =
+    Map(
+      "spark.openivm.fuseScratch.enabled"              -> "true",
+      "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+    )
+
   private final class BufferingAppender(name: String)
       extends AbstractAppender(
         name,

@@ -2340,8 +2340,10 @@ case class RefreshMaterializedViewCommand(
                   // Keep the legacy on-disk breadcrumb for non-fused refreshes.
                   Set(viewNameStr)
                 } else triggerKeys
+              val cascadeCacheOn = FeatureGate.fuseScratchCascadeCacheEnabled(spark)
               val stagingPathForCascade =
                 fusedScratchView match {
+                  case Some(view) if cascadeCacheOn => StagingDeltaView.CachedViewDeltaRef.encode(view)
                   case Some(view) if triggerKeys.nonEmpty =>
                     spark
                       .table(s"global_temp.$view")
@@ -2350,8 +2352,8 @@ case class RefreshMaterializedViewCommand(
                       .mode("overwrite")
                       .save(viewDeltaPath)
                     viewDeltaPath
-                  case Some(view) => StagingDeltaView.CachedViewDeltaRef.encode(view)
-                  case None       => viewDeltaPath
+                  case Some(_) => viewDeltaPath
+                  case None    => viewDeltaPath
                 }
               val txnTs = new Timestamp(System.currentTimeMillis())
               keysToRecord.foreach { triggerKey =>

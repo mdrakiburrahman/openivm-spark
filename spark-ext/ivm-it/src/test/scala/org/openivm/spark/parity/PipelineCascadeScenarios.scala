@@ -19,6 +19,12 @@ import scala.collection.mutable.ArrayBuffer
 abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-cascade") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
+  override protected def extraSparkConf: Map[String, String] =
+    Map(
+      "spark.openivm.fuseScratch.enabled"              -> "true",
+      "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+    )
+
   /** Issue refreshes in dependency order: every name in `mvs` is refreshed
     * after the ones before it. */
   protected def refreshChain(mvs: String*): Unit =

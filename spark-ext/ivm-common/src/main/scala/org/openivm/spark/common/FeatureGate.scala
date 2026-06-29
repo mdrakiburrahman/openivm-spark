@@ -57,7 +57,8 @@ object FeatureGate {
     * Default ON. Flip OFF via `spark.openivm.fuseScratch.enabled=false` to
     * fall back to the on-disk scratch path (e.g. for diagnostics).
     */
-  val FuseScratchEnabledKey: String = "spark.openivm.fuseScratch.enabled"
+  val FuseScratchEnabledKey: String             = "spark.openivm.fuseScratch.enabled"
+  val FuseScratchCascadeCacheEnabledKey: String = "spark.openivm.fuseScratch.cascadeCache.enabled"
 
   /** Capture per-step refresh + create profile rows into the RocksDB
     * `refresh_profile` column family ([[RefreshProfileCatalog]]).
@@ -233,7 +234,10 @@ object FeatureGate {
     boolConf(spark.sparkContext.getConf, DeltaAutoCompactKey, default = true)
 
   def fuseScratchEnabled(spark: SparkSession): Boolean =
-    boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = true)
+    boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = false)
+
+  def fuseScratchCascadeCacheEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, FuseScratchCascadeCacheEnabledKey, default = false)
 
   def profileRefreshEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ProfileRefreshKey, default = false)
