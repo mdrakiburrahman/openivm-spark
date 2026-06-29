@@ -2148,7 +2148,10 @@ case class RefreshMaterializedViewCommand(
           }
         } else {
           val windowSuffixInsertSql: Option[String] =
-            if (meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly)
+            if (
+              meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly &&
+              downstreamSourceKeysForThisMv.isEmpty
+            )
               buildWindowSuffixInsertSql(spark, meta, mergeTargetId)
             else None
           val windowSuffixSafe =
