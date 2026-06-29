@@ -164,6 +164,18 @@ object FeatureGate {
     */
   val SelectiveBroadcastEnabledKey: String = "spark.openivm.refresh.selectiveBroadcast.enabled"
 
+  /** Inject exact semi-join prefilters into JOIN_DELTA `full_source` CTEs.
+    *
+    * OpenIVM's range-join delta programs can materialise a full base-table CTE
+    * and only later join it to a tiny changed-source delta. When this gate is
+    * enabled, the Spark rewriter wraps that `full_source` CTE with a
+    * result-invariant `WHERE <fk> IN (SELECT <key> FROM Δsrc)` prefilter derived
+    * from the existing join predicate. Default OFF while the shape coverage is
+    * expanded; flip ON via
+    * `spark.openivm.refresh.semiJoinPrune.enabled=true`.
+    */
+  val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
+
   /** Enable runtime-filter (bloom / semi-join) pushdown for the SCD2 view-delta
     * joins. Every IVM view-delta is a union of delta-rule terms, and the
     * `FULL_SOURCE ⋈ Δdimension` term scans the entire source table against the
@@ -225,6 +237,12 @@ object FeatureGate {
 
   def selectiveBroadcastEnabled(spark: SparkSession): Boolean =
     selectiveBroadcastEnabled(spark.sparkContext.getConf)
+
+  def semiJoinPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SemiJoinPruneEnabledKey, default = false)
+
+  def semiJoinPruneEnabled(spark: SparkSession): Boolean =
+    semiJoinPruneEnabled(spark.sparkContext.getConf)
 
   /** Resolve the AQE runtime-broadcast byte budget. An explicit
     * [[AdaptiveBroadcastThresholdKey]] > 0 wins; otherwise inherit the supplied

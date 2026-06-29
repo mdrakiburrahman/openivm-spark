@@ -256,6 +256,7 @@ object SparkRefreshRewriter {
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
+      semiJoinPruneEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -272,7 +273,7 @@ object SparkRefreshRewriter {
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath, deltaShape))
+            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath, deltaShape, semiJoinPruneEnabled))
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -578,10 +579,12 @@ object SparkRefreshRewriter {
       stmt: String,
       viewLogicalName: String,
       viewDeltaPath: String,
-      deltaShape: Map[String, DeltaShape]
+      deltaShape: Map[String, DeltaShape],
+      semiJoinPruneEnabled: Boolean
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
+    s = semiJoinPruneFullSourceCtes(s, deltaShape, semiJoinPruneEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
@@ -603,6 +606,195 @@ object SparkRefreshRewriter {
 
   private def shortTableName(table: String): String =
     table.split("\\.").last.replace("`", "").replace("\"", "")
+
+  private[common] def semiJoinPruneFullSourceCtes(
+      sql: String,
+      deltaShape: Map[String, DeltaShape],
+      enabled: Boolean
+  ): String = {
+    if (!enabled) return sql
+    val changedShortNames =
+      deltaShape.collect {
+        case (table, shape) if shape != DeltaShape.Unchanged => shortTableName(table).toLowerCase
+      }.toSet
+    if (changedShortNames.isEmpty) return sql
+
+    val predicates = semiJoinPrunePredicates(sql, changedShortNames)
+    if (predicates.isEmpty) sql
+    else rewriteFullSourceCteBodies(sql, predicates)
+  }
+
+  private case class SqlRelationRef(ref: String, shortName: String, alias: String, deltaSourceShortName: Option[String])
+
+  private case class SemiJoinPrunePredicate(sourceShortName: String, fullSourceCol: String, deltaCol: String) {
+    def sql(fullSourceAlias: String): String =
+      s"$fullSourceAlias.$fullSourceCol IN (SELECT $deltaCol FROM memory.main.openivm_delta_$sourceShortName)"
+  }
+
+  private def semiJoinPrunePredicates(sql: String, changedShortNames: Set[String]): Seq[SemiJoinPrunePredicate] = {
+    val relations = collectSqlRelationRefs(sql)
+    val byAlias = relations
+      .groupBy(r => stripBackticks(r.alias))
+      .flatMap { case (alias, refs) =>
+        val signatures = refs.map(r => (r.shortName.toLowerCase, r.deltaSourceShortName.map(_.toLowerCase))).distinct
+        if (signatures.size == 1) Some(alias -> refs.head) else None
+      }
+    val equalityRe =
+      "(?is)(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*=\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)".r
+
+    equalityRe
+      .findAllMatchIn(sql)
+      .flatMap { m =>
+        val lhsAlias = stripBackticks(m.group(1))
+        val lhsCol   = m.group(2)
+        val rhsAlias = stripBackticks(m.group(3))
+        val rhsCol   = m.group(4)
+        for {
+          lhs  <- byAlias.get(lhsAlias)
+          rhs  <- byAlias.get(rhsAlias)
+          pred <- semiJoinPrunePredicate(lhs, lhsCol, rhs, rhsCol, changedShortNames)
+        } yield pred
+      }
+      .toVector
+      .distinct
+  }
+
+  private def semiJoinPrunePredicate(
+      lhs: SqlRelationRef,
+      lhsCol: String,
+      rhs: SqlRelationRef,
+      rhsCol: String,
+      changedShortNames: Set[String]
+  ): Option[SemiJoinPrunePredicate] = {
+    (lhs.shortName.equalsIgnoreCase("full_source"), rhs.deltaSourceShortName) match {
+      case (true, Some(deltaShort)) if changedShortNames(deltaShort.toLowerCase) =>
+        Some(SemiJoinPrunePredicate(deltaShort, lhsCol, rhsCol))
+      case _ =>
+        (rhs.shortName.equalsIgnoreCase("full_source"), lhs.deltaSourceShortName) match {
+          case (true, Some(deltaShort)) if changedShortNames(deltaShort.toLowerCase) =>
+            Some(SemiJoinPrunePredicate(deltaShort, rhsCol, lhsCol))
+          case _ => None
+        }
+    }
+  }
+
+  private def collectSqlRelationRefs(sql: String): Seq[SqlRelationRef] = {
+    val refs = scala.collection.mutable.ArrayBuffer.empty[SqlRelationRef]
+    val stop = Set(
+      "ON",
+      "WHERE",
+      "JOIN",
+      "LEFT",
+      "RIGHT",
+      "FULL",
+      "INNER",
+      "OUTER",
+      "CROSS",
+      "GROUP",
+      "ORDER",
+      "HAVING",
+      "LIMIT",
+      "UNION",
+      "WHEN",
+      "USING",
+      "AS"
+    )
+
+    scanSql(sql) { (idx, _, _) =>
+      if (isKeywordAt(sql, idx, "FROM") || isKeywordAt(sql, idx, "JOIN")) {
+        val keywordEnd = idx + (if (isKeywordAt(sql, idx, "FROM")) "FROM".length else "JOIN".length)
+        val refStart   = skipWhitespace(sql, keywordEnd)
+        if (refStart < sql.length && sql.charAt(refStart) != '(') {
+          val refEnd = scanSqlTableRef(sql, refStart)
+          if (refEnd > refStart) {
+            val ref        = sql.substring(refStart, refEnd).replaceAll("\\s+", "")
+            var aliasStart = skipWhitespace(sql, refEnd)
+            if (isKeywordAt(sql, aliasStart, "AS")) aliasStart = skipWhitespace(sql, aliasStart + "AS".length)
+            val aliasEnd   = scanBareToken(sql, aliasStart)
+            val normalized = normalizeSqlIdentifier(ref)
+            val short      = normalized.split("\\.").lastOption.getOrElse(normalized)
+            val alias =
+              if (aliasEnd > aliasStart) sql.substring(aliasStart, aliasEnd)
+              else short
+            if (!stop(alias.toUpperCase)) {
+              val deltaShort = deltaSourceShortName(short)
+              refs += SqlRelationRef(ref, short, alias, deltaShort)
+            }
+          }
+        }
+      }
+    }
+    refs.toVector
+  }
+
+  private def deltaSourceShortName(shortName: String): Option[String] = {
+    val prefix = "openivm_delta_"
+    if (shortName.toLowerCase.startsWith(prefix)) Some(shortName.substring(prefix.length))
+    else None
+  }
+
+  private def rewriteFullSourceCteBodies(sql: String, predicates: Seq[SemiJoinPrunePredicate]): String = {
+    val out  = new StringBuilder(sql.length)
+    var from = 0
+    var i    = 0
+    while (i < sql.length) {
+      if (startsWithSqlKeyword(sql, i, "full_source")) {
+        val bodyOpen = fullSourceCteBodyOpen(sql, i + "full_source".length)
+        bodyOpen match {
+          case Some(openIdx) =>
+            val closeIdx = findMatchingCloseParen(sql, openIdx)
+            if (closeIdx > openIdx) {
+              out.append(sql.substring(from, openIdx + 1))
+              out.append(wrapFullSourceBody(sql.substring(openIdx + 1, closeIdx), predicates))
+              from = closeIdx
+              i = closeIdx + 1
+            } else i += "full_source".length
+          case None => i += "full_source".length
+        }
+      } else {
+        sql.charAt(i) match {
+          case '\'' => i = skipSingleQuoted(sql, i)
+          case '"'  => i = skipDelimited(sql, i, '"')
+          case '`'  => i = skipDelimited(sql, i, '`')
+          case _    => i += 1
+        }
+      }
+    }
+    if (from == 0) sql
+    else {
+      out.append(sql.substring(from))
+      out.toString
+    }
+  }
+
+  private def fullSourceCteBodyOpen(sql: String, from: Int): Option[Int] = {
+    var i = skipWhitespace(sql, from)
+    if (i < sql.length && sql.charAt(i) == '(') {
+      val colsClose = findMatchingCloseParen(sql, i)
+      if (colsClose < 0) return None
+      i = skipWhitespace(sql, colsClose + 1)
+    }
+    if (!startsWithSqlKeyword(sql, i, "AS")) None
+    else {
+      i = skipWhitespace(sql, i + "AS".length)
+      if (i < sql.length && sql.charAt(i) == '(') Some(i) else None
+    }
+  }
+
+  private def wrapFullSourceBody(body: String, predicates: Seq[SemiJoinPrunePredicate]): String = {
+    val alias = "__openivm_full_source_pre"
+    val grouped = predicates
+      .groupBy(_.sourceShortName.toLowerCase)
+      .toSeq
+      .sortBy(_._1)
+      .map { case (_, ps) =>
+        ps.sortBy(p => (p.fullSourceCol.toLowerCase, p.deltaCol.toLowerCase))
+          .map(_.sql(alias))
+          .mkString("(", " AND ", ")")
+      }
+    val where = grouped.mkString(" OR ")
+    s"SELECT * FROM ($body) $alias WHERE $where"
+  }
 
   private def pruneUnionTermsInSql(sql: String, unchangedShortNames: Set[String]): String = {
     val withNestedPruned = rewriteParenthesizedSql(sql)(inner => pruneUnionTermsInSql(inner, unchangedShortNames))

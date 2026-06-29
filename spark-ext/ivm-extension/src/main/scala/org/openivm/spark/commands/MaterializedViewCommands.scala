@@ -1745,6 +1745,7 @@ case class RefreshMaterializedViewCommand(
               qual.split("\\.").last -> schema.fieldNames.toSeq
             },
             deltaShape = sourceDeltaShape,
+            semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.

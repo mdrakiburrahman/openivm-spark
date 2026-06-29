@@ -65,4 +65,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe true
     }
   }
+
+  describe("FeatureGate.semiJoinPruneEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.semiJoinPruneEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.semiJoinPruneEnabled(
+        new SparkConf(false).set(FeatureGate.SemiJoinPruneEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }

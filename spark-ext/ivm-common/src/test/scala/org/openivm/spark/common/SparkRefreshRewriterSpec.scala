@@ -201,6 +201,80 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("semi-join full_source pre-prune") {
+    val joinDeltaInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH full_source (sk_security_id, trade_date, amount) AS (
+        |  SELECT sk_security_id, trade_date, amount
+        |  FROM memory.main.daily_market
+        |),
+        |join_delta AS (
+        |  SELECT fs.sk_security_id, fs.amount, d.openivm_multiplicity
+        |  FROM full_source fs
+        |  JOIN memory.main.openivm_delta_dim_security d
+        |    ON fs.sk_security_id = d.sk_security_id
+        |   AND fs.trade_date >= d.effective_date
+        |)
+        |INSERT INTO openivm_delta_mv_r (sk_security_id, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("wraps FULL_SOURCE with a changed-source semi-join prefilter when enabled") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = joinDeltaInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        deltaShape = Map("default.dim_security" -> DeltaShape.InsertOnly),
+        semiJoinPruneEnabled = true
+      )
+
+      val stmt = rewritten.statements.head
+      stmt should include("SELECT * FROM (")
+      stmt should include(
+        "__openivm_full_source_pre.sk_security_id IN (SELECT sk_security_id FROM `openivm_delta_dim_security`)"
+      )
+      stmt should include("FROM full_source fs")
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves FULL_SOURCE unchanged when the gate is off or the delta source is unchanged") {
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map("default.dim_security" -> DeltaShape.InsertOnly),
+          semiJoinPruneEnabled = false
+        )
+        .statements
+        .head
+
+      val unchanged = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map("default.dim_security" -> DeltaShape.Unchanged),
+          semiJoinPruneEnabled = true
+        )
+        .statements
+        .head
+
+      disabled should not include "__openivm_full_source_pre"
+      unchanged should not include "__openivm_full_source_pre"
+    }
+  }
+
   // ── 4. openivm_data_mv_r → `mydb`.`mv_r` ──────────────────────────────────
   describe("MV identifier rewrite") {
     it("rewrites openivm_data_mv_r to backtick-quoted multi-part MV identifier in statement C") {
