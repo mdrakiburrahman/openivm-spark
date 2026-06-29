@@ -1667,7 +1667,7 @@ case class RefreshMaterializedViewCommand(
       // dimension MV refreshing) does not block the fast path, because the
       // view-delta sign (1) is the authoritative signal for the FACT.
       lazy val batchHasReplace: Boolean =
-        sourceDeltaShape.isEmpty || cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
+        cdfChangeBatches.isEmpty || cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
 
       lazy val batchInsertOnly: Boolean =
         sourceDeltaShape.nonEmpty &&
