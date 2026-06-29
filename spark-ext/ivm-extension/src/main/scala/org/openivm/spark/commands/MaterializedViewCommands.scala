@@ -1751,6 +1751,11 @@ case class RefreshMaterializedViewCommand(
             },
             deltaShape = sourceDeltaShape,
             semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
+            uniqueKeys =
+              if (FeatureGate.uniqueJoinSimplifyEnabled(spark))
+                WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables).uniqueKeys
+              else Seq.empty,
+            uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark),
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.

@@ -176,6 +176,13 @@ object FeatureGate {
     */
   val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
 
+  /** Simplify refresh joins whose right-side join key is known unique from
+    * [[WorkloadFacts.uniqueKeys]]. INNER joins with unused right columns are
+    * demoted to EXISTS probes; LEFT joins with unused right columns are dropped.
+    * Default OFF while shape coverage grows.
+    */
+  val UniqueJoinSimplifyEnabledKey: String = "spark.openivm.refresh.uniqueJoinSimplify.enabled"
+
   /** Enable runtime-filter (bloom / semi-join) pushdown for the SCD2 view-delta
     * joins. Every IVM view-delta is a union of delta-rule terms, and the
     * `FULL_SOURCE ⋈ Δdimension` term scans the entire source table against the
@@ -250,6 +257,12 @@ object FeatureGate {
 
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
+
+  def uniqueJoinSimplifyEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, UniqueJoinSimplifyEnabledKey, default = false)
+
+  def uniqueJoinSimplifyEnabled(spark: SparkSession): Boolean =
+    uniqueJoinSimplifyEnabled(spark.sparkContext.getConf)
 
   /** Resolve the AQE runtime-broadcast byte budget. An explicit
     * [[AdaptiveBroadcastThresholdKey]] > 0 wins; otherwise inherit the supplied

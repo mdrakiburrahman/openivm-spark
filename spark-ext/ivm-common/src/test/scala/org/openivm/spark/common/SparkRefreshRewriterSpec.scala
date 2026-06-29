@@ -275,6 +275,82 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("unique-key join simplification") {
+    val joinInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH join_delta AS (
+        |  SELECT f.id, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.dim_customer d ON f.customer_id = d.id
+        |),
+        |left_join_delta AS (
+        |  SELECT f.id, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  LEFT JOIN memory.main.dim_region r ON f.region_id = r.id
+        |)
+        |INSERT INTO openivm_delta_mv_r (id, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta UNION ALL SELECT * FROM left_join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("demotes unused INNER unique-dimension joins to EXISTS probes and drops unused LEFT joins") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = joinInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id")), UniqueKey("dim_region", Seq("id"))),
+        uniqueJoinSimplifyEnabled = true
+      )
+
+      val stmt = rewritten.statements.head
+      stmt should include("EXISTS (SELECT 1 FROM `dim_customer` d WHERE f.customer_id = d.id)")
+      stmt should not include "JOIN `dim_customer`"
+      stmt should not include "JOIN `dim_region`"
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves joins unchanged when the gate is off or right columns are projected") {
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id")), UniqueKey("dim_region", Seq("id"))),
+          uniqueJoinSimplifyEnabled = false
+        )
+        .statements
+        .head
+
+      val rightUsedInput = joinInput.replace(
+        "SELECT f.id, f.amount, f.openivm_multiplicity",
+        "SELECT f.id, d.name, f.openivm_multiplicity"
+      )
+      val rightUsed = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = rightUsedInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id"))),
+          uniqueJoinSimplifyEnabled = true
+        )
+        .statements
+        .head
+
+      disabled should include("JOIN `dim_customer`")
+      disabled should include("LEFT JOIN `dim_region`")
+      rightUsed should include("JOIN `dim_customer`")
+    }
+  }
+
   // ── 4. openivm_data_mv_r → `mydb`.`mv_r` ──────────────────────────────────
   describe("MV identifier rewrite") {
     it("rewrites openivm_data_mv_r to backtick-quoted multi-part MV identifier in statement C") {

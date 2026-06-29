@@ -56,6 +56,15 @@ object SparkRefreshRewriter {
       effectiveExpr: String,
       endExpr: String
   )
+  private final case class UniqueJoinKey(shortName: String, columns: Set[String])
+  private final case class UniqueJoinClause(
+      removeStart: Int,
+      removeEnd: Int,
+      joinType: String,
+      relation: String,
+      alias: String,
+      onCondition: String
+  )
 
   /** Per-rewrite map of short source-table name → fully-qualified Spark name.
     *
@@ -283,6 +292,8 @@ object SparkRefreshRewriter {
       sourceQualifiedNames: Map[String, String] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
+      uniqueKeys: Seq[UniqueKey] = Seq.empty,
+      uniqueJoinSimplifyEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -299,7 +310,17 @@ object SparkRefreshRewriter {
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(rewriteViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath, deltaShape, semiJoinPruneEnabled))
+            Seq(
+              rewriteViewDeltaInsert(
+                stmt,
+                viewLogicalName,
+                viewDeltaPath,
+                deltaShape,
+                semiJoinPruneEnabled,
+                uniqueKeys,
+                uniqueJoinSimplifyEnabled
+              )
+            )
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -606,11 +627,14 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       viewDeltaPath: String,
       deltaShape: Map[String, DeltaShape],
-      semiJoinPruneEnabled: Boolean
+      semiJoinPruneEnabled: Boolean,
+      uniqueKeys: Seq[UniqueKey],
+      uniqueJoinSimplifyEnabled: Boolean
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
     s = semiJoinPruneFullSourceCtes(s, deltaShape, semiJoinPruneEnabled)
+    s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
@@ -762,6 +786,178 @@ object SparkRefreshRewriter {
     val prefix = "openivm_delta_"
     if (shortName.toLowerCase.startsWith(prefix)) Some(shortName.substring(prefix.length))
     else None
+  }
+
+  private[common] def simplifyUniqueKeyJoins(
+      sql: String,
+      uniqueKeys: Seq[UniqueKey],
+      enabled: Boolean
+  ): String = {
+    val keys = uniqueKeys
+      .filter(k => k.rely && k.columns.nonEmpty)
+      .map(k =>
+        UniqueJoinKey(shortTableName(k.table).toLowerCase, k.columns.map(stripBackticks).map(_.toLowerCase).toSet)
+      )
+    if (!enabled || keys.isEmpty || !"(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined) sql
+    else rewriteSelectBlocks(sql)(block => simplifyUniqueKeyJoinsInBlock(block, keys))
+  }
+
+  private def simplifyUniqueKeyJoinsInBlock(block: String, uniqueKeys: Seq[UniqueJoinKey]): String = {
+    if (selectListHasWildcard(block)) return block
+    val clauses = uniqueJoinClauses(block).filter { clause =>
+      val shortName = normalizeSqlIdentifier(clause.relation).split("\\.").lastOption.getOrElse("")
+      !shortName.startsWith("openivm_delta_") &&
+      rightAliasUnusedOutsideJoin(block, clause) &&
+      uniqueKeys.exists(key =>
+        key.shortName == shortName && joinConditionCoversKey(clause.alias, clause.onCondition, key)
+      )
+    }
+    if (clauses.isEmpty) block
+    else {
+      val probes = clauses.filter(_.joinType == "inner").map { clause =>
+        val relationAndAlias =
+          if (
+            clause.alias.equalsIgnoreCase(normalizeSqlIdentifier(clause.relation).split("\\.").lastOption.getOrElse(""))
+          )
+            clause.relation
+          else s"${clause.relation} ${clause.alias}"
+        s"EXISTS (SELECT 1 FROM $relationAndAlias WHERE ${clause.onCondition.trim})"
+      }
+      val withoutJoins = clauses.sortBy(-_.removeStart).foldLeft(block) { case (current, clause) =>
+        current.substring(0, clause.removeStart) + current.substring(clause.removeEnd)
+      }
+      probes.foldLeft(withoutJoins)(addTopLevelWhereConjunct)
+    }
+  }
+
+  private def rewriteSelectBlocks(sql: String)(rewrite: String => String): String = {
+    val offsets = selectKeywordOffsets(sql).filter(idx => topLevelSelectFromIdx(sql, idx).isDefined)
+    if (offsets.isEmpty) sql
+    else {
+      val out = new StringBuilder(sql)
+      offsets.sortBy(-_).foreach { selectIdx =>
+        val end     = selectBlockEnd(sql, selectIdx)
+        val block   = sql.substring(selectIdx, end)
+        val updated = rewrite(block)
+        if (updated != block) out.replace(selectIdx, end, updated)
+      }
+      out.toString
+    }
+  }
+
+  private def uniqueJoinClauses(block: String): Seq[UniqueJoinClause] = {
+    val clauses = scala.collection.mutable.ArrayBuffer.empty[UniqueJoinClause]
+    scanSql(block) { (idx, _, depth) =>
+      if (depth == 0 && isKeywordAt(block, idx, "JOIN")) {
+        val (joinType, removeStart) = joinTypeAndStart(block, idx)
+        if (joinType == "inner" || joinType == "left") {
+          val refStart = skipWhitespace(block, idx + "JOIN".length)
+          if (refStart < block.length && block.charAt(refStart) != '(') {
+            val refEnd   = scanSqlTableRef(block, refStart)
+            val relation = block.substring(refStart, refEnd).replaceAll("\\s+", "")
+            var aliasAt  = skipWhitespace(block, refEnd)
+            if (isKeywordAt(block, aliasAt, "AS")) aliasAt = skipWhitespace(block, aliasAt + "AS".length)
+            val aliasEnd = scanBareToken(block, aliasAt)
+            val short    = normalizeSqlIdentifier(relation).split("\\.").lastOption.getOrElse(relation)
+            val alias =
+              if (aliasEnd > aliasAt) block.substring(aliasAt, aliasEnd)
+              else short
+            if (!sqlClauseKeywords.contains(alias.toUpperCase)) {
+              val onIdx = findTopLevelSqlKeyword(block, aliasEnd.max(refEnd), block.length, "ON")
+              onIdx.foreach { onStart =>
+                val onBodyStart = skipWhitespace(block, onStart + "ON".length)
+                val onEnd       = nextJoinBoundary(block, onBodyStart)
+                clauses += UniqueJoinClause(
+                  removeStart,
+                  onEnd,
+                  joinType,
+                  relation,
+                  alias,
+                  block.substring(onBodyStart, onEnd)
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+    clauses.toVector
+  }
+
+  private def joinTypeAndStart(block: String, joinIdx: Int): (String, Int) = {
+    val beforeJoin = block.substring(0, joinIdx)
+    "(?is)(LEFT\\s+OUTER|LEFT|INNER)\\s*$".r.findFirstMatchIn(beforeJoin) match {
+      case Some(m) if m.group(1).toUpperCase.startsWith("LEFT") => "left"  -> m.start
+      case Some(m) if m.group(1).equalsIgnoreCase("INNER")      => "inner" -> m.start
+      case _                                                    => "inner" -> joinIdx
+    }
+  }
+
+  private def nextJoinBoundary(block: String, from: Int): Int = {
+    val keywords = Seq("JOIN", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION")
+    var end      = block.length
+    scanSql(block, from) { (idx, _, depth) =>
+      if (idx > from && depth == 0 && end == block.length && keywords.exists(k => isKeywordAt(block, idx, k))) {
+        end = if (isKeywordAt(block, idx, "JOIN")) {
+          val (_, start) = joinTypeAndStart(block, idx)
+          start
+        } else idx
+      }
+    }
+    end
+  }
+
+  private def rightAliasUnusedOutsideJoin(block: String, clause: UniqueJoinClause): Boolean = {
+    val outside = block.substring(0, clause.removeStart) + " " + block.substring(clause.removeEnd)
+    !referencesAlias(outside, clause.alias)
+  }
+
+  private def joinConditionCoversKey(alias: String, condition: String, key: UniqueJoinKey): Boolean =
+    key.columns.forall(col => conditionHasAliasColumnEquality(condition, alias, col))
+
+  private def conditionHasAliasColumnEquality(condition: String, alias: String, col: String): Boolean = {
+    val a        = java.util.regex.Pattern.quote(alias)
+    val c        = java.util.regex.Pattern.quote(col)
+    val aliasCol = s"`?$a`?\\s*\\.\\s*`?$c`?"
+    val otherCol = """(?:`?[A-Za-z_]\w*`?\s*\.\s*`?[A-Za-z_]\w*`?)"""
+    val re       = (s"(?is)(?:$aliasCol\\s*(?:=|<=>)\\s*$otherCol|$otherCol\\s*(?:=|<=>)\\s*$aliasCol)").r
+    re.findFirstIn(condition).isDefined
+  }
+
+  private def referencesAlias(text: String, alias: String): Boolean = {
+    val a = java.util.regex.Pattern.quote(alias)
+    (s"(?is)(?:^|[^A-Za-z0-9_`])`?$a`?\\s*\\.").r.findFirstIn(text).isDefined
+  }
+
+  private def selectListHasWildcard(block: String): Boolean =
+    topLevelSelectFromIdx(block, 0).exists { fromIdx =>
+      val selectList = block.substring("SELECT".length, fromIdx)
+      "(?is)(^|,)\\s*(?:`?[A-Za-z_]\\w*`?\\s*\\.\\s*)?\\*\\s*(?:,|$)".r.findFirstIn(selectList).isDefined
+    }
+
+  private def topLevelSelectFromIdx(block: String, selectIdx: Int): Option[Int] =
+    findTopLevelSqlKeyword(block, selectIdx + "SELECT".length, selectBlockEnd(block, selectIdx), "FROM")
+
+  private def addTopLevelWhereConjunct(block: String, predicate: String): String = {
+    val fromIdx  = topLevelSelectFromIdx(block, 0).getOrElse(return block)
+    val whereIdx = findTopLevelSqlKeyword(block, fromIdx + "FROM".length, block.length, "WHERE")
+    whereIdx match {
+      case Some(idx) =>
+        val end = nextWhereBoundary(block, idx + "WHERE".length)
+        block.substring(0, end) + s" AND $predicate" + block.substring(end)
+      case None =>
+        val insertAt = nextWhereBoundary(block, fromIdx + "FROM".length)
+        block.substring(0, insertAt) + s" WHERE $predicate" + block.substring(insertAt)
+    }
+  }
+
+  private def nextWhereBoundary(block: String, from: Int): Int = {
+    val keywords = Seq("GROUP", "HAVING", "ORDER", "LIMIT", "UNION")
+    var end      = block.length
+    scanSql(block, from) { (idx, _, depth) =>
+      if (idx > from && depth == 0 && end == block.length && keywords.exists(k => isKeywordAt(block, idx, k))) end = idx
+    }
+    end
   }
 
   private def rewriteFullSourceCteBodies(sql: String, predicates: Seq[SemiJoinPrunePredicate]): String = {
