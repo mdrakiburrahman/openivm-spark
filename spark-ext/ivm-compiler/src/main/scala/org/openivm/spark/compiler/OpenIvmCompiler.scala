@@ -6,6 +6,7 @@ import java.util.Comparator
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
+import org.openivm.spark.common.{ForeignKeyRelation, UniqueKey}
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -47,23 +48,52 @@ final case class CompileRequest(
   *     PROVEN this batch is append-only; re-enables the insert-only fast paths
   *     (skip aggregate/projection delete, MIN/MAX GREATEST/LEAST) that
   *     `compileOnly` otherwise disables. Defaults false — identical to v1.
+  *   - `fkRelations` / `uniqueKeys` — trusted declaration-registry facts.
+  *     Defaults empty, so existing compile behaviour is unchanged until openivm
+  *     consumes them.
   */
 final case class WorkloadFacts(
     targetDialect: String = "spark",
     compileOnly: Boolean = true,
     forceViewDeltaCascade: Boolean = true,
     assumeInsertOnly: Boolean = false,
+    fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
+    uniqueKeys: Seq[UniqueKey] = Seq.empty,
     schemaVersion: Int = 2
 ) {
 
   /** Canonical, whitespace-free JSON matching openivm's hand-rolled substring
     * parser (`ParseFactsJson` in `compile_facts.cpp`). */
   def toJson: String = {
-    def b(x: Boolean): String = if (x) "true" else "false"
+    def b(x: Boolean): String      = if (x) "true" else "false"
+    def q(x: String): String       = "\"" + escapeJson(x) + "\""
+    def a(xs: Seq[String]): String = xs.map(q).mkString("[", ",", "]")
+    val fks = fkRelations
+      .map { fk =>
+        s"""{"child_table":${q(fk.childTable)},"child_columns":${a(fk.childColumns)},""" +
+          s""""parent_table":${q(fk.parentTable)},"parent_columns":${a(fk.parentColumns)},"rely":${b(fk.rely)}}"""
+      }
+      .mkString("[", ",", "]")
+    val uniques = uniqueKeys
+      .map(key => s"""{"table":${q(key.table)},"columns":${a(key.columns)},"rely":${b(key.rely)}}""")
+      .mkString("[", ",", "]")
     s"""{"schema_version":$schemaVersion,"target_dialect":"$targetDialect",""" +
       s""""compile_only":${b(compileOnly)},"force_view_delta_cascade":${b(forceViewDeltaCascade)},""" +
-      s""""assume_insert_only":${b(assumeInsertOnly)}}"""
+      s""""assume_insert_only":${b(assumeInsertOnly)},"fk_relations":$fks,"unique_keys":$uniques}"""
   }
+
+  private def escapeJson(raw: String): String =
+    raw.flatMap {
+      case '"'              => "\\\""
+      case '\\'             => "\\\\"
+      case '\b'             => "\\b"
+      case '\f'             => "\\f"
+      case '\n'             => "\\n"
+      case '\r'             => "\\r"
+      case '\t'             => "\\t"
+      case c if c.isControl => f"\\u${c.toInt}%04x"
+      case c                => c.toString
+    }
 }
 
 /** Wraps DuckDB CLI errors surfaced by the OpenIVM compiler bridge.

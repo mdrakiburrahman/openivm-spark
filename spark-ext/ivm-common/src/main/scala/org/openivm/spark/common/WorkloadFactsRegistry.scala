@@ -1,0 +1,220 @@
+package org.openivm.spark.common
+
+import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.types.StructType
+
+final case class ForeignKeyRelation(
+    childTable: String,
+    childColumns: Seq[String],
+    parentTable: String,
+    parentColumns: Seq[String],
+    rely: Boolean = true
+)
+
+final case class UniqueKey(table: String, columns: Seq[String], rely: Boolean = true)
+
+final case class DeltaConstraint(table: String, name: String, expression: String)
+
+final case class GeneratedColumn(table: String, column: String, expression: String)
+
+final case class WorkloadConstraintFacts(
+    fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
+    uniqueKeys: Seq[UniqueKey] = Seq.empty,
+    deltaConstraints: Seq[DeltaConstraint] = Seq.empty,
+    generatedColumns: Seq[GeneratedColumn] = Seq.empty
+)
+
+final class WorkloadFactsRegistry {
+  import WorkloadFactsRegistry._
+
+  def discover(
+      spark: SparkSession,
+      sourceTables: Seq[String],
+      configuredFkRelations: Seq[ForeignKeyRelation] = Seq.empty,
+      configuredUniqueKeys: Seq[UniqueKey] = Seq.empty
+  ): WorkloadConstraintFacts = {
+    val perTable = sourceTables.distinct.map(table => tableFacts(spark, table))
+    WorkloadConstraintFacts(
+      fkRelations = distinctFk(configuredFkRelations ++ perTable.flatMap(_.fkRelations)),
+      uniqueKeys = distinctUnique(configuredUniqueKeys ++ perTable.flatMap(_.uniqueKeys)),
+      deltaConstraints = perTable.flatMap(_.deltaConstraints).distinct,
+      generatedColumns = perTable.flatMap(_.generatedColumns).distinct
+    )
+  }
+}
+
+object WorkloadFactsRegistry {
+  private val ForeignKeyPrefix       = "spark.openivm.fk."
+  private val ForeignKeyListKey      = "spark.openivm.fk"
+  private val UniqueKeyKey           = "spark.openivm.unique_key"
+  private val UniqueKeyPrefix        = "spark.openivm.unique_key."
+  private val PrimaryKey             = "spark.openivm.pk"
+  private val PrimaryKeyPrefix       = "spark.openivm.pk."
+  private val DeltaConstraintPrefix  = "delta.constraints."
+  private val GenerationMetadataKey  = "delta.generationExpression"
+  private val IdentityStartPrefix    = "delta.identity.start"
+  private val IdentityGeneratedValue = "IDENTITY"
+
+  def forRefresh(): WorkloadFactsRegistry = new WorkloadFactsRegistry
+
+  private[common] def tableFacts(spark: SparkSession, table: String): WorkloadConstraintFacts = {
+    val properties = tableProperties(spark, table)
+    val schema     = tableSchema(spark, table)
+    val generated  = schema.toSeq.flatMap(generatedColumn(table, _))
+    val identityKeys = generated
+      .filter(_.expression == IdentityGeneratedValue)
+      .map(col => UniqueKey(table, Seq(col.column)))
+    WorkloadConstraintFacts(
+      fkRelations = parseForeignKeys(table, properties),
+      uniqueKeys = parseUniqueKeys(table, properties) ++ identityKeys,
+      deltaConstraints = parseDeltaConstraints(table, properties),
+      generatedColumns = generated
+    )
+  }
+
+  private[common] def parseForeignKeys(
+      childTable: String,
+      properties: Map[String, String]
+  ): Seq[ForeignKeyRelation] = {
+    val keyed = properties.toSeq.flatMap { case (rawKey, rawValue) =>
+      val key = rawKey.trim
+      if (key == ForeignKeyListKey) parseForeignKeyList(childTable, rawValue)
+      else if (key.startsWith(ForeignKeyPrefix)) {
+        val childSpec = key.stripPrefix(ForeignKeyPrefix)
+        parseForeignKey(childTable, childSpec, rawValue)
+      } else Seq.empty
+    }
+    distinctFk(keyed)
+  }
+
+  private[common] def parseUniqueKeys(table: String, properties: Map[String, String]): Seq[UniqueKey] =
+    distinctUnique(
+      properties.toSeq.flatMap { case (rawKey, rawValue) =>
+        val key = rawKey.trim
+        if (
+          key == UniqueKeyKey || key == PrimaryKey || key.startsWith(UniqueKeyPrefix) || key
+            .startsWith(PrimaryKeyPrefix)
+        ) {
+          splitColumns(rawValue).filter(_.nonEmpty).map(cols => UniqueKey(table, cols))
+        } else Seq.empty
+      }
+    )
+
+  private def parseForeignKeyList(childTable: String, rawValue: String): Seq[ForeignKeyRelation] =
+    splitTopLevel(rawValue, ';').flatMap { part =>
+      splitRelation(part).toSeq.flatMap { case (childSpec, parentSpec) =>
+        parseForeignKey(childTable, childSpec, parentSpec)
+      }
+    }
+
+  private def parseForeignKey(
+      childTable: String,
+      childSpec: String,
+      parentSpec: String
+  ): Seq[ForeignKeyRelation] = {
+    val (child, parent) = splitRelation(parentSpec).getOrElse(childSpec -> parentSpec)
+    for {
+      childCols <- splitColumns(child)
+      parentRef <- parseParentRef(parent)
+      if childCols.size == parentRef._2.size
+    } yield ForeignKeyRelation(childTable, childCols, parentRef._1, parentRef._2)
+  }.toSeq
+
+  private def splitRelation(raw: String): Option[(String, String)] = {
+    val idx = Seq(raw.indexOf("->"), raw.indexOf("=")).filter(_ >= 0).sorted.headOption
+    idx.map { i =>
+      val sepWidth = if (raw.substring(i).startsWith("->")) 2 else 1
+      raw.substring(0, i).trim -> raw.substring(i + sepWidth).trim
+    }
+  }
+
+  private def parseParentRef(raw: String): Option[(String, Seq[String])] = {
+    val trimmed = raw.trim
+    val paren   = """^(.+)\((.+)\)$""".r
+    trimmed match {
+      case paren(table, cols) =>
+        splitColumns(cols).map(table.trim -> _)
+      case _ =>
+        val lastDot = trimmed.lastIndexOf('.')
+        if (lastDot <= 0 || lastDot == trimmed.length - 1) None
+        else Some(trimmed.substring(0, lastDot).trim -> Seq(unquote(trimmed.substring(lastDot + 1).trim)))
+    }
+  }
+
+  private def splitColumns(raw: String): Option[Seq[String]] = {
+    val cleaned = raw.trim.stripPrefix("(").stripSuffix(")")
+    val cols = splitTopLevel(cleaned, ',')
+      .map(unquote)
+      .filter(_.nonEmpty)
+    if (cols.nonEmpty) Some(cols) else None
+  }
+
+  private def splitTopLevel(raw: String, delimiter: Char): Seq[String] =
+    raw.split(delimiter).toSeq.map(_.trim).filter(_.nonEmpty)
+
+  private def parseDeltaConstraints(table: String, properties: Map[String, String]): Seq[DeltaConstraint] =
+    properties.toSeq
+      .collect {
+        case (key, value) if key.startsWith(DeltaConstraintPrefix) =>
+          DeltaConstraint(table, key.stripPrefix(DeltaConstraintPrefix), value)
+      }
+      .sortBy(_.name)
+
+  private[common] def generatedColumn(
+      table: String,
+      field: org.apache.spark.sql.types.StructField
+  ): Option[GeneratedColumn] = {
+    if (field.metadata.contains(GenerationMetadataKey)) {
+      Some(GeneratedColumn(table, field.name, field.metadata.getString(GenerationMetadataKey)))
+    } else {
+      if (field.metadata.json.contains(IdentityStartPrefix))
+        Some(GeneratedColumn(table, field.name, IdentityGeneratedValue))
+      else None
+    }
+  }
+
+  private def tableProperties(spark: SparkSession, table: String): Map[String, String] =
+    deltaProperties(spark, table) ++ catalogProperties(spark, table)
+
+  private def deltaProperties(spark: SparkSession, table: String): Map[String, String] =
+    try {
+      DeltaLog.forTable(spark, parseTableIdentifier(spark, table)).update().metadata.configuration
+    } catch {
+      case _: Throwable =>
+        try DeltaLog.forTable(spark, new Path(table)).update().metadata.configuration
+        catch { case _: Throwable => Map.empty[String, String] }
+    }
+
+  private def catalogProperties(spark: SparkSession, table: String): Map[String, String] =
+    try spark.sessionState.catalog.getTableMetadata(parseTableIdentifier(spark, table)).properties
+    catch { case _: Throwable => Map.empty[String, String] }
+
+  private def tableSchema(spark: SparkSession, table: String): StructType =
+    try spark.table(table).schema
+    catch { case _: Throwable => StructType(Nil) }
+
+  private def parseTableIdentifier(spark: SparkSession, table: String): TableIdentifier =
+    spark.sessionState.sqlParser.parseTableIdentifier(table)
+
+  private def distinctFk(fks: Seq[ForeignKeyRelation]): Seq[ForeignKeyRelation] =
+    fks
+      .groupBy(fk => (fk.childTable, fk.childColumns, fk.parentTable, fk.parentColumns))
+      .values
+      .map(_.head)
+      .toSeq
+      .sortBy(fk => (fk.childTable, fk.childColumns.mkString(","), fk.parentTable, fk.parentColumns.mkString(",")))
+
+  private def distinctUnique(keys: Seq[UniqueKey]): Seq[UniqueKey] =
+    keys
+      .groupBy(key => (key.table, key.columns))
+      .values
+      .map(_.head)
+      .toSeq
+      .sortBy(key => (key.table, key.columns.mkString(",")))
+
+  private def unquote(raw: String): String =
+    raw.trim.stripPrefix("`").stripSuffix("`").stripPrefix("\"").stripSuffix("\"")
+}

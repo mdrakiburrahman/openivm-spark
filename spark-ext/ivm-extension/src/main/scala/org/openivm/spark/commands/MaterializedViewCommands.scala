@@ -23,7 +23,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
-import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
+import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler, WorkloadFacts}
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
@@ -554,6 +554,11 @@ case class CreateMaterializedViewCommand(
     // incrementality for correctness: the MV stays bag-equal to the live
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
+    val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
+    val workloadFacts = WorkloadFacts(
+      fkRelations = constraintFacts.fkRelations,
+      uniqueKeys = constraintFacts.uniqueKeys
+    )
     val compiler = OpenIvmCompilers.forSession(spark)
     val compiled = profile.timeStep(
       "create_compile_classification",
@@ -565,7 +570,8 @@ case class CreateMaterializedViewCommand(
             viewName = name.table,
             viewSql = originalQueryText,
             sources = compileSchemas,
-            sourceQualifiedNames = shortToQual
+            sourceQualifiedNames = shortToQual,
+            facts = workloadFacts
           )
         )
       catch {
@@ -1474,13 +1480,18 @@ case class RefreshMaterializedViewCommand(
               initialLoadSql = cachedInitialLoadSql
             )
           case None =>
-            val compiler = OpenIvmCompilers.forSession(spark)
+            val compiler        = OpenIvmCompilers.forSession(spark)
+            val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
             val fresh = compiler.compile(
               CompileRequest(
                 viewName = name.table,
                 viewSql = meta.querySql,
                 sources = compileSchemas,
-                sourceQualifiedNames = shortToQual
+                sourceQualifiedNames = shortToQual,
+                facts = WorkloadFacts(
+                  fkRelations = constraintFacts.fkRelations,
+                  uniqueKeys = constraintFacts.uniqueKeys
+                )
               )
             )
             if (fresh.sql.nonEmpty) {
