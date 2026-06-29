@@ -1425,10 +1425,24 @@ case class RefreshMaterializedViewCommand(
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
         )
+      // An incremental MV (e.g. AGGREGATE_GROUP count-monoid) routed here by
+      // `replaceBatch` has hidden bookkeeping columns (e.g. openivm_count_star)
+      // in its data table, created from the openivm initial-load SQL. The raw
+      // user query (`meta.querySql`) omits those columns, so an
+      // `INSERT OVERWRITE ... SELECT *` from it trips
+      // DELTA_INSERT_COLUMN_ARITY_MISMATCH. Use the compiled initial-load SQL
+      // (which reproduces the hidden columns) for any non-FULL_REFRESH MV; a
+      // genuinely FULL_REFRESH MV has no hidden columns and uses its body.
+      val fullRefreshSql = {
+        val initialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).getOrElse("")
+        if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
+          org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
+        else meta.querySql
+      }
       val input = AssemblyInput(
         refreshType = RefreshTypeCode.FullRefresh,
         refreshTypeName = "FULL_REFRESH",
-        deltaSql = meta.querySql,
+        deltaSql = fullRefreshSql,
         mvName = metaName(name),
         mvLocation = meta.location
       )
