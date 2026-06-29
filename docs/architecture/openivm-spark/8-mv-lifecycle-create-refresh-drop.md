@@ -615,7 +615,7 @@ path, never the MV body directly). The fallback only fixes the MV's *own*
 bag — the bag-correct rewriter's `net + replenish` strategy can mis-apply
 mixed-sign rows on the local MV, but Δ(MV) is unaffected. Wiping the
 cascade evidence here was the
-$silver.holdings_{history} \to gold.fact_{holdings}$ correctness bug fixed by
+$silver.holdings_{\text{history}} \to gold.fact_{\text{holdings}}$ correctness bug fixed by
 commit `56d91e9`: downstream MVs saw `deltas=0` even though the source
 had real change.
 

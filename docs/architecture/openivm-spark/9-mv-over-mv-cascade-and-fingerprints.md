@@ -893,5 +893,5 @@ sequenceDiagram
    upstream MV's own bag (the bag-correct rewriter mis-applies mixed-sign
    rows on the local MV body); stmt\[0\]'s view-delta CTAS is still openivm's
    bag-correct Δ(MV) for downstream consumers. Wiping it caused the
-   $silver.holdings_{history} \to gold.fact_{holdings}$ cascade bug (fixed by
+   $silver.holdings_{\text{history}} \to gold.fact_{\text{holdings}}$ cascade bug (fixed by
    commit `56d91e9`); see chapter 8 §2.9.

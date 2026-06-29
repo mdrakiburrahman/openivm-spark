@@ -1,6 +1,6 @@
 # Question D5 — The math under OpenIVM: Z-sets, DBSP, deltas, and Möbius
 
-## TL;DR: OpenIVM is practical SQL engineering built on a small algebraic idea: represent a table as a **Z-set** (a bag whose tuple counts may be negative), represent changes as another Z-set, and compile a view's **delta function** so `REFRESH` applies only the change. DBSP and differential dataflow provide the stream/time model; OpenIVM turns that model into SQL programs, with special cases for joins, aggregates, `DISTINCT`, and `HAVING`.
+> TL;DR: OpenIVM is practical SQL engineering built on a small algebraic idea: represent a table as a **Z-set** (a bag whose tuple counts may be negative), represent changes as another Z-set, and compile a view's **delta function** so `REFRESH` applies only the change. DBSP and differential dataflow provide the stream/time model; OpenIVM turns that model into SQL programs, with special cases for joins, aggregates, `DISTINCT`, and `HAVING`.
 
 ## 1. Why this chapter exists
 
@@ -319,9 +319,9 @@ The checker rejects volatile expressions in filters because a non-deterministic 
 So it is linear by definition:
 
 $$
-(A_1 \oplus B_1) \cup_{all} (A_2 \oplus B_2)
+(A_1 \oplus B_1) \cup_{\text{all}} (A_2 \oplus B_2)
 =
-(A_1 \cup_{all} A_2) \oplus (B_1 \cup_{all} B_2)
+(A_1 \cup_{\text{all}} A_2) \oplus (B_1 \cup_{\text{all}} B_2)
 $$
 
 In practical SQL, this means deltas from both branches can be concatenated.
@@ -362,22 +362,22 @@ But it is not linear in both inputs together because both sides can change at on
 For two inputs:
 
 $$
-(R \oplus \Delta R) \Join (S \oplus \Delta S)
+(R \oplus \Delta R) \bowtie (S \oplus \Delta S)
 $$
 
 Expand it like a binomial:
 
 $$
-(R \Join S)
-\oplus (R \Join \Delta S)
-\oplus (\Delta R \Join S)
-\oplus (\Delta R \Join \Delta S)
+(R \bowtie S)
+\oplus (R \bowtie \Delta S)
+\oplus (\Delta R \bowtie S)
+\oplus (\Delta R \bowtie \Delta S)
 $$
 
 Subtract the old view:
 
 $$
-R \Join S
+R \bowtie S
 $$
 
 The delta is:
@@ -385,11 +385,11 @@ The delta is:
 $$
 V^\Delta((R,S),(\Delta R,\Delta S))
 =
-(R \Join \Delta S)
+(R \bowtie \Delta S)
 \oplus
-(\Delta R \Join S)
+(\Delta R \bowtie S)
 \oplus
-(\Delta R \Join \Delta S)
+(\Delta R \bowtie \Delta S)
 $$
 
 The prompt's single-symbol form is:
@@ -397,11 +397,11 @@ The prompt's single-symbol form is:
 $$
 V^\Delta(D, \Delta D)
 =
-(D \Join \Delta D)
+(D \bowtie \Delta D)
 \oplus
-(\Delta D \Join D)
+(\Delta D \bowtie D)
 \oplus
-(\Delta D \Join \Delta D)
+(\Delta D \bowtie \Delta D)
 $$
 
 That is the textbook old-base version.
@@ -421,7 +421,7 @@ Where `k` is the number of delta-side leaves in the term.
 The implementation comment explains why:
 
 - DML has already been applied to the source.
-- The current scan reads $R_{now} = R_{old} + \Delta R$.
+- The current scan reads $R_{\text{now}} = R_{\text{old}} + \Delta R$.
 - The inclusion-exclusion sign cancels overcounting.
 - This is algebraically equivalent to the textbook DBSP delta-join formula.
   Citation:
@@ -438,18 +438,18 @@ ______________________________________________________________________
 For an n-way join:
 
 $$
-R_1 \Join R_2 \Join \cdots \Join R_n
+R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n
 $$
 
 The new state is:
 
 $$
 (R_1 \oplus \Delta R_1)
-\Join
+\bowtie
 (R_2 \oplus \Delta R_2)
-\Join
+\bowtie
 \cdots
-\Join
+\bowtie
 (R_n \oplus \Delta R_n)
 $$
 
@@ -457,7 +457,7 @@ The product expansion has `2^n` terms.
 One term is the old view:
 
 $$
-R_1 \Join R_2 \Join \cdots \Join R_n
+R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n
 $$
 
 The other `2^n - 1` terms contain at least one delta input.
@@ -473,9 +473,9 @@ and:
 $$
 term(S)
 =
-\left(\Join_{i \in S} \Delta R_i\right)
-\Join
-\left(\Join_{j \notin S} R_j\right)
+\left(\bowtie_{i \in S} \Delta R_i\right)
+\bowtie
+\left(\bowtie_{j \notin S} R_j\right)
 $$
 
 So the delta is:
@@ -495,37 +495,37 @@ For the subset lattice ordered by inclusion, the relevant sign alternates by sub
 For three relations:
 
 $$
-R \Join S \Join T
+R \bowtie S \bowtie T
 $$
 
 OpenIVM's current-base inclusion-exclusion form is:
 
 $$
-+\Delta R \Join S \Join T
++\Delta R \bowtie S \bowtie T
 $$
 
 $$
-+R \Join \Delta S \Join T
++R \bowtie \Delta S \bowtie T
 $$
 
 $$
-+R \Join S \Join \Delta T
++R \bowtie S \bowtie \Delta T
 $$
 
 $$
--\Delta R \Join \Delta S \Join T
+-\Delta R \bowtie \Delta S \bowtie T
 $$
 
 $$
--\Delta R \Join S \Join \Delta T
+-\Delta R \bowtie S \bowtie \Delta T
 $$
 
 $$
--R \Join \Delta S \Join \Delta T
+-R \bowtie \Delta S \bowtie \Delta T
 $$
 
 $$
-+\Delta R \Join \Delta S \Join \Delta T
++\Delta R \bowtie \Delta S \bowtie \Delta T
 $$
 
 The signs are:
@@ -554,56 +554,56 @@ It converts from a product over current relations to a delta relative to the old
 For two relations:
 
 $$
-R_{now} = R_{old} \oplus \Delta R
+R_{\text{now}} = R_{\text{old}} \oplus \Delta R
 $$
 
 $$
-S_{now} = S_{old} \oplus \Delta S
+S_{\text{now}} = S_{\text{old}} \oplus \Delta S
 $$
 
 The current-base formula is:
 
 $$
-\Delta R \Join S_{now}
+\Delta R \bowtie S_{\text{now}}
 \oplus
-R_{now} \Join \Delta S
+R_{\text{now}} \bowtie \Delta S
 \ominus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 $$
 
 Expand it:
 
 $$
-\Delta R \Join (S_{old} \oplus \Delta S)
+\Delta R \bowtie (S_{\text{old}} \oplus \Delta S)
 \oplus
-(R_{old} \oplus \Delta R) \Join \Delta S
+(R_{\text{old}} \oplus \Delta R) \bowtie \Delta S
 \ominus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 $$
 
 Now distribute:
 
 $$
-\Delta R \Join S_{old}
+\Delta R \bowtie S_{\text{old}}
 \oplus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 \oplus
-R_{old} \Join \Delta S
+R_{\text{old}} \bowtie \Delta S
 \oplus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 \ominus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 $$
 
 One duplicate $\Delta R \bowtie \Delta S$ remains, which is exactly the textbook delta term.
 So the current-base formula equals:
 
 $$
-\Delta R \Join S_{old}
+\Delta R \bowtie S_{\text{old}}
 \oplus
-R_{old} \Join \Delta S
+R_{\text{old}} \bowtie \Delta S
 \oplus
-\Delta R \Join \Delta S
+\Delta R \bowtie \Delta S
 $$
 
 ## Same result. Different implementation basis.

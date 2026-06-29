@@ -97,7 +97,7 @@ It must be added exactly once, so the $\Delta R\bowtie \Delta S$ term is positiv
 
 OpenIVM's C++ comments explicitly call out why its compiled rule has signs.
 At refresh time, the source scan sees the current base table, because the DML has already been applied to the source table before the view refresh runs.
-The comment says the scan reads $R_{now} = R_{old} + \Delta R$, and therefore the join delta must use an inclusion-exclusion form (`.temp/openivm/src/rules/join.cpp:873-884`).
+The comment says the scan reads $R_{\text{now}} = R_{\text{old}} + \Delta R$, and therefore the join delta must use an inclusion-exclusion form (`.temp/openivm/src/rules/join.cpp:873-884`).
 
 For two inputs, write the current bases as `R` and `S`.
 Then old bases are $R - \Delta R$ and $S - \Delta S$.

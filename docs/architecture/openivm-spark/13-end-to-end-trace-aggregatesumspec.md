@@ -697,7 +697,7 @@ WITH refresh_cte AS ( select sale_date,  	sum(openivm_multiplicity * total) as t
 
 `assertMvCorrect("aggsum_mv_daily", viewBody)` ran 2 time(s) in this block and passed every bidirectional `EXCEPT ALL` check.
 
-### 13.5.5 $Empty table \to CREATE MV \to INSERT \to refresh — aggsum_empty_{base}$
+### 13.5.5 $Empty table \to CREATE MV \to INSERT \to refresh — aggsum_empty_{\text{base}}$
 
 Source lines: `171-182`.
 
@@ -942,7 +942,7 @@ WITH refresh_cte AS ( select grp,  	sum(openivm_multiplicity * total) as total, 
 
 `assertMvCorrect("aggsum_mv_batch", viewBody)` ran 1 time(s) in this block and passed every bidirectional `EXCEPT ALL` check.
 
-### 13.5.7 $DELETE all rows \to MV should be empty — aggsum_del_{all}$
+### 13.5.7 $DELETE all rows \to MV should be empty — aggsum_del_{\text{all}}$
 
 Source lines: `207-219`.
 

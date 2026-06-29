@@ -642,7 +642,7 @@ Spark maps ordinal 9 to `AuxStateAssembler` for assembled programs.
 
 ## 3.16 Ordinary joins and the missing JOIN_INCREMENTAL type
 
-The requested tree included $INNER/LEFT/FULL JOIN \to JOIN_{INCREMENTAL}$.
+The requested tree included $INNER/LEFT/FULL JOIN \to JOIN_{\text{INCREMENTAL}}$.
 Current OpenIVM does not have that stored type.
 `src/rules/join.cpp` is still central: it produces a signed join delta that the
 root operator consumes.

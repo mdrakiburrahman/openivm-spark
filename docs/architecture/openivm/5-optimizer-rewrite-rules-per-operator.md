@@ -159,7 +159,7 @@ flowchart TD
 
   Input SQL: `SELECT * FROM dl_a JOIN dl_b USING (k)`.
 
-  Output plan: $Term0(\Delta a \bowtie b_{old}) UNION ALL Term1(a_{now} \bowtie \Delta b)$ with snapshot annotations on later leaves.
+  Output plan: $Term0(\Delta a \bowtie b_{\text{old}}) UNION ALL Term1(a_{\text{now}} \bowtie \Delta b)$ with snapshot annotations on later leaves.
 
 ### `filter.cpp`
 
@@ -243,7 +243,7 @@ flowchart TD
 
   Input SQL: `SELECT * FROM r JOIN s ON r.k=s.k`.
 
-  Output refresh subplan: $Project(cols, w_r) over \Delta r\bowtie s_{now} UNION ALL Project(cols, w_s) over r_{now}\bowtie \Delta s UNION ALL Project(cols, -w_r*w_s) over \Delta r\bowtie \Delta s$.
+  Output refresh subplan: $Project(cols, w_r) over \Delta r\bowtie s_{\text{now}} UNION ALL Project(cols, w_s) over r_{\text{now}}\bowtie \Delta s UNION ALL Project(cols, -w_r*w_s) over \Delta r\bowtie \Delta s$.
 
 ### `join_output.cpp`
 
@@ -441,7 +441,7 @@ The requested `top_k.cpp` is named `topk.cpp`. It strips `TOP_N`, `LIMIT`, and `
 
 ## Möbius implementation deep dive: `join.cpp:873-891`
 
-The join rule has to account for OpenIVM's physical timing: source base tables have already been updated when refresh runs, and delta tables record the signed changes. Therefore a base scan reads $R_{now} = R_{old} + \Delta R$, not `R_old`.
+The join rule has to account for OpenIVM's physical timing: source base tables have already been updated when refresh runs, and delta tables record the signed changes. Therefore a base scan reads $R_{\text{now}} = R_{\text{old}} + \Delta R$, not `R_old`.
 
 For two inputs, the desired delta is:
 
@@ -475,15 +475,15 @@ Finally, `join.cpp:917-923` appends the signed product to the projection and pus
 
 ### Three-table example
 
-|  Mask | Term                                         | Sign |
-| ----: | -------------------------------------------- | ---: |
-| `001` | $\Delta A \bowtie B_{now} \bowtie C_{now}$   |  `+` |
-| `010` | $A_{now} \bowtie \Delta B \bowtie C_{now}$   |  `+` |
-| `100` | $A_{now} \bowtie B_{now} \bowtie \Delta C$   |  `+` |
-| `011` | $\Delta A \bowtie \Delta B \bowtie C_{now}$  |  `-` |
-| `101` | $\Delta A \bowtie B_{now} \bowtie \Delta C$  |  `-` |
-| `110` | $A_{now} \bowtie \Delta B \bowtie \Delta C$  |  `-` |
-| `111` | $\Delta A \bowtie \Delta B \bowtie \Delta C$ |  `+` |
+|  Mask | Term                                                     | Sign |
+| ----: | -------------------------------------------------------- | ---: |
+| `001` | $\Delta A \bowtie B_{\text{now}} \bowtie C_{\text{now}}$ |  `+` |
+| `010` | $A_{\text{now}} \bowtie \Delta B \bowtie C_{\text{now}}$ |  `+` |
+| `100` | $A_{\text{now}} \bowtie B_{\text{now}} \bowtie \Delta C$ |  `+` |
+| `011` | $\Delta A \bowtie \Delta B \bowtie C_{\text{now}}$       |  `-` |
+| `101` | $\Delta A \bowtie B_{\text{now}} \bowtie \Delta C$       |  `-` |
+| `110` | $A_{\text{now}} \bowtie \Delta B \bowtie \Delta C$       |  `-` |
+| `111` | $\Delta A \bowtie \Delta B \bowtie \Delta C$             |  `+` |
 
 The emitted SQL shape, after logical-plan-to-SQL, is a `UNION ALL` of those seven SELECT arms, each ending in `openivm_multiplicity` computed from the sign and the selected delta weights. This is exactly the chapter 1 Möbius inversion applied to the chapter 7 refresh SQL pipeline.
 

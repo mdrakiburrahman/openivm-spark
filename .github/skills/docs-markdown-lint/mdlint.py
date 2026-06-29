@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Fix GitHub-incompatible math and format docs/architecture markdown.
 
-Two stages, idempotent:
+Three stages, idempotent:
   1. math fix  - backtick-wrapped LaTeX / math-Unicode renders as code on GitHub,
                  not math; rewrite those spans to inline $...$ and Unicode->LaTeX.
-  2. format    - mdformat-gfm, with $$...$$ and $...$ protected so the formatter
+  2. math norm - inside $...$ / $$...$$, map MathJax-unsupported commands to
+                 supported ones (\\Join -> \\bowtie) and wrap multi-letter
+                 subscripts in \\text{} so they stay upright (now/old/all).
+  3. format    - mdformat-gfm, with $$...$$ and $...$ protected so the formatter
                  never mangles them. Fenced code (mermaid, sql, ascii) is preserved.
 
 Usage:
@@ -27,6 +30,42 @@ FENCE = re.compile(r"^(```|~~~)")
 BACKTICK_SPAN = re.compile(r"`([^`\n]+)`")
 MULTICHAR_SUB = re.compile(r"_([A-Za-z][A-Za-z0-9]+)\b")
 LATEX_CMD = re.compile(r"\\[A-Za-z]+")
+
+# MathJax (GitHub) lacks some amssymb/latexsym commands; map to supported ones.
+UNSUPPORTED_CMD = {r"\Join": r"\bowtie"}
+# Multi-letter subscripts render as italic variable products (n*o*w); force upright.
+WORD_SUB = re.compile(r"_\{([A-Za-z]{2,})\}")
+MATH_SPAN = re.compile(r"\$\$.*?\$\$|(?<!\$)\$(?!\$)[^$\n]+\$(?!\$)", re.S)
+
+
+def _norm_one(m):
+    body = m.group(0)
+    for bad, good in UNSUPPORTED_CMD.items():
+        body = body.replace(bad, good)
+    return WORD_SUB.sub(r"_{\\text{\1}}", body)
+
+
+def normalize_math(text: str) -> str:
+    chunk, in_fence = [], False
+    out = []
+
+    def flush():
+        if chunk:
+            out.append(MATH_SPAN.sub(_norm_one, "".join(chunk)))
+            chunk.clear()
+
+    for line in text.splitlines(keepends=True):
+        if FENCE.match(line.strip()):
+            flush()
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+        else:
+            chunk.append(line)
+    flush()
+    return "".join(out)
 
 
 def _is_math(span: str) -> bool:
@@ -91,7 +130,7 @@ def format_md(text: str) -> str:
 
 
 def process(text: str) -> str:
-    return format_md(fix_math(text))
+    return format_md(normalize_math(fix_math(text)))
 
 
 def main() -> int:
