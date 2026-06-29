@@ -2341,7 +2341,18 @@ case class RefreshMaterializedViewCommand(
                   Set(viewNameStr)
                 } else triggerKeys
               val stagingPathForCascade =
-                fusedScratchView.map(StagingDeltaView.CachedViewDeltaRef.encode).getOrElse(viewDeltaPath)
+                fusedScratchView match {
+                  case Some(view) if triggerKeys.nonEmpty =>
+                    spark
+                      .table(s"global_temp.$view")
+                      .write
+                      .format("delta")
+                      .mode("overwrite")
+                      .save(viewDeltaPath)
+                    viewDeltaPath
+                  case Some(view) => StagingDeltaView.CachedViewDeltaRef.encode(view)
+                  case None       => viewDeltaPath
+                }
               val txnTs = new Timestamp(System.currentTimeMillis())
               keysToRecord.foreach { triggerKey =>
                 StagingCatalog.record(
