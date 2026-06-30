@@ -115,5 +115,27 @@ class WorkloadFactsRegistrySpec extends AnyFunSpec with BeforeAndAfterAll with M
       facts.fkRelations shouldBe Seq(configuredFk)
       facts.uniqueKeys shouldBe Seq(configuredUk)
     }
+
+    it("discovers FK declarations from Spark conf and serializes them for compile facts") {
+      val key = "spark.openivm.fk.fact_trade"
+      spark.conf.set(key, "sk_account_id->dim_account(sk_account_id);sk_security_id=dim_security.sk_security_id")
+      try {
+        val facts = WorkloadFactsRegistry
+          .forRefresh()
+          .discover(spark, Seq("default.fact_trade", "default.dim_account", "default.dim_security"))
+
+        facts.fkRelations should contain(
+          ForeignKeyRelation("fact_trade", Seq("sk_account_id"), "dim_account", Seq("sk_account_id"))
+        )
+        facts.fkRelations should contain(
+          ForeignKeyRelation("fact_trade", Seq("sk_security_id"), "dim_security", Seq("sk_security_id"))
+        )
+        WorkloadFacts(fkRelations = facts.fkRelations).toJson should include(
+          """"fk_relations":[{"child_table":"fact_trade","child_columns":["sk_account_id"],"parent_table":"dim_account","parent_columns":["sk_account_id"],"rely":true},{"child_table":"fact_trade","child_columns":["sk_security_id"],"parent_table":"dim_security","parent_columns":["sk_security_id"],"rely":true}]"""
+        )
+      } finally {
+        spark.conf.unset(key)
+      }
+    }
   }
 }

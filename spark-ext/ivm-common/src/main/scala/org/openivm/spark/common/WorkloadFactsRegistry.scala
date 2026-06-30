@@ -38,7 +38,8 @@ final class WorkloadFactsRegistry {
   ): WorkloadConstraintFacts = {
     val perTable = sourceTables.distinct.map(table => tableFacts(spark, table))
     WorkloadConstraintFacts(
-      fkRelations = distinctFk(configuredFkRelations ++ perTable.flatMap(_.fkRelations)),
+      fkRelations =
+        distinctFk(configuredFkRelations ++ sessionForeignKeys(spark, sourceTables) ++ perTable.flatMap(_.fkRelations)),
       uniqueKeys = distinctUnique(configuredUniqueKeys ++ perTable.flatMap(_.uniqueKeys)),
       deltaConstraints = perTable.flatMap(_.deltaConstraints).distinct,
       generatedColumns = perTable.flatMap(_.generatedColumns).distinct
@@ -196,8 +197,27 @@ object WorkloadFactsRegistry {
     try spark.table(table).schema
     catch { case _: Throwable => StructType(Nil) }
 
+  private[common] def sessionForeignKeys(
+      spark: SparkSession,
+      sourceTables: Seq[String]
+  ): Seq[ForeignKeyRelation] = {
+    val sourceAliases = sourceTables.flatMap(table => Seq(table, shortName(table))).toSet
+    val fromConf = spark.conf.getAll.toSeq.flatMap { case (rawKey, rawValue) =>
+      val key = rawKey.trim
+      if (key.startsWith(ForeignKeyPrefix)) {
+        val childTable = key.stripPrefix(ForeignKeyPrefix)
+        if (sourceAliases.contains(childTable)) {
+          parseForeignKeyList(childTable, rawValue).filter(fk => sourceAliases.contains(fk.parentTable))
+        } else Seq.empty
+      } else Seq.empty
+    }
+    distinctFk(fromConf)
+  }
+
   private def parseTableIdentifier(spark: SparkSession, table: String): TableIdentifier =
     spark.sessionState.sqlParser.parseTableIdentifier(table)
+
+  private def shortName(table: String): String = table.split('.').lastOption.getOrElse(table)
 
   private def distinctFk(fks: Seq[ForeignKeyRelation]): Seq[ForeignKeyRelation] =
     fks
