@@ -5,8 +5,15 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, NamedExpression, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{
+  Alias,
+  AttributeReference,
+  Expression,
+  NamedExpression,
+  SubqueryExpression
+}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.WindowExpression
 import org.apache.spark.sql.catalyst.plans.logical.{
   Aggregate,
   Filter,
@@ -220,6 +227,36 @@ private[commands] object MvCommandHelper {
     val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
     val segment   = id.database.fold(id.table)(db => s"$db/${id.table}")
     s"$warehouse/_ivm/views/$segment"
+  }
+
+  /** Resolved simple-column window partition key for physically partitioning
+    * WINDOW_PARTITION MV data tables. Skips safely when any window PARTITION BY
+    * expression is not a plain output column, when windows use different keys,
+    * or when the key is not projected by the MV data table.
+    */
+  def resolvedWindowPartitionColumns(plan: LogicalPlan): Option[Seq[String]] = {
+    val windowPartSpecs = plan.collect { case node =>
+      node.expressions.flatMap(_.collect { case w: WindowExpression => w.windowSpec.partitionSpec })
+    }.flatten
+    if (windowPartSpecs.isEmpty) return None
+
+    val parsedSpecs = windowPartSpecs.map { spec =>
+      spec.map {
+        case a: AttributeReference => Some(a.name)
+        case _                     => None
+      }
+    }
+    if (parsedSpecs.exists(parts => parts.isEmpty || parts.exists(_.isEmpty))) return None
+
+    val keys     = parsedSpecs.map(_.flatten)
+    val firstKey = keys.head
+    val sameKey = keys.forall { key =>
+      key.map(_.toLowerCase(java.util.Locale.ROOT)) == firstKey.map(_.toLowerCase(java.util.Locale.ROOT))
+    }
+    if (!sameKey) return None
+
+    val outputCols = plan.output.map(_.name.toLowerCase(java.util.Locale.ROOT)).toSet
+    if (firstKey.forall(c => outputCols.contains(c.toLowerCase(java.util.Locale.ROOT)))) Some(firstKey) else None
   }
 
   /**
@@ -971,13 +1008,23 @@ case class CreateMaterializedViewCommand(
       else
         org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
+    val windowPartitionCols =
+      if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowPartitionPruneEnabled(spark))
+        resolvedWindowPartitionColumns(analyzed)
+      else None
+    val partitionClause =
+      windowPartitionCols
+        .filter(_.nonEmpty)
+        .map(cols => s"PARTITIONED BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
+        .getOrElse("")
+
     val escaped  = location.replace("'", "\\'")
     val tblProps = FeatureGate.buildMvDataTblProperties(spark)
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val initSql =
       s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
-        s"${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
+        s"$partitionClause${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
     // Wipe stray files from a previous aborted CREATE so Delta's
     // "non-empty location, not a Delta table" check does not fail dbt
     // retries after an OOM-aborted initial load (see exp-000 SF=100
