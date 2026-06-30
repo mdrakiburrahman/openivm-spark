@@ -348,6 +348,12 @@ object SparkRefreshRewriter {
             rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowTempCreate =>
+            Seq(rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowFastInsert =>
+            Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowTempDrop =>
+            Seq(rewriteRunningWindowTempDrop(stmt, viewLogicalName))
           case StatementKind.GroupRecomputeAffectedCreate =>
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
@@ -509,18 +515,23 @@ object SparkRefreshRewriter {
       * shape: substitute `openivm_data_<view>` → MV name, rewrite
       * `memory.main.<x>` → `` `<x>` ``, and strip the inner timestamp filter
       * (the Spark staging delta temp view already restricts visible rows). */
-    case object PartitionScopedInsert extends StatementKind
-    case object Cleanup               extends StatementKind
-    case object Unknown               extends StatementKind
+    case object PartitionScopedInsert   extends StatementKind
+    case object RunningWindowTempCreate extends StatementKind
+    case object RunningWindowFastInsert extends StatementKind
+    case object RunningWindowTempDrop   extends StatementKind
+    case object Cleanup                 extends StatementKind
+    case object Unknown                 extends StatementKind
   }
 
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
-    val upper            = stmt.toUpperCase.trim
-    val affectedKeysName = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
-    val currentName      = s"OPENIVM_CURRENT_${viewLogicalName.toUpperCase}"
-    val oldSnapshotName  = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
-    val newSnapshotName  = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
-    val compactName      = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
+    val upper             = stmt.toUpperCase.trim
+    val affectedKeysName  = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val currentName       = s"OPENIVM_CURRENT_${viewLogicalName.toUpperCase}"
+    val oldSnapshotName   = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
+    val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
+    val runTempPrefix     = "OPENIVM_RUN_"
+    val runTempViewSuffix = s"_${viewLogicalName.toUpperCase}"
+    val compactName       = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
     //   2. DELETE FROM openivm_delta_<view> WHERE ...
@@ -534,6 +545,10 @@ object SparkRefreshRewriter {
     }
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
+    } else if (
+      upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $runTempPrefix") && upper.contains(s"$runTempViewSuffix AS")
+    ) {
+      StatementKind.RunningWindowTempCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
@@ -543,6 +558,8 @@ object SparkRefreshRewriter {
       StatementKind.OldSnapshotCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $newSnapshotName")) {
       StatementKind.NewSnapshotCreate
+    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $runTempPrefix") && upper.contains(runTempViewSuffix)) {
+      StatementKind.RunningWindowTempDrop
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
@@ -572,6 +589,17 @@ object SparkRefreshRewriter {
       else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
+    } else if (
+      upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      containsInSubquery(upper)
+    ) {
+      // WINDOW_PARTITION (type 5) DELETE: `DELETE FROM openivm_data_<v> WHERE <part>
+      // IN (SELECT DISTINCT <part> FROM openivm_delta_<src> WHERE …)`.  Delta does
+      // not support `IN (subquery)` in DELETE; rewriter emits one MERGE per IN clause.
+      // The `IN (SELECT` marker distinguishes this from the MIN/MAX bare DELETE
+      // (handled by ScalarDeleteMv) and from GROUP_RECOMPUTE / AGGREGATE_GROUP+minmax
+      // DELETEs (both use `WHERE EXISTS`, not `WHERE IN`).
+      StatementKind.PartitionScopedDelete
     } else if (upper.contains(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ScalarDeleteMv
     } else if (
@@ -579,6 +607,11 @@ object SparkRefreshRewriter {
       upper.contains(s"FROM $newSnapshotName")
     ) {
       StatementKind.SnapshotDataInsert
+    } else if (
+      upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains(" OPENIVM_RUN_FAST_")
+    ) {
+      StatementKind.RunningWindowFastInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
       upper.contains("OPENIVM_RECOMPUTE") &&
@@ -604,17 +637,6 @@ object SparkRefreshRewriter {
       StatementKind.SimpleProjectionDataInsert
     } else if (upper.contains(s"UPDATE OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ScalarUpdate
-    } else if (
-      upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-      containsInSubquery(upper)
-    ) {
-      // WINDOW_PARTITION (type 5) DELETE: `DELETE FROM openivm_data_<v> WHERE <part>
-      // IN (SELECT DISTINCT <part> FROM openivm_delta_<src> WHERE …)`.  Delta does
-      // not support `IN (subquery)` in DELETE; rewriter emits one MERGE per IN clause.
-      // The `IN (SELECT` marker distinguishes this from the MIN/MAX bare DELETE
-      // (handled by ScalarDeleteMv) and from GROUP_RECOMPUTE / AGGREGATE_GROUP+minmax
-      // DELETEs (both use `WHERE EXISTS`, not `WHERE IN`).
-      StatementKind.PartitionScopedDelete
     } else if (upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.ScalarDeleteMv
     } else if (upper.startsWith("DELETE FROM") || upper.startsWith("UPDATE ")) {
@@ -2465,6 +2487,46 @@ object SparkRefreshRewriter {
   private def rewriteCreateOrReplaceTempTableAsView(stmt: String): String =
     """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
       .replaceFirstIn(stmt, "CREATE OR REPLACE TEMPORARY VIEW")
+
+  private def rewriteRunningWindowTempCreate(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String = {
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = rewriteRunningWindowSqlRefs(s, viewLogicalName, mvName)
+    s
+  }
+
+  private def rewriteRunningWindowFastInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String =
+    rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
+
+  private def rewriteRunningWindowSqlRefs(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String = {
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  private def rewriteRunningWindowTempDrop(stmt: String, viewLogicalName: String): String = {
+    val re = ("(?i)^\\s*DROP\\s+TABLE\\s+IF\\s+EXISTS\\s+(`?openivm_run_[A-Za-z0-9_]+_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?)\\s*;?\\s*$").r
+    stmt match {
+      case re(name) => s"DROP VIEW IF EXISTS `${name.stripPrefix("`").stripSuffix("`")}`"
+      case _        => stmt.replaceFirst("(?i)DROP\\s+TABLE", "DROP VIEW")
+    }
+  }
 
   /** Rewrites the pragma-gated `openivm_old_<view>` snapshot create into a
     * TEMPORARY VIEW over the MV's pre-refresh Delta version.

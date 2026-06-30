@@ -110,4 +110,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe true
     }
   }
+
+  describe("FeatureGate.windowRunningIncrementalEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowRunningIncrementalEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowRunningIncrementalEnabled(
+        new SparkConf(false).set(FeatureGate.WindowRunningIncrementalEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }

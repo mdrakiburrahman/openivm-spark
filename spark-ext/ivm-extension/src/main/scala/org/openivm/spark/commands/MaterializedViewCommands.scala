@@ -1644,7 +1644,13 @@ case class RefreshMaterializedViewCommand(
             val compileFacts = statsFacts.copy(
               deltaShape = sourceDeltaShape,
               fkRelations = constraintFacts.fkRelations,
-              uniqueKeys = constraintFacts.uniqueKeys
+              uniqueKeys = constraintFacts.uniqueKeys,
+              runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+              assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
+                meta.refreshType == RefreshTypeCode.WindowPartition &&
+                sourceDeltaShape.nonEmpty &&
+                sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
+                sourceDeltaShape.values.forall(_ != DeltaShape.General)
             )
             val fresh = compiler.compile(
               CompileRequest(

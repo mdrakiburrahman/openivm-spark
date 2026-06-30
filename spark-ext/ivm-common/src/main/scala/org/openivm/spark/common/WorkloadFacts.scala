@@ -33,6 +33,7 @@ final case class WorkloadFacts(
     compileOnly: Boolean = true,
     forceViewDeltaCascade: Boolean = true,
     assumeInsertOnly: Boolean = false,
+    runningWindowIncremental: Boolean = false,
     deltaShape: Map[String, DeltaShape] = Map.empty,
     fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
     uniqueKeys: Seq[UniqueKey] = Seq.empty,
@@ -62,7 +63,8 @@ final case class WorkloadFacts(
 
     s"""{"schema_version":$schemaVersion,"target_dialect":${q(targetDialect)},""" +
       s""""compile_only":${bool(compileOnly)},"force_view_delta_cascade":${bool(forceViewDeltaCascade)},""" +
-      s""""assume_insert_only":${bool(assumeInsertOnly)},"delta_shape":$shapes,""" +
+      s""""assume_insert_only":${bool(assumeInsertOnly)},""" +
+      s""""running_window_incremental":${bool(runningWindowIncremental)},"delta_shape":$shapes,""" +
       s""""fk_relations":$fks,"unique_keys":$uniques,""" +
       s""""table_stats":${tableStatsJson(tableStats)},"column_stats":${columnStatsJson(columnStats)},""" +
       s""""delta_stats":${deltaStatsJson(deltaStats)}}"""

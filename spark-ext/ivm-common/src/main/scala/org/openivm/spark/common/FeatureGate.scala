@@ -242,6 +242,15 @@ object FeatureGate {
     */
   val WindowClusterPruneEnabledKey: String = "spark.openivm.refresh.windowClusterPrune.enabled"
 
+  /** Emit the running-window suffix-extend refresh (P5.2) for cumulative
+    * `SUM/MIN/MAX/COUNT/AVG OVER (PARTITION BY k ORDER BY d)` WINDOW MVs on a
+    * proven insert-only batch: affected partitions whose new rows sort strictly
+    * after the existing partition max are extended from the persisted running
+    * value instead of recomputed from base; backdated partitions fall back to
+    * the full window recompute. Default OFF (opt-in, append-only-shape only).
+    */
+  val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -365,6 +374,12 @@ object FeatureGate {
 
   def windowClusterPruneEnabled(spark: SparkSession): Boolean =
     windowClusterPruneEnabled(spark.sparkContext.getConf)
+
+  def windowRunningIncrementalEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowRunningIncrementalEnabledKey, default = false)
+
+  def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
+    windowRunningIncrementalEnabled(spark.sparkContext.getConf)
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)

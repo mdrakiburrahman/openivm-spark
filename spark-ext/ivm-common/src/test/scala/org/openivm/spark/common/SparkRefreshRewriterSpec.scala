@@ -1130,6 +1130,139 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("P5.2 running-window suffix-extend rewrite") {
+    val p52ViewLogicalName = "wradm_mv"
+    val p52MvName          = TableIdentifier("wradm_mv", Some("default"))
+    val p52Input: String =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'wradm_mv';
+        |CREATE OR REPLACE TEMP TABLE openivm_run_affected_wradm_mv AS
+        |SELECT DISTINCT d.dm_s_symb
+        |FROM openivm_delta_wradm_daily_market d
+        |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+        |CREATE OR REPLACE TEMP TABLE openivm_run_bounds_wradm_mv AS
+        |WITH old_max AS (
+        |  SELECT dm_s_symb, MAX(dm_date) AS openivm_old_max_order
+        |  FROM openivm_data_wradm_mv
+        |  GROUP BY dm_s_symb
+        |), delta_min AS (
+        |  SELECT d.dm_s_symb, MIN(d.dm_date) AS openivm_delta_min_order
+        |  FROM openivm_delta_wradm_daily_market d
+        |  WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP)
+        |  GROUP BY d.dm_s_symb
+        |)
+        |SELECT a.dm_s_symb, m.openivm_old_max_order, b.openivm_delta_min_order
+        |FROM openivm_run_affected_wradm_mv a
+        |LEFT JOIN old_max m ON a.dm_s_symb IS NOT DISTINCT FROM m.dm_s_symb
+        |JOIN delta_min b ON a.dm_s_symb IS NOT DISTINCT FROM b.dm_s_symb;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_fast_wradm_mv AS
+        |SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv
+        |WHERE openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_fallback_wradm_mv AS
+        |SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv
+        |WHERE openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_state_wradm_mv AS
+        |SELECT dm_s_symb, dm_date, run_sum, openivm_prior_count FROM (
+        |  SELECT dt.dm_s_symb, dt.dm_date, dt.run_sum,
+        |         COUNT(*) OVER (PARTITION BY dt.dm_s_symb) AS openivm_prior_count,
+        |         ROW_NUMBER() OVER (PARTITION BY dt.dm_s_symb ORDER BY dt.dm_date DESC) AS openivm_rn
+        |  FROM openivm_data_wradm_mv dt
+        |  JOIN openivm_run_fast_wradm_mv fk ON dt.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+        |) openivm_state_ranked WHERE openivm_rn = 1;
+        |DELETE FROM openivm_data_wradm_mv WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+        |INSERT INTO openivm_data_wradm_mv
+        |SELECT * FROM (
+        |  SELECT dm_s_symb, dm_date, dm_close,
+        |         SUM(dm_close) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS run_sum
+        |  FROM memory.main.wradm_daily_market
+        |) openivm_recompute
+        |WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+        |INSERT INTO openivm_data_wradm_mv (dm_s_symb, dm_date, dm_close, run_sum)
+        |SELECT d.dm_s_symb, d.dm_date, d.dm_close,
+        |       CASE WHEN s.run_sum IS NULL THEN SUM(d.dm_close) OVER (PARTITION BY d.dm_s_symb ORDER BY d.dm_date)
+        |            ELSE s.run_sum + SUM(d.dm_close) OVER (PARTITION BY d.dm_s_symb ORDER BY d.dm_date)
+        |       END AS run_sum
+        |FROM openivm_delta_wradm_daily_market d
+        |JOIN openivm_run_fast_wradm_mv fk ON d.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+        |LEFT JOIN openivm_run_state_wradm_mv s ON d.dm_s_symb IS NOT DISTINCT FROM s.dm_s_symb
+        |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+        |DROP TABLE IF EXISTS openivm_run_state_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_fallback_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_fast_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_bounds_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_affected_wradm_mv;
+        |DELETE FROM openivm_delta_wradm_mv;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'wradm_mv';
+        |""".stripMargin
+
+    def rewriteP52(): Seq[String] =
+      SparkRefreshRewriter
+        .rewrite(
+          compiledSql = p52Input,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid"
+        )
+        .statements
+
+    it("keeps all running-window helper CREATEs as temporary views with Spark identifiers") {
+      val rewritten = rewriteP52()
+      val creates   = rewritten.take(5)
+      creates should have size 5
+      creates.foreach { stmt =>
+        stmt should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_")
+        stmt should not include "TEMP TABLE"
+        stmt should not include "openivm_timestamp"
+        stmt should not include "openivm_data_wradm_mv"
+        stmt should include("openivm_run_")
+      }
+      creates(1) should include("`default`.`wradm_mv`")
+      creates(4) should include("`default`.`wradm_mv`")
+    }
+
+    it("rewrites fallback delete and recompute insert while preserving the run_fallback subquery") {
+      val rewritten = rewriteP52()
+      val deleteMerge = rewritten
+        .find(s => s.contains("WHEN MATCHED THEN DELETE") && s.contains("openivm_run_fallback_wradm_mv"))
+        .getOrElse(fail("partition-scoped delete MERGE missing"))
+      deleteMerge should startWith("MERGE INTO `default`.`wradm_mv` AS v")
+      deleteMerge should include("SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv")
+      deleteMerge should include("AS d ON")
+      deleteMerge should include("v.dm_s_symb IS NOT DISTINCT FROM d.dm_s_symb")
+
+      val fallbackInsert = rewritten
+        .find(s => s.contains("openivm_recompute") && s.contains("openivm_run_fallback_wradm_mv"))
+        .getOrElse(fail("fallback recompute insert missing"))
+      fallbackInsert should include("`wradm_daily_market`")
+      fallbackInsert should include("openivm_run_fallback_wradm_mv")
+      fallbackInsert should not include "memory.main."
+      fallbackInsert should not include "openivm_timestamp"
+    }
+
+    it("rewrites the suffix fast INSERT before the generic data-insert classifier can grab it") {
+      val fastInsert = rewriteP52()
+        .find(s => s.startsWith("INSERT INTO `default`.`wradm_mv` (dm_s_symb, dm_date, dm_close, run_sum)"))
+        .getOrElse(fail("running-window fast insert missing"))
+      fastInsert should include("FROM openivm_delta_wradm_daily_market d")
+      fastInsert should include("JOIN openivm_run_fast_wradm_mv fk")
+      fastInsert should include("LEFT JOIN openivm_run_state_wradm_mv s")
+      fastInsert should include("d.openivm_multiplicity > 0")
+      fastInsert should not include "openivm_data_wradm_mv"
+      fastInsert should not include "openivm_timestamp"
+    }
+
+    it("drops running-window helper objects as views") {
+      rewriteP52().takeRight(5) shouldBe Seq(
+        "DROP VIEW IF EXISTS `openivm_run_state_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_fallback_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_fast_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_bounds_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_affected_wradm_mv`"
+      )
+    }
+  }
+
   // ── 11. hasRealDelta detection ───────────────────────────────────────────
   describe("hasRealDelta") {
     it("returns true for a real CTE-prefixed delta (single-source AGGREGATE_GROUP)") {
