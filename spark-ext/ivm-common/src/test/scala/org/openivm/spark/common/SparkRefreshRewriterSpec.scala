@@ -204,6 +204,104 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FK term pruning") {
+    val fkJoinDeltaInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH full_source (sale_id, product_id, amount) AS (
+        |  SELECT sale_id, product_id, amount
+        |  FROM memory.main.fact_sales
+        |),
+        |join_delta AS (
+        |  SELECT f.sale_id, p.name, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+        |  UNION ALL
+        |  SELECT fs.sale_id, p.name, fs.amount, p.openivm_multiplicity
+        |  FROM full_source fs
+        |  JOIN memory.main.openivm_delta_dim_product p ON fs.product_id = p.product_id
+        |  UNION ALL
+        |  SELECT f.sale_id, p.name, f.amount, -1 * f.openivm_multiplicity * p.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (sale_id, name, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("drops FK-redundant higher-order terms while leaving semiJoinPrune visible") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = fkJoinDeltaInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        deltaShape = Map(
+          "default.fact_sales"  -> DeltaShape.InsertOnly,
+          "default.dim_product" -> DeltaShape.InsertOnly
+        ),
+        semiJoinPruneEnabled = true,
+        fkTermPruneEnabled = true,
+        fkRelations =
+          Seq(ForeignKeyRelation("default.fact_sales", Seq("product_id"), "default.dim_product", Seq("product_id")))
+      )
+
+      val stmt = rewritten.statements.head
+      stmt.split("(?i)UNION\\s+ALL").length shouldBe 2
+      stmt should include("`openivm_delta_fact_sales`")
+      stmt should include("`openivm_delta_dim_product`")
+      stmt should not include "-1 * f.openivm_multiplicity * p.openivm_multiplicity"
+      stmt should include(
+        "__openivm_full_source_pre.product_id IN (SELECT product_id FROM `openivm_delta_dim_product`)"
+      )
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves terms unchanged without FK facts or when the sub-flag is off") {
+      val noFacts = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = fkJoinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.InsertOnly
+          ),
+          semiJoinPruneEnabled = true,
+          fkTermPruneEnabled = true
+        )
+        .statements
+        .head
+
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = fkJoinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.InsertOnly
+          ),
+          semiJoinPruneEnabled = true,
+          fkTermPruneEnabled = false,
+          fkRelations =
+            Seq(ForeignKeyRelation("default.fact_sales", Seq("product_id"), "default.dim_product", Seq("product_id")))
+        )
+        .statements
+        .head
+
+      noFacts should include("-1 * f.openivm_multiplicity * p.openivm_multiplicity")
+      disabled should include("-1 * f.openivm_multiplicity * p.openivm_multiplicity")
+    }
+  }
+
   describe("semi-join full_source pre-prune") {
     val joinDeltaInput =
       """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';

@@ -1837,6 +1837,13 @@ case class RefreshMaterializedViewCommand(
           withSelectiveBroadcast
       }
 
+      val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)
+      val fkTermPruneEnabled        = FeatureGate.fkTermPruneEnabled(spark)
+      val rewriteConstraintFacts =
+        if (uniqueJoinSimplifyEnabled || fkTermPruneEnabled)
+          WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+        else WorkloadConstraintFacts()
+
       val rewritten = profile.timeStep(
         "generate_refresh_sql.assembly",
         s"compiled_sql_bytes=${compiled.sql.length}"
@@ -1858,11 +1865,10 @@ case class RefreshMaterializedViewCommand(
             },
             deltaShape = sourceDeltaShape,
             semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
-            uniqueKeys =
-              if (FeatureGate.uniqueJoinSimplifyEnabled(spark))
-                WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables).uniqueKeys
-              else Seq.empty,
-            uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark),
+            fkTermPruneEnabled = fkTermPruneEnabled,
+            fkRelations = rewriteConstraintFacts.fkRelations,
+            uniqueKeys = rewriteConstraintFacts.uniqueKeys,
+            uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.

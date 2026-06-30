@@ -178,11 +178,19 @@ object FeatureGate {
     * and only later join it to a tiny changed-source delta. When this gate is
     * enabled, the Spark rewriter wraps that `full_source` CTE with a
     * result-invariant `WHERE <fk> IN (SELECT <key> FROM Δsrc)` prefilter derived
-    * from the existing join predicate. Default OFF while the shape coverage is
-    * expanded; flip ON via
-    * `spark.openivm.refresh.semiJoinPrune.enabled=true`.
+    * from the existing join predicate. Default ON; flip OFF via
+    * `spark.openivm.refresh.semiJoinPrune.enabled=false`.
     */
   val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
+
+  /** Drop FK-redundant inclusion-exclusion JOIN_DELTA terms in the Spark
+    * rewriter, after Delta batch-shape classification has proven the referenced
+    * tables are insert-only/unchanged. This composes with
+    * [[SemiJoinPruneEnabledKey]] because it operates on the same openivm-emitted
+    * SQL shape instead of changing the compiler output. Default OFF until the
+    * SF10 benchmark validates the combined win.
+    */
+  val FkTermPruneEnabledKey: String = "spark.openivm.refresh.fkTermPrune.enabled"
 
   /** Simplify refresh joins whose right-side join key is known unique from
     * [[WorkloadFacts.uniqueKeys]]. INNER joins with unused right columns are
@@ -304,6 +312,12 @@ object FeatureGate {
 
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
+
+  def fkTermPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, FkTermPruneEnabledKey, default = false)
+
+  def fkTermPruneEnabled(spark: SparkSession): Boolean =
+    fkTermPruneEnabled(spark.sparkContext.getConf)
 
   def uniqueJoinSimplifyEnabled(conf: SparkConf): Boolean =
     boolConf(conf, UniqueJoinSimplifyEnabledKey, default = false)

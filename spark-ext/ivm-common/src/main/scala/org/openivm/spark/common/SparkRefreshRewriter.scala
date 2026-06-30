@@ -292,6 +292,8 @@ object SparkRefreshRewriter {
       sourceQualifiedNames: Map[String, String] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
+      fkTermPruneEnabled: Boolean = false,
+      fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None
@@ -317,6 +319,8 @@ object SparkRefreshRewriter {
                 viewDeltaPath,
                 deltaShape,
                 semiJoinPruneEnabled,
+                fkTermPruneEnabled,
+                fkRelations,
                 uniqueKeys,
                 uniqueJoinSimplifyEnabled
               )
@@ -628,11 +632,14 @@ object SparkRefreshRewriter {
       viewDeltaPath: String,
       deltaShape: Map[String, DeltaShape],
       semiJoinPruneEnabled: Boolean,
+      fkTermPruneEnabled: Boolean,
+      fkRelations: Seq[ForeignKeyRelation],
       uniqueKeys: Seq[UniqueKey],
       uniqueJoinSimplifyEnabled: Boolean
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
+    s = pruneFkRedundantDeltaUnionTerms(s, deltaShape, semiJoinPruneEnabled && fkTermPruneEnabled, fkRelations)
     s = semiJoinPruneFullSourceCtes(s, deltaShape, semiJoinPruneEnabled)
     s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
@@ -658,6 +665,50 @@ object SparkRefreshRewriter {
 
   private def shortTableName(table: String): String =
     table.split("\\.").last.replace("`", "").replace("\"", "")
+
+  private case class FkTermPruneRelation(
+      childShortName: String,
+      childColumns: Seq[String],
+      parentShortName: String,
+      parentColumns: Seq[String]
+  )
+
+  /** Drop higher-order inclusion-exclusion terms whose delta set contains both
+    * sides of a declared child→parent FK when both sides are proven append-only
+    * (or unchanged) for this refresh. The child-delta/full-parent arm is kept,
+    * so inserted child rows still join to the post-refresh parent; this only
+    * removes the FK-redundant correction arm and leaves the full-source Δparent
+    * shape visible to [[semiJoinPruneFullSourceCtes]].
+    */
+  private[common] def pruneFkRedundantDeltaUnionTerms(
+      sql: String,
+      deltaShape: Map[String, DeltaShape],
+      enabled: Boolean,
+      fkRelations: Seq[ForeignKeyRelation]
+  ): String = {
+    if (!enabled || fkRelations.isEmpty) return sql
+
+    val shapesByShort = deltaShape.map { case (table, shape) => shortTableName(table).toLowerCase -> shape }
+    def appendOnlyOrUnchanged(short: String): Boolean =
+      shapesByShort
+        .get(short.toLowerCase)
+        .exists(shape => shape == DeltaShape.InsertOnly || shape == DeltaShape.Unchanged)
+
+    val eligible = fkRelations
+      .filter(fk => fk.rely && fk.childColumns.nonEmpty && fk.parentColumns.nonEmpty)
+      .map { fk =>
+        FkTermPruneRelation(
+          shortTableName(fk.childTable).toLowerCase,
+          fk.childColumns.map(stripBackticks).map(_.toLowerCase),
+          shortTableName(fk.parentTable).toLowerCase,
+          fk.parentColumns.map(stripBackticks).map(_.toLowerCase)
+        )
+      }
+      .filter(fk => appendOnlyOrUnchanged(fk.childShortName) && appendOnlyOrUnchanged(fk.parentShortName))
+
+    if (eligible.isEmpty) sql
+    else pruneUnionTermsInSql(sql, term => fkRedundantUnionTerm(term, eligible))
+  }
 
   private[common] def semiJoinPruneFullSourceCtes(
       sql: String,
@@ -692,10 +743,6 @@ object SparkRefreshRewriter {
     val relations = collectScd2RelationRefs(sql)
     val byAlias = relations
       .groupBy(r => stripBackticks(r.alias))
-      .flatMap { case (alias, refs) =>
-        val signatures = refs.map(r => (r.shortName.toLowerCase, r.deltaSourceShortName.map(_.toLowerCase))).distinct
-        if (signatures.size == 1) Some(alias -> refs.head) else None
-      }
     val equalityRe =
       "(?is)(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*=\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)".r
 
@@ -707,9 +754,11 @@ object SparkRefreshRewriter {
         val rhsAlias = stripBackticks(m.group(3))
         val rhsCol   = m.group(4)
         for {
-          lhs  <- byAlias.get(lhsAlias)
-          rhs  <- byAlias.get(rhsAlias)
-          pred <- semiJoinPrunePredicate(lhs, lhsCol, rhs, rhsCol, changedShortNames)
+          lhsRefs <- byAlias.get(lhsAlias).toSeq
+          rhsRefs <- byAlias.get(rhsAlias).toSeq
+          lhs     <- lhsRefs
+          rhs     <- rhsRefs
+          pred    <- semiJoinPrunePredicate(lhs, lhsCol, rhs, rhsCol, changedShortNames)
         } yield pred
       }
       .toVector
@@ -788,6 +837,52 @@ object SparkRefreshRewriter {
     val prefix = "openivm_delta_"
     if (shortName.toLowerCase.startsWith(prefix)) Some(shortName.substring(prefix.length))
     else None
+  }
+
+  private def fkRedundantUnionTerm(term: String, fks: Seq[FkTermPruneRelation]): Boolean = {
+    val refs            = collectScd2RelationRefs(term)
+    val deltaShortNames = refs.flatMap(_.deltaSourceShortName.map(_.toLowerCase)).toSet
+    fks.exists { fk =>
+      deltaShortNames(fk.childShortName) &&
+      deltaShortNames(fk.parentShortName) &&
+      termHasFkJoinPredicate(term, refs, fk)
+    }
+  }
+
+  private def termHasFkJoinPredicate(
+      term: String,
+      refs: Seq[Scd2RelationRef],
+      fk: FkTermPruneRelation
+  ): Boolean = {
+    val aliasesByShort = refs
+      .flatMap { ref =>
+        val short = ref.deltaSourceShortName.getOrElse(ref.shortName).toLowerCase
+        Some(short -> stripBackticks(ref.alias).toLowerCase)
+      }
+      .groupBy(_._1)
+      .map { case (short, pairs) => short -> pairs.map(_._2).toSet }
+    val childAliases  = aliasesByShort.getOrElse(fk.childShortName, Set.empty)
+    val parentAliases = aliasesByShort.getOrElse(fk.parentShortName, Set.empty)
+    if (childAliases.isEmpty || parentAliases.isEmpty) return false
+
+    val equalities = equalityPredicates(term).map { case (a1, c1, a2, c2) =>
+      (a1.toLowerCase, stripBackticks(c1).toLowerCase, a2.toLowerCase, stripBackticks(c2).toLowerCase)
+    }
+    fk.childColumns.zip(fk.parentColumns).forall { case (childCol, parentCol) =>
+      equalities.exists { case (a1, c1, a2, c2) =>
+        (childAliases(a1) && c1 == childCol && parentAliases(a2) && c2 == parentCol) ||
+        (parentAliases(a1) && c1 == parentCol && childAliases(a2) && c2 == childCol)
+      }
+    }
+  }
+
+  private def equalityPredicates(sql: String): Seq[(String, String, String, String)] = {
+    val equalityRe =
+      "(?is)(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*=\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)".r
+    equalityRe
+      .findAllMatchIn(sql)
+      .map(m => (stripBackticks(m.group(1)), m.group(2), stripBackticks(m.group(3)), m.group(4)))
+      .toVector
   }
 
   private[common] def simplifyUniqueKeyJoins(
@@ -1026,11 +1121,15 @@ object SparkRefreshRewriter {
   }
 
   private def pruneUnionTermsInSql(sql: String, unchangedShortNames: Set[String]): String = {
-    val withNestedPruned = rewriteParenthesizedSql(sql)(inner => pruneUnionTermsInSql(inner, unchangedShortNames))
+    pruneUnionTermsInSql(sql, term => referencesAnyUnchangedDelta(term, unchangedShortNames))
+  }
+
+  private def pruneUnionTermsInSql(sql: String, pruneTerm: String => Boolean): String = {
+    val withNestedPruned = rewriteParenthesizedSql(sql)(inner => pruneUnionTermsInSql(inner, pruneTerm))
     val terms            = splitTopLevelUnionAll(withNestedPruned)
     if (terms.lengthCompare(2) < 0) withNestedPruned
     else {
-      val kept = terms.filterNot(term => referencesAnyUnchangedDelta(term, unchangedShortNames))
+      val kept = terms.filterNot(pruneTerm)
       if (kept.nonEmpty && kept.size < terms.size) kept.mkString(" UNION ALL ")
       else withNestedPruned
     }

@@ -84,6 +84,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.fkTermPruneEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.fkTermPruneEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.fkTermPruneEnabled(
+        new SparkConf(false).set(FeatureGate.FkTermPruneEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
   describe("FeatureGate.scd2RangeAccelEnabled") {
     it("defaults ON and honours an explicit OFF flag") {
       FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true
