@@ -1198,13 +1198,14 @@ object SparkRefreshRewriter {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
-    val qcol = "(?:\\w+\\.)?openivm_timestamp"
+    val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
+    val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
     // Case 1: standalone `WHERE openivm_timestamp OP '...'::TIMESTAMP`
-    val standalone = ("(?i)\\s+WHERE\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP").r
+    val standalone = ("(?i)\\s+WHERE\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral).r
     // Case 2: trailing `AND openivm_timestamp OP '...'::TIMESTAMP`
-    val trailingAnd = ("(?i)\\s+AND\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP").r
+    val trailingAnd = ("(?i)\\s+AND\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral).r
     // Case 3: leading `openivm_timestamp OP '...'::TIMESTAMP AND `
-    val leadingAnd = ("(?i)\\b" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*'[^']*'::\\s*TIMESTAMP\\s+AND\\s+").r
+    val leadingAnd = ("(?i)\\b" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral + "\\s+AND\\s+").r
 
     leadingAnd.replaceAllIn(
       trailingAnd.replaceAllIn(

@@ -246,4 +246,26 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       concRows should have size 4
     }
   }
+  describe("MvMetadata compile cache keys") {
+    it("key compiled SQL by schema fingerprint and facts tier") {
+      val fp1 = MvCatalog.schemaFingerprint(
+        Map("orders" -> StructType(Seq(StructField("id", IntegerType))))
+      )
+      val fp2 = MvCatalog.schemaFingerprint(
+        Map("orders" -> StructType(Seq(StructField("id", LongType))))
+      )
+      val tier1 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.InsertOnly)))
+      val tier2 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.General)))
+
+      tier1 should not equal tier2
+      val props = MvMetadata.compiledProperties(fp1, tier1, "SQL", "INIT", 0, "AGGREGATE_GROUP")
+
+      MvMetadata.cachedCompiledSql(props, fp1, tier1) shouldBe Some("SQL")
+      MvMetadata.cachedInitialLoadSql(props, fp1, tier1) shouldBe Some("INIT")
+      MvMetadata.cachedCompiledSql(props, fp2, tier1) shouldBe None
+      MvMetadata.cachedCompiledSql(props, fp1, tier2) shouldBe None
+      props should not contain key(MvMetadata.CompiledSqlKey)
+    }
+  }
+
 }

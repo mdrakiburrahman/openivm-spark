@@ -113,19 +113,18 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
-  /** Property key recording the cached `CompiledRefresh.sql` from the
-    * DuckDB-CLI compile-bridge at CREATE time, so REFRESH can skip
-    * re-invoking the bridge. Empty / absent for legacy MVs created before
-    * this caching was added; in that case REFRESH compiles lazily and
-    * back-fills.
+  /** Legacy naive compile-cache keys.  Do not write new values here: they
+    * were not schema/tier keyed.  They remain readable only for full-refresh
+    * hidden-column recovery on old metadata rows.
     */
-  val CompiledSqlKey: String = "_ivm_compiled_sql"
-
-  /** Property key recording the cached `CompiledRefresh.initialLoadSql`
-    * companion to [[CompiledSqlKey]]. Kept under the same MV row so the
-    * pair is atomic.
-    */
+  val CompiledSqlKey: String            = "_ivm_compiled_sql"
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
+
+  private val CompileCachePrefix: String                = "_ivm_compile_cache"
+  private val CompileCacheSqlSuffix: String             = "sql"
+  private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
+  private val CompileCacheRefreshTypeSuffix: String     = "refresh_type"
+  private val CompileCacheRefreshTypeNameSuffix: String = "refresh_type_name"
 
   /** Build the property-map entries for the given source-watermarks. */
   def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
@@ -143,17 +142,93 @@ object MvMetadata {
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
 
-  /** Build the property entries persisting the DuckDB-CLI compile result
-    * so REFRESH can reuse it. Returns an empty map when `compiledSql` is
-    * empty (legacy / compile-failed views) — the absence of the key is
-    * the sentinel that REFRESH must compile on-the-fly.
+  /** Tier component for the W7.1 compile cache key.  It includes only facts
+    * that may change the emitted SQL shape/classification, not quantitative
+    * stats that should be handled by Spark-side rewrites after cache lookup.
     */
-  def compiledProperties(compiledSql: String, initialLoadSql: String): Map[String, String] = {
-    val a = if (compiledSql.nonEmpty) Map(CompiledSqlKey -> compiledSql) else Map.empty
-    val b =
-      if (initialLoadSql.nonEmpty) Map(CompiledInitialLoadSqlKey -> initialLoadSql) else Map.empty
-    a ++ b
+  def compileCacheTier(facts: WorkloadFacts): String = {
+    val shapes = facts.deltaShape.toSeq
+      .sortBy(_._1)
+      .map { case (table, shape) => s"$table=${shape.compileFactValue}" }
+      .mkString(",")
+    val fks = facts.fkRelations
+      .sortBy(fk => (fk.childTable, fk.childColumns.mkString(","), fk.parentTable, fk.parentColumns.mkString(",")))
+      .map(fk =>
+        s"${fk.childTable}(${fk.childColumns.mkString(",")})->${fk.parentTable}(${fk.parentColumns.mkString(",")})/${fk.rely}"
+      )
+      .mkString(";")
+    val uniques = facts.uniqueKeys
+      .sortBy(key => (key.table, key.columns.mkString(",")))
+      .map(key => s"${key.table}(${key.columns.mkString(",")})/${key.rely}")
+      .mkString(";")
+    val raw =
+      s"dialect=${facts.targetDialect}|compileOnly=${facts.compileOnly}|cascade=${facts.forceViewDeltaCascade}|" +
+        s"insertOnly=${facts.assumeInsertOnly}|shape=$shapes|fk=$fks|unique=$uniques"
+    val digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes("UTF-8"))
+    digest.map("%02x".format(_)).mkString
   }
+
+  def compileCacheSqlKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheSqlSuffix)
+
+  def compileCacheInitialLoadSqlKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheInitialLoadSuffix)
+
+  def compileCacheRefreshTypeKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheRefreshTypeSuffix)
+
+  def compileCacheRefreshTypeNameKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheRefreshTypeNameSuffix)
+
+  def cachedCompiledSql(
+      properties: Map[String, String],
+      sourceSchemaFingerprint: String,
+      tier: String
+  ): Option[String] =
+    properties.get(compileCacheSqlKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+
+  def cachedInitialLoadSql(
+      properties: Map[String, String],
+      sourceSchemaFingerprint: String,
+      tier: String
+  ): Option[String] =
+    properties.get(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+
+  def anyCachedInitialLoadSql(properties: Map[String, String], sourceSchemaFingerprint: String): Option[String] = {
+    val prefix = s"$CompileCachePrefix:$sourceSchemaFingerprint:"
+    properties.collectFirst {
+      case (key, value)
+          if key.startsWith(prefix) && key.endsWith(s":$CompileCacheInitialLoadSuffix") && value.nonEmpty =>
+        value
+    }
+  }
+
+  /** Build schema/tier-scoped cache entries for the shape-stable openivm compile
+    * result.  The cached SQL is still passed through SparkRefreshRewriter on
+    * every REFRESH, which recreates per-refresh `openivm_old_*` / `*_merge`
+    * temp views and substitutes fresh scratch paths.
+    */
+  def compiledProperties(
+      sourceSchemaFingerprint: String,
+      tier: String,
+      compiledSql: String,
+      initialLoadSql: String,
+      refreshType: Int,
+      refreshTypeName: String
+  ): Map[String, String] = {
+    val sql =
+      if (compiledSql.nonEmpty) Map(compileCacheSqlKey(sourceSchemaFingerprint, tier) -> compiledSql) else Map.empty
+    val init = if (initialLoadSql.nonEmpty) {
+      Map(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier) -> initialLoadSql)
+    } else Map.empty
+    sql ++ init ++ Map(
+      compileCacheRefreshTypeKey(sourceSchemaFingerprint, tier)     -> refreshType.toString,
+      compileCacheRefreshTypeNameKey(sourceSchemaFingerprint, tier) -> refreshTypeName
+    )
+  }
+
+  private def compileCacheKey(sourceSchemaFingerprint: String, tier: String, suffix: String): String =
+    s"$CompileCachePrefix:$sourceSchemaFingerprint:$tier:$suffix"
 }
 
 /** RocksDB-backed catalog for materialized-view metadata. */

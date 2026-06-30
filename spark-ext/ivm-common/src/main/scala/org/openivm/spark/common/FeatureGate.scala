@@ -73,6 +73,13 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
+  /** Cache openivm compile/classification results per MV schema + facts tier.
+    * Default OFF while W7.1 is validated; when enabled, REFRESH still rewrites
+    * the cached shape-stable SQL every time so per-refresh snapshot temp views
+    * are recreated on each execution.
+    */
+  val CompileClassificationCacheEnabledKey: String = "spark.openivm.compile.classificationCache.enabled"
+
   /** Capture every SQL statement actually executed by a CREATE / REFRESH
     * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
     * family ([[RefreshSqlLogCatalog]]).
@@ -256,6 +263,12 @@ object FeatureGate {
 
   def profileRefreshEnabled(conf: SparkConf): Boolean =
     boolConf(conf, ProfileRefreshKey, default = false)
+
+  def compileClassificationCacheEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, CompileClassificationCacheEnabledKey, default = false)
+
+  def compileClassificationCacheEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, CompileClassificationCacheEnabledKey, default = false)
 
   def queryLogEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)

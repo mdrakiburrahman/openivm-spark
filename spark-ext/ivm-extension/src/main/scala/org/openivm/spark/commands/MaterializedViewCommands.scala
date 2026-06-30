@@ -948,18 +948,36 @@ case class CreateMaterializedViewCommand(
     val userOutputCols: Seq[String] =
       if (isHavingViewIncremental) analyzed.output.map(_.name) else Nil
 
-    // Persist internal metadata alongside any user-provided properties
+    // Persist internal metadata alongside any user-provided properties.
     val baseProps         = Map("_ivm_group_keys" -> groupKeys.mkString(","))
     val countProp         = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp        = havingPred.map(p => "_ivm_having_pred" -> p).toMap
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
-    // Persist the raw DuckDB-CLI compile result so REFRESH can skip the
-    // subprocess fork + extension load + binder (≈2-5s per call) on every
-    // incremental refresh. Suppressed for FULL_REFRESH (no incremental SQL
-    // is used) and for compile_failed views (compiled.sql is empty).
+
+    // Fingerprint the current source schemas + every upstream MV's identity
+    // hash. Captures schema drift AND upstream-body drift (DROP + recreate
+    // with same schema but different body).
+    val mvIdentityBySource: Map[String, String] =
+      upstreamMvByQual.map { case (qn, m) => qn -> MvCatalog.mvIdentity(m) }
+    val fingerprint = MvCatalog.schemaFingerprint(qualSchemas, mvIdentityBySource)
+
+    // Persist the raw DuckDB-CLI compile result behind W7.1's schema/tier-keyed
+    // cache gate.  The cached SQL is shape-stable only: REFRESH still invokes
+    // SparkRefreshRewriter every time, so per-refresh snapshot temp views and
+    // scratch Delta paths are always recreated.
+    val createCompileTier = MvMetadata.compileCacheTier(workloadFacts)
     val compiledProps =
-      if (effectiveRefreshType == RefreshTypeCode.FullRefresh) Map.empty[String, String]
-      else MvMetadata.compiledProperties(compiled.sql, compiled.initialLoadSql)
+      if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
+        Map.empty[String, String]
+      else
+        MvMetadata.compiledProperties(
+          fingerprint,
+          createCompileTier,
+          compiled.sql,
+          compiled.initialLoadSql,
+          compiled.refreshType,
+          compiled.refreshTypeName
+        )
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
     // REFRESH ignores any staging rows / Delta versions that pre-date this MV
     // (otherwise we'd double-apply upstream view-deltas this MV already
@@ -971,13 +989,6 @@ case class CreateMaterializedViewCommand(
       properties ++ baseProps ++ countProp ++ havingProp ++ cascadeDeltaProps ++
         compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
-
-    // Fingerprint the current source schemas + every upstream MV's identity
-    // hash. Captures schema drift AND upstream-body drift (DROP + recreate
-    // with same schema but different body).
-    val mvIdentityBySource: Map[String, String] =
-      upstreamMvByQual.map { case (qn, m) => qn -> MvCatalog.mvIdentity(m) }
-    val fingerprint = MvCatalog.schemaFingerprint(qualSchemas, mvIdentityBySource)
 
     val meta = MvMetadata(
       name = name,
@@ -1481,7 +1492,9 @@ case class RefreshMaterializedViewCommand(
       // (which reproduces the hidden columns) for any non-FULL_REFRESH MV; a
       // genuinely FULL_REFRESH MV has no hidden columns and uses its body.
       val fullRefreshSql = {
-        val initialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).getOrElse("")
+        val legacyInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
+        val cachedInitialLoad = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
+        val initialLoad       = legacyInitialLoad.orElse(cachedInitialLoad).getOrElse("")
         if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
           org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
         else meta.querySql
@@ -1554,30 +1567,40 @@ case class RefreshMaterializedViewCommand(
     val shortToQual: Map[String, String] = freshSchemas.map { case (q, _) =>
       q.split("\\.").last -> q
     }
-    // Reuse the cached compile result if CREATE persisted it. The source
-    // schema fingerprint above (lines 728-738) has already guaranteed the
-    // cache is still valid for this REFRESH — schema drift triggers
-    // INCOMPATIBLE_VIEW_SCHEMA_CHANGE and never reaches here.
-    //
-    // Falls back to invoking the DuckDB CLI on a cache miss (legacy MVs
-    // created before this caching was added) and back-fills the metadata
-    // so subsequent REFRESHes skip the subprocess. The back-fill uses
-    // `MvCatalog.updateProperties` — a property-only update that preserves
-    // the row's `last_version`, unlike a full `upsert(meta.copy(...))`
-    // which would race with the end-of-refresh `advance` call.
-    val cachedCompiledSql = meta.properties.get(MvMetadata.CompiledSqlKey).filter(_.nonEmpty)
+    val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
+    val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+    val cacheTierFacts = WorkloadFacts(
+      deltaShape = sourceDeltaShape,
+      fkRelations = constraintFacts.fkRelations,
+      uniqueKeys = constraintFacts.uniqueKeys
+    )
+    val compileCacheTier = MvMetadata.compileCacheTier(cacheTierFacts)
+
+    // Reuse only W7.1 schema/tier-keyed, shape-stable compiled SQL.  The cached
+    // text is intentionally NOT rewritten SQL: every REFRESH below still calls
+    // SparkRefreshRewriter.rewrite, which recreates the per-refresh
+    // `openivm_old_*` / `openivm_new_*` snapshot temp views and substitutes a
+    // fresh view-delta path before execution.
+    val cachedCompiledSql =
+      if (compileCacheEnabled)
+        MvMetadata.cachedCompiledSql(meta.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+      else None
     val cachedInitialLoadSql =
-      meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).getOrElse("")
+      if (compileCacheEnabled) {
+        MvMetadata
+          .cachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+          .getOrElse("")
+      } else ""
     val compileCacheHit = cachedCompiledSql.isDefined
     val compiled = profile.timeStep(
       "generate_refresh_sql.compile",
-      s"compile_cache_hit=$compileCacheHit"
+      s"compile_cache_hit=$compileCacheHit;compile_cache_tier=$compileCacheTier"
     ) {
       RefreshPerf.timePhase(
         refreshId,
         viewLabel,
         "compile",
-        s"compile_cache_hit=$compileCacheHit"
+        s"compile_cache_hit=$compileCacheHit compile_cache_tier=$compileCacheTier"
       ) {
         cachedCompiledSql match {
           case Some(sql) =>
@@ -1588,27 +1611,34 @@ case class RefreshMaterializedViewCommand(
               initialLoadSql = cachedInitialLoadSql
             )
           case None =>
-            val compiler        = OpenIvmCompilers.forSession(spark)
-            val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+            val compiler = OpenIvmCompilers.forSession(spark)
             val statsFacts = SparkDeltaStatsService
               .forRefresh()
               .workloadFactsFor(spark, meta.sourceTables, changeBatches)
+            val compileFacts = statsFacts.copy(
+              deltaShape = sourceDeltaShape,
+              fkRelations = constraintFacts.fkRelations,
+              uniqueKeys = constraintFacts.uniqueKeys
+            )
             val fresh = compiler.compile(
               CompileRequest(
                 viewName = name.table,
                 viewSql = meta.querySql,
                 sources = compileSchemas,
                 sourceQualifiedNames = shortToQual,
-                facts = statsFacts.copy(
-                  deltaShape = sourceDeltaShape,
-                  fkRelations = constraintFacts.fkRelations,
-                  uniqueKeys = constraintFacts.uniqueKeys
-                )
+                facts = compileFacts
               )
             )
-            if (fresh.sql.nonEmpty) {
+            if (compileCacheEnabled && fresh.sql.nonEmpty) {
               val backfilled = meta.properties ++
-                MvMetadata.compiledProperties(fresh.sql, fresh.initialLoadSql)
+                MvMetadata.compiledProperties(
+                  meta.sourceSchemaFingerprint,
+                  compileCacheTier,
+                  fresh.sql,
+                  fresh.initialLoadSql,
+                  fresh.refreshType,
+                  fresh.refreshTypeName
+                )
               try MvCatalog.updateProperties(spark, name, backfilled)
               catch {
                 case t: Throwable =>
