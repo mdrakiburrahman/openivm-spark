@@ -50,6 +50,16 @@ object CdfWatermarkCatalog {
     }
   }
 
+  def putAll(spark: SparkSession, viewName: String, versionsBySource: Map[String, Long]): Unit = {
+    if (versionsBySource.isEmpty) return
+    val db = openIndexDb(spark)
+    db.withBatch { batch =>
+      versionsBySource.foreach { case (source, version) =>
+        OpenIvmRocksDBBatchOps.put(db, batch, Cf, key(viewName, source), RocksDBCodec.encodeLongBE(version))
+      }
+    }
+  }
+
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
     if (!Files.exists(Paths.get(indexDbPath(spark)))) return
     val db        = openIndexDb(spark)

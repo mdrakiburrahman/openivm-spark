@@ -1354,6 +1354,35 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
+    val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+
+    lazy val cdfBatchVerdicts: Map[String, BatchVerdict] =
+      cdfChangeBatches
+        .groupBy(_.baseTable)
+        .map { case (source, batches) =>
+          val startVersion = batches.map(_.startVersionExclusive).min
+          val verdict =
+            try DeltaCommitClassifier.classify(spark, source, startVersion)
+            catch { case _: Throwable => BatchVerdict.Replace }
+          source -> verdict
+        }
+
+    if (
+      FeatureGate.noopFastExitEnabled(spark) &&
+      meta.refreshType != RefreshTypeCode.FullRefresh &&
+      cdfChangeBatches.size == changeBatches.size &&
+      cdfChangeBatches.nonEmpty &&
+      cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
+    ) {
+      propagation.markConsumed(spark, viewNameStr, changeBatches)
+      logInfo(
+        s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+          "outcome='noop_fast_exit'"
+      )
+      emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
+      return Seq.empty
+    }
+
     // Once we know we'll be doing real work, record the user-supplied CREATE-MV
     // body as the leading row of this refresh's query log. Not executed by us
     // (stmt_order = -1, duration_ms = -1) but invaluable for the benchmarker
@@ -1420,19 +1449,6 @@ case class RefreshMaterializedViewCommand(
     // the -Ywarn-unused:imports compile flag (the value is intentionally kept
     // local — debugging will want it).
     val _ = freshMvIdentityBySource
-
-    val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
-
-    lazy val cdfBatchVerdicts: Map[String, BatchVerdict] =
-      cdfChangeBatches
-        .groupBy(_.baseTable)
-        .map { case (source, batches) =>
-          val startVersion = batches.map(_.startVersionExclusive).min
-          val verdict =
-            try DeltaCommitClassifier.classify(spark, source, startVersion)
-            catch { case _: Throwable => BatchVerdict.Replace }
-          source -> verdict
-        }
 
     def verdictForSource(source: String): Option[BatchVerdict] =
       cdfBatchVerdicts

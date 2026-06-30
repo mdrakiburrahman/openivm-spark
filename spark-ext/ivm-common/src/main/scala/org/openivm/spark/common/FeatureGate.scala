@@ -234,6 +234,14 @@ object FeatureGate {
     */
   val WindowClusterPruneEnabledKey: String = "spark.openivm.refresh.windowClusterPrune.enabled"
 
+  /** Fast-exit a CDF refresh when every source-table Delta commit since the
+    * last consumed version is metadata-only / dataChange=false NOOP. Default
+    * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
+    * the heavier per-MV refresh phases only when [[DeltaCommitClassifier]]
+    * proves that the advanced Delta versions contain no row changes.
+    */
+  val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -343,6 +351,12 @@ object FeatureGate {
 
   def windowClusterPruneEnabled(spark: SparkSession): Boolean =
     windowClusterPruneEnabled(spark.sparkContext.getConf)
+
+  def noopFastExitEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, NoopFastExitEnabledKey, default = false)
+
+  def noopFastExitEnabled(spark: SparkSession): Boolean =
+    noopFastExitEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
