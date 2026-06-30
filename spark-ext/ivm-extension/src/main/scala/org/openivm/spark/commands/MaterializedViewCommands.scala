@@ -2161,15 +2161,19 @@ case class RefreshMaterializedViewCommand(
             }
           }
         } else {
-          val windowSuffixInsertSql: Option[String] =
+          val windowSuffixSql: Option[WindowSuffixSql] =
             if (
-              meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly &&
-              downstreamSourceKeysForThisMv.isEmpty
+              FeatureGate.windowSuffixSkipEnabled(spark) &&
+              meta.refreshType == RefreshTypeCode.WindowPartition &&
+              batchInsertOnly
             )
-              buildWindowSuffixInsertSql(spark, meta, mergeTargetId)
+              buildWindowSuffixSql(spark, meta, mergeTargetId, viewDeltaPath)
             else None
           val windowSuffixSafe =
-            windowSuffixInsertSql.isDefined && windowSuffixBatchIsStrictSuffix(spark, meta, mergeTargetId)
+            windowSuffixSql.isDefined && windowSuffixBatchIsStrictSuffix(spark, meta, mergeTargetId)
+          val windowSuffixEmitsCascade =
+            windowSuffixSafe && downstreamSourceKeysForThisMv.nonEmpty && cleanupMeta.emitsCascadeViewDelta
+          var windowSuffixCascadeWritten = false
           val boundedRankInsertSql: Option[String] =
             if (
               !windowSuffixSafe &&
@@ -2189,6 +2193,9 @@ case class RefreshMaterializedViewCommand(
               windowSuffixSafe && isWindowPartitionDeleteSql(sql, mergeTargetId)
             val skipWindowPartitionInsert =
               windowSuffixSafe && isWindowPartitionInsertSql(sql, mergeTargetId)
+            val replaceWithWindowSuffixCascadeCtas =
+              windowSuffixEmitsCascade && !windowSuffixCascadeWritten &&
+                SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined
             val skipBoundedRankAux =
               boundedRankInsertSql.isDefined && isWindowPartitionAuxSql(sql, mergeTargetId)
             val replaceWithBoundedRankInsert =
@@ -2200,6 +2207,12 @@ case class RefreshMaterializedViewCommand(
                   "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
               )
               logSkippedDeleteMerge(idx)
+            } else if (replaceWithWindowSuffixCascadeCtas) {
+              withPlanTimeBroadcastDisabled {
+                executeSqlAt(windowSuffixSql.get.viewDeltaCtasSql, idx)
+              }
+              windowSuffixCascadeWritten = true
+              logViewDeltaDiagnostics(spark, name, viewDeltaPath, idx)
             } else if (skipWindowPartitionAux) {
               logSkippedWindowStmt(idx, "window_suffix_aux_skipped")
             } else if (skipWindowPartitionDelete) {
@@ -2208,10 +2221,22 @@ case class RefreshMaterializedViewCommand(
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_suffix_skip'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                  "outcome='window_suffix_skip' reason='append_only_strict_suffix'"
+                  "outcome='window_suffix_skip' reason='append_only_strict_suffix' " +
+                  s"emits_cascade_view_delta='$windowSuffixEmitsCascade'"
               )
+              if (windowSuffixEmitsCascade && !windowSuffixCascadeWritten) {
+                withPlanTimeBroadcastDisabled {
+                  executeSql(windowSuffixSql.get.viewDeltaCtasSql)
+                }
+                windowSuffixCascadeWritten = true
+                logViewDeltaDiagnostics(spark, name, viewDeltaPath, idx)
+              }
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(windowSuffixInsertSql.get, idx)
+                executeSqlAt(
+                  if (windowSuffixEmitsCascade) windowSuffixSql.get.insertFromViewDeltaSql
+                  else windowSuffixSql.get.insertSql,
+                  idx
+                )
               }
             } else if (skipBoundedRankAux) {
               logSkippedWindowStmt(idx, "bounded_rank_aux_skipped")
@@ -2593,6 +2618,8 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowSuffixShape(sourceShort: String, partitionCols: Seq[String], orderCol: String)
 
+  private case class WindowSuffixSql(insertSql: String, viewDeltaCtasSql: String, insertFromViewDeltaSql: String)
+
   private case class BoundedRankShape(
       sourceShort: String,
       partitionCols: Seq[String],
@@ -2602,11 +2629,12 @@ case class RefreshMaterializedViewCommand(
       limit: Int
   )
 
-  private def buildWindowSuffixInsertSql(
+  private def buildWindowSuffixSql(
       spark: SparkSession,
       meta: MvMetadata,
-      targetId: TableIdentifier
-  ): Option[String] =
+      targetId: TableIdentifier,
+      viewDeltaPath: String
+  ): Option[WindowSuffixSql] =
     windowSuffixShape(meta).flatMap { shape =>
       try {
         val mvCols     = spark.table(MvCommandHelper.sqlIdent(targetId)).columns.toSeq
@@ -2628,35 +2656,47 @@ case class RefreshMaterializedViewCommand(
             partitionMatch("openivm_target_context", "a", shape.partitionCols)
           val maxExists = partitionMatch("openivm_suffix", "m", shape.partitionCols)
           replaceWindowSuffixSource(meta.querySql, "context_source").map { suffixBody =>
-            s"""|INSERT INTO $targetRef ($colList)
-                |WITH affected AS (
-                |  SELECT DISTINCT $partList
-                |  FROM $deltaRef
-                |  WHERE `openivm_multiplicity` > 0
-                |),
-                |current_max AS (
-                |  SELECT $partList, MAX($orderCol) AS `openivm_max_order`
-                |  FROM $targetRef
-                |  GROUP BY $partList
-                |),
-                |context_source AS (
-                |  SELECT $sourceList
-                |  FROM $targetRef openivm_target_context
-                |  WHERE EXISTS (SELECT 1 FROM affected a WHERE $targetContextPartExists)
-                |  UNION ALL
-                |  SELECT $sourceList
-                |  FROM $deltaRef
-                |  WHERE `openivm_multiplicity` > 0
-                |)
-                |SELECT $colList
-                |FROM ($suffixBody) openivm_suffix
-                |WHERE EXISTS (SELECT 1 FROM affected a WHERE $partExists)
-                |  AND (
-                |    NOT EXISTS (SELECT 1 FROM current_max m WHERE $maxExists)
-                |    OR openivm_suffix.$orderCol > (
-                |      SELECT MAX(m.`openivm_max_order`) FROM current_max m WHERE $maxExists
-                |    )
-                |  )""".stripMargin
+            def suffixQuery(selectList: String): String =
+              s"""|WITH affected AS (
+                  |  SELECT DISTINCT $partList
+                  |  FROM $deltaRef
+                  |  WHERE `openivm_multiplicity` > 0
+                  |),
+                  |current_max AS (
+                  |  SELECT $partList, MAX($orderCol) AS `openivm_max_order`
+                  |  FROM $targetRef
+                  |  GROUP BY $partList
+                  |),
+                  |context_source AS (
+                  |  SELECT $sourceList
+                  |  FROM $targetRef openivm_target_context
+                  |  WHERE EXISTS (SELECT 1 FROM affected a WHERE $targetContextPartExists)
+                  |  UNION ALL
+                  |  SELECT $sourceList
+                  |  FROM $deltaRef
+                  |  WHERE `openivm_multiplicity` > 0
+                  |)
+                  |SELECT $selectList
+                  |FROM ($suffixBody) openivm_suffix
+                  |WHERE EXISTS (SELECT 1 FROM affected a WHERE $partExists)
+                  |  AND (
+                  |    NOT EXISTS (SELECT 1 FROM current_max m WHERE $maxExists)
+                  |    OR openivm_suffix.$orderCol > (
+                  |      SELECT MAX(m.`openivm_max_order`) FROM current_max m WHERE $maxExists
+                  |    )
+                  |  )""".stripMargin
+            val suffixSelect         = suffixQuery(colList)
+            val suffixViewDeltaQuery = suffixQuery(s"$colList, CAST(1 AS INT) AS `openivm_multiplicity`")
+            val escapedViewDeltaPath = viewDeltaPath.replace("`", "``")
+            WindowSuffixSql(
+              insertSql = s"INSERT INTO $targetRef ($colList)\n$suffixSelect",
+              viewDeltaCtasSql = s"""|CREATE OR REPLACE TABLE delta.`$escapedViewDeltaPath` USING DELTA AS
+                    |$suffixViewDeltaQuery""".stripMargin,
+              insertFromViewDeltaSql = s"""|INSERT INTO $targetRef ($colList)
+                    |SELECT $colList
+                    |FROM delta.`$escapedViewDeltaPath`
+                    |WHERE `openivm_multiplicity` > 0""".stripMargin
+            )
           }
         } else None
       } catch { case _: Throwable => None }
@@ -2900,7 +2940,7 @@ case class RefreshMaterializedViewCommand(
     val view  = targetId.table.toUpperCase(java.util.Locale.ROOT)
     upper.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_OLD_$view") ||
     upper.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_NEW_$view") ||
-    (upper.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
+    ((upper.startsWith("CREATE OR REPLACE TABLE DELTA.") || upper.startsWith("CREATE OR REPLACE TABLE DELTA.`")) &&
       upper.contains(s"FROM OPENIVM_OLD_$view") &&
       upper.contains(s"FROM OPENIVM_NEW_$view"))
   }

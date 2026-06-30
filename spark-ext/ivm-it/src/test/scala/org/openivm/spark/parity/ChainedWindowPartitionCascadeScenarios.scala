@@ -16,6 +16,9 @@ abstract class ChainedWindowPartitionCascadeScenarios extends IvmParitySpecBase(
   protected def refreshChain(mvs: String*): Unit =
     mvs.foreach(m => sql(s"REFRESH MATERIALIZED VIEW $m").collect())
 
+  override protected def extraSparkConf: Map[String, String] =
+    Map("spark.openivm.refresh.windowSuffixSkip.enabled" -> "true")
+
   protected def mvRefreshType(name: String): Int = {
     val id = spark.sessionState.sqlParser.parseTableIdentifier(name)
     MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType

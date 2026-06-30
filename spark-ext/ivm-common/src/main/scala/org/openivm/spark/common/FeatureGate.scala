@@ -215,6 +215,12 @@ object FeatureGate {
     */
   val BoundedRankEnabledKey: String = "spark.openivm.refresh.boundedRank.enabled"
 
+  /** Enable append-only strict-suffix INSERT rewrite for WINDOW_PARTITION MVs.
+    * Default ON to preserve the existing terminal-MV fast path; in cascade
+    * cases, refresh still materializes the MV view-delta before inserting.
+    */
+  val WindowSuffixSkipEnabledKey: String = "spark.openivm.refresh.windowSuffixSkip.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -306,6 +312,12 @@ object FeatureGate {
 
   def boundedRankEnabled(spark: SparkSession): Boolean =
     boundedRankEnabled(spark.sparkContext.getConf)
+
+  def windowSuffixSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSuffixSkipEnabledKey, default = true)
+
+  def windowSuffixSkipEnabled(spark: SparkSession): Boolean =
+    windowSuffixSkipEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
