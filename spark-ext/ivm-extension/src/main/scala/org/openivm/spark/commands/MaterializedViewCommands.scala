@@ -966,7 +966,16 @@ case class CreateMaterializedViewCommand(
     // SparkRefreshRewriter every time, so per-refresh snapshot temp views and
     // scratch Delta paths are always recreated.
     val createCompileTier = MvMetadata.compileCacheTier(workloadFacts)
-    val compiledProps =
+    // The legacy `_ivm_compiled_sql` / `_ivm_compiled_initial_load_sql` properties
+    // must ALWAYS be persisted at CREATE: the FULL_REFRESH arity fix (count-monoid
+    // MVs re-routed to FULL_REFRESH) reads `CompiledInitialLoadSqlKey` to reproduce
+    // hidden bookkeeping columns, independent of the compile-cache feature flag.
+    // Only the NEW per-(fingerprint,tier) cache properties are gated by the flag.
+    val legacyCompiledProps =
+      (if (compiled.sql.nonEmpty) Map(MvMetadata.CompiledSqlKey -> compiled.sql) else Map.empty[String, String]) ++
+        (if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
+         else Map.empty[String, String])
+    val cacheCompiledProps =
       if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
         Map.empty[String, String]
       else
@@ -978,6 +987,7 @@ case class CreateMaterializedViewCommand(
           compiled.refreshType,
           compiled.refreshTypeName
         )
+    val compiledProps = legacyCompiledProps ++ cacheCompiledProps
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
     // REFRESH ignores any staging rows / Delta versions that pre-date this MV
     // (otherwise we'd double-apply upstream view-deltas this MV already
