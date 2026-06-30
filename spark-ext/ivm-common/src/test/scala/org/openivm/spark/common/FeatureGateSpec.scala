@@ -67,11 +67,11 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
   }
 
   describe("FeatureGate.semiJoinPruneEnabled") {
-    it("defaults OFF and honours an explicit ON flag") {
-      FeatureGate.semiJoinPruneEnabled(new SparkConf(false)) shouldBe false
+    it("defaults ON and honours an explicit OFF flag") {
+      FeatureGate.semiJoinPruneEnabled(new SparkConf(false)) shouldBe true
       FeatureGate.semiJoinPruneEnabled(
-        new SparkConf(false).set(FeatureGate.SemiJoinPruneEnabledKey, "true")
-      ) shouldBe true
+        new SparkConf(false).set(FeatureGate.SemiJoinPruneEnabledKey, "false")
+      ) shouldBe false
     }
   }
 
@@ -85,11 +85,11 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
   }
 
   describe("FeatureGate.scd2RangeAccelEnabled") {
-    it("defaults OFF and honours an explicit ON flag") {
-      FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe false
+    it("defaults ON and honours an explicit OFF flag") {
+      FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true
       FeatureGate.scd2RangeAccelEnabled(
-        new SparkConf(false).set(FeatureGate.Scd2RangeAccelEnabledKey, "true")
-      ) shouldBe true
+        new SparkConf(false).set(FeatureGate.Scd2RangeAccelEnabledKey, "false")
+      ) shouldBe false
     }
   }
 }

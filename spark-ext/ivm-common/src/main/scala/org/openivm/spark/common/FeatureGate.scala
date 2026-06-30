@@ -267,7 +267,7 @@ object FeatureGate {
     selectiveBroadcastEnabled(spark.sparkContext.getConf)
 
   def semiJoinPruneEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, SemiJoinPruneEnabledKey, default = false)
+    boolConf(conf, SemiJoinPruneEnabledKey, default = true)
 
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
@@ -296,7 +296,7 @@ object FeatureGate {
     runtimeFilterEnabled(spark.sparkContext.getConf)
 
   def scd2RangeAccelEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, Scd2RangeAccelEnabledKey, default = false)
+    boolConf(conf, Scd2RangeAccelEnabledKey, default = true)
 
   def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
     scd2RangeAccelEnabled(spark.sparkContext.getConf)
