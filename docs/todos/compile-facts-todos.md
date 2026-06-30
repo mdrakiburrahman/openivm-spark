@@ -104,6 +104,19 @@ Everything still worth doing is re‑pointed at those two, plus `fact_holdings` 
 > aggregate auxiliary state (P5.2), an XL openivm‑C++ feature** — not another rewrite/clustering/config lever. The
 > per‑MV overhead (W7.1 cache, W7.6 NOOP) is implemented + correct + default‑off but did not produce a reproducible
 > wall win either (exec < wall inversion ⇒ serial overhead offset). See THE TODO LIST for the re‑prioritized frontier.
+>
+> **2026‑06‑30 (root‑cause, via a clean local `.explain()` probe — closes the "push the partition filter into the
+> window source scan" idea):** openivm's WINDOW recompute is `SELECT * FROM (<window query>) WHERE part IN (Δkeys)`
+> and one might think Spark computes windows over _all_ partitions then discards 99%. **It does not.** Catalyst rewrites
+> the `IN (subquery)` to a `LeftSemi` join and **pushes it _below_ the `Window` operator** (verified: the semi‑join is
+> the Window's child; the Window's input is already filtered to the affected partitions; result rowcount = exactly the
+> affected‑partition rows). So **there is no wasted window computation to reclaim** — the WINDOW cost is purely the
+> **full source scan** (the semi‑join's probe side reads the whole source to find affected‑partition rows) **plus the
+> DELETE/INSERT file rewrite**. That scan can only be pruned by physically clustering the source by `part_col` — which
+> is exactly W7.2, whose Delta clustering write/commit overhead negated the read saving. **The window recompute is
+> therefore I/O‑bound, and every rewrite/clustering lever against it is exhausted.** The only remaining angle is P5.2
+> (persisted per‑partition running aggregate state) so the affected partitions don't have to be re‑scanned/re‑computed
+> from base at all — XL openivm‑C++, and bounded by the same backdated‑insert pattern that made P5.1 a no‑op.
 
 ---
 
@@ -588,7 +601,7 @@ flowchart TD
 
 **TIER 1 — the remaining beat‑vanilla lever (deep; the cheap levers are exhausted):**
 
-- [ ] **P5.2 — Running‑aggregate auxiliary state (openivm‑C++).** _Target: the ~99 s WINDOW full‑partition recompute — the #1 residual cost, and the ONLY un‑disproven lever against it._ Add a `WINDOW_RUNNING_AGGREGATE` refresh type that persists per‑partition running state so a cumulative window updates O(new rows) instead of recomputing the partition. Files: openivm `refresh_compiler*.cpp` (new refresh type) + spark‑ext assembler + new parity specs. **Prereq: a working openivm build loop** (local `make release` is broken here — DuckLake header + `roaringConfig.cmake`; iterate via the ivm‑bench image build, bumping `OPENIVM_COMMIT` + deleting the cached builder image to force a rebuild). Gate: EXCEPT‑ALL green on all `*Window*` specs + SF10 B2 window cost < ~20 s (must not regress B1, unlike P5.3).
+- [ ] **P5.2 — Running‑aggregate auxiliary state (openivm‑C++).** _Target: the ~99 s WINDOW full‑partition recompute — the #1 residual cost, and the ONLY un‑disproven lever against it._ Add a `WINDOW_RUNNING_AGGREGATE` refresh type that persists per‑partition running state so a cumulative window updates O(new rows) instead of recomputing the partition. **Why this is the only window lever left (2026‑06‑30 probe):** a clean `.explain()` proved Spark _already_ pushes the partition‑key `IN (Δ)` filter **below** the `Window` (the semi‑join is the Window's child) — so there is **no wasted window computation** to reclaim; the WINDOW cost is the **full source scan** (semi‑join probe side) + the DELETE/INSERT file rewrite. Rewrite/clustering levers can only prune that scan via physical clustering (W7.2), whose write overhead negates the win. P5.2 is different: it reads **persisted aux state + the new rows**, so the affected partitions are **never re‑scanned from base**. Files: openivm `refresh_compiler*.cpp` (new refresh type + aux‑state table) + spark‑ext assembler + new parity specs. **Build loop is UNBLOCKED:** `apt install ninja-build && rm -rf build && GEN=ninja make -j$(nproc)` in `.temp/openivm` builds clean (the prior "broken build" was just a missing `ninja` + a stale Unix‑Makefiles CMake cache — _not_ DuckLake/roaring). Gate: EXCEPT‑ALL green on all `*Window*` specs + SF10 B2 window cost < ~20 s (must not regress B1, unlike P5.3). **Risk:** bounded by the same backdated‑insert pattern that made P5.1 a no‑op — a row inserted mid‑partition still forces a suffix re‑compute from the insertion point.
 - [ ] **W7.1 / W7.6 (perf isolation, optional).** Both are implemented + default‑off. If a controlled, uncontended SF10 A/B proves either nets out positive on wall (not just exec), flip it default‑on with a confirming full verify. Otherwise leave opt‑in.
 
 **TIER 2 — finish the structural pruning already half‑shipped (only if a correct compose is found):**
