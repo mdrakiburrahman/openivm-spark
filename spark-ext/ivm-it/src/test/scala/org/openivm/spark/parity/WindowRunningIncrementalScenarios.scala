@@ -96,5 +96,41 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_seq_mv", seqSql)
       mvRefreshType("wri_seq_mv") shouldBe RefreshTypeCode.WindowPartition
     }
+
+    it("handles the real daily_market window-over-window shape (cumulative MIN/MAX -> flag CASE -> cumulative MAX)") {
+      sql(
+        "CREATE TABLE wri_wow_market(dm_date DATE, dm_s_symb STRING, dm_close INT, dm_high INT, dm_low INT, " +
+          "dm_vol INT) USING DELTA"
+      )
+      sql(
+        "INSERT INTO wri_wow_market VALUES " +
+          "(DATE '2024-01-01','AAA',10,20,5,100),(DATE '2024-01-02','AAA',11,22,4,110)," +
+          "(DATE '2024-01-01','BBB',30,40,15,200),(DATE '2024-01-02','BBB',31,38,16,210)"
+      )
+      val wowSql =
+        "WITH cumulative AS (" +
+          "SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol, " +
+          "MIN(dm_low) OVER w AS f52_low, MAX(dm_high) OVER w AS f52_high " +
+          "FROM wri_wow_market WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)), " +
+          "flagged AS (SELECT *, " +
+          "CASE WHEN dm_low = f52_low THEN dm_date ELSE NULL END AS low_flag, " +
+          "CASE WHEN dm_high = f52_high THEN dm_date ELSE NULL END AS high_flag FROM cumulative) " +
+          "SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol, f52_low, f52_high, " +
+          "MAX(low_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS f52_low_date, " +
+          "MAX(high_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS f52_high_date FROM flagged"
+      sql(s"CREATE MATERIALIZED VIEW wri_wow_mv AS $wowSql")
+      assertMvCorrect("wri_wow_mv", wowSql)
+      mvRefreshType("wri_wow_mv") shouldBe RefreshTypeCode.WindowPartition
+
+      // Strictly-later insert-only batch (fast path) + a brand-new partition.
+      sql(
+        "INSERT INTO wri_wow_market VALUES " +
+          "(DATE '2024-01-03','AAA',9,24,3,120),(DATE '2024-01-03','BBB',33,36,17,220)," +
+          "(DATE '2024-01-01','CCC',50,60,25,300)"
+      )
+      refreshMv("wri_wow_mv")
+      assertMvCorrect("wri_wow_mv", wowSql)
+      mvRefreshType("wri_wow_mv") shouldBe RefreshTypeCode.WindowPartition
+    }
   }
 }
