@@ -92,4 +92,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe false
     }
   }
+
+  describe("FeatureGate.windowClusterPruneEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowClusterPruneEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowClusterPruneEnabled(
+        new SparkConf(false).set(FeatureGate.WindowClusterPruneEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }

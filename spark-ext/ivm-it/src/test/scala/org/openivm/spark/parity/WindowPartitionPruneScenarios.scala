@@ -1,5 +1,6 @@
 package org.openivm.spark.parity
 
+import org.apache.spark.sql.delta.DeltaLog
 import org.openivm.spark.common.{FeatureGate, RefreshTypeCode}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
@@ -7,15 +8,29 @@ abstract class WindowPartitionPruneScenarios extends IvmParitySpecBase("window-p
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    Map(FeatureGate.WindowPartitionPruneEnabledKey -> "true")
+    Map(FeatureGate.WindowClusterPruneEnabledKey -> "true")
 
-  private def deltaPartitionColumns(tableName: String): Seq[String] = {
+  private def deltaClusteringMetadata(tableName: String): String = {
     val escaped = tableName.replace("`", "``")
-    spark
-      .sql(s"DESCRIBE DETAIL `$escaped`")
-      .select("partitionColumns")
-      .head()
-      .getAs[Seq[String]]("partitionColumns")
+    val detail  = spark.sql(s"DESCRIBE DETAIL `$escaped`")
+    val describeClustering =
+      if (detail.schema.fieldNames.contains("clusteringColumns"))
+        Option(detail.select("clusteringColumns").head().getAs[Seq[String]]("clusteringColumns"))
+          .getOrElse(Seq.empty)
+          .mkString(",")
+      else ""
+    val id = spark.sessionState.sqlParser.parseTableIdentifier(tableName)
+    val configClustering = DeltaLog
+      .forTable(spark, id)
+      .update()
+      .metadata
+      .configuration
+      .filter { case (key, _) => key.toLowerCase(java.util.Locale.ROOT).contains("clustering") }
+      .toSeq
+      .sortBy(_._1)
+      .map { case (key, value) => s"$key=$value" }
+      .mkString(";")
+    s"$describeClustering;$configClustering"
   }
 
   private def mvRefreshType(name: String): Int = {
@@ -23,8 +38,8 @@ abstract class WindowPartitionPruneScenarios extends IvmParitySpecBase("window-p
     org.openivm.spark.common.MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType
   }
 
-  describe("WINDOW_PARTITION data-table partition pruning") {
-    it("partitions the Delta data table by the window key and stays correct after a single-partition INSERT") {
+  describe("WINDOW_PARTITION data-table cluster pruning") {
+    it("liquid-clusters the Delta data table by the window key and stays correct after a single-partition INSERT") {
       sql("CREATE TABLE wpp_sales(id INT, region STRING, amount INT) USING DELTA")
       sql(
         "INSERT INTO wpp_sales VALUES " +
@@ -38,7 +53,7 @@ abstract class WindowPartitionPruneScenarios extends IvmParitySpecBase("window-p
       sql(s"CREATE MATERIALIZED VIEW wpp_mv_sales AS $viewSql")
 
       mvRefreshType("wpp_mv_sales") shouldBe RefreshTypeCode.WindowPartition
-      deltaPartitionColumns("wpp_mv_sales") shouldBe Seq("region")
+      deltaClusteringMetadata("wpp_mv_sales").toLowerCase(java.util.Locale.ROOT) should include("region")
 
       sql("INSERT INTO wpp_sales VALUES (7,'east',25)")
       refreshMv("wpp_mv_sales")

@@ -228,11 +228,11 @@ object FeatureGate {
     */
   val WindowSuffixSkipEnabledKey: String = "spark.openivm.refresh.windowSuffixSkip.enabled"
 
-  /** Physically partition eligible WINDOW_PARTITION MV data tables by their
-    * resolved window PARTITION BY columns at CREATE time. Default OFF so the
-    * storage layout change is opt-in and reversible.
+  /** Liquid-cluster eligible WINDOW_PARTITION MV data tables by their resolved
+    * window PARTITION BY columns at CREATE time. Default OFF so the storage
+    * layout change is opt-in and reversible.
     */
-  val WindowPartitionPruneEnabledKey: String = "spark.openivm.refresh.windowPartitionPrune.enabled"
+  val WindowClusterPruneEnabledKey: String = "spark.openivm.refresh.windowClusterPrune.enabled"
 
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
@@ -338,11 +338,11 @@ object FeatureGate {
   def windowSuffixSkipEnabled(spark: SparkSession): Boolean =
     windowSuffixSkipEnabled(spark.sparkContext.getConf)
 
-  def windowPartitionPruneEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, WindowPartitionPruneEnabledKey, default = false)
+  def windowClusterPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowClusterPruneEnabledKey, default = false)
 
-  def windowPartitionPruneEnabled(spark: SparkSession): Boolean =
-    windowPartitionPruneEnabled(spark.sparkContext.getConf)
+  def windowClusterPruneEnabled(spark: SparkSession): Boolean =
+    windowClusterPruneEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The

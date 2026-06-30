@@ -229,7 +229,7 @@ private[commands] object MvCommandHelper {
     s"$warehouse/_ivm/views/$segment"
   }
 
-  /** Resolved simple-column window partition key for physically partitioning
+  /** Resolved simple-column window partition key for liquid-clustering
     * WINDOW_PARTITION MV data tables. Skips safely when any window PARTITION BY
     * expression is not a plain output column, when windows use different keys,
     * or when the key is not projected by the MV data table.
@@ -1019,14 +1019,14 @@ case class CreateMaterializedViewCommand(
       else
         org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
-    val windowPartitionCols =
-      if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowPartitionPruneEnabled(spark))
+    val windowClusterCols =
+      if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowClusterPruneEnabled(spark))
         resolvedWindowPartitionColumns(analyzed)
       else None
-    val partitionClause =
-      windowPartitionCols
+    val clusterClause =
+      windowClusterCols
         .filter(_.nonEmpty)
-        .map(cols => s"PARTITIONED BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
+        .map(cols => s"CLUSTER BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
         .getOrElse("")
 
     val escaped  = location.replace("'", "\\'")
@@ -1035,7 +1035,7 @@ case class CreateMaterializedViewCommand(
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val initSql =
       s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
-        s"$partitionClause${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
+        s"$clusterClause${tblPropsClause}LOCATION '$escaped' AS $viewBodySql"
     // Wipe stray files from a previous aborted CREATE so Delta's
     // "non-empty location, not a Delta table" check does not fail dbt
     // retries after an OOM-aborted initial load (see exp-000 SF=100
