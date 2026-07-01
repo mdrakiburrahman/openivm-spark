@@ -119,4 +119,20 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe true
     }
   }
+
+  describe("FeatureGate.windowPartitionReplaceWhereEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowPartitionReplaceWhereEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowPartitionReplaceWhereEnabled(
+        new SparkConf(false).set(FeatureGate.WindowPartitionReplaceWhereEnabledKey, "true")
+      ) shouldBe true
+    }
+
+    it("defaults the affected-key guardrail and honours an override") {
+      FeatureGate.windowPartitionReplaceWhereMaxKeys(new SparkConf(false)) shouldBe 50000
+      FeatureGate.windowPartitionReplaceWhereMaxKeys(
+        new SparkConf(false).set(FeatureGate.WindowPartitionReplaceWhereMaxKeysKey, "123")
+      ) shouldBe 123
+    }
+  }
 }

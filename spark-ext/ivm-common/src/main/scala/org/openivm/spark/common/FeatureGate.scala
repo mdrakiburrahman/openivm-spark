@@ -251,6 +251,14 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Replace the WINDOW_PARTITION DELETE-MERGE + INSERT pair with one Delta
+    * `INSERT ... REPLACE WHERE` over literal affected partition keys. Default
+    * OFF while benchmark-only validation proves the speedup on SCD forward-fill
+    * views such as TPC-DI `gold.dim_customer`.
+    */
+  val WindowPartitionReplaceWhereEnabledKey: String = "spark.openivm.refresh.windowPartitionReplaceWhere.enabled"
+  val WindowPartitionReplaceWhereMaxKeysKey: String = "spark.openivm.refresh.windowPartitionReplaceWhere.maxKeys"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -380,6 +388,18 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def windowPartitionReplaceWhereEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowPartitionReplaceWhereEnabledKey, default = false)
+
+  def windowPartitionReplaceWhereEnabled(spark: SparkSession): Boolean =
+    windowPartitionReplaceWhereEnabled(spark.sparkContext.getConf)
+
+  def windowPartitionReplaceWhereMaxKeys(conf: SparkConf): Int =
+    scala.util.Try(conf.getInt(WindowPartitionReplaceWhereMaxKeysKey, 50000)).getOrElse(50000)
+
+  def windowPartitionReplaceWhereMaxKeys(spark: SparkSession): Int =
+    windowPartitionReplaceWhereMaxKeys(spark.sparkContext.getConf)
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)

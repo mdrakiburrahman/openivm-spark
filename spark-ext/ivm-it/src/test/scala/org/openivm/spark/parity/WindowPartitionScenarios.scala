@@ -2,7 +2,15 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.apache.logging.log4j.core.{LogEvent, Logger}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
+
+import java.util.UUID
+import scala.collection.mutable.ArrayBuffer
 
 /** P5.rt5 — Coverage of RefreshType 5 (WINDOW_PARTITION).
   *
@@ -72,6 +80,36 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   */
 abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partition") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  private final class BufferingAppender(name: String)
+      extends AbstractAppender(
+        name,
+        null,
+        PatternLayout.createDefaultLayout(),
+        false,
+        Property.EMPTY_ARRAY
+      ) {
+    protected val buffer = ArrayBuffer.empty[String]
+
+    override def append(event: LogEvent): Unit =
+      buffer.synchronized {
+        buffer += event.getMessage.getFormattedMessage
+      }
+
+    def messages: Seq[String] = buffer.synchronized(buffer.toVector)
+  }
+
+  private def withLogCapture[A](body: BufferingAppender => A): A = {
+    val appender = new BufferingAppender(s"wp-${UUID.randomUUID()}")
+    val root     = LogManager.getRootLogger.asInstanceOf[Logger]
+    appender.start()
+    root.addAppender(appender)
+    try body(appender)
+    finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
 
   /** Looks up the recorded refresh type for `name` via the MV catalog. */
   protected def mvRefreshType(name: String): Int = {
@@ -404,6 +442,82 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
       refreshMv("mv_wp12")
 
       assertMvCorrect("mv_wp12", viewSql)
+    }
+  }
+
+  // ── (13) dim_customer-shaped forward-fill with cascade ─────────────────────
+
+  describe("(13) dim_customer-shaped LAST_VALUE forward-fill can use REPLACE WHERE") {
+    it("refreshes affected customer keys without FullRefresh demotion and cascades downstream") {
+      restartSpark(Map(FeatureGate.WindowPartitionReplaceWhereEnabledKey -> "true"))
+      try {
+        spark.sparkContext.getConf.set(FeatureGate.WindowPartitionReplaceWhereEnabledKey, "true")
+        FeatureGate.windowPartitionReplaceWhereEnabled(spark) shouldBe true
+
+        sql(
+          "CREATE TABLE dimc_customers(customer_id INT, account_id INT, effective_ts TIMESTAMP, status STRING, " +
+            "tax_id STRING, last_name STRING, first_name STRING, postal_code STRING, address_line1 STRING, " +
+            "address_line2 STRING) USING DELTA"
+        )
+        sql(
+          "CREATE TABLE dimc_prospect(first_name STRING, last_name STRING, postal_code STRING, address_line1 STRING, " +
+            "address_line2 STRING, agency_id STRING) USING DELTA"
+        )
+        sql(
+          "INSERT INTO dimc_prospect VALUES " +
+            "('Ann','A','11111','1 Main',NULL,'P1'),('Bob','B','22222','2 Main',NULL,'P2')"
+        )
+        sql(
+          "INSERT INTO dimc_customers VALUES " +
+            "(1,10,TIMESTAMP'2024-01-01 00:00:00','A','T1','A','Ann','11111','1 Main',NULL)," +
+            "(1,11,TIMESTAMP'2024-02-01 00:00:00','A',NULL,NULL,NULL,'11111','1 Main',NULL)," +
+            "(2,20,TIMESTAMP'2024-01-05 00:00:00','A','T2','B','Bob','22222','2 Main',NULL)"
+        )
+
+        val viewSql =
+          "WITH s1 AS (" +
+            "SELECT c.*, p.agency_id FROM dimc_customers c LEFT JOIN dimc_prospect p " +
+            "ON c.first_name = p.first_name AND c.last_name = p.last_name AND c.postal_code = p.postal_code " +
+            "AND c.address_line1 = p.address_line1 AND coalesce(c.address_line2, '') = coalesce(p.address_line2, '')) " +
+            "SELECT customer_id, account_id, effective_ts, status, " +
+            "coalesce(tax_id, last_value(tax_id, true) OVER (PARTITION BY customer_id ORDER BY effective_ts, status, account_id)) AS tax_id, " +
+            "coalesce(last_name, last_value(last_name, true) OVER (PARTITION BY customer_id ORDER BY effective_ts, status, account_id)) AS last_name, " +
+            "coalesce(first_name, last_value(first_name, true) OVER (PARTITION BY customer_id ORDER BY effective_ts, status, account_id)) AS first_name, " +
+            "agency_id FROM s1"
+        val downstreamSql =
+          s"SELECT customer_id, account_id, tax_id, last_name, first_name, agency_id FROM ($viewSql) dimc_expected"
+
+        sql(s"CREATE MATERIALIZED VIEW dimc_mv_customer AS $viewSql")
+        sql(
+          "CREATE MATERIALIZED VIEW dimc_mv_customer_proj AS " +
+            "SELECT customer_id, account_id, tax_id, last_name, first_name, agency_id FROM dimc_mv_customer"
+        )
+        mvRefreshType("dimc_mv_customer") shouldBe RefreshTypeCode.WindowPartition
+        mvRefreshType("dimc_mv_customer_proj") should not equal RefreshTypeCode.FullRefresh
+
+        sql(
+          "INSERT INTO dimc_customers VALUES " +
+            "(1,12,TIMESTAMP'2024-03-01 00:00:00','A',NULL,NULL,NULL,'11111','1 Main',NULL)," +
+            "(2,21,TIMESTAMP'2024-02-05 00:00:00','A',NULL,NULL,NULL,'22222','2 Main',NULL)," +
+            "(3,30,TIMESTAMP'2024-01-10 00:00:00','A','T3','C','Cat','33333','3 Main',NULL)"
+        )
+
+        val perfLines = withLogCapture { appender =>
+          refreshMv("dimc_mv_customer")
+          refreshMv("dimc_mv_customer_proj")
+          appender.messages.filter(m => m.startsWith("[openivm-perf] ") && m.contains("dimc_mv_customer"))
+        }
+
+        withClue("captured [openivm-perf] lines:\n" + perfLines.mkString("\n") + "\n") {
+          perfLines.exists(_.contains("outcome='window_partition_replace_where'")) shouldBe true
+        }
+        mvRefreshType("dimc_mv_customer") shouldBe RefreshTypeCode.WindowPartition
+        mvRefreshType("dimc_mv_customer_proj") should not equal RefreshTypeCode.FullRefresh
+        assertMvCorrect("dimc_mv_customer", viewSql)
+        assertMvCorrect("dimc_mv_customer_proj", downstreamSql)
+      } finally {
+        restartSpark()
+      }
     }
   }
 }

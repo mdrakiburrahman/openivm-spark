@@ -2276,8 +2276,46 @@ case class RefreshMaterializedViewCommand(
             }
           }
         } else {
+          val windowReplaceWhereExecuted =
+            if (
+              FeatureGate.windowPartitionReplaceWhereEnabled(spark) &&
+              meta.refreshType == RefreshTypeCode.WindowPartition
+            ) {
+              executeWindowPartitionReplaceWhere(
+                spark,
+                meta,
+                mergeTargetId,
+                rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker),
+                viewDeltaPath,
+                downstreamSourceKeysForThisMv.nonEmpty && cleanupMeta.emitsCascadeViewDelta,
+                executeSqlAt,
+                logSkippedWindowStmt
+              ) match {
+                case Some(cascadeWritten) =>
+                  RefreshPerf.emit(
+                    refreshId,
+                    viewLabel,
+                    "fast_path",
+                    s"outcome='window_partition_replace_where' emits_cascade_view_delta='$cascadeWritten'"
+                  )
+                  logInfo(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                      "outcome='window_partition_replace_where' reason='affected_partition_replace_where' " +
+                      s"emits_cascade_view_delta='$cascadeWritten'"
+                  )
+                  if (!cascadeWritten && propagation.requiresDmlInterception && downstreamSourceKeysForThisMv.isEmpty) {
+                    cleanupMeta = cleanupMeta.copy(
+                      properties = cleanupMeta.properties + (MvMetadata.EmitsCascadeViewDeltaKey -> false.toString)
+                    )
+                  }
+                  true
+                case None => false
+              }
+            } else false
+
           val windowSuffixSql: Option[WindowSuffixSql] =
             if (
+              !windowReplaceWhereExecuted &&
               FeatureGate.windowSuffixSkipEnabled(spark) &&
               meta.refreshType == RefreshTypeCode.WindowPartition &&
               batchInsertOnly
@@ -2298,7 +2336,7 @@ case class RefreshMaterializedViewCommand(
             ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
             else None
 
-          rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
+          if (!windowReplaceWhereExecuted) rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
             val skipDeleteMerge =
               SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
@@ -2868,6 +2906,146 @@ case class RefreshMaterializedViewCommand(
       } catch { case _: Throwable => false }
     }
 
+  private def executeWindowPartitionReplaceWhere(
+      spark: SparkSession,
+      meta: MvMetadata,
+      targetId: TableIdentifier,
+      statements: Seq[String],
+      viewDeltaPath: String,
+      cascadeNeeded: Boolean,
+      executeSqlAt: (String, Int) => Unit,
+      logSkippedWindowStmt: (Int, String) => Unit
+  ): Option[Boolean] = {
+    val partitionCols = commonWindowPartitionCols(meta.querySql).getOrElse {
+      return None
+    }
+    if (partitionCols.isEmpty) {
+      return None
+    }
+
+    val targetRef    = MvCommandHelper.sqlIdent(targetId)
+    val newName      = s"openivm_new_${targetId.table}"
+    val oldName      = s"openivm_old_${targetId.table}"
+    val newCreateIdx = statements.indexWhere(isTempViewCreate(_, newName))
+    if (newCreateIdx < 0) {
+      return None
+    }
+
+    val oldCreateIdx = statements.indexWhere(isTempViewCreate(_, oldName))
+    val cascadeIdx =
+      statements.indexWhere(sql => SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined)
+    val deleteIdx = statements.indexWhere(sql => isWindowPartitionDeleteSql(sql, targetId))
+    val insertIdx = statements.indexWhere(sql => isWindowPartitionInsertSql(sql, targetId))
+
+    if (deleteIdx < 0 || insertIdx < 0) {
+      return None
+    }
+    if (cascadeNeeded && (oldCreateIdx < 0 || cascadeIdx < 0)) {
+      return None
+    }
+
+    val newViewRef = quoteCol(newName)
+    statements.zipWithIndex.foreach { case (sql, idx) =>
+      if (idx != oldCreateIdx && idx != newCreateIdx && isAnyTempViewCreate(sql)) executeSqlAt(sql, idx)
+    }
+    if (cascadeNeeded) executeSqlAt(statements(oldCreateIdx), oldCreateIdx)
+    executeSqlAt(statements(newCreateIdx), newCreateIdx)
+
+    val maxKeys = FeatureGate.windowPartitionReplaceWhereMaxKeys(spark)
+    val keys = spark
+      .table(newName)
+      .selectExpr(partitionCols.map(quoteCol): _*)
+      .distinct()
+      .limit(maxKeys + 1)
+      .collect()
+      .toSeq
+    if (keys.isEmpty || keys.size > maxKeys) {
+      return None
+    }
+
+    executeSqlAt(s"CACHE TABLE $newViewRef", newCreateIdx + 1)
+    spark.table(newName).count()
+
+    if (cascadeNeeded) executeSqlAt(statements(cascadeIdx), cascadeIdx)
+
+    val mvCols  = spark.table(targetRef).columns.toSeq
+    val colList = mvCols.map(quoteCol).mkString(", ")
+    val pred    = replaceWherePredicate(partitionCols, keys)
+    val replaceSql =
+      s"""|INSERT INTO $targetRef REPLACE WHERE $pred
+          |SELECT $colList FROM $newViewRef""".stripMargin
+    executeSqlAt(replaceSql, insertIdx)
+    logSkippedWindowStmt(deleteIdx, "window_replace_where_delete_skipped")
+
+    statements.zipWithIndex.foreach { case (sql, idx) =>
+      val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
+      if (upper.startsWith("DROP VIEW IF EXISTS OPENIVM_OLD_") || upper.startsWith("DROP VIEW IF EXISTS OPENIVM_NEW_"))
+        executeSqlAt(sql, idx)
+      else if (idx == cascadeIdx && !cascadeNeeded)
+        logSkippedWindowStmt(idx, "window_replace_where_aux_skipped")
+    }
+    Some(cascadeNeeded)
+  }
+
+  private def commonWindowPartitionCols(sql: String): Option[Seq[String]] = {
+    val overSpecs = "(?is)\\bOVER\\s*\\((.*?)\\)".r.findAllMatchIn(sql).map(_.group(1)).toVector
+    if (overSpecs.isEmpty) return None
+    val parsed = overSpecs.flatMap { spec =>
+      "(?is)\\bPARTITION\\s+BY\\s+(.+?)\\s+ORDER\\s+BY\\s+".r.findFirstMatchIn(spec).map { hit =>
+        splitIdentifierList(hit.group(1))
+      }
+    }
+    if (parsed.size != overSpecs.size || parsed.exists(_.isEmpty)) None
+    else {
+      val first = parsed.head
+      if (parsed.forall(_ == first)) Some(first) else None
+    }
+  }
+
+  private def isTempViewCreate(sql: String, viewName: String): Boolean = {
+    val name = java.util.regex.Pattern.quote(viewName)
+    (s"(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?$name`?\\s+AS\\b").r
+      .findFirstIn(sql)
+      .isDefined
+  }
+
+  private def isAnyTempViewCreate(sql: String): Boolean =
+    "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+".r.findFirstIn(sql).isDefined
+
+  private def replaceWherePredicate(cols: Seq[String], rows: Seq[Row]): String = {
+    if (cols.size == 1) {
+      val col      = quoteCol(cols.head)
+      val literals = rows.map(_.get(0)).distinct
+      val nonNull  = literals.filter(_ != null).map(sqlLiteral)
+      val pieces =
+        (if (nonNull.nonEmpty) Seq(s"$col IN (${nonNull.mkString(", ")})") else Seq.empty[String]) ++
+          (if (literals.exists(_ == null)) Seq(s"$col IS NULL") else Seq.empty[String])
+      pieces.mkString(" OR ")
+    } else {
+      rows
+        .map { row =>
+          cols.zipWithIndex
+            .map { case (col, i) =>
+              val q = quoteCol(col)
+              if (row.isNullAt(i)) s"$q IS NULL" else s"$q <=> ${sqlLiteral(row.get(i))}"
+            }
+            .mkString("(", " AND ", ")")
+        }
+        .mkString(" OR ")
+    }
+  }
+
+  private def sqlLiteral(value: Any): String = value match {
+    case null                     => "NULL"
+    case s: String                => "'" + s.replace("'", "''") + "'"
+    case d: java.sql.Date         => s"DATE '${d.toString}'"
+    case t: java.sql.Timestamp    => s"TIMESTAMP '${t.toString}'"
+    case b: Boolean               => if (b) "true" else "false"
+    case bd: java.math.BigDecimal => bd.toPlainString
+    case d: BigDecimal            => d.bigDecimal.toPlainString
+    case other                    => other.toString
+  }
+
   private def buildBoundedRankInsertSql(
       spark: SparkSession,
       meta: MvMetadata,
@@ -3062,19 +3240,18 @@ case class RefreshMaterializedViewCommand(
 
   private def isWindowPartitionDeleteSql(sql: String, targetId: TableIdentifier): Boolean = {
     val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
-    upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS V") &&
-    upper.contains("SELECT DISTINCT") &&
-    upper.contains("OPENIVM_DELTA_") &&
+    upper.startsWith("MERGE INTO ") &&
     upper.contains("WHEN MATCHED THEN DELETE")
   }
 
   private def isWindowPartitionInsertSql(sql: String, targetId: TableIdentifier): Boolean = {
-    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
-    upper.startsWith(s"INSERT INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)}") &&
+    val upper   = sql.trim.toUpperCase(java.util.Locale.ROOT)
+    val newView = targetId.table.toUpperCase(java.util.Locale.ROOT)
+    upper.startsWith("INSERT INTO ") &&
     ((upper.contains("OPENIVM_RECOMPUTE") &&
       "\\bIN\\s*\\(\\s*SELECT\\s+DISTINCT\\b".r.findFirstIn(upper).isDefined &&
       upper.contains("OPENIVM_DELTA_")) ||
-      upper.contains(s"FROM OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}"))
+      s"(?s).*\\bFROM\\s+`?OPENIVM_NEW_$newView`?\\b.*".r.findFirstIn(upper).isDefined)
   }
 
   /** Advance the MV's tracked Delta version and prune fully-consumed staging
