@@ -1885,6 +1885,7 @@ case class RefreshMaterializedViewCommand(
             fkRelations = rewriteConstraintFacts.fkRelations,
             uniqueKeys = rewriteConstraintFacts.uniqueKeys,
             uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
+            windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark),
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.

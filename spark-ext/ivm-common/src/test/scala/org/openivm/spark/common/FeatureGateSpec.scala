@@ -119,4 +119,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe true
     }
   }
+
+  describe("FeatureGate.windowPartitionSingleDeleteMergeEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowPartitionSingleDeleteMergeEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowPartitionSingleDeleteMergeEnabled(
+        new SparkConf(false).set(FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }
