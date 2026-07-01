@@ -124,6 +124,16 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
       classify(table, before) shouldBe Replace
     }
 
+    it("classifies predicate-scoped replaceWhere commits as Mutating") {
+      val table = createTable("replacewhere")
+      spark.sql(s"INSERT INTO $table VALUES (1, 'a'), (2, 'b')")
+      val before = latest(table)
+
+      spark.sql(s"INSERT INTO $table REPLACE WHERE id = 1 SELECT 1 AS id, 'z' AS name")
+
+      classify(table, before) shouldBe Mutating
+    }
+
     it("classifies truncate commit metadata as Replace") {
       val truncateInfo = CommitInfo.empty(None).copy(operation = "TRUNCATE", operationParameters = Map.empty)
 

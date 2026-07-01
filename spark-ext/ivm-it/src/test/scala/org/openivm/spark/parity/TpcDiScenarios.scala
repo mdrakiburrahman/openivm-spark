@@ -546,10 +546,17 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
         val rows         = historySince.collect()
         // Empty rows = no new commits = refresh was a no-op (empty source delta). Skip.
         rows.foreach { row =>
-          val op               = row.getAs[String]("operation")
-          val opParams         = Option(row.getAs[Map[String, String]]("operationParameters")).getOrElse(Map.empty)
-          val mode             = opParams.getOrElse("mode", "")
-          val isOverwriteWrite = op == "WRITE" && mode == "Overwrite"
+          val op       = row.getAs[String]("operation")
+          val opParams = Option(row.getAs[Map[String, String]]("operationParameters")).getOrElse(Map.empty)
+          val mode     = opParams.getOrElse("mode", "")
+          val predicate = opParams
+            .get("predicate")
+            .orElse(opParams.get("replaceWhere"))
+            .orElse(opParams.get("partitionPredicate"))
+            .map(_.trim)
+          val isPredicateScopedOverwrite =
+            predicate.exists(p => p.nonEmpty && p != "[]" && !p.equalsIgnoreCase("true"))
+          val isOverwriteWrite = op == "WRITE" && mode == "Overwrite" && !isPredicateScopedOverwrite
           if (isOverwriteWrite) {
             failures += s"[$phase] $mvName (${meta.refreshTypeName}) at v${row.getAs[Long]("version")}: " +
               s"non-incremental WRITE/Overwrite (location=${meta.location}, params=$opParams)"
