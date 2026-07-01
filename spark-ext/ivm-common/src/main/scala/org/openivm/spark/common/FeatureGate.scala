@@ -259,6 +259,13 @@ object FeatureGate {
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
 
+  /** Runtime delta-size aware refresh skip. Default OFF: when opted in, REFRESH
+    * probes the already-registered `openivm_delta_<source>` temp views and
+    * consumes the batch without executing the recompute program only when every
+    * materialized source delta is empty.
+    */
+  val RuntimeEmptyDeltaSkipEnabledKey: String = "spark.openivm.refresh.runtimeEmptyDeltaSkip.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -386,6 +393,12 @@ object FeatureGate {
 
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def runtimeEmptyDeltaSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RuntimeEmptyDeltaSkipEnabledKey, default = false)
+
+  def runtimeEmptyDeltaSkipEnabled(spark: SparkSession): Boolean =
+    runtimeEmptyDeltaSkipEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
