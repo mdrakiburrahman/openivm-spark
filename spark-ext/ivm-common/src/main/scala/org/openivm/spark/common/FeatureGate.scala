@@ -242,6 +242,14 @@ object FeatureGate {
     */
   val WindowSuffixSkipEnabledKey: String = "spark.openivm.refresh.windowSuffixSkip.enabled"
 
+  /** Collapse WINDOW_PARTITION's OR-expanded affected-partition DELETE into one
+    * Delta MERGE over the UNION of affected keys. Default OFF: the legacy
+    * one-MERGE-per-source/partition-clause plan remains byte-identical unless
+    * explicitly opted in.
+    */
+  val WindowPartitionSingleDeleteMergeEnabledKey: String =
+    "spark.openivm.refresh.windowPartitionSingleDeleteMerge.enabled"
+
   /** Liquid-cluster eligible WINDOW_PARTITION MV data tables by their resolved
     * window PARTITION BY columns at CREATE time. Default OFF so the storage
     * layout change is opt-in and reversible.
@@ -394,6 +402,12 @@ object FeatureGate {
 
   def windowSuffixSkipEnabled(spark: SparkSession): Boolean =
     windowSuffixSkipEnabled(spark.sparkContext.getConf)
+
+  def windowPartitionSingleDeleteMergeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowPartitionSingleDeleteMergeEnabledKey, default = false)
+
+  def windowPartitionSingleDeleteMergeEnabled(spark: SparkSession): Boolean =
+    windowPartitionSingleDeleteMergeEnabled(spark.sparkContext.getConf)
 
   def windowClusterPruneEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowClusterPruneEnabledKey, default = false)

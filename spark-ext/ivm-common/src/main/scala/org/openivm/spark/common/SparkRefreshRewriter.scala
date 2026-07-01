@@ -296,6 +296,7 @@ object SparkRefreshRewriter {
       fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
+      windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -345,7 +346,7 @@ object SparkRefreshRewriter {
           case StatementKind.ScalarFullRecomputeInsert =>
             Seq(rewriteScalarFullRecomputeInsert(stmt, viewLogicalName, mvName, mvLocation, viewDeltaPath))
           case StatementKind.PartitionScopedDelete =>
-            rewritePartitionScopedDelete(stmt, viewLogicalName, mvName)
+            rewritePartitionScopedDelete(stmt, viewLogicalName, mvName, windowPartitionSingleDeleteMergeEnabled)
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
@@ -2363,7 +2364,8 @@ object SparkRefreshRewriter {
   private def rewritePartitionScopedDelete(
       stmt: String,
       viewLogicalName: String,
-      mvName: TableIdentifier
+      mvName: TableIdentifier,
+      singleMergeEnabled: Boolean
   ): Seq[String] = {
     val mvRef = backtickMvName(mvName)
     val dataViewRe = ("(?i)\\bopenivm_data_" +
@@ -2378,10 +2380,80 @@ object SparkRefreshRewriter {
       return Seq(s)
     }
 
-    splitTopLevelOr(whereBody).flatMap { clause =>
-      val trimmed = clause.trim
-      inClauseToMerge(trimmed, mvRef)
+    val clauses = splitTopLevelOr(whereBody)
+    if (singleMergeEnabled) {
+      combinedPartitionDeleteMerge(clauses, mvRef)
+        .map(Seq(_))
+        .getOrElse(clauses.flatMap { clause =>
+          inClauseToMerge(clause.trim, mvRef)
+        })
+    } else
+      clauses.flatMap { clause =>
+        val trimmed = clause.trim
+        inClauseToMerge(trimmed, mvRef)
+      }
+  }
+
+  private def combinedPartitionDeleteMerge(clauses: Seq[String], mvRef: String): Option[String] = {
+    val parsed = clauses.flatMap(parseSingleColumnInClause)
+    if (parsed.size != clauses.size || parsed.isEmpty) return None
+
+    val targetCol = parsed.head.targetCol
+    if (!parsed.forall(_.targetCol == targetCol)) return None
+
+    val keyAlias = quoteIfNeeded(targetCol)
+    val unionArms = parsed.zipWithIndex.map { case (p, idx) =>
+      s"SELECT ${p.sourceExpr} AS $keyAlias FROM (${p.subquery}) openivm_key_src_$idx"
     }
+    Some(
+      s"""|MERGE INTO $mvRef AS v
+          |USING (
+          |  SELECT DISTINCT $keyAlias
+          |  FROM (
+          |    ${unionArms.mkString("\n    UNION ALL\n    ")}
+          |  ) openivm_affected_keys
+          |) AS d
+          |ON v.${paddedSqlIdent(targetCol)} IS NOT DISTINCT FROM d.$keyAlias
+          |WHEN MATCHED THEN DELETE""".stripMargin
+    )
+  }
+
+  private case class ParsedInClause(targetCol: String, sourceExpr: String, subquery: String)
+
+  private def parseSingleColumnInClause(clause: String): Option[ParsedInClause] = {
+    val openIdx = clause.toUpperCase.indexOf(" IN ")
+    if (openIdx < 0) return None
+    val lhs = clause.substring(0, openIdx).trim
+    if (lhs.startsWith("(") || lhs.contains(",")) return None
+    val rest = clause.substring(openIdx + 4).trim
+    if (!rest.startsWith("(")) return None
+    val close = findMatchingCloseParen(rest, 0)
+    if (close < 0) return None
+    val subq     = rest.substring(1, close).trim
+    val selectRe = """(?is)^\s*SELECT\s+(?:DISTINCT\s+)?(.+?)\s+FROM\s+.+$""".r
+    selectRe.findFirstMatchIn(subq).flatMap { m =>
+      val sourceExpr = stripProjectionAlias(m.group(1).trim)
+      if (sourceExpr.contains(",")) None
+      else Some(ParsedInClause(stripSqlIdentifier(lhs), sourceExpr, subq))
+    }
+  }
+
+  private def stripProjectionAlias(expr: String): String =
+    """(?is)^(.+?)\s+AS\s+(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\s*$""".r
+      .findFirstMatchIn(expr)
+      .map(_.group(1).trim)
+      .getOrElse(expr)
+
+  private def stripSqlIdentifier(ident: String): String =
+    ident.trim.stripPrefix("`").stripSuffix("`")
+
+  private def paddedSqlIdent(ident: String): String =
+    quoteIfNeeded(stripSqlIdentifier(ident))
+
+  private def quoteIfNeeded(ident: String): String = {
+    val clean = stripSqlIdentifier(ident)
+    if (clean.matches("[A-Za-z_][A-Za-z0-9_]*")) clean
+    else s"`${clean.replace("`", "``")}`"
   }
 
   /** Convert a single `<col> IN (SELECT …)` clause to a `MERGE INTO <mv> AS v
