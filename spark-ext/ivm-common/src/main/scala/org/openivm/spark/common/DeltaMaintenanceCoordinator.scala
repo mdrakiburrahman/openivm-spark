@@ -102,7 +102,11 @@ object DeltaMaintenanceCoordinator {
 
       val spark = this.synchronized { sparkSession }
       if (spark != null) {
-        runOnce(spark)
+        try runOnce(spark)
+        catch {
+          case error: Throwable =>
+            log.warn("openivm Delta maintenance tick failed", error)
+        }
       }
     }
 
@@ -118,12 +122,19 @@ object DeltaMaintenanceCoordinator {
       }
 
     mvs.foreach { mv =>
-      val location = normalizeLocation(mv.location)
-      if (isInProgress(location)) {
-        log.debug(s"openivm Delta maintenance skipped in-progress MV at ${mv.location}")
-      } else {
-        runOptimizeIfNeeded(spark, mv)
-        runVacuumIfNeeded(spark, mv)
+      try {
+        val location = normalizeLocation(mv.location)
+        if (isInProgress(location)) {
+          log.debug(s"openivm Delta maintenance skipped in-progress MV at ${mv.location}")
+        } else {
+          runOptimizeIfNeeded(spark, mv)
+          runVacuumIfNeeded(spark, mv)
+        }
+      } catch {
+        case error: Throwable =>
+          // One poison MV (e.g. null location) must not abort the tick or kill
+          // the daemon thread — skip it and continue with the rest.
+          log.warn(s"openivm Delta maintenance skipped MV '${mv.name}' after error", error)
       }
     }
   }

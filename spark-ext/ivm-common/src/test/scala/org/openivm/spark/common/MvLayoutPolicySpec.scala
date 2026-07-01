@@ -14,8 +14,6 @@ class MvLayoutPolicySpec extends AnyFunSpec with Matchers {
     recompute = false,
     legacyWindowClusterPrune = false,
     fullRefreshOptimizeWrite = false,
-    targetFileSize = None,
-    tuneFileSizesForRewrites = false,
     dataSkippingStatsColumns = false,
     checkpointInterval = None
   )
@@ -90,22 +88,8 @@ class MvLayoutPolicySpec extends AnyFunSpec with Matchers {
   }
 
   describe("extra TBLPROPERTIES levers") {
-    it("targetFileSize / tuneFileSizesForRewrites / checkpointInterval are neutral until set") {
+    it("checkpointInterval / dataSkippingStatsColumns are neutral until set") {
       resolve(allOff, RefreshTypeCode.SimpleProjection, Seq("a")).extraTblProperties shouldBe empty
-    }
-
-    it("emits delta.targetFileSize when configured") {
-      val cfg = allOff.copy(targetFileSize = Some("64mb"))
-      resolve(cfg, RefreshTypeCode.SimpleProjection, Seq("a")).extraTblProperties should contain(
-        "'delta.targetFileSize' = '64mb'"
-      )
-    }
-
-    it("emits delta.tuneFileSizesForRewrites when enabled") {
-      val cfg = allOff.copy(tuneFileSizesForRewrites = true)
-      resolve(cfg, RefreshTypeCode.SimpleProjection, Seq("a")).extraTblProperties should contain(
-        "'delta.tuneFileSizesForRewrites' = 'true'"
-      )
     }
 
     it("indexes data-skipping stats on the probe key when enabled") {

@@ -275,9 +275,11 @@ object FeatureGate {
   val LayoutFullRefreshOptimizeWriteKey: String = "spark.openivm.delta.layout.fullRefresh.optimizeWrite"
 
   // Per-type TBLPROPERTIES calibration (DA.6 "all tunables" sweep). Each is
-  // neutral when unset/OFF so it does not perturb the OFF baseline.
-  val DeltaTargetFileSizeKey: String           = "spark.openivm.delta.targetFileSize"
-  val DeltaTuneFileSizesForRewritesKey: String = "spark.openivm.delta.tuneFileSizesForRewrites.enabled"
+  // neutral when unset/OFF so it does not perturb the OFF baseline. NOTE:
+  // `delta.targetFileSize` / `delta.tuneFileSizesForRewrites` are Databricks-only
+  // and rejected by OSS Delta 3.2.0 (DELTA_UNKNOWN_CONFIGURATION at CREATE), so
+  // they are intentionally NOT exposed here; OSS OPTIMIZE output sizing is the
+  // `spark.databricks.delta.optimize.maxFileSize` spark conf instead.
   val DeltaDataSkippingStatsColumnsKey: String = "spark.openivm.delta.dataSkippingStatsColumns.enabled"
   val DeltaCheckpointIntervalKey: String       = "spark.openivm.delta.checkpointInterval"
 
@@ -308,9 +310,6 @@ object FeatureGate {
   private def intConf(conf: SparkConf, key: String, default: Int): Int =
     conf.getInt(key, default)
 
-  private def stringConfOpt(conf: SparkConf, key: String): Option[String] =
-    conf.getOption(key).map(_.trim).filter(_.nonEmpty)
-
   def deletionVectorsEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, DeltaEnableDeletionVectorsKey, default = true)
 
@@ -335,12 +334,6 @@ object FeatureGate {
 
   def layoutFullRefreshOptimizeWriteEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, LayoutFullRefreshOptimizeWriteKey, default = false)
-
-  def deltaTargetFileSize(spark: SparkSession): Option[String] =
-    stringConfOpt(spark.sparkContext.getConf, DeltaTargetFileSizeKey)
-
-  def deltaTuneFileSizesForRewritesEnabled(spark: SparkSession): Boolean =
-    boolConf(spark.sparkContext.getConf, DeltaTuneFileSizesForRewritesKey, default = false)
 
   def deltaDataSkippingStatsColumnsEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, DeltaDataSkippingStatsColumnsKey, default = false)

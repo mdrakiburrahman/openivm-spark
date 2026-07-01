@@ -34,8 +34,6 @@ object MvLayoutPolicy {
       recompute: Boolean,
       legacyWindowClusterPrune: Boolean,
       fullRefreshOptimizeWrite: Boolean,
-      targetFileSize: Option[String],
-      tuneFileSizesForRewrites: Boolean,
       dataSkippingStatsColumns: Boolean,
       checkpointInterval: Option[Int]
   )
@@ -58,8 +56,6 @@ object MvLayoutPolicy {
     recompute = FeatureGate.layoutRecomputeEnabled(spark),
     legacyWindowClusterPrune = FeatureGate.windowClusterPruneEnabled(spark),
     fullRefreshOptimizeWrite = FeatureGate.layoutFullRefreshOptimizeWriteEnabled(spark),
-    targetFileSize = FeatureGate.deltaTargetFileSize(spark),
-    tuneFileSizesForRewrites = FeatureGate.deltaTuneFileSizesForRewritesEnabled(spark),
     dataSkippingStatsColumns = FeatureGate.deltaDataSkippingStatsColumnsEnabled(spark),
     checkpointInterval = FeatureGate.deltaCheckpointInterval(spark)
   )
@@ -80,8 +76,6 @@ object MvLayoutPolicy {
     val cluster = if (clusteringEnabled(cfg, refreshType)) keys.take(4) else Nil
 
     val props = scala.collection.mutable.ArrayBuffer.empty[String]
-    cfg.targetFileSize.foreach(sz => props += s"'delta.targetFileSize' = '$sz'")
-    if (cfg.tuneFileSizesForRewrites) props += "'delta.tuneFileSizesForRewrites' = 'true'"
     // Index data-skipping stats on exactly the probe key(s) so min/max file
     // pruning is cheap + targeted, vs Delta's default first-N-column stats.
     if (cfg.dataSkippingStatsColumns && keys.nonEmpty)
