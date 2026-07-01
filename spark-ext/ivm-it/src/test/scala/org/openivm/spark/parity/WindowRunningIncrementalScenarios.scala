@@ -132,5 +132,37 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_wow_mv", wowSql)
       mvRefreshType("wri_wow_mv") shouldBe RefreshTypeCode.WindowPartition
     }
+
+    it("keeps a downstream MV correct via the window fast path's cascade view-delta") {
+      sql("CREATE TABLE wri_casc_market(dm_date DATE, dm_s_symb STRING, dm_low INT, dm_high INT) USING DELTA")
+      sql(
+        "INSERT INTO wri_casc_market VALUES " +
+          "(DATE '2024-01-01','AAA',10,20),(DATE '2024-01-02','AAA',8,22)," +
+          "(DATE '2024-01-01','BBB',15,25),(DATE '2024-01-02','BBB',14,26)"
+      )
+      val upstreamSql =
+        "SELECT dm_date, dm_s_symb, " +
+          "MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low, " +
+          "MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high " +
+          "FROM wri_casc_market"
+      sql(s"CREATE MATERIALIZED VIEW wri_casc_win AS $upstreamSql")
+      // Downstream MV consumes the window MV's view-delta (depth-2 MV-over-MV chain).
+      val downstreamSql =
+        "SELECT dm_s_symb, COUNT(*) AS n, MIN(wk_low) AS lo, MAX(wk_high) AS hi FROM wri_casc_win GROUP BY dm_s_symb"
+      sql(s"CREATE MATERIALIZED VIEW wri_casc_agg AS $downstreamSql")
+      assertMvCorrect("wri_casc_win", upstreamSql)
+      assertMvCorrect("wri_casc_agg", downstreamSql)
+
+      // Strictly-later insert-only batch → window fast path → cascade view-delta → downstream stays incremental.
+      sql(
+        "INSERT INTO wri_casc_market VALUES " +
+          "(DATE '2024-01-03','AAA',7,24),(DATE '2024-01-03','BBB',13,27),(DATE '2024-01-01','CCC',30,40)"
+      )
+      refreshMv("wri_casc_win")
+      refreshMv("wri_casc_agg")
+      assertMvCorrect("wri_casc_win", upstreamSql)
+      assertMvCorrect("wri_casc_agg", downstreamSql)
+      mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
+    }
   }
 }
