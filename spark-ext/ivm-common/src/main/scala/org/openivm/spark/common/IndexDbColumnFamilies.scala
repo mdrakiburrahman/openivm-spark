@@ -5,9 +5,9 @@ package org.openivm.spark.common
   *
   * The [[org.openivm.spark.common.rocksdb.OpenIvmRocksDBRegistry]] enforces
   * a no-widening invariant on the requested CF set per DB path, so every
-  * caller that opens this DB MUST declare the full union.  Keep this list
+  * caller that opens this DB MUST declare the full union. Keep this list
   * in sync with all `openIndexDb` call sites: [[MvCatalog]],
-  * [[StagingCatalog]], and [[CdfWatermarkCatalog]].
+  * [[StagingCatalog]], [[CdfWatermarkCatalog]], and [[WindowStateCatalog]].
   */
 private[common] object IndexDbColumnFamilies {
 
@@ -15,6 +15,7 @@ private[common] object IndexDbColumnFamilies {
   val SourceToMvs: String   = "source_to_mvs"
   val TableIndex: String    = "table_index"
   val CdfWatermarks: String = "cdf_watermarks"
+  val WindowState: String   = "window_state"
 
-  val All: Seq[String] = Seq(MvIndex, SourceToMvs, TableIndex, CdfWatermarks)
+  val All: Seq[String] = Seq(MvIndex, SourceToMvs, TableIndex, CdfWatermarks, WindowState)
 }
