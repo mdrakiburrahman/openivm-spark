@@ -2297,20 +2297,6 @@ case class RefreshMaterializedViewCommand(
               meta.refreshType == RefreshTypeCode.WindowPartition
             ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
             else None
-          lazy val windowSinglePassReplaceSql: Option[String] =
-            if (
-              FeatureGate.windowSinglePassReplaceEnabled(spark) &&
-              meta.refreshType == RefreshTypeCode.WindowPartition &&
-              !windowSuffixSafe &&
-              boundedRankInsertSql.isEmpty
-            )
-              buildWindowSinglePassReplaceSql(
-                spark,
-                meta,
-                mergeTargetId,
-                rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
-              )
-            else None
 
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
@@ -2329,10 +2315,6 @@ case class RefreshMaterializedViewCommand(
               boundedRankInsertSql.isDefined && isWindowPartitionAuxSql(sql, mergeTargetId)
             val replaceWithBoundedRankInsert =
               boundedRankInsertSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
-            val skipWindowSinglePassDelete =
-              windowSinglePassReplaceSql.isDefined && isWindowPartitionDeleteSql(sql, mergeTargetId)
-            val replaceWithWindowSinglePassInsert =
-              windowSinglePassReplaceSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
 
             if (skipDeleteMerge) {
               logInfo(
@@ -2381,21 +2363,6 @@ case class RefreshMaterializedViewCommand(
               )
               withPlanTimeBroadcastDisabled {
                 executeSqlAt(boundedRankInsertSql.get, idx)
-              }
-            } else if (skipWindowSinglePassDelete) {
-              logSkippedWindowStmt(idx, "window_replace_delete_skipped")
-            } else if (replaceWithWindowSinglePassInsert) {
-              if (windowSinglePassReplaceSql.get.isEmpty) {
-                logSkippedWindowStmt(idx, "window_replace_empty_skipped")
-              } else {
-                RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_single_pass_replace'")
-                logInfo(
-                  s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                    "outcome='window_single_pass_replace' reason='small_literal_partition_set'"
-                )
-                withPlanTimeBroadcastDisabled {
-                  executeSqlAt(windowSinglePassReplaceSql.get, idx)
-                }
               }
             } else {
               // Apply the per-statement plan-time broadcast disable to BOTH
@@ -2768,8 +2735,6 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowSuffixSql(insertSql: String, viewDeltaCtasSql: String, insertFromViewDeltaSql: String)
 
-  private case class WindowReplaceKeySet(targetCol: String, literals: Seq[String], hasNull: Boolean)
-
   private case class BoundedRankShape(
       sourceShort: String,
       partitionCols: Seq[String],
@@ -2778,139 +2743,6 @@ case class RefreshMaterializedViewCommand(
       rankFunction: String,
       limit: Int
   )
-
-  private val WindowReplaceMaxLiteralKeys    = 10000
-  private val WindowReplaceMaxPredicateBytes = 1024 * 1024
-
-  private def buildWindowSinglePassReplaceSql(
-      spark: SparkSession,
-      meta: MvMetadata,
-      targetId: TableIdentifier,
-      rewrittenStatements: Seq[String]
-  ): Option[String] = {
-    val insertIdx = rewrittenStatements.indexWhere(isWindowNewSnapshotInsertSql(_, targetId))
-    if (insertIdx < 0) return None
-
-    val deleteSqls = rewrittenStatements.take(insertIdx).filter(isWindowPartitionDeleteSql(_, targetId))
-    if (deleteSqls.isEmpty) return None
-
-    val keySets = deleteSqls.flatMap(collectWindowReplaceKeySet(spark, _))
-    if (keySets.size != deleteSqls.size || keySets.isEmpty) return None
-    if (keySets.forall(keys => keys.literals.isEmpty && !keys.hasNull)) return Some("")
-
-    val predicates = keySets.flatMap { keys =>
-      val inPred =
-        if (keys.literals.nonEmpty) Some(s"${keys.targetCol} IN (${keys.literals.mkString(", ")})")
-        else None
-      val nullPred = if (keys.hasNull) Some(s"${keys.targetCol} IS NULL") else None
-      (inPred ++ nullPred).toSeq match {
-        case Nil      => None
-        case Seq(one) => Some(one)
-        case many     => Some(many.mkString("(", " OR ", ")"))
-      }
-    }
-    if (predicates.isEmpty) return Some("")
-
-    val predicate = predicates.mkString("(", " OR ", ")")
-    if (predicate.length > WindowReplaceMaxPredicateBytes) return None
-
-    val escapedLocation = meta.location.replace("`", "``")
-    val view            = targetId.table.replace("`", "``")
-    Some(
-      s"""|INSERT INTO delta.`$escapedLocation`
-          |REPLACE WHERE $predicate
-          |SELECT * FROM `openivm_new_$view`""".stripMargin
-    )
-  }
-
-  private def isWindowNewSnapshotInsertSql(sql: String, targetId: TableIdentifier): Boolean = {
-    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
-    upper.startsWith(s"INSERT INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)}") &&
-    upper.contains(s"FROM OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}")
-  }
-
-  private def collectWindowReplaceKeySet(spark: SparkSession, deleteMergeSql: String): Option[WindowReplaceKeySet] = {
-    val (targetCol, subquery) = parseWindowDeleteMerge(deleteMergeSql).getOrElse(return None)
-    val probeSql =
-      s"""SELECT DISTINCT * FROM (
-         |$subquery
-         |) __openivm_window_replace_keys
-         |LIMIT ${WindowReplaceMaxLiteralKeys + 1}""".stripMargin
-    val df = spark.sql(probeSql)
-    if (df.schema.fields.length != 1) return None
-    val rows = df.collect()
-    if (rows.length > WindowReplaceMaxLiteralKeys) return None
-
-    val literals = scala.collection.mutable.ArrayBuffer.empty[String]
-    var hasNull  = false
-    rows.foreach { row =>
-      if (row.isNullAt(0)) hasNull = true
-      else
-        literalSql(row.get(0)) match {
-          case Some(lit) => literals += lit
-          case None      => return None
-        }
-    }
-    Some(WindowReplaceKeySet(targetCol, literals.distinct.toSeq, hasNull))
-  }
-
-  private def parseWindowDeleteMerge(sql: String): Option[(String, String)] = {
-    val usingIdx = "(?is)\\bUSING\\s*\\(".r.findFirstMatchIn(sql).map(_.end - 1).getOrElse(return None)
-    val closeIdx = matchingCloseParen(sql, usingIdx)
-    if (closeIdx < 0) return None
-    val subquery = sql.substring(usingIdx + 1, closeIdx).trim
-    val tail     = sql.substring(closeIdx + 1)
-    val ident    = """(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"""
-    val onRe =
-      ("""(?is)\bAS\s+d\s+ON\s+v\.\s*(""" + ident + """)\s+IS\s+NOT\s+DISTINCT\s+FROM\s+d\.\s*(""" +
-        ident + """)\s+WHEN\s+MATCHED\s+THEN\s+DELETE\b""").r
-    onRe.findFirstMatchIn(tail).map(m => m.group(1).trim -> subquery)
-  }
-
-  private def matchingCloseParen(sql: String, openIdx: Int): Int = {
-    var depth    = 0
-    var i        = openIdx
-    var inSingle = false
-    var inTick   = false
-    while (i < sql.length) {
-      val c = sql.charAt(i)
-      if (inSingle) {
-        if (c == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 1
-        else if (c == '\'') inSingle = false
-      } else if (inTick) {
-        if (c == '`') inTick = false
-      } else {
-        c match {
-          case '\'' => inSingle = true
-          case '`'  => inTick = true
-          case '('  => depth += 1
-          case ')' =>
-            depth -= 1
-            if (depth == 0) return i
-          case _ =>
-        }
-      }
-      i += 1
-    }
-    -1
-  }
-
-  private def literalSql(value: Any): Option[String] =
-    value match {
-      case s: String                 => Some("'" + s.replace("'", "''") + "'")
-      case d: java.sql.Date          => Some("DATE '" + d.toString + "'")
-      case t: java.sql.Timestamp     => Some("TIMESTAMP '" + t.toString.replace("'", "''") + "'")
-      case b: java.lang.Boolean      => Some(if (b.booleanValue()) "TRUE" else "FALSE")
-      case bd: java.math.BigDecimal  => Some(bd.toPlainString)
-      case bd: scala.math.BigDecimal => Some(bd.bigDecimal.toPlainString)
-      case n: java.lang.Byte         => Some(n.toString)
-      case n: java.lang.Short        => Some(n.toString)
-      case n: java.lang.Integer      => Some(n.toString)
-      case n: java.lang.Long         => Some(n.toString)
-      case n: java.lang.Float        => if (java.lang.Float.isFinite(n)) Some(n.toString) else None
-      case n: java.lang.Double       => if (java.lang.Double.isFinite(n)) Some(n.toString) else None
-      case _                         => None
-    }
 
   private def buildWindowSuffixSql(
       spark: SparkSession,
