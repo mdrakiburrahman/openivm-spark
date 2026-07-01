@@ -1661,6 +1661,18 @@ case class RefreshMaterializedViewCommand(
                 facts = compileFacts
               )
             )
+            if (
+              FeatureGate.windowRunningIncrementalEnabled(spark) &&
+              meta.refreshType == RefreshTypeCode.WindowPartition
+            ) {
+              logWarning(
+                s"[p52-diag] view='${sqlIdent(name)}' refreshType='${meta.refreshTypeName}' " +
+                  s"assumeInsertOnly=${compileFacts.assumeInsertOnly} " +
+                  s"runningWindowIncremental=${compileFacts.runningWindowIncremental} " +
+                  s"deltaShapes=[${sourceDeltaShape.map { case (t, s) => s"$t=$s" }.mkString(",")}] " +
+                  s"emittedFastPath=${fresh.sql.contains("openivm_run_fast")}"
+              )
+            }
             if (compileCacheEnabled && fresh.sql.nonEmpty) {
               val backfilled = meta.properties ++
                 MvMetadata.compiledProperties(
