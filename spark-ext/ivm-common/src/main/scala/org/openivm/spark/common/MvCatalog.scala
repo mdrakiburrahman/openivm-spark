@@ -113,6 +113,13 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
+  val LastCostModelHintKey: String              = "_ivm_last_cost_model_hint"
+  val LastCostModelRefreshIdKey: String         = "_ivm_last_cost_model_refresh_id"
+  val LastCostModelAffectedFractionKey: String  = "_ivm_last_cost_model_affected_fraction"
+  val LastCostModelIncrementalCostKey: String   = "_ivm_last_cost_model_incremental_cost"
+  val LastCostModelFullRecomputeCostKey: String = "_ivm_last_cost_model_full_recompute_cost"
+  val LastCostModelRationaleKey: String         = "_ivm_last_cost_model_rationale"
+
   /** Legacy naive compile-cache keys.  Do not write new values here: they
     * were not schema/tier keyed.  They remain readable only for full-refresh
     * hidden-column recovery on old metadata rows.
@@ -141,6 +148,16 @@ object MvMetadata {
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
+
+  def costModelProperties(refreshId: String, estimate: RefreshCostEstimate): Map[String, String] =
+    Map(
+      LastCostModelHintKey              -> (if (estimate.recommendFullRefresh) "FULL_RECOMPUTE" else "INCREMENTAL"),
+      LastCostModelRefreshIdKey         -> refreshId,
+      LastCostModelAffectedFractionKey  -> f"${estimate.affectedFraction}%.6f",
+      LastCostModelIncrementalCostKey   -> f"${estimate.incrementalCost}%.2f",
+      LastCostModelFullRecomputeCostKey -> f"${estimate.fullRecomputeCost}%.2f",
+      LastCostModelRationaleKey         -> estimate.rationale
+    )
 
   /** Tier component for the W7.1 compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative

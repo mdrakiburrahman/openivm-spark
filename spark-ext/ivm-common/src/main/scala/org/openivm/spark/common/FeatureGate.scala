@@ -80,6 +80,11 @@ object FeatureGate {
     */
   val CompileClassificationCacheEnabledKey: String = "spark.openivm.compile.classificationCache.enabled"
 
+  /** Compute and persist/log the refresh cost-model routing hint for WINDOW_PARTITION MVs.
+    * Default OFF: the hint is observable-only and never changes refresh execution.
+    */
+  val RefreshCostModelEnabledKey: String = "spark.openivm.refresh.costModel.enabled"
+
   /** Capture every SQL statement actually executed by a CREATE / REFRESH
     * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
     * family ([[RefreshSqlLogCatalog]]).
@@ -294,6 +299,9 @@ object FeatureGate {
 
   def compileClassificationCacheEnabled(conf: SparkConf): Boolean =
     boolConf(conf, CompileClassificationCacheEnabledKey, default = false)
+
+  def refreshCostModelEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, RefreshCostModelEnabledKey, default = false)
 
   def queryLogEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)

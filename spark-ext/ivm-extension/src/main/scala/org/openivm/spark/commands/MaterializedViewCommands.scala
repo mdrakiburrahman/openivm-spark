@@ -1594,7 +1594,22 @@ case class RefreshMaterializedViewCommand(
       q.split("\\.").last -> q
     }
     val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
+    val statsService        = SparkDeltaStatsService.forRefresh()
     val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+    lazy val compileFacts = {
+      val statsFacts = statsService.workloadFactsFor(spark, meta.sourceTables, changeBatches)
+      statsFacts.copy(
+        deltaShape = sourceDeltaShape,
+        fkRelations = constraintFacts.fkRelations,
+        uniqueKeys = constraintFacts.uniqueKeys,
+        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+        assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.WindowPartition &&
+          sourceDeltaShape.nonEmpty &&
+          sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
+          sourceDeltaShape.values.forall(_ != DeltaShape.General)
+      )
+    }
     val cacheTierFacts = WorkloadFacts(
       deltaShape = sourceDeltaShape,
       fkRelations = constraintFacts.fkRelations,
@@ -1617,7 +1632,8 @@ case class RefreshMaterializedViewCommand(
           .cachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint, compileCacheTier)
           .getOrElse("")
       } else ""
-    val compileCacheHit = cachedCompiledSql.isDefined
+    val compileCacheHit  = cachedCompiledSql.isDefined
+    var latestProperties = meta.properties
     val compiled = profile.timeStep(
       "generate_refresh_sql.compile",
       s"compile_cache_hit=$compileCacheHit;compile_cache_tier=$compileCacheTier"
@@ -1638,20 +1654,6 @@ case class RefreshMaterializedViewCommand(
             )
           case None =>
             val compiler = OpenIvmCompilers.forSession(spark)
-            val statsFacts = SparkDeltaStatsService
-              .forRefresh()
-              .workloadFactsFor(spark, meta.sourceTables, changeBatches)
-            val compileFacts = statsFacts.copy(
-              deltaShape = sourceDeltaShape,
-              fkRelations = constraintFacts.fkRelations,
-              uniqueKeys = constraintFacts.uniqueKeys,
-              runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-              assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
-                meta.refreshType == RefreshTypeCode.WindowPartition &&
-                sourceDeltaShape.nonEmpty &&
-                sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
-                sourceDeltaShape.values.forall(_ != DeltaShape.General)
-            )
             val fresh = compiler.compile(
               CompileRequest(
                 viewName = name.table,
@@ -1662,7 +1664,7 @@ case class RefreshMaterializedViewCommand(
               )
             )
             if (compileCacheEnabled && fresh.sql.nonEmpty) {
-              val backfilled = meta.properties ++
+              val backfilled = latestProperties ++
                 MvMetadata.compiledProperties(
                   meta.sourceSchemaFingerprint,
                   compileCacheTier,
@@ -1671,8 +1673,10 @@ case class RefreshMaterializedViewCommand(
                   fresh.refreshType,
                   fresh.refreshTypeName
                 )
-              try MvCatalog.updateProperties(spark, name, backfilled)
-              catch {
+              try {
+                MvCatalog.updateProperties(spark, name, backfilled)
+                latestProperties = backfilled
+              } catch {
                 case t: Throwable =>
                   logWarning(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
@@ -1682,6 +1686,34 @@ case class RefreshMaterializedViewCommand(
             }
             fresh
         }
+      }
+    }
+
+    if (FeatureGate.refreshCostModelEnabled(spark) && meta.refreshType == RefreshTypeCode.WindowPartition) {
+      val mvRowCount = scala.util.Try(statsService.statsFor(spark, meta.location).tableStats.rowCount).getOrElse(0L)
+      val estimate = RefreshCostModel.estimate(
+        refreshType = meta.refreshType,
+        facts = compileFacts,
+        mvRowCount = mvRowCount,
+        sourceTables = meta.sourceTables
+      )
+      val routingHint = if (estimate.recommendFullRefresh) "FULL_RECOMPUTE" else "INCREMENTAL"
+      logInfo(
+        s"[openivm-cost-model] refresh_id='$refreshId' view='$viewLabel' refresh_type='${meta.refreshTypeName}' " +
+          s"routing_hint='$routingHint' affected_fraction=${estimate.affectedFraction} " +
+          s"incremental_cost=${estimate.incrementalCost} full_recompute_cost=${estimate.fullRecomputeCost} " +
+          s"rationale='${estimate.rationale}'"
+      )
+      val costProperties = latestProperties ++ MvMetadata.costModelProperties(refreshId, estimate)
+      try {
+        MvCatalog.updateProperties(spark, name, costProperties)
+        latestProperties = costProperties
+      } catch {
+        case t: Throwable =>
+          logWarning(
+            s"[openivm-cost-model] refresh_id='$refreshId' view='$viewLabel' " +
+              s"property_update_failed='${t.getClass.getName}: ${t.getMessage}'"
+          )
       }
     }
 
