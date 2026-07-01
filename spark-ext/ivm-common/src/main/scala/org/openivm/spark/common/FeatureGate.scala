@@ -251,6 +251,15 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Back the running-window suffix-extend refresh (P5.2) with a RocksDB
+    * `WindowStateCatalog` — per-partition `(running_value, max_order_key)` — so
+    * the refresh recovers its running state from an `O(affected partitions)`
+    * point lookup instead of scanning the full MV data table. This is what makes
+    * P5.2 actually pay off at SF10 (issue #15). Default OFF; only meaningful when
+    * `windowRunningIncremental` is also enabled.
+    */
+  val WindowRocksdbStateEnabledKey: String = "spark.openivm.window.rocksdbState.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -380,6 +389,12 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def windowRocksdbStateEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowRocksdbStateEnabledKey, default = false)
+
+  def windowRocksdbStateEnabled(spark: SparkSession): Boolean =
+    windowRocksdbStateEnabled(spark.sparkContext.getConf)
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)
