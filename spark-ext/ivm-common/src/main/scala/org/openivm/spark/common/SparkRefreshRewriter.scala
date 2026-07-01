@@ -47,6 +47,12 @@ final case class RewrittenRefresh(statements: Seq[String])
 object SparkRefreshRewriter {
 
   final case class SelectiveBroadcastTable(shortName: String, qualifiedName: String, sizeBytes: Long)
+  final case class SkewFanoutDeltaBroadcast(
+      shortName: String,
+      qualifiedName: String,
+      deltaRows: Long,
+      signal: String
+  )
 
   private final case class SqlRelationRef(relation: String, alias: String)
   private final case class Scd2RangeJoin(
@@ -109,6 +115,68 @@ object SparkRefreshRewriter {
         val aliases  = broadcastAliasesInBlock(block, names)
         if (aliases.isEmpty) None
         else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${aliases.mkString(", ")}) */")
+      }
+      if (edits.isEmpty) sql
+      else {
+        val out  = new StringBuilder(sql)
+        var bias = 0
+        edits.foreach { case (idx, hint) =>
+          out.insert(idx + bias, hint)
+          bias += hint.length
+        }
+        out.toString()
+      }
+    }
+  }
+
+  private[spark] def planSkewFanoutDeltaBroadcasts(
+      facts: WorkloadFacts,
+      maxDeltaRows: Long,
+      maxOverlapRatio: Double
+  ): Seq[SkewFanoutDeltaBroadcast] =
+    facts.deltaStats.toSeq
+      .flatMap { case (table, delta) =>
+        delta.rowCount.filter(rows => rows >= 0L && rows <= maxDeltaRows).map { rows =>
+          val signal = narrowestOverlapSignal(table, delta, facts.columnStats, maxOverlapRatio)
+            .getOrElse(s"delta_rows=$rows<=${maxDeltaRows};histogram_bins=unavailable")
+          SkewFanoutDeltaBroadcast(shortTableName(table), table, rows, signal)
+        }
+      }
+      .sortBy(b => (b.shortName.toLowerCase, b.qualifiedName.toLowerCase))
+
+  private[spark] def injectSkewFanoutBroadcastHints(
+      sql: String,
+      broadcasts: Seq[SkewFanoutDeltaBroadcast]
+  ): String = {
+    if (broadcasts.isEmpty || sql.contains("OPENIVM_SKEW_FANOUT") || !"(?is)\\bJOIN\\b".r.findFirstIn(sql).isDefined)
+      sql
+    else {
+      val deltaNames = broadcasts
+        .flatMap { b =>
+          val deltaShort = s"openivm_delta_${b.shortName}"
+          Seq(deltaShort, s"memory.main.$deltaShort")
+        }
+        .map(normalizeSqlIdentifier)
+        .toSet
+      val byShort = broadcasts.map(b => b.shortName.toLowerCase -> b).toMap
+      val edits = selectKeywordOffsets(sql).flatMap { selectIdx =>
+        val blockEnd = selectBlockEnd(sql, selectIdx)
+        val block    = sql.substring(selectIdx, blockEnd)
+        val aliases  = broadcastAliasesInBlock(block, deltaNames)
+        if (aliases.isEmpty) None
+        else {
+          val observed = relationRefsInBlock(block).flatMap { ref =>
+            deltaSourceShortName(normalizeSqlIdentifier(ref.relation).split("\\.").lastOption.getOrElse(ref.relation))
+              .flatMap(short => byShort.get(short.toLowerCase))
+          }.distinct
+          val signal = observed
+            .map(b => s"${b.shortName}:rows=${b.deltaRows}:${b.signal}")
+            .mkString(";")
+            .replace("*/", "")
+          Some(
+            selectIdx + "SELECT".length -> s" /*+ BROADCAST(${aliases.mkString(", ")}) */ /*OPENIVM_SKEW_FANOUT $signal*/"
+          )
+        }
       }
       if (edits.isEmpty) sql
       else {
@@ -703,6 +771,70 @@ object SparkRefreshRewriter {
 
   private def shortTableName(table: String): String =
     table.split("\\.").last.replace("`", "").replace("\"", "")
+
+  private def narrowestOverlapSignal(
+      table: String,
+      delta: WorkloadDeltaStats,
+      columnStats: Map[String, WorkloadColumnStats],
+      maxOverlapRatio: Double
+  ): Option[String] = {
+    val tableNorm = normalizeSqlIdentifier(table)
+    val candidates = (delta.min.keySet ++ delta.max.keySet).flatMap { column =>
+      for {
+        deltaMin <- delta.min.get(column)
+        deltaMax <- delta.max.get(column)
+        base     <- columnStatsFor(columnStats, tableNorm, column)
+        baseMin  <- base.min
+        baseMax  <- base.max
+        ratio    <- overlapRatio(deltaMin, deltaMax, baseMin, baseMax)
+        if ratio <= maxOverlapRatio
+      } yield s"min_max_overlap column=$column ratio=${"%.6f".formatLocal(java.util.Locale.ROOT, ratio)}<=${maxOverlapRatio}"
+    }
+    candidates.toSeq.sorted.headOption
+  }
+
+  private def columnStatsFor(
+      columnStats: Map[String, WorkloadColumnStats],
+      tableNorm: String,
+      column: String
+  ): Option[WorkloadColumnStats] = {
+    val columnNorm = normalizeSqlIdentifier(column)
+    columnStats
+      .get(s"$tableNorm.$columnNorm")
+      .orElse {
+        columnStats.collectFirst {
+          case (key, stat)
+              if normalizeSqlIdentifier(key) == s"$tableNorm.$columnNorm" ||
+                normalizeSqlIdentifier(key).endsWith(s".$tableNorm.$columnNorm") =>
+            stat
+        }
+      }
+  }
+
+  private def overlapRatio(deltaMin: String, deltaMax: String, baseMin: String, baseMax: String): Option[Double] =
+    (toDecimal(deltaMin), toDecimal(deltaMax), toDecimal(baseMin), toDecimal(baseMax)) match {
+      case (Some(dMin), Some(dMax), Some(bMin), Some(bMax)) =>
+        val deltaLo = dMin.min(dMax)
+        val deltaHi = dMin.max(dMax)
+        val baseLo  = bMin.min(bMax)
+        val baseHi  = bMin.max(bMax)
+        if (deltaHi < baseLo || baseHi < deltaLo) Some(0.0d)
+        else {
+          val baseWidth = baseHi - baseLo
+          if (baseWidth == BigDecimal(0)) Some(if (deltaLo == baseLo && deltaHi == baseHi) 0.0d else 1.0d)
+          else {
+            val overlapLo = deltaLo.max(baseLo)
+            val overlapHi = deltaHi.min(baseHi)
+            Some(((overlapHi - overlapLo) / baseWidth).toDouble.max(0.0d))
+          }
+        }
+      case _ if deltaMin == deltaMax && baseMin <= deltaMin && deltaMin <= baseMax =>
+        Some(0.0d)
+      case _ => None
+    }
+
+  private def toDecimal(value: String): Option[BigDecimal] =
+    scala.util.Try(BigDecimal(value)).toOption
 
   private case class FkTermPruneRelation(
       childShortName: String,
