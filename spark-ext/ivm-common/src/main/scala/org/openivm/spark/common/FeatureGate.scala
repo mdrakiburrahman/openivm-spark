@@ -258,6 +258,12 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Enable openivm cascade-delta minimization for recompute cascade producers.
+    * Default OFF so legacy WINDOW/GROUP_RECOMPUTE cascade snapshots remain
+    * byte-identical unless explicitly enabled.
+    */
+  val CascadeDeltaMinimizeEnabledKey: String = "spark.openivm.refresh.cascadeDeltaMinimize.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -393,6 +399,12 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def cascadeDeltaMinimizeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, CascadeDeltaMinimizeEnabledKey, default = false)
+
+  def cascadeDeltaMinimizeEnabled(spark: SparkSession): Boolean =
+    cascadeDeltaMinimizeEnabled(spark.sparkContext.getConf)
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)

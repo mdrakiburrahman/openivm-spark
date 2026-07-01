@@ -16,7 +16,7 @@ class WorkloadFactsSpec extends AnyFunSpec with Matchers {
   describe("WorkloadFacts") {
     it("serializes empty registry facts by default") {
       WorkloadFacts().toJson shouldBe
-        """{"schema_version":2,"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true,"assume_insert_only":false,"running_window_incremental":false,"delta_shape":{},"fk_relations":[],"unique_keys":[],"table_stats":{},"column_stats":{},"delta_stats":{}}"""
+        """{"schema_version":2,"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true,"assume_insert_only":false,"running_window_incremental":false,"cascade_delta_minimize":false,"delta_shape":{},"fk_relations":[],"unique_keys":[],"table_stats":{},"column_stats":{},"delta_stats":{}}"""
     }
 
     it("serializes per-source delta_shape facts deterministically") {

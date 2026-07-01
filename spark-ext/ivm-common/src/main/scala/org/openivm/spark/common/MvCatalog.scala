@@ -163,7 +163,8 @@ object MvMetadata {
       .mkString(";")
     val raw =
       s"dialect=${facts.targetDialect}|compileOnly=${facts.compileOnly}|cascade=${facts.forceViewDeltaCascade}|" +
-        s"insertOnly=${facts.assumeInsertOnly}|shape=$shapes|fk=$fks|unique=$uniques"
+        s"insertOnly=${facts.assumeInsertOnly}|cascadeMin=${facts.cascadeDeltaMinimize}|shape=$shapes|" +
+        s"fk=$fks|unique=$uniques"
     val digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes("UTF-8"))
     digest.map("%02x".format(_)).mkString
   }

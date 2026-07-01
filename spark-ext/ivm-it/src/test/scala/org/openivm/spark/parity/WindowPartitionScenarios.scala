@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
 
 /** P5.rt5 — Coverage of RefreshType 5 (WINDOW_PARTITION).
   *
@@ -72,6 +72,9 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   */
 abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partition") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] =
+    Map(FeatureGate.WindowSuffixSkipEnabledKey -> "false")
 
   /** Looks up the recorded refresh type for `name` via the MV catalog. */
   protected def mvRefreshType(name: String): Int = {
@@ -406,4 +409,48 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
       assertMvCorrect("mv_wp12", viewSql)
     }
   }
+
+  // ── (13) Cascade-delta minimization keeps suffix appends insert-only ───────
+
+  describe("(13) WINDOW_PARTITION cascade-delta minimization for suffix appends") {
+    itIntercept("emits only positive cascade rows for a suffix append and keeps a downstream MV correct") {
+      sql("CREATE TABLE IF NOT EXISTS casc_min_src(id INT, dept STRING, salary INT) USING DELTA")
+      sql(
+        "INSERT INTO casc_min_src VALUES " +
+          "(1,'eng',100), (2,'eng',200), (3,'eng',300), " +
+          "(4,'sales',50), (5,'sales',75)"
+      )
+
+      val upstreamSql =
+        "SELECT id, dept, salary, " +
+          "ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary, id) AS rn FROM casc_min_src"
+      val downstreamSql =
+        s"SELECT id, dept, salary, rn FROM ($upstreamSql) casc_min_expected"
+
+      sql(s"CREATE MATERIALIZED VIEW casc_min_ranked AS $upstreamSql")
+      sql("CREATE MATERIALIZED VIEW casc_min_ranked_proj AS SELECT id, dept, salary, rn FROM casc_min_ranked")
+
+      mvRefreshType("casc_min_ranked") shouldBe RefreshTypeCode.WindowPartition
+      sql("INSERT INTO casc_min_src VALUES (6,'eng',400)")
+      refreshMv("casc_min_ranked")
+
+      val downstreamMeta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("casc_min_ranked_proj"))
+        .getOrElse(fail("MV casc_min_ranked_proj not found in catalog"))
+      val cascades = StagingCatalog
+        .collectFor(spark, "casc_min_ranked_proj", downstreamMeta.sourceTables)
+        .filter(_.opType == StagingDelta.OpTypes.MvViewDelta)
+      cascades should not be empty
+
+      val cascadeRows = spark.read.format("delta").load(cascades.last.stagingPath)
+      cascadeRows.where("openivm_multiplicity > 0").count() should be > 0L
+      val negativeRows = cascadeRows.where("openivm_multiplicity < 0").count()
+      if (FeatureGate.cascadeDeltaMinimizeEnabled(spark)) negativeRows shouldBe 0L
+      else negativeRows should be > 0L
+
+      refreshMv("casc_min_ranked_proj")
+      assertMvCorrect("casc_min_ranked_proj", downstreamSql)
+    }
+  }
+
 }
