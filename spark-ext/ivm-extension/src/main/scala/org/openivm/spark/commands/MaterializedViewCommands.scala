@@ -1762,6 +1762,38 @@ case class RefreshMaterializedViewCommand(
         }
       }
 
+      if (FeatureGate.runtimeEmptyDeltaSkipEnabled(spark)) {
+        val deltaRowsBySource = meta.sourceTables.map { qualTable =>
+          val deltaView = StagingDeltaView.deltaViewName(qualTable)
+          val hasRows = spark
+            .sql(s"SELECT 1 FROM `${deltaView.replace("`", "``")}` LIMIT 1")
+            .head(1)
+            .nonEmpty
+          qualTable -> hasRows
+        }
+        val nonEmptySources = deltaRowsBySource.collect { case (source, true) => source }
+        if (nonEmptySources.isEmpty) {
+          profile.appendStep(
+            "runtime_empty_delta_skip",
+            s"sources=${deltaRowsBySource.map(_._1).mkString(",")};signal=limit1_empty",
+            0L
+          )
+          RefreshPerf.emit(
+            refreshId,
+            viewLabel,
+            "fast_path",
+            "outcome='runtime_empty_delta_skip' signal='limit1_empty'"
+          )
+          logInfo(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='runtime_empty_delta_skip' " +
+              "reason='all_source_delta_views_empty'"
+          )
+          consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
+          emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
+          return Seq.empty
+        }
+      }
+
       // For AGGREGATE_HAVING the user-facing object is a Spark VIEW; the actual
       // Delta data lives in a sibling table that stores ALL groups (no HAVING
       // filter). Redirect MERGE/DELETE statements to the sibling table so a
@@ -3365,6 +3397,29 @@ case class RefreshMaterializedViewCommand(
         }
       }
     }
+  }
+
+  /** Consume source changes after proving their materialized runtime delta views
+    * are empty. Unlike [[postRefreshCleanup]], this intentionally does not
+    * advance the MV Delta version or synthesize downstream cascade triggers,
+    * because the MV table was not written and its logical contents did not
+    * change.
+    */
+  private def consumeRefreshChangesWithoutMvWrite(
+      spark: SparkSession,
+      viewNameStr: String,
+      changeBatches: Seq[ChangeBatch]
+  ): Unit = {
+    import MvCommandHelper._
+
+    val propagation = ChangePropagationFactory.forSession(spark)
+    propagation.markConsumed(spark, viewNameStr, changeBatches)
+    val viewsByTable = MvCatalog
+      .list(spark)
+      .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+      .groupBy(_._1)
+      .map { case (t, pairs) => t -> pairs.map(_._2) }
+    propagation.pruneConsumed(spark, viewsByTable)
   }
 
   /** True for refresh types whose openivm-emitted MERGE preserves rows whose
