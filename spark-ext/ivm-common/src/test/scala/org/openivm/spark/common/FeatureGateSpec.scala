@@ -102,6 +102,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.scd2RangeJoinAccelEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.scd2RangeJoinAccelEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.scd2RangeJoinAccelEnabled(
+        new SparkConf(false).set(FeatureGate.Scd2RangeJoinAccelEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
   describe("FeatureGate.windowClusterPruneEnabled") {
     it("defaults OFF and honours an explicit ON flag") {
       FeatureGate.windowClusterPruneEnabled(new SparkConf(false)) shouldBe false
