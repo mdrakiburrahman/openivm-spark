@@ -1015,6 +1015,42 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("skew fanout delta broadcast planning") {
+    it("plans and injects a delta BROADCAST hint for narrow min/max overlap") {
+      val facts = WorkloadFacts(
+        columnStats = Map(
+          "db.fact.customer_id" -> WorkloadColumnStats(min = Some("1"), max = Some("100000"), rowCount = Some(1000000L))
+        ),
+        deltaStats = Map(
+          "db.fact" -> WorkloadDeltaStats(
+            rowCount = Some(4L),
+            min = Map("customer_id" -> "42"),
+            max = Map("customer_id" -> "42")
+          )
+        )
+      )
+      val plan = SparkRefreshRewriter.planSkewFanoutDeltaBroadcasts(facts, maxDeltaRows = 100L, maxOverlapRatio = 0.01d)
+      plan should have size 1
+      plan.head.signal should include("min_max_overlap column=customer_id")
+
+      val sql =
+        """SELECT f.id, d.name
+          |FROM memory.main.openivm_delta_fact f
+          |JOIN `db`.`dim_customer` d ON f.customer_id = d.id""".stripMargin
+      val hinted = SparkRefreshRewriter.injectSkewFanoutBroadcastHints(sql, plan)
+
+      hinted should include("SELECT /*+ BROADCAST(f) */ /*OPENIVM_SKEW_FANOUT fact:rows=4:")
+    }
+
+    it("falls back to row-count-only delta broadcast when histogram bins are unavailable") {
+      val facts = WorkloadFacts(deltaStats = Map("db.fact" -> WorkloadDeltaStats(rowCount = Some(5L))))
+      val plan  = SparkRefreshRewriter.planSkewFanoutDeltaBroadcasts(facts, maxDeltaRows = 10L, maxOverlapRatio = 0.05d)
+
+      plan.map(_.shortName) shouldBe Seq("fact")
+      plan.head.signal should include("histogram_bins=unavailable")
+    }
+  }
+
   describe("SCD2 range acceleration injection") {
     it("broadcasts the SCD alias and pre-filters it to the source-delta timestamp range") {
       val sql =
