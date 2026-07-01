@@ -94,11 +94,11 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
   }
 
   describe("FeatureGate.scd2RangeAccelEnabled") {
-    it("defaults ON and honours an explicit OFF flag") {
-      FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe false
       FeatureGate.scd2RangeAccelEnabled(
-        new SparkConf(false).set(FeatureGate.Scd2RangeAccelEnabledKey, "false")
-      ) shouldBe false
+        new SparkConf(false).set(FeatureGate.Scd2RangeAccelEnabledKey, "true")
+      ) shouldBe true
     }
   }
 

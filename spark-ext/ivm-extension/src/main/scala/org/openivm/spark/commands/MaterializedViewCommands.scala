@@ -595,7 +595,8 @@ case class CreateMaterializedViewCommand(
     val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
     val workloadFacts = statsFacts.copy(
       fkRelations = constraintFacts.fkRelations,
-      uniqueKeys = constraintFacts.uniqueKeys
+      uniqueKeys = constraintFacts.uniqueKeys,
+      scd2RangeJoinAccel = FeatureGate.scd2RangeAccelEnabled(spark)
     )
     val compiler = OpenIvmCompilers.forSession(spark)
     val compiled = profile.timeStep(
@@ -1646,6 +1647,7 @@ case class RefreshMaterializedViewCommand(
               fkRelations = constraintFacts.fkRelations,
               uniqueKeys = constraintFacts.uniqueKeys,
               runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+              scd2RangeJoinAccel = FeatureGate.scd2RangeAccelEnabled(spark),
               assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
                 meta.refreshType == RefreshTypeCode.WindowPartition &&
                 sourceDeltaShape.nonEmpty &&
