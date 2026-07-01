@@ -517,13 +517,13 @@ object SparkRefreshRewriter {
       * shape: substitute `openivm_data_<view>` → MV name, rewrite
       * `memory.main.<x>` → `` `<x>` ``, and strip the inner timestamp filter
       * (the Spark staging delta temp view already restricts visible rows). */
-    case object PartitionScopedInsert   extends StatementKind
-    case object RunningWindowTempCreate   extends StatementKind
-    case object RunningWindowFastInsert   extends StatementKind
+    case object PartitionScopedInsert      extends StatementKind
+    case object RunningWindowTempCreate    extends StatementKind
+    case object RunningWindowFastInsert    extends StatementKind
     case object RunningWindowCascadeInsert extends StatementKind
-    case object RunningWindowTempDrop     extends StatementKind
-    case object Cleanup                 extends StatementKind
-    case object Unknown                 extends StatementKind
+    case object RunningWindowTempDrop      extends StatementKind
+    case object Cleanup                    extends StatementKind
+    case object Unknown                    extends StatementKind
   }
 
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {

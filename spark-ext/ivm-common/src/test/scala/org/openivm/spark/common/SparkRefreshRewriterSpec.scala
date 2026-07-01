@@ -1219,10 +1219,11 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       }
       // bounds + state READ the MV, so they must snapshot the pre-refresh Delta
       // version (the program mutates the MV mid-refresh).
-      val boundsCreate = creates.find(_.contains("openivm_run_bounds_wradm_mv")).getOrElse(fail("bounds create missing"))
-      val stateCreate  = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
+      val boundsCreate =
+        creates.find(_.contains("openivm_run_bounds_wradm_mv")).getOrElse(fail("bounds create missing"))
+      val stateCreate = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
       boundsCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
-      stateCreate  should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
+      stateCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
       // Each helper is eagerly CACHEd so the snapshot is frozen before the MV mutates.
       val caches = rewritten.filter(_.startsWith("CACHE TABLE `openivm_run_"))
       caches should have size 5
