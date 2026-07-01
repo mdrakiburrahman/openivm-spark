@@ -229,6 +229,16 @@ private[commands] object MvCommandHelper {
     s"$warehouse/_ivm/views/$segment"
   }
 
+  /** Filesystem-safe segment for per-MV internal namespaces. */
+  def safeMvName(id: TableIdentifier): String =
+    metaName(id).replaceAll("[^A-Za-z0-9_-]", "_")
+
+  /** Stable persisted aux-state Delta path for running-window refreshes. */
+  def auxStatePath(spark: SparkSession, id: TableIdentifier): String = {
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    s"$warehouse/_ivm/aux_state/${safeMvName(id)}"
+  }
+
   /** Resolved simple-column window partition key for liquid-clustering
     * WINDOW_PARTITION MV data tables. Skips safely when any window PARTITION BY
     * expression is not a plain output column, when windows use different keys,
@@ -1695,8 +1705,9 @@ case class RefreshMaterializedViewCommand(
     // name) so two MVs with the same short name in different databases
     // don't collide on disk.
     val warehouse     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
-    val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
+    val safeMvSegment = safeMvName(name)
+    val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvSegment/${java.util.UUID.randomUUID()}"
+    val auxPath       = auxStatePath(spark, name)
 
     val byTable                                 = changeBatches.groupBy(_.baseTable)
     val tempViewShortNames                      = scala.collection.mutable.ArrayBuffer[String]()
@@ -1872,6 +1883,7 @@ case class RefreshMaterializedViewCommand(
             viewLogicalName = name.table,
             sourceTempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap,
             viewDeltaPath = viewDeltaPath,
+            auxStatePath = auxPath,
             postProcess = refreshPostProcess,
             // Pass the user-facing column list for each source so the rewriter can
             // expand DuckDB-style `SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)`
@@ -3279,8 +3291,8 @@ case class DropMaterializedViewCommand(
         //   - bare short-name match (downstream MVs created without a db
         //     prefix store their source as the bare name)
         //
-        // Also delete the per-MV view-delta namespace on disk so view-delta
-        // Delta paths from previous refreshes are gone.
+        // Also delete the per-MV view-delta namespace and persisted running-window
+        // aux-state namespace on disk so state from previous incarnations is gone.
         val mvQual      = metaName(name)
         val mvShort     = name.identifier
         val propagation = ChangePropagationFactory.forSession(spark)
@@ -3296,12 +3308,15 @@ case class DropMaterializedViewCommand(
         if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
 
         val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-        val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
-        val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
-        try {
-          val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
-          if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
-        } catch { case _: Throwable => () }
+        val safeMvSegment   = safeMvName(name)
+        val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvSegment")
+        val auxNsPath       = new Path(auxStatePath(spark, name))
+        Seq(viewDeltaNsPath, auxNsPath).foreach { path =>
+          try {
+            val pathFs = path.getFileSystem(spark.sessionState.newHadoopConf())
+            if (pathFs.exists(path)) pathFs.delete(path, /* recursive = */ true)
+          } catch { case _: Throwable => () }
+        }
 
         // Remove the tracking row from the MV catalog
         MvCatalog.remove(spark, name)

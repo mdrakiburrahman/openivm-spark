@@ -17,6 +17,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvName          = TableIdentifier("mv_r", Some("mydb"))
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
+  private val auxStatePath    = "dbfs:/delta/_ivm/aux_state/mydb_mv_r"
 
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
     * FROM sales GROUP BY region`, captured verbatim per the P4.5 spec.
@@ -95,6 +96,59 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         viewDeltaPath = viewDeltaPath
       )
       rewritten.statements should have size 2
+    }
+  }
+
+  describe("running-window aux-state rewrites") {
+    it("maps persisted aux CREATE/read/DELETE/INSERT statements to one stable Delta path") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |CREATE TABLE IF NOT EXISTS openivm_aux_mv_r AS
+          |SELECT region, dt AS openivm_aux_max_order, wk_low
+          |FROM (
+          |  SELECT region, dt, wk_low,
+          |    ROW_NUMBER() OVER (PARTITION BY region ORDER BY dt DESC) AS openivm_rn
+          |  FROM openivm_data_mv_r
+          |) openivm_aux_ranked
+          |WHERE openivm_rn = 1;
+          |CREATE OR REPLACE TEMP TABLE openivm_run_bounds_mv_r AS
+          |SELECT d.region, m.openivm_aux_max_order AS openivm_old_max_order
+          |FROM memory.main.openivm_delta_sales d
+          |LEFT JOIN openivm_aux_mv_r m ON d.region IS NOT DISTINCT FROM m.region
+          |WHERE d.openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP;
+          |DELETE FROM openivm_aux_mv_r a
+          |WHERE EXISTS (
+          |  SELECT 1 FROM openivm_run_aux_update_mv_r u
+          |  WHERE a.region IS NOT DISTINCT FROM u.region
+          |);
+          |INSERT INTO openivm_aux_mv_r SELECT * FROM openivm_run_aux_update_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+          viewDeltaPath = viewDeltaPath,
+          auxStatePath = auxStatePath
+        )
+        .statements
+
+      rewritten should have size 5
+      val auxRef = s"delta.`$auxStatePath`"
+      rewritten.head should startWith(s"CREATE TABLE IF NOT EXISTS $auxRef USING DELTA AS")
+      rewritten.head should include("FROM `mydb`.`mv_r`")
+      rewritten(1) should include(auxRef)
+      rewritten(2) shouldBe "CACHE TABLE `openivm_run_bounds_mv_r`"
+      rewritten(3) should startWith(s"MERGE INTO $auxRef AS a")
+      rewritten(3) should include("SELECT DISTINCT u.`region` AS `region`")
+      rewritten(3) should include("WHEN MATCHED THEN DELETE")
+      rewritten(4) should startWith(s"INSERT INTO $auxRef")
+      rewritten.mkString("\n") should not include "openivm_aux_mv_r"
+      rewritten.count(_.contains(auxStatePath)) should be >= 4
     }
   }
 

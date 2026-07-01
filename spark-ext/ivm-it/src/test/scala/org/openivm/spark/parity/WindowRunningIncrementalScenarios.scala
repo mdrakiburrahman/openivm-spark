@@ -97,6 +97,43 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       mvRefreshType("wri_seq_mv") shouldBe RefreshTypeCode.WindowPartition
     }
 
+    it("persists and maintains aux state across three consecutive suffix batches") {
+      sql("CREATE TABLE wri_aux_daily_market(dm_date DATE, dm_s_symb STRING, dm_low INT, dm_high INT) USING DELTA")
+      sql(
+        "INSERT INTO wri_aux_daily_market VALUES " +
+          "(DATE '2024-04-01','AAA',10,20),(DATE '2024-04-01','BBB',30,40)"
+      )
+      val auxSql =
+        "SELECT dm_date, dm_s_symb, " +
+          "MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low, " +
+          "MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high " +
+          "FROM wri_aux_daily_market"
+      sql(s"CREATE MATERIALIZED VIEW wri_aux_mv AS $auxSql")
+      assertMvCorrect("wri_aux_mv", auxSql)
+
+      sql(
+        "INSERT INTO wri_aux_daily_market VALUES " +
+          "(DATE '2024-04-02','AAA',8,22),(DATE '2024-04-02','BBB',28,42)"
+      )
+      refreshMv("wri_aux_mv")
+      assertMvCorrect("wri_aux_mv", auxSql)
+
+      sql(
+        "INSERT INTO wri_aux_daily_market VALUES " +
+          "(DATE '2024-04-03','AAA',7,21),(DATE '2024-04-03','BBB',29,45)"
+      )
+      refreshMv("wri_aux_mv")
+      assertMvCorrect("wri_aux_mv", auxSql)
+
+      sql(
+        "INSERT INTO wri_aux_daily_market VALUES " +
+          "(DATE '2024-04-04','AAA',9,24),(DATE '2024-04-04','BBB',27,43),(DATE '2024-04-01','CCC',50,60)"
+      )
+      refreshMv("wri_aux_mv")
+      assertMvCorrect("wri_aux_mv", auxSql)
+      mvRefreshType("wri_aux_mv") shouldBe RefreshTypeCode.WindowPartition
+    }
+
     it("handles the real daily_market window-over-window shape (cumulative MIN/MAX -> flag CASE -> cumulative MAX)") {
       sql(
         "CREATE TABLE wri_wow_market(dm_date DATE, dm_s_symb STRING, dm_close INT, dm_high INT, dm_low INT, " +
