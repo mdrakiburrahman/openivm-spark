@@ -129,17 +129,14 @@ object DeltaMaintenanceCoordinator {
   }
 
   private def runOptimizeIfNeeded(spark: SparkSession, mv: MvMetadata): Unit = {
-    val zorderColumns = if (FeatureGate.maintenanceZorderEnabled(spark)) probeKeys(mv) else Seq.empty[String]
-    val shouldOptimize = FeatureGate.maintenanceOptimizeEnabled(spark) ||
-      (FeatureGate.maintenanceZorderEnabled(spark) && zorderColumns.nonEmpty)
-    if (!shouldOptimize) return
+    if (!FeatureGate.maintenanceOptimizeEnabled(spark)) return
 
     val files = fileCount(spark, mv.location).getOrElse(
       return
     )
     if (files <= FeatureGate.maintenanceOptimizeMinFiles(spark).toLong) return
 
-    val sql = optimizeSql(mv.location, zorderColumns)
+    val sql = optimizeSql(mv.location)
     try {
       spark.sql(sql).collect()
       log.info(s"openivm Delta maintenance executed: $sql")
@@ -185,20 +182,8 @@ object DeltaMaintenanceCoordinator {
 
   private def normalizeLocation(location: String): String = location.trim.stripSuffix("/")
 
-  private[common] def probeKeys(mv: MvMetadata): Seq[String] =
-    mv.properties
-      .get("_ivm_probe_keys")
-      .toSeq
-      .flatMap(_.split(","))
-      .map(_.trim.stripPrefix("`").stripSuffix("`"))
-      .filter(_.nonEmpty)
-      .distinct
-      .take(4)
-
-  private[common] def optimizeSql(location: String, zorderColumns: Seq[String]): String = {
-    val base = s"OPTIMIZE delta.`${escapeBackticks(location)}`"
-    if (zorderColumns.nonEmpty) s"$base ZORDER BY (${zorderColumns.map(quoteColumn).mkString(", ")})" else base
-  }
+  private[common] def optimizeSql(location: String): String =
+    s"OPTIMIZE delta.`${escapeBackticks(location)}`"
 
   private[common] def vacuumSql(location: String, retentionHours: Int): String =
     s"VACUUM delta.`${escapeBackticks(location)}` RETAIN $retentionHours HOURS"
@@ -211,8 +196,6 @@ object DeltaMaintenanceCoordinator {
   private[common] def isMarkedInProgress(location: String): Boolean = isInProgress(location)
 
   private[common] def runOnceForTesting(spark: SparkSession): Unit = runOnce(spark)
-
-  private def quoteColumn(column: String): String = s"`${escapeBackticks(column)}`"
 
   private def escapeBackticks(value: String): String = value.replace("`", "``")
 }

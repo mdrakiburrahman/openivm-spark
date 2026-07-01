@@ -283,11 +283,14 @@ object FeatureGate {
 
   // ── issue #13: out-of-band Delta maintenance daemon (Proposal B) ──
   //
-  // OPTIMIZE (bin-compaction), ZORDER, and VACUUM run on a background daemon
-  // thread INSIDE the extension (never ivm-bench) so the write/commit cost is
-  // paid off the refresh critical path — the W7.2 pivot. All default-OFF.
+  // OPTIMIZE (bin-compaction) and VACUUM run on a background daemon thread INSIDE
+  // the extension (never ivm-bench) so the write/commit cost is paid off the
+  // refresh critical path — the W7.2 pivot. All default-OFF. ZORDER was evaluated
+  // at SF10 and REJECTED: OPTIMIZE ZORDER re-sorts the full table each tick (~70x
+  // the maintenance I/O of liquid clustering) while never reducing the refresh
+  // read — liquid clustering (`MvLayoutPolicy` CLUSTER BY) is the strictly better
+  // physical-ordering lever.
   val MaintenanceOptimizeEnabledKey: String      = "spark.openivm.maintenance.optimize.enabled"
-  val MaintenanceZorderEnabledKey: String        = "spark.openivm.maintenance.zorder.enabled"
   val MaintenanceVacuumEnabledKey: String        = "spark.openivm.maintenance.vacuum.enabled"
   val MaintenanceOptimizeMinFilesKey: String     = "spark.openivm.maintenance.optimize.minFiles"
   val MaintenanceVacuumRetentionHoursKey: String = "spark.openivm.maintenance.vacuum.retentionHours"
@@ -351,14 +354,11 @@ object FeatureGate {
   def maintenanceOptimizeEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, MaintenanceOptimizeEnabledKey, default = false)
 
-  def maintenanceZorderEnabled(spark: SparkSession): Boolean =
-    boolConf(spark.sparkContext.getConf, MaintenanceZorderEnabledKey, default = false)
-
   def maintenanceVacuumEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, MaintenanceVacuumEnabledKey, default = false)
 
   def maintenanceEnabled(spark: SparkSession): Boolean =
-    maintenanceOptimizeEnabled(spark) || maintenanceZorderEnabled(spark) || maintenanceVacuumEnabled(spark)
+    maintenanceOptimizeEnabled(spark) || maintenanceVacuumEnabled(spark)
 
   def maintenanceOptimizeMinFiles(spark: SparkSession): Int =
     math.max(2, intConf(spark.sparkContext.getConf, MaintenanceOptimizeMinFilesKey, default = 16))

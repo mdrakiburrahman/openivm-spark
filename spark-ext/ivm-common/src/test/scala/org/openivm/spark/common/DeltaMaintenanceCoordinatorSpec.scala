@@ -101,17 +101,11 @@ class DeltaMaintenanceCoordinatorSpec extends AnyFunSpec with BeforeAndAfterEach
       DeltaMaintenanceCoordinator.isRunning shouldBe false
     }
 
-    it("builds capped ZORDER and VACUUM SQL") {
-      val mv = meta(
-        "mv_sql",
-        "/warehouse/mv_sql",
-        Map("_ivm_probe_keys" -> " k1,`k2`,k3,k4,k5 ")
-      )
-
-      DeltaMaintenanceCoordinator.probeKeys(mv) shouldBe Seq("k1", "k2", "k3", "k4")
-      DeltaMaintenanceCoordinator.optimizeSql(mv.location, DeltaMaintenanceCoordinator.probeKeys(mv)) shouldBe
-        "OPTIMIZE delta.`/warehouse/mv_sql` ZORDER BY (`k1`, `k2`, `k3`, `k4`)"
-      DeltaMaintenanceCoordinator.vacuumSql(mv.location, 168) shouldBe
+    it("builds compaction OPTIMIZE and VACUUM SQL") {
+      val loc = "/warehouse/mv_sql"
+      DeltaMaintenanceCoordinator.optimizeSql(loc) shouldBe
+        "OPTIMIZE delta.`/warehouse/mv_sql`"
+      DeltaMaintenanceCoordinator.vacuumSql(loc, 168) shouldBe
         "VACUUM delta.`/warehouse/mv_sql` RETAIN 168 HOURS"
     }
 

@@ -957,9 +957,8 @@ case class CreateMaterializedViewCommand(
         SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 
     // issue #13: the columns this refresh type probes on the MV data table — the
-    // CLUSTER BY / data-skipping key for the type-aware layout ([[MvLayoutPolicy]])
-    // and the ZORDER key for the out-of-band maintenance daemon. Persisted as
-    // `_ivm_probe_keys` so REFRESH + the daemon can read it back.
+    // CLUSTER BY / data-skipping key for the type-aware layout ([[MvLayoutPolicy]]).
+    // Also persisted as `_ivm_probe_keys` for diagnostics / future layout tooling.
     val probeKeys = resolveProbeKeys(effectiveRefreshType, analyzed, groupKeys)
 
     {
