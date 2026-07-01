@@ -6,7 +6,7 @@ import java.util.Comparator
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.WorkloadFacts
+import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -168,6 +168,7 @@ class OpenIvmCompiler private (
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
     for ((_, ddl)       <- tableDdls) sb ++= s"$ddl;\n"
+    declareRelyFkStatements(req).foreach(stmt => sb ++= s"$stmt\n")
     // ── Spark-only function shims ──
     //
     // compile_only=true in the CompileFacts payload means DuckDB only parses +
@@ -264,6 +265,48 @@ class OpenIvmCompiler private (
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
     )
+  }
+
+  private[compiler] def declareRelyFkStatements(req: CompileRequest): Seq[String] = {
+    if (!req.facts.declareRelyFk) return Seq.empty
+
+    def normalizeTableName(table: String): Option[String] = {
+      val exactShort = req.sources.get(table).map(_ => table)
+      val fromQual = req.sourceQualifiedNames.collectFirst {
+        case (short, qualified) if qualified.equalsIgnoreCase(table) && req.sources.contains(short) => short
+      }
+      val trailing = table.split('.').lastOption.filter(req.sources.contains)
+      exactShort.orElse(fromQual).orElse(trailing)
+    }
+
+    req.facts.fkRelations
+      .filter(fk => fk.rely && fk.childColumns.nonEmpty && fk.parentColumns.nonEmpty)
+      .flatMap { fk =>
+        for {
+          child  <- normalizeTableName(fk.childTable)
+          parent <- normalizeTableName(fk.parentTable)
+        } yield declareRelyFkStatement(fk.copy(childTable = child, parentTable = parent))
+      }
+      .distinct
+  }
+
+  private[compiler] def declareRelyFkStatement(fk: ForeignKeyRelation): String =
+    s"PRAGMA openivm_declare_rely_fk('${escapeSql(fk.childTable)}','${escapeSql(jsonArray(fk.childColumns))}'," +
+      s"'${escapeSql(fk.parentTable)}','${escapeSql(jsonArray(fk.parentColumns))}');"
+
+  private def jsonArray(values: Seq[String]): String =
+    values.map(v => "\"" + v.flatMap(jsonEscapeChar) + "\"").mkString("[", ",", "]")
+
+  private def jsonEscapeChar(ch: Char): String = ch match {
+    case '"'          => "\\\""
+    case '\\'         => "\\\\"
+    case '\b'         => "\\b"
+    case '\f'         => "\\f"
+    case '\n'         => "\\n"
+    case '\r'         => "\\r"
+    case '\t'         => "\\t"
+    case c if c < ' ' => f"\\u${c.toInt}%04x"
+    case c            => c.toString
   }
 
   /** Escapes single-quote characters for embedding a value inside SQL single quotes. */
