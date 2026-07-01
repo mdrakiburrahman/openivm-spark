@@ -192,6 +192,12 @@ object FeatureGate {
     */
   val FkTermPruneEnabledKey: String = "spark.openivm.refresh.fkTermPrune.enabled"
 
+  /** Declare trusted FK metadata into openivm's per-connection constraints
+    * cache before compiling refresh SQL. Default OFF until the matching
+    * openivm constraints-cache build is pinned.
+    */
+  val DeclareRelyFkEnabledKey: String = "spark.openivm.refresh.declareRelyFk.enabled"
+
   /** Simplify refresh joins whose right-side join key is known unique from
     * [[WorkloadFacts.uniqueKeys]]. INNER joins with unused right columns are
     * demoted to EXISTS probes; LEFT joins with unused right columns are dropped.
@@ -355,6 +361,12 @@ object FeatureGate {
 
   def fkTermPruneEnabled(spark: SparkSession): Boolean =
     fkTermPruneEnabled(spark.sparkContext.getConf)
+
+  def declareRelyFkEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, DeclareRelyFkEnabledKey, default = false)
+
+  def declareRelyFkEnabled(spark: SparkSession): Boolean =
+    declareRelyFkEnabled(spark.sparkContext.getConf)
 
   def uniqueJoinSimplifyEnabled(conf: SparkConf): Boolean =
     boolConf(conf, UniqueJoinSimplifyEnabledKey, default = false)

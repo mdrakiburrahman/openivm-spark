@@ -270,6 +270,14 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       MvMetadata.cachedCompiledSql(props, fp1, tier2) shouldBe None
       props should not contain key(MvMetadata.CompiledSqlKey)
     }
+
+    it("separates declareRelyFk compile tiers without changing compile facts JSON") {
+      val off = WorkloadFacts(fkRelations = Seq(ForeignKeyRelation("child", Seq("parent_id"), "parent", Seq("id"))))
+      val on  = off.copy(declareRelyFk = true)
+
+      MvMetadata.compileCacheTier(off) should not equal MvMetadata.compileCacheTier(on)
+      off.toJson shouldBe on.toJson
+    }
   }
 
 }

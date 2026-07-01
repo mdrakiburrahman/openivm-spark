@@ -35,6 +35,7 @@ final case class WorkloadFacts(
     assumeInsertOnly: Boolean = false,
     runningWindowIncremental: Boolean = false,
     scd2RangeJoinAccel: Boolean = false,
+    declareRelyFk: Boolean = false,
     deltaShape: Map[String, DeltaShape] = Map.empty,
     fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
     uniqueKeys: Seq[UniqueKey] = Seq.empty,
