@@ -1672,6 +1672,9 @@ case class RefreshMaterializedViewCommand(
                   s"deltaShapes=[${sourceDeltaShape.map { case (t, s) => s"$t=$s" }.mkString(",")}] " +
                   s"emittedFastPath=${fresh.sql.contains("openivm_run_fast")}"
               )
+              logWarning(
+                s"[p52-diag-sql] view='${sqlIdent(name)}' querySql=<<<${meta.querySql.replace("\n", " ")}>>>"
+              )
             }
             if (compileCacheEnabled && fresh.sql.nonEmpty) {
               val backfilled = meta.properties ++
