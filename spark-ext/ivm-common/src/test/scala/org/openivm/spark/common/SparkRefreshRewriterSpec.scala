@@ -1202,23 +1202,30 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           mvLocation = "dbfs:/delta/wradm_mv",
           viewLogicalName = p52ViewLogicalName,
           sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
-          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid"
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
         )
         .statements
 
-    it("keeps all running-window helper CREATEs as temporary views with Spark identifiers") {
+    it("materialises running-window helper CREATEs as version-pinned, eagerly cached temporary views") {
       val rewritten = rewriteP52()
-      val creates   = rewritten.take(5)
+      val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
       creates should have size 5
       creates.foreach { stmt =>
-        stmt should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_")
         stmt should not include "TEMP TABLE"
         stmt should not include "openivm_timestamp"
         stmt should not include "openivm_data_wradm_mv"
         stmt should include("openivm_run_")
       }
-      creates(1) should include("`default`.`wradm_mv`")
-      creates(4) should include("`default`.`wradm_mv`")
+      // bounds + state READ the MV, so they must snapshot the pre-refresh Delta
+      // version (the program mutates the MV mid-refresh).
+      val boundsCreate = creates.find(_.contains("openivm_run_bounds_wradm_mv")).getOrElse(fail("bounds create missing"))
+      val stateCreate  = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
+      boundsCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
+      stateCreate  should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
+      // Each helper is eagerly CACHEd so the snapshot is frozen before the MV mutates.
+      val caches = rewritten.filter(_.startsWith("CACHE TABLE `openivm_run_"))
+      caches should have size 5
     }
 
     it("rewrites fallback delete and recompute insert while preserving the run_fallback subquery") {
@@ -1260,6 +1267,57 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "DROP VIEW IF EXISTS `openivm_run_bounds_wradm_mv`",
         "DROP VIEW IF EXISTS `openivm_run_affected_wradm_mv`"
       )
+    }
+
+    it("CTAS-creates the view-delta on the fallback cascade and APPENDS the fast cascade") {
+      // Cascade-source running window (force_view_delta_cascade=true): openivm
+      // emits TWO `INSERT INTO openivm_delta_<view>` — the fallback signed
+      // multiset (openivm_old/openivm_new) then the fast suffix rows (joins
+      // openivm_run_fast). The first must CTAS-create the view-delta path; the
+      // second must APPEND, else the second overwrites the first.
+      val cascadeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'wradm_mv';
+          |CREATE OR REPLACE TEMP TABLE openivm_run_fast_wradm_mv AS SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv WHERE openivm_old_max_order IS NULL;
+          |CREATE OR REPLACE TEMP TABLE openivm_old_wradm_mv AS SELECT * FROM openivm_data_wradm_mv WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+          |CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM (SELECT dm_s_symb, dm_date, dm_close, SUM(dm_close) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS run_sum FROM memory.main.wradm_daily_market) openivm_recompute WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_wradm_mv
+          |UNION ALL
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT d.dm_s_symb, d.dm_date, d.dm_close, s.run_sum, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
+          |FROM openivm_delta_wradm_daily_market d
+          |JOIN openivm_run_fast_wradm_mv fk ON d.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+          |LEFT JOIN openivm_run_state_wradm_mv s ON d.dm_s_symb IS NOT DISTINCT FROM s.dm_s_symb
+          |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'wradm_mv';
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = cascadeInput,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      val ctas = rewritten
+        .find(s => s.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+        .getOrElse(fail("fallback cascade CTAS missing"))
+      ctas should include("openivm_old_wradm_mv")
+      ctas should include("openivm_new_wradm_mv")
+      val append = rewritten
+        .find(s =>
+          s.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`") &&
+            s.contains("openivm_run_fast_wradm_mv")
+        )
+        .getOrElse(fail("fast cascade append missing"))
+      append should not include "CREATE OR REPLACE TABLE"
+      append should not include "openivm_timestamp"
+      // Exactly one CTAS create of the view-delta path (the second is an append).
+      rewritten.count(_.contains("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
   }
 

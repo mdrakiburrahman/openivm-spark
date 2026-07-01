@@ -349,9 +349,11 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
-            Seq(rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName))
+            rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
           case StatementKind.RunningWindowFastInsert =>
             Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowCascadeInsert =>
+            Seq(rewriteRunningWindowCascadeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.RunningWindowTempDrop =>
             Seq(rewriteRunningWindowTempDrop(stmt, viewLogicalName))
           case StatementKind.GroupRecomputeAffectedCreate =>
@@ -516,9 +518,10 @@ object SparkRefreshRewriter {
       * `memory.main.<x>` → `` `<x>` ``, and strip the inner timestamp filter
       * (the Spark staging delta temp view already restricts visible rows). */
     case object PartitionScopedInsert   extends StatementKind
-    case object RunningWindowTempCreate extends StatementKind
-    case object RunningWindowFastInsert extends StatementKind
-    case object RunningWindowTempDrop   extends StatementKind
+    case object RunningWindowTempCreate   extends StatementKind
+    case object RunningWindowFastInsert   extends StatementKind
+    case object RunningWindowCascadeInsert extends StatementKind
+    case object RunningWindowTempDrop     extends StatementKind
     case object Cleanup                 extends StatementKind
     case object Unknown                 extends StatementKind
   }
@@ -570,6 +573,18 @@ object SparkRefreshRewriter {
       upper.startsWith(s"DROP TABLE IF EXISTS $newSnapshotName")
     ) {
       StatementKind.SnapshotDrop
+    } else if (
+      upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
+      upper.contains("OPENIVM_RUN_FAST_")
+    ) {
+      // WINDOW running-suffix (P5.2) fast-path cascade delta: an APPEND of the
+      // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
+      // SELECT reads the source delta + the run_fast/run_state temp views. The
+      // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
+      // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
+      // statement appends to it. Distinguished from the fallback cascade by the
+      // OPENIVM_RUN_FAST_ reference (the fallback reads openivm_old/openivm_new).
+      StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
       // emitted when `force_view_delta_cascade=true`) from the main
@@ -2488,14 +2503,34 @@ object SparkRefreshRewriter {
     """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
       .replaceFirstIn(stmt, "CREATE OR REPLACE TEMPORARY VIEW")
 
+  /** Rewrite a WINDOW running-suffix (P5.2) `openivm_run_*` TEMP TABLE create.
+    *
+    * openivm emits these as materialised `CREATE OR REPLACE TEMP TABLE`s — they
+    * are per-partition SNAPSHOTS (bounds/fast/fallback read the MV data table;
+    * state reads the MV + run_fast) taken BEFORE the program mutates the MV
+    * (the fallback DELETE+INSERT and the fast INSERT). A naive rewrite to a
+    * lazy Spark `TEMPORARY VIEW` re-evaluates the snapshot AFTER the MV is
+    * mutated, so bounds/fallback/state go stale (the backdated partition loses
+    * its recomputed rows; the fast cascade reads post-insert state). We
+    * therefore emit the view AND an eager `CACHE TABLE` so the snapshot is
+    * frozen at creation time, matching openivm's materialised-temp-table
+    * semantics. The trailing `DROP VIEW` (RunningWindowTempDrop) auto-uncaches.
+    */
   private def rewriteRunningWindowTempCreate(
       stmt: String,
       viewLogicalName: String,
-      mvName: TableIdentifier
-  ): String = {
+      mvName: TableIdentifier,
+      mvLocation: String,
+      mvVersionBeforeRefresh: Option[Long]
+  ): Seq[String] = {
     var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = rewriteRunningWindowSqlRefs(s, viewLogicalName, mvName)
-    s
+    s = rewriteRunningWindowSnapshotRefs(s, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+    val nameRe =
+      "(?is)CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?([A-Za-z0-9_]+)`?\\s+AS".r
+    nameRe.findFirstMatchIn(s) match {
+      case Some(m) => Seq(s, s"CACHE TABLE `${m.group(1)}`")
+      case None    => Seq(s)
+    }
   }
 
   private def rewriteRunningWindowFastInsert(
@@ -2505,6 +2540,45 @@ object SparkRefreshRewriter {
   ): String =
     rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
 
+  /** Rewrite the WINDOW running-suffix (P5.2) fast-path cascade delta INSERT.
+    *
+    * openivm emits (for a cascade-source cumulative window):
+    * {{{
+    *   INSERT INTO openivm_delta_<view>
+    *   SELECT <running-adjusted cols>, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
+    *   FROM   openivm_delta_<src> d
+    *   JOIN   openivm_run_fast_<view>  fk ON …
+    *   LEFT JOIN openivm_run_state_<view> s ON …
+    *   WHERE  d.openivm_multiplicity > 0 AND openivm_timestamp > '…'
+    * }}}
+    *
+    * The fallback cascade (`openivm_old`/`openivm_new` signed-multiset, emitted
+    * earlier as a [[StatementKind.ViewDeltaInsert]]) CTAS-creates the
+    * `viewDeltaPath`; this statement APPENDS the fast suffix rows to it. The
+    * body's `openivm_data_<view>` / `memory.main.` / EXCLUDE / timestamp refs
+    * are rewritten with the same helper as the fast MV insert so the two stay
+    * consistent.
+    */
+  private def rewriteRunningWindowCascadeInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      viewDeltaPath: String
+  ): String = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?").r
+    val retargeted = insertTargetRe.replaceFirstIn(
+      stmt,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
+    )
+    rewriteRunningWindowSqlRefs(retargeted, viewLogicalName, mvName)
+  }
+
+  /** Shared reference rewrites for the fast MV insert + fast cascade append:
+    * the `openivm_data_<view>` occurrence is the writable INSERT TARGET (fast
+    * insert) or absent (cascade), so it maps to the live MV identifier.
+    */
   private def rewriteRunningWindowSqlRefs(
       stmt: String,
       viewLogicalName: String,
@@ -2513,6 +2587,33 @@ object SparkRefreshRewriter {
     val dataViewRe = ("(?i)\\bopenivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
     var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  /** Reference rewrites for the running-window `bounds`/`state` snapshot
+    * TEMP-TABLE creates. Their `openivm_data_<view>` occurrences are READS of
+    * the MV that must snapshot the PRE-refresh version (the program mutates the
+    * MV mid-refresh via the fallback DELETE+INSERT and the fast INSERT), so
+    * they pin to `delta.<location> VERSION AS OF <pre-refresh-version>`. Falls
+    * back to the live identifier when no version is known.
+    */
+  private def rewriteRunningWindowSnapshotRefs(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      mvLocation: String,
+      mvVersionBeforeRefresh: Option[Long]
+  ): String = {
+    val mvRef = mvVersionBeforeRefresh match {
+      case Some(version) => s"delta.`${mvLocation.replace("`", "``")}` VERSION AS OF $version"
+      case None          => backtickMvName(mvName)
+    }
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteExcludeAsExcept(s)
