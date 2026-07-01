@@ -259,6 +259,40 @@ object FeatureGate {
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
 
+  // ── issue #13: openivm-workload-aware Delta table layout (Proposal A) ──
+  //
+  // Per-RefreshType CLUSTER BY on the column each refresh actually probes. Each
+  // flag is default-OFF; when all are OFF the CREATE DDL is byte-identical to the
+  // pre-issue-#13 baseline (modulo the legacy `windowClusterPrune` path, which is
+  // now routed through [[MvLayoutPolicy]] for back-compat). Wall-clock gains must
+  // be proven at SF10 before any flag flips default-ON. See W7.2 in
+  // docs/todos/compile-facts-todos.md: inline clustering already lost on wall, so
+  // these levers only pay off paired with out-of-band maintenance (Proposal B).
+  val LayoutSimpleProjectionEnabledKey: String  = "spark.openivm.delta.layout.simpleProjection.enabled"
+  val LayoutAggregateGroupEnabledKey: String    = "spark.openivm.delta.layout.aggregateGroup.enabled"
+  val LayoutWindowEnabledKey: String            = "spark.openivm.delta.layout.window.enabled"
+  val LayoutRecomputeEnabledKey: String         = "spark.openivm.delta.layout.recompute.enabled"
+  val LayoutFullRefreshOptimizeWriteKey: String = "spark.openivm.delta.layout.fullRefresh.optimizeWrite"
+
+  // Per-type TBLPROPERTIES calibration (DA.6 "all tunables" sweep). Each is
+  // neutral when unset/OFF so it does not perturb the OFF baseline.
+  val DeltaTargetFileSizeKey: String           = "spark.openivm.delta.targetFileSize"
+  val DeltaTuneFileSizesForRewritesKey: String = "spark.openivm.delta.tuneFileSizesForRewrites.enabled"
+  val DeltaDataSkippingStatsColumnsKey: String = "spark.openivm.delta.dataSkippingStatsColumns.enabled"
+  val DeltaCheckpointIntervalKey: String       = "spark.openivm.delta.checkpointInterval"
+
+  // ── issue #13: out-of-band Delta maintenance daemon (Proposal B) ──
+  //
+  // OPTIMIZE (bin-compaction), ZORDER, and VACUUM run on a background daemon
+  // thread INSIDE the extension (never ivm-bench) so the write/commit cost is
+  // paid off the refresh critical path — the W7.2 pivot. All default-OFF.
+  val MaintenanceOptimizeEnabledKey: String      = "spark.openivm.maintenance.optimize.enabled"
+  val MaintenanceZorderEnabledKey: String        = "spark.openivm.maintenance.zorder.enabled"
+  val MaintenanceVacuumEnabledKey: String        = "spark.openivm.maintenance.vacuum.enabled"
+  val MaintenanceOptimizeMinFilesKey: String     = "spark.openivm.maintenance.optimize.minFiles"
+  val MaintenanceVacuumRetentionHoursKey: String = "spark.openivm.maintenance.vacuum.retentionHours"
+  val MaintenanceIntervalSecondsKey: String      = "spark.openivm.maintenance.intervalSeconds"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -268,6 +302,12 @@ object FeatureGate {
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)
 
+  private def intConf(conf: SparkConf, key: String, default: Int): Int =
+    conf.getInt(key, default)
+
+  private def stringConfOpt(conf: SparkConf, key: String): Option[String] =
+    conf.getOption(key).map(_.trim).filter(_.nonEmpty)
+
   def deletionVectorsEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, DeltaEnableDeletionVectorsKey, default = true)
 
@@ -276,6 +316,58 @@ object FeatureGate {
 
   def autoCompactEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, DeltaAutoCompactKey, default = true)
+
+  // ── issue #13 Proposal A: per-type layout flags (all default OFF) ──
+  def layoutSimpleProjectionEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, LayoutSimpleProjectionEnabledKey, default = false)
+
+  def layoutAggregateGroupEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, LayoutAggregateGroupEnabledKey, default = false)
+
+  def layoutWindowEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, LayoutWindowEnabledKey, default = false)
+
+  def layoutRecomputeEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, LayoutRecomputeEnabledKey, default = false)
+
+  def layoutFullRefreshOptimizeWriteEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, LayoutFullRefreshOptimizeWriteKey, default = false)
+
+  def deltaTargetFileSize(spark: SparkSession): Option[String] =
+    stringConfOpt(spark.sparkContext.getConf, DeltaTargetFileSizeKey)
+
+  def deltaTuneFileSizesForRewritesEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, DeltaTuneFileSizesForRewritesKey, default = false)
+
+  def deltaDataSkippingStatsColumnsEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, DeltaDataSkippingStatsColumnsKey, default = false)
+
+  def deltaCheckpointInterval(spark: SparkSession): Option[Int] = {
+    val v = intConf(spark.sparkContext.getConf, DeltaCheckpointIntervalKey, default = 0)
+    if (v > 0) Some(v) else None
+  }
+
+  // ── issue #13 Proposal B: out-of-band maintenance daemon flags ──
+  def maintenanceOptimizeEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, MaintenanceOptimizeEnabledKey, default = false)
+
+  def maintenanceZorderEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, MaintenanceZorderEnabledKey, default = false)
+
+  def maintenanceVacuumEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, MaintenanceVacuumEnabledKey, default = false)
+
+  def maintenanceEnabled(spark: SparkSession): Boolean =
+    maintenanceOptimizeEnabled(spark) || maintenanceZorderEnabled(spark) || maintenanceVacuumEnabled(spark)
+
+  def maintenanceOptimizeMinFiles(spark: SparkSession): Int =
+    math.max(2, intConf(spark.sparkContext.getConf, MaintenanceOptimizeMinFilesKey, default = 16))
+
+  def maintenanceVacuumRetentionHours(spark: SparkSession): Int =
+    math.max(0, intConf(spark.sparkContext.getConf, MaintenanceVacuumRetentionHoursKey, default = 168))
+
+  def maintenanceIntervalSeconds(spark: SparkSession): Int =
+    math.max(5, intConf(spark.sparkContext.getConf, MaintenanceIntervalSecondsKey, default = 60))
 
   def fuseScratchEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = false)

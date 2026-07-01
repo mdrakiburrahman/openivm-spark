@@ -259,6 +259,33 @@ private[commands] object MvCommandHelper {
     if (firstKey.forall(c => outputCols.contains(c.toLowerCase(java.util.Locale.ROOT)))) Some(firstKey) else None
   }
 
+  /** Columns each refresh type's incremental program physically probes on the MV
+    * data table — the natural CLUSTER BY / data-skipping key for that type
+    * (issue #13). Empty when no clean low-cardinality key is resolvable; callers
+    * treat empty as "no type-aware layout" and fall back to the flat baseline.
+    *
+    *   - AGGREGATE_GROUP/HAVING, GROUP_RECOMPUTE: the GROUP BY key (per-key MERGE).
+    *   - DISTINCT_INCREMENTAL: the GROUP BY key, else the full output tuple.
+    *   - WINDOW_PARTITION: the resolved window PARTITION BY key.
+    *   - SIMPLE_PROJECTION: the projected output columns. openivm's `rowid` is a
+    *     DuckDB-internal column that is NOT materialised on the Spark side (the
+    *     MERGE is value-equality), so there is no stored `_ivm_rowid` to cluster
+    *     on — DA.1 refines this key selection and measures it. Default-OFF.
+    *   - SIMPLE_AGGREGATE / FULL_REFRESH / SEMI_ANTI / TopK: none.
+    */
+  private[commands] def resolveProbeKeys(refreshType: Int, plan: LogicalPlan, groupKeys: Seq[String]): Seq[String] =
+    refreshType match {
+      case RefreshTypeCode.AggregateGroup | RefreshTypeCode.AggregateHaving | RefreshTypeCode.GroupRecompute =>
+        groupKeys
+      case RefreshTypeCode.DistinctIncremental =>
+        if (groupKeys.nonEmpty) groupKeys else plan.output.map(_.name)
+      case RefreshTypeCode.WindowPartition =>
+        resolvedWindowPartitionColumns(plan).getOrElse(Nil)
+      case RefreshTypeCode.SimpleProjection =>
+        plan.output.map(_.name)
+      case _ => Nil
+    }
+
   /**
    * Best-effort cleanup of a stale, non-Delta MV location before CREATE.
    *
@@ -925,6 +952,12 @@ case class CreateMaterializedViewCommand(
       RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
         SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 
+    // issue #13: the columns this refresh type probes on the MV data table — the
+    // CLUSTER BY / data-skipping key for the type-aware layout ([[MvLayoutPolicy]])
+    // and the ZORDER key for the out-of-band maintenance daemon. Persisted as
+    // `_ivm_probe_keys` so REFRESH + the daemon can read it back.
+    val probeKeys = resolveProbeKeys(effectiveRefreshType, analyzed, groupKeys)
+
     {
       val msg =
         s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${compiled.refreshTypeName}' " +
@@ -949,7 +982,10 @@ case class CreateMaterializedViewCommand(
       if (isHavingViewIncremental) analyzed.output.map(_.name) else Nil
 
     // Persist internal metadata alongside any user-provided properties.
-    val baseProps         = Map("_ivm_group_keys" -> groupKeys.mkString(","))
+    val baseProps = Map(
+      "_ivm_group_keys" -> groupKeys.mkString(","),
+      "_ivm_probe_keys" -> probeKeys.mkString(",")
+    )
     val countProp         = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp        = havingPred.map(p => "_ivm_having_pred" -> p).toMap
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
@@ -1029,18 +1065,15 @@ case class CreateMaterializedViewCommand(
       else
         org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
-    val windowClusterCols =
-      if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowClusterPruneEnabled(spark))
-        resolvedWindowPartitionColumns(analyzed)
-      else None
+    val layout =
+      MvLayoutPolicy.resolve(spark, effectiveRefreshType, probeKeys)
     val clusterClause =
-      windowClusterCols
-        .filter(_.nonEmpty)
-        .map(cols => s"CLUSTER BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
-        .getOrElse("")
+      if (layout.clusterColumns.nonEmpty)
+        s"CLUSTER BY (${layout.clusterColumns.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) "
+      else ""
 
     val escaped  = location.replace("'", "\\'")
-    val tblProps = FeatureGate.buildMvDataTblProperties(spark)
+    val tblProps = FeatureGate.buildMvDataTblProperties(spark) ++ layout.extraTblProperties
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val initSql =
