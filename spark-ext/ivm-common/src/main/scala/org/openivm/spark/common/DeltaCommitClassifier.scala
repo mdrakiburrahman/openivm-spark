@@ -81,7 +81,9 @@ object DeltaCommitClassifier {
     val parameters = commitInfo.map(_.operationParameters).getOrElse(Map.empty[String, String])
 
     if (isReplace(operation, parameters)) {
-      // Replaces invalidate incremental semantics across the full target.
+      // Full-target replaces invalidate incremental semantics across the full target.
+      // Predicate-scoped Delta replaceWhere commits still expose row-level CDF
+      // deletes/inserts for the affected predicate and are handled as mutating.
       Replace
     } else if (hasDataChangeRemove(actions) || hasDeletionVectorAdd(actions) || isMutatingOperation(operation)) {
       // Any row removal or deletion-vector rewrite must take the mutating path.
@@ -98,11 +100,19 @@ object DeltaCommitClassifier {
     }
   }
 
+  private[common] def isPredicateScopedOverwrite(parameters: Map[String, String]): Boolean = {
+    val predicate = parameters
+      .get("predicate")
+      .orElse(parameters.get("replaceWhere"))
+      .orElse(parameters.get("partitionPredicate"))
+      .map(_.trim)
+    predicate.exists(p => p.nonEmpty && p != "[]" && !p.equalsIgnoreCase("true"))
+  }
+
   private def isReplace(operation: String, parameters: Map[String, String]): Boolean = {
     val mode = parameters.get("mode").orElse(parameters.get("Mode")).map(_.trim.toUpperCase)
-    operation.contains("REPLACE") || operation == "TRUNCATE" || mode.exists(mode =>
-      mode == "OVERWRITE" || mode == "REPLACE"
-    )
+    operation.contains("REPLACE") || operation == "TRUNCATE" ||
+    (mode.exists(mode => mode == "OVERWRITE" || mode == "REPLACE") && !isPredicateScopedOverwrite(parameters))
   }
 
   private def isMutatingOperation(operation: String): Boolean =

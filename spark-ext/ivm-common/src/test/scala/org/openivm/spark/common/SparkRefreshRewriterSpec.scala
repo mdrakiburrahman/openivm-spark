@@ -827,6 +827,64 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("WINDOW_PARTITION single delete MERGE rewrite") {
+    val windowDeleteInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_trh';
+        |DELETE FROM openivm_data_mv_trh
+        |WHERE trade_id IN (
+        |  SELECT DISTINCT t_id FROM openivm_delta_brokerage_trade
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP
+        |)
+        |OR trade_id IN (
+        |  SELECT DISTINCT th_t_id FROM openivm_delta_brokerage_trade_history
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP
+        |);
+        |INSERT INTO openivm_data_mv_trh
+        |SELECT * FROM (SELECT t_id AS trade_id FROM memory.main.brokerage_trade) openivm_recompute
+        |WHERE trade_id IN (SELECT DISTINCT t_id FROM openivm_delta_brokerage_trade
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP);
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_trh';
+        |""".stripMargin
+
+    it("keeps the legacy one-MERGE-per-IN-clause shape when the gate is off") {
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid"
+        )
+        .statements
+
+      rewritten.filter(_.contains("WHEN MATCHED THEN DELETE")) should have size 2
+      rewritten.mkString("\n") should not include "UNION ALL"
+    }
+
+    it("collapses same-target partition deletes to one MERGE over unioned affected keys when enabled") {
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          windowPartitionSingleDeleteMergeEnabled = true
+        )
+        .statements
+
+      val deleteMerges = rewritten.filter(_.contains("WHEN MATCHED THEN DELETE"))
+      deleteMerges should have size 1
+      deleteMerges.head should include("UNION ALL")
+      deleteMerges.head should include("SELECT t_id AS trade_id")
+      deleteMerges.head should include("SELECT th_t_id AS trade_id")
+      deleteMerges.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
+      deleteMerges.head should not include "openivm_timestamp"
+    }
+  }
+
   // ── 8. SIMPLE_PROJECTION delete MERGE is tagged for runtime skip ─────────
   describe("simple projection delete MERGE tagging") {
     it("tags the delete-only MERGE so refresh execution can skip it when the view-delta has no negative rows") {

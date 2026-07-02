@@ -102,6 +102,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.scd2RangeJoinAccelEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.scd2RangeJoinAccelEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.scd2RangeJoinAccelEnabled(
+        new SparkConf(false).set(FeatureGate.Scd2RangeJoinAccelEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
   describe("FeatureGate.windowClusterPruneEnabled") {
     it("defaults OFF and honours an explicit ON flag") {
       FeatureGate.windowClusterPruneEnabled(new SparkConf(false)) shouldBe false
@@ -116,6 +125,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.windowRunningIncrementalEnabled(new SparkConf(false)) shouldBe false
       FeatureGate.windowRunningIncrementalEnabled(
         new SparkConf(false).set(FeatureGate.WindowRunningIncrementalEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
+  describe("FeatureGate.windowPartitionSingleDeleteMergeEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowPartitionSingleDeleteMergeEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowPartitionSingleDeleteMergeEnabled(
+        new SparkConf(false).set(FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey, "true")
       ) shouldBe true
     }
   }

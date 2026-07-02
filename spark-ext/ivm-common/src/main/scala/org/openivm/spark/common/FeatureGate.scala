@@ -213,12 +213,18 @@ object FeatureGate {
     */
   val RuntimeFilterEnabledKey: String = "spark.openivm.refresh.runtimeFilter.enabled"
 
-  /** Enable SCD-2 range-join acceleration for refresh statements. Default OFF:
-    * when opted in, the refresh SQL rewriter adds result-invariant overlap
+  /** Enable Spark-side SCD-2 range-join acceleration for refresh statements.
+    * Default ON: the refresh SQL rewriter adds result-invariant overlap
     * predicates for `ts BETWEEN effective_timestamp AND end_timestamp` joins
     * whose probe side is a source delta, and broadcasts the SCD alias by hint.
     */
   val Scd2RangeAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeAccel.enabled"
+
+  /** Enable openivm-side SCD-2 range-join acceleration during refresh SQL
+    * compilation. Default OFF: when opted in, openivm narrows SCD-2 dimension
+    * scans with delta-fact bounds filters in the emitted refresh program.
+    */
+  val Scd2RangeJoinAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeJoinAccel.enabled"
 
   /** Enable bounded recompute for top-K ROW_NUMBER/RANK WINDOW_PARTITION MVs.
     *
@@ -235,6 +241,14 @@ object FeatureGate {
     * cases, refresh still materializes the MV view-delta before inserting.
     */
   val WindowSuffixSkipEnabledKey: String = "spark.openivm.refresh.windowSuffixSkip.enabled"
+
+  /** Collapse WINDOW_PARTITION's OR-expanded affected-partition DELETE into one
+    * Delta MERGE over the UNION of affected keys. Default OFF: the legacy
+    * one-MERGE-per-source/partition-clause plan remains byte-identical unless
+    * explicitly opted in.
+    */
+  val WindowPartitionSingleDeleteMergeEnabledKey: String =
+    "spark.openivm.refresh.windowPartitionSingleDeleteMerge.enabled"
 
   /** Liquid-cluster eligible WINDOW_PARTITION MV data tables by their resolved
     * window PARTITION BY columns at CREATE time. Default OFF so the storage
@@ -265,6 +279,13 @@ object FeatureGate {
     * proves that the advanced Delta versions contain no row changes.
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
+
+  /** Runtime delta-size aware refresh skip. Default OFF: when opted in, REFRESH
+    * probes the already-registered `openivm_delta_<source>` temp views and
+    * consumes the batch without executing the recompute program only when every
+    * materialized source delta is empty.
+    */
+  val RuntimeEmptyDeltaSkipEnabledKey: String = "spark.openivm.refresh.runtimeEmptyDeltaSkip.enabled"
 
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
@@ -364,6 +385,12 @@ object FeatureGate {
   def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
     scd2RangeAccelEnabled(spark.sparkContext.getConf)
 
+  def scd2RangeJoinAccelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, Scd2RangeJoinAccelEnabledKey, default = false)
+
+  def scd2RangeJoinAccelEnabled(spark: SparkSession): Boolean =
+    scd2RangeJoinAccelEnabled(spark.sparkContext.getConf)
+
   def boundedRankEnabled(conf: SparkConf): Boolean =
     boolConf(conf, BoundedRankEnabledKey, default = false)
 
@@ -375,6 +402,12 @@ object FeatureGate {
 
   def windowSuffixSkipEnabled(spark: SparkSession): Boolean =
     windowSuffixSkipEnabled(spark.sparkContext.getConf)
+
+  def windowPartitionSingleDeleteMergeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowPartitionSingleDeleteMergeEnabledKey, default = false)
+
+  def windowPartitionSingleDeleteMergeEnabled(spark: SparkSession): Boolean =
+    windowPartitionSingleDeleteMergeEnabled(spark.sparkContext.getConf)
 
   def windowClusterPruneEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowClusterPruneEnabledKey, default = false)
@@ -399,6 +432,12 @@ object FeatureGate {
 
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def runtimeEmptyDeltaSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RuntimeEmptyDeltaSkipEnabledKey, default = false)
+
+  def runtimeEmptyDeltaSkipEnabled(spark: SparkSession): Boolean =
+    runtimeEmptyDeltaSkipEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The

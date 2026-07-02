@@ -164,6 +164,9 @@ class OpenIvmCompiler private (
     if (!req.facts.assumeInsertOnly) {
       sb ++= "SET openivm_minmax_incremental=false;\n"
     }
+    if (req.facts.scd2RangeJoinAccel) {
+      sb ++= "SET openivm_scd2_range_join_accel=true;\n"
+    }
     sb ++= s"SET openivm_files_path='${escapeSql(tmpDir.toAbsolutePath.toString)}';\n"
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
