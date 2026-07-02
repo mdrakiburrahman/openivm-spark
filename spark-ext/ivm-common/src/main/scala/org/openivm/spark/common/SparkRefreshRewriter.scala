@@ -213,6 +213,22 @@ object SparkRefreshRewriter {
     "(?is)^\\s*MERGE\\s+INTO\\s+".r.findFirstMatchIn(stripped).isDefined
   }
 
+  /** Returns the `openivm_run_aux_update_<view>` temporary-view name if `sql`
+    * is the rewritten aux write-back staging create (originally a DuckDB
+    * `CREATE OR REPLACE TEMP TABLE`).  This is the ONE running-window run-temp
+    * that MUST be materialised eagerly: its query lazily reads
+    * `openivm_run_state_<view>` → `openivm_aux_<view>`, but the very next two
+    * statements DELETE-then-INSERT into `openivm_aux_<view>`.  As a lazy Spark
+    * view it would re-evaluate against the already-mutated aux table and
+    * corrupt the persisted per-partition state.  Materialising (cache + force)
+    * it pins the pre-mutation snapshot so the write-back upserts correctly. */
+  private[spark] def runningWindowAuxUpdateViewName(sql: String): Option[String] = {
+    val stripped = stripExecutionMarker(sql)
+    ("(?is)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?TEMPORARY\\s+VIEW\\s+`?(openivm_run_aux_update_[A-Za-z0-9_]+)`?\\s+AS\\b").r
+      .findFirstMatchIn(stripped)
+      .map(_.group(1))
+  }
+
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse
@@ -296,7 +312,8 @@ object SparkRefreshRewriter {
       fkRelations: Seq[ForeignKeyRelation] = Seq.empty,
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
-      mvVersionBeforeRefresh: Option[Long] = None
+      mvVersionBeforeRefresh: Option[Long] = None,
+      windowAuxLocation: String = ""
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -354,6 +371,16 @@ object SparkRefreshRewriter {
             Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempDrop =>
             Seq(rewriteRunningWindowTempDrop(stmt, viewLogicalName))
+          case StatementKind.RunningWindowAuxCreate =>
+            Seq(rewriteRunningWindowAuxCreate(stmt, viewLogicalName, mvName, windowAuxLocation))
+          case StatementKind.RunningWindowAuxSeedInsert =>
+            Seq(rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowAuxWriteInsert =>
+            Seq(rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName))
+          case StatementKind.RunningWindowAuxDelete =>
+            Seq(rewriteRunningWindowAuxDelete(stmt, viewLogicalName))
+          case StatementKind.RunningWindowFastCascadeDelta =>
+            Seq(rewriteRunningWindowFastCascadeDelta(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.GroupRecomputeAffectedCreate =>
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
@@ -519,8 +546,40 @@ object SparkRefreshRewriter {
     case object RunningWindowTempCreate extends StatementKind
     case object RunningWindowFastInsert extends StatementKind
     case object RunningWindowTempDrop   extends StatementKind
-    case object Cleanup                 extends StatementKind
-    case object Unknown                 extends StatementKind
+
+    /** Running-window aux-state (`windowRunningIncremental`, openivm merge
+      * `e1a6b06`) persistent per-partition state table `openivm_aux_<view>`.
+      *
+      *  - [[RunningWindowAuxCreate]]      — `CREATE TABLE IF NOT EXISTS
+      *    openivm_aux_<v> AS SELECT <pk>, <order> AS openivm_aux_max_order,
+      *    <running outputs…> FROM (… ROW_NUMBER() … DESC …) WHERE rn=1`.
+      *    Seeded once from the MV; rewritten to a Delta table under
+      *    `<warehouse>/_ivm/aux/…` (persistent, one row per partition).
+      *  - [[RunningWindowAuxSeedInsert]]  — `INSERT INTO openivm_aux_<v> …
+      *    WHERE NOT EXISTS (…)` top-up for partitions present in the MV but not
+      *    yet in aux.
+      *  - [[RunningWindowAuxDelete]]      — `DELETE FROM openivm_aux_<v> a WHERE
+      *    EXISTS (SELECT 1 FROM openivm_run_aux_update_<v> u …)` write-back
+      *    retract; Delta forbids DELETE subqueries so it becomes a MERGE.
+      *  - [[RunningWindowAuxWriteInsert]] — `INSERT INTO openivm_aux_<v> SELECT
+      *    * FROM openivm_run_aux_update_<v>` write-back of the new state.
+      */
+    case object RunningWindowAuxCreate      extends StatementKind
+    case object RunningWindowAuxSeedInsert  extends StatementKind
+    case object RunningWindowAuxDelete      extends StatementKind
+    case object RunningWindowAuxWriteInsert extends StatementKind
+
+    /** Running-window fast-suffix cascade view-delta: `INSERT INTO
+      * openivm_delta_<v> SELECT …, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM
+      * openivm_run_fast_rows_<v>`. The fallback cascade CTAS
+      * ([[ViewDeltaInsert]], reading `openivm_old_<v>`/`openivm_new_<v>`) always
+      * precedes it and creates the view-delta table, so this arm APPENDS the
+      * fast-suffix rows rather than replacing the table (which would clobber the
+      * fallback delta). */
+    case object RunningWindowFastCascadeDelta extends StatementKind
+
+    case object Cleanup extends StatementKind
+    case object Unknown extends StatementKind
   }
 
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
@@ -542,6 +601,37 @@ object SparkRefreshRewriter {
     // none of them are relevant — drop unconditionally.
     if (upper.contains(compactName)) {
       return StatementKind.Cleanup
+    }
+    val auxName          = s"OPENIVM_AUX_${viewLogicalName.toUpperCase}"
+    val runAuxUpdateName = s"OPENIVM_RUN_AUX_UPDATE_${viewLogicalName.toUpperCase}"
+    // ── Running-window aux-state (openivm merge e1a6b06) ──
+    // The persistent per-partition `openivm_aux_<view>` table + its fast-suffix
+    // cascade companion.  Detected BEFORE the generic openivm_run_* / view-delta
+    // arms so they don't swallow the aux statements.
+    if (upper.startsWith(s"CREATE TABLE IF NOT EXISTS $auxName")) {
+      return StatementKind.RunningWindowAuxCreate
+    }
+    if (upper.startsWith(s"DELETE FROM $auxName")) {
+      return StatementKind.RunningWindowAuxDelete
+    }
+    if (upper.startsWith(s"INSERT INTO $auxName")) {
+      // Write-back INSERT reads the run-aux-update temp; the seed INSERT reads
+      // the MV data table (and carries a WHERE NOT EXISTS top-up guard).
+      return if (upper.contains(runAuxUpdateName)) StatementKind.RunningWindowAuxWriteInsert
+      else StatementKind.RunningWindowAuxSeedInsert
+    }
+    // Fast-suffix cascade view-delta: `INSERT INTO openivm_delta_<v>` whose body
+    // reads a fast-path run temp (`openivm_run_fast_<v>` / `openivm_run_fast_rows_<v>`).
+    // Distinguished from the fallback cascade [[ViewDeltaInsert]] (stmt 12), which
+    // reads `openivm_old_<v>` / `openivm_new_<v>` and never a run temp.  The single
+    // running-aggregate shape uses `openivm_run_fast_rows`; the window-over-window
+    // shape uses a `WITH … SELECT … FROM openivm_run_fast_<v> …` CTE chain.
+    if (
+      upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
+      (upper.contains(s"OPENIVM_RUN_FAST_${viewLogicalName.toUpperCase}") ||
+        upper.contains(s"OPENIVM_RUN_FAST_ROWS_${viewLogicalName.toUpperCase}"))
+    ) {
+      return StatementKind.RunningWindowFastCascadeDelta
     }
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
@@ -2525,6 +2615,91 @@ object SparkRefreshRewriter {
     stmt match {
       case re(name) => s"DROP VIEW IF EXISTS `${name.stripPrefix("`").stripSuffix("`")}`"
       case _        => stmt.replaceFirst("(?i)DROP\\s+TABLE", "DROP VIEW")
+    }
+  }
+
+  /** Rewrites the aux-state seed `CREATE TABLE IF NOT EXISTS openivm_aux_<view>
+    * AS SELECT … FROM openivm_data_<view> …` into a Delta catalog table backed
+    * by an explicit `_ivm/aux/…` LOCATION.  `IF NOT EXISTS` makes it a one-time
+    * seed: the first refresh populates it from the MV, later refreshes skip the
+    * CTAS and read/write the persisted per-partition state instead of scanning
+    * the full MV.  `openivm_data_<view>` is rewritten to the MV identifier. */
+  private def rewriteRunningWindowAuxCreate(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      windowAuxLocation: String
+  ): String = {
+    val seeded = rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
+    if (windowAuxLocation.isEmpty) seeded
+    else {
+      val escaped = windowAuxLocation.replace("'", "''")
+      val re = ("(?is)^(\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+`?openivm_aux_" +
+        java.util.regex.Pattern.quote(viewLogicalName) + "`?)\\s+AS\\b").r
+      re.replaceAllIn(
+        seeded,
+        m => java.util.regex.Matcher.quoteReplacement(s"${m.group(1)} USING DELTA LOCATION '$escaped' AS ")
+      )
+    }
+  }
+
+  /** Rewrites the aux-state write-back `DELETE FROM openivm_aux_<view> a WHERE
+    * EXISTS (SELECT 1 FROM openivm_run_aux_update_<view> u WHERE <cond>)` into a
+    * Delta-compatible `MERGE … WHEN MATCHED THEN DELETE` (Delta forbids
+    * subqueries in DELETE).  The subsequent [[RunningWindowAuxWriteInsert]] then
+    * appends the fresh state, so delete-then-insert is a per-partition upsert. */
+  private def rewriteRunningWindowAuxDelete(stmt: String, viewLogicalName: String): String = {
+    val auxName = s"openivm_aux_$viewLogicalName"
+    val re = ("(?is)^\\s*DELETE\\s+FROM\\s+`?" + java.util.regex.Pattern.quote(auxName) +
+      "`?\\s+(?:AS\\s+)?(\\w+)\\s+WHERE\\s+EXISTS\\s*\\(\\s*SELECT\\s+\\S+\\s+FROM\\s+(\\S+)\\s+(?:AS\\s+)?(\\w+)\\s+WHERE\\s+(.+?)\\)\\s*;?\\s*$").r
+    re.findFirstMatchIn(stmt) match {
+      case Some(m) =>
+        val tgtAlias = m.group(1)
+        val src      = m.group(2)
+        val srcAlias = m.group(3)
+        val onCond   = m.group(4).trim
+        s"""|MERGE INTO $auxName AS $tgtAlias
+            |USING $src AS $srcAlias
+            |ON $onCond
+            |WHEN MATCHED THEN DELETE""".stripMargin
+      case None => stmt
+    }
+  }
+
+  /** Rewrites the fast-suffix cascade view-delta into an APPEND to the
+    * per-refresh view-delta Delta path.  Two emitted shapes are handled:
+    *   - single running-aggregate: `INSERT INTO openivm_delta_<view> SELECT …,
+    *     CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_fast_rows_<view>`;
+    *   - window-over-window: `INSERT INTO openivm_delta_<view> WITH <CTEs> SELECT
+    *     …, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_fast_<view> …`.
+    *
+    * The fallback cascade CTAS (a [[ViewDeltaInsert]] reading
+    * `openivm_old`/`openivm_new`) always runs first and creates the table, so
+    * appending here preserves BOTH the fallback and fast-suffix deltas for
+    * downstream MV-over-MV consumers.  The trailing `CAST(1 AS INTEGER)` /
+    * `CURRENT_TIMESTAMP` metadata expressions are aliased explicitly because a
+    * Spark append has no positional target schema. */
+  private def rewriteRunningWindowFastCascadeDelta(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      viewDeltaPath: String
+  ): String = {
+    val insertRe = ("(?is)^\\s*INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?\\s+((?:SELECT|WITH)\\b.+)$").r
+    insertRe.findFirstMatchIn(stmt) match {
+      case None => stmt
+      case Some(m) =>
+        val body = rewriteRunningWindowSqlRefs(m.group(1).trim, viewLogicalName, mvName)
+        val multAliased =
+          """(?i)CAST\(\s*[+-]?\d+\s+AS\s+INTEGER\s*\)(?!\s+AS\s+openivm_multiplicity\b)""".r
+            .replaceAllIn(body, m0 => s"${m0.matched} AS openivm_multiplicity")
+        val tsAliased =
+          """(?i)\bCURRENT_TIMESTAMP(?:\(\))?(?!\s+AS\s+openivm_timestamp\b)""".r
+            .replaceAllIn(multAliased, m0 => s"${m0.matched} AS openivm_timestamp")
+        val escapedPath = viewDeltaPath.replace("`", "``")
+        s"""INSERT INTO delta.`$escapedPath`
+           |$tsAliased""".stripMargin
     }
   }
 

@@ -1516,4 +1516,27 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
     }
   }
+
+  describe("running-window aux create rewrite") {
+    it("injects USING DELTA LOCATION and preserves the seed subquery") {
+      val prog =
+        "CREATE TABLE IF NOT EXISTS openivm_aux_mv_r AS SELECT dm_s_symb, dm_date AS openivm_aux_max_order, wk_low, wk_high FROM (\n" +
+          "  SELECT dt.dm_s_symb AS dm_s_symb, dt.dm_date AS dm_date, dt.wk_low AS wk_low, dt.wk_high AS wk_high, ROW_NUMBER() OVER (PARTITION BY dt.dm_s_symb ORDER BY dt.dm_date DESC) AS openivm_rn\n" +
+          "  FROM openivm_data_mv_r dt\n" +
+          ") openivm_aux_ranked\n" +
+          "WHERE openivm_rn = 1;"
+      val out = SparkRefreshRewriter.rewrite(
+        compiledSql = prog,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        sourceSchemas = Map("wri_daily_market" -> Seq("dm_date", "dm_s_symb", "dm_low", "dm_high")),
+        windowAuxLocation = "file:/wh/_ivm/aux/mydb/mv_r"
+      )
+      out.statements.head should include("CREATE TABLE IF NOT EXISTS openivm_aux_mv_r USING DELTA LOCATION")
+      out.statements.head should not include "$1"
+    }
+  }
 }

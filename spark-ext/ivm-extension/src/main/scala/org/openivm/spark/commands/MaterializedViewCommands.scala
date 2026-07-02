@@ -229,6 +229,16 @@ private[commands] object MvCommandHelper {
     s"$warehouse/_ivm/views/$segment"
   }
 
+  /** Physical path for the running-window aux-state Delta table inside
+    * `<warehouse>/_ivm/aux/`.  Holds one persisted row per window partition
+    * (`openivm_aux_<view>`) so suffix bounds / state seeds read the tiny aux
+    * table instead of scanning the full MV. */
+  def auxLocation(spark: SparkSession, id: TableIdentifier): String = {
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val segment   = id.database.fold(id.table)(db => s"$db/${id.table}")
+    s"$warehouse/_ivm/aux/$segment"
+  }
+
   /** Resolved simple-column window partition key for liquid-clustering
     * WINDOW_PARTITION MV data tables. Skips safely when any window PARTITION BY
     * expression is not a plain output column, when windows use different keys,
@@ -288,6 +298,46 @@ private[commands] object MvCommandHelper {
       val children = fs.listStatus(path)
       if (children == null || children.isEmpty) return
       fs.delete(path, true)
+    } catch {
+      case _: Throwable => ()
+    }
+  }
+
+  /** Re-register an existing running-window aux Delta table into the session
+    * catalog. The `openivm_aux_<view>` Delta files persist under `_ivm/aux/…`
+    * across sessions, but the catalog registration does not; without this the
+    * emitted `CREATE TABLE … AS SELECT` would fail against a non-empty location.
+    * A no-op when the location has no `_delta_log` yet (first refresh will seed
+    * it) or when the table is already registered. */
+  def ensureWindowAuxRegistered(spark: SparkSession, auxTableName: String, location: String): Unit = {
+    try {
+      val path     = new Path(location)
+      val hconf    = spark.sparkContext.hadoopConfiguration
+      val fs       = path.getFileSystem(hconf)
+      val deltaLog = new Path(path, "_delta_log")
+      if (!fs.exists(deltaLog)) return
+      val esc = location.replace("'", "''")
+      spark.sql(s"CREATE TABLE IF NOT EXISTS `$auxTableName` USING DELTA LOCATION '$esc'")
+    } catch {
+      case _: Throwable => ()
+    }
+  }
+
+  /** Reset a stale running-window aux table. Drops the catalog registration and
+    * deletes the `_ivm/aux/…` Delta directory so the next insert-only refresh's
+    * `CREATE TABLE IF NOT EXISTS … AS SELECT` re-seeds the per-partition state
+    * from the freshly recomputed MV. */
+  def invalidateWindowAux(spark: SparkSession, auxTableName: String, location: String): Unit = {
+    try {
+      spark.sql(s"DROP TABLE IF EXISTS `$auxTableName`")
+    } catch {
+      case _: Throwable => ()
+    }
+    try {
+      val path  = new Path(location)
+      val hconf = spark.sparkContext.hadoopConfiguration
+      val fs    = path.getFileSystem(hconf)
+      if (fs.exists(path)) fs.delete(path, true)
     } catch {
       case _: Throwable => ()
     }
@@ -1713,6 +1763,20 @@ case class RefreshMaterializedViewCommand(
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
+    // ── Running-window aux-state (openivm merge e1a6b06) ──
+    // openivm emits a persistent per-partition `openivm_aux_<view>` state table
+    // + fast/fallback suffix split when the running-window gate is on AND the
+    // batch is provably insert-only (the compile then carries
+    // `assume_insert_only=true`).  We detect that the emitted program actually
+    // uses the aux table (a mixed/delete batch compiles to the classic
+    // WINDOW_PARTITION DELETE+INSERT instead, which carries no aux statements).
+    val windowAuxTableName = s"openivm_aux_${name.table}"
+    val windowAuxLoc       = auxLocation(spark, name)
+    val windowAuxActive =
+      FeatureGate.windowRunningIncrementalEnabled(spark) &&
+        meta.refreshType == RefreshTypeCode.WindowPartition &&
+        compiled.sql.contains(windowAuxTableName)
+
     val byTable                                 = changeBatches.groupBy(_.baseTable)
     val tempViewShortNames                      = scala.collection.mutable.ArrayBuffer[String]()
     var fusedScratchView: Option[String]        = None
@@ -1906,7 +1970,8 @@ case class RefreshMaterializedViewCommand(
             // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
             // Spark would resolve `<short>` against the current_schema.
             sourceQualifiedNames = shortToQual,
-            mvVersionBeforeRefresh = Some(meta.lastVersion)
+            mvVersionBeforeRefresh = Some(meta.lastVersion),
+            windowAuxLocation = windowAuxLoc
           )
         }
       }
@@ -2294,6 +2359,7 @@ case class RefreshMaterializedViewCommand(
           val windowSuffixSql: Option[WindowSuffixSql] =
             if (
               FeatureGate.windowSuffixSkipEnabled(spark) &&
+              !windowAuxActive &&
               meta.refreshType == RefreshTypeCode.WindowPartition &&
               batchInsertOnly
             )
@@ -2307,11 +2373,23 @@ case class RefreshMaterializedViewCommand(
           val boundedRankInsertSql: Option[String] =
             if (
               !windowSuffixSafe &&
+              !windowAuxActive &&
               !propagation.requiresDmlInterception &&
               FeatureGate.boundedRankEnabled(spark) &&
               meta.refreshType == RefreshTypeCode.WindowPartition
             ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
             else None
+
+          // Running-window aux-state re-attach guard. `openivm_aux_<view>` is a
+          // persistent Delta table under `_ivm/aux/…`; the emitted `CREATE TABLE
+          // IF NOT EXISTS … LOCATION` seeds it on the first refresh, but a fresh
+          // SparkSession loses the catalog registration while the Delta files
+          // remain, and `CREATE TABLE … AS SELECT` over a non-empty location
+          // would fail.  Re-register the existing table so the emitted seed
+          // becomes a no-op and reads/writes resolve.
+          if (windowAuxActive) {
+            ensureWindowAuxRegistered(spark, windowAuxTableName, windowAuxLoc)
+          }
 
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
@@ -2412,6 +2490,26 @@ case class RefreshMaterializedViewCommand(
               } else {
                 executeSqlAt(sql, idx)
               }
+              // Eagerly materialise the aux write-back staging view into a
+              // dependency-free local relation before the subsequent
+              // DELETE/INSERT mutate `openivm_aux_<view>`. The emitted view
+              // lazily reads `openivm_run_state_<view>` → `openivm_aux_<view>`;
+              // a plain cache does NOT help because Spark's CacheManager
+              // auto-invalidates any cache whose plan references a table that
+              // is later written, so stmt 19's aux DELETE would uncache it and
+              // stmt 20 would re-read the already-emptied aux (dropping the
+              // prior suffix sum and corrupting the persisted state). Snapshot
+              // the rows (one per affected partition — tiny) into a
+              // LocalRelation, which has no logical dependency on aux.
+              if (windowAuxActive) {
+                SparkRefreshRewriter.runningWindowAuxUpdateViewName(sql).foreach { auxUpdateView =>
+                  try {
+                    val src  = spark.table(auxUpdateView)
+                    val rows = java.util.Arrays.asList(src.collect(): _*)
+                    spark.createDataFrame(rows, src.schema).createOrReplaceTempView(auxUpdateView)
+                  } catch { case _: Throwable => () }
+                }
+              }
               // After any CTAS that wrote to the view-delta path, log a diagnostic
               // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
               // rows. Gated by OPENIVM_REFRESH_DIAGNOSTICS=1.
@@ -2422,7 +2520,21 @@ case class RefreshMaterializedViewCommand(
           }
         }
 
-        // For count-monoid refresh types, the openivm-emitted MERGE leaves
+        // Running-window aux-state consistency: when the gate is on but THIS
+        // WINDOW_PARTITION refresh did NOT take the aux fast path (a batch with
+        // deletes/updates compiles to the classic partition DELETE+INSERT, which
+        // leaves no aux statements), the persisted `openivm_aux_<view>` rows for
+        // the recomputed partitions are now stale. Reset the aux table so the
+        // next insert-only refresh re-seeds it from the corrected MV rather than
+        // extending stale suffix state.
+        if (
+          FeatureGate.windowRunningIncrementalEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.WindowPartition &&
+          !windowAuxActive
+        ) {
+          invalidateWindowAux(spark, windowAuxTableName, windowAuxLoc)
+        }
+
         // zero-count rows behind when a group retracts to 0. Clean them up
         // so the user-visible MV reflects the live aggregate. The column
         // used as the bookkeeping count is either openivm_count_star
