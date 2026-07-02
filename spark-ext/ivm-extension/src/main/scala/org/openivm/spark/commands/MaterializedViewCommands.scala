@@ -2386,6 +2386,10 @@ case class RefreshMaterializedViewCommand(
               windowSinglePassReplaceSql.isDefined && isWindowPartitionDeleteSql(sql, mergeTargetId)
             val replaceWithWindowSinglePassInsert =
               windowSinglePassReplaceSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
+            val cacheWindowSinglePassSnapshot =
+              windowSinglePassReplaceSql.isDefined &&
+                FeatureGate.windowSnapshotCacheEnabled(spark) &&
+                isWindowNewSnapshotCreateSql(sql, mergeTargetId)
 
             if (skipDeleteMerge) {
               logInfo(
@@ -2482,6 +2486,9 @@ case class RefreshMaterializedViewCommand(
                 }
               } else {
                 executeSqlAt(sql, idx)
+              }
+              if (cacheWindowSinglePassSnapshot) {
+                executeSqlAt(s"CACHE TABLE `openivm_new_${mergeTargetId.table.replace("`", "``")}`", idx)
               }
               // After any CTAS that wrote to the view-delta path, log a diagnostic
               // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
@@ -3279,6 +3286,13 @@ case class RefreshMaterializedViewCommand(
     ((upper.startsWith("CREATE OR REPLACE TABLE DELTA.") || upper.startsWith("CREATE OR REPLACE TABLE DELTA.`")) &&
       upper.contains(s"FROM OPENIVM_OLD_$view") &&
       upper.contains(s"FROM OPENIVM_NEW_$view"))
+  }
+
+  private def isWindowNewSnapshotCreateSql(sql: String, targetId: TableIdentifier): Boolean = {
+    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
+    upper.startsWith(
+      s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}"
+    )
   }
 
   private def isWindowPartitionDeleteSql(sql: String, targetId: TableIdentifier): Boolean = {
