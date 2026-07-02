@@ -263,6 +263,12 @@ object FeatureGate {
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
+  /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
+    * `REPLACE WHERE` path will consume it twice (cascade view-delta plus MV
+    * data write). Default OFF: flag-off execution remains byte-identical.
+    */
+  val WindowSnapshotCacheEnabledKey: String = "spark.openivm.refresh.windowSnapshotCache.enabled"
+
   /** Emit the running-window suffix-extend refresh (P5.2) for cumulative
     * `SUM/MIN/MAX/COUNT/AVG OVER (PARTITION BY k ORDER BY d)` WINDOW MVs on a
     * proven insert-only batch: affected partitions whose new rows sort strictly
@@ -420,6 +426,12 @@ object FeatureGate {
 
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
+
+  def windowSnapshotCacheEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSnapshotCacheEnabledKey, default = false)
+
+  def windowSnapshotCacheEnabled(spark: SparkSession): Boolean =
+    windowSnapshotCacheEnabled(spark.sparkContext.getConf)
 
   def windowRunningIncrementalEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowRunningIncrementalEnabledKey, default = false)
