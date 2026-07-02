@@ -343,6 +343,52 @@ private[commands] object MvCommandHelper {
     }
   }
 
+  /** Composite RocksDB state key for one aux row: the partition-key column
+    * values stringified and joined with a low control char (single-column keys
+    * are the common case; multi-column window partitions concatenate). */
+  private def windowStateKey(row: org.apache.spark.sql.Row, pkCols: Seq[String]): String =
+    pkCols.map(c => String.valueOf(row.getAs[Any](c))).mkString("\u0001")
+
+  /** Persist per-partition aux rows of `df` into the RocksDB
+    * [[WindowStateCatalog]] under `view`, keyed by `pkCols`.  The full row is
+    * serialised to JSON so the temp-view standing in for `openivm_aux_<view>`
+    * can be reconstructed with the exact aux schema on the next refresh. */
+  def windowStatePersist(
+      spark: SparkSession,
+      view: String,
+      df: org.apache.spark.sql.DataFrame,
+      pkCols: Seq[String]
+  ): Unit = {
+    import org.apache.spark.sql.functions.{col, struct, to_json}
+    val jsonCol  = "openivm_state_json"
+    val withJson = df.withColumn(jsonCol, to_json(struct(df.columns.map(col): _*)))
+    val entries = withJson.collect().toSeq.map { r =>
+      windowStateKey(r, pkCols) -> r.getAs[String](jsonCol)
+    }
+    WindowStateCatalog.putAll(spark, view, entries)
+  }
+
+  /** Register the temp view standing in for `openivm_aux_<view>` from the
+    * RocksDB-persisted per-partition state, reconstructing typed columns via
+    * `auxSchema`.  An empty state (first refresh) yields an empty typed view so
+    * the emitted bounds LEFT JOIN treats every partition as new. */
+  def windowStateRegisterView(
+      spark: SparkSession,
+      view: String,
+      auxViewName: String,
+      auxSchema: org.apache.spark.sql.types.StructType
+  ): Unit = {
+    val payloads = WindowStateCatalog.scanForView(spark, view).map(_._2)
+    val df =
+      if (payloads.isEmpty)
+        spark.createDataFrame(spark.sparkContext.emptyRDD[org.apache.spark.sql.Row], auxSchema)
+      else {
+        val ds = spark.createDataset(payloads)(org.apache.spark.sql.Encoders.STRING)
+        spark.read.schema(auxSchema).json(ds)
+      }
+    df.createOrReplaceTempView(auxViewName)
+  }
+
   /**
    * Analyze `querySql` in the current session and return
    * (qualifiedNames, qualifiedSchemas, compileSchemas, shortToQualMap).
@@ -1776,6 +1822,12 @@ case class RefreshMaterializedViewCommand(
       FeatureGate.windowRunningIncrementalEnabled(spark) &&
         meta.refreshType == RefreshTypeCode.WindowPartition &&
         compiled.sql.contains(windowAuxTableName)
+    // Step B: back `openivm_aux_<view>` with the RocksDB WindowStateCatalog
+    // instead of a Delta table.  Only when BOTH the running-window gate and the
+    // RocksDB gate are on AND the emitted program actually uses the aux table.
+    val windowRocksdbActive =
+      windowAuxActive && FeatureGate.windowRocksdbStateEnabled(spark)
+    val windowStateView = name.table
 
     val byTable                                 = changeBatches.groupBy(_.baseTable)
     val tempViewShortNames                      = scala.collection.mutable.ArrayBuffer[String]()
@@ -2387,12 +2439,46 @@ case class RefreshMaterializedViewCommand(
           // remain, and `CREATE TABLE … AS SELECT` over a non-empty location
           // would fail.  Re-register the existing table so the emitted seed
           // becomes a no-op and reads/writes resolve.
-          if (windowAuxActive) {
+          if (windowAuxActive && !windowRocksdbActive) {
             ensureWindowAuxRegistered(spark, windowAuxTableName, windowAuxLoc)
+          }
+
+          // Step B: RocksDB-backed aux. Build the temp view standing in for
+          // `openivm_aux_<view>` from the persisted per-partition state (seeding
+          // it from the MV on the first refresh), so the emitted bounds / state
+          // reads resolve against RocksDB instead of a Delta table. The aux
+          // CREATE / seed / write-back statements are skipped in the loop below;
+          // the fresh state is captured from `openivm_run_aux_update_<view>`.
+          val windowStatePkCols: Seq[String] =
+            if (windowRocksdbActive)
+              rewritten.statements.iterator
+                .map(SparkRefreshRewriter.stripExecutionMarker)
+                .flatMap(s =>
+                  Some(SparkRefreshRewriter.runningWindowPartitionKeyCols(s, name.table)).filter(_.nonEmpty)
+                )
+                .toSeq
+                .headOption
+                .getOrElse(Seq.empty)
+            else Seq.empty
+          if (windowRocksdbActive && windowStatePkCols.nonEmpty) {
+            val seedBodyOpt = rewritten.statements.iterator
+              .map(SparkRefreshRewriter.stripExecutionMarker)
+              .flatMap(s => SparkRefreshRewriter.runningWindowAuxSeedBody(s, name.table, mergeTargetId))
+              .toSeq
+              .headOption
+            seedBodyOpt.foreach { seedBody =>
+              val auxSchema = spark.sql(seedBody).schema
+              if (WindowStateCatalog.scanForView(spark, windowStateView).isEmpty) {
+                windowStatePersist(spark, windowStateView, spark.sql(seedBody), windowStatePkCols)
+              }
+              windowStateRegisterView(spark, windowStateView, windowAuxTableName, auxSchema)
+            }
           }
 
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+            val skipRocksdbAuxStmt =
+              windowRocksdbActive && SparkRefreshRewriter.isRunningWindowAuxTableStmt(sql, name.table)
             val skipDeleteMerge =
               SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
             val skipWindowPartitionAux =
@@ -2409,7 +2495,9 @@ case class RefreshMaterializedViewCommand(
             val replaceWithBoundedRankInsert =
               boundedRankInsertSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
 
-            if (skipDeleteMerge) {
+            if (skipRocksdbAuxStmt) {
+              logSkippedWindowStmt(idx, "rocksdb_aux_stmt_skipped")
+            } else if (skipDeleteMerge) {
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                   "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
@@ -2504,9 +2592,17 @@ case class RefreshMaterializedViewCommand(
               if (windowAuxActive) {
                 SparkRefreshRewriter.runningWindowAuxUpdateViewName(sql).foreach { auxUpdateView =>
                   try {
-                    val src  = spark.table(auxUpdateView)
-                    val rows = java.util.Arrays.asList(src.collect(): _*)
-                    spark.createDataFrame(rows, src.schema).createOrReplaceTempView(auxUpdateView)
+                    val src      = spark.table(auxUpdateView)
+                    val rows     = java.util.Arrays.asList(src.collect(): _*)
+                    val snapshot = spark.createDataFrame(rows, src.schema)
+                    snapshot.createOrReplaceTempView(auxUpdateView)
+                    // Step B: persist the affected partitions' fresh suffix
+                    // state into RocksDB. Non-affected partitions keep their
+                    // existing state, so the next refresh reads the tiny
+                    // per-partition state without rescanning the MV.
+                    if (windowRocksdbActive && windowStatePkCols.nonEmpty) {
+                      windowStatePersist(spark, windowStateView, snapshot, windowStatePkCols)
+                    }
                   } catch { case _: Throwable => () }
                 }
               }
@@ -2533,6 +2629,9 @@ case class RefreshMaterializedViewCommand(
           !windowAuxActive
         ) {
           invalidateWindowAux(spark, windowAuxTableName, windowAuxLoc)
+          if (FeatureGate.windowRocksdbStateEnabled(spark)) {
+            WindowStateCatalog.removeAll(spark, windowStateView)
+          }
         }
 
         // zero-count rows behind when a group retracts to 0. Clean them up

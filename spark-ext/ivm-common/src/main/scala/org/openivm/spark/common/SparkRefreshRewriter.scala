@@ -229,6 +229,62 @@ object SparkRefreshRewriter {
       .map(_.group(1))
   }
 
+  /** True when `sql` is one of the aux-table lifecycle statements the RocksDB
+    * backing (Step B) replaces: the `openivm_aux_<view>` CREATE / seed INSERT /
+    * write-back MERGE-or-DELETE / write-back INSERT.  Under the RocksDB gate the
+    * aux table is a session temp view fed from [[WindowStateCatalog]] and the
+    * write-back is persisted out-of-band, so these Delta-oriented statements are
+    * skipped in the execution loop. */
+  private[spark] def isRunningWindowAuxTableStmt(sql: String, viewLogicalName: String): Boolean = {
+    val s   = stripExecutionMarker(sql)
+    val aux = java.util.regex.Pattern.quote(s"openivm_aux_$viewLogicalName")
+    ("(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+`?" + aux + "`?\\b").r.findFirstMatchIn(s).isDefined ||
+    ("(?is)^\\s*CREATE\\s+TABLE\\s+`?" + aux + "`?\\b").r.findFirstMatchIn(s).isDefined ||
+    ("(?is)^\\s*INSERT\\s+INTO\\s+`?" + aux + "`?\\b").r.findFirstMatchIn(s).isDefined ||
+    ("(?is)^\\s*DELETE\\s+FROM\\s+`?" + aux + "`?\\b").r.findFirstMatchIn(s).isDefined ||
+    ("(?is)^\\s*MERGE\\s+INTO\\s+`?" + aux + "`?\\b").r.findFirstMatchIn(s).isDefined
+  }
+
+  /** Extracts the `SELECT … FROM (… ROW_NUMBER …) … WHERE openivm_rn = 1` body
+    * of the aux seed `CREATE TABLE [IF NOT EXISTS] openivm_aux_<view> [USING
+    * DELTA LOCATION '…'] AS <body>`, with `openivm_data_<view>` rewritten to the
+    * MV identifier.  Used by the RocksDB backing to derive the aux schema
+    * (analysis-only, no scan) and to seed the per-partition state from the MV on
+    * the first refresh. */
+  private[spark] def runningWindowAuxSeedBody(
+      sql: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): Option[String] = {
+    val s   = stripExecutionMarker(sql)
+    val aux = java.util.regex.Pattern.quote(s"openivm_aux_$viewLogicalName")
+    ("(?is)^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?`?" + aux +
+      "`?\\s+(?:USING\\s+DELTA\\s+LOCATION\\s+'(?:[^']|'')*'\\s+)?AS\\s+(.+)$").r
+      .findFirstMatchIn(s)
+      .map(m => rewriteRunningWindowSqlRefs(m.group(1).trim, viewLogicalName, mvName))
+  }
+
+  /** Partition-key column aliases from the `openivm_run_affected_<view>` create
+    * (`SELECT DISTINCT d.k AS k[, d.k2 AS k2] …`).  These name the per-partition
+    * grouping columns and, under the RocksDB backing, form the composite state
+    * key. */
+  private[spark] def runningWindowPartitionKeyCols(sql: String, viewLogicalName: String): Seq[String] = {
+    val s = stripExecutionMarker(sql)
+    val re = ("(?is)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?TEMP(?:ORARY)?\\s+(?:TABLE|VIEW)\\s+`?openivm_run_affected_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?\\s+AS\\s+SELECT\\s+DISTINCT\\s+(.+?)\\s+FROM\\b").r
+    re.findFirstMatchIn(s) match {
+      case None => Seq.empty
+      case Some(m) =>
+        m.group(1)
+          .split(",")
+          .toSeq
+          .map(_.trim)
+          .flatMap { proj =>
+            "(?is)\\bAS\\s+`?([A-Za-z0-9_]+)`?\\s*$".r.findFirstMatchIn(proj).map(_.group(1))
+          }
+    }
+  }
+
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse
