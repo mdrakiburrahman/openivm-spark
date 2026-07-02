@@ -2044,6 +2044,9 @@ case class RefreshMaterializedViewCommand(
             uniqueKeys = rewriteConstraintFacts.uniqueKeys,
             uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
             windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark),
+            runningWindowStateEnabled =
+              FeatureGate.windowRunningIncrementalEnabled(spark) && meta.refreshType == RefreshTypeCode.WindowPartition,
+            auxRunStateLocation = Some(runningWindowStateLocation(meta.location)),
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
             // when the user's view body referenced a Hive-qualified table.
@@ -3091,6 +3094,9 @@ case class RefreshMaterializedViewCommand(
       case n: java.lang.Double       => if (java.lang.Double.isFinite(n)) Some(n.toString) else None
       case _                         => None
     }
+
+  private def runningWindowStateLocation(mvLocation: String): String =
+    s"${mvLocation.stripSuffix("/")}_openivm_aux_run_state"
 
   private def buildWindowSuffixSql(
       spark: SparkSession,

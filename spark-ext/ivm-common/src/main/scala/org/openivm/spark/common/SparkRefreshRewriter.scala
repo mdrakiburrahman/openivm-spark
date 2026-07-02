@@ -365,6 +365,8 @@ object SparkRefreshRewriter {
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
+      runningWindowStateEnabled: Boolean = false,
+      auxRunStateLocation: Option[String] = None,
       mvVersionBeforeRefresh: Option[Long] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -418,13 +420,52 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
-            rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+            rewriteRunningWindowTempCreate(
+              stmt,
+              viewLogicalName,
+              mvName,
+              mvLocation,
+              mvVersionBeforeRefresh,
+              auxRunStateLocation.filter(_ => runningWindowStateEnabled)
+            )
           case StatementKind.RunningWindowFastInsert =>
-            Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
+            Seq(
+              rewriteRunningWindowFastInsert(
+                stmt,
+                viewLogicalName,
+                mvName,
+                auxRunStateLocation.filter(_ => runningWindowStateEnabled)
+              )
+            )
           case StatementKind.RunningWindowCascadeInsert =>
-            Seq(rewriteRunningWindowCascadeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(
+              rewriteRunningWindowCascadeInsert(
+                stmt,
+                viewLogicalName,
+                mvName,
+                viewDeltaPath,
+                auxRunStateLocation.filter(_ => runningWindowStateEnabled)
+              )
+            )
           case StatementKind.RunningWindowTempDrop =>
             Seq(rewriteRunningWindowTempDrop(stmt, viewLogicalName))
+          case StatementKind.AuxRunStateCreate if runningWindowStateEnabled =>
+            auxRunStateLocation.toSeq.map { location =>
+              rewriteAuxRunStateCreate(location, stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+            }
+          case StatementKind.AuxRunStateDelete if runningWindowStateEnabled =>
+            auxRunStateLocation.toSeq.map(rewriteAuxRunStateDelete(stmt, viewLogicalName, _))
+          case StatementKind.AuxRunStateInsert if runningWindowStateEnabled =>
+            auxRunStateLocation.toSeq.map { location =>
+              rewriteRunningWindowSqlRefs(
+                rewriteAuxRunStateSql(stmt, viewLogicalName, location),
+                viewLogicalName,
+                mvName,
+                Some(location)
+              )
+            }
+          case StatementKind.AuxRunStateCreate | StatementKind.AuxRunStateDelete | StatementKind.AuxRunStateInsert =>
+            Nil
           case StatementKind.GroupRecomputeAffectedCreate =>
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
@@ -591,6 +632,9 @@ object SparkRefreshRewriter {
     case object RunningWindowFastInsert    extends StatementKind
     case object RunningWindowCascadeInsert extends StatementKind
     case object RunningWindowTempDrop      extends StatementKind
+    case object AuxRunStateCreate          extends StatementKind
+    case object AuxRunStateDelete          extends StatementKind
+    case object AuxRunStateInsert          extends StatementKind
     case object Cleanup                    extends StatementKind
     case object Unknown                    extends StatementKind
   }
@@ -603,7 +647,18 @@ object SparkRefreshRewriter {
     val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
     val runTempPrefix     = "OPENIVM_RUN_"
     val runTempViewSuffix = s"_${viewLogicalName.toUpperCase}"
-    val compactName       = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
+    val auxRunStateName   = s"OPENIVM_AUX_RUN_STATE_${viewLogicalName.toUpperCase}"
+    // Anchor aux-state DELETE/INSERT classification on the TARGET table (right
+    // after the DML keyword, allowing catalog prefixes + backticks).  The fast
+    // MV insert and the cascade delta insert both merely REFERENCE the aux state
+    // in a join, so a bare `contains` would misclassify them.
+    val auxDeleteTargetRe =
+      ("(?is)^\\s*DELETE\\s+FROM\\s+(?:`?[A-Z0-9_]+`?\\.)*`?" +
+        java.util.regex.Pattern.quote(auxRunStateName) + "`?\\b").r
+    val auxInsertTargetRe =
+      ("(?is)^\\s*INSERT\\s+INTO\\s+(?:`?[A-Z0-9_]+`?\\.)*`?" +
+        java.util.regex.Pattern.quote(auxRunStateName) + "`?[\\s(]").r
+    val compactName = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
     //   2. DELETE FROM openivm_delta_<view> WHERE ...
@@ -617,6 +672,12 @@ object SparkRefreshRewriter {
     }
     if (upper.startsWith("UPDATE OPENIVM_VIEWS")) {
       StatementKind.InProgressFlag
+    } else if (upper.contains(s"CREATE TABLE IF NOT EXISTS") && upper.contains(auxRunStateName)) {
+      StatementKind.AuxRunStateCreate
+    } else if (auxDeleteTargetRe.findFirstIn(upper).isDefined) {
+      StatementKind.AuxRunStateDelete
+    } else if (auxInsertTargetRe.findFirstIn(upper).isDefined) {
+      StatementKind.AuxRunStateInsert
     } else if (
       upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $runTempPrefix") && upper.contains(s"$runTempViewSuffix AS")
     ) {
@@ -2725,10 +2786,12 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       mvName: TableIdentifier,
       mvLocation: String,
-      mvVersionBeforeRefresh: Option[Long]
+      mvVersionBeforeRefresh: Option[Long],
+      auxRunStateLocation: Option[String]
   ): Seq[String] = {
     var s = rewriteCreateOrReplaceTempTableAsView(stmt)
     s = rewriteRunningWindowSnapshotRefs(s, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+    s = rewriteAuxRunStateRefs(s, viewLogicalName, auxRunStateLocation)
     val nameRe =
       "(?is)CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?([A-Za-z0-9_]+)`?\\s+AS".r
     nameRe.findFirstMatchIn(s) match {
@@ -2740,9 +2803,10 @@ object SparkRefreshRewriter {
   private def rewriteRunningWindowFastInsert(
       stmt: String,
       viewLogicalName: String,
-      mvName: TableIdentifier
+      mvName: TableIdentifier,
+      auxRunStateLocation: Option[String]
   ): String =
-    rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
+    rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName, auxRunStateLocation)
 
   /** Rewrite the WINDOW running-suffix (P5.2) fast-path cascade delta INSERT.
     *
@@ -2767,7 +2831,8 @@ object SparkRefreshRewriter {
       stmt: String,
       viewLogicalName: String,
       mvName: TableIdentifier,
-      viewDeltaPath: String
+      viewDeltaPath: String,
+      auxRunStateLocation: Option[String]
   ): String = {
     val escapedPath = viewDeltaPath.replace("`", "``")
     val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
@@ -2776,7 +2841,7 @@ object SparkRefreshRewriter {
       stmt,
       java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
     )
-    rewriteRunningWindowSqlRefs(retargeted, viewLogicalName, mvName)
+    rewriteRunningWindowSqlRefs(retargeted, viewLogicalName, mvName, auxRunStateLocation)
   }
 
   /** Shared reference rewrites for the fast MV insert + fast cascade append:
@@ -2786,7 +2851,8 @@ object SparkRefreshRewriter {
   private def rewriteRunningWindowSqlRefs(
       stmt: String,
       viewLogicalName: String,
-      mvName: TableIdentifier
+      mvName: TableIdentifier,
+      auxRunStateLocation: Option[String]
   ): String = {
     val dataViewRe = ("(?i)\\bopenivm_data_" +
       java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
@@ -2794,8 +2860,62 @@ object SparkRefreshRewriter {
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteExcludeAsExcept(s)
+    s = rewriteAuxRunStateRefs(s, viewLogicalName, auxRunStateLocation)
     s
   }
+
+  private def rewriteAuxRunStateCreate(
+      stateLocation: String,
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      mvLocation: String,
+      mvVersionBeforeRefresh: Option[Long]
+  ): String = {
+    val createRe =
+      ("(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+(?:[A-Za-z0-9_]+\\.)*" +
+        "`?openivm_aux_run_state_" + java.util.regex.Pattern.quote(viewLogicalName) + "`?\\s+AS\\s+").r
+    val target     = s"CREATE TABLE IF NOT EXISTS delta.`${stateLocation.replace("`", "``")}` USING DELTA AS "
+    val retargeted = createRe.replaceFirstIn(stmt, java.util.regex.Matcher.quoteReplacement(target))
+    var s = rewriteRunningWindowSnapshotRefs(retargeted, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  private def rewriteAuxRunStateSql(stmt: String, viewLogicalName: String, stateLocation: String): String = {
+    var s = rewriteAuxRunStateRefs(stmt, viewLogicalName, Some(stateLocation))
+    s = stripTimestampPredicate(s)
+    s = rewriteMemoryMainPrefix(s)
+    s = rewriteExcludeAsExcept(s)
+    s
+  }
+
+  /** openivm emits state-eviction as `DELETE FROM <state> st WHERE EXISTS
+    * (SELECT 1 FROM openivm_run_affected_<view> fk WHERE <null-safe key match>)`.
+    * Delta 3.2 rejects subqueries in DELETE, so lower it to an equivalent
+    * `MERGE … WHEN MATCHED THEN DELETE` over the affected-keys temp view.
+    */
+  private def rewriteAuxRunStateDelete(stmt: String, viewLogicalName: String, stateLocation: String): String = {
+    val refRewritten = rewriteAuxRunStateSql(stmt, viewLogicalName, stateLocation)
+    val deleteExistsRe =
+      ("(?is)^\\s*DELETE\\s+FROM\\s+(\\S+)\\s+(\\w+)\\s+WHERE\\s+EXISTS\\s*\\(\\s*SELECT\\s+1\\s+FROM\\s+" +
+        "(\\S+)\\s+(\\w+)\\s+WHERE\\s+(.*?)\\)\\s*;?\\s*$").r
+    refRewritten match {
+      case deleteExistsRe(target, tAlias, source, sAlias, cond) =>
+        s"MERGE INTO $target $tAlias USING $source $sAlias ON ${cond.trim} WHEN MATCHED THEN DELETE"
+      case _ => refRewritten
+    }
+  }
+
+  private def rewriteAuxRunStateRefs(stmt: String, viewLogicalName: String, stateLocation: Option[String]): String =
+    stateLocation match {
+      case Some(location) =>
+        val auxRe = ("(?i)(?:\\b[A-Za-z0-9_]+\\.)*`?openivm_aux_run_state_" +
+          java.util.regex.Pattern.quote(viewLogicalName) + "`?\\b").r
+        auxRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(s"delta.`${location.replace("`", "``")}`"))
+      case None => stmt
+    }
 
   /** Reference rewrites for the running-window `bounds`/`state` snapshot
     * TEMP-TABLE creates. Their `openivm_data_<view>` occurrences are READS of

@@ -24,6 +24,20 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
     MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType
   }
 
+  private def mvLocation(name: String): String = {
+    val id = spark.sessionState.sqlParser.parseTableIdentifier(name)
+    MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).location
+  }
+
+  private def assertRunStateRows(mvName: String, expectedRows: Long): Unit = {
+    val stateLocation = s"${mvLocation(mvName).stripSuffix("/")}_openivm_aux_run_state"
+    spark.sql(s"DESCRIBE DETAIL delta.`${stateLocation.replace("`", "``")}`").count() shouldBe 1
+    spark
+      .sql(s"SELECT COUNT(*) FROM delta.`${stateLocation.replace("`", "``")}`")
+      .head()
+      .getLong(0) shouldBe expectedRows
+  }
+
   private val viewSql =
     "SELECT dm_date, dm_s_symb, " +
       "MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low, " +
@@ -163,6 +177,41 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_casc_win", upstreamSql)
       assertMvCorrect("wri_casc_agg", downstreamSql)
       mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
+    }
+
+    it("persists one high-water state row per partition across suffix and backdated batches") {
+      sql(
+        "CREATE TABLE wri_state_daily_market(dm_date DATE, dm_s_symb STRING, dm_low INT, dm_high INT) USING DELTA"
+      )
+      sql(
+        "INSERT INTO wri_state_daily_market VALUES " +
+          "(DATE '2024-04-01','AAA',10,20),(DATE '2024-04-02','AAA',8,22)," +
+          "(DATE '2024-04-01','BBB',15,25),(DATE '2024-04-02','BBB',14,26)"
+      )
+      val stateSql =
+        "SELECT dm_date, dm_s_symb, " +
+          "MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low, " +
+          "MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high " +
+          "FROM wri_state_daily_market"
+      sql(s"CREATE MATERIALIZED VIEW wri_state_mv AS $stateSql")
+      assertMvCorrect("wri_state_mv", stateSql)
+
+      sql(
+        "INSERT INTO wri_state_daily_market VALUES " +
+          "(DATE '2024-04-03','AAA',7,24),(DATE '2024-04-03','BBB',13,27),(DATE '2024-04-01','CCC',30,40)"
+      )
+      refreshMv("wri_state_mv")
+      assertMvCorrect("wri_state_mv", stateSql)
+      assertRunStateRows("wri_state_mv", 3L)
+
+      sql(
+        "INSERT INTO wri_state_daily_market VALUES " +
+          "(DATE '2024-04-02','AAA',3,30),(DATE '2024-04-04','BBB',12,28),(DATE '2024-04-02','CCC',29,41)"
+      )
+      refreshMv("wri_state_mv")
+      assertMvCorrect("wri_state_mv", stateSql)
+      assertRunStateRows("wri_state_mv", 3L)
+      mvRefreshType("wri_state_mv") shouldBe RefreshTypeCode.WindowPartition
     }
   }
 }
