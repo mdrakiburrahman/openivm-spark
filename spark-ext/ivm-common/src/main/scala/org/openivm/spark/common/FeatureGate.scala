@@ -297,6 +297,14 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Maintain an opt-in per-partition backing-state Delta side table for
+    * LAST_VALUE/LAST IGNORE NULLS forward-fill WINDOW_PARTITION MVs. Default
+    * OFF: legacy CREATE and REFRESH SQL/execution remain byte-identical unless
+    * explicitly enabled.
+    */
+  val WindowLastValueBackingStateEnabledKey: String =
+    "spark.openivm.refresh.windowLastValueBackingState.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -488,6 +496,12 @@ object FeatureGate {
 
   def windowSnapshotCacheEnabled(spark: SparkSession): Boolean =
     windowSnapshotCacheEnabled(spark.sparkContext.getConf)
+
+  def windowLastValueBackingStateEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowLastValueBackingStateEnabledKey, default = false)
+
+  def windowLastValueBackingStateEnabled(spark: SparkSession): Boolean =
+    windowLastValueBackingStateEnabled(spark.sparkContext.getConf)
 
   def windowRunningIncrementalEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowRunningIncrementalEnabledKey, default = false)

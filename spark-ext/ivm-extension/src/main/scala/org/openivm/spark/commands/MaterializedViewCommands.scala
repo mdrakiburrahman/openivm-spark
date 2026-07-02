@@ -426,6 +426,46 @@ private[commands] object MvCommandHelper {
   def dataTableId(id: TableIdentifier): TableIdentifier =
     id.copy(table = id.table + "__ivm_data")
 
+  def lastValueBackingStateId(id: TableIdentifier): TableIdentifier =
+    id.copy(table = id.table + "__ivm_last_value_state")
+
+  def isLastValueForwardFillWindowMv(querySql: String, analyzed: LogicalPlan): Boolean = {
+    val lower      = querySql.toLowerCase(java.util.Locale.ROOT)
+    val hasForward = """(?s)\b(last_value|last)\s*\([^)]*(,\s*true)?\s*\)\s*over\s*\(""".r.findFirstIn(lower).isDefined
+    val hasWindow  = lower.contains(" over ") && lower.contains("partition by") && lower.contains("order by")
+    val disallowedWindowAgg =
+      """(?s)\b(sum|avg|count|min|max|rank|dense_rank|row_number|lead|lag|first_value|first)\s*\([^)]*\)\s*over\s*\(""".r
+        .findFirstIn(lower)
+        .isDefined
+    hasForward && hasWindow && !disallowedWindowAgg && resolvedWindowPartitionColumns(analyzed).exists(_.nonEmpty)
+  }
+
+  def refreshLastValueBackingState(
+      spark: SparkSession,
+      mvName: TableIdentifier,
+      analyzed: LogicalPlan
+  ): Unit = {
+    resolvedWindowPartitionColumns(analyzed).foreach { keys =>
+      val stateId  = lastValueBackingStateId(mvName)
+      val keyExprs = keys.map(c => s"'${c.replace("'", "''")}', `$c`").mkString(", ")
+      val keyJson  = s"to_json(named_struct($keyExprs))"
+      val stateSelect =
+        s"""SELECT $keyJson AS openivm_partition_key_json,
+           |       COUNT(*) AS openivm_partition_row_count,
+           |       current_timestamp() AS openivm_state_refreshed_at
+           |FROM ${sqlIdent(mvName)}
+           |GROUP BY ${keys.map(c => s"`$c`").mkString(", ")}""".stripMargin
+      val exists = stateId.database match {
+        case Some(db) => spark.catalog.tableExists(db, stateId.table)
+        case None     => spark.catalog.tableExists(stateId.table)
+      }
+      val sql =
+        if (exists) s"INSERT OVERWRITE ${sqlIdent(stateId)} $stateSelect"
+        else s"CREATE TABLE ${sqlIdent(stateId)} USING DELTA AS $stateSelect"
+      spark.sql(sql).collect()
+    }
+  }
+
   /** Extract the HAVING predicate from an analyzed plan as a Spark-SQL string,
     * with each aggregate function reference rewritten to the SELECT-list alias
     * that materialises it on the data table.
@@ -1113,6 +1153,16 @@ case class CreateMaterializedViewCommand(
               durationMs = ms
             )
           }
+        }
+      }
+
+      if (
+        FeatureGate.windowLastValueBackingStateEnabled(spark) &&
+        effectiveRefreshType == RefreshTypeCode.WindowPartition &&
+        isLastValueForwardFillWindowMv(originalQueryText, analyzed)
+      ) {
+        profile.timeStep("create_mv_last_value_backing_state", "kind=window_last_value") {
+          refreshLastValueBackingState(spark, name, analyzed)
         }
       }
 
@@ -2693,6 +2743,20 @@ case class RefreshMaterializedViewCommand(
               s"Rewritten SQL:\n$sqlSnippet",
             t
           )
+      }
+
+      if (
+        FeatureGate.windowLastValueBackingStateEnabled(spark) &&
+        meta.refreshType == RefreshTypeCode.WindowPartition
+      ) {
+        val analyzedForState = spark.sql(meta.querySql).queryExecution.analyzed
+        if (isLastValueForwardFillWindowMv(meta.querySql, analyzedForState)) {
+          profile.timeStep("metadata_post_sql", "phase=last_value_backing_state") {
+            RefreshPerf.timePhase(refreshId, viewLabel, "last_value_backing_state") {
+              refreshLastValueBackingState(spark, name, analyzedForState)
+            }
+          }
+        }
       }
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {

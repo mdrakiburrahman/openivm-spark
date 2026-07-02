@@ -146,6 +146,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.windowLastValueBackingStateEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.windowLastValueBackingStateEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.windowLastValueBackingStateEnabled(
+        new SparkConf(false).set(FeatureGate.WindowLastValueBackingStateEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
   describe("FeatureGate.windowPartitionSingleDeleteMergeEnabled") {
     it("defaults OFF and honours an explicit ON flag") {
       FeatureGate.windowPartitionSingleDeleteMergeEnabled(new SparkConf(false)) shouldBe false
