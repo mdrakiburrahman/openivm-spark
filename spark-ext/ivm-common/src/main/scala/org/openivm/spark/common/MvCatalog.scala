@@ -120,6 +120,12 @@ object MvMetadata {
   val CompiledSqlKey: String            = "_ivm_compiled_sql"
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
 
+  /** Last observable compile-time cost-model hint captured during REFRESH. */
+  val LastCostModelHintKey: String = "_ivm_last_cost_model_hint"
+
+  /** Last observable unified refresh-intelligence decision captured during REFRESH. */
+  val RefreshDecisionKey: String = "_ivm_refresh_decision"
+
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
   private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"

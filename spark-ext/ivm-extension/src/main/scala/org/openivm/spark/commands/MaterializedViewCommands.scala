@@ -1603,7 +1603,29 @@ case class RefreshMaterializedViewCommand(
       scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
       declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
     )
-    val compileCacheTier = MvMetadata.compileCacheTier(cacheTierFacts)
+    val compileCacheTier                            = MvMetadata.compileCacheTier(cacheTierFacts)
+    var refreshProperties                           = meta.properties
+    var observedCompileFacts: Option[WorkloadFacts] = None
+    def refreshCompileFacts(): WorkloadFacts = {
+      val statsFacts = SparkDeltaStatsService
+        .forRefresh()
+        .workloadFactsFor(spark, meta.sourceTables, changeBatches)
+      val facts = statsFacts.copy(
+        deltaShape = sourceDeltaShape,
+        fkRelations = constraintFacts.fkRelations,
+        uniqueKeys = constraintFacts.uniqueKeys,
+        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
+        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+        scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
+        assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.WindowPartition &&
+          sourceDeltaShape.nonEmpty &&
+          sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
+          sourceDeltaShape.values.forall(_ != DeltaShape.General)
+      )
+      observedCompileFacts = Some(facts)
+      facts
+    }
 
     // Reuse only W7.1 schema/tier-keyed, shape-stable compiled SQL.  The cached
     // text is intentionally NOT rewritten SQL: every REFRESH below still calls
@@ -1612,12 +1634,12 @@ case class RefreshMaterializedViewCommand(
     // fresh view-delta path before execution.
     val cachedCompiledSql =
       if (compileCacheEnabled)
-        MvMetadata.cachedCompiledSql(meta.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+        MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
       else None
     val cachedInitialLoadSql =
       if (compileCacheEnabled) {
         MvMetadata
-          .cachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+          .cachedInitialLoadSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
           .getOrElse("")
       } else ""
     val compileCacheHit = cachedCompiledSql.isDefined
@@ -1640,23 +1662,8 @@ case class RefreshMaterializedViewCommand(
               initialLoadSql = cachedInitialLoadSql
             )
           case None =>
-            val compiler = OpenIvmCompilers.forSession(spark)
-            val statsFacts = SparkDeltaStatsService
-              .forRefresh()
-              .workloadFactsFor(spark, meta.sourceTables, changeBatches)
-            val compileFacts = statsFacts.copy(
-              deltaShape = sourceDeltaShape,
-              fkRelations = constraintFacts.fkRelations,
-              uniqueKeys = constraintFacts.uniqueKeys,
-              declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
-              runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-              scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
-              assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
-                meta.refreshType == RefreshTypeCode.WindowPartition &&
-                sourceDeltaShape.nonEmpty &&
-                sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
-                sourceDeltaShape.values.forall(_ != DeltaShape.General)
-            )
+            val compiler     = OpenIvmCompilers.forSession(spark)
+            val compileFacts = refreshCompileFacts()
             val fresh = compiler.compile(
               CompileRequest(
                 viewName = name.table,
@@ -1667,7 +1674,7 @@ case class RefreshMaterializedViewCommand(
               )
             )
             if (compileCacheEnabled && fresh.sql.nonEmpty) {
-              val backfilled = meta.properties ++
+              val backfilled = refreshProperties ++
                 MvMetadata.compiledProperties(
                   meta.sourceSchemaFingerprint,
                   compileCacheTier,
@@ -1676,8 +1683,10 @@ case class RefreshMaterializedViewCommand(
                   fresh.refreshType,
                   fresh.refreshTypeName
                 )
-              try MvCatalog.updateProperties(spark, name, backfilled)
-              catch {
+              try {
+                MvCatalog.updateProperties(spark, name, backfilled)
+                refreshProperties = backfilled
+              } catch {
                 case t: Throwable =>
                   logWarning(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
@@ -1765,20 +1774,67 @@ case class RefreshMaterializedViewCommand(
         }
       }
 
-      if (FeatureGate.runtimeEmptyDeltaSkipEnabled(spark)) {
-        val deltaRowsBySource = meta.sourceTables.map { qualTable =>
-          val deltaView = StagingDeltaView.deltaViewName(qualTable)
-          val hasRows = spark
-            .sql(s"SELECT 1 FROM `${deltaView.replace("`", "``")}` LIMIT 1")
-            .head(1)
-            .nonEmpty
-          qualTable -> hasRows
+      val unifiedIntelligenceEnabled = FeatureGate.unifiedRefreshIntelligenceEnabled(spark)
+      val runtimeDeltaSizeForDecision =
+        if (unifiedIntelligenceEnabled) {
+          val rowsBySource = meta.sourceTables.map { qualTable =>
+            val deltaView = StagingDeltaView.deltaViewName(qualTable)
+            val rows = spark
+              .sql(s"SELECT COUNT(*) FROM `${deltaView.replace("`", "``")}`")
+              .head()
+              .getLong(0)
+            qualTable -> rows
+          }.toMap
+          Some(RuntimeDeltaSize(rowsBySource))
+        } else None
+
+      if (unifiedIntelligenceEnabled || FeatureGate.costModelEnabled(spark)) {
+        val facts    = observedCompileFacts.getOrElse(refreshCompileFacts())
+        val estimate = RefreshCostModel.estimate(facts)
+        val decision = RefreshIntelligence.decide(facts, estimate, runtimeDeltaSizeForDecision)
+        val intelligenceProps =
+          (if (FeatureGate.costModelEnabled(spark)) Map(MvMetadata.LastCostModelHintKey -> estimate.hint)
+           else Map.empty[String, String]) ++
+            (if (unifiedIntelligenceEnabled) Map(MvMetadata.RefreshDecisionKey -> decision.toJson)
+             else Map.empty[String, String])
+        if (intelligenceProps.nonEmpty) {
+          val updated = refreshProperties ++ intelligenceProps
+          try {
+            MvCatalog.updateProperties(spark, name, updated)
+            refreshProperties = updated
+          } catch {
+            case t: Throwable =>
+              logWarning(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_intelligence_property_update_failed: " +
+                  s"${t.getClass.getName}: ${t.getMessage}"
+              )
+          }
         }
-        val nonEmptySources = deltaRowsBySource.collect { case (source, true) => source }
+        if (unifiedIntelligenceEnabled) {
+          logInfo(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_decision='${decision.route.name}' " +
+              s"reasons='${decision.reasons.mkString(",")}' cost_hint='${estimate.hint}'"
+          )
+        }
+      }
+
+      if (FeatureGate.runtimeEmptyDeltaSkipEnabled(spark)) {
+        val nonEmptySources = runtimeDeltaSizeForDecision match {
+          case Some(size) => size.rowsBySource.collect { case (source, rows) if rows > 0L => source }.toSeq
+          case None =>
+            meta.sourceTables.flatMap { qualTable =>
+              val deltaView = StagingDeltaView.deltaViewName(qualTable)
+              val hasRows = spark
+                .sql(s"SELECT 1 FROM `${deltaView.replace("`", "``")}` LIMIT 1")
+                .head(1)
+                .nonEmpty
+              if (hasRows) Some(qualTable) else None
+            }
+        }
         if (nonEmptySources.isEmpty) {
           profile.appendStep(
             "runtime_empty_delta_skip",
-            s"sources=${deltaRowsBySource.map(_._1).mkString(",")};signal=limit1_empty",
+            s"sources=${meta.sourceTables.mkString(",")};signal=limit1_empty",
             0L
           )
           RefreshPerf.emit(

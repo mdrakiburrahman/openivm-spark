@@ -305,12 +305,23 @@ object FeatureGate {
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
 
+  /** Compile-time cost model observability. Default OFF: when opted in, REFRESH
+    * records the deterministic WorkloadFacts-derived cost hint in MV metadata.
+    */
+  val CostModelEnabledKey: String = "spark.openivm.refresh.costModel.enabled"
+
   /** Runtime delta-size aware refresh skip. Default OFF: when opted in, REFRESH
     * probes the already-registered `openivm_delta_<source>` temp views and
     * consumes the batch without executing the recompute program only when every
     * materialized source delta is empty.
     */
   val RuntimeEmptyDeltaSkipEnabledKey: String = "spark.openivm.refresh.runtimeEmptyDeltaSkip.enabled"
+
+  /** Unified compile/runtime refresh intelligence observability. Default OFF:
+    * when opted in, REFRESH records a single decision surface that combines the
+    * WorkloadFacts cost estimate with the runtime materialized delta size.
+    */
+  val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
 
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
@@ -490,11 +501,23 @@ object FeatureGate {
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
 
+  def costModelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, CostModelEnabledKey, default = false)
+
+  def costModelEnabled(spark: SparkSession): Boolean =
+    costModelEnabled(spark.sparkContext.getConf)
+
   def runtimeEmptyDeltaSkipEnabled(conf: SparkConf): Boolean =
     boolConf(conf, RuntimeEmptyDeltaSkipEnabledKey, default = false)
 
   def runtimeEmptyDeltaSkipEnabled(spark: SparkSession): Boolean =
     runtimeEmptyDeltaSkipEnabled(spark.sparkContext.getConf)
+
+  def unifiedRefreshIntelligenceEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, UnifiedRefreshIntelligenceEnabledKey, default = false)
+
+  def unifiedRefreshIntelligenceEnabled(spark: SparkSession): Boolean =
+    unifiedRefreshIntelligenceEnabled(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
