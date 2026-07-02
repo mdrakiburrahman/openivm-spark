@@ -93,5 +93,9 @@ class WorkloadFactsSpec extends AnyFunSpec with Matchers {
         """"delta_stats":{"sales.orders":{"row_count":5,"num_files":1,"min":{"customer_id":"7"},"max":{"customer_id":"9"},"nulls":{"customer_id":0}}}"""
       )
     }
+
+    it("does not serialize declare_rely_fk into openivm compile facts") {
+      WorkloadFacts(declareRelyFk = true).toJson should not include "declare_rely_fk"
+    }
   }
 }

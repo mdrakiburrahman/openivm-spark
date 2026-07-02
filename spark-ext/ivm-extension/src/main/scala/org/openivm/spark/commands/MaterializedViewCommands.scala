@@ -595,7 +595,8 @@ case class CreateMaterializedViewCommand(
     val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
     val workloadFacts = statsFacts.copy(
       fkRelations = constraintFacts.fkRelations,
-      uniqueKeys = constraintFacts.uniqueKeys
+      uniqueKeys = constraintFacts.uniqueKeys,
+      declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
     )
     val compiler = OpenIvmCompilers.forSession(spark)
     val compiled = profile.timeStep(
@@ -1599,7 +1600,8 @@ case class RefreshMaterializedViewCommand(
       deltaShape = sourceDeltaShape,
       fkRelations = constraintFacts.fkRelations,
       uniqueKeys = constraintFacts.uniqueKeys,
-      scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark)
+      scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
+      declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
     )
     val compileCacheTier = MvMetadata.compileCacheTier(cacheTierFacts)
 
@@ -1646,6 +1648,7 @@ case class RefreshMaterializedViewCommand(
               deltaShape = sourceDeltaShape,
               fkRelations = constraintFacts.fkRelations,
               uniqueKeys = constraintFacts.uniqueKeys,
+              declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
               runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
               scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
               assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
@@ -1877,14 +1880,29 @@ case class RefreshMaterializedViewCommand(
           }
         }
 
+      lazy val skewFanoutDeltaBroadcasts: Seq[SparkRefreshRewriter.SkewFanoutDeltaBroadcast] =
+        if (!FeatureGate.skewFanoutEnabled(spark)) Seq.empty
+        else {
+          val statsFacts = SparkDeltaStatsService
+            .forRefresh()
+            .workloadFactsFor(spark, meta.sourceTables, changeBatches)
+          SparkRefreshRewriter.planSkewFanoutDeltaBroadcasts(
+            statsFacts,
+            maxDeltaRows = FeatureGate.skewFanoutNarrowDeltaRows(spark.sparkContext.getConf),
+            maxOverlapRatio = FeatureGate.skewFanoutNarrowOverlapRatio(spark.sparkContext.getConf)
+          )
+        }
+
       def refreshPostProcess(sql: String): String = {
         val translated = LptsSparkDialect.translate(sql)
         val withSelectiveBroadcast =
           SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
+        val withSkewFanout =
+          SparkRefreshRewriter.injectSkewFanoutBroadcastHints(withSelectiveBroadcast, skewFanoutDeltaBroadcasts)
         if (FeatureGate.scd2RangeAccelEnabled(spark))
-          SparkRefreshRewriter.injectScd2RangeAcceleration(withSelectiveBroadcast)
+          SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
         else
-          withSelectiveBroadcast
+          withSkewFanout
       }
 
       val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)

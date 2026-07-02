@@ -3,6 +3,7 @@ package org.openivm.spark.compiler
 import java.util.concurrent.{CountDownLatch, Executors}
 
 import org.apache.spark.sql.types._
+import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -293,6 +294,25 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val result = sharedCompiler.compile(req)
     result.refreshType should be >= 0
     result.sql should not be empty
+  }
+
+  it should "emit RELY FK declarations for qualified compile facts when opted in" in {
+    val req = CompileRequest(
+      viewName = "mv_relyfk_script",
+      viewSql = "SELECT e.emp_id, d.dept_name FROM tpcdi.employees e JOIN tpcdi.departments d ON e.dept_id = d.dept_id",
+      sources = Map(
+        "employees"   -> StructType.fromDDL("emp_id INT, dept_id INT"),
+        "departments" -> StructType.fromDDL("dept_id INT")
+      ),
+      sourceQualifiedNames = Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments"),
+      facts = WorkloadFacts(
+        declareRelyFk = true,
+        fkRelations = Seq(ForeignKeyRelation("tpcdi.employees", Seq("dept_id"), "tpcdi.departments", Seq("dept_id")))
+      )
+    )
+
+    sharedCompiler.declareRelyFkStatements(req) should contain only
+      """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
   }
 
   // ── Test 8: Thread safety ─────────────────────────────────────────────────

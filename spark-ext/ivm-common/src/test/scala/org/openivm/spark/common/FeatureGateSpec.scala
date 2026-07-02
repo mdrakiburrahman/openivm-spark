@@ -75,6 +75,23 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.skewFanoutEnabled") {
+    it("defaults OFF and honours explicit strategy thresholds") {
+      val base = new SparkConf(false)
+      FeatureGate.skewFanoutEnabled(base) shouldBe false
+      FeatureGate.skewFanoutNarrowDeltaRows(base) shouldBe FeatureGate.SkewFanoutDefaultNarrowDeltaRows
+      FeatureGate.skewFanoutNarrowOverlapRatio(base) shouldBe FeatureGate.SkewFanoutDefaultNarrowOverlapRatio
+
+      val tuned = new SparkConf(false)
+        .set(FeatureGate.SkewFanoutEnabledKey, "true")
+        .set(FeatureGate.SkewFanoutNarrowDeltaRowsKey, "123")
+        .set(FeatureGate.SkewFanoutNarrowOverlapRatioKey, "0.01")
+      FeatureGate.skewFanoutEnabled(tuned) shouldBe true
+      FeatureGate.skewFanoutNarrowDeltaRows(tuned) shouldBe 123L
+      FeatureGate.skewFanoutNarrowOverlapRatio(tuned) shouldBe 0.01d
+    }
+  }
+
   describe("FeatureGate.uniqueJoinSimplifyEnabled") {
     it("defaults OFF and honours an explicit ON flag") {
       FeatureGate.uniqueJoinSimplifyEnabled(new SparkConf(false)) shouldBe false

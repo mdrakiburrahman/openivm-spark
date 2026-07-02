@@ -183,6 +183,19 @@ object FeatureGate {
     */
   val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
 
+  /** Enable skew-aware delta fanout join hints. Default OFF: when opted in, the
+    * refresh planner inspects per-refresh delta stats against source column
+    * stats and broadcasts only the narrow/small source-delta side of
+    * delta⋈base joins. This is a safe prototype of histogram-bin overlap
+    * planning: Spark/Delta currently expose min/max/null/NDV here, not actual
+    * histogram bins, so wider hot-bin salting is intentionally not emitted.
+    */
+  val SkewFanoutEnabledKey: String                = "spark.openivm.refresh.skewFanout.enabled"
+  val SkewFanoutNarrowDeltaRowsKey: String        = "spark.openivm.refresh.skewFanout.narrowDeltaRows"
+  val SkewFanoutNarrowOverlapRatioKey: String     = "spark.openivm.refresh.skewFanout.narrowOverlapRatio"
+  val SkewFanoutDefaultNarrowDeltaRows: Long      = 10000L
+  val SkewFanoutDefaultNarrowOverlapRatio: Double = 0.05d
+
   /** Drop FK-redundant inclusion-exclusion JOIN_DELTA terms in the Spark
     * rewriter, after Delta batch-shape classification has proven the referenced
     * tables are insert-only/unchanged. This composes with
@@ -191,6 +204,12 @@ object FeatureGate {
     * SF10 benchmark validates the combined win.
     */
   val FkTermPruneEnabledKey: String = "spark.openivm.refresh.fkTermPrune.enabled"
+
+  /** Declare trusted FK metadata into openivm's per-connection constraints
+    * cache before compiling refresh SQL. Default OFF until the matching
+    * openivm constraints-cache build is pinned.
+    */
+  val DeclareRelyFkEnabledKey: String = "spark.openivm.refresh.declareRelyFk.enabled"
 
   /** Simplify refresh joins whose right-side join key is known unique from
     * [[WorkloadFacts.uniqueKeys]]. INNER joins with unused right columns are
@@ -350,11 +369,37 @@ object FeatureGate {
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
 
+  def skewFanoutEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SkewFanoutEnabledKey, default = false)
+
+  def skewFanoutEnabled(spark: SparkSession): Boolean =
+    skewFanoutEnabled(spark.sparkContext.getConf)
+
+  def skewFanoutNarrowDeltaRows(conf: SparkConf): Long =
+    scala.util
+      .Try(conf.getLong(SkewFanoutNarrowDeltaRowsKey, SkewFanoutDefaultNarrowDeltaRows))
+      .getOrElse(
+        SkewFanoutDefaultNarrowDeltaRows
+      )
+
+  def skewFanoutNarrowOverlapRatio(conf: SparkConf): Double =
+    scala.util
+      .Try(conf.getDouble(SkewFanoutNarrowOverlapRatioKey, SkewFanoutDefaultNarrowOverlapRatio))
+      .getOrElse(
+        SkewFanoutDefaultNarrowOverlapRatio
+      )
+
   def fkTermPruneEnabled(conf: SparkConf): Boolean =
     boolConf(conf, FkTermPruneEnabledKey, default = false)
 
   def fkTermPruneEnabled(spark: SparkSession): Boolean =
     fkTermPruneEnabled(spark.sparkContext.getConf)
+
+  def declareRelyFkEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, DeclareRelyFkEnabledKey, default = false)
+
+  def declareRelyFkEnabled(spark: SparkSession): Boolean =
+    declareRelyFkEnabled(spark.sparkContext.getConf)
 
   def uniqueJoinSimplifyEnabled(conf: SparkConf): Boolean =
     boolConf(conf, UniqueJoinSimplifyEnabledKey, default = false)
