@@ -242,6 +242,13 @@ object FeatureGate {
     */
   val WindowClusterPruneEnabledKey: String = "spark.openivm.refresh.windowClusterPrune.enabled"
 
+  /** Replace WINDOW_PARTITION delete+insert recompute pairs with one Delta
+    * `INSERT ... REPLACE WHERE` when the affected partition literal list is
+    * small enough to collect safely. Default ON; flip OFF to restore the legacy
+    * MERGE-delete plus INSERT execution path byte-for-byte.
+    */
+  val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
+
   /** Emit the running-window suffix-extend refresh (P5.2) for cumulative
     * `SUM/MIN/MAX/COUNT/AVG OVER (PARTITION BY k ORDER BY d)` WINDOW MVs on a
     * proven insert-only batch: affected partitions whose new rows sort strictly
@@ -374,6 +381,12 @@ object FeatureGate {
 
   def windowClusterPruneEnabled(spark: SparkSession): Boolean =
     windowClusterPruneEnabled(spark.sparkContext.getConf)
+
+  def windowSinglePassReplaceEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSinglePassReplaceEnabledKey, default = true)
+
+  def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
+    windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
 
   def windowRunningIncrementalEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowRunningIncrementalEnabledKey, default = false)
