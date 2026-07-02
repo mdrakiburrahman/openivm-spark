@@ -76,4 +76,7 @@ lazy val ivmIt = (project in file("ivm-it"))
   .settings(commonSettings: _*)
   .settings(parallelForkSettings: _*)
   .settings(libraryDependencies ++= Dependencies.it)
+  .settings(
+    Test / test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-l", "org.openivm.spark.tags.MicroBenchmark")
+  )
   .settings(publish / skip := true)
