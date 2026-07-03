@@ -1469,12 +1469,17 @@ object SparkRefreshRewriter {
     // emitted by openivm when `force_view_delta_cascade=true`).
     val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
     val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
-    // Case 1: standalone `WHERE openivm_timestamp OP '...'::TIMESTAMP`
-    val standalone = ("(?i)\\s+WHERE\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral).r
-    // Case 2: trailing `AND openivm_timestamp OP '...'::TIMESTAMP`
-    val trailingAnd = ("(?i)\\s+AND\\s+" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral).r
-    // Case 3: leading `openivm_timestamp OP '...'::TIMESTAMP AND `
-    val leadingAnd = ("(?i)\\b" + qcol + "\\s*(?:>=|>|<=|<|=)\\s*" + tsLiteral + "\\s+AND\\s+").r
+    val cmp       = "\\s*(?:>=|>|<=|<|=)\\s*"
+    // LPTS rewrites parenthesises each WHERE conjunct
+    // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
+    // wrapped in a balanced paren pair or bare (pre-merge single-line form).
+    val tsPred = "(?:\\(\\s*" + qcol + cmp + tsLiteral + "\\s*\\)|" + qcol + cmp + tsLiteral + ")"
+    // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
+    val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
+    // Case 2: trailing `AND [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
+    val trailingAnd = ("(?i)\\s+AND\\s+" + tsPred).r
+    // Case 3: leading `[(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
+    val leadingAnd = ("(?i)" + tsPred + "\\s+AND\\s+").r
 
     leadingAnd.replaceAllIn(
       trailingAnd.replaceAllIn(
