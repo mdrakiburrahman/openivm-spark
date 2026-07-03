@@ -282,6 +282,14 @@ object FeatureGate {
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
+  /** Net signed view-delta rows before the scratch Delta write.
+    *
+    * Default OFF: flag-off execution keeps the emitted refresh SQL byte-identical.
+    * When enabled, `(+row, -row)` pairs in the already-signed openivm view-delta
+    * cancel under bag semantics before MERGE/INSERT statements consume it.
+    */
+  val RefreshEffectivizeEnabledKey: String = "spark.openivm.refresh.effectivize.enabled"
+
   /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
     * `REPLACE WHERE` path will consume it twice (cascade view-delta plus MV
     * data write). Default OFF: flag-off execution remains byte-identical.
@@ -487,6 +495,12 @@ object FeatureGate {
 
   def windowSinglePassReplaceEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowSinglePassReplaceEnabledKey, default = true)
+
+  def refreshEffectivizeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RefreshEffectivizeEnabledKey, default = false)
+
+  def refreshEffectivizeEnabled(spark: SparkSession): Boolean =
+    refreshEffectivizeEnabled(spark.sparkContext.getConf)
 
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
