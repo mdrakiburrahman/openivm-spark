@@ -16,12 +16,18 @@ class WorkloadFactsSpec extends AnyFunSpec with Matchers {
   describe("WorkloadFacts") {
     it("serializes empty registry facts by default") {
       WorkloadFacts().toJson shouldBe
-        """{"schema_version":2,"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true,"assume_insert_only":false,"running_window_incremental":false,"scd2_range_join_accel":false,"delta_shape":{},"fk_relations":[],"unique_keys":[],"table_stats":{},"column_stats":{},"delta_stats":{}}"""
+        """{"schema_version":2,"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true,"assume_insert_only":false,"running_window_incremental":false,"scd2_range_join_accel":false,"scd2_projection_delta":false,"delta_shape":{},"fk_relations":[],"unique_keys":[],"table_stats":{},"column_stats":{},"delta_stats":{}}"""
     }
 
     it("serializes openivm-side SCD2 range-join acceleration fact") {
       WorkloadFacts(scd2RangeJoinAccel = true).toJson should include(
         "\"scd2_range_join_accel\":true"
+      )
+    }
+
+    it("serializes openivm-side SCD2 projection-delta fact") {
+      WorkloadFacts(scd2ProjectionDelta = true).toJson should include(
+        "\"scd2_projection_delta\":true"
       )
     }
 
