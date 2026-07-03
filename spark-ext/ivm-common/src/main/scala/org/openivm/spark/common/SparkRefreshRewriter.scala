@@ -299,6 +299,68 @@ object SparkRefreshRewriter {
     ctasRe.findFirstMatchIn(stripExecutionMarker(stmt)).map(_.group(1).trim)
   }
 
+  private def effectivizeViewDeltaCtas(stmt: String, viewDeltaPath: String, enabled: Boolean): String =
+    if (!enabled) stmt
+    else {
+      extractViewDeltaCtasBody(stmt, viewDeltaPath)
+        .flatMap(viewDeltaColumns)
+        .filter(_.exists(normalizeColumnName(_) == "openivm_multiplicity"))
+        .map { columns =>
+          val escapedPath  = viewDeltaPath.replace("`", "``")
+          val hasTimestamp = columns.exists(normalizeColumnName(_) == "openivm_timestamp")
+          val userColumns  = columns.filterNot(c => isOpenIvmDeltaMetadataColumn(normalizeColumnName(c)))
+          val groupedUserCols =
+            if (userColumns.isEmpty) ""
+            else userColumns.map(quoteColumnName).mkString(", ") + ", "
+          val groupBy =
+            if (userColumns.isEmpty) ""
+            else s"GROUP BY ${userColumns.map(quoteColumnName).mkString(", ")}"
+          val selectUserCols =
+            if (userColumns.isEmpty) ""
+            else userColumns.map(quoteColumnName).mkString(", ") + ", "
+          val timestampExpr = if (hasTimestamp) "MAX(openivm_timestamp)" else "CURRENT_TIMESTAMP"
+          s"""CREATE OR REPLACE TABLE delta.`$escapedPath` USING DELTA AS
+             |WITH __openivm_effective_raw AS (
+             |${extractViewDeltaCtasBody(stmt, viewDeltaPath).get}
+             |),
+             |__openivm_effective_net AS (
+             |  SELECT ${groupedUserCols}SUM(openivm_multiplicity) AS openivm_multiplicity,
+             |         $timestampExpr AS openivm_timestamp
+             |  FROM __openivm_effective_raw
+             |  $groupBy
+             |  HAVING SUM(openivm_multiplicity) <> 0
+             |)
+             |SELECT ${selectUserCols}CAST(openivm_multiplicity AS INTEGER) AS openivm_multiplicity,
+             |       openivm_timestamp
+             |FROM __openivm_effective_net""".stripMargin
+        }
+        .getOrElse(stmt)
+    }
+
+  private def viewDeltaColumns(ctasBody: String): Option[Seq[String]] = {
+    val selectRe = "(?is).*\\bSELECT\\s+(.+)\\s+FROM\\s+\\w+\\s*$".r
+    selectRe.findFirstMatchIn(ctasBody).map { m =>
+      splitSelectList(m.group(1)).map(selectItemName)
+    }
+  }
+
+  private def selectItemName(item: String): String = {
+    val trimmed = item.trim
+    val asRe    = "(?is)\\s+AS\\s+(.+)$".r
+    asRe.findFirstMatchIn(trimmed).map(_.group(1).trim).getOrElse(trimmed)
+  }
+
+  private def normalizeColumnName(name: String): String =
+    name.trim.stripPrefix("`").stripSuffix("`").stripPrefix("\"").stripSuffix("\"").toLowerCase
+
+  private def quoteColumnName(name: String): String = {
+    val normalized = name.trim.stripPrefix("`").stripSuffix("`").replace("`", "``")
+    s"`$normalized`"
+  }
+
+  private def isOpenIvmDeltaMetadataColumn(name: String): Boolean =
+    name == "openivm_multiplicity" || name == "openivm_timestamp"
+
   /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
     * `` `<tempViewName>` ``. Anchored on the exact escaped path (the path is
     * UUID-suffixed so this is functionally safe) but uses a literal-quoted
@@ -365,6 +427,7 @@ object SparkRefreshRewriter {
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
+      refreshEffectivizeEnabled: Boolean = false,
       runningWindowStateEnabled: Boolean = false,
       auxRunStateLocation: Option[String] = None,
       mvVersionBeforeRefresh: Option[Long] = None
@@ -393,7 +456,8 @@ object SparkRefreshRewriter {
                 fkTermPruneEnabled,
                 fkRelations,
                 uniqueKeys,
-                uniqueJoinSimplifyEnabled
+                uniqueJoinSimplifyEnabled,
+                refreshEffectivizeEnabled
               )
             )
           case StatementKind.ViewDeltaCompanion =>
@@ -802,7 +866,8 @@ object SparkRefreshRewriter {
       fkTermPruneEnabled: Boolean,
       fkRelations: Seq[ForeignKeyRelation],
       uniqueKeys: Seq[UniqueKey],
-      uniqueJoinSimplifyEnabled: Boolean
+      uniqueJoinSimplifyEnabled: Boolean,
+      refreshEffectivizeEnabled: Boolean
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
@@ -814,6 +879,7 @@ object SparkRefreshRewriter {
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
+    s = effectivizeViewDeltaCtas(s, viewDeltaPath, refreshEffectivizeEnabled)
     s
   }
 

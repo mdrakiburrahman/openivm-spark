@@ -2138,6 +2138,7 @@ case class RefreshMaterializedViewCommand(
             uniqueKeys = rewriteConstraintFacts.uniqueKeys,
             uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
             windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark),
+            refreshEffectivizeEnabled = FeatureGate.refreshEffectivizeEnabled(spark),
             runningWindowStateEnabled =
               FeatureGate.windowRunningIncrementalEnabled(spark) && meta.refreshType == RefreshTypeCode.WindowPartition,
             auxRunStateLocation = Some(runningWindowStateLocation(meta.location)),

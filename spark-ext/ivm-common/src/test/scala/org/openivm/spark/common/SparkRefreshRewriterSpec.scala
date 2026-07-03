@@ -18,6 +18,44 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
+  describe("refresh effectivization") {
+    it("is default-off and wraps the signed view delta when enabled") {
+      val input =
+        """WITH d (id, v, mult) AS (
+          |  SELECT 1, 'a', 1
+          |  UNION ALL
+          |  SELECT 1, 'a', -1
+          |  UNION ALL
+          |  SELECT 1, 'a', 1
+          |)
+          |INSERT INTO openivm_delta_mv_r (id, v, openivm_multiplicity)
+          |SELECT * FROM d""".stripMargin
+
+      val off = SparkRefreshRewriter.rewrite(
+        input,
+        mvName,
+        mvLocation,
+        viewLogicalName,
+        Map.empty,
+        viewDeltaPath
+      )
+      off.statements.head should not include "__openivm_effective_raw"
+
+      val on = SparkRefreshRewriter.rewrite(
+        input,
+        mvName,
+        mvLocation,
+        viewLogicalName,
+        Map.empty,
+        viewDeltaPath,
+        refreshEffectivizeEnabled = true
+      )
+      on.statements.head should include("__openivm_effective_raw")
+      on.statements.head should include("GROUP BY `id`, `v`")
+      on.statements.head should include("HAVING SUM(openivm_multiplicity) <> 0")
+    }
+  }
+
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
     * FROM sales GROUP BY region`, captured verbatim per the P4.5 spec.
     */

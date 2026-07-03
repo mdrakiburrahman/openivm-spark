@@ -163,4 +163,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe true
     }
   }
+
+  describe("FeatureGate.refreshEffectivizeEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.refreshEffectivizeEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.refreshEffectivizeEnabled(
+        new SparkConf(false).set(FeatureGate.RefreshEffectivizeEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
 }
