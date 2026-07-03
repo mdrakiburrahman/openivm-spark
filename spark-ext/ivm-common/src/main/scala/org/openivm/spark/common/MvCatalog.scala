@@ -25,6 +25,7 @@ import scala.util.Try
  * @param lastVersion             Delta version of the MV table at last successful refresh
  * @param sourceTables            list of base tables the MV depends on
  * @param sourceSchemaFingerprint SHA-256 hex of the sorted (table → StructType.toDDL) encoding
+  * @param queryPlanFingerprint    optional SHA-256 hex of the normalized analyzed query plan
  * @param location                HDFS / object-store path of the MV Delta table
  * @param createdAt               creation timestamp
  * @param properties              free-form key/value properties
@@ -37,6 +38,7 @@ final case class MvMetadata(
     lastVersion: Long,
     sourceTables: Seq[String],
     sourceSchemaFingerprint: String,
+    queryPlanFingerprint: Option[String],
     location: String,
     createdAt: Timestamp,
     properties: Map[String, String]
@@ -125,6 +127,8 @@ object MvMetadata {
 
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
+
+  val ForceFullRefreshOnceKey: String = "_ivm_force_full_refresh_once"
 
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
@@ -247,10 +251,11 @@ object MvCatalog {
   private val IndexColumnFamilies = IndexDbColumnFamilies.All
   private val PerMvColumnFamilies = Seq("meta", "properties", "consumed")
 
-  private val MvIndexCf     = "mv_index"
-  private val SourceToMvsCf = "source_to_mvs"
-  private val MetaCf        = "meta"
-  private val PropertiesCf  = "properties"
+  private val MvIndexCf               = "mv_index"
+  private val SourceToMvsCf           = "source_to_mvs"
+  private val DroppedMvFingerprintsCf = "dropped_mv_fingerprints"
+  private val MetaCf                  = "meta"
+  private val PropertiesCf            = "properties"
 
   private val EmptyBytes = Array.emptyByteArray
 
@@ -261,6 +266,7 @@ object MvCatalog {
   private val LastVersionMetaKey             = RocksDBCodec.utf8("last_version")
   private val SourceTablesMetaKey            = RocksDBCodec.utf8("source_tables")
   private val SourceSchemaFingerprintMetaKey = RocksDBCodec.utf8("source_schema_fingerprint")
+  private val QueryPlanFingerprintMetaKey    = RocksDBCodec.utf8("query_plan_fingerprint")
   private val LocationMetaKey                = RocksDBCodec.utf8("location")
   private val CreatedAtMetaKey               = RocksDBCodec.utf8("created_at")
 
@@ -381,6 +387,7 @@ object MvCatalog {
       lastVersion = lastVersion,
       sourceTables = decodeSourceTables(sourceTablesEncoded),
       sourceSchemaFingerprint = sourceSchemaFingerprint,
+      queryPlanFingerprint = getUtf8(db, MetaCf, QueryPlanFingerprintMetaKey).filter(_.nonEmpty),
       location = location,
       createdAt = new Timestamp(createdAtMillis),
       properties = readProperties(db)
@@ -431,6 +438,9 @@ object MvCatalog {
       RocksDBCodec.utf8(meta.sourceSchemaFingerprint)
     )
     OpenIvmRocksDBBatchOps.put(db, batch, MetaCf, LocationMetaKey, RocksDBCodec.utf8(meta.location))
+    meta.queryPlanFingerprint.foreach { fp =>
+      OpenIvmRocksDBBatchOps.put(db, batch, MetaCf, QueryPlanFingerprintMetaKey, RocksDBCodec.utf8(fp))
+    }
     OpenIvmRocksDBBatchOps.put(db, batch, MetaCf, CreatedAtMetaKey, RocksDBCodec.utf8(meta.createdAt.getTime.toString))
   }
 
@@ -482,6 +492,10 @@ object MvCatalog {
         lastVersion = row.getAs[Long]("last_version"),
         sourceTables = row.getSeq[String](row.fieldIndex("source_tables")),
         sourceSchemaFingerprint = row.getAs[String]("source_schema_fingerprint"),
+        queryPlanFingerprint =
+          if (row.schema.fieldNames.contains("query_plan_fingerprint"))
+            Option(row.getAs[String]("query_plan_fingerprint")).filter(_.nonEmpty)
+          else None,
         location = row.getAs[String]("location"),
         createdAt = row.getAs[Timestamp]("created_at"),
         properties = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
@@ -644,13 +658,19 @@ object MvCatalog {
       }
   }
 
+  def droppedQueryPlanFingerprint(spark: SparkSession, name: TableIdentifier): Option[String] = {
+    val indexDb = openIndexDb(spark)
+    indexDb.get(DroppedMvFingerprintsCf, RocksDBCodec.utf8(serializeName(name))).map(RocksDBCodec.fromUtf8)
+  }
+
   def remove(spark: SparkSession, name: TableIdentifier): Unit = {
     val serializedName = serializeName(name)
     val indexDb        = openIndexDb(spark)
     val indexedPath    = lookupPath(indexDb, serializedName)
     val candidatePath  = indexedPath.getOrElse(perMvDbPath(spark, serializedName))
+    val existingMeta   = readMetadataAtPath(spark, candidatePath)
     val sourceTables =
-      readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
+      existingMeta.map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
         indexDb,
         serializedName
       )
@@ -661,6 +681,15 @@ object MvCatalog {
     if (indexedPath.nonEmpty || sourceTables.nonEmpty) {
       indexDb.withBatch { batch =>
         OpenIvmRocksDBBatchOps.delete(indexDb, batch, MvIndexCf, RocksDBCodec.utf8(serializedName))
+        existingMeta.flatMap(_.queryPlanFingerprint).foreach { fp =>
+          OpenIvmRocksDBBatchOps.put(
+            indexDb,
+            batch,
+            DroppedMvFingerprintsCf,
+            RocksDBCodec.utf8(serializedName),
+            RocksDBCodec.utf8(fp)
+          )
+        }
         sourceTables.toSeq.sorted.foreach { sourceTable =>
           OpenIvmRocksDBBatchOps.delete(indexDb, batch, SourceToMvsCf, sourceToMvKey(sourceTable, serializedName))
         }

@@ -33,6 +33,7 @@ import org.openivm.spark.common._
 import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
+import java.security.MessageDigest
 import java.util.{Collections, UUID}
 import java.util.concurrent.{Executors, TimeUnit}
 
@@ -567,6 +568,23 @@ private[commands] object MvCommandHelper {
     viewNames.foreach(n => spark.sql(s"DROP VIEW IF EXISTS `$n`"))
 
   private def escapePath(p: String): String = p.replace("`", "``")
+
+  def normalizedQueryPlanFingerprint(spark: SparkSession, querySql: String): String = {
+    val analyzed   = spark.sql(querySql).queryExecution.analyzed
+    val normalized = analyzed.canonicalized.treeString(verbose = true, addSuffix = false)
+    val digest     = MessageDigest.getInstance("SHA-256").digest(normalized.getBytes("UTF-8"))
+    digest.map("%02x".format(_)).mkString
+  }
+
+  def containsNonDeterministicExpression(spark: SparkSession, querySql: String): Boolean = {
+    val analyzed       = spark.sql(querySql).queryExecution.analyzed
+    val expressionFlag = analyzed.exists(_.expressions.exists(_.exists(e => !e.deterministic)))
+    val sqlFlag =
+      """(?i)\b(rand|randn|random|uuid|current_timestamp|now|current_date|shuffle)\s*\(""".r
+        .findFirstIn(querySql)
+        .isDefined
+    expressionFlag || sqlFlag
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +674,16 @@ case class CreateMaterializedViewCommand(
     val analyzed       = spark.sql(originalQueryText).queryExecution.analyzed
     val groupKeys      = extractGroupKeys(analyzed)
     val countStarAlias = extractCountStarAlias(analyzed)
+    val queryPlanFingerprint =
+      if (FeatureGate.fingerprintGuardEnabled(spark)) Some(normalizedQueryPlanFingerprint(spark, originalQueryText))
+      else None
+    val forceFullRefreshOnceProp =
+      if (FeatureGate.fingerprintGuardEnabled(spark)) {
+        val changedSinceDrop =
+          queryPlanFingerprint.exists(fp => MvCatalog.droppedQueryPlanFingerprint(spark, name).exists(_ != fp))
+        if (changedSinceDrop) Map(MvMetadata.ForceFullRefreshOnceKey -> "query_fingerprint_mismatch")
+        else Map.empty[String, String]
+      } else Map.empty[String, String]
 
     // Compile the view via OpenIVM. If openivm's DuckDB subprocess cannot
     // compile the query (e.g. the user's view body references Spark-only
@@ -1072,7 +1100,7 @@ case class CreateMaterializedViewCommand(
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
     val allProps =
       properties ++ baseProps ++ countProp ++ havingProp ++ cascadeDeltaProps ++
-        compiledProps ++ watermarkProps
+        compiledProps ++ watermarkProps ++ forceFullRefreshOnceProp
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -1083,6 +1111,7 @@ case class CreateMaterializedViewCommand(
       lastVersion = -1L,
       sourceTables = qualNames,
       sourceSchemaFingerprint = fingerprint,
+      queryPlanFingerprint = queryPlanFingerprint,
       location = location,
       createdAt = now,
       properties = allProps
@@ -1402,9 +1431,32 @@ case class RefreshMaterializedViewCommand(
         )
       }
 
-    val viewNameStr      = metaName(name)
-    val propagation      = ChangePropagationFactory.forSession(spark)
-    val sourceWatermarks = meta.changeWatermarks
+    val viewNameStr             = metaName(name)
+    val propagation             = ChangePropagationFactory.forSession(spark)
+    val sourceWatermarks        = meta.changeWatermarks
+    val fingerprintGuardEnabled = FeatureGate.fingerprintGuardEnabled(spark)
+    val forcedFullRefreshReason: Option[String] =
+      if (!fingerprintGuardEnabled) None
+      else {
+        val nonDeterministic = containsNonDeterministicExpression(spark, meta.querySql)
+        val currentFingerprint =
+          if (nonDeterministic) meta.queryPlanFingerprint
+          else Some(normalizedQueryPlanFingerprint(spark, meta.querySql))
+        meta.properties
+          .get(MvMetadata.ForceFullRefreshOnceKey)
+          .filter(_.nonEmpty)
+          .orElse(
+            if (nonDeterministic)
+              Some(
+                "non_deterministic_query"
+              )
+            else
+              meta.queryPlanFingerprint
+                .filter(_.nonEmpty)
+                .filter(_ != currentFingerprint.getOrElse(""))
+                .map(_ => "query_fingerprint_mismatch")
+          )
+      }
 
     // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
     // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
@@ -1416,6 +1468,7 @@ case class RefreshMaterializedViewCommand(
       catch { case _: Throwable => Seq.empty[MvMetadata] }
 
     if (
+      forcedFullRefreshReason.isEmpty &&
       meta.refreshType != RefreshTypeCode.FullRefresh &&
       !propagation.hasPendingChanges(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
     ) {
@@ -1440,7 +1493,7 @@ case class RefreshMaterializedViewCommand(
 
     // Defensive backstop: the cheap existence probe above and the full collect
     // can diverge if another refresh consumes the same rows before we collect.
-    if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+    if (forcedFullRefreshReason.isEmpty && meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
           "outcome='no_pending_deltas'"
@@ -1589,8 +1642,13 @@ case class RefreshMaterializedViewCommand(
     // once; conservative (failure => treat as Replace).
     lazy val replaceBatch: Boolean =
       cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
-    if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
-      if (meta.refreshType != RefreshTypeCode.FullRefresh)
+    if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch || forcedFullRefreshReason.nonEmpty) {
+      if (forcedFullRefreshReason.nonEmpty)
+        logInfo(
+          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='fingerprint_guard_full_refresh' " +
+            s"reason='${forcedFullRefreshReason.get}'"
+        )
+      else if (meta.refreshType != RefreshTypeCode.FullRefresh)
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
         )
@@ -1653,6 +1711,8 @@ case class RefreshMaterializedViewCommand(
             postRefreshCleanup(spark, name, meta, changeBatches, viewNameStr, sqlLog, qlogOrder)
           }
         }
+        if (forcedFullRefreshReason.contains("query_fingerprint_mismatch"))
+          MvCatalog.updateProperties(spark, name, meta.properties - MvMetadata.ForceFullRefreshOnceKey)
         emitEnd("full_refresh_executed", "FULL_REFRESH", changeBatches.size)
       } catch {
         case t: Throwable =>
