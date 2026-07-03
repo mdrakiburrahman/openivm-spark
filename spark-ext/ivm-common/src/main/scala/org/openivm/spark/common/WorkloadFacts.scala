@@ -34,6 +34,7 @@ final case class WorkloadFacts(
     forceViewDeltaCascade: Boolean = true,
     assumeInsertOnly: Boolean = false,
     runningWindowIncremental: Boolean = false,
+    lastValueStateIncremental: Boolean = false,
     scd2RangeJoinAccel: Boolean = false,
     declareRelyFk: Boolean = false,
     deltaShape: Map[String, DeltaShape] = Map.empty,
@@ -67,6 +68,7 @@ final case class WorkloadFacts(
       s""""compile_only":${bool(compileOnly)},"force_view_delta_cascade":${bool(forceViewDeltaCascade)},""" +
       s""""assume_insert_only":${bool(assumeInsertOnly)},""" +
       s""""running_window_incremental":${bool(runningWindowIncremental)},""" +
+      s""""last_value_state_incremental":${bool(lastValueStateIncremental)},""" +
       s""""scd2_range_join_accel":${bool(scd2RangeJoinAccel)},"delta_shape":$shapes,""" +
       s""""fk_relations":$fks,"unique_keys":$uniques,""" +
       s""""table_stats":${tableStatsJson(tableStats)},"column_stats":${columnStatsJson(columnStats)},""" +

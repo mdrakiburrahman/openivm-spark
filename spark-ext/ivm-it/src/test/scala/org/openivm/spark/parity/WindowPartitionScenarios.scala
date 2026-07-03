@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 
 /** P5.rt5 — Coverage of RefreshType 5 (WINDOW_PARTITION).
   *
@@ -404,6 +404,36 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
       refreshMv("mv_wp12")
 
       assertMvCorrect("mv_wp12", viewSql)
+    }
+  }
+
+  describe("(13) LAST_VALUE IGNORE NULLS backing state") {
+    it("handles suffix append, backdated insert, and delete of max with EXCEPT ALL correctness") {
+      restartSpark(Map(FeatureGate.WindowLastValueBackingStateEnabledKey -> "true"))
+      sql("CREATE TABLE IF NOT EXISTS sales_wp13(id INT, acct STRING, seq INT, status STRING) USING DELTA")
+      sql(
+        "INSERT INTO sales_wp13 VALUES " +
+          "(1,'a',1,'new'), (2,'a',2,NULL), (3,'a',3,'active'), " +
+          "(4,'b',1,NULL), (5,'b',2,'warm')"
+      )
+      val viewSql =
+        "SELECT id, acct, seq, status, " +
+          "LAST_VALUE(status, true) OVER (PARTITION BY acct ORDER BY seq) AS ff_status FROM sales_wp13"
+      sql(s"CREATE MATERIALIZED VIEW mv_wp13 AS $viewSql")
+
+      mvRefreshType("mv_wp13") shouldBe RefreshTypeCode.WindowPartition
+
+      sql("INSERT INTO sales_wp13 VALUES (6,'a',4,'closed'), (7,'b',3,NULL)")
+      refreshMv("mv_wp13")
+      assertMvCorrect("mv_wp13", viewSql)
+
+      sql("INSERT INTO sales_wp13 VALUES (8,'a',0,'seed')")
+      refreshMv("mv_wp13")
+      assertMvCorrect("mv_wp13", viewSql)
+
+      sql("DELETE FROM sales_wp13 WHERE acct='a' AND seq=4")
+      refreshMv("mv_wp13")
+      assertMvCorrect("mv_wp13", viewSql)
     }
   }
 }

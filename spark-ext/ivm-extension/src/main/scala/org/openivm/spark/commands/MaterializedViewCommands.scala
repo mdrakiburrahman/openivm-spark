@@ -1666,6 +1666,7 @@ case class RefreshMaterializedViewCommand(
         uniqueKeys = constraintFacts.uniqueKeys,
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
         runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+        lastValueStateIncremental = false,
         scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
         assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.WindowPartition &&
@@ -2045,7 +2046,9 @@ case class RefreshMaterializedViewCommand(
             uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
             windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark),
             runningWindowStateEnabled =
-              FeatureGate.windowRunningIncrementalEnabled(spark) && meta.refreshType == RefreshTypeCode.WindowPartition,
+              (FeatureGate.windowRunningIncrementalEnabled(spark) ||
+                FeatureGate.windowLastValueBackingStateEnabled(spark)) &&
+                meta.refreshType == RefreshTypeCode.WindowPartition,
             auxRunStateLocation = Some(runningWindowStateLocation(meta.location)),
             // Pass the short → qualified source name map so the rewriter can
             // expand `memory.main.<short>` to the fully-qualified Spark name
