@@ -79,6 +79,9 @@ object FeatureGate {
     * are recreated on each execution.
     */
   val CompileClassificationCacheEnabledKey: String = "spark.openivm.compile.classificationCache.enabled"
+  val RefreshProgramCacheEnabledKey: String        = "spark.openivm.refresh.programCache.enabled"
+  val RefreshStatementFusionEnabledKey: String     = "spark.openivm.refresh.statementFusion.enabled"
+  val RefreshSiblingParallelEnabledKey: String     = "spark.openivm.refresh.siblingParallel.enabled"
 
   /** Capture every SQL statement actually executed by a CREATE / REFRESH
     * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
@@ -365,7 +368,26 @@ object FeatureGate {
     boolConf(spark.sparkContext.getConf, CompileClassificationCacheEnabledKey, default = false)
 
   def compileClassificationCacheEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, CompileClassificationCacheEnabledKey, default = false)
+    boolConf(conf, CompileClassificationCacheEnabledKey, default = false) ||
+      boolConf(conf, RefreshProgramCacheEnabledKey, default = false)
+
+  def refreshProgramCacheEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RefreshProgramCacheEnabledKey, default = false)
+
+  def refreshProgramCacheEnabled(spark: SparkSession): Boolean =
+    refreshProgramCacheEnabled(spark.sparkContext.getConf)
+
+  def refreshStatementFusionEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RefreshStatementFusionEnabledKey, default = false)
+
+  def refreshStatementFusionEnabled(spark: SparkSession): Boolean =
+    refreshStatementFusionEnabled(spark.sparkContext.getConf)
+
+  def refreshSiblingParallelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RefreshSiblingParallelEnabledKey, default = false)
+
+  def refreshSiblingParallelEnabled(spark: SparkSession): Boolean =
+    refreshSiblingParallelEnabled(spark.sparkContext.getConf)
 
   def queryLogEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)

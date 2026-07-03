@@ -34,6 +34,7 @@ import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
+import java.util.concurrent.{Executors, TimeUnit}
 
 // ---------------------------------------------------------------------------
 // Compiler singleton — one OpenIvmCompiler per SparkSession, lazily created.
@@ -91,6 +92,39 @@ private[commands] object RefreshMutex {
           }
         }
     lock.synchronized(body)
+  }
+}
+
+private[commands] object SiblingRefreshExecutor {
+  def refreshAll(spark: SparkSession, views: Seq[TableIdentifier]): Unit = {
+    if (!FeatureGate.refreshSiblingParallelEnabled(spark) || views.size <= 1) {
+      views.foreach(v => RefreshMaterializedViewCommand(v).run(spark))
+      return
+    }
+    val metas   = views.flatMap(v => MvCatalog.lookup(spark, v).map(v -> _))
+    val mvNames = metas.map { case (_, m) => MvCommandHelper.metaName(m.name).split("\\.").last }.toSet
+    val hasMvDependency = metas.exists { case (_, m) =>
+      m.sourceTables.exists(t => mvNames.contains(t.split("\\.").last))
+    }
+    if (hasMvDependency) {
+      views.foreach(v => RefreshMaterializedViewCommand(v).run(spark))
+      return
+    }
+    val pool = Executors.newFixedThreadPool(math.min(views.size, Runtime.getRuntime.availableProcessors().max(1)))
+    try {
+      val futures = views.map { view =>
+        pool.submit(new Runnable {
+          override def run(): Unit =
+            RefreshMaterializedViewCommand(view).run(
+              org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
+            )
+        })
+      }
+      futures.foreach(_.get())
+    } finally {
+      pool.shutdown()
+      pool.awaitTermination(1, TimeUnit.MINUTES)
+    }
   }
 }
 
@@ -2080,7 +2114,7 @@ case class RefreshMaterializedViewCommand(
       }
 
       val fuseEligible =
-        FeatureGate.fuseScratchEnabled(spark) &&
+        (FeatureGate.fuseScratchEnabled(spark) || FeatureGate.refreshStatementFusionEnabled(spark)) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
           rewritten.statements.nonEmpty
 
