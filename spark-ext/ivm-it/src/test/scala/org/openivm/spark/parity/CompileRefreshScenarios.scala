@@ -96,16 +96,16 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
       sources = Map("sales" -> salesSchema)
     )
 
-  /** Replace `'YYYY-MM-DD HH:MM:SS.ffffff'::TIMESTAMP` literals — which openivm
-    * embeds via `now()` at compile time to bound the delta-scan window — with
-    * a stable placeholder, so two compile invocations on the same request can
-    * be compared structurally.
+  /** Replace `'YYYY-MM-DD HH:MM:SS.ffffff'` datetime literals — which openivm
+    * embeds via `now()` at compile time to bound the delta-scan window, in either
+    * `'…'::TIMESTAMP` or `CAST('…' AS TIMESTAMP)` form — with a stable placeholder,
+    * so two compile invocations on the same request can be compared structurally.
     */
   protected val TimestampLiteral =
-    """'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?'::TIMESTAMP""".r
+    """'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?'""".r
 
   protected def stripTimestamps(sql: String): String =
-    TimestampLiteral.replaceAllIn(sql, "'<TS>'::TIMESTAMP")
+    TimestampLiteral.replaceAllIn(sql, "'<TS>'")
 
   // ── Tests ──────────────────────────────────────────────────────────────────
 

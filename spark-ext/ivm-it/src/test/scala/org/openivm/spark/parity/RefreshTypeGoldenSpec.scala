@@ -18,11 +18,11 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
   private var sharedCompiler: OpenIvmCompiler = _
 
   private val goldenHashes: Map[String, String] = Map(
-    "aggregate-group"   -> "163c8c9efdeea4668469bd4ffc8d6f45886903248ec8ebd88822ecccd32f97cc",
-    "simple-aggregate"  -> "ad37be4ba0e1bd264c99a8001cd455c12bfaa04e384a613c9975e8d765420f54",
-    "simple-projection" -> "880c37e197fd6532c8f0b5d9c60d3dbcaf1785b6bcbd8eded0c1d12a8998a64f",
-    "window-partition"  -> "0be629f88996a1440a53f2fdb6050c348a03d408173b8db5ce447dc864f2fe98",
-    "group-recompute"   -> "da6e8d9b80c1243862cef21667079a404fb7856f101508f98974617cfb4d6c0c"
+    "aggregate-group"   -> "5e9febd162b83fe7ede40a087ca1817773596375bbdde884d01d652551bd954d",
+    "simple-aggregate"  -> "25d6e0fac7298e20145229306de4cee01c3666fab4b19aff6965e478826b49e4",
+    "simple-projection" -> "2628b0b68e7b8adbdbdc38b08d2ec21de6b392d9711d080734162112e4fae229",
+    "window-partition"  -> "e79ce22841b0bb6745bffea5bc53bbbe4dd5d6a90edfb86e5455c03169a08e2c",
+    "group-recompute"   -> "df27a68011d5fe774113c481c74bc0a2547b0dbb3fc23c1606cf3f73929b12df"
   )
 
   private val cases: Seq[GoldenCase] = Seq(
@@ -101,12 +101,14 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
     }
   }
 
+  // Matches the datetime literal itself, independent of the surrounding cast
+  // syntax, so both `'…'::TIMESTAMP` and `CAST('…' AS TIMESTAMP)` normalize.
   private val TimestampLiteral =
-    """'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?'::TIMESTAMP""".r
+    """'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?'""".r
 
   private def normalizeSql(sql: String): String =
     TimestampLiteral
-      .replaceAllIn(sql, "'<timestamp>'::timestamp")
+      .replaceAllIn(sql, "'<timestamp>'")
       .trim
       .replaceAll("\\s+", " ")
       .toLowerCase(Locale.ROOT)
