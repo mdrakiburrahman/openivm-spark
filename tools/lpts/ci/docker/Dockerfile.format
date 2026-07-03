@@ -1,0 +1,42 @@
+# Mirrors the format-check job of duckdb/extension-ci-tools @ v1.5-variegata:
+#   runs-on: ubuntu-22.04
+#   env: CC=gcc-10, CXX=g++-10, GEN=ninja
+#   apt: ninja-build clang-format-11
+#   pip3: cmake-format 'black==24.*' cxxheaderparser pcpp 'clang_format==11.0.1'
+# CI also has gcc-10/g++-10 from the runner image; format-check itself only
+# calls duckdb/scripts/format.py so the compiler is unused, but we keep the
+# env vars exported for parity.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CC=gcc-10
+ENV CXX=g++-10
+ENV GEN=ninja
+
+RUN apt-get update -y -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        ca-certificates \
+        git \
+        make \
+        ninja-build \
+        clang-format-11 \
+        python3 \
+        python3-pip \
+        gcc-10 \
+        g++-10 && \
+    rm -rf /var/lib/apt/lists/*
+
+# pip3 deps verbatim from the upstream Install step. clang_format==11.0.1
+# is the PyPI wrapper used by duckdb/scripts/format.py; the apt
+# clang-format-11 binary is also needed because the wrapper shells out to it.
+RUN pip3 install --no-cache-dir \
+        'cmake-format' \
+        'black==24.*' \
+        'cxxheaderparser' \
+        'pcpp' \
+        'clang_format==11.0.1'
+
+RUN git config --global --add safe.directory "*"
+
+WORKDIR /work
