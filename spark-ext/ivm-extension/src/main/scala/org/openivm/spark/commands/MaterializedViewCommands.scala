@@ -1745,6 +1745,7 @@ case class RefreshMaterializedViewCommand(
       fkRelations = constraintFacts.fkRelations,
       uniqueKeys = constraintFacts.uniqueKeys,
       scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
+      scd2ProjectionDelta = FeatureGate.scd2ProjectionDeltaEnabled(spark),
       declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
     )
     val compileCacheTier                            = MvMetadata.compileCacheTier(cacheTierFacts)
@@ -1761,6 +1762,7 @@ case class RefreshMaterializedViewCommand(
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
         runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
         scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
+        scd2ProjectionDelta = FeatureGate.scd2ProjectionDeltaEnabled(spark),
         assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.WindowPartition &&
           sourceDeltaShape.nonEmpty &&

@@ -128,6 +128,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.scd2ProjectionDeltaEnabled") {
+    it("defaults OFF and honours an explicit ON flag") {
+      FeatureGate.scd2ProjectionDeltaEnabled(new SparkConf(false)) shouldBe false
+      FeatureGate.scd2ProjectionDeltaEnabled(
+        new SparkConf(false).set(FeatureGate.Scd2ProjectionDeltaEnabledKey, "true")
+      ) shouldBe true
+    }
+  }
+
   describe("FeatureGate.windowClusterPruneEnabled") {
     it("defaults OFF and honours an explicit ON flag") {
       FeatureGate.windowClusterPruneEnabled(new SparkConf(false)) shouldBe false

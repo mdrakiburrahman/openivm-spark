@@ -178,4 +178,61 @@ abstract class SimpleProjectionDmlScenarios extends IvmParitySpecBase("simple-pr
         .flatMap(_.get("mode")) shouldBe Some("Append")
     }
   }
+
+  // ── (15) SCD-2 close-out batch keeps SIMPLE_PROJECTION delta-only ──────────
+
+  describe("(15) SCD-2 close-out + new version uses signed projection delta") {
+    it("refreshes an SCD-2 projection with negative close-outs without full recompute") {
+      spark.conf.set("spark.openivm.refresh.scd2ProjectionDelta.enabled", "true")
+      sql(
+        "CREATE TABLE IF NOT EXISTS trades_hist_p15(" +
+          "trade_id STRING, effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP, " +
+          "is_current BOOLEAN, qty INT) USING DELTA"
+      )
+      sql(
+        "INSERT INTO trades_hist_p15 VALUES " +
+          "('T1', TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '9999-12-31 00:00:00', true, 10)," +
+          "('T2', TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '9999-12-31 00:00:00', true, 20)"
+      )
+      sql(
+        "CREATE MATERIALIZED VIEW mv_sp15 AS SELECT " +
+          "md5(concat(trade_id, cast(effective_timestamp AS STRING))) AS trade_sk, " +
+          "trade_id, effective_timestamp, end_timestamp, is_current, qty FROM trades_hist_p15"
+      )
+
+      sql(
+        "UPDATE trades_hist_p15 SET end_timestamp = TIMESTAMP '2024-02-01 00:00:00', is_current = false " +
+          "WHERE trade_id = 'T1' AND is_current = true"
+      )
+      sql(
+        "INSERT INTO trades_hist_p15 VALUES " +
+          "('T1', TIMESTAMP '2024-02-01 00:00:00', TIMESTAMP '9999-12-31 00:00:00', true, 11)"
+      )
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_sp15")).getOrElse(fail("mv_sp15 metadata missing"))
+      val escapedLocation = meta.location.replace("`", "``")
+      val preRefreshVersion = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .selectExpr("max(version) AS version")
+        .head()
+        .getAs[Long]("version")
+
+      refreshMv("mv_sp15")
+      assertMvCorrect(
+        "mv_sp15",
+        "SELECT md5(concat(trade_id, cast(effective_timestamp AS STRING))) AS trade_sk, " +
+          "trade_id, effective_timestamp, end_timestamp, is_current, qty FROM trades_hist_p15"
+      )
+
+      val overwriteWrites = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .where(s"version > $preRefreshVersion")
+        .collect()
+        .count { row =>
+          row.getAs[String]("operation") == "WRITE" &&
+          Option(row.getAs[Map[String, String]]("operationParameters")).flatMap(_.get("mode")).contains("Overwrite")
+        }
+      overwriteWrites shouldBe 0
+    }
+  }
 }

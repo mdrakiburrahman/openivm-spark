@@ -248,6 +248,12 @@ object FeatureGate {
     */
   val Scd2RangeJoinAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeJoinAccel.enabled"
 
+  /** Enable signed-delta SIMPLE_PROJECTION maintenance for SCD-2-shaped batches.
+    * Default OFF: openivm emits the legacy affected-key recompute SQL unless both
+    * this Spark flag and the matching openivm compile setting are enabled.
+    */
+  val Scd2ProjectionDeltaEnabledKey: String = "spark.openivm.refresh.scd2ProjectionDelta.enabled"
+
   /** Enable bounded recompute for top-K ROW_NUMBER/RANK WINDOW_PARTITION MVs.
     *
     * Default OFF: when opted in, eligible top-K ranking refreshes replace the
@@ -499,6 +505,12 @@ object FeatureGate {
 
   def scd2RangeJoinAccelEnabled(spark: SparkSession): Boolean =
     scd2RangeJoinAccelEnabled(spark.sparkContext.getConf)
+
+  def scd2ProjectionDeltaEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, Scd2ProjectionDeltaEnabledKey, default = false)
+
+  def scd2ProjectionDeltaEnabled(spark: SparkSession): Boolean =
+    scd2ProjectionDeltaEnabled(spark.sparkContext.getConf)
 
   def boundedRankEnabled(conf: SparkConf): Boolean =
     boolConf(conf, BoundedRankEnabledKey, default = false)
