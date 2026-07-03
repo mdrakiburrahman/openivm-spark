@@ -62,6 +62,7 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
         Map("orders" -> StructType(Seq(StructField("id", StringType))))
       ),
+      queryPlanFingerprint = None,
       location = s"$warehouseDir/mv_$suffix",
       createdAt = new Timestamp(1700000000000L),
       properties = Map("owner" -> "alice", "tier" -> "gold")

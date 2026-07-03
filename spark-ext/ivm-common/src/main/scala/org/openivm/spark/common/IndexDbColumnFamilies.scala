@@ -11,10 +11,11 @@ package org.openivm.spark.common
   */
 private[common] object IndexDbColumnFamilies {
 
-  val MvIndex: String       = "mv_index"
-  val SourceToMvs: String   = "source_to_mvs"
-  val TableIndex: String    = "table_index"
-  val CdfWatermarks: String = "cdf_watermarks"
+  val MvIndex: String               = "mv_index"
+  val SourceToMvs: String           = "source_to_mvs"
+  val TableIndex: String            = "table_index"
+  val CdfWatermarks: String         = "cdf_watermarks"
+  val DroppedMvFingerprints: String = "dropped_mv_fingerprints"
 
-  val All: Seq[String] = Seq(MvIndex, SourceToMvs, TableIndex, CdfWatermarks)
+  val All: Seq[String] = Seq(MvIndex, SourceToMvs, TableIndex, CdfWatermarks, DroppedMvFingerprints)
 }

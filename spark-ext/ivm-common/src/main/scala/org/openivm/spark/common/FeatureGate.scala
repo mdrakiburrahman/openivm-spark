@@ -331,6 +331,12 @@ object FeatureGate {
     */
   val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
 
+  /** Guard incremental refresh reuse with a normalized logical-plan fingerprint.
+    * Default OFF: legacy metadata rows and refresh routing remain byte-identical
+    * unless explicitly enabled.
+    */
+  val FingerprintGuardEnabledKey: String = "spark.openivm.refresh.fingerprintGuard.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -366,6 +372,9 @@ object FeatureGate {
 
   def compileClassificationCacheEnabled(conf: SparkConf): Boolean =
     boolConf(conf, CompileClassificationCacheEnabledKey, default = false)
+
+  def fingerprintGuardEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, FingerprintGuardEnabledKey, default = false)
 
   def queryLogEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)

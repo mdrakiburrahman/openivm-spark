@@ -114,6 +114,7 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
         Map(qn -> spark.table(tableName).schema)
       ),
+      queryPlanFingerprint = None,
       location = s"$warehouseDir/mv_$tableName",
       createdAt = new Timestamp(System.currentTimeMillis()),
       properties = Map.empty

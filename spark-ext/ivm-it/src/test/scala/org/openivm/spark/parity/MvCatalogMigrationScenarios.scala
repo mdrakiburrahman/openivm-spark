@@ -122,6 +122,7 @@ abstract class MvCatalogMigrationScenarios extends IvmParitySpecBase("mv-catalog
       sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
         Map("orders" -> StructType(Seq(StructField("id", IntegerType, nullable = false))))
       ),
+      queryPlanFingerprint = None,
       location = Paths.get(warehouseDir, s"$name-location").toString,
       createdAt = new Timestamp(1700001000000L),
       properties = Map("owner" -> "migration-spec")
