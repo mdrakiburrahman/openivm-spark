@@ -170,6 +170,9 @@ class OpenIvmCompiler private (
     if (req.facts.scd2ProjectionDelta) {
       sb ++= "SET openivm_scd2_projection_delta=true;\n"
     }
+    if (req.facts.lastValueStateIncremental) {
+      sb ++= "SET openivm_last_value_state_incremental=true;\n"
+    }
     sb ++= s"SET openivm_files_path='${escapeSql(tmpDir.toAbsolutePath.toString)}';\n"
     sb ++= s"DROP VIEW IF EXISTS ${req.viewName};\n"
     for ((tableName, _) <- tableDdls) sb ++= s"DROP TABLE IF EXISTS $tableName;\n"
