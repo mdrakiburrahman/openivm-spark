@@ -20,7 +20,7 @@ ThisBuild / scalaVersion := "2.12.17"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "org.openivm"
 
-ThisBuild / javacOptions ++= Seq("-source", "17", "-target", "17")
+ThisBuild / javacOptions ++= Seq("--release", "11")
 ThisBuild / Test / fork := true
 ThisBuild / Test / javaOptions ++= jvmModuleOpts
 ThisBuild / Test / parallelExecution := false
