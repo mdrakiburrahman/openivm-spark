@@ -18,25 +18,45 @@ object FeatureGate {
 
   val EnabledKey: String = "spark.openivm.enabled"
 
-  /** Optional override for the base directory under which openivm derives ALL
-    * of its state paths: the RocksDB index / per-MV / per-table stores
-    * (`<base>/_openivm/...`), DML staging Delta (`<base>/_ivm/staging/...`), and
-    * MV Delta tables (`<base>/_ivm/views/...`).
+  /** Optional override for the base directory under which openivm places its
+    * local RocksDB stores (``<base>/_openivm/…/rocksdb`` — the index, per-MV,
+    * per-table, refresh-profile, refresh-sql-log and CDF-watermark DBs).
     *
     * Defaults (unset) to `spark.sql.warehouse.dir`, preserving the historical
     * layout for local / HDFS deployments where the warehouse is already a local
-    * or file: path.
+    * or file: path. Only RocksDB paths honor this; the Delta state (MV tables,
+    * DML staging, view-deltas) always uses `spark.sql.warehouse.dir` so it lands
+    * in durable object storage.
     *
-    * Managed cloud Spark (e.g. Microsoft Fabric) points
-    * `spark.sql.warehouse.dir` at a remote object-store URI (`abfss://…`), which
-    * openivm's RocksDB stores cannot use — `RocksDBCodec.requireLocalPath`
-    * rejects any non-`file:` scheme. Set this to a durable, locally-addressable
-    * path so RocksDB has a real POSIX filesystem while the state still persists
-    * in cloud storage — e.g. the OneLake FUSE mount
-    * `/lakehouse/default/Files/_openivm`, which is backed by OneLake and so
-    * survives the ephemeral Fabric Spark session.
+    * Managed cloud Spark (e.g. Microsoft Fabric) sets `spark.sql.warehouse.dir`
+    * to a remote object-store URI (`abfss://…`), which RocksDB cannot use —
+    * `RocksDBCodec.requireLocalPath` rejects any non-`file:` scheme. Set this to
+    * a real local path (e.g. `/tmp/openivm-state`); pair it with
+    * [[StateSyncUriKey]] to mirror that local state into OneLake for durability
+    * across the ephemeral Fabric Spark session.
     */
   val StatePathKey: String = "spark.openivm.statePath"
+
+  /** Optional OneLake (or any Hadoop FS) URI that the local RocksDB state tree
+    * under ``<statePath>/_openivm`` is mirrored to for durability.
+    *
+    * Fabric Livy sessions have NO ``/lakehouse/default`` FUSE mount and ephemeral
+    * local disk, but the default Hadoop FS IS OneLake (``abfss://…``). When set,
+    * openivm restores the local RocksDB tree from this URI on first open and
+    * incrementally backs it up (immutable-SST dedup) after each CREATE/REFRESH,
+    * so IVM state survives Fabric session recycling. Unset (default) → no sync,
+    * local-only behavior unchanged.
+    */
+  val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+
+  /** Optional Hadoop FS (OneLake ``abfss://…``) directory holding the DuckDB CLI
+    * (``duckdb``) + OpenIVM extension (``openivm.duckdb_extension``) for the
+    * compile bridge. Managed Fabric Spark has neither on local disk; when set,
+    * openivm stages them to a local temp dir (chmod +x) on first compiler use.
+    * Unset (default) → use the on-disk ``OPENIVM_CLI_PATH`` / ``OPENIVM_EXTENSION_PATH``
+    * (default ``/opt/openivm/…``), local behavior unchanged.
+    */
+  val CompilerAssetsUriKey: String = "spark.openivm.compiler.assetsUri"
 
   /** Delta table performance knobs for MV backing data tables.
     *
@@ -359,6 +379,15 @@ object FeatureGate {
     * when set, otherwise `spark.sql.warehouse.dir`. */
   def stateWarehouse(spark: SparkSession): String =
     statePath(spark).getOrElse(spark.conf.get("spark.sql.warehouse.dir"))
+
+  def stateSyncUri(conf: SparkConf): Option[String] =
+    conf.getOption(StateSyncUriKey).map(_.trim).filter(_.nonEmpty)
+
+  def stateSyncUri(spark: SparkSession): Option[String] =
+    stateSyncUri(spark.sparkContext.getConf)
+
+  def compilerAssetsUri(spark: SparkSession): Option[String] =
+    spark.sparkContext.getConf.getOption(CompilerAssetsUriKey).map(_.trim).filter(_.nonEmpty)
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)

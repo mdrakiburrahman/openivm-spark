@@ -161,4 +161,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.statePath(new SparkConf(false).set(FeatureGate.StatePathKey, "   ")) shouldBe None
     }
   }
+
+  describe("FeatureGate.stateSyncUri") {
+    it("defaults to None and returns the trimmed URI when set") {
+      FeatureGate.stateSyncUri(new SparkConf(false)) shouldBe None
+      FeatureGate.stateSyncUri(
+        new SparkConf(false).set(FeatureGate.StateSyncUriKey, "  abfss://ws@onelake/lh/Files/_openivm  ")
+      ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm")
+    }
+  }
 }

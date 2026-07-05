@@ -281,7 +281,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
   }
 
   private def stagingPath(tableName: String, opType: String): String = {
-    val warehouse = FeatureGate.stateWarehouse(session).stripSuffix("/")
+    val warehouse = session.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
     val safeTable = tableName.replace(".", "_").replace(" ", "_")
     val txnTs = DateTimeFormatter
       .ofPattern("yyyy-MM-dd'T'HH-mm-ss.SSS'Z'")

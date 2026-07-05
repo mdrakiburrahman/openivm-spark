@@ -30,6 +30,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
@@ -49,11 +50,43 @@ private[commands] object OpenIvmCompilers {
     cache.synchronized {
       val existing2 = cache.get(spark)
       if (existing2 != null) return existing2
-      val c = OpenIvmCompiler.build()
+      val c = buildForSession(spark)
       cache.put(spark, c)
       Runtime.getRuntime.addShutdownHook(new Thread(() => c.close()))
       c
     }
+  }
+
+  /** Build the compiler, staging the DuckDB CLI + OpenIVM extension from the
+    * [[FeatureGate.CompilerAssetsUriKey]] Hadoop-FS URI (OneLake on Fabric) to a
+    * local temp dir when set — managed Fabric Spark has neither binary on local
+    * disk. Unset → use the on-disk defaults (`/opt/openivm/…`). */
+  private def buildForSession(spark: SparkSession): OpenIvmCompiler =
+    FeatureGate.compilerAssetsUri(spark) match {
+      case Some(uri) =>
+        val (extPath, cliPath) = stageCompilerAssets(spark, uri)
+        OpenIvmCompiler.build(extensionPath = extPath, cliPath = cliPath)
+      case None =>
+        OpenIvmCompiler.build()
+    }
+
+  private def stageCompilerAssets(spark: SparkSession, uri: String): (String, String) = {
+    val localDir = new java.io.File(s"/tmp/openivm-assets-${spark.sparkContext.applicationId}")
+    localDir.mkdirs()
+    val ext  = new java.io.File(localDir, "openivm.duckdb_extension")
+    val cli  = new java.io.File(localDir, "duckdb")
+    val base = new Path(uri)
+    val fs   = base.getFileSystem(spark.sessionState.newHadoopConf())
+
+    def fetch(remoteName: String, dst: java.io.File): Unit =
+      if (!dst.exists() || dst.length() == 0L) {
+        fs.copyToLocalFile(/* delSrc = */ false, new Path(base, remoteName), new Path(dst.getAbsolutePath), /* useRawLocalFileSystem = */ true)
+      }
+
+    fetch("openivm.duckdb_extension", ext)
+    fetch("duckdb", cli)
+    cli.setExecutable(true, /* ownerOnly = */ false)
+    (ext.getAbsolutePath, cli.getAbsolutePath)
   }
 }
 
@@ -224,7 +257,7 @@ private[commands] object MvCommandHelper {
 
   /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
   def mvLocation(spark: SparkSession, id: TableIdentifier): String = {
-    val warehouse = FeatureGate.stateWarehouse(spark).stripSuffix("/")
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
     val segment   = id.database.fold(id.table)(db => s"$db/${id.table}")
     s"$warehouse/_ivm/views/$segment"
   }
@@ -532,8 +565,11 @@ case class CreateMaterializedViewCommand(
       sql = originalQueryText,
       durationMs = -1L
     )
-    try runCreate(spark, profile, sqlLog)
-    finally {
+    try {
+      val rows = runCreate(spark, profile, sqlLog)
+      OpenIvmStateSync.backupAsync(spark)
+      rows
+    } finally {
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
       profile.flush()
@@ -1151,7 +1187,7 @@ case class RefreshMaterializedViewCommand(
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
     val lockT0 = System.nanoTime()
-    RefreshMutex.withLock(metaName(name)) {
+    val rows = RefreshMutex.withLock(metaName(name)) {
       val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
       // Clone the SparkSession so every refresh gets its own temp-view
       // namespace.  Concurrent refresh waves (e.g. TpcDiSpec's
@@ -1166,6 +1202,8 @@ case class RefreshMaterializedViewCommand(
       // per refresh.
       runUnderLock(org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark), lockAcqMs)
     }
+    OpenIvmStateSync.backupAsync(spark)
+    rows
   }
 
   private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
@@ -1708,7 +1746,7 @@ case class RefreshMaterializedViewCommand(
     // The fully-qualified MV name (db.table) is used (not just the short
     // name) so two MVs with the same short name in different databases
     // don't collide on disk.
-    val warehouse     = FeatureGate.stateWarehouse(spark).stripSuffix("/")
+    val warehouse     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
@@ -3440,7 +3478,7 @@ case class RefreshMaterializedViewCommand(
         .distinct
 
       if (downstreamSourceKeys.nonEmpty) {
-        val warehouse   = FeatureGate.stateWarehouse(spark).stripSuffix("/")
+        val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
         val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
         val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
         // The actual write goes through the DataFrame API (Delta needs the
@@ -3609,7 +3647,7 @@ case class DropMaterializedViewCommand(
         CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
         if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
 
-        val warehouse       = FeatureGate.stateWarehouse(spark).stripSuffix("/")
+        val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
         val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
         val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
         try {
