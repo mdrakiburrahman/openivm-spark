@@ -146,12 +146,19 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  describe("FeatureGate.windowPartitionSingleDeleteMergeEnabled") {
-    it("defaults OFF and honours an explicit ON flag") {
-      FeatureGate.windowPartitionSingleDeleteMergeEnabled(new SparkConf(false)) shouldBe false
-      FeatureGate.windowPartitionSingleDeleteMergeEnabled(
-        new SparkConf(false).set(FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey, "true")
-      ) shouldBe true
+  describe("FeatureGate.statePath") {
+    it("defaults to None when unset") {
+      FeatureGate.statePath(new SparkConf(false)) shouldBe None
+    }
+
+    it("returns the trimmed override when set") {
+      FeatureGate.statePath(
+        new SparkConf(false).set(FeatureGate.StatePathKey, "  /lakehouse/default/Files/_openivm  ")
+      ) shouldBe Some("/lakehouse/default/Files/_openivm")
+    }
+
+    it("treats a blank override as unset") {
+      FeatureGate.statePath(new SparkConf(false).set(FeatureGate.StatePathKey, "   ")) shouldBe None
     }
   }
 }

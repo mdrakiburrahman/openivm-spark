@@ -224,7 +224,7 @@ private[commands] object MvCommandHelper {
 
   /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
   def mvLocation(spark: SparkSession, id: TableIdentifier): String = {
-    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val warehouse = FeatureGate.stateWarehouse(spark).stripSuffix("/")
     val segment   = id.database.fold(id.table)(db => s"$db/${id.table}")
     s"$warehouse/_ivm/views/$segment"
   }
@@ -1708,7 +1708,7 @@ case class RefreshMaterializedViewCommand(
     // The fully-qualified MV name (db.table) is used (not just the short
     // name) so two MVs with the same short name in different databases
     // don't collide on disk.
-    val warehouse     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val warehouse     = FeatureGate.stateWarehouse(spark).stripSuffix("/")
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
@@ -3440,7 +3440,7 @@ case class RefreshMaterializedViewCommand(
         .distinct
 
       if (downstreamSourceKeys.nonEmpty) {
-        val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        val warehouse   = FeatureGate.stateWarehouse(spark).stripSuffix("/")
         val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
         val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
         // The actual write goes through the DataFrame API (Delta needs the
@@ -3609,7 +3609,7 @@ case class DropMaterializedViewCommand(
         CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
         if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
 
-        val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        val warehouse       = FeatureGate.stateWarehouse(spark).stripSuffix("/")
         val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
         val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
         try {

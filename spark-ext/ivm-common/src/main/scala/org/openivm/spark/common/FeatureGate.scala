@@ -18,6 +18,26 @@ object FeatureGate {
 
   val EnabledKey: String = "spark.openivm.enabled"
 
+  /** Optional override for the base directory under which openivm derives ALL
+    * of its state paths: the RocksDB index / per-MV / per-table stores
+    * (`<base>/_openivm/...`), DML staging Delta (`<base>/_ivm/staging/...`), and
+    * MV Delta tables (`<base>/_ivm/views/...`).
+    *
+    * Defaults (unset) to `spark.sql.warehouse.dir`, preserving the historical
+    * layout for local / HDFS deployments where the warehouse is already a local
+    * or file: path.
+    *
+    * Managed cloud Spark (e.g. Microsoft Fabric) points
+    * `spark.sql.warehouse.dir` at a remote object-store URI (`abfss://…`), which
+    * openivm's RocksDB stores cannot use — `RocksDBCodec.requireLocalPath`
+    * rejects any non-`file:` scheme. Set this to a durable, locally-addressable
+    * path so RocksDB has a real POSIX filesystem while the state still persists
+    * in cloud storage — e.g. the OneLake FUSE mount
+    * `/lakehouse/default/Files/_openivm`, which is backed by OneLake and so
+    * survives the ephemeral Fabric Spark session.
+    */
+  val StatePathKey: String = "spark.openivm.statePath"
+
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -328,6 +348,17 @@ object FeatureGate {
 
   def enabled(spark: SparkSession): Boolean =
     enabled(spark.sparkContext.getConf)
+
+  def statePath(conf: SparkConf): Option[String] =
+    conf.getOption(StatePathKey).map(_.trim).filter(_.nonEmpty)
+
+  def statePath(spark: SparkSession): Option[String] =
+    statePath(spark.sparkContext.getConf)
+
+  /** Base directory for all openivm state paths: the [[StatePathKey]] override
+    * when set, otherwise `spark.sql.warehouse.dir`. */
+  def stateWarehouse(spark: SparkSession): String =
+    statePath(spark).getOrElse(spark.conf.get("spark.sql.warehouse.dir"))
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)
