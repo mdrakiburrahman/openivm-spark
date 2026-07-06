@@ -31,7 +31,7 @@ import scala.util.control.NonFatal
 object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
 
-  private val restoredApps = ConcurrentHashMap.newKeySet[String]()
+  private val restoredApps  = ConcurrentHashMap.newKeySet[String]()
   private val backupPending = new AtomicBoolean(false)
   private val backupExecutor = Executors.newSingleThreadExecutor { r =>
     val t = new Thread(r, "openivm-state-sync")
@@ -46,7 +46,11 @@ object OpenIvmStateSync {
     * call per Spark application. Best-effort: any failure logs a warning and
     * leaves the local tree empty (openivm then rebuilds state from scratch). */
   def maybeRestore(spark: SparkSession): Unit = {
-    val uri   = FeatureGate.stateSyncUri(spark).getOrElse(return)
+    val uri = FeatureGate
+      .stateSyncUri(spark)
+      .getOrElse(
+        return
+      )
     val appId = spark.sparkContext.applicationId
     if (!restoredApps.add(appId)) return
     try {
@@ -71,7 +75,11 @@ object OpenIvmStateSync {
         Option(dst.getParentFile).foreach(_.mkdirs())
         // useRawLocalFileSystem=true so Hadoop does NOT drop .crc sidecars into
         // the RocksDB directory (RocksDB would choke on the extra files).
-        fs.copyToLocalFile(/* delSrc = */ false, remotePath, new Path(dst.getAbsolutePath), /* useRawLocalFileSystem = */ true)
+        fs.copyToLocalFile(
+          /* delSrc = */ false,
+          remotePath,
+          new Path(dst.getAbsolutePath), /* useRawLocalFileSystem = */ true
+        )
         restored += 1
       }
       log.info(s"openivm state-sync: restored $restored files from $uri to $local")
@@ -96,7 +104,11 @@ object OpenIvmStateSync {
 
   /** Synchronous incremental backup. Public for tests / explicit checkpoints. */
   def backupNow(spark: SparkSession): Unit = {
-    val uri   = FeatureGate.stateSyncUri(spark).getOrElse(return)
+    val uri = FeatureGate
+      .stateSyncUri(spark)
+      .getOrElse(
+        return
+      )
     val local = localRoot(spark)
     if (!local.exists()) return
 
@@ -122,7 +134,7 @@ object OpenIvmStateSync {
             catch { case NonFatal(_) => false }
           }
         if (!skip) {
-          fs.copyFromLocalFile(/* delSrc = */ false, /* overwrite = */ true, new Path(f.getAbsolutePath), remote)
+          fs.copyFromLocalFile( /* delSrc = */ false, /* overwrite = */ true, new Path(f.getAbsolutePath), remote)
           uploaded += 1
         }
       }
