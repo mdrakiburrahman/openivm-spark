@@ -149,23 +149,11 @@ pre_clean_if_requested() {
 }
 
 # Reclaim ownership of the bind-mounted workspace for the invoking host user.
-#
-# The build container runs as root, so every target/ artifact sbt writes into
-# the bind-mounted /work/spark-ext (= host spark-ext/) is root-owned on the
-# host. Left as-is those files break a later `git clean -ffdx` / checkout with
-# EACCES on the persistent self-hosted CI runner, and need sudo to clean on the
-# dev box. Chown them back from inside the same root container (mirrors the
-# `.logs` chmod workaround in setup_test_log_dir). Best-effort: a chown hiccup
-# must never change the outcome of the actual build/test command. .git lives at
-# the repo root — outside this bind mount — so it is never touched. Used as an
-# EXIT trap, so it also fires when the wrapped subcommand fails.
 reclaim_workspace_ownership() {
     local rc=$?
     local uid gid
     uid="$(id -u)"
     gid="$(id -g)"
-    # Already root (some CI contexts): host and container UID match, nothing to
-    # reclaim.
     if [[ "$uid" != "0" ]]; then
         compose run --rm -T build chown -R "${uid}:${gid}" /work/spark-ext \
             >/dev/null 2>&1 || true
