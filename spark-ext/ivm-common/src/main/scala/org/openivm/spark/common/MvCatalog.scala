@@ -1,7 +1,6 @@
 package org.openivm.spark.common
 
-import io.delta.tables.DeltaTable
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
@@ -454,77 +453,8 @@ object MvCatalog {
       ()
     }
 
-  private def maybeMigrateLegacyTables(spark: SparkSession, indexDb: OpenIvmRocksDB, warehouse: String): Unit = {
-    val legacyMvMeta  = Paths.get(warehouse, "_ivm", "_meta", "mv_metadata").toString
-    val legacyStaging = Paths.get(warehouse, "_ivm", "_meta", "staging").toString
-
-    val hasLegacyMvMeta  = DeltaTable.isDeltaTable(spark, legacyMvMeta)
-    val hasLegacyStaging = DeltaTable.isDeltaTable(spark, legacyStaging)
-    if (!hasLegacyMvMeta && !hasLegacyStaging) {
-      return
-    }
-
-    val alreadyMigrated = {
-      val iterator = indexDb.prefixScan(MvIndexCf, Array.emptyByteArray)
-      try iterator.hasNext
-      finally closeQuietly(iterator.asInstanceOf[AnyRef])
-    }
-    if (alreadyMigrated) {
-      return
-    }
-
-    def legacyRowToMetadata(row: Row): MvMetadata =
-      MvMetadata(
-        name = deserializeName(row.getAs[String]("name")),
-        querySql = row.getAs[String]("query_sql"),
-        refreshType = row.getAs[Int]("refresh_type"),
-        refreshTypeName = row.getAs[String]("refresh_type_name"),
-        lastVersion = row.getAs[Long]("last_version"),
-        sourceTables = row.getSeq[String](row.fieldIndex("source_tables")),
-        sourceSchemaFingerprint = row.getAs[String]("source_schema_fingerprint"),
-        location = row.getAs[String]("location"),
-        createdAt = row.getAs[Timestamp]("created_at"),
-        properties = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
-      )
-
-    def legacyRowToStaging(row: Row): StagingDelta =
-      StagingDelta(
-        baseTable = row.getAs[String]("base_table"),
-        opType = row.getAs[String]("op_type"),
-        stagingPath = row.getAs[String]("staging_path"),
-        txnTs = row.getAs[Timestamp]("txn_ts"),
-        consumedBy = row.getSeq[String](row.fieldIndex("consumed_by"))
-      )
-
-    val mvRows =
-      if (hasLegacyMvMeta) spark.read.format("delta").load(legacyMvMeta).collect().toSeq else Seq.empty
-    mvRows.map(legacyRowToMetadata).foreach(meta => upsert(spark, meta))
-
-    val stagingRows =
-      if (hasLegacyStaging) spark.read.format("delta").load(legacyStaging).collect().toSeq else Seq.empty
-    stagingRows.map(legacyRowToStaging).foreach { delta =>
-      StagingCatalog.record(spark, delta)
-      delta.consumedBy.distinct.filter(_.trim.nonEmpty).foreach { viewName =>
-        StagingCatalog.markConsumed(spark, viewName, Seq(delta.stagingPath))
-      }
-    }
-
-    val hadoopConf = spark.sessionState.newHadoopConf()
-    def dropDir(path: String): Unit = {
-      val p  = new org.apache.hadoop.fs.Path(path)
-      val fs = p.getFileSystem(hadoopConf)
-      if (fs.exists(p)) fs.delete(p, true)
-    }
-
-    dropDir(legacyMvMeta)
-    dropDir(legacyStaging)
-
-    log.info(s"openivm-rocksdb migrated ${mvRows.size} MVs + ${stagingRows.size} staging rows from legacy Delta tables")
-  }
-
   def ensureTables(spark: SparkSession): Unit = {
-    val indexDb = openIndexDb(spark)
-    maybeMigrateLegacyTables(spark, indexDb, warehouseRoot(spark).toString)
+    openIndexDb(spark)
     ()
   }
 

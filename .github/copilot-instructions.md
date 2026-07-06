@@ -171,9 +171,9 @@ the residual gap is the WINDOW MVs.
   MV **~5×** — ~3 for the partition-scoped DELETE+INSERT recompute + ~2 for the
   cascade view-delta — so window MVs read **6–10× vanilla's single clean CTAS**.
   Partition **clustering does NOT prune it** (a TPC-DI batch touches most partitions),
-  and running-window suffix-extend (P5.2) falls back on backdated batches. Beating
-  vanilla on windows needs a **single-pass recompute + an incremental cascade-delta**
-  (see `docs/todos/compile-facts-todos.md` → `W-FULL`/`W7.7`). **Cascade constraint:**
+  and running-window suffix-extend falls back on backdated batches. Beating
+  vanilla on windows needs a **single-pass recompute + an incremental cascade-delta**.
+  **Cascade constraint:**
   `daily_market` feeds `fact_market_history` (the 38× win), so it MUST emit a
   view-delta — it cannot simply be routed to `FULL_REFRESH`.
 
