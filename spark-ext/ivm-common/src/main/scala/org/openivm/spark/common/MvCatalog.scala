@@ -268,7 +268,7 @@ object MvCatalog {
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
   private def warehouseRoot(spark: SparkSession): Path =
-    Paths.get(canonicalLocalPath(spark.conf.get("spark.sql.warehouse.dir")))
+    Paths.get(canonicalLocalPath(FeatureGate.stateWarehouse(spark)))
 
   private def indexDbPath(spark: SparkSession): String =
     warehouseRoot(spark).resolve("_openivm").resolve("index").resolve("rocksdb").toString

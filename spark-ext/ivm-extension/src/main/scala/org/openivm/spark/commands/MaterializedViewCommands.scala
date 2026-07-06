@@ -30,6 +30,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
@@ -49,11 +50,74 @@ private[commands] object OpenIvmCompilers {
     cache.synchronized {
       val existing2 = cache.get(spark)
       if (existing2 != null) return existing2
-      val c = OpenIvmCompiler.build()
+      val c = buildForSession(spark)
       cache.put(spark, c)
       Runtime.getRuntime.addShutdownHook(new Thread(() => c.close()))
       c
     }
+  }
+
+  /** Build the compiler, resolving the DuckDB CLI + OpenIVM extension binaries:
+    *
+    *  1. on-disk `OPENIVM_CLI_PATH` / `OPENIVM_EXTENSION_PATH` (default
+    *     `/opt/openivm/…`) — the local spark-openivm container symlinks both
+    *     here, so this path is unchanged.
+    *  2. otherwise the binaries baked into the assembly JAR under
+    *     `/openivm-native/` are extracted to a per-app local temp dir (chmod +x).
+    *     Managed Fabric Spark has neither binary on local disk but loads the JAR
+    *     on the driver classpath (`spark.jars`), so the compile bridge stays
+    *     self-contained with no OneLake round-trip.
+    */
+  private def buildForSession(spark: SparkSession): OpenIvmCompiler = {
+    val extEnv = sys.env.getOrElse(
+      "OPENIVM_EXTENSION_PATH",
+      "/opt/openivm/openivm.duckdb_extension"
+    )
+    val cliEnv = sys.env.getOrElse(
+      "OPENIVM_CLI_PATH",
+      Option(new java.io.File(extEnv).getParentFile)
+        .map(dir => new java.io.File(dir, "duckdb").getAbsolutePath)
+        .getOrElse("/opt/openivm/duckdb")
+    )
+    if (new java.io.File(extEnv).exists() && new java.io.File(cliEnv).exists())
+      OpenIvmCompiler.build(extensionPath = extEnv, cliPath = cliEnv)
+    else {
+      val (extPath, cliPath) = extractBundledAssets(spark)
+      OpenIvmCompiler.build(extensionPath = extPath, cliPath = cliPath)
+    }
+  }
+
+  /** Extract the DuckDB CLI + OpenIVM extension baked into the assembly JAR
+    * (`/openivm-native/…`) to a per-app local temp dir; chmod +x the CLI. */
+  private def extractBundledAssets(spark: SparkSession): (String, String) = {
+    val localDir = new java.io.File(s"/tmp/openivm-assets-${spark.sparkContext.applicationId}")
+    localDir.mkdirs()
+    val ext = new java.io.File(localDir, "openivm.duckdb_extension")
+    val cli = new java.io.File(localDir, "duckdb")
+
+    def extract(resource: String, dst: java.io.File): Unit =
+      if (!dst.exists() || dst.length() == 0L) {
+        val in = Option(getClass.getResourceAsStream(resource)).getOrElse(
+          throw new IllegalStateException(
+            s"bundled compile asset $resource not found on the classpath — the " +
+              "openivm-spark assembly JAR must embed it under /openivm-native/ " +
+              "(set OPENIVM_NATIVE_DIR at build time), or provide it on disk via " +
+              "OPENIVM_CLI_PATH / OPENIVM_EXTENSION_PATH"
+          )
+        )
+        try
+          java.nio.file.Files.copy(
+            in,
+            dst.toPath,
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING
+          )
+        finally in.close()
+      }
+
+    extract("/openivm-native/openivm.duckdb_extension", ext)
+    extract("/openivm-native/duckdb", cli)
+    cli.setExecutable(true, /* ownerOnly = */ false)
+    (ext.getAbsolutePath, cli.getAbsolutePath)
   }
 }
 
@@ -532,8 +596,11 @@ case class CreateMaterializedViewCommand(
       sql = originalQueryText,
       durationMs = -1L
     )
-    try runCreate(spark, profile, sqlLog)
-    finally {
+    try {
+      val rows = runCreate(spark, profile, sqlLog)
+      OpenIvmStateSync.backupAsync(spark)
+      rows
+    } finally {
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
       profile.flush()
@@ -1151,7 +1218,7 @@ case class RefreshMaterializedViewCommand(
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
     val lockT0 = System.nanoTime()
-    RefreshMutex.withLock(metaName(name)) {
+    val rows = RefreshMutex.withLock(metaName(name)) {
       val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
       // Clone the SparkSession so every refresh gets its own temp-view
       // namespace.  Concurrent refresh waves (e.g. TpcDiSpec's
@@ -1166,6 +1233,8 @@ case class RefreshMaterializedViewCommand(
       // per refresh.
       runUnderLock(org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark), lockAcqMs)
     }
+    OpenIvmStateSync.backupAsync(spark)
+    rows
   }
 
   private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {

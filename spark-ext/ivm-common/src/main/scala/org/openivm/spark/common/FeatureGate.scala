@@ -18,6 +18,37 @@ object FeatureGate {
 
   val EnabledKey: String = "spark.openivm.enabled"
 
+  /** Optional override for the base directory under which openivm places its
+    * local RocksDB stores (``<base>/_openivm/…/rocksdb`` — the index, per-MV,
+    * per-table, refresh-profile, refresh-sql-log and CDF-watermark DBs).
+    *
+    * Defaults (unset) to `spark.sql.warehouse.dir`, preserving the historical
+    * layout for local / HDFS deployments where the warehouse is already a local
+    * or file: path. Only RocksDB paths honor this; the Delta state (MV tables,
+    * DML staging, view-deltas) always uses `spark.sql.warehouse.dir` so it lands
+    * in durable object storage.
+    *
+    * Managed cloud Spark (e.g. Microsoft Fabric) sets `spark.sql.warehouse.dir`
+    * to a remote object-store URI (`abfss://…`), which RocksDB cannot use —
+    * `RocksDBCodec.requireLocalPath` rejects any non-`file:` scheme. Set this to
+    * a real local path (e.g. `/tmp/openivm-state`); pair it with
+    * [[StateSyncUriKey]] to mirror that local state into OneLake for durability
+    * across the ephemeral Fabric Spark session.
+    */
+  val StatePathKey: String = "spark.openivm.statePath"
+
+  /** Optional OneLake (or any Hadoop FS) URI that the local RocksDB state tree
+    * under ``<statePath>/_openivm`` is mirrored to for durability.
+    *
+    * Fabric Livy sessions have NO ``/lakehouse/default`` FUSE mount and ephemeral
+    * local disk, but the default Hadoop FS IS OneLake (``abfss://…``). When set,
+    * openivm restores the local RocksDB tree from this URI on first open and
+    * incrementally backs it up (immutable-SST dedup) after each CREATE/REFRESH,
+    * so IVM state survives Fabric session recycling. Unset (default) → no sync,
+    * local-only behavior unchanged.
+    */
+  val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -328,6 +359,23 @@ object FeatureGate {
 
   def enabled(spark: SparkSession): Boolean =
     enabled(spark.sparkContext.getConf)
+
+  def statePath(conf: SparkConf): Option[String] =
+    conf.getOption(StatePathKey).map(_.trim).filter(_.nonEmpty)
+
+  def statePath(spark: SparkSession): Option[String] =
+    statePath(spark.sparkContext.getConf)
+
+  /** Base directory for all openivm state paths: the [[StatePathKey]] override
+    * when set, otherwise `spark.sql.warehouse.dir`. */
+  def stateWarehouse(spark: SparkSession): String =
+    statePath(spark).getOrElse(spark.conf.get("spark.sql.warehouse.dir"))
+
+  def stateSyncUri(conf: SparkConf): Option[String] =
+    conf.getOption(StateSyncUriKey).map(_.trim).filter(_.nonEmpty)
+
+  def stateSyncUri(spark: SparkSession): Option[String] =
+    stateSyncUri(spark.sparkContext.getConf)
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)

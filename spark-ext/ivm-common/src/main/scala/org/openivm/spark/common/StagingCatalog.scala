@@ -82,7 +82,7 @@ object StagingCatalog {
   private val ConsumedCf   = "consumed"
 
   private def warehouseDir(spark: SparkSession): String =
-    RocksDBCodec.requireLocalPath(spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/"))
+    RocksDBCodec.requireLocalPath(FeatureGate.stateWarehouse(spark).stripSuffix("/"))
 
   private def indexDbPath(spark: SparkSession): String =
     Paths.get(warehouseDir(spark), "_openivm", "index", "rocksdb").toString
