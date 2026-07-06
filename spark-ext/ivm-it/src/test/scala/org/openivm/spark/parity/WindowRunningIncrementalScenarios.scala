@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P5.2 — running-window suffix-extend refresh (`windowRunningIncremental`).
+/** running-window suffix-extend refresh (`windowRunningIncremental`).
   *
   * Exercises the gated cumulative-window fast path: a daily-market-shaped MV
   * (`MIN/MAX(v) OVER (PARTITION BY k ORDER BY d)`) whose insert-only batch adds

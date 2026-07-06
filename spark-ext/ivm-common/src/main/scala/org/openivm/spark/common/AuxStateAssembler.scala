@@ -14,8 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger
   *   4. DELETE flipped-off rows from the MV.
   *   5. INSERT flipped-on rows into the MV.
   *
-  * Steps 2 and 5 are skeleton placeholders marked TODO P5.rt9 — the real right-side
-  * delta derivation and the join back to the base table are wired in P5.
+  * Steps 2 and 5 are skeleton placeholders marked TODO — the real right-side
+  * delta derivation and the join back to the base table are wired in a follow-up.
   */
 object AuxStateAssembler extends Assembler with IdentifierOps {
 
@@ -38,7 +38,7 @@ object AuxStateAssembler extends Assembler with IdentifierOps {
       s"CREATE OR REPLACE TEMP VIEW $snapView AS SELECT *, _match_count > 0 AS _visible_old FROM $auxName"
 
     // Step 2: apply right-side delta to aux state
-    // TODO P5.rt9: replace deltaSql placeholder with the actual right-side match-count delta
+    // TODO: replace deltaSql placeholder with the actual right-side match-count delta
     val step2 =
       s"""|MERGE INTO $auxName a
           |USING (${in.deltaSql}) d
@@ -59,7 +59,7 @@ object AuxStateAssembler extends Assembler with IdentifierOps {
       s"DELETE FROM $mv WHERE _ivm_left_pk IN (SELECT _ivm_left_pk FROM $flippedView WHERE _visible_old)"
 
     // Step 4b: insert rows that flipped from invisible to visible
-    // TODO P5.rt9: join back to base table to reconstruct full row projection
+    // TODO: join back to base table to reconstruct full row projection
     val step4Insert =
       s"INSERT INTO $mv SELECT * FROM $flippedView WHERE NOT _visible_old"
 

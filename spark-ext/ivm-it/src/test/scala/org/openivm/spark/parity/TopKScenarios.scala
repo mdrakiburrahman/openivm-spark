@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.DataFrame
 
-/** P5.topk — End-to-end parity tests for Top-K materialized views
+/** End-to-end parity tests for Top-K materialized views
   * (`ORDER BY … LIMIT k`).
   *
   * == Design ==

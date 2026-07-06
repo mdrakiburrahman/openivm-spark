@@ -1029,20 +1029,19 @@ case class CreateMaterializedViewCommand(
       upstreamMvByQual.map { case (qn, m) => qn -> MvCatalog.mvIdentity(m) }
     val fingerprint = MvCatalog.schemaFingerprint(qualSchemas, mvIdentityBySource)
 
-    // Persist the raw DuckDB-CLI compile result behind W7.1's schema/tier-keyed
+    // Persist the raw DuckDB-CLI compile result behind the schema/tier-keyed
     // cache gate.  The cached SQL is shape-stable only: REFRESH still invokes
     // SparkRefreshRewriter every time, so per-refresh snapshot temp views and
     // scratch Delta paths are always recreated.
     val createCompileTier = MvMetadata.compileCacheTier(workloadFacts)
-    // The legacy `_ivm_compiled_sql` / `_ivm_compiled_initial_load_sql` properties
-    // must ALWAYS be persisted at CREATE: the FULL_REFRESH arity fix (count-monoid
-    // MVs re-routed to FULL_REFRESH) reads `CompiledInitialLoadSqlKey` to reproduce
-    // hidden bookkeeping columns, independent of the compile-cache feature flag.
-    // Only the NEW per-(fingerprint,tier) cache properties are gated by the flag.
-    val legacyCompiledProps =
-      (if (compiled.sql.nonEmpty) Map(MvMetadata.CompiledSqlKey -> compiled.sql) else Map.empty[String, String]) ++
-        (if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
-         else Map.empty[String, String])
+    // The compiled initial-load SQL is ALWAYS persisted at CREATE: the FULL_REFRESH
+    // arity fix (count-monoid MVs re-routed to FULL_REFRESH) reads
+    // `CompiledInitialLoadSqlKey` to reproduce hidden bookkeeping columns,
+    // independent of the compile-cache feature flag. Only the per-(fingerprint,tier)
+    // cache properties are gated by the flag.
+    val initialLoadProps =
+      if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
+      else Map.empty[String, String]
     val cacheCompiledProps =
       if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
         Map.empty[String, String]
@@ -1055,7 +1054,7 @@ case class CreateMaterializedViewCommand(
           compiled.refreshType,
           compiled.refreshTypeName
         )
-    val compiledProps = legacyCompiledProps ++ cacheCompiledProps
+    val compiledProps = initialLoadProps ++ cacheCompiledProps
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
     // REFRESH ignores any staging rows / Delta versions that pre-date this MV
     // (otherwise we'd double-apply upstream view-deltas this MV already
@@ -1568,7 +1567,7 @@ case class RefreshMaterializedViewCommand(
 
     // -----------------------------------------------------------------------
     // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
-    // P1.2: a REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
+    // A REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
     // semantics for THIS batch, so route it through a full recompute (the MV
     // stays incremental for subsequent append batches). Classifier consulted
     // once; conservative (failure => treat as Replace).
@@ -1588,9 +1587,9 @@ case class RefreshMaterializedViewCommand(
       // (which reproduces the hidden columns) for any non-FULL_REFRESH MV; a
       // genuinely FULL_REFRESH MV has no hidden columns and uses its body.
       val fullRefreshSql = {
-        val legacyInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
-        val cachedInitialLoad = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
-        val initialLoad       = legacyInitialLoad.orElse(cachedInitialLoad).getOrElse("")
+        val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
+        val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
+        val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
         if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
           org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
         else meta.querySql
@@ -1696,7 +1695,7 @@ case class RefreshMaterializedViewCommand(
       facts
     }
 
-    // Reuse only W7.1 schema/tier-keyed, shape-stable compiled SQL.  The cached
+    // Reuse only the schema/tier-keyed, shape-stable compiled SQL.  The cached
     // text is intentionally NOT rewritten SQL: every REFRESH below still calls
     // SparkRefreshRewriter.rewrite, which recreates the per-refresh
     // `openivm_old_*` / `openivm_new_*` snapshot temp views and substitutes a

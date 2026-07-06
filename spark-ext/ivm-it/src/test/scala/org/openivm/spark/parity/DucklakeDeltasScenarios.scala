@@ -6,7 +6,7 @@ import io.delta.tables.DeltaTable
 import org.apache.spark.sql.AnalysisException
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6d — Port of `openivm/test/sql/ducklake_deltas.test`.
+/** Port of `openivm/test/sql/ducklake_deltas.test`.
   *
   * DuckLake-snapshot semantics translate to Delta snapshot reads as follows:
   *

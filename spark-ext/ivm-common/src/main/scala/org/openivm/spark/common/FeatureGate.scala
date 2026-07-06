@@ -105,7 +105,7 @@ object FeatureGate {
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
   /** Cache openivm compile/classification results per MV schema + facts tier.
-    * Default OFF while W7.1 is validated; when enabled, REFRESH still rewrites
+    * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
     * the cached shape-stable SQL every time so per-refresh snapshot temp views
     * are recreated on each execution.
     */
@@ -319,7 +319,7 @@ object FeatureGate {
     */
   val WindowSnapshotCacheEnabledKey: String = "spark.openivm.refresh.windowSnapshotCache.enabled"
 
-  /** Emit the running-window suffix-extend refresh (P5.2) for cumulative
+  /** Emit the running-window suffix-extend refresh for cumulative
     * `SUM/MIN/MAX/COUNT/AVG OVER (PARTITION BY k ORDER BY d)` WINDOW MVs on a
     * proven insert-only batch: affected partitions whose new rows sort strictly
     * after the existing partition max are extended from the persisted running

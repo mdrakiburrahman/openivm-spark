@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — first half of the 1:1 ScalaTest port of openivm `test/sql/cte.test`.
+/** first half of the 1:1 ScalaTest port of openivm `test/sql/cte.test`.
   *
   * Covers sections §1–§8 of openivm/cte (basic aggregate, two- and three-table
   * joins, scalar SUM+COUNT, DISTINCT, HAVING, self-join, and the AVG-via-CTE

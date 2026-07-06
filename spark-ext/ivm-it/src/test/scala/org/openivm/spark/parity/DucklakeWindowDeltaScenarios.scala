@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_window_delta.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_window_delta.test`.
   *
   * Verifies the WINDOW_PARTITION rewriter's partition-scoped DELETE+INSERT
   * preserves unchanged partition rows: only the partitions whose rows changed

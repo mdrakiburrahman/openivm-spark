@@ -210,7 +210,7 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
   }
 
   // openivm test/sql/aggregate.test §AVG without explicit alias
-  // TODO(P6f-AggregateSpec): `SELECT AVG(val)` without an alias produces a Spark
+  // TODO: `SELECT AVG(val)` without an alias produces a Spark
   // column named "avg(val)" that the openivm-spark refresh rewrite cannot resolve
   // (it expects the renamed `openivm_sum_avg_val` / `openivm_count_avg_val`
   // hidden columns to map back to the user alias). openivm fixes this via a

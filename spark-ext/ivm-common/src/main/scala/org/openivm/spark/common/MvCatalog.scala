@@ -113,11 +113,11 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
-  /** Legacy naive compile-cache keys.  Do not write new values here: they
-    * were not schema/tier keyed.  They remain readable only for full-refresh
-    * hidden-column recovery on old metadata rows.
+  /** Compiled initial-load SQL persisted at CREATE.  The FULL_REFRESH path
+    * reads it to reproduce the hidden bookkeeping columns (e.g.
+    * `openivm_count_star`) that the raw user query omits, independent of the
+    * opt-in compile-classification cache below.
     */
-  val CompiledSqlKey: String            = "_ivm_compiled_sql"
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
 
   /** Last observable compile-time cost-model hint captured during REFRESH. */
@@ -148,7 +148,7 @@ object MvMetadata {
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
 
-  /** Tier component for the W7.1 compile cache key.  It includes only facts
+  /** Tier component for the compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative
     * stats that should be handled by Spark-side rewrites after cache lookup.
     */

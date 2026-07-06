@@ -15,7 +15,7 @@ abstract class CompileCacheScenarios extends IvmParitySpecBase("compile-cache") 
     metaProps.keys.filter(k => k.startsWith(prefix) && k.endsWith(":sql")).toSeq
   }
 
-  describe("W7.1 compile-classification cache") {
+  describe("compile-classification cache") {
     it("reuses cached SQL on a cache hit while preserving correctness after restore") {
       sql("CREATE TABLE IF NOT EXISTS cc_sales(region STRING, amount INT) USING DELTA")
       sql("INSERT INTO cc_sales VALUES ('us', 10)")

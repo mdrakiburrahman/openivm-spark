@@ -127,7 +127,7 @@ Fast smoke without tidy:
 
 | Pin                      | Value                                      |
 | ------------------------ | ------------------------------------------ |
-| duckdb submodule         | `v1.5.3`                                    |
+| duckdb submodule         | `v1.5.3`                                   |
 | extension-ci-tools       | `v1.5-variegata`                           |
 | vcpkg commit             | `84bab45d415d22042bd0b9081aea57f362da3f35` |
 | vcpkg target triplet     | `x64-linux-release`                        |

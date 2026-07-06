@@ -19,7 +19,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
-    * FROM sales GROUP BY region`, captured verbatim per the P4.5 spec.
+    * FROM sales GROUP BY region`, captured verbatim per the spec.
     */
   private val sevenStatementInput: String =
     """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1224,7 +1224,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  describe("P5.2 running-window suffix-extend rewrite") {
+  describe("running-window suffix-extend rewrite") {
     val p52ViewLogicalName = "wradm_mv"
     val p52MvName          = TableIdentifier("wradm_mv", Some("default"))
     val p52Input: String =

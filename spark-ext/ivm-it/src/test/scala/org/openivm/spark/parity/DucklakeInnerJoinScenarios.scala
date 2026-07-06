@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_inner_join.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_inner_join.test`.
   *
   * DuckLake's snapshot-based incremental delta over base tables maps onto
   * Delta Lake's snapshot isolation in Spark.  Each `PRAGMA refresh(...)` in

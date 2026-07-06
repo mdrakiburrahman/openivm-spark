@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_window.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_window.test`.
   *
   * DuckLake window MVs route through `WINDOW_PARTITION` (rt5).  Per
   * `openivm/CLAUDE.md` rule table, `WINDOW_PARTITION` calls

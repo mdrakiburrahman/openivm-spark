@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 ScalaTest port of openivm/test/sql/argminmax.test.
+/** 1:1 ScalaTest port of openivm/test/sql/argminmax.test.
   *
   * Covers IVM with ARG_MIN and ARG_MAX (two-argument, group-recompute path)
   * across four scenarios:
@@ -16,7 +16,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   * Spark 3.5 ships `min_by(value, key)` and `max_by(value, key)` as direct
   * semantic equivalents to DuckDB's `ARG_MIN(value, key)` and
   * `ARG_MAX(value, key)`: both return the `value` from the row whose `key` is
-  * the minimum / maximum of the group. Per the P6f conventions we use
+  * the minimum / maximum of the group. We use
   * `min_by` / `max_by` in **both** the materialized-view definition and the
   * expected-SQL baseline so the bidirectional `EXCEPT ALL` check exercised by
   * [[assertMvCorrect]] compares like-for-like.

@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6a — Port of `openivm/test/sql/union.test`.
+/** Port of `openivm/test/sql/union.test`.
   *
   * Exercises UNION ALL / UNION DISTINCT shapes with multiple input branches.
   *

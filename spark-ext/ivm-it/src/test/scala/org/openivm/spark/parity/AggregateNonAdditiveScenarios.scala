@@ -47,7 +47,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §CASE over aggregate (aggna_case_sales)
-  // TODO(P6f-AggregateSpec): CASE expressions over an aggregate produce a HUGEINT
+  // TODO: CASE expressions over an aggregate produce a HUGEINT
   // intermediate in DuckDB's compile output, which Spark cannot parse
   // (UNSUPPORTED_DATATYPE "HUGEINT"). openivm needs to cast to BIGINT before
   // emitting Spark SQL. Re-enable when openivm's HUGEINT→BIGINT downcast is
@@ -71,7 +71,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §LIST aggregate (aggna_list_events) — ordered LIST<INT>
-  // TODO(P6f-AggregateSpec): openivm's DuckDB compile path does not know about
+  // TODO: openivm's DuckDB compile path does not know about
   // Spark's `collect_list` function — `openivm_compile_with_facts('aggna_mv_user_items', ...)`
   // returns "Catalog Error: Scalar Function with name collect_list does not
   // exist". The Spark-side rewrite needs to either route LIST aggregates to
@@ -145,7 +145,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §CASE over AVG (aggna_case_avg)
-  // TODO(P6f-AggregateSpec): CASE over an aggregate plus a derived projection
+  // TODO: CASE over an aggregate plus a derived projection
   // confuses openivm-spark's group-recompute fallback — the MV ends up with one
   // extra row after the second refresh (off-by-one bag-equality failure on
   // `aggna_mv_case_avg`). Likely related to the same orphan-derived-alias detection
@@ -178,7 +178,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §LIST<VARCHAR> with ORDER BY (aggna_list_varchar)
-  // TODO(P6f-AggregateSpec): Same `collect_list` catalog-error problem as
+  // TODO: Same `collect_list` catalog-error problem as
   // aggna_mv_user_items above — openivm's DuckDB session does not know about Spark's
   // collect_list/array_sort/struct/transform combinations. Re-enable with the
   // same fix.
@@ -209,7 +209,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §BOOLEAN scalar over aggregate (aggna_bool_check)
-  // TODO(P6f-AggregateSpec): Same HUGEINT downcast gap — `(SUM(v) > 50)` returns
+  // TODO: Same HUGEINT downcast gap — `(SUM(v) > 50)` returns
   // a HUGEINT comparison in DuckDB which Spark cannot parse. Re-enable when
   // openivm's HUGEINT→BIGINT downcast lands in the SPARK dialect path.
   describe("BOOLEAN scalar over aggregate — aggna_bool_check") {
@@ -230,7 +230,7 @@ abstract class AggregateNonAdditiveScenarios extends IvmParitySpecBase("aggregat
   }
 
   // openivm test/sql/aggregate.test §UNION-ALL of aggregates with literals (aggna_ua_events)
-  // TODO(P6f-AggregateSpec): The compiled refresh emits a `rowid` reference for
+  // TODO: The compiled refresh emits a `rowid` reference for
   // UNION-ALL-of-COUNT shapes which has no Spark equivalent. openivm's
   // SimpleAggregate UNION-ALL path needs to either route to FULL_REFRESH for
   // Spark or use a synthetic Spark rowid. Re-enable when the SimpleAggregate

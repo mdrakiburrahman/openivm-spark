@@ -5,7 +5,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 import org.apache.spark.sql.DataFrame
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6a — Port of `openivm/test/sql/lateral.test`.
+/** Port of `openivm/test/sql/lateral.test`.
   *
   * == Why most openivm shapes cannot be ported verbatim ==
   *

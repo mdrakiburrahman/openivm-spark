@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** Parity coverage for P1.4 per-term empty-delta pruning.
+/** Parity coverage for per-term empty-delta pruning.
   *
   * A 3-way star join normally emits 2^N-1 inclusion-exclusion delta terms. When
   * only the fact table changes, both dimensions are `delta_shape=UNCHANGED`;

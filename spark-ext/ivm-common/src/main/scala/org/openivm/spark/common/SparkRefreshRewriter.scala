@@ -646,7 +646,7 @@ object SparkRefreshRewriter {
       upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
       upper.contains("OPENIVM_RUN_FAST_")
     ) {
-      // WINDOW running-suffix (P5.2) fast-path cascade delta: an APPEND of the
+      // WINDOW running-suffix fast-path cascade delta: an APPEND of the
       // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
       // SELECT reads the source delta + the run_fast/run_state temp views. The
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
@@ -2712,7 +2712,7 @@ object SparkRefreshRewriter {
     """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
       .replaceFirstIn(stmt, "CREATE OR REPLACE TEMPORARY VIEW")
 
-  /** Rewrite a WINDOW running-suffix (P5.2) `openivm_run_*` TEMP TABLE create.
+  /** Rewrite a WINDOW running-suffix `openivm_run_*` TEMP TABLE create.
     *
     * openivm emits these as materialised `CREATE OR REPLACE TEMP TABLE`s — they
     * are per-partition SNAPSHOTS (bounds/fast/fallback read the MV data table;
@@ -2749,7 +2749,7 @@ object SparkRefreshRewriter {
   ): String =
     rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
 
-  /** Rewrite the WINDOW running-suffix (P5.2) fast-path cascade delta INSERT.
+  /** Rewrite the WINDOW running-suffix fast-path cascade delta INSERT.
     *
     * openivm emits (for a cascade-source cumulative window):
     * {{{

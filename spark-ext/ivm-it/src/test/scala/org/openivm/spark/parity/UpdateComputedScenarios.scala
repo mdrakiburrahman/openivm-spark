@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6a — Port of `openivm/test/sql/update_computed.test`.
+/** Port of `openivm/test/sql/update_computed.test`.
   *
   * Exercises UPDATEs whose SET clause uses computed expressions referencing
   * the column being updated (`val = val + 5`, `price = price - 10.0`,

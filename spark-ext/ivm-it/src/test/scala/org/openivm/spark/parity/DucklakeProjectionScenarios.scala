@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_projection.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_projection.test`.
   *
   * DuckLake projection refresh is functionally identical to standard openivm
   * projection refresh, only the delta detection mechanism differs (snapshot

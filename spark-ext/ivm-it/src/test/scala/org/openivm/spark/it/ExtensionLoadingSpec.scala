@@ -5,7 +5,7 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 /**
- * Smoke test for the P3 scaffold.
+ * Smoke test for the openivm-spark extension.
  *
  * Verifies that a SparkSession with the openivm-spark extension installed
  * boots successfully:
@@ -14,8 +14,7 @@ import org.scalatest.matchers.should.Matchers
  *  - turning the feature gate on does not break SparkSession init
  *  - the openivm DuckDB extension is present at the expected path
  *
- * Once P4 lands (parser, commands, rules, etc.), this suite stays as the
- * canonical "the jar still loads" check.
+ * This suite is the canonical "the jar still loads" check.
  */
 class ExtensionLoadingSpec extends AnyFunSpec with Matchers {
 

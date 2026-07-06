@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P5.rt9 — Comprehensive coverage of SEMI/ANTI shapes (without aggregation).
+/** Comprehensive coverage of SEMI/ANTI shapes (without aggregation).
   *
   * == Empirical classification on the current openivm/openivm-spark pin ==
   *
@@ -16,7 +16,7 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   *   `SEMI JOIN`     / `ANTI JOIN`          │ FULL_REFRESH (3)
   *
   * All shapes empirically land in `RefreshTypeCode.FullRefresh` (3) — this was
-  * verified via a probe spec during P5.rt9 implementation.  See "Why
+  * verified via a probe spec during implementation.  See "Why
   * FULL_REFRESH and not SEMI_ANTI_RECOMPUTE (9)?" below.
   *
   * == Why FULL_REFRESH and not SEMI_ANTI_RECOMPUTE (9)? ==
@@ -63,8 +63,8 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   *      delta) …` chain for Delta Lake MERGE semantics.
   *   4. Wiring an `AuxStateAssembler` branch through `SparkMergeAssembler`.
   *
-  * That is a multi-day, multi-PR effort and is intentionally scoped out of
-  * P5.rt9.  This spec exercises the rt3 fallback path that is already correct
+  * That is a multi-day, multi-PR effort and is intentionally out of scope.
+  * This spec exercises the rt3 fallback path that is already correct
   * by construction (INSERT OVERWRITE always reflects the live source) and
   * thereby pins the user-visible behaviour for all 11 shapes the task
   * specifies.  Each test sets up base tables, creates the MV, performs DML
@@ -73,8 +73,8 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   * `sql(viewBody)`.
   *
   * The `LEFT SEMI JOIN` / `LEFT ANTI JOIN` shapes additionally exercise the
-  * `OpenIvmCompiler.normalizeSparkSqlForDuckdb` translation added as part of
-  * P5.rt9: Spark accepts both `LEFT SEMI`/`LEFT ANTI` and bare `SEMI`/`ANTI`,
+  * `OpenIvmCompiler.normalizeSparkSqlForDuckdb` translation: Spark accepts both
+  * `LEFT SEMI`/`LEFT ANTI` and bare `SEMI`/`ANTI`,
   * but DuckDB only accepts the bare forms, so the CREATE-time bridge strips
   * the `LEFT` prefix before forwarding the SQL to openivm.
   */

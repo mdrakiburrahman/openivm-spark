@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 ScalaTest port of `openivm/test/sql/left_join.test`.
+/** 1:1 ScalaTest port of `openivm/test/sql/left_join.test`.
   *
   * Covers LEFT JOIN incremental maintenance on Spark + Delta:
   *
@@ -321,7 +321,7 @@ abstract class LeftJoinScenarios extends IvmParitySpecBase("left-join") {
   // ============================================================================
   describe("(10) LEFT JOIN aggregate fixe_mv: COALESCE wraps SUM in the projection") {
     ignore("COALESCE-wrapped SUM — disabled: non-BCR projection over LJ aggregate (TODO)") {
-      // TODO(P6f): per `.temp/openivm/CLAUDE.md` "Fix E" (LEFT/RIGHT/OUTER JOIN
+      // TODO: per `.temp/openivm/CLAUDE.md` "Fix E" (LEFT/RIGHT/OUTER JOIN
       // aggregate with COALESCE-wrapped aggregate or non-pass-through
       // projection), the Larson & Zhou MERGE assumes raw SUM(NULL)=NULL when
       // match_count=0, which produces the wrong value for
@@ -370,7 +370,7 @@ abstract class LeftJoinScenarios extends IvmParitySpecBase("left-join") {
   // ============================================================================
   describe("(11) LEFT JOIN aggregate fixe_mv2: SUM(COALESCE(x,0)) + AVG over DECIMAL") {
     ignore("COALESCE-in-arg plus AVG(DECIMAL) — disabled: AVG/DECIMAL drift (TODO)") {
-      // TODO(P6f): per `.temp/openivm/CLAUDE.md` "AVG on DECIMAL columns drifts
+      // TODO: per `.temp/openivm/CLAUDE.md` "AVG on DECIMAL columns drifts
       // 1–2 ULPs vs native AVG" — the MV's stored value is semantically correct
       // but not bit-identical to the base query (e.g. 47.989999999999994884 vs
       // 47.99000000000000199).  Enabling this requires either:

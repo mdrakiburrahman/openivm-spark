@@ -20,8 +20,8 @@ package org.openivm.spark.common
   * }}}
   *
   * Any RefreshType with no registered assembler (including the dead TopK enum value 7)
-  * throws [[UnsupportedOperationException]] with a descriptive message.  P5 fills in
-  * additional paths as operator-specific refinements land.
+  * throws [[UnsupportedOperationException]] with a descriptive message.  Additional
+  * paths are filled in as operator-specific refinements land.
   */
 object SparkMergeAssembler {
 

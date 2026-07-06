@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 port of `openivm/test/sql/projection.test`.
+/** 1:1 port of `openivm/test/sql/projection.test`.
   *
   * Exercises SIMPLE_PROJECTION (and projection-on-top-of-join) materialized
   * views across every shape the openivm reference suite covers: pure

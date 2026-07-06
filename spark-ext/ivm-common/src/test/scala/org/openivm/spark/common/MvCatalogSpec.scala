@@ -268,7 +268,6 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       MvMetadata.cachedInitialLoadSql(props, fp1, tier1) shouldBe Some("INIT")
       MvMetadata.cachedCompiledSql(props, fp2, tier1) shouldBe None
       MvMetadata.cachedCompiledSql(props, fp1, tier2) shouldBe None
-      props should not contain key(MvMetadata.CompiledSqlKey)
     }
 
     it("separates declareRelyFk compile tiers without changing compile facts JSON") {

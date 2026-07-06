@@ -172,7 +172,7 @@ abstract class AggregateHavingJoinScenarios extends IvmParitySpecBase("aggregate
   }
 
   // openivm test/sql/aggregate.test §HAVING hidden COUNT (agghj_hav_hidden_count)
-  // TODO(P6f-AggregateSpec): The AGGREGATE_HAVING path (RefreshType 4) does not
+  // TODO: The AGGREGATE_HAVING path (RefreshType 4) does not
   // yet support HAVING predicates that reference aggregates absent from the
   // SELECT clause (e.g. `HAVING COUNT(*) > 3` when COUNT(*) is not selected).
   // The Spark-side data table only carries the SELECTed aggregate plus a single

@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6a — Port of `openivm/test/sql/filter.test`.
+/** Port of `openivm/test/sql/filter.test`.
   *
   * The openivm test exercises SIMPLE_PROJECTION views with a single-source
   * `WHERE` predicate, covering: INSERT inside the filter, INSERT outside the
