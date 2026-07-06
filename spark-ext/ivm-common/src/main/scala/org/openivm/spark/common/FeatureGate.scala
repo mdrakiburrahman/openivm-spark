@@ -49,15 +49,6 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
-  /** Optional Hadoop FS (OneLake ``abfss://…``) directory holding the DuckDB CLI
-    * (``duckdb``) + OpenIVM extension (``openivm.duckdb_extension``) for the
-    * compile bridge. Managed Fabric Spark has neither on local disk; when set,
-    * openivm stages them to a local temp dir (chmod +x) on first compiler use.
-    * Unset (default) → use the on-disk ``OPENIVM_CLI_PATH`` / ``OPENIVM_EXTENSION_PATH``
-    * (default ``/opt/openivm/…``), local behavior unchanged.
-    */
-  val CompilerAssetsUriKey: String = "spark.openivm.compiler.assetsUri"
-
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -385,9 +376,6 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
-
-  def compilerAssetsUri(spark: SparkSession): Option[String] =
-    spark.sparkContext.getConf.getOption(CompilerAssetsUriKey).map(_.trim).filter(_.nonEmpty)
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)

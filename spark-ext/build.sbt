@@ -70,6 +70,31 @@ lazy val ivmExtension = (project in file("ivm-extension"))
       "OPENIVM_CLI_PATH"       -> openIvmCliPath
     )
   )
+  .settings(
+    // Bake the DuckDB CLI + OpenIVM extension into the assembly JAR under
+    // `openivm-native/` when OPENIVM_NATIVE_DIR points at a dir containing both
+    // binaries (set at Docker build time). This makes the compile bridge
+    // self-contained on managed Fabric Spark, which has neither binary on local
+    // disk — MaterializedViewCommands extracts them from the classpath at
+    // runtime. Opt-in: a plain local `sbt assembly` without the env var embeds
+    // nothing and the on-disk OPENIVM_CLI_PATH/EXTENSION_PATH is used instead.
+    Compile / resourceGenerators += Def.task {
+      sys.env.get("OPENIVM_NATIVE_DIR").filter(_.nonEmpty) match {
+        case None => Seq.empty[File]
+        case Some(dir) =>
+          val outDir = (Compile / resourceManaged).value / "openivm-native"
+          IO.createDirectory(outDir)
+          Seq("duckdb", "openivm.duckdb_extension").flatMap { name =>
+            val src = file(dir) / name
+            if (!src.exists())
+              sys.error(s"OPENIVM_NATIVE_DIR set but missing native binary: $src")
+            val dst = outDir / name
+            IO.copyFile(src, dst, preserveLastModified = true)
+            Seq(dst)
+          }
+      }
+    }.taskValue
+  )
 
 lazy val ivmIt = (project in file("ivm-it"))
   .dependsOn(ivmExtension % "compile->compile;test->test")
