@@ -147,6 +147,38 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stmtB should include("`openivm_delta_sales`")
       stmtB should not include ("`memory`.`main`.`openivm_delta_sales`")
     }
+
+    it("qualifies bare live source refs after affected-key rewrites") {
+      val mergeInput =
+        """MERGE INTO openivm_data_mv_r v USING (
+          |  SELECT s.id
+          |  FROM dim_security s
+          |  JOIN daily_market d ON d.symbol = s.symbol
+          |) AS d
+          |ON false
+          |WHEN NOT MATCHED THEN INSERT (id) VALUES (d.id);
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = mergeInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        sourceQualifiedNames = Map(
+          "dim_security" -> "gold.dim_security",
+          "daily_market" -> "silver.daily_market"
+        )
+      )
+
+      rewritten.statements should have size 1
+      val stmt = rewritten.statements.head
+      stmt should include("FROM `gold`.`dim_security` s")
+      stmt should include("JOIN `silver`.`daily_market` d")
+      stmt should not include "FROM dim_security"
+      stmt should not include "JOIN daily_market"
+    }
   }
 
   describe("per-source delta_shape empty-delta term pruning") {
@@ -563,6 +595,51 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       mergeStmt should include("v.region")
       mergeStmt should not include "`mydb`.`mv_r`.openivm_left_key"
       mergeStmt should not include "`mydb`.`mv_r`.region"
+    }
+
+    it("rewrites aggregate cascade companions to read the per-refresh view-delta path") {
+      val companionInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |WITH scan_0 (t2_region, t2_openivm_multiplicity) AS (
+          |  SELECT region, openivm_multiplicity
+          |  FROM memory.main.openivm_delta_sales
+          |  WHERE openivm_timestamp >= '2026-01-01'::TIMESTAMP
+          |), projection_1 (region, openivm_multiplicity) AS (
+          |  SELECT t2_region, t2_openivm_multiplicity FROM scan_0
+          |) INSERT INTO openivm_delta_mv_r (region, openivm_multiplicity)
+          |SELECT * FROM projection_1;
+          |INSERT INTO openivm_delta_mv_r (region, openivm_multiplicity)
+          |SELECT d.region, -1
+          |FROM openivm_delta_mv_r d
+          |WHERE d.openivm_multiplicity > 0
+          |  AND d.openivm_timestamp > '2026-01-01'::TIMESTAMP
+          |  AND EXISTS (SELECT 1 FROM openivm_data_mv_r m WHERE d.region IS NOT DISTINCT FROM m.region);
+          |WITH refresh_cte AS (
+          |  SELECT region, SUM(openivm_multiplicity) AS openivm_multiplicity
+          |  FROM openivm_delta_mv_r
+          |  GROUP BY region
+          |) MERGE INTO openivm_data_mv_r v USING refresh_cte d
+          |ON v.region IS NOT DISTINCT FROM d.region
+          |WHEN NOT MATCHED THEN INSERT (region) VALUES (d.region);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = companionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 3
+      val companion = rewritten.statements(1)
+      companion should startWith(s"INSERT INTO delta.`$viewDeltaPath` (region, openivm_multiplicity)")
+      companion should include(s"FROM delta.`$viewDeltaPath` d")
+      companion should include("EXISTS (SELECT 1 FROM `mydb`.`mv_r` m")
+      companion should not include "openivm_delta_mv_r d"
+      companion should not include "openivm_timestamp"
     }
 
     it("handles newlines between MERGE alias and USING (DuckDB multi-line output)") {
@@ -1221,6 +1298,50 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "DROP VIEW IF EXISTS `openivm_affected_mv_r`",
         "DROP VIEW IF EXISTS `openivm_current_mv_r`"
       )
+    }
+
+    it("creates then appends snapshot-companion rows for CURRENT_DIFF_RECOMPUTE full refreshes") {
+      val currentDiffFullInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |CREATE TEMP TABLE openivm_old_mv_r AS SELECT * FROM openivm_data_mv_r;
+          |DELETE FROM openivm_data_mv_r;
+          |INSERT INTO openivm_data_mv_r
+          |SELECT region, total FROM memory.main.sales;
+          |DELETE FROM openivm_delta_mv_r WHERE 1=1 AND openivm_timestamp >= '2026-01-01'::TIMESTAMP;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, total, -1 FROM openivm_old_mv_r;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, total, 1 FROM openivm_data_mv_r;
+          |DROP TABLE openivm_old_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = currentDiffFullInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(9L)
+      )
+
+      rewritten.statements should have size 6
+      rewritten.statements.head should include(s"delta.`$mvLocation` VERSION AS OF 9")
+      rewritten.statements.head should not include "openivm_data_mv_r"
+      rewritten.statements(1) shouldBe "DELETE FROM `mydb`.`mv_r`"
+      rewritten.statements(2) should include("INSERT INTO `mydb`.`mv_r`")
+      rewritten.statements(2) should include("`sales`")
+
+      val oldDelta = rewritten.statements(3)
+      oldDelta should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath` USING DELTA AS")
+      oldDelta should include("SELECT region, total, -1 FROM openivm_old_mv_r")
+
+      val newDelta = rewritten.statements(4)
+      newDelta should startWith(s"INSERT INTO delta.`$viewDeltaPath` (region, total, openivm_multiplicity)")
+      newDelta should include("SELECT region, total, 1 FROM `mydb`.`mv_r`")
+      newDelta should not include "CREATE OR REPLACE TABLE"
+      rewritten.statements.last shouldBe "DROP VIEW IF EXISTS `openivm_old_mv_r`"
     }
   }
 

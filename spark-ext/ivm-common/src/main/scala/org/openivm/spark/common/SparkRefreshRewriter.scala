@@ -396,6 +396,8 @@ object SparkRefreshRewriter {
             )
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
+          case StatementKind.SnapshotDeltaAppend =>
+            Seq(rewriteSnapshotDeltaAppend(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
             Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.SimpleProjectionDataInsert =>
@@ -451,12 +453,16 @@ object SparkRefreshRewriter {
       // (emitted by openivm for multi-source join-aware GROUP_RECOMPUTE and
       // similar refresh programs) into an explicit column list using the source
       // schemas supplied by the caller.
-      val withExceptExpanded = rewritten.map(s => expandSelectStarExcept(s, sourceSchemas))
+      val escapedViewDeltaPath = viewDeltaPath.replace("`", "``")
+      val withCompanionSources =
+        rewritten.map(s => rewriteCompanionSelfSource(s, viewLogicalName, escapedViewDeltaPath))
+      val withExceptExpanded = withCompanionSources.map(s => expandSelectStarExcept(s, sourceSchemas))
       val withAliasFixup     = withExceptExpanded.map(s => fixMergeAliasRefs(s, mvName))
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
+      val withQualifiedSources = withSemiJoinRewrite.map(rewriteBareQualifiedSourceRefs)
+      RewrittenRefresh(withQualifiedSources.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
     }
@@ -489,6 +495,12 @@ object SparkRefreshRewriter {
       * the additive view-delta lacks retraction rows for groups that already
       * exist in the data table. */
     case object ViewDeltaCompanion extends StatementKind
+
+    /** Snapshot-diff cascade INSERT emitted as the post-recompute current-row
+      * statement. The old-row statement has already created the per-refresh
+      * Delta path, so this statement must append instead of replacing it.
+      */
+    case object SnapshotDeltaAppend extends StatementKind
 
     case object MvMerge extends StatementKind
 
@@ -533,10 +545,9 @@ object SparkRefreshRewriter {
 
     /** Recompute-cascade snapshot of the PRE-refresh MV rows.
       *
-      * When openivm `4471f4e929fd3b21ac55ea0c47249d4716853c98` is enabled
-      * and CompileFacts has `force_view_delta_cascade=true` (which
-      * openivm-spark always sets), both WINDOW_PARTITION and
-      * GROUP_RECOMPUTE emit
+      * When OpenIVM emits cascade view deltas for Spark workloads,
+      * WINDOW_PARTITION, GROUP_RECOMPUTE, and
+      * CURRENT_DIFF_RECOMPUTE can emit
       * `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS SELECT … FROM openivm_data_<view> …`.
       * Spark must keep this pinned to the pre-refresh MV contents, so we rewrite
       * it to a TEMPORARY VIEW over `delta.<mvLocation> VERSION AS OF <pre-refresh-version>`.
@@ -554,7 +565,8 @@ object SparkRefreshRewriter {
 
     /** Recompute-cascade data-table INSERT fed by `openivm_new_<view>`.
       *
-      * Shape (WINDOW_PARTITION / GROUP_RECOMPUTE with the new pragma enabled):
+      * Shape (WINDOW_PARTITION / GROUP_RECOMPUTE / CURRENT_DIFF_RECOMPUTE
+      * with the new pragma enabled):
       * `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>`.
       */
     case object SnapshotDataInsert extends StatementKind
@@ -604,6 +616,19 @@ object SparkRefreshRewriter {
     val runTempPrefix     = "OPENIVM_RUN_"
     val runTempViewSuffix = s"_${viewLogicalName.toUpperCase}"
     val compactName       = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
+    val deltaName         = s"openivm_delta_$viewLogicalName"
+    def startsWithTempTableCreate(name: String): Boolean =
+      internalRelationForms(name).exists { n =>
+        upper.startsWith(s"CREATE TEMP TABLE $n") ||
+        upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $n")
+      }
+
+    def startsWithDropTable(name: String): Boolean =
+      internalRelationForms(name).exists { n =>
+        upper.startsWith(s"DROP TABLE $n") ||
+        upper.startsWith(s"DROP TABLE IF EXISTS $n")
+      }
+
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
     //   2. DELETE FROM openivm_delta_<view> WHERE ...
@@ -621,29 +646,27 @@ object SparkRefreshRewriter {
       upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $runTempPrefix") && upper.contains(s"$runTempViewSuffix AS")
     ) {
       StatementKind.RunningWindowTempCreate
-    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
+    } else if (startsWithTempTableCreate(affectedKeysName)) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
-    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $currentName")) {
+    } else if (startsWithTempTableCreate(currentName)) {
       StatementKind.CurrentSnapshotCreate
-    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $oldSnapshotName")) {
+    } else if (startsWithTempTableCreate(oldSnapshotName)) {
       StatementKind.OldSnapshotCreate
-    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $newSnapshotName")) {
+    } else if (startsWithTempTableCreate(newSnapshotName)) {
       StatementKind.NewSnapshotCreate
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $runTempPrefix") && upper.contains(runTempViewSuffix)) {
       StatementKind.RunningWindowTempDrop
-    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
+    } else if (startsWithDropTable(affectedKeysName)) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
-    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $currentName")) {
+    } else if (startsWithDropTable(currentName)) {
       StatementKind.CurrentSnapshotDrop
-    } else if (
-      upper.startsWith(s"DROP TABLE IF EXISTS $oldSnapshotName") ||
-      upper.startsWith(s"DROP TABLE IF EXISTS $newSnapshotName")
-    ) {
+    } else if (startsWithDropTable(oldSnapshotName) || startsWithDropTable(newSnapshotName)) {
       StatementKind.SnapshotDrop
     } else if (
-      upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
+      upper.contains("INSERT INTO") &&
+      containsInternalRelation(upper, deltaName) &&
       upper.contains("OPENIVM_RUN_FAST_")
     ) {
       // WINDOW running-suffix fast-path cascade delta: an APPEND of the
@@ -654,7 +677,10 @@ object SparkRefreshRewriter {
       // statement appends to it. Distinguished from the fallback cascade by the
       // OPENIVM_RUN_FAST_ reference (the fallback reads openivm_old/openivm_new).
       StatementKind.RunningWindowCascadeInsert
-    } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
+    } else if (upper.contains("INSERT INTO") && containsInternalRelation(upper, deltaName)) {
+      if (containsInternalRelation(upper, s"openivm_data_$viewLogicalName")) {
+        return StatementKind.SnapshotDeltaAppend
+      }
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
       // emitted when `force_view_delta_cascade=true`) from the main
       // view-delta CTAS.  Both target `openivm_delta_<view>`.  The companion is
@@ -1466,7 +1492,8 @@ object SparkRefreshRewriter {
   private def stripTimestampPredicate(sql: String): String = {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
-    // emitted by openivm when `force_view_delta_cascade=true`).
+    // emitted by openivm when `force_view_delta_cascade=true`) and may be
+    // backtick-quoted by the Spark target dialect.
     val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
     val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
     val cmp       = "\\s*(?:>=|>|<=|<|=)\\s*"
@@ -1527,6 +1554,22 @@ object SparkRefreshRewriter {
         }
       }
     )
+  }
+
+  private def rewriteBareQualifiedSourceRefs(sql: String): String = {
+    activeQualifiedNames.get().foldLeft(sql) { case (acc, (short, qual)) =>
+      if (!qual.contains(".")) acc
+      else {
+        val quotedQual = qual.split("\\.").map(p => s"`$p`").mkString(".")
+        val refRe = ("(?i)(\\b(?:FROM|JOIN)\\s+)`?" +
+          java.util.regex.Pattern.quote(short) +
+          "`?(?=\\s|\\)|$)").r
+        refRe.replaceAllIn(
+          acc,
+          m => java.util.regex.Matcher.quoteReplacement(m.group(1) + quotedQual)
+        )
+      }
+    }
   }
 
   /** Transform openivm's `WITH ... INSERT INTO openivm_delta_<view> (cols) SELECT * FROM <lastCte>`
@@ -1706,9 +1749,12 @@ object SparkRefreshRewriter {
     )
 
     // Replace the FROM/EXISTS source delta-view references: `openivm_delta_<view>` → `delta.\`<path>\``
-    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
-      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
-    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    s = replaceInternalRelation(
+      s,
+      s"openivm_delta_$viewLogicalName",
+      s"delta.`$escapedPath`"
+    )
+    s = rewriteCompanionSelfSource(s, viewLogicalName, escapedPath)
 
     // Replace data-table reference inside the EXISTS subquery: `openivm_data_<view>` → MV table name
     val dataViewRe = ("(?i)\\bopenivm_data_" +
@@ -1721,6 +1767,54 @@ object SparkRefreshRewriter {
     s = stripTimestampPredicate(s)
 
     s
+  }
+
+  private def replaceInternalRelation(sql: String, relationName: String, replacement: String): String = {
+    internalRelationForms(relationName).foldLeft(sql) { (acc, form) =>
+      acc.replace(form, replacement)
+    }
+  }
+
+  private def rewriteCompanionSelfSource(sql: String, viewLogicalName: String, escapedPath: String): String = {
+    internalRelationForms(s"openivm_delta_$viewLogicalName").foldLeft(sql) { (acc, relation) =>
+      acc
+        .replace(s"FROM $relation d", s"FROM delta.`$escapedPath` d")
+        .replace(s"FROM $relation AS d", s"FROM delta.`$escapedPath` AS d")
+    }
+  }
+
+  private def internalRelationForms(name: String): Seq[String] = {
+    val variants = Seq(name, name.toUpperCase(java.util.Locale.ROOT))
+    variants.flatMap(n => Seq(n, s"`$n`", s""""$n"""")).distinct
+  }
+
+  private def containsInternalRelation(sql: String, relationName: String): Boolean =
+    internalRelationForms(relationName).exists(sql.contains)
+
+  /** Rewrite the post-recompute half of `build_snapshot_companion()`:
+    *
+    *   INSERT INTO openivm_delta_<view> (cols)
+    *   SELECT <cols>, 1 FROM openivm_data_<view>
+    *
+    * into an append to the already-created per-refresh view-delta path.
+    */
+  private def rewriteSnapshotDeltaAppend(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier,
+      viewDeltaPath: String
+  ): String = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    var s = replaceInternalRelation(
+      stmt,
+      s"openivm_delta_$viewLogicalName",
+      s"delta.`$escapedPath`"
+    )
+
+    val dataViewRe = ("(?i)\\bopenivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
+    stripTimestampPredicate(s)
   }
 
   // ── Statement C rewrite (MERGE INTO openivm_data_<view>) ─────────────────
@@ -2709,7 +2803,7 @@ object SparkRefreshRewriter {
   }
 
   private def rewriteCreateOrReplaceTempTableAsView(stmt: String): String =
-    """(?i)CREATE\s+OR\s+REPLACE\s+TEMP\s+TABLE""".r
+    """(?i)CREATE\s+(?:OR\s+REPLACE\s+)?TEMP\s+TABLE""".r
       .replaceFirstIn(stmt, "CREATE OR REPLACE TEMPORARY VIEW")
 
   /** Rewrite a WINDOW running-suffix `openivm_run_*` TEMP TABLE create.

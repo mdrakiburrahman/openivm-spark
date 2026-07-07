@@ -13,9 +13,10 @@ object RefreshTypeCode {
   val GroupRecompute   = 6
   // TopK (7) is a dead enum value — the classifier never assigns it. OpenIVM strips ORDER BY/LIMIT
   // at CREATE time; the inner query rides on AggregateGroup or SimpleProjection instead.
-  val TopK                = 7
-  val DistinctIncremental = 8
-  val SemiAntiRecompute   = 9
+  val TopK                 = 7
+  val DistinctIncremental  = 8
+  val SemiAntiRecompute    = 9
+  val CurrentDiffRecompute = 10
 
   /** True for refresh types whose compiled SQL shape CAN write an
     * `INSERT INTO openivm_delta_<view>` statement carrying a USABLE signed
@@ -37,9 +38,9 @@ object RefreshTypeCode {
     *     `openivm_delta_<view>`. The Spark side rewrites this into a CTAS
     *     into the per-refresh view-delta path. Downstream SIMPLE_PROJECTION
     *     / AGGREGATE_GROUP cascade picks up the +1/-1 rows directly.
-    *   - **WINDOW_PARTITION / GROUP_RECOMPUTE** (with
-    *     `force_view_delta_cascade=true`, which is what openivm-spark always
-    *     sets in its CompileFacts payload): openivm
+    *   - **WINDOW_PARTITION / GROUP_RECOMPUTE / CURRENT_DIFF_RECOMPUTE** (with
+    *     `force_view_delta_cascade=true`, which is part of the Spark workload
+    *     facts sent to OpenIVM): openivm
     *     snapshots the affected pre-refresh rows plus the recomputed
     *     post-refresh rows before mutating `openivm_data_<view>`, then appends
     *     them as `-1/+1` rows into `openivm_delta_<view>`. The old
@@ -59,6 +60,11 @@ object RefreshTypeCode {
     * scope; for now SIMPLE_AGGREGATE upstreams force downstream
     * FullRefresh-demotion.
     *
+    * CURRENT_DIFF_RECOMPUTE is OpenIVM's exact old/current diff recompute path
+    * for shapes that cannot derive affected groups from source deltas alone.
+    * It still emits a signed `openivm_delta_<view>` companion when
+    * `force_view_delta_cascade=true`, so downstream MVs can consume it.
+    *
     * The remaining complement set — DISTINCT_INCREMENTAL,
     * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH, SIMPLE_AGGREGATE — does NOT
     * emit a cascade-usable view-delta. Downstream MVs over a
@@ -70,7 +76,9 @@ object RefreshTypeCode {
     * `CreateMaterializedViewCommand`.
     */
   def emitsCascadeViewDelta(rt: Int): Boolean = rt match {
-    case AggregateGroup | AggregateHaving | SimpleProjection | WindowPartition | GroupRecompute => true
-    case _                                                                                      => false
+    case AggregateGroup | AggregateHaving | SimpleProjection | WindowPartition | GroupRecompute |
+        CurrentDiffRecompute =>
+      true
+    case _ => false
   }
 }

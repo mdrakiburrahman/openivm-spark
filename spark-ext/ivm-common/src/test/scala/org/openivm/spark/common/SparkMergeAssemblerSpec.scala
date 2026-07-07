@@ -312,6 +312,7 @@ class SparkMergeAssemblerSpec extends AnyFunSpec with Matchers {
       RefreshTypeCode.TopK shouldBe 7
       RefreshTypeCode.DistinctIncremental shouldBe 8
       RefreshTypeCode.SemiAntiRecompute shouldBe 9
+      RefreshTypeCode.CurrentDiffRecompute shouldBe 10
     }
   }
 

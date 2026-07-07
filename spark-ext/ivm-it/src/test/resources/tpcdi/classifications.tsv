@@ -40,9 +40,9 @@ silver.customers	WINDOW_PARTITION	5
 silver.daily_market	WINDOW_PARTITION	5
 silver.date	SIMPLE_PROJECTION	2
 silver.employees	SIMPLE_PROJECTION	2
-silver.financials	WINDOW_PARTITION	5
+silver.financials	CURRENT_DIFF_RECOMPUTE	10
 silver.holdings_history	SIMPLE_PROJECTION	2
-silver.securities	WINDOW_PARTITION	5
+silver.securities	CURRENT_DIFF_RECOMPUTE	10
 silver.trades	WINDOW_PARTITION	5
 silver.trades_history	WINDOW_PARTITION	5
 silver.watches	AGGREGATE_GROUP	0
