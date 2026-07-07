@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 ScalaTest port of `openivm/test/sql/window.test`.
+/** 1:1 ScalaTest port of `openivm/test/sql/window.test`.
   *
   * Covers window-function IVM via the partition-level recompute path
   * (`WINDOW_PARTITION`, RefreshType 5 on DuckDB).  Unlike the structural

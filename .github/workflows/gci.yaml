@@ -25,6 +25,29 @@ jobs:
       OPENIVM_TEST_FORKS: "24"
 
     steps:
+      - name: Reclaim workspace from root-owned Docker artifacts
+        # dev.sh verify writes root-owned files that survive on this persistent
+        # runner, breaking the next checkout's git clean (EACCES). Cancelled runs
+        # also leave orphan containers still writing such files. So: kill every
+        # container FIRST (one job at a time = all orphans, like dev.sh PRE_CLEAN),
+        # THEN chown the tree back. Best-effort; this step never fails.
+        shell: bash
+        run: |
+          set -uo pipefail
+          running="$(docker ps -q 2>/dev/null || true)"
+          if [ -n "$running" ]; then
+            # shellcheck disable=SC2086
+            docker rm -f $running || true
+          fi
+          ws="${GITHUB_WORKSPACE:-$PWD}"
+          [ -d "$ws" ] || exit 0
+          if sudo -n true 2>/dev/null; then
+            sudo chown -R "$(id -u):$(id -g)" "$ws" || true
+          else
+            docker run --rm -v "$ws:/ws" alpine:3 \
+              chown -R "$(id -u):$(id -g)" /ws || true
+          fi
+
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:

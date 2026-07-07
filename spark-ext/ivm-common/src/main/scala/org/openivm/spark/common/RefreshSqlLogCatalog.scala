@@ -58,7 +58,7 @@ object RefreshSqlLogCatalog {
   private def warehouseRoot(spark: SparkSession): Path =
     Paths.get(
       new File(
-        RocksDBCodec.requireLocalPath(spark.conf.get("spark.sql.warehouse.dir"))
+        RocksDBCodec.requireLocalPath(FeatureGate.stateWarehouse(spark))
       ).getCanonicalPath
     )
 

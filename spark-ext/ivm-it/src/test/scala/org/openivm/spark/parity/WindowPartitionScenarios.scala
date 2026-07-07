@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P5.rt5 — Coverage of RefreshType 5 (WINDOW_PARTITION).
+/** Coverage of RefreshType 5 (WINDOW_PARTITION).
   *
   * WINDOW_PARTITION applies whenever the openivm classifier identifies a view
   * whose top-level projection contains one or more window functions with a

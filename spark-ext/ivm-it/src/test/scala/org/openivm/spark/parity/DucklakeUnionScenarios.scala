@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_union.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_union.test`.
   *
   * UNION ALL under aggregation: per `openivm/CLAUDE.md` rule table,
   * UNION ALL routes through `IncrementalUnionRule` in

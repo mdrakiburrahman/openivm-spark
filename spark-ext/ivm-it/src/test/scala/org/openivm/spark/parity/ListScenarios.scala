@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P6a — Port of `openivm/test/sql/list.test` (DuckDB LIST → Spark ARRAY).
+/** Port of `openivm/test/sql/list.test` (DuckDB LIST → Spark ARRAY).
   *
   * == Why the view body must be portable to both DuckDB and Spark ==
   *

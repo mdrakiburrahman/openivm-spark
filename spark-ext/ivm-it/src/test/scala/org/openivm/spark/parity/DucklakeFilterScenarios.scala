@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6d — Port of `openivm/test/sql/ducklake_filter.test`.
+/** Port of `openivm/test/sql/ducklake_filter.test`.
   *
   * Translation:
   *   - DuckLake catalog `dl` → Spark/Delta default catalog. The openivm test

@@ -2,6 +2,15 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.apache.logging.log4j.core.{LogEvent, Logger}
+
+import java.util.UUID
+import scala.collection.mutable.ArrayBuffer
+
 /** Split from the original parity spec.  Scope:
   * Depth-2 fan-out, upstream cascade, empty-base and group-delete scenarios from `pipeline.test`.
   *
@@ -10,10 +19,46 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-cascade") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
+  override protected def extraSparkConf: Map[String, String] =
+    Map(
+      "spark.openivm.fuseScratch.enabled"              -> "true",
+      "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+    )
+
   /** Issue refreshes in dependency order: every name in `mvs` is refreshed
     * after the ones before it. */
   protected def refreshChain(mvs: String*): Unit =
     mvs.foreach(m => sql(s"REFRESH MATERIALIZED VIEW $m").collect())
+
+  private final class BufferingAppender(name: String)
+      extends AbstractAppender(
+        name,
+        null,
+        PatternLayout.createDefaultLayout(),
+        false,
+        Property.EMPTY_ARRAY
+      ) {
+    protected val buffer = ArrayBuffer.empty[String]
+
+    override def append(event: LogEvent): Unit =
+      buffer.synchronized {
+        buffer += event.getMessage.getFormattedMessage
+      }
+
+    def messages: Seq[String] = buffer.synchronized(buffer.toVector)
+  }
+
+  private def withLogCapture[A](body: BufferingAppender => A): A = {
+    val appender = new BufferingAppender(s"pipeline-cascade-${UUID.randomUUID()}")
+    val root     = LogManager.getRootLogger.asInstanceOf[Logger]
+    appender.start()
+    root.addAppender(appender)
+    try body(appender)
+    finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
 
   // ──────────────────────────────────────────────────────────────────────────
   // (G) Fan-out: one MV feeds two independent two-level children
@@ -212,6 +257,40 @@ abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-casc
         "plc_pipe_up2",
         "SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM plc_pipe_up GROUP BY k) t"
       )
+    }
+  }
+
+  describe("(N) SIMPLE_PROJECTION cascade reuses the fused scratch cache") {
+
+    it("refreshes the upstream through the fused path and feeds the downstream from the cached delta") {
+      sql("CREATE TABLE IF NOT EXISTS plc_fuse_src(id INT, name STRING, age INT) USING DELTA")
+      sql("INSERT INTO plc_fuse_src VALUES (1, 'Alice', 30), (2, 'Bob', 22)")
+      sql(
+        "CREATE MATERIALIZED VIEW plc_fuse_up AS " +
+          "SELECT id, name, age FROM plc_fuse_src WHERE age >= 18"
+      )
+      sql(
+        "CREATE MATERIALIZED VIEW plc_fuse_down AS " +
+          "SELECT id, name FROM plc_fuse_up WHERE age >= 25"
+      )
+      sql("INSERT INTO plc_fuse_src VALUES (3, 'Carol', 40)")
+
+      val lines = withLogCapture { appender =>
+        sql("REFRESH MATERIALIZED VIEW plc_fuse_up").collect()
+        appender.messages.filter(m => m.startsWith("[openivm-perf] ") && m.contains("view='`plc_fuse_up`'"))
+      }
+
+      withClue("captured [openivm-perf] lines:\n" + lines.mkString("\n") + "\n") {
+        lines.exists { line =>
+          line.contains("phase='stmt'") &&
+          line.contains("stmt_kind='view_delta_ctas'") &&
+          line.contains("fused='true'")
+        } shouldBe true
+      }
+
+      sql("REFRESH MATERIALIZED VIEW plc_fuse_down").collect()
+      assertMvCorrect("plc_fuse_up", "SELECT id, name, age FROM plc_fuse_src WHERE age >= 18")
+      assertMvCorrect("plc_fuse_down", "SELECT id, name FROM plc_fuse_src WHERE age >= 25")
     }
   }
 }

@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, StagingCatalog}
 
-/** P6f — 1:1 ScalaTest port of `openivm/test/sql/full_refresh.test`.
+/** 1:1 ScalaTest port of `openivm/test/sql/full_refresh.test`.
   *
   * This is a parallel port that mirrors the DuckDB `full_refresh.test` script
   * line-by-line using openivm's exact data set (tables `t1(a, b)`, `t2(a, c)`,

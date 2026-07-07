@@ -19,7 +19,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
-    * FROM sales GROUP BY region`, captured verbatim per the P4.5 spec.
+    * FROM sales GROUP BY region`, captured verbatim per the spec.
     */
   private val sevenStatementInput: String =
     """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -146,6 +146,309 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       val stmtB = rewritten.statements.head
       stmtB should include("`openivm_delta_sales`")
       stmtB should not include ("`memory`.`main`.`openivm_delta_sales`")
+    }
+  }
+
+  describe("per-source delta_shape empty-delta term pruning") {
+    it("drops UNION ALL join terms whose selected source delta is UNCHANGED") {
+      System.setProperty("openivm.refresh.emptyDeltaSkip", "true")
+      try {
+        val input =
+          """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |WITH join_delta AS (
+          |  SELECT f.region_id, p.name, f.amount, f.openivm_multiplicity
+          |  FROM memory.main.openivm_delta_fact_sales f
+          |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, p.openivm_multiplicity
+          |  FROM memory.main.fact_sales f
+          |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, r.openivm_multiplicity
+          |  FROM memory.main.fact_sales f
+          |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.openivm_delta_dim_region r ON f.region_id = r.region_id
+          |  UNION ALL
+          |  SELECT f.region_id, p.name, f.amount, -1 * f.openivm_multiplicity * p.openivm_multiplicity
+          |  FROM memory.main.openivm_delta_fact_sales f
+          |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+          |  JOIN memory.main.dim_region r ON f.region_id = r.region_id
+          |)
+          |INSERT INTO openivm_delta_mv_r (region_id, name, amount, openivm_multiplicity)
+          |SELECT * FROM join_delta;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.Unchanged,
+            "default.dim_region"  -> DeltaShape.Unchanged
+          )
+        )
+
+        val stmt = rewritten.statements.head
+        stmt should include("`openivm_delta_fact_sales`")
+        stmt should not include "openivm_delta_dim_product"
+        stmt should not include "openivm_delta_dim_region"
+        stmt.split("(?i)UNION\\s+ALL").length shouldBe 1
+      } finally System.clearProperty("openivm.refresh.emptyDeltaSkip")
+    }
+  }
+
+  describe("FK term pruning") {
+    val fkJoinDeltaInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH full_source (sale_id, product_id, amount) AS (
+        |  SELECT sale_id, product_id, amount
+        |  FROM memory.main.fact_sales
+        |),
+        |join_delta AS (
+        |  SELECT f.sale_id, p.name, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.dim_product p ON f.product_id = p.product_id
+        |  UNION ALL
+        |  SELECT fs.sale_id, p.name, fs.amount, p.openivm_multiplicity
+        |  FROM full_source fs
+        |  JOIN memory.main.openivm_delta_dim_product p ON fs.product_id = p.product_id
+        |  UNION ALL
+        |  SELECT f.sale_id, p.name, f.amount, -1 * f.openivm_multiplicity * p.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.openivm_delta_dim_product p ON f.product_id = p.product_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (sale_id, name, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("drops FK-redundant higher-order terms while leaving semiJoinPrune visible") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = fkJoinDeltaInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        deltaShape = Map(
+          "default.fact_sales"  -> DeltaShape.InsertOnly,
+          "default.dim_product" -> DeltaShape.InsertOnly
+        ),
+        semiJoinPruneEnabled = true,
+        fkTermPruneEnabled = true,
+        fkRelations =
+          Seq(ForeignKeyRelation("default.fact_sales", Seq("product_id"), "default.dim_product", Seq("product_id")))
+      )
+
+      val stmt = rewritten.statements.head
+      stmt.split("(?i)UNION\\s+ALL").length shouldBe 2
+      stmt should include("`openivm_delta_fact_sales`")
+      stmt should include("`openivm_delta_dim_product`")
+      stmt should not include "-1 * f.openivm_multiplicity * p.openivm_multiplicity"
+      stmt should include(
+        "__openivm_full_source_pre.product_id IN (SELECT product_id FROM `openivm_delta_dim_product`)"
+      )
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves terms unchanged without FK facts or when the sub-flag is off") {
+      val noFacts = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = fkJoinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.InsertOnly
+          ),
+          semiJoinPruneEnabled = true,
+          fkTermPruneEnabled = true
+        )
+        .statements
+        .head
+
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = fkJoinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map(
+            "default.fact_sales"  -> DeltaShape.InsertOnly,
+            "default.dim_product" -> DeltaShape.InsertOnly
+          ),
+          semiJoinPruneEnabled = true,
+          fkTermPruneEnabled = false,
+          fkRelations =
+            Seq(ForeignKeyRelation("default.fact_sales", Seq("product_id"), "default.dim_product", Seq("product_id")))
+        )
+        .statements
+        .head
+
+      noFacts should include("-1 * f.openivm_multiplicity * p.openivm_multiplicity")
+      disabled should include("-1 * f.openivm_multiplicity * p.openivm_multiplicity")
+    }
+  }
+
+  describe("semi-join full_source pre-prune") {
+    val joinDeltaInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH full_source (sk_security_id, trade_date, amount) AS (
+        |  SELECT sk_security_id, trade_date, amount
+        |  FROM memory.main.daily_market
+        |),
+        |join_delta AS (
+        |  SELECT fs.sk_security_id, fs.amount, d.openivm_multiplicity
+        |  FROM full_source fs
+        |  JOIN memory.main.openivm_delta_dim_security d
+        |    ON fs.sk_security_id = d.sk_security_id
+        |   AND fs.trade_date >= d.effective_date
+        |)
+        |INSERT INTO openivm_delta_mv_r (sk_security_id, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("wraps FULL_SOURCE with a changed-source semi-join prefilter when enabled") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = joinDeltaInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        deltaShape = Map("default.dim_security" -> DeltaShape.InsertOnly),
+        semiJoinPruneEnabled = true
+      )
+
+      val stmt = rewritten.statements.head
+      stmt should include("SELECT * FROM (")
+      stmt should include(
+        "__openivm_full_source_pre.sk_security_id IN (SELECT sk_security_id FROM `openivm_delta_dim_security`)"
+      )
+      stmt should include("FROM full_source fs")
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves FULL_SOURCE unchanged when the gate is off or the delta source is unchanged") {
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map("default.dim_security" -> DeltaShape.InsertOnly),
+          semiJoinPruneEnabled = false
+        )
+        .statements
+        .head
+
+      val unchanged = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinDeltaInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          deltaShape = Map("default.dim_security" -> DeltaShape.Unchanged),
+          semiJoinPruneEnabled = true
+        )
+        .statements
+        .head
+
+      disabled should not include "__openivm_full_source_pre"
+      unchanged should not include "__openivm_full_source_pre"
+    }
+  }
+
+  describe("unique-key join simplification") {
+    val joinInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+        |WITH join_delta AS (
+        |  SELECT f.id, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  JOIN memory.main.dim_customer d ON f.customer_id = d.id
+        |),
+        |left_join_delta AS (
+        |  SELECT f.id, f.amount, f.openivm_multiplicity
+        |  FROM memory.main.openivm_delta_fact_sales f
+        |  LEFT JOIN memory.main.dim_region r ON f.region_id = r.id
+        |)
+        |INSERT INTO openivm_delta_mv_r (id, amount, openivm_multiplicity)
+        |SELECT * FROM join_delta UNION ALL SELECT * FROM left_join_delta;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+        |""".stripMargin
+
+    it("demotes unused INNER unique-dimension joins to EXISTS probes and drops unused LEFT joins") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = joinInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id")), UniqueKey("dim_region", Seq("id"))),
+        uniqueJoinSimplifyEnabled = true
+      )
+
+      val stmt = rewritten.statements.head
+      stmt should include("EXISTS (SELECT 1 FROM `dim_customer` d WHERE f.customer_id = d.id)")
+      stmt should not include "JOIN `dim_customer`"
+      stmt should not include "JOIN `dim_region`"
+      stmt should not include "FULL_REFRESH"
+    }
+
+    it("leaves joins unchanged when the gate is off or right columns are projected") {
+      val disabled = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = joinInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id")), UniqueKey("dim_region", Seq("id"))),
+          uniqueJoinSimplifyEnabled = false
+        )
+        .statements
+        .head
+
+      val rightUsedInput = joinInput.replace(
+        "SELECT f.id, f.amount, f.openivm_multiplicity",
+        "SELECT f.id, d.name, f.openivm_multiplicity"
+      )
+      val rightUsed = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = rightUsedInput,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          uniqueKeys = Seq(UniqueKey("dim_customer", Seq("id"))),
+          uniqueJoinSimplifyEnabled = true
+        )
+        .statements
+        .head
+
+      disabled should include("JOIN `dim_customer`")
+      disabled should include("LEFT JOIN `dim_region`")
+      rightUsed should include("JOIN `dim_customer`")
     }
   }
 
@@ -524,6 +827,64 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("WINDOW_PARTITION single delete MERGE rewrite") {
+    val windowDeleteInput =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_trh';
+        |DELETE FROM openivm_data_mv_trh
+        |WHERE trade_id IN (
+        |  SELECT DISTINCT t_id FROM openivm_delta_brokerage_trade
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP
+        |)
+        |OR trade_id IN (
+        |  SELECT DISTINCT th_t_id FROM openivm_delta_brokerage_trade_history
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP
+        |);
+        |INSERT INTO openivm_data_mv_trh
+        |SELECT * FROM (SELECT t_id AS trade_id FROM memory.main.brokerage_trade) openivm_recompute
+        |WHERE trade_id IN (SELECT DISTINCT t_id FROM openivm_delta_brokerage_trade
+        |  WHERE openivm_timestamp > '2026-07-01 00:00:00'::TIMESTAMP);
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_trh';
+        |""".stripMargin
+
+    it("keeps the legacy one-MERGE-per-IN-clause shape when the gate is off") {
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid"
+        )
+        .statements
+
+      rewritten.filter(_.contains("WHEN MATCHED THEN DELETE")) should have size 2
+      rewritten.mkString("\n") should not include "UNION ALL"
+    }
+
+    it("collapses same-target partition deletes to one MERGE over unioned affected keys when enabled") {
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          windowPartitionSingleDeleteMergeEnabled = true
+        )
+        .statements
+
+      val deleteMerges = rewritten.filter(_.contains("WHEN MATCHED THEN DELETE"))
+      deleteMerges should have size 1
+      deleteMerges.head should include("UNION ALL")
+      deleteMerges.head should include("SELECT t_id AS trade_id")
+      deleteMerges.head should include("SELECT th_t_id AS trade_id")
+      deleteMerges.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
+      deleteMerges.head should not include "openivm_timestamp"
+    }
+  }
+
   // ── 8. SIMPLE_PROJECTION delete MERGE is tagged for runtime skip ─────────
   describe("simple projection delete MERGE tagging") {
     it("tags the delete-only MERGE so refresh execution can skip it when the view-delta has no negative rows") {
@@ -686,6 +1047,95 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("selective broadcast hint injection") {
+    it("adds a BROADCAST hint only for proven-small join-side aliases") {
+      val sql =
+        """SELECT f.id, d.name
+          |FROM `db`.`fact_sales` AS f
+          |JOIN `db`.`dim_customer` d ON f.customer_id = d.id
+          |JOIN `db`.`dim_large` l ON f.large_id = l.id""".stripMargin
+      val hinted = SparkRefreshRewriter.injectSelectiveBroadcastHints(
+        sql,
+        Seq(SparkRefreshRewriter.SelectiveBroadcastTable("dim_customer", "db.dim_customer", 1024L))
+      )
+
+      hinted should include("SELECT /*+ BROADCAST(d) */ f.id")
+      hinted should not include "BROADCAST(l)"
+    }
+
+    it("leaves non-join statements unchanged even when a table is small") {
+      val sql = "SELECT id FROM `db`.`dim_customer`"
+
+      SparkRefreshRewriter.injectSelectiveBroadcastHints(
+        sql,
+        Seq(SparkRefreshRewriter.SelectiveBroadcastTable("dim_customer", "db.dim_customer", 1024L))
+      ) shouldBe sql
+    }
+  }
+
+  describe("skew fanout delta broadcast planning") {
+    it("plans and injects a delta BROADCAST hint for narrow min/max overlap") {
+      val facts = WorkloadFacts(
+        columnStats = Map(
+          "db.fact.customer_id" -> WorkloadColumnStats(min = Some("1"), max = Some("100000"), rowCount = Some(1000000L))
+        ),
+        deltaStats = Map(
+          "db.fact" -> WorkloadDeltaStats(
+            rowCount = Some(4L),
+            min = Map("customer_id" -> "42"),
+            max = Map("customer_id" -> "42")
+          )
+        )
+      )
+      val plan = SparkRefreshRewriter.planSkewFanoutDeltaBroadcasts(facts, maxDeltaRows = 100L, maxOverlapRatio = 0.01d)
+      plan should have size 1
+      plan.head.signal should include("min_max_overlap column=customer_id")
+
+      val sql =
+        """SELECT f.id, d.name
+          |FROM memory.main.openivm_delta_fact f
+          |JOIN `db`.`dim_customer` d ON f.customer_id = d.id""".stripMargin
+      val hinted = SparkRefreshRewriter.injectSkewFanoutBroadcastHints(sql, plan)
+
+      hinted should include("SELECT /*+ BROADCAST(f) */ /*OPENIVM_SKEW_FANOUT fact:rows=4:")
+    }
+
+    it("falls back to row-count-only delta broadcast when histogram bins are unavailable") {
+      val facts = WorkloadFacts(deltaStats = Map("db.fact" -> WorkloadDeltaStats(rowCount = Some(5L))))
+      val plan  = SparkRefreshRewriter.planSkewFanoutDeltaBroadcasts(facts, maxDeltaRows = 10L, maxOverlapRatio = 0.05d)
+
+      plan.map(_.shortName) shouldBe Seq("fact")
+      plan.head.signal should include("histogram_bins=unavailable")
+    }
+  }
+
+  describe("SCD2 range acceleration injection") {
+    it("broadcasts the SCD alias and pre-filters it to the source-delta timestamp range") {
+      val sql =
+        """SELECT f.id, d.name
+          |FROM `openivm_delta_fact_market_history` f
+          |JOIN `dim_security` d
+          |  ON f.security_id = d.security_id
+          | AND f.ts BETWEEN d.effective_timestamp AND d.end_timestamp""".stripMargin
+
+      val accelerated = SparkRefreshRewriter.injectScd2RangeAcceleration(sql)
+
+      accelerated should include("SELECT /*+ BROADCAST(d) */ f.id")
+      accelerated should include("/*__openivm_scd2_range_accel__*/")
+      accelerated should include(
+        "d.effective_timestamp <= (SELECT MAX(__openivm_scd2_probe_0.ts) FROM `openivm_delta_fact_market_history` AS __openivm_scd2_probe_0)"
+      )
+      accelerated should include(
+        "d.end_timestamp >= (SELECT MIN(__openivm_scd2_probe_0.ts) FROM `openivm_delta_fact_market_history` AS __openivm_scd2_probe_0)"
+      )
+    }
+
+    it("leaves non-SCD2 joins unchanged") {
+      val sql = "SELECT f.id FROM fact f JOIN dim d ON f.id = d.id"
+      SparkRefreshRewriter.injectScd2RangeAcceleration(sql) shouldBe sql
+    }
+  }
+
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
@@ -771,6 +1221,198 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "DROP VIEW IF EXISTS `openivm_affected_mv_r`",
         "DROP VIEW IF EXISTS `openivm_current_mv_r`"
       )
+    }
+  }
+
+  describe("running-window suffix-extend rewrite") {
+    val p52ViewLogicalName = "wradm_mv"
+    val p52MvName          = TableIdentifier("wradm_mv", Some("default"))
+    val p52Input: String =
+      """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'wradm_mv';
+        |CREATE OR REPLACE TEMP TABLE openivm_run_affected_wradm_mv AS
+        |SELECT DISTINCT d.dm_s_symb
+        |FROM openivm_delta_wradm_daily_market d
+        |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+        |CREATE OR REPLACE TEMP TABLE openivm_run_bounds_wradm_mv AS
+        |WITH old_max AS (
+        |  SELECT dm_s_symb, MAX(dm_date) AS openivm_old_max_order
+        |  FROM openivm_data_wradm_mv
+        |  GROUP BY dm_s_symb
+        |), delta_min AS (
+        |  SELECT d.dm_s_symb, MIN(d.dm_date) AS openivm_delta_min_order
+        |  FROM openivm_delta_wradm_daily_market d
+        |  WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP)
+        |  GROUP BY d.dm_s_symb
+        |)
+        |SELECT a.dm_s_symb, m.openivm_old_max_order, b.openivm_delta_min_order
+        |FROM openivm_run_affected_wradm_mv a
+        |LEFT JOIN old_max m ON a.dm_s_symb IS NOT DISTINCT FROM m.dm_s_symb
+        |JOIN delta_min b ON a.dm_s_symb IS NOT DISTINCT FROM b.dm_s_symb;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_fast_wradm_mv AS
+        |SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv
+        |WHERE openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_fallback_wradm_mv AS
+        |SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv
+        |WHERE openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order;
+        |CREATE OR REPLACE TEMP TABLE openivm_run_state_wradm_mv AS
+        |SELECT dm_s_symb, dm_date, run_sum, openivm_prior_count FROM (
+        |  SELECT dt.dm_s_symb, dt.dm_date, dt.run_sum,
+        |         COUNT(*) OVER (PARTITION BY dt.dm_s_symb) AS openivm_prior_count,
+        |         ROW_NUMBER() OVER (PARTITION BY dt.dm_s_symb ORDER BY dt.dm_date DESC) AS openivm_rn
+        |  FROM openivm_data_wradm_mv dt
+        |  JOIN openivm_run_fast_wradm_mv fk ON dt.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+        |) openivm_state_ranked WHERE openivm_rn = 1;
+        |DELETE FROM openivm_data_wradm_mv WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+        |INSERT INTO openivm_data_wradm_mv
+        |SELECT * FROM (
+        |  SELECT dm_s_symb, dm_date, dm_close,
+        |         SUM(dm_close) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS run_sum
+        |  FROM memory.main.wradm_daily_market
+        |) openivm_recompute
+        |WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+        |INSERT INTO openivm_data_wradm_mv (dm_s_symb, dm_date, dm_close, run_sum)
+        |SELECT d.dm_s_symb, d.dm_date, d.dm_close,
+        |       CASE WHEN s.run_sum IS NULL THEN SUM(d.dm_close) OVER (PARTITION BY d.dm_s_symb ORDER BY d.dm_date)
+        |            ELSE s.run_sum + SUM(d.dm_close) OVER (PARTITION BY d.dm_s_symb ORDER BY d.dm_date)
+        |       END AS run_sum
+        |FROM openivm_delta_wradm_daily_market d
+        |JOIN openivm_run_fast_wradm_mv fk ON d.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+        |LEFT JOIN openivm_run_state_wradm_mv s ON d.dm_s_symb IS NOT DISTINCT FROM s.dm_s_symb
+        |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+        |DROP TABLE IF EXISTS openivm_run_state_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_fallback_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_fast_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_bounds_wradm_mv;
+        |DROP TABLE IF EXISTS openivm_run_affected_wradm_mv;
+        |DELETE FROM openivm_delta_wradm_mv;
+        |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'wradm_mv';
+        |""".stripMargin
+
+    def rewriteP52(): Seq[String] =
+      SparkRefreshRewriter
+        .rewrite(
+          compiledSql = p52Input,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+
+    it("materialises running-window helper CREATEs as version-pinned, eagerly cached temporary views") {
+      val rewritten = rewriteP52()
+      val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
+      creates should have size 5
+      creates.foreach { stmt =>
+        stmt should not include "TEMP TABLE"
+        stmt should not include "openivm_timestamp"
+        stmt should not include "openivm_data_wradm_mv"
+        stmt should include("openivm_run_")
+      }
+      // bounds + state READ the MV, so they must snapshot the pre-refresh Delta
+      // version (the program mutates the MV mid-refresh).
+      val boundsCreate =
+        creates.find(_.contains("openivm_run_bounds_wradm_mv")).getOrElse(fail("bounds create missing"))
+      val stateCreate = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
+      boundsCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
+      stateCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
+      // Each helper is eagerly CACHEd so the snapshot is frozen before the MV mutates.
+      val caches = rewritten.filter(_.startsWith("CACHE TABLE `openivm_run_"))
+      caches should have size 5
+    }
+
+    it("rewrites fallback delete and recompute insert while preserving the run_fallback subquery") {
+      val rewritten = rewriteP52()
+      val deleteMerge = rewritten
+        .find(s => s.contains("WHEN MATCHED THEN DELETE") && s.contains("openivm_run_fallback_wradm_mv"))
+        .getOrElse(fail("partition-scoped delete MERGE missing"))
+      deleteMerge should startWith("MERGE INTO `default`.`wradm_mv` AS v")
+      deleteMerge should include("SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv")
+      deleteMerge should include("AS d ON")
+      deleteMerge should include("v.dm_s_symb IS NOT DISTINCT FROM d.dm_s_symb")
+
+      val fallbackInsert = rewritten
+        .find(s => s.contains("openivm_recompute") && s.contains("openivm_run_fallback_wradm_mv"))
+        .getOrElse(fail("fallback recompute insert missing"))
+      fallbackInsert should include("`wradm_daily_market`")
+      fallbackInsert should include("openivm_run_fallback_wradm_mv")
+      fallbackInsert should not include "memory.main."
+      fallbackInsert should not include "openivm_timestamp"
+    }
+
+    it("rewrites the suffix fast INSERT before the generic data-insert classifier can grab it") {
+      val fastInsert = rewriteP52()
+        .find(s => s.startsWith("INSERT INTO `default`.`wradm_mv` (dm_s_symb, dm_date, dm_close, run_sum)"))
+        .getOrElse(fail("running-window fast insert missing"))
+      fastInsert should include("FROM openivm_delta_wradm_daily_market d")
+      fastInsert should include("JOIN openivm_run_fast_wradm_mv fk")
+      fastInsert should include("LEFT JOIN openivm_run_state_wradm_mv s")
+      fastInsert should include("d.openivm_multiplicity > 0")
+      fastInsert should not include "openivm_data_wradm_mv"
+      fastInsert should not include "openivm_timestamp"
+    }
+
+    it("drops running-window helper objects as views") {
+      rewriteP52().takeRight(5) shouldBe Seq(
+        "DROP VIEW IF EXISTS `openivm_run_state_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_fallback_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_fast_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_bounds_wradm_mv`",
+        "DROP VIEW IF EXISTS `openivm_run_affected_wradm_mv`"
+      )
+    }
+
+    it("CTAS-creates the view-delta on the fallback cascade and APPENDS the fast cascade") {
+      // Cascade-source running window (force_view_delta_cascade=true): openivm
+      // emits TWO `INSERT INTO openivm_delta_<view>` — the fallback signed
+      // multiset (openivm_old/openivm_new) then the fast suffix rows (joins
+      // openivm_run_fast). The first must CTAS-create the view-delta path; the
+      // second must APPEND, else the second overwrites the first.
+      val cascadeInput =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'wradm_mv';
+          |CREATE OR REPLACE TEMP TABLE openivm_run_fast_wradm_mv AS SELECT dm_s_symb FROM openivm_run_bounds_wradm_mv WHERE openivm_old_max_order IS NULL;
+          |CREATE OR REPLACE TEMP TABLE openivm_old_wradm_mv AS SELECT * FROM openivm_data_wradm_mv WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+          |CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM (SELECT dm_s_symb, dm_date, dm_close, SUM(dm_close) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS run_sum FROM memory.main.wradm_daily_market) openivm_recompute WHERE dm_s_symb IN (SELECT dm_s_symb FROM openivm_run_fallback_wradm_mv);
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_wradm_mv
+          |UNION ALL
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT d.dm_s_symb, d.dm_date, d.dm_close, s.run_sum, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
+          |FROM openivm_delta_wradm_daily_market d
+          |JOIN openivm_run_fast_wradm_mv fk ON d.dm_s_symb IS NOT DISTINCT FROM fk.dm_s_symb
+          |LEFT JOIN openivm_run_state_wradm_mv s ON d.dm_s_symb IS NOT DISTINCT FROM s.dm_s_symb
+          |WHERE d.openivm_multiplicity > 0 AND d.openivm_timestamp > CAST('2026-06-30 20:00:00' AS TIMESTAMP);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'wradm_mv';
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = cascadeInput,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      val ctas = rewritten
+        .find(s => s.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+        .getOrElse(fail("fallback cascade CTAS missing"))
+      ctas should include("openivm_old_wradm_mv")
+      ctas should include("openivm_new_wradm_mv")
+      val append = rewritten
+        .find(s =>
+          s.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`") &&
+            s.contains("openivm_run_fast_wradm_mv")
+        )
+        .getOrElse(fail("fast cascade append missing"))
+      append should not include "CREATE OR REPLACE TABLE"
+      append should not include "openivm_timestamp"
+      // Exactly one CTAS create of the view-delta path (the second is an append).
+      rewritten.count(_.contains("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
   }
 

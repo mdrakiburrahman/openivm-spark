@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_left_join.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_left_join.test`.
   *
   * LEFT JOIN aggregates on DuckLake use `openivm_left_join_merge=true`
   * (default) per `openivm/CLAUDE.md` ("LEFT JOIN aggregates use incremental

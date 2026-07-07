@@ -12,12 +12,18 @@ import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
 
 /** Verifies the scratch-CTAS fuse fast path emits `fused='true'` on
-  * stmt_kind='view_delta_ctas' for leaf SIMPLE_PROJECTION MVs, falls back to
-  * the on-disk scratch path when there is a downstream MV consumer, and
-  * preserves correctness in both retract and insert-only scenarios.
+  * stmt_kind='view_delta_ctas' for SIMPLE_PROJECTION MVs, reuses the cached
+  * view-delta as an MV-over-MV cascade input, and preserves correctness in
+  * both retract and insert-only scenarios.
   */
 abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] =
+    Map(
+      "spark.openivm.fuseScratch.enabled"              -> "true",
+      "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+    )
 
   private final class BufferingAppender(name: String)
       extends AbstractAppender(
@@ -75,7 +81,7 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
       assertMvCorrect("fuse_mv_leaf", "SELECT id, name FROM fuse_users_a WHERE age >= 25")
     }
 
-    it("uses the on-disk scratch path (no fused breadcrumb) when an MV-over-MV chain depends on it") {
+    it("uses the fused scratch cache as the cascade input when an MV-over-MV chain depends on it") {
       sql("CREATE TABLE fuse_users_b(id INT, name STRING, age INT) USING DELTA")
       sql("INSERT INTO fuse_users_b VALUES (1, 'Alice', 30), (2, 'Bob', 22)")
       sql(
@@ -94,9 +100,11 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
       }
 
       withClue("captured [openivm-perf] lines:\n" + lines.mkString("\n") + "\n") {
-        val ctasLine = lines.find(l => l.contains("phase='stmt'") && l.contains("stmt_kind='view_delta_ctas'"))
-        ctasLine should not be empty
-        ctasLine.get should not include "fused='true'"
+        lines.exists { line =>
+          line.contains("phase='stmt'") &&
+          line.contains("stmt_kind='view_delta_ctas'") &&
+          line.contains("fused='true'")
+        } shouldBe true
       }
       sql("REFRESH MATERIALIZED VIEW fuse_mv_downstream").collect()
       assertMvCorrect(

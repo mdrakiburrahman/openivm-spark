@@ -6,7 +6,7 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode, StagingCatalog, Sta
 
 import java.util.UUID
 
-/** P5.rt3 — Comprehensive coverage of RefreshType 3 (FULL_REFRESH).
+/** Comprehensive coverage of RefreshType 3 (FULL_REFRESH).
   *
   * FULL_REFRESH applies whenever the openivm classifier marks a view as
   * non-incrementally-maintainable.  In those cases `RefreshMaterializedViewCommand`

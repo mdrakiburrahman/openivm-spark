@@ -75,7 +75,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
    * Create a staging Delta table that holds `rows` and register it in
    * StagingCatalog.  Returns the staging path so tests can track it.
    *
-   * This simulates what the P4.dml DML interceptor would do automatically.
+   * This simulates what the DML interceptor would do automatically.
    * The bypass flag prevents the DML interceptor from re-wrapping these
    * administrative writes (staging path is not a tracked source table).
    */
@@ -405,7 +405,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t12_window")).get
       meta.refreshType shouldBe RefreshTypeCode.WindowPartition
       meta.refreshTypeName shouldBe "WINDOW_PARTITION"
-      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe true
+      meta.properties.contains(MvMetadata.CompiledInitialLoadSqlKey) shouldBe true
 
       val expectedCreate = spark.sql(viewBody)
       val mvCreate       = spark.table("mv_t12_window").select("id", "customer_id", "effective_ts", "carried_status")
@@ -443,7 +443,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t13_value_join")).get
       meta.refreshType shouldBe RefreshTypeCode.SimpleProjection
       meta.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-      meta.properties.contains(MvMetadata.CompiledSqlKey) shouldBe true
+      meta.properties.contains(MvMetadata.CompiledInitialLoadSqlKey) shouldBe true
 
       val expectedCreate = spark.sql(viewBody)
       val mvCreate       = spark.table("mv_t13_value_join").select("id", "last_name", "priority")

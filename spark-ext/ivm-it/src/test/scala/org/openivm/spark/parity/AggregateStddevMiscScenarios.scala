@@ -59,7 +59,7 @@ abstract class AggregateStddevMiscScenarios extends IvmParitySpecBase("aggregate
   }
 
   // openivm test/sql/aggregate.test §LIST with large batch of mixed inserts/deletes (aggsd_list_heavy)
-  // TODO(P6f-AggregateSpec): Same `collect_list` catalog-error problem — openivm
+  // TODO: Same `collect_list` catalog-error problem — openivm
   // does not recognise Spark's collect_list. Re-enable when cross-dialect
   // aggregate name mapping is in place.
   describe("LIST heavy batch — aggsd_list_heavy") {
@@ -194,7 +194,7 @@ abstract class AggregateStddevMiscScenarios extends IvmParitySpecBase("aggregate
   }
 
   // openivm test/sql/aggregate.test §Fix B cv variant (aggsd_fixb_cv)
-  // TODO(P6f-AggregateSpec): Fix B cv variant — the off-by-one bag-equality
+  // TODO: Fix B cv variant — the off-by-one bag-equality
   // failure indicates the orphan-derived-alias group-recompute path needs a
   // refinement when the projection includes both pass-through aggregates
   // (avg_b, std_b) AND a derived expression over them (cv).
@@ -249,7 +249,7 @@ abstract class AggregateStddevMiscScenarios extends IvmParitySpecBase("aggregate
   }
 
   // openivm test/sql/aggregate.test §Fix B SUM/COUNT (aggsd_fixb_pay)
-  // TODO(P6f-AggregateSpec): Same HUGEINT downcast gap — `SUM(c_bal) /
+  // TODO: Same HUGEINT downcast gap — `SUM(c_bal) /
   // NULLIF(COUNT(c_bal), 0)` produces a HUGEINT division in openivm's compiled
   // refresh SQL which Spark cannot parse. Re-enable when openivm's HUGEINT→
   // BIGINT downcast is in the SPARK dialect.

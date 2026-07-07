@@ -2,9 +2,9 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 ScalaTest port of openivm's `test/sql/semi_anti_join.test`.
+/** 1:1 ScalaTest port of openivm's `test/sql/semi_anti_join.test`.
   *
-  * This spec lives alongside `SemiAntiSpec.scala` (P5.rt9) which exercises a
+  * This spec lives alongside `SemiAntiSpec.scala` which exercises a
   * curated, parallel set of 11 SEMI/ANTI shapes against the same FULL_REFRESH
   * fallback path.  Where `SemiAntiSpec` is hand-crafted from first principles,
   * this spec is a structural mirror of the openivm-side `.test` file: every
@@ -35,7 +35,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   * `INSERT OVERWRITE`s the MV from the original user SQL, which is always
   * correct by construction.  See `SemiAntiSpec.scala`'s scaladoc for the full
   * write-up.  This spec deliberately does **not** assert specific
-  * `RefreshType` codes (per the P6f conventions); it only asserts that the MV
+  * `RefreshType` codes; it only asserts that the MV
   * is bag-equivalent to the re-evaluated view body after each refresh.
   *
   * == DuckDB → Spark dialect translation ==

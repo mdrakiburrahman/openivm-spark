@@ -1,0 +1,66 @@
+# Mirrors duckdb/extension-ci-tools/docker/linux_amd64/Dockerfile @ v1.5-variegata.
+# lpts's vcpkg.json has no direct dependencies and lpts needs no extra
+# toolchains (no rust, go, fortran, unixodbc, multimedia), so the
+# `case "$extra_toolchains" in ...` blocks from the upstream Dockerfile are
+# dropped. Base image, tooling, vcpkg setup, env vars, and volumes are
+# verbatim with the upstream so the build container is byte-equivalent for
+# our purposes.
+
+FROM quay.io/pypa/manylinux_2_28_x86_64
+
+RUN yum groupinstall -y "Development Tools"
+RUN yum install -y curl zip unzip tar autoconf libtool
+RUN yum install -y ninja-build
+RUN yum install -y perl-IPC-Cmd
+RUN yum install -y perl-core
+RUN yum install -y ccache
+RUN yum install -y java-11-openjdk-devel maven
+RUN yum install -y wget
+RUN yum install -y kernel-headers
+RUN yum install -y kernel-devel
+RUN yum install -y glibc-devel
+RUN yum install -y jq
+
+# Recent CMake (matches CI's 4.0.2 pin)
+RUN mkdir /cmake_4_02 && \
+    cd /cmake_4_02 && \
+    wget -q https://github.com/Kitware/CMake/releases/download/v4.0.2/cmake-4.0.2-linux-x86_64.sh && \
+    chmod +x cmake-4.0.2-linux-x86_64.sh  && \
+    ./cmake-4.0.2-linux-x86_64.sh --skip-license --prefix=/usr/local && \
+    cmake --version
+
+# AWS CLI (matches CI install; unused for our local read-only vcpkg cache fetch
+# but kept for parity in case future test deps reach for it).
+RUN curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.22.35.zip" -o "awscliv2.zip" && \
+    unzip -q awscliv2.zip && \
+    ./aws/install && \
+    aws --version && \
+    rm -rf awscliv2.zip aws
+
+# vcpkg pinned to v1.5.2's default (84bab45d…). The orchestrator passes these
+# build-args explicitly so a future bump only needs to touch run-all.sh.
+ARG vcpkg_url
+ARG vcpkg_commit
+RUN mkdir /vcpkg && \
+    cd /vcpkg && \
+    git init && \
+    git remote add origin $vcpkg_url && \
+    git fetch --depth 1 origin $vcpkg_commit && \
+    git checkout $vcpkg_commit && \
+    ./bootstrap-vcpkg.sh -disableMetrics
+
+ENV VCPKG_ROOT=/vcpkg
+ENV VCPKG_TOOLCHAIN_PATH=/vcpkg/scripts/buildsystems/vcpkg.cmake
+ENV PATH="${VCPKG_ROOT}:${PATH}"
+ENV GEN=ninja
+
+VOLUME /duckdb_build_dir
+WORKDIR /duckdb_build_dir
+
+RUN git config --global --add safe.directory "*"
+
+VOLUME /ccache_dir
+ENV CCACHE_DIR=/ccache_dir
+ENV CCACHE_COMPRESS=TRUE
+ENV CCACHE_COMPRESSLEVEL=6
+ENV CCACHE_MAXSIZE=400M

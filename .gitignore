@@ -36,3 +36,4 @@ out/
 *.tfstate.*
 *.tfvars
 *.tfvars.json
+.wt/

@@ -14,13 +14,13 @@ Core invariant:
 The implementation spans:
 
 1. `IvmDmlInterceptorRule`: recognizes DML logical plans.
-2. `StagedDmlNode`: current runnable wrapper emitted by the rule.
-3. `WithDeltaStaging` + `IvmStrategy` + `DeltaStagingExec`: planner lowering path
+1. `StagedDmlNode`: current runnable wrapper emitted by the rule.
+1. `WithDeltaStaging` + `IvmStrategy` + `DeltaStagingExec`: planner lowering path
    for a logical staging marker.
-4. `StagingCatalog`: RocksDB-backed index of pending staging deltas.
-5. `StagingDeltaView`: turns pending deltas into `openivm_delta_<source>` views.
+1. `StagingCatalog`: RocksDB-backed index of pending staging deltas.
+1. `StagingDeltaView`: turns pending deltas into `openivm_delta_<source>` views.
 
----
+______________________________________________________________________
 
 ## 3.1 Role: delta capture without Delta CDF
 
@@ -58,7 +58,7 @@ The rule is active only when:
 
 Citations: `IvmDmlInterceptorRule.scala:40-43` and `IvmDmlInterceptorRule.scala:246-268`.
 
----
+______________________________________________________________________
 
 ## 3.2 Registration and why ordering matters
 
@@ -101,7 +101,7 @@ Therefore the rule must match both:
 If OpenIVM matched only the original Spark V2 syntax, `DELETE`, `UPDATE`, and
 `MERGE` would be missed after DeltaAnalysis had lowered them.
 
----
+______________________________________________________________________
 
 ## 3.3 `IvmDmlInterceptorRule.apply` method
 
@@ -252,33 +252,33 @@ override def apply(plan: LogicalPlan): LogicalPlan = {
 }
 ```
 
----
+______________________________________________________________________
 
 ## 3.4 `apply` walkthrough
 
-| Lines | Walkthrough |
-|---:|---|
-| 40 | Entry point for the Catalyst rule. |
-| 41 | Feature gate and bypass guard; bypass prevents recursion when staged commands execute their original DML. |
-| 42 | Double-wrap guard using `alreadyWrapped`. |
-| 44 | Begins matching the current logical node. |
-| 49-56 | `AppendData`: stages the input query as `INSERT`. |
-| 61-68 | `OverwriteByExpression`: stages replacement rows as `OVERWRITE`. |
-| 73-80 | `DeltaDelete`: stages `Filter(condition, child)` as `DELETE`. |
-| 86-129 | `DeltaUpdateTable`: builds old-row and new-row plans. |
-| 105-107 | `filteredPlan` captures rows matching the update predicate before mutation. |
-| 108-117 | Builds a SET-assignment map from Delta update columns and expressions. |
-| 118-124 | Projects the after image, preserving unchanged columns. |
-| 125-128 | Emits `UPDATE_BEFORE` and `UPDATE_AFTER`. |
-| 135-140 | `DeltaMergeInto`: stages the source as `MERGE_SRC`. |
-| 147-163 | `ReplaceData`: Delta-lowered delete/update fallback. |
-| 151-157 | Update-shaped `ReplaceData` emits before and after images. |
-| 159-160 | Delete-shaped `ReplaceData` emits removed rows. |
-| 165-170 | `WriteDelta`: Delta-lowered merge fallback, staged as `MERGE_SRC`. |
-| 176-182 | Spark-standard delete fallback. |
-| 185-213 | Spark-standard update fallback. |
-| 216-221 | Spark-standard merge fallback. |
-| 224 | All unrelated plans pass through unchanged. |
+|   Lines | Walkthrough                                                                                               |
+| ------: | --------------------------------------------------------------------------------------------------------- |
+|      40 | Entry point for the Catalyst rule.                                                                        |
+|      41 | Feature gate and bypass guard; bypass prevents recursion when staged commands execute their original DML. |
+|      42 | Double-wrap guard using `alreadyWrapped`.                                                                 |
+|      44 | Begins matching the current logical node.                                                                 |
+|   49-56 | `AppendData`: stages the input query as `INSERT`.                                                         |
+|   61-68 | `OverwriteByExpression`: stages replacement rows as `OVERWRITE`.                                          |
+|   73-80 | `DeltaDelete`: stages `Filter(condition, child)` as `DELETE`.                                             |
+|  86-129 | `DeltaUpdateTable`: builds old-row and new-row plans.                                                     |
+| 105-107 | `filteredPlan` captures rows matching the update predicate before mutation.                               |
+| 108-117 | Builds a SET-assignment map from Delta update columns and expressions.                                    |
+| 118-124 | Projects the after image, preserving unchanged columns.                                                   |
+| 125-128 | Emits `UPDATE_BEFORE` and `UPDATE_AFTER`.                                                                 |
+| 135-140 | `DeltaMergeInto`: stages the source as `MERGE_SRC`.                                                       |
+| 147-163 | `ReplaceData`: Delta-lowered delete/update fallback.                                                      |
+| 151-157 | Update-shaped `ReplaceData` emits before and after images.                                                |
+| 159-160 | Delete-shaped `ReplaceData` emits removed rows.                                                           |
+| 165-170 | `WriteDelta`: Delta-lowered merge fallback, staged as `MERGE_SRC`.                                        |
+| 176-182 | Spark-standard delete fallback.                                                                           |
+| 185-213 | Spark-standard update fallback.                                                                           |
+| 216-221 | Spark-standard merge fallback.                                                                            |
+|     224 | All unrelated plans pass through unchanged.                                                               |
 
 Related helpers:
 
@@ -288,7 +288,7 @@ Related helpers:
 - `extractTableName`: `IvmDmlInterceptorRule.scala:270-281`.
 - `stagingPath`: `IvmDmlInterceptorRule.scala:283-290`.
 
----
+______________________________________________________________________
 
 ## 3.5 `WithDeltaStaging`
 
@@ -319,7 +319,7 @@ at `IvmDmlInterceptorRule.scala:55` and `IvmDmlInterceptorRule.scala:67`.
 `WithDeltaStaging` remains the logical marker that `IvmStrategy` knows how to
 lower when such a node is present.
 
----
+______________________________________________________________________
 
 ## 3.6 `IvmStrategy` and physical tee execution
 
@@ -352,10 +352,10 @@ case class DeltaStagingExec(
 Its `doExecute` method performs both sides of the tee:
 
 1. execute `child` and cache the RDD;
-2. convert `InternalRow` values to external `Row` values;
-3. write those rows to `stagingPath` as a Delta table in append mode;
-4. call `StagingCatalog.record` with `baseTable`, `opType`, `stagingPath`, and a timestamp;
-5. return the cached RDD so the parent Delta write consumes the original rows.
+1. convert `InternalRow` values to external `Row` values;
+1. write those rows to `stagingPath` as a Delta table in append mode;
+1. call `StagingCatalog.record` with `baseTable`, `opType`, `stagingPath`, and a timestamp;
+1. return the cached RDD so the parent Delta write consumes the original rows.
 
 Citations: `DeltaStagingExec.scala:44-77`, with the catalog record at lines 64-74.
 
@@ -365,7 +365,7 @@ original DML with bypass enabled, then write any post-DML staging. Citation:
 `StagedDmlNode.scala:43-59`. Its writer records `StagingDelta` at
 `StagedDmlNode.scala:81-91`.
 
----
+______________________________________________________________________
 
 ## 3.7 The seven `opType` values
 
@@ -383,15 +383,15 @@ object OpTypes {
 }
 ```
 
-| opType | Triggered by | Staging shape | Exact emitter |
-|---|---|---|---|
-| `INSERT` | `AppendData` / `INSERT INTO` | rows to add | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`. |
-| `DELETE` | `DELETE FROM` | rows to remove | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`. |
-| `UPDATE_BEFORE` | `UPDATE` before-image | old rows matching the predicate | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`. |
-| `UPDATE_AFTER` | `UPDATE` after-image | rows after SET projections | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`. |
-| `MERGE_SRC` | `MERGE INTO` source side | source rows available to the merge | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`. |
-| `OVERWRITE` | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`. |
-| `MV_VIEW_DELTA` | MV-over-MV cascade | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`. |
+| opType          | Triggered by                                 | Staging shape                              | Exact emitter                                                                                                                           |
+| --------------- | -------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `INSERT`        | `AppendData` / `INSERT INTO`                 | rows to add                                | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`.                                                           |
+| `DELETE`        | `DELETE FROM`                                | rows to remove                             | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`.          |
+| `UPDATE_BEFORE` | `UPDATE` before-image                        | old rows matching the predicate            | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`.   |
+| `UPDATE_AFTER`  | `UPDATE` after-image                         | rows after SET projections                 | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`.   |
+| `MERGE_SRC`     | `MERGE INTO` source side                     | source rows available to the merge         | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`.                      |
+| `OVERWRITE`     | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set                   | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`. |
+| `MV_VIEW_DELTA` | MV-over-MV cascade                           | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`.                                                                     |
 
 `StagingDeltaView` maps these to refresh-time multiplicities:
 
@@ -400,7 +400,7 @@ object OpTypes {
 - `DELETE`, `UPDATE_BEFORE`: synthesize `-1` (`StagingDeltaView.scala:79-84`);
 - `MERGE_SRC`: currently unsupported by that builder and falls through to `None` (`StagingDeltaView.scala:86-88`).
 
----
+______________________________________________________________________
 
 ## 3.8 Staging paths and catalog paths
 
@@ -461,7 +461,7 @@ The code citations above show the current split: RocksDB catalog state lives
 under `_openivm/tables/<base64url>/rocksdb`, while intercepted row Delta files
 are still written under `_ivm/staging/<db_table>/<opType>/<txnTs>`.
 
----
+______________________________________________________________________
 
 ## 3.9 `StagingCatalog.ensureTables` and RocksDB schema
 
@@ -500,8 +500,8 @@ Citation: `StagingCatalog.scala:152-160`; the put is at `StagingCatalog.scala:16
 
 Decoded schema:
 
-| Location | Key | Value |
-|---|---|---|
+| Location                       | Key                                                            | Value                       |
+| ------------------------------ | -------------------------------------------------------------- | --------------------------- |
 | per-base RocksDB, `staging` CF | composite `(txnTsMillis: Long big-endian, stagingPath: UTF-8)` | composite `(opType: UTF-8)` |
 
 The index DB's `table_index` CF maps `baseTable -> baseDbPath`, written at
@@ -511,7 +511,7 @@ Reads decode the same schema via `decodeStagingKey` and `decodeOpType` at
 `StagingCatalog.scala:116-126`, then `collectFor` returns sorted pending
 `StagingDelta` rows at `StagingCatalog.scala:207-248`.
 
----
+______________________________________________________________________
 
 ## 3.10 Decoded TPC-DI example
 
@@ -523,18 +523,18 @@ First ten directories under the local benchmark result path:
 
 Each name is base64url without padding, matching `RocksDBCodec.safePathSegment`.
 
-| # | Directory | Decoded base table |
-|---:|---|---|
-| 1 | `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ` | `bronze.brokerage_trade` |
-| 2 | `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5` | `bronze.brokerage_watch_history` |
-| 3 | `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` |
-| 4 | `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ` | `bronze.brokerage_daily_market` |
-| 5 | `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk` | `bronze.brokerage_holding_history` |
-| 6 | `YnJvbnplLmNybV9jdXN0b21lcl9tZ210` | `bronze.crm_customer_mgmt` |
-| 7 | `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q` | `bronze.syndicated_prospect` |
-| 8 | `Z29sZC5kaW1fY3VzdG9tZXI` | `gold.dim_customer` |
-| 9 | `Z29sZC5kaW1fYWNjb3VudA` | `gold.dim_account` |
-| 10 | `Z29sZC5kaW1fc2VjdXJpdHk` | `gold.dim_security` |
+|   # | Directory                                      | Decoded base table                  |
+| --: | ---------------------------------------------- | ----------------------------------- |
+|   1 | `YnJvbnplLmJyb2tlcmFnZV90cmFkZQ`               | `bronze.brokerage_trade`            |
+|   2 | `YnJvbnplLmJyb2tlcmFnZV93YXRjaF9oaXN0b3J5`     | `bronze.brokerage_watch_history`    |
+|   3 | `YnJvbnplLmJyb2tlcmFnZV9jYXNoX3RyYW5zYWN0aW9u` | `bronze.brokerage_cash_transaction` |
+|   4 | `YnJvbnplLmJyb2tlcmFnZV9kYWlseV9tYXJrZXQ`      | `bronze.brokerage_daily_market`     |
+|   5 | `YnJvbnplLmJyb2tlcmFnZV9ob2xkaW5nX2hpc3Rvcnk`  | `bronze.brokerage_holding_history`  |
+|   6 | `YnJvbnplLmNybV9jdXN0b21lcl9tZ210`             | `bronze.crm_customer_mgmt`          |
+|   7 | `YnJvbnplLnN5bmRpY2F0ZWRfcHJvc3BlY3Q`          | `bronze.syndicated_prospect`        |
+|   8 | `Z29sZC5kaW1fY3VzdG9tZXI`                      | `gold.dim_customer`                 |
+|   9 | `Z29sZC5kaW1fYWNjb3VudA`                       | `gold.dim_account`                  |
+|  10 | `Z29sZC5kaW1fc2VjdXJpdHk`                      | `gold.dim_security`                 |
 
 Decoder:
 
@@ -544,7 +544,7 @@ padded = segment + "=" * ((4 - len(segment) % 4) % 4)
 base_table = base64.urlsafe_b64decode(padded.encode()).decode()
 ```
 
----
+______________________________________________________________________
 
 ## 3.11 Sequence diagram
 
@@ -589,17 +589,17 @@ For plain append, the current code matches `AppendData` directly at
 `IvmDmlInterceptorRule.scala:49-56`. For lowered merge, it matches `WriteDelta`
 at `IvmDmlInterceptorRule.scala:165-170`.
 
----
+______________________________________________________________________
 
 ## 3.12 Refresh consumption lifecycle
 
 After staging exists, refresh follows this lifecycle:
 
 1. `StagingCatalog.collectFor` returns pending deltas for the MV's sources.
-2. `StagingDeltaView.buildSourceDeltaViewSql` builds signed delta temp views.
-3. `MaterializedViewCommands` executes the rewritten refresh SQL.
-4. `postRefreshCleanup` advances the MV version and marks staging paths consumed.
-5. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs.
+1. `StagingDeltaView.buildSourceDeltaViewSql` builds signed delta temp views.
+1. `MaterializedViewCommands` executes the rewritten refresh SQL.
+1. `postRefreshCleanup` advances the MV version and marks staging paths consumed.
+1. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs.
 
 Citations:
 

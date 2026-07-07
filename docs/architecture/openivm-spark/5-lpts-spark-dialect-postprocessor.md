@@ -63,19 +63,19 @@ Source: `LptsSparkDialect.scala:94-131`.
 Current call order:
 
 1. `rewriteNowTimestamp`
-2. `rewriteToTimestampDoubleCast`
-3. `rewriteSparkFunctionInlinings`
-4. `rewriteTimestampWithTimeZone`
-5. `rewriteStructExtract`
-6. `rewritePostfixCasts`
-7. `rewriteBareVarcharCast`
-8. `rewriteBareHugeIntCast`
-9. `rewriteGenerateSeries`
-10. `rewriteToTemporalUnit`
-11. `rewriteIntervalLiterals`
-12. `rewriteCountStar`
-13. `rewriteErrorFn`
-14. `rewriteDoubleQuotedIdentifiers`
+1. `rewriteToTimestampDoubleCast`
+1. `rewriteSparkFunctionInlinings`
+1. `rewriteTimestampWithTimeZone`
+1. `rewriteStructExtract`
+1. `rewritePostfixCasts`
+1. `rewriteBareVarcharCast`
+1. `rewriteBareHugeIntCast`
+1. `rewriteGenerateSeries`
+1. `rewriteToTemporalUnit`
+1. `rewriteIntervalLiterals`
+1. `rewriteCountStar`
+1. `rewriteErrorFn`
+1. `rewriteDoubleQuotedIdentifiers`
 
 Order matters. `rewriteNowTimestamp` must run before generic postfix casts so
 `now()::timestamp` becomes `current_timestamp()`, not `CAST(now() AS TIMESTAMP)`
@@ -143,8 +143,7 @@ so earlier passes can still match DuckDB-shaped syntax.
   (`LptsSparkDialect.scala:315`), then the loop repeats until no more matches
   remain (`LptsSparkDialect.scala:325-342`). This bottom-up loop is required for
   nested calls.
-- Quoting: `struct_extract(s, 'a b')` becomes `s.\`a b\`` for non-simple fields
-  (`LptsSparkDialect.scala:317-338`).
+- Quoting: `struct_extract(s, 'a b')` becomes `s.\`a b\`` for non-simple fields (`LptsSparkDialect.scala:317-338\`).
 
 ### 6. `rewritePostfixCasts`
 
@@ -236,7 +235,7 @@ so earlier passes can still match DuckDB-shaped syntax.
 
 - Source: `LptsSparkDialect.scala:564-603`.
 - Input: `SELECT "name", "user", "value" FROM t`.
-- Output: ``SELECT `name`, `user`, `value` FROM t``.
+- Output: `` SELECT `name`, `user`, `value` FROM t ``.
 - Why: DuckDB quotes identifiers with double quotes. Spark's safe identifier
   quote is the backtick. This matters for reserved words and generated aliases.
 - Safety: single-quoted string literals are protected first; only
@@ -486,42 +485,42 @@ Use this split when a refresh statement fails:
 1. `::TYPE`, `count_star()`, `generate_series`, quoted intervals,
    `struct_extract`, `HUGEINT`, `error(...)`, or double-quoted identifiers:
    `LptsSparkDialect`.
-2. `memory.main.<short>` for a live source: the qualified-source map and
+1. `memory.main.<short>` for a live source: the qualified-source map and
    `rewriteMemoryMainPrefix`.
-3. `openivm_data_<view>` or `openivm_delta_<view>` still visible at execution:
+1. `openivm_data_<view>` or `openivm_delta_<view>` still visible at execution:
    `SparkRefreshRewriter` statement-shape rewriting.
-4. Spark-only functions rejected during compile: `OpenIvmCompiler` shim
+1. Spark-only functions rejected during compile: `OpenIvmCompiler` shim
    pre-pass plus `rewriteSparkFunctionInlinings` post-pass.
-5. CREATE succeeds but REFRESH recompiles: MV metadata properties
+1. CREATE succeeds but REFRESH recompiles: MV metadata properties
    `_ivm_compiled_sql` and `_ivm_compiled_initial_load_sql`.
 
 ## Source map
 
-| Concern | Source |
-| --- | --- |
-| `translate()` order | `LptsSparkDialect.scala:104-131` |
-| `now()::timestamp` | `LptsSparkDialect.scala:349-350` |
-| `to_timestamp(CAST('<literal>' AS DOUBLE))` | `LptsSparkDialect.scala:138-142` |
-| Spark shim back-translation | `LptsSparkDialect.scala:165-174`, `SparkFunctionShimSql.scala:87-109` |
-| timestamp timezone suffixes | `LptsSparkDialect.scala:278-285` |
-| `struct_extract` | `LptsSparkDialect.scala:305-344` |
-| postfix casts | `LptsSparkDialect.scala:363-421` |
-| parenthesized postfix casts | `LptsSparkDialect.scala:433-476` |
-| bare `VARCHAR`/`CHAR`/`TEXT` | `LptsSparkDialect.scala:540-543` |
-| bare `HUGEINT`/`UHUGEINT` | `LptsSparkDialect.scala:551-554` |
-| `generate_series` | `LptsSparkDialect.scala:353-354` |
-| `to_<unit>` helpers | `LptsSparkDialect.scala:205-263` |
-| interval literals | `LptsSparkDialect.scala:482-483` |
-| `count_star()` | `LptsSparkDialect.scala:486-487` |
-| `error(...)` | `LptsSparkDialect.scala:495-525` |
-| double-quoted identifiers | `LptsSparkDialect.scala:564-603` |
-| `stripDbQualifiers` | `OpenIvmCompiler.scala:221-234` |
-| compiler strip call site | `OpenIvmCompiler.scala:194` |
-| initial-load `memory.main` rewrite | `OpenIvmCompiler.scala:344-348` |
-| `ThreadLocal` qualified names | `SparkRefreshRewriter.scala:49-65` |
-| set/restore context | `SparkRefreshRewriter.scala:122-127`, `SparkRefreshRewriter.scala:176-178` |
-| `rewriteMemoryMainPrefix` | `SparkRefreshRewriter.scala:474-495` |
-| refresh call with `postProcess` | `MaterializedViewCommands.scala:983-1003` |
+| Concern                                     | Source                                                                     |
+| ------------------------------------------- | -------------------------------------------------------------------------- |
+| `translate()` order                         | `LptsSparkDialect.scala:104-131`                                           |
+| `now()::timestamp`                          | `LptsSparkDialect.scala:349-350`                                           |
+| `to_timestamp(CAST('<literal>' AS DOUBLE))` | `LptsSparkDialect.scala:138-142`                                           |
+| Spark shim back-translation                 | `LptsSparkDialect.scala:165-174`, `SparkFunctionShimSql.scala:87-109`      |
+| timestamp timezone suffixes                 | `LptsSparkDialect.scala:278-285`                                           |
+| `struct_extract`                            | `LptsSparkDialect.scala:305-344`                                           |
+| postfix casts                               | `LptsSparkDialect.scala:363-421`                                           |
+| parenthesized postfix casts                 | `LptsSparkDialect.scala:433-476`                                           |
+| bare `VARCHAR`/`CHAR`/`TEXT`                | `LptsSparkDialect.scala:540-543`                                           |
+| bare `HUGEINT`/`UHUGEINT`                   | `LptsSparkDialect.scala:551-554`                                           |
+| `generate_series`                           | `LptsSparkDialect.scala:353-354`                                           |
+| `to_<unit>` helpers                         | `LptsSparkDialect.scala:205-263`                                           |
+| interval literals                           | `LptsSparkDialect.scala:482-483`                                           |
+| `count_star()`                              | `LptsSparkDialect.scala:486-487`                                           |
+| `error(...)`                                | `LptsSparkDialect.scala:495-525`                                           |
+| double-quoted identifiers                   | `LptsSparkDialect.scala:564-603`                                           |
+| `stripDbQualifiers`                         | `OpenIvmCompiler.scala:221-234`                                            |
+| compiler strip call site                    | `OpenIvmCompiler.scala:194`                                                |
+| initial-load `memory.main` rewrite          | `OpenIvmCompiler.scala:344-348`                                            |
+| `ThreadLocal` qualified names               | `SparkRefreshRewriter.scala:49-65`                                         |
+| set/restore context                         | `SparkRefreshRewriter.scala:122-127`, `SparkRefreshRewriter.scala:176-178` |
+| `rewriteMemoryMainPrefix`                   | `SparkRefreshRewriter.scala:474-495`                                       |
+| refresh call with `postProcess`             | `MaterializedViewCommands.scala:983-1003`                                  |
 
 ## Takeaways
 

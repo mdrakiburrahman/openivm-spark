@@ -138,6 +138,45 @@ conventions:
 - `SIMPLE_PROJECTION` MVs over a source with byte-identical duplicate rows
   are not fully supported (the value-equality MERGE deletes all copies).
 
+## Performance tuning (SF-scale bottleneck analysis)
+
+Perf work is driven by the ivm-bench benchmark (`.temp/ivm-bench`, TPC-DI, `spark`
+vs `spark-openivm`). Shipped baseline: openivm B2/B3 ≈ **1.23× / 1.21×** vanilla
+full-refresh, with the insert-only fast path up to **38×** on `fact_market_history`;
+the residual gap is the WINDOW MVs.
+
+- **Use per-MV telemetry, NOT batch wall-clock.** Batch wall-clock has ±15% run-to-run
+  noise that hides real wins/regressions. The ivm-bench spark-metrics feature (Spark
+  event log, `spark_metrics_capture` flag, default on) emits
+  `mount/metrics/<sf>/processed/metrics_by_model.parquet` (per-MV `wall_clock_ms` /
+  `records_read` / `records_written` / `files_scanned` / shuffle / spill, for BOTH
+  engines) + `metrics_long.parquet` (per-execution) + REST routes `/metrics/kpis`,
+  `/metrics/diff?model=`, `POST /metrics/query`. **`records_read`/`records_written`
+  are deterministic — the decisive signal.** Query the Parquet directly with the
+  openivm duckdb CLI.
+- **Iterate openivm-C++ locally (fast, no SF cycle) — the build is NOT broken.**
+  `apt install ninja-build && rm -rf build && GEN=ninja make -j"$(nproc)"` in
+  `.temp/openivm` (or a worktree) builds `duckdb` + `openivm.duckdb_extension` in
+  ~10 min. A stale `Unix Makefiles` `CMakeCache` breaks the Ninja generator, so
+  always `rm -rf build` first; needs the `third_party/lpts` submodules inited
+  (DuckLake headers).
+- **Validate an unpinned openivm build against spark-ext WITHOUT rebuilding the image:**
+  stage the fresh `duckdb` + `openivm.duckdb_extension` under
+  `spark-ext/target/openivm-<tag>/` (git-ignored, bind-mounted at
+  `/work/spark-ext/target/…`), then run any parity spec with
+  `docker compose … run -e OPENIVM_CLI_PATH=/work/spark-ext/target/openivm-<tag>/duckdb -e OPENIVM_EXTENSION_PATH=/work/spark-ext/target/openivm-<tag>/openivm.duckdb_extension build sbt 'ivmIt/testOnly …'`.
+  `OpenIvmCompiler` reads both env vars (defaults `/opt/openivm/{duckdb,openivm.duckdb_extension}`).
+- **The WINDOW bottleneck (measured via per-MV telemetry).** openivm's
+  `WINDOW_PARTITION` recompute is a Delta MERGE that scans the full (often one-file)
+  MV **~5×** — ~3 for the partition-scoped DELETE+INSERT recompute + ~2 for the
+  cascade view-delta — so window MVs read **6–10× vanilla's single clean CTAS**.
+  Partition **clustering does NOT prune it** (a TPC-DI batch touches most partitions),
+  and running-window suffix-extend falls back on backdated batches. Beating
+  vanilla on windows needs a **single-pass recompute + an incremental cascade-delta**.
+  **Cascade constraint:**
+  `daily_market` feeds `fact_market_history` (the 38× win), so it MUST emit a
+  view-delta — it cannot simply be routed to `FULL_REFRESH`.
+
 ## Principles
 
 - We do NOT tolerate verbose logging in test code. Tests should ONLY emit the test status from the test framework,

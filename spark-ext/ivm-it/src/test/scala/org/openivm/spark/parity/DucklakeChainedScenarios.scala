@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6d — Port of `openivm/test/sql/ducklake_chained.test`.
+/** Port of `openivm/test/sql/ducklake_chained.test`.
   *
   * Depth limit (per PLAN §12: "MV-over-MV cascade depth > 2" is explicitly
   * out of scope):

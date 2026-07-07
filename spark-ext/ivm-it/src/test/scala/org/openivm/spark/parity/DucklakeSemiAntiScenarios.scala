@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_semi_anti.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_semi_anti.test`.
   *
   * In openivm the DuckLake SEMI/ANTI shape with `WHERE col IN (subq)`
   * classifies as `SEMI_ANTI_RECOMPUTE` (type 9) because the parser registers

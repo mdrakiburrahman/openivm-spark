@@ -246,4 +246,37 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       concRows should have size 4
     }
   }
+  describe("MvMetadata compile cache keys") {
+    it("key compiled SQL by schema fingerprint and facts tier") {
+      val fp1 = MvCatalog.schemaFingerprint(
+        Map("orders" -> StructType(Seq(StructField("id", IntegerType))))
+      )
+      val fp2 = MvCatalog.schemaFingerprint(
+        Map("orders" -> StructType(Seq(StructField("id", LongType))))
+      )
+      val tier1 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.InsertOnly)))
+      val tier2 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.General)))
+      val tier3 = MvMetadata.compileCacheTier(
+        WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.InsertOnly), scd2RangeJoinAccel = true)
+      )
+
+      tier1 should not equal tier2
+      tier1 should not equal tier3
+      val props = MvMetadata.compiledProperties(fp1, tier1, "SQL", "INIT", 0, "AGGREGATE_GROUP")
+
+      MvMetadata.cachedCompiledSql(props, fp1, tier1) shouldBe Some("SQL")
+      MvMetadata.cachedInitialLoadSql(props, fp1, tier1) shouldBe Some("INIT")
+      MvMetadata.cachedCompiledSql(props, fp2, tier1) shouldBe None
+      MvMetadata.cachedCompiledSql(props, fp1, tier2) shouldBe None
+    }
+
+    it("separates declareRelyFk compile tiers without changing compile facts JSON") {
+      val off = WorkloadFacts(fkRelations = Seq(ForeignKeyRelation("child", Seq("parent_id"), "parent", Seq("id"))))
+      val on  = off.copy(declareRelyFk = true)
+
+      MvMetadata.compileCacheTier(off) should not equal MvMetadata.compileCacheTier(on)
+      off.toJson shouldBe on.toJson
+    }
+  }
+
 }

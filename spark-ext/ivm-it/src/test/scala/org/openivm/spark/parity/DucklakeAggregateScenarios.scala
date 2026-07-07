@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6d — Port of `openivm/test/sql/ducklake_aggregate.test`.
+/** Port of `openivm/test/sql/ducklake_aggregate.test`.
   *
   * Translation:
   *   - DuckLake catalog `dl.<table>` → Delta tables in the default Spark

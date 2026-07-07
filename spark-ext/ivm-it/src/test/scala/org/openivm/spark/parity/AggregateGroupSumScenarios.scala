@@ -68,6 +68,25 @@ abstract class AggregateGroupSumScenarios extends IvmParitySpecBase("aggregate-g
     }
   }
 
+  describe("(1e) GROUP BY k, SUM(x) — source INSERT OVERWRITE routes to FULL_REFRESH") {
+    // CDF-only: `replaceBatch` is detected from the CDF commit verdicts, so the
+    // REPLACE→FULL_REFRESH routing (and the count-monoid arity regression it
+    // guards) is a CDF-mode path. Intercept-mode REPLACE detection via staging
+    // is a separate, pre-existing gap. SF10 runs in CDF mode.
+    itCdf("count-monoid MV survives a replaced source without an arity mismatch") {
+      sql("CREATE TABLE IF NOT EXISTS aggrpsum_ag_sum_1e(k STRING, x INT) USING DELTA")
+      sql("INSERT INTO aggrpsum_ag_sum_1e VALUES ('a', 10), ('b', 20)")
+      sql(
+        "CREATE MATERIALIZED VIEW aggrpsum_mv_ag_sum_1e AS " +
+          "SELECT k, SUM(x) AS total FROM aggrpsum_ag_sum_1e GROUP BY k"
+      )
+      refreshMv("aggrpsum_mv_ag_sum_1e")
+      sql("INSERT OVERWRITE TABLE aggrpsum_ag_sum_1e VALUES ('a', 1), ('c', 7), ('c', 3)")
+      refreshMv("aggrpsum_mv_ag_sum_1e")
+      assertMvCorrect("aggrpsum_mv_ag_sum_1e", "SELECT k, SUM(x) AS total FROM aggrpsum_ag_sum_1e GROUP BY k")
+    }
+  }
+
   describe("(8a) GROUP BY k1, k2, SUM(x) — composite key INSERT") {
     it("composite group key is tracked correctly on INSERT") {
       sql("CREATE TABLE IF NOT EXISTS aggrpsum_ag_comp_8a(k1 STRING, k2 INT, x INT) USING DELTA")

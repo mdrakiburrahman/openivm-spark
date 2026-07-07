@@ -15,25 +15,25 @@ remaining DuckDB/OpenIVM tokens that LPTS does not own.
 
 ## Source map
 
-| Area | Source |
-|---|---|
-| LPTS dialect enum | `.temp/lpts/src/include/sql_dialect.hpp:13-21` |
-| Identifier quoting helper | `.temp/lpts/src/lpts_helpers.cpp:9-27` |
-| Qualified table names | `.temp/lpts/src/lpts_helpers.cpp:68-92` |
-| LPTS setting registration | `.temp/lpts/src/lpts_extension.cpp:286-292` |
-| LPTS setting read path | `.temp/lpts/src/lpts_extension.cpp:25-34`, `.temp/lpts/src/lpts_extension.cpp:117-120` |
-| Dialect parser | `.temp/lpts/src/lpts_pipeline.cpp:2506-2519` |
-| Function-name remapping | `.temp/lpts/src/lpts_pipeline.cpp:908-941` |
-| Window-frame Spark checks | `.temp/lpts/src/lpts_pipeline.cpp:780-812` |
-| CTE serialization | `.temp/lpts/src/cte_nodes.cpp:82-93`, `.temp/lpts/src/cte_nodes.cpp:372-389` |
-| Set operation serialization | `.temp/lpts/src/cte_nodes.cpp:245-284` |
-| OpenIVM CompileFacts surface | `.temp/openivm/src/include/compile_facts.hpp` |
-| OpenIVM compile table-function path | `.temp/openivm/src/upsert/refresh.cpp` |
-| OpenIVM CREATE-time LPTS call | `.temp/openivm/src/core/parser.cpp:301-305` |
-| OpenIVM refresh LPTS call | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873` |
-| OpenIVM insert-rule LPTS calls | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146` |
-| Spark bridge sets target | `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:149-176` |
-| Spark post-processor | `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/LptsSparkDialect.scala:94-131` |
+| Area                                | Source                                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------ |
+| LPTS dialect enum                   | `.temp/lpts/src/include/sql_dialect.hpp:13-21`                                                   |
+| Identifier quoting helper           | `.temp/lpts/src/lpts_helpers.cpp:9-27`                                                           |
+| Qualified table names               | `.temp/lpts/src/lpts_helpers.cpp:68-92`                                                          |
+| LPTS setting registration           | `.temp/lpts/src/lpts_extension.cpp:286-292`                                                      |
+| LPTS setting read path              | `.temp/lpts/src/lpts_extension.cpp:25-34`, `.temp/lpts/src/lpts_extension.cpp:117-120`           |
+| Dialect parser                      | `.temp/lpts/src/lpts_pipeline.cpp:2506-2519`                                                     |
+| Function-name remapping             | `.temp/lpts/src/lpts_pipeline.cpp:908-941`                                                       |
+| Window-frame Spark checks           | `.temp/lpts/src/lpts_pipeline.cpp:780-812`                                                       |
+| CTE serialization                   | `.temp/lpts/src/cte_nodes.cpp:82-93`, `.temp/lpts/src/cte_nodes.cpp:372-389`                     |
+| Set operation serialization         | `.temp/lpts/src/cte_nodes.cpp:245-284`                                                           |
+| OpenIVM CompileFacts surface        | `.temp/openivm/src/include/compile_facts.hpp`                                                    |
+| OpenIVM compile table-function path | `.temp/openivm/src/upsert/refresh.cpp`                                                           |
+| OpenIVM CREATE-time LPTS call       | `.temp/openivm/src/core/parser.cpp:301-305`                                                      |
+| OpenIVM refresh LPTS call           | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873`                                               |
+| OpenIVM insert-rule LPTS calls      | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146`                                        |
+| Spark bridge sets target            | `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:149-176` |
+| Spark post-processor                | `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/LptsSparkDialect.scala:94-131` |
 
 ## 1. Dialect enum and abstraction
 
@@ -93,25 +93,25 @@ The following table is the practical rule set.
 It distinguishes rules implemented inside LPTS from rules handled later by
 `openivm-spark`.
 
-| Rule family | DuckDB dialect | Spark dialect | Postgres dialect | Source / note |
-|---|---|---|---|---|
-| Identifier quoting | Uses DuckDB `KeywordHelper::WriteOptionallyQuoted`; simple names are often unquoted, reserved/special names use `"name"`. | Always emits backticks, doubling embedded backticks: `` `name` ``. | Same as DuckDB helper; double quotes only when needed. | `.temp/lpts/src/lpts_helpers.cpp:9-27` |
-| Column-list quoting | `DialectVecToQuotedIdentifierList` uses the dialect-specific quoting helper. | Same helper, therefore every scan/final alias is backticked. | Same helper as DuckDB. | `.temp/lpts/src/lpts_helpers.cpp:68-76` |
-| Qualified table names | `"catalog"."schema"."table"` when catalog is known. | `` `catalog`.`schema`.`table` `` when catalog is known. | The same helper can render three-part names, though Postgres normally wants `schema.table`; LPTS only has limited Postgres compatibility. | `.temp/lpts/src/lpts_helpers.cpp:88-92`, `.temp/lpts/src/cte_nodes.cpp:107-115` |
-| Function names | Mostly pass through DuckDB bound function names. | Maps a small set of DuckDB names to Spark equivalents. | Maps `strptime` and `strftime` to Postgres-style names. | `.temp/lpts/src/lpts_pipeline.cpp:908-941` |
-| Internal compression functions | `__internal_compress_*` and `__internal_decompress_*` are stripped by rendering the first child. | Same. | Same. | `.temp/lpts/src/lpts_pipeline.cpp:898-907` |
-| Operators | Binary arithmetic/string operators render as infix when possible. | Same. | Same. | `.temp/lpts/src/lpts_pipeline.cpp:955-967` |
-| Keyword-like scalar functions | `position`, `substring`, `overlay`, and `trim` are emitted as quoted function identifiers to avoid DuckDB parser keyword syntax. | Same current implementation, even though Spark may not need double-quoted function identifiers. | Same. | `.temp/lpts/src/lpts_pipeline.cpp:975-985` |
-| Aggregate name aliases | `sum_no_overflow` becomes `sum`; window `count_star` becomes `count`. | Same. | Same. | `.temp/lpts/src/lpts_pipeline.cpp:566-575`, `.temp/lpts/src/lpts_pipeline.cpp:1694-1700` |
-| Type names in casts | Uses DuckDB `LogicalType::ToString()`. | Same raw LPTS output; Spark normalization is mainly post-processor work. | Same raw LPTS output. | `.temp/lpts/src/lpts_pipeline.cpp:874-879` |
-| Set operations | Emits positional `UNION`, `UNION ALL`, `EXCEPT`, `EXCEPT ALL`, `INTERSECT`, `INTERSECT ALL`. | Same raw syntax; Spark accepts many but not all semantic shapes. | Same. | `.temp/lpts/src/cte_nodes.cpp:245-284` |
-| `UNION ALL BY NAME` | Not emitted. DuckDB may parse it as input, but LPTS serializes normalized positional set ops. | Not emitted. | Not emitted. | No `BY NAME` support in LPTS serializer; see set-op source above. |
-| Pivot / unpivot | No explicit LPTS support found. Unsupported logical operators fall through to `NotImplementedException`. | Same. | Same. | No `PIVOT`/`UNPIVOT` matches in `.temp/lpts/src`; generic unsupported path is `.temp/lpts/src/lpts_pipeline.cpp:2380-2383`. |
-| Window frames | Emits `ROWS`, `RANGE`, or `GROUPS` based on DuckDB window boundaries. | Rejects `GROUPS` and `EXCLUDE` because Spark SQL does not support them. | Same as DuckDB except no Postgres-specific normalization. | `.temp/lpts/src/lpts_pipeline.cpp:608-625`, `.temp/lpts/src/lpts_pipeline.cpp:780-812` |
-| LATERAL / dependent joins | DuckDB decorrelates LATERAL into `LOGICAL_DELIM_JOIN` / `LOGICAL_DEPENDENT_JOIN`; LPTS emits ordinary CTE joins plus `SELECT DISTINCT` delim scans. | Same output shape; no `LATERAL` keyword is emitted. | Same. | `.temp/lpts/src/lpts_pipeline.cpp:2258-2355`, `.temp/lpts/src/lpts_pipeline.cpp:2930-2978` |
-| CTE materialization hints | Input hints may affect DuckDB's plan, but output CTEs are always `name AS (...)`. | Same. | Same. | `.temp/lpts/src/cte_nodes.cpp:82-93`, `.temp/lpts/test/sql/cte.test:122-155` |
-| Recursive CTEs | Emits `WITH RECURSIVE` when needed. | Same raw syntax; Spark support depends on runtime/version. | Same. | `.temp/lpts/src/cte_nodes.cpp:352-389` |
-| String literal escaping | LPTS doubles single quotes for embedded SQL strings. | Same; the Spark post-processor protects string literals before regex rewrites. | Same. | `.temp/lpts/src/lpts_helpers.cpp:94-103`, `spark-ext/.../LptsSparkDialect.scala:356-421` |
+| Rule family                    | DuckDB dialect                                                                                                                                      | Spark dialect                                                                                   | Postgres dialect                                                                                                                          | Source / note                                                                                                               |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Identifier quoting             | Uses DuckDB `KeywordHelper::WriteOptionallyQuoted`; simple names are often unquoted, reserved/special names use `"name"`.                           | Always emits backticks, doubling embedded backticks: `` `name` ``.                              | Same as DuckDB helper; double quotes only when needed.                                                                                    | `.temp/lpts/src/lpts_helpers.cpp:9-27`                                                                                      |
+| Column-list quoting            | `DialectVecToQuotedIdentifierList` uses the dialect-specific quoting helper.                                                                        | Same helper, therefore every scan/final alias is backticked.                                    | Same helper as DuckDB.                                                                                                                    | `.temp/lpts/src/lpts_helpers.cpp:68-76`                                                                                     |
+| Qualified table names          | `"catalog"."schema"."table"` when catalog is known.                                                                                                 | `` `catalog`.`schema`.`table` `` when catalog is known.                                         | The same helper can render three-part names, though Postgres normally wants `schema.table`; LPTS only has limited Postgres compatibility. | `.temp/lpts/src/lpts_helpers.cpp:88-92`, `.temp/lpts/src/cte_nodes.cpp:107-115`                                             |
+| Function names                 | Mostly pass through DuckDB bound function names.                                                                                                    | Maps a small set of DuckDB names to Spark equivalents.                                          | Maps `strptime` and `strftime` to Postgres-style names.                                                                                   | `.temp/lpts/src/lpts_pipeline.cpp:908-941`                                                                                  |
+| Internal compression functions | `__internal_compress_*` and `__internal_decompress_*` are stripped by rendering the first child.                                                    | Same.                                                                                           | Same.                                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:898-907`                                                                                  |
+| Operators                      | Binary arithmetic/string operators render as infix when possible.                                                                                   | Same.                                                                                           | Same.                                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:955-967`                                                                                  |
+| Keyword-like scalar functions  | `position`, `substring`, `overlay`, and `trim` are emitted as quoted function identifiers to avoid DuckDB parser keyword syntax.                    | Same current implementation, even though Spark may not need double-quoted function identifiers. | Same.                                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:975-985`                                                                                  |
+| Aggregate name aliases         | `sum_no_overflow` becomes `sum`; window `count_star` becomes `count`.                                                                               | Same.                                                                                           | Same.                                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:566-575`, `.temp/lpts/src/lpts_pipeline.cpp:1694-1700`                                    |
+| Type names in casts            | Uses DuckDB `LogicalType::ToString()`.                                                                                                              | Same raw LPTS output; Spark normalization is mainly post-processor work.                        | Same raw LPTS output.                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:874-879`                                                                                  |
+| Set operations                 | Emits positional `UNION`, `UNION ALL`, `EXCEPT`, `EXCEPT ALL`, `INTERSECT`, `INTERSECT ALL`.                                                        | Same raw syntax; Spark accepts many but not all semantic shapes.                                | Same.                                                                                                                                     | `.temp/lpts/src/cte_nodes.cpp:245-284`                                                                                      |
+| `UNION ALL BY NAME`            | Not emitted. DuckDB may parse it as input, but LPTS serializes normalized positional set ops.                                                       | Not emitted.                                                                                    | Not emitted.                                                                                                                              | No `BY NAME` support in LPTS serializer; see set-op source above.                                                           |
+| Pivot / unpivot                | No explicit LPTS support found. Unsupported logical operators fall through to `NotImplementedException`.                                            | Same.                                                                                           | Same.                                                                                                                                     | No `PIVOT`/`UNPIVOT` matches in `.temp/lpts/src`; generic unsupported path is `.temp/lpts/src/lpts_pipeline.cpp:2380-2383`. |
+| Window frames                  | Emits `ROWS`, `RANGE`, or `GROUPS` based on DuckDB window boundaries.                                                                               | Rejects `GROUPS` and `EXCLUDE` because Spark SQL does not support them.                         | Same as DuckDB except no Postgres-specific normalization.                                                                                 | `.temp/lpts/src/lpts_pipeline.cpp:608-625`, `.temp/lpts/src/lpts_pipeline.cpp:780-812`                                      |
+| LATERAL / dependent joins      | DuckDB decorrelates LATERAL into `LOGICAL_DELIM_JOIN` / `LOGICAL_DEPENDENT_JOIN`; LPTS emits ordinary CTE joins plus `SELECT DISTINCT` delim scans. | Same output shape; no `LATERAL` keyword is emitted.                                             | Same.                                                                                                                                     | `.temp/lpts/src/lpts_pipeline.cpp:2258-2355`, `.temp/lpts/src/lpts_pipeline.cpp:2930-2978`                                  |
+| CTE materialization hints      | Input hints may affect DuckDB's plan, but output CTEs are always `name AS (...)`.                                                                   | Same.                                                                                           | Same.                                                                                                                                     | `.temp/lpts/src/cte_nodes.cpp:82-93`, `.temp/lpts/test/sql/cte.test:122-155`                                                |
+| Recursive CTEs                 | Emits `WITH RECURSIVE` when needed.                                                                                                                 | Same raw syntax; Spark support depends on runtime/version.                                      | Same.                                                                                                                                     | `.temp/lpts/src/cte_nodes.cpp:352-389`                                                                                      |
+| String literal escaping        | LPTS doubles single quotes for embedded SQL strings.                                                                                                | Same; the Spark post-processor protects string literals before regex rewrites.                  | Same.                                                                                                                                     | `.temp/lpts/src/lpts_helpers.cpp:94-103`, `spark-ext/.../LptsSparkDialect.scala:356-421`                                    |
 
 The table reveals an important design choice.
 LPTS is not trying to be a full SQL pretty-printer for every engine.
@@ -131,16 +131,16 @@ DuckDB is the default.
 Most bound function names are emitted unchanged.
 The generic non-dialect-specific rewrites still apply:
 
-| Input bound function or expression | DuckDB output | Notes |
-|---|---|---|
-| `__internal_compress_* (x)` | `x` | Strips optimizer compression wrappers. |
-| `__internal_decompress_* (x)` | `x` | Same. |
-| `sum_no_overflow(x)` aggregate | `sum(x)` | Internal aggregate variant is user-facing `sum`. |
-| `count_star()` as a window aggregate | `count(*)` shape through `count` + empty args | See window function-name handling. |
-| `+`, `-`, `*`, `/`, `%`, `||` binary calls | infix operator | `a + b`, `a || b`, etc. |
-| `position`, `substring`, `overlay`, `trim` | `"position"(...)`, etc. | Quoted to avoid DuckDB keyword syntax collisions. |
-| `struct_pack` / `row` returning named struct | `struct_pack("field" := expr, ...)` | Field names come from the return type. |
-| Other scalar functions | unchanged | `length`, `lower`, `upper`, `coalesce`, etc. |
+| Input bound function or expression           | DuckDB output                                 | Notes                                             |
+| -------------------------------------------- | --------------------------------------------- | ------------------------------------------------- |
+| `__internal_compress_* (x)`                  | `x`                                           | Strips optimizer compression wrappers.            |
+| `__internal_decompress_* (x)`                | `x`                                           | Same.                                             |
+| `sum_no_overflow(x)` aggregate               | `sum(x)`                                      | Internal aggregate variant is user-facing `sum`.  |
+| `count_star()` as a window aggregate         | `count(*)` shape through `count` + empty args | See window function-name handling.                |
+| `+`, `-`, `*`, `/`, `%`, \`                  |                                               | \` binary calls                                   |
+| `position`, `substring`, `overlay`, `trim`   | `"position"(...)`, etc.                       | Quoted to avoid DuckDB keyword syntax collisions. |
+| `struct_pack` / `row` returning named struct | `struct_pack("field" := expr, ...)`           | Field names come from the return type.            |
+| Other scalar functions                       | unchanged                                     | `length`, `lower`, `upper`, `coalesce`, etc.      |
 
 Source references:
 
@@ -154,21 +154,21 @@ Source references:
 
 Spark inherits the generic table above, then applies the following names:
 
-| DuckDB / LPTS bound name | Spark raw LPTS output | Notes |
-|---|---|---|
-| `strftime` | `date_format` | Spark's closest date formatting builtin. |
-| `strptime` | `to_timestamp` | Works for some timestamp patterns but not every shim expansion. |
-| `list_transform` | `transform` | Spark higher-order function. |
-| `array_transform` | `transform` | Alias to Spark higher-order function. |
-| `list_aggregate` | `aggregate` | Spark higher-order aggregate. |
-| `array_aggregate` | `aggregate` | Same. |
-| `list_filter` | `filter` | Spark higher-order filter. |
-| `array_filter` | `filter` | Same. |
-| `list_value` | `array` | Spark array constructor. |
-| `list_contains` | `array_contains` | Spark builtin. |
-| `array_contains` | `array_contains` | Already Spark-compatible. |
-| `list_extract` | `element_at` | Spark `element_at` is 1-indexed, matching DuckDB list semantics. |
-| `array_extract` | `element_at` | Same. |
+| DuckDB / LPTS bound name | Spark raw LPTS output | Notes                                                            |
+| ------------------------ | --------------------- | ---------------------------------------------------------------- |
+| `strftime`               | `date_format`         | Spark's closest date formatting builtin.                         |
+| `strptime`               | `to_timestamp`        | Works for some timestamp patterns but not every shim expansion.  |
+| `list_transform`         | `transform`           | Spark higher-order function.                                     |
+| `array_transform`        | `transform`           | Alias to Spark higher-order function.                            |
+| `list_aggregate`         | `aggregate`           | Spark higher-order aggregate.                                    |
+| `array_aggregate`        | `aggregate`           | Same.                                                            |
+| `list_filter`            | `filter`              | Spark higher-order filter.                                       |
+| `array_filter`           | `filter`              | Same.                                                            |
+| `list_value`             | `array`               | Spark array constructor.                                         |
+| `list_contains`          | `array_contains`      | Spark builtin.                                                   |
+| `array_contains`         | `array_contains`      | Already Spark-compatible.                                        |
+| `list_extract`           | `element_at`          | Spark `element_at` is 1-indexed, matching DuckDB list semantics. |
+| `array_extract`          | `element_at`          | Same.                                                            |
 
 Source: `.temp/lpts/src/lpts_pipeline.cpp:916-940`.
 
@@ -182,10 +182,10 @@ See `.temp/lpts/src/lpts_pipeline.cpp:917-922`.
 
 Postgres inherits the generic table and maps only two names today:
 
-| DuckDB / LPTS bound name | Postgres output | Notes |
-|---|---|---|
-| `strptime` | `to_timestamp` | Postgres-style timestamp parsing name. |
-| `strftime` | `to_char` | Postgres-style formatting name. |
+| DuckDB / LPTS bound name | Postgres output | Notes                                  |
+| ------------------------ | --------------- | -------------------------------------- |
+| `strptime`               | `to_timestamp`  | Postgres-style timestamp parsing name. |
+| `strftime`               | `to_char`       | Postgres-style formatting name.        |
 
 Source: `.temp/lpts/src/lpts_pipeline.cpp:910-915`.
 
@@ -221,17 +221,17 @@ See `.temp/openivm/src/core/parser.cpp:301-305` and
 
 ### Spark rules LPTS gets right directly
 
-| Input / logical shape | Spark raw LPTS behavior | Why it is useful |
-|---|---|---|
-| Plain identifiers | Emits backticks: `` `a` ``, `` `memory`.`main`.`t` ``. | Spark accepts backticks for reserved words and mixed case. |
-| `SELECT a, COUNT(*) FROM t GROUP BY a` | Emits CTEs with Spark-safe quoted aliases and standard `GROUP BY`. | Common aggregate MV path works without post-processing. |
-| `strftime(ts, fmt)` | Emits `date_format(ts, fmt)`. | Spark name is selected by the dialect branch. |
-| `list_transform(arr, lambda x: ...)` | Emits `transform(arr, lambda x: ...)`. | Spark higher-order function name is selected. |
-| `list_extract(arr, i)` | Emits `element_at(arr, i)`. | Indexing semantics line up for 1-indexed list access. |
-| Window frame with `ROWS` or `RANGE` | Emits `ROWS ...` / `RANGE ...`. | Spark accepts these frame units. |
-| Window frame with `GROUPS` | Throws instead of emitting invalid Spark SQL. | Prevents silent invalid SQL. |
-| Window `EXCLUDE` clause | Throws for Spark. | Spark SQL 3.5 does not support window `EXCLUDE`. |
-| Correlated/LATERAL shape after DuckDB decorrelation | Emits ordinary joins and delim CTEs, not `LATERAL`. | Avoids Spark-specific lateral syntax differences. |
+| Input / logical shape                               | Spark raw LPTS behavior                                            | Why it is useful                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------- |
+| Plain identifiers                                   | Emits backticks: `` `a` ``, `` `memory`.`main`.`t` ``.             | Spark accepts backticks for reserved words and mixed case. |
+| `SELECT a, COUNT(*) FROM t GROUP BY a`              | Emits CTEs with Spark-safe quoted aliases and standard `GROUP BY`. | Common aggregate MV path works without post-processing.    |
+| `strftime(ts, fmt)`                                 | Emits `date_format(ts, fmt)`.                                      | Spark name is selected by the dialect branch.              |
+| `list_transform(arr, lambda x: ...)`                | Emits `transform(arr, lambda x: ...)`.                             | Spark higher-order function name is selected.              |
+| `list_extract(arr, i)`                              | Emits `element_at(arr, i)`.                                        | Indexing semantics line up for 1-indexed list access.      |
+| Window frame with `ROWS` or `RANGE`                 | Emits `ROWS ...` / `RANGE ...`.                                    | Spark accepts these frame units.                           |
+| Window frame with `GROUPS`                          | Throws instead of emitting invalid Spark SQL.                      | Prevents silent invalid SQL.                               |
+| Window `EXCLUDE` clause                             | Throws for Spark.                                                  | Spark SQL 3.5 does not support window `EXCLUDE`.           |
+| Correlated/LATERAL shape after DuckDB decorrelation | Emits ordinary joins and delim CTEs, not `LATERAL`.                | Avoids Spark-specific lateral syntax differences.          |
 
 Spark-specific window checks are at `.temp/lpts/src/lpts_pipeline.cpp:792-812`.
 Delim join serialization is at `.temp/lpts/src/lpts_pipeline.cpp:2930-2978`.
@@ -244,21 +244,21 @@ binder in a form that LPTS does not normalize.
 `LptsSparkDialect.translate` applies the final Spark pass.
 Its pipeline is in `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/LptsSparkDialect.scala:94-131`.
 
-| Raw OpenIVM/LPTS Spark output | After `LptsSparkDialect` | Reason |
-|---|---|---|
-| `struct_extract(s, 'k')` or `STRUCT_EXTRACT(s, 'k')` | `s.k` | Spark SQL uses dot field access; no `struct_extract` builtin. |
-| `generate_series(1, n)` | `sequence(1, n)` | Spark's generator/array function name differs. |
-| `now()::timestamp` | `current_timestamp()` | Spark does not parse DuckDB postfix cast syntax. |
-| `'2024-01-01'::TIMESTAMP` | `CAST('2024-01-01' AS TIMESTAMP)` | Generic postfix casts are rewritten to standard `CAST`. |
-| `COALESCE(a, b)::DOUBLE` | `CAST(COALESCE(a, b) AS DOUBLE)` | Parenthesized postfix casts need balanced scanning. |
-| `INTERVAL '1 hour'` | `INTERVAL 1 HOUR` | Spark interval literal grammar differs. |
-| `count_star()` | `COUNT(*)` | DuckDB count-star spelling can leak through compiled SQL. |
-| `CAST(x AS TIMESTAMP WITH TIME ZONE)` | `CAST(x AS TIMESTAMP)` | Spark 3.5 does not accept the SQL-standard suffix. |
-| `CAST(NULL AS HUGEINT)` | `CAST(NULL AS BIGINT)` | Spark lacks DuckDB `HUGEINT`. |
-| `error('msg')` | `raise_error('msg')` | Spark's error function is named `raise_error`. |
-| `regexp_matches(s, p)` | `regexp_like(s, p)` | Macro shim expansion must be translated back. |
-| `strptime(raw, fmt)` after shim expansion | `to_timestamp(raw, fmt)` | Restores Spark function spelling. |
-| `strftime(ts, fmt)` after shim expansion | `date_format(ts, fmt)` | Restores Spark function spelling. |
+| Raw OpenIVM/LPTS Spark output                        | After `LptsSparkDialect`          | Reason                                                        |
+| ---------------------------------------------------- | --------------------------------- | ------------------------------------------------------------- |
+| `struct_extract(s, 'k')` or `STRUCT_EXTRACT(s, 'k')` | `s.k`                             | Spark SQL uses dot field access; no `struct_extract` builtin. |
+| `generate_series(1, n)`                              | `sequence(1, n)`                  | Spark's generator/array function name differs.                |
+| `now()::timestamp`                                   | `current_timestamp()`             | Spark does not parse DuckDB postfix cast syntax.              |
+| `'2024-01-01'::TIMESTAMP`                            | `CAST('2024-01-01' AS TIMESTAMP)` | Generic postfix casts are rewritten to standard `CAST`.       |
+| `COALESCE(a, b)::DOUBLE`                             | `CAST(COALESCE(a, b) AS DOUBLE)`  | Parenthesized postfix casts need balanced scanning.           |
+| `INTERVAL '1 hour'`                                  | `INTERVAL 1 HOUR`                 | Spark interval literal grammar differs.                       |
+| `count_star()`                                       | `COUNT(*)`                        | DuckDB count-star spelling can leak through compiled SQL.     |
+| `CAST(x AS TIMESTAMP WITH TIME ZONE)`                | `CAST(x AS TIMESTAMP)`            | Spark 3.5 does not accept the SQL-standard suffix.            |
+| `CAST(NULL AS HUGEINT)`                              | `CAST(NULL AS BIGINT)`            | Spark lacks DuckDB `HUGEINT`.                                 |
+| `error('msg')`                                       | `raise_error('msg')`              | Spark's error function is named `raise_error`.                |
+| `regexp_matches(s, p)`                               | `regexp_like(s, p)`               | Macro shim expansion must be translated back.                 |
+| `strptime(raw, fmt)` after shim expansion            | `to_timestamp(raw, fmt)`          | Restores Spark function spelling.                             |
+| `strftime(ts, fmt)` after shim expansion             | `date_format(ts, fmt)`            | Restores Spark function spelling.                             |
 
 Relevant sources:
 
@@ -338,26 +338,26 @@ LPTS works from DuckDB's logical plan.
 `openivm-spark` has the extra constraint that the original MV body must also be
 valid Spark SQL at user-facing CREATE time.
 
-| MV body | DuckDB output | Spark output raw | Spark output after `LptsSparkDialect` | Postgres output |
-|---|---|---|---|---|
-| `SELECT a, COUNT(*) FROM t GROUP BY a` | OK. Standard CTEs, `count(*)`, DuckDB identifiers. | OK. Backticked identifiers and standard aggregate. | OK. No extra rewrite needed. | Mostly OK; simple aggregate and quoted identifiers are compatible. |
-| `SELECT struct_extract(s,'k') FROM t` | OK if DuckDB binds the struct field. | Not OK for Spark if `struct_extract` remains; Spark parser has no builtin of that name. | OK: `struct_extract(s,'k')` becomes `s.k`. | Error/unsupported: no Postgres mapping for DuckDB struct extraction. |
-| `WITH t AS (SELECT a FROM base) SELECT a FROM t` | OK; optimizer may inline or materialize, output is LPTS CTEs. | OK; output CTEs do not preserve materialization hints. | OK. | OK for simple CTE shape. |
-| `WITH t AS MATERIALIZED (SELECT a FROM base) SELECT a FROM t` | OK; hint affects DuckDB plan, but output is plain `AS`. | Raw OK if the resulting CTE plan is supported. | OK; no hint remains. | OK syntax-wise for plain output, but hint is not preserved. |
-| `SELECT strftime(ts, '%Y-%m') FROM t` | OK as `strftime`. | OK raw as `date_format(ts, '%Y-%m')`. | OK; may also rewrite shim-expanded `strftime` to `date_format`. | OK-ish as `to_char(ts, '%Y-%m')`, though format-token semantics may differ. |
-| `SELECT strptime(s, fmt) FROM t` | OK as `strptime`. | Raw emits `to_timestamp(s, fmt)` for LPTS-owned expressions. | OK; shim expansions are also restored to `to_timestamp`. | OK-ish as `to_timestamp(s, fmt)`, format-token semantics may differ. |
-| `SELECT list_transform(xs, lambda x: x + 1) FROM t` | OK in DuckDB. | Raw emits `transform(xs, lambda x: x + 1)`. Spark higher-order lambda syntax may still require parser-compatible shape. | Usually OK if Spark accepts the lambda spelling; otherwise workload-specific. | Error/unsupported: no Postgres mapping for DuckDB list lambdas. |
-| `SELECT list_extract(xs, 1) FROM t` | OK. | Raw emits `element_at(xs, 1)`. | OK. | Error/unsupported: no Postgres array/list mapping. |
-| `SELECT row_number() OVER (PARTITION BY a ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t` | OK. | OK raw. | OK. | OK. |
-| `SELECT sum(x) OVER (ORDER BY ts GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t` | OK if DuckDB supports the frame. | LPTS Spark throws before emitting. | Error by design; user must rewrite to ROWS/RANGE. | Raw may be OK on modern Postgres, but LPTS has no Postgres-specific check. |
-| `SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t` | OK if DuckDB supports it. | LPTS Spark throws because Spark has no window `EXCLUDE`. | Error by design. | Postgres may support `EXCLUDE`, but LPTS emits it without deeper compatibility checks. |
-| `SELECT a FROM t1 UNION ALL SELECT a FROM t2` | OK. | OK raw. | OK. | OK. |
-| `SELECT * FROM t1 UNION ALL BY NAME SELECT * FROM t2` | DuckDB input may parse, but LPTS output is positional `UNION ALL`; name matching is not preserved as syntax. | Raw output is positional, so valid only if column order is compatible. | Same. | Not a Postgres feature. |
-| `SELECT * FROM t PIVOT (...)` | Not implemented in LPTS unless DuckDB optimizes it into supported operators. | Same. | Same. | Same. |
-| `SELECT w_id, slot FROM wh CROSS JOIN LATERAL (...)` | OK in tested dependent-join cases; LPTS emits decorrelated joins/delim CTEs. | Raw is ordinary joins, not `LATERAL`; often OK. | OK if downstream Spark accepts the generated joins/functions. | Often OK only after semantics are expressible without DuckDB-specific table functions. |
-| `SELECT generate_series(1, n) FROM t` | OK in OpenIVM-assembled SQL. | Raw OpenIVM can contain `generate_series`. | OK after rewrite to `sequence(1, n)`. | Error/unsupported unless Postgres `generate_series` context matches. |
-| `SELECT now()::timestamp FROM t` | OK DuckDB syntax. | Raw OpenIVM can contain postfix cast. | OK after rewrite to `current_timestamp()`. | Postgres supports postfix casts but `now()` type semantics differ. |
-| `SELECT INTERVAL '1 hour' FROM t` | OK DuckDB syntax. | Raw OpenIVM can contain quoted interval literal. | OK after rewrite to `INTERVAL 1 HOUR`. | OK in Postgres with quoted interval syntax. |
+| MV body                                                                                                        | DuckDB output                                                                                                | Spark output raw                                                                                                        | Spark output after `LptsSparkDialect`                                         | Postgres output                                                                        |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `SELECT a, COUNT(*) FROM t GROUP BY a`                                                                         | OK. Standard CTEs, `count(*)`, DuckDB identifiers.                                                           | OK. Backticked identifiers and standard aggregate.                                                                      | OK. No extra rewrite needed.                                                  | Mostly OK; simple aggregate and quoted identifiers are compatible.                     |
+| `SELECT struct_extract(s,'k') FROM t`                                                                          | OK if DuckDB binds the struct field.                                                                         | Not OK for Spark if `struct_extract` remains; Spark parser has no builtin of that name.                                 | OK: `struct_extract(s,'k')` becomes `s.k`.                                    | Error/unsupported: no Postgres mapping for DuckDB struct extraction.                   |
+| `WITH t AS (SELECT a FROM base) SELECT a FROM t`                                                               | OK; optimizer may inline or materialize, output is LPTS CTEs.                                                | OK; output CTEs do not preserve materialization hints.                                                                  | OK.                                                                           | OK for simple CTE shape.                                                               |
+| `WITH t AS MATERIALIZED (SELECT a FROM base) SELECT a FROM t`                                                  | OK; hint affects DuckDB plan, but output is plain `AS`.                                                      | Raw OK if the resulting CTE plan is supported.                                                                          | OK; no hint remains.                                                          | OK syntax-wise for plain output, but hint is not preserved.                            |
+| `SELECT strftime(ts, '%Y-%m') FROM t`                                                                          | OK as `strftime`.                                                                                            | OK raw as `date_format(ts, '%Y-%m')`.                                                                                   | OK; may also rewrite shim-expanded `strftime` to `date_format`.               | OK-ish as `to_char(ts, '%Y-%m')`, though format-token semantics may differ.            |
+| `SELECT strptime(s, fmt) FROM t`                                                                               | OK as `strptime`.                                                                                            | Raw emits `to_timestamp(s, fmt)` for LPTS-owned expressions.                                                            | OK; shim expansions are also restored to `to_timestamp`.                      | OK-ish as `to_timestamp(s, fmt)`, format-token semantics may differ.                   |
+| `SELECT list_transform(xs, lambda x: x + 1) FROM t`                                                            | OK in DuckDB.                                                                                                | Raw emits `transform(xs, lambda x: x + 1)`. Spark higher-order lambda syntax may still require parser-compatible shape. | Usually OK if Spark accepts the lambda spelling; otherwise workload-specific. | Error/unsupported: no Postgres mapping for DuckDB list lambdas.                        |
+| `SELECT list_extract(xs, 1) FROM t`                                                                            | OK.                                                                                                          | Raw emits `element_at(xs, 1)`.                                                                                          | OK.                                                                           | Error/unsupported: no Postgres array/list mapping.                                     |
+| `SELECT row_number() OVER (PARTITION BY a ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t` | OK.                                                                                                          | OK raw.                                                                                                                 | OK.                                                                           | OK.                                                                                    |
+| `SELECT sum(x) OVER (ORDER BY ts GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t`                           | OK if DuckDB supports the frame.                                                                             | LPTS Spark throws before emitting.                                                                                      | Error by design; user must rewrite to ROWS/RANGE.                             | Raw may be OK on modern Postgres, but LPTS has no Postgres-specific check.             |
+| `SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t` | OK if DuckDB supports it.                                                                                    | LPTS Spark throws because Spark has no window `EXCLUDE`.                                                                | Error by design.                                                              | Postgres may support `EXCLUDE`, but LPTS emits it without deeper compatibility checks. |
+| `SELECT a FROM t1 UNION ALL SELECT a FROM t2`                                                                  | OK.                                                                                                          | OK raw.                                                                                                                 | OK.                                                                           | OK.                                                                                    |
+| `SELECT * FROM t1 UNION ALL BY NAME SELECT * FROM t2`                                                          | DuckDB input may parse, but LPTS output is positional `UNION ALL`; name matching is not preserved as syntax. | Raw output is positional, so valid only if column order is compatible.                                                  | Same.                                                                         | Not a Postgres feature.                                                                |
+| `SELECT * FROM t PIVOT (...)`                                                                                  | Not implemented in LPTS unless DuckDB optimizes it into supported operators.                                 | Same.                                                                                                                   | Same.                                                                         | Same.                                                                                  |
+| `SELECT w_id, slot FROM wh CROSS JOIN LATERAL (...)`                                                           | OK in tested dependent-join cases; LPTS emits decorrelated joins/delim CTEs.                                 | Raw is ordinary joins, not `LATERAL`; often OK.                                                                         | OK if downstream Spark accepts the generated joins/functions.                 | Often OK only after semantics are expressible without DuckDB-specific table functions. |
+| `SELECT generate_series(1, n) FROM t`                                                                          | OK in OpenIVM-assembled SQL.                                                                                 | Raw OpenIVM can contain `generate_series`.                                                                              | OK after rewrite to `sequence(1, n)`.                                         | Error/unsupported unless Postgres `generate_series` context matches.                   |
+| `SELECT now()::timestamp FROM t`                                                                               | OK DuckDB syntax.                                                                                            | Raw OpenIVM can contain postfix cast.                                                                                   | OK after rewrite to `current_timestamp()`.                                    | Postgres supports postfix casts but `now()` type semantics differ.                     |
+| `SELECT INTERVAL '1 hour' FROM t`                                                                              | OK DuckDB syntax.                                                                                            | Raw OpenIVM can contain quoted interval literal.                                                                        | OK after rewrite to `INTERVAL 1 HOUR`.                                        | OK in Postgres with quoted interval syntax.                                            |
 
 The main lesson from the matrix:
 LPTS Spark is enough for many logical-plan-owned expressions, but not for every
@@ -387,24 +387,24 @@ Source: `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIv
 From there the flow is:
 
 1. Spark extension receives a materialized-view compile request.
-2. `OpenIvmCompiler.buildScript` embeds the Spark CompileFacts JSON in the table-function call.
-3. The DuckDB CLI loads OpenIVM and creates the source stubs and MV.
-4. `openivm_compile_with_facts` resolves the view, parses the CompileFacts payload, and builds refresh SQL.
-5. Each LPTS call uses the per-call target dialect.
-6. OpenIVM passes `SqlDialect::SPARK` into `LogicalPlanToAst`.
-7. OpenIVM passes the same enum into `AstToCteList`.
-8. `CteList::ToQuery(...)` serializes CTE SQL using Spark quoting and mappings.
-9. The Scala side parses the JSON-line compile result.
-10. `LptsSparkDialect.translate` cleans up remaining Spark-incompatible tokens.
+1. `OpenIvmCompiler.buildScript` embeds the Spark CompileFacts JSON in the table-function call.
+1. The DuckDB CLI loads OpenIVM and creates the source stubs and MV.
+1. `openivm_compile_with_facts` resolves the view, parses the CompileFacts payload, and builds refresh SQL.
+1. Each LPTS call uses the per-call target dialect.
+1. OpenIVM passes `SqlDialect::SPARK` into `LogicalPlanToAst`.
+1. OpenIVM passes the same enum into `AstToCteList`.
+1. `CteList::ToQuery(...)` serializes CTE SQL using Spark quoting and mappings.
+1. The Scala side parses the JSON-line compile result.
+1. `LptsSparkDialect.translate` cleans up remaining Spark-incompatible tokens.
 
 Important call sites:
 
-| OpenIVM phase | Dialect hand-off |
-|---|---|
-| CompileFacts payload | `.temp/openivm/src/include/compile_facts.hpp` |
-| Refresh delta plan serialization | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873` |
-| Insert-rule delta serialization | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146` |
-| Compile table-function path | `.temp/openivm/src/upsert/refresh.cpp` |
+| OpenIVM phase                    | Dialect hand-off                                          |
+| -------------------------------- | --------------------------------------------------------- |
+| CompileFacts payload             | `.temp/openivm/src/include/compile_facts.hpp`             |
+| Refresh delta plan serialization | `.temp/openivm/src/upsert/refresh_sql.cpp:867-873`        |
+| Insert-rule delta serialization  | `.temp/openivm/src/rules/refresh_insert_rule.cpp:125-146` |
+| Compile table-function path      | `.temp/openivm/src/upsert/refresh.cpp`                    |
 
 Older docs described this as a PRAGMA-style target setting.
 In the code path used here, the CompileFacts JSON is passed as a single argument
@@ -602,14 +602,14 @@ problem before changing code.
 
 1. If the invalid token is inside an LPTS-owned expression, fix the LPTS Spark
    branch or add an LPTS test.
-2. If the invalid token is from OpenIVM hand-written refresh SQL, fix
+1. If the invalid token is from OpenIVM hand-written refresh SQL, fix
    `LptsSparkDialect` or the OpenIVM string generator.
-3. If the user's MV body is Spark-only and DuckDB cannot bind it, add a compile
+1. If the user's MV body is Spark-only and DuckDB cannot bind it, add a compile
    bridge shim before the SQL reaches DuckDB.
-4. If DuckDB binds a Spark function to a different overload, use the shim
+1. If DuckDB binds a Spark function to a different overload, use the shim
    rename/prologue/back-translation pattern in `OpenIvmCompiler` and
    `SparkFunctionShimSql`.
-5. If Spark and DuckDB semantics differ, do not add a name-only mapping unless
+1. If Spark and DuckDB semantics differ, do not add a name-only mapping unless
    parity tests prove the behavior.
 
 The current Spark shim system does exactly this for selected functions.

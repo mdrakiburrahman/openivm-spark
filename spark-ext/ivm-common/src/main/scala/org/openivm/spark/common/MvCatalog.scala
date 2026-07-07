@@ -1,7 +1,6 @@
 package org.openivm.spark.common
 
-import io.delta.tables.DeltaTable
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
@@ -113,19 +112,24 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
-  /** Property key recording the cached `CompiledRefresh.sql` from the
-    * DuckDB-CLI compile-bridge at CREATE time, so REFRESH can skip
-    * re-invoking the bridge. Empty / absent for legacy MVs created before
-    * this caching was added; in that case REFRESH compiles lazily and
-    * back-fills.
-    */
-  val CompiledSqlKey: String = "_ivm_compiled_sql"
-
-  /** Property key recording the cached `CompiledRefresh.initialLoadSql`
-    * companion to [[CompiledSqlKey]]. Kept under the same MV row so the
-    * pair is atomic.
+  /** Compiled initial-load SQL persisted at CREATE.  The FULL_REFRESH path
+    * reads it to reproduce the hidden bookkeeping columns (e.g.
+    * `openivm_count_star`) that the raw user query omits, independent of the
+    * opt-in compile-classification cache below.
     */
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
+
+  /** Last observable compile-time cost-model hint captured during REFRESH. */
+  val LastCostModelHintKey: String = "_ivm_last_cost_model_hint"
+
+  /** Last observable unified refresh-intelligence decision captured during REFRESH. */
+  val RefreshDecisionKey: String = "_ivm_refresh_decision"
+
+  private val CompileCachePrefix: String                = "_ivm_compile_cache"
+  private val CompileCacheSqlSuffix: String             = "sql"
+  private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
+  private val CompileCacheRefreshTypeSuffix: String     = "refresh_type"
+  private val CompileCacheRefreshTypeNameSuffix: String = "refresh_type_name"
 
   /** Build the property-map entries for the given source-watermarks. */
   def watermarkProperties(watermarks: Map[String, Timestamp]): Map[String, String] =
@@ -143,17 +147,95 @@ object MvMetadata {
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
 
-  /** Build the property entries persisting the DuckDB-CLI compile result
-    * so REFRESH can reuse it. Returns an empty map when `compiledSql` is
-    * empty (legacy / compile-failed views) — the absence of the key is
-    * the sentinel that REFRESH must compile on-the-fly.
+  /** Tier component for the compile cache key.  It includes only facts
+    * that may change the emitted SQL shape/classification, not quantitative
+    * stats that should be handled by Spark-side rewrites after cache lookup.
     */
-  def compiledProperties(compiledSql: String, initialLoadSql: String): Map[String, String] = {
-    val a = if (compiledSql.nonEmpty) Map(CompiledSqlKey -> compiledSql) else Map.empty
-    val b =
-      if (initialLoadSql.nonEmpty) Map(CompiledInitialLoadSqlKey -> initialLoadSql) else Map.empty
-    a ++ b
+  def compileCacheTier(facts: WorkloadFacts): String = {
+    val shapes = facts.deltaShape.toSeq
+      .sortBy(_._1)
+      .map { case (table, shape) => s"$table=${shape.compileFactValue}" }
+      .mkString(",")
+    val fks = facts.fkRelations
+      .sortBy(fk => (fk.childTable, fk.childColumns.mkString(","), fk.parentTable, fk.parentColumns.mkString(",")))
+      .map(fk =>
+        s"${fk.childTable}(${fk.childColumns.mkString(",")})->${fk.parentTable}(${fk.parentColumns.mkString(",")})/${fk.rely}"
+      )
+      .mkString(";")
+    val uniques = facts.uniqueKeys
+      .sortBy(key => (key.table, key.columns.mkString(",")))
+      .map(key => s"${key.table}(${key.columns.mkString(",")})/${key.rely}")
+      .mkString(";")
+    val raw =
+      s"dialect=${facts.targetDialect}|compileOnly=${facts.compileOnly}|cascade=${facts.forceViewDeltaCascade}|" +
+        s"insertOnly=${facts.assumeInsertOnly}|scd2RangeJoinAccel=${facts.scd2RangeJoinAccel}|" +
+        s"declareRelyFk=${facts.declareRelyFk}|shape=$shapes|fk=$fks|" +
+        s"unique=$uniques"
+    val digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes("UTF-8"))
+    digest.map("%02x".format(_)).mkString
   }
+
+  def compileCacheSqlKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheSqlSuffix)
+
+  def compileCacheInitialLoadSqlKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheInitialLoadSuffix)
+
+  def compileCacheRefreshTypeKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheRefreshTypeSuffix)
+
+  def compileCacheRefreshTypeNameKey(sourceSchemaFingerprint: String, tier: String): String =
+    compileCacheKey(sourceSchemaFingerprint, tier, CompileCacheRefreshTypeNameSuffix)
+
+  def cachedCompiledSql(
+      properties: Map[String, String],
+      sourceSchemaFingerprint: String,
+      tier: String
+  ): Option[String] =
+    properties.get(compileCacheSqlKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+
+  def cachedInitialLoadSql(
+      properties: Map[String, String],
+      sourceSchemaFingerprint: String,
+      tier: String
+  ): Option[String] =
+    properties.get(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+
+  def anyCachedInitialLoadSql(properties: Map[String, String], sourceSchemaFingerprint: String): Option[String] = {
+    val prefix = s"$CompileCachePrefix:$sourceSchemaFingerprint:"
+    properties.collectFirst {
+      case (key, value)
+          if key.startsWith(prefix) && key.endsWith(s":$CompileCacheInitialLoadSuffix") && value.nonEmpty =>
+        value
+    }
+  }
+
+  /** Build schema/tier-scoped cache entries for the shape-stable openivm compile
+    * result.  The cached SQL is still passed through SparkRefreshRewriter on
+    * every REFRESH, which recreates per-refresh `openivm_old_*` / `*_merge`
+    * temp views and substitutes fresh scratch paths.
+    */
+  def compiledProperties(
+      sourceSchemaFingerprint: String,
+      tier: String,
+      compiledSql: String,
+      initialLoadSql: String,
+      refreshType: Int,
+      refreshTypeName: String
+  ): Map[String, String] = {
+    val sql =
+      if (compiledSql.nonEmpty) Map(compileCacheSqlKey(sourceSchemaFingerprint, tier) -> compiledSql) else Map.empty
+    val init = if (initialLoadSql.nonEmpty) {
+      Map(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier) -> initialLoadSql)
+    } else Map.empty
+    sql ++ init ++ Map(
+      compileCacheRefreshTypeKey(sourceSchemaFingerprint, tier)     -> refreshType.toString,
+      compileCacheRefreshTypeNameKey(sourceSchemaFingerprint, tier) -> refreshTypeName
+    )
+  }
+
+  private def compileCacheKey(sourceSchemaFingerprint: String, tier: String, suffix: String): String =
+    s"$CompileCachePrefix:$sourceSchemaFingerprint:$tier:$suffix"
 }
 
 /** RocksDB-backed catalog for materialized-view metadata. */
@@ -185,7 +267,7 @@ object MvCatalog {
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
   private def warehouseRoot(spark: SparkSession): Path =
-    Paths.get(canonicalLocalPath(spark.conf.get("spark.sql.warehouse.dir")))
+    Paths.get(canonicalLocalPath(FeatureGate.stateWarehouse(spark)))
 
   private def indexDbPath(spark: SparkSession): String =
     warehouseRoot(spark).resolve("_openivm").resolve("index").resolve("rocksdb").toString
@@ -371,77 +453,8 @@ object MvCatalog {
       ()
     }
 
-  private def maybeMigrateLegacyTables(spark: SparkSession, indexDb: OpenIvmRocksDB, warehouse: String): Unit = {
-    val legacyMvMeta  = Paths.get(warehouse, "_ivm", "_meta", "mv_metadata").toString
-    val legacyStaging = Paths.get(warehouse, "_ivm", "_meta", "staging").toString
-
-    val hasLegacyMvMeta  = DeltaTable.isDeltaTable(spark, legacyMvMeta)
-    val hasLegacyStaging = DeltaTable.isDeltaTable(spark, legacyStaging)
-    if (!hasLegacyMvMeta && !hasLegacyStaging) {
-      return
-    }
-
-    val alreadyMigrated = {
-      val iterator = indexDb.prefixScan(MvIndexCf, Array.emptyByteArray)
-      try iterator.hasNext
-      finally closeQuietly(iterator.asInstanceOf[AnyRef])
-    }
-    if (alreadyMigrated) {
-      return
-    }
-
-    def legacyRowToMetadata(row: Row): MvMetadata =
-      MvMetadata(
-        name = deserializeName(row.getAs[String]("name")),
-        querySql = row.getAs[String]("query_sql"),
-        refreshType = row.getAs[Int]("refresh_type"),
-        refreshTypeName = row.getAs[String]("refresh_type_name"),
-        lastVersion = row.getAs[Long]("last_version"),
-        sourceTables = row.getSeq[String](row.fieldIndex("source_tables")),
-        sourceSchemaFingerprint = row.getAs[String]("source_schema_fingerprint"),
-        location = row.getAs[String]("location"),
-        createdAt = row.getAs[Timestamp]("created_at"),
-        properties = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
-      )
-
-    def legacyRowToStaging(row: Row): StagingDelta =
-      StagingDelta(
-        baseTable = row.getAs[String]("base_table"),
-        opType = row.getAs[String]("op_type"),
-        stagingPath = row.getAs[String]("staging_path"),
-        txnTs = row.getAs[Timestamp]("txn_ts"),
-        consumedBy = row.getSeq[String](row.fieldIndex("consumed_by"))
-      )
-
-    val mvRows =
-      if (hasLegacyMvMeta) spark.read.format("delta").load(legacyMvMeta).collect().toSeq else Seq.empty
-    mvRows.map(legacyRowToMetadata).foreach(meta => upsert(spark, meta))
-
-    val stagingRows =
-      if (hasLegacyStaging) spark.read.format("delta").load(legacyStaging).collect().toSeq else Seq.empty
-    stagingRows.map(legacyRowToStaging).foreach { delta =>
-      StagingCatalog.record(spark, delta)
-      delta.consumedBy.distinct.filter(_.trim.nonEmpty).foreach { viewName =>
-        StagingCatalog.markConsumed(spark, viewName, Seq(delta.stagingPath))
-      }
-    }
-
-    val hadoopConf = spark.sessionState.newHadoopConf()
-    def dropDir(path: String): Unit = {
-      val p  = new org.apache.hadoop.fs.Path(path)
-      val fs = p.getFileSystem(hadoopConf)
-      if (fs.exists(p)) fs.delete(p, true)
-    }
-
-    dropDir(legacyMvMeta)
-    dropDir(legacyStaging)
-
-    log.info(s"openivm-rocksdb migrated ${mvRows.size} MVs + ${stagingRows.size} staging rows from legacy Delta tables")
-  }
-
   def ensureTables(spark: SparkSession): Unit = {
-    val indexDb = openIndexDb(spark)
-    maybeMigrateLegacyTables(spark, indexDb, warehouseRoot(spark).toString)
+    openIndexDb(spark)
     ()
   }
 

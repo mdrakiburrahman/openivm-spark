@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6d — Port of `openivm/test/sql/ducklake_chained_physical.test`.
+/** Port of `openivm/test/sql/ducklake_chained_physical.test`.
   *
   * openivm fixture shape:
   *   `dl.bronze.src → dl.bronze.l1 → dl.silver.l2 → dl.silver.l3`

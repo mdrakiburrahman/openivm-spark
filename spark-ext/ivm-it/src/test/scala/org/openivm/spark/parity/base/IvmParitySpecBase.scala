@@ -169,6 +169,17 @@ abstract class IvmParitySpecBase(val specSlug: String) extends AnyFunSpec with M
       ignore(text)(test)
   }
 
+  /** Register a test that only makes sense under CDF mode.  Under intercept
+    * mode the test is registered as `ignore(text)` so the parity gap stays
+    * visible without executing the (CDF-specific) body. The inverse of
+    * [[itIntercept]]. */
+  protected def itCdf(text: String)(test: => Any): Unit = {
+    if (changeFeedMode == org.openivm.spark.common.ChangeFeedMode.Cdf)
+      it(text)(test)
+    else
+      ignore(text)(test)
+  }
+
   /** Register an entire `describe` block that only makes sense under
     * intercept mode.  Under CDF mode the block is registered as a single
     * `ignore(text)` so the suite still reports the gap explicitly without

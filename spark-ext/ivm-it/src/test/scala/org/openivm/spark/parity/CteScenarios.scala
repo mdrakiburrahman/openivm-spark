@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P5.cte — Non-recursive Common Table Expression coverage.
+/** Non-recursive Common Table Expression coverage.
   *
   * Per RESEARCH.md §9 and §6.8: non-recursive CTEs inherit the refresh chain
   * of their inner query.  OpenIVM's pipeline flattens (inlines) the CTE before
@@ -394,7 +394,7 @@ abstract class CteScenarios extends IvmParitySpecBase("cte") {
       // RefreshType 3 (FULL_REFRESH).  Since Spark itself rejects the syntax,
       // the test is omitted here.  A future integration could pass the CTE body
       // as a string directly to the openivm compiler without going through
-      // Spark's own parser; that path is out of scope for P5.
+      // Spark's own parser; that path is out of scope.
       succeed
     }
   }

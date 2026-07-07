@@ -25,6 +25,7 @@ object OpenIvmRocksDBRegistry {
 
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
+    OpenIvmStateSync.maybeRestore(spark)
 
     val appId         = spark.sparkContext.applicationId
     val canonicalPath = canonicalLocalPath(dbPath)

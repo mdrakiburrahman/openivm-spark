@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P5.rt0-minmax — Parity tests for grouped MIN/MAX (RefreshType 0 / 6 with `has_minmax`).
+/** Parity tests for grouped MIN/MAX (RefreshType 0 / 6 with `has_minmax`).
   *
   * Mirrors openivm/test/sql/argminmax.test shapes for the MIN/MAX subset (ARG_MIN/ARG_MAX
   * have no direct Spark equivalent — see (10) for documented fallback).

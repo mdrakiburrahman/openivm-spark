@@ -7,6 +7,7 @@
 > each refresh strategy.
 >
 > Read with:
+>
 > - [openivm-spark / 4. DuckDB CLI compile bridge](../openivm-spark/4-duckdb-cli-compile-bridge.md)
 > - [openivm-spark / 5. LptsSparkDialect](../openivm-spark/5-lpts-spark-dialect-postprocessor.md)
 > - [openivm-spark / 6. SparkRefreshRewriter](../openivm-spark/6-refresh-rewriter-and-assemblers.md)
@@ -77,9 +78,9 @@ It does four things around the native compiler:
 
 1. Parses `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, and
    `DROP MATERIALIZED VIEW` through its Spark parser extension.
-2. Analyzes the MV body in Spark, collecting source table schemas.
-3. Calls OpenIVM through the DuckDB CLI bridge.
-4. Post-processes and rewrites OpenIVM's compiled refresh program into Spark
+1. Analyzes the MV body in Spark, collecting source table schemas.
+1. Calls OpenIVM through the DuckDB CLI bridge.
+1. Post-processes and rewrites OpenIVM's compiled refresh program into Spark
    SQL / Delta Lake DML.
 
 The compile bridge input is `CompileRequest`:
@@ -206,12 +207,12 @@ Source: `.temp/lpts/src/lpts_helpers.cpp:9-23`.
 
 ## 8.3 Handoff summary
 
-| Boundary | Caller | Callee | Payload | Return |
-| --- | --- | --- | --- | --- |
-| Spark -> OpenIVM | openivm-spark | DuckDB CLI + OpenIVM | `openivm_compile_with_facts(view_name, facts_json)` after registering source schemas | JSON-lines row |
-| OpenIVM -> LPTS | openivm | LPTS pipeline | `LPTS_emit(rewritten_plan, dialect='spark', options={...})` | SQL string |
-| LPTS -> OpenIVM | LPTS | openivm | serialized CTE SQL | string |
-| OpenIVM -> Spark | openivm | openivm-spark | `refresh_type`, `refresh_type_name`, `sql` plus sidecar initial-load SQL | `CompiledRefresh` |
+| Boundary         | Caller        | Callee               | Payload                                                                              | Return            |
+| ---------------- | ------------- | -------------------- | ------------------------------------------------------------------------------------ | ----------------- |
+| Spark -> OpenIVM | openivm-spark | DuckDB CLI + OpenIVM | `openivm_compile_with_facts(view_name, facts_json)` after registering source schemas | JSON-lines row    |
+| OpenIVM -> LPTS  | openivm       | LPTS pipeline        | `LPTS_emit(rewritten_plan, dialect='spark', options={...})`                          | SQL string        |
+| LPTS -> OpenIVM  | LPTS          | openivm              | serialized CTE SQL                                                                   | string            |
+| OpenIVM -> Spark | openivm       | openivm-spark        | `refresh_type`, `refresh_type_name`, `sql` plus sidecar initial-load SQL             | `CompiledRefresh` |
 
 The user-facing compact form is:
 
@@ -249,11 +250,11 @@ Source: `.temp/openivm/src/include/compile_facts.hpp` and the compile table-func
 The contract is intentionally pragmatic:
 
 1. LPTS should emit Spark-looking SQL when `dialect='spark'`.
-2. OpenIVM can still emit some DuckDB-shaped fragments outside the clean LPTS
+1. OpenIVM can still emit some DuckDB-shaped fragments outside the clean LPTS
    path.
-3. openivm-spark owns a final defensive post-processor,
+1. openivm-spark owns a final defensive post-processor,
    `LptsSparkDialect.translate`.
-4. `SparkRefreshRewriter` then converts the OpenIVM maintenance program into
+1. `SparkRefreshRewriter` then converts the OpenIVM maintenance program into
    executable Delta Lake statements.
 
 This is why chapter 5 of openivm-spark exists.
@@ -261,40 +262,40 @@ The Spark dialect is a shared responsibility, not a single switch.
 
 ## 8.5 Fix ownership map
 
-| Fix | Owner | Justification |
-| --- | --- | --- |
-| `struct_extract(x, 'f')` -> `x.f` | LPTS Spark dialect **and** openivm-spark backup | LPTS should serialize easy struct access; openivm-spark covers nested calls and sidecar SQL defensively. |
-| `TIMESTAMP WITH TIME ZONE` -> `TIMESTAMP` | openivm-spark | LPTS serializes DuckDB's logical type; Spark 3.5 rejects the SQL-standard suffix in emitted cast contexts. |
-| `memory.main.<short>` -> `<db>.<short>` | openivm-spark | The qualified-DB problem is created by openivm-spark's ephemeral `:memory:` compiler session and Spark catalog resolution. |
-| double-quoted identifiers -> backticks | openivm-spark backup; LPTS Spark dialect should do it | LPTS Spark mode backtick-quotes identifiers, but OpenIVM or old cached SQL can still surface DuckDB quotes. |
-| `expr::TYPE` -> `CAST(expr AS TYPE)` | openivm-spark | Postfix casts leak from DuckDB/OpenIVM fragments and Spark does not parse them. |
-| `VARCHAR`, `CHAR`, `TEXT` bare casts -> `STRING` | openivm-spark | Spark requires sized `VARCHAR(n)` / `CHAR(n)` or unbounded `STRING`; DuckDB often emits bare names. |
-| `HUGEINT`, `UHUGEINT` -> `BIGINT` | openivm-spark | DuckDB aggregate widening can produce 128-bit types Spark SQL does not recognize. |
-| `count_star()` -> `COUNT(*)` | openivm-spark | DuckDB has `count_star()`; Spark's spelling is standard `COUNT(*)`. |
-| `generate_series(...)` -> `sequence(...)` | openivm-spark | Projection refresh paths can contain DuckDB row-multiplicity expansion; Spark uses `sequence`. |
-| `INTERVAL '1 day'` -> `INTERVAL 1 DAY` | openivm-spark | DuckDB accepts quoted interval literals; Spark expects tokenized interval quantity and unit. |
-| `to_milliseconds(expr)` and friends -> `expr * INTERVAL 1 UNIT` | openivm-spark | LPTS/DuckDB interval helper functions do not exist in Spark. |
-| `error(...)` -> `raise_error(...)` | openivm-spark | DuckDB assertion helper name differs from Spark's built-in. |
-| Spark shim macro bodies -> original Spark functions | openivm-spark | OpenIVM serializes DuckDB macro expansions; the Scala post-pass reverses them. |
-| `SELECT * EXCEPT (...)` expansion | `SparkRefreshRewriter` | This is not just dialect spelling; it needs Spark source schemas supplied by the caller. |
-| `LEFT SEMI JOIN` / `LEFT ANTI JOIN` before compile | openivm-spark pre-normalization | DuckDB parses `SEMI JOIN` / `ANTI JOIN`, while Spark users write `LEFT SEMI/ANTI`. |
+| Fix                                                             | Owner                                                 | Justification                                                                                                              |
+| --------------------------------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `struct_extract(x, 'f')` -> `x.f`                               | LPTS Spark dialect **and** openivm-spark backup       | LPTS should serialize easy struct access; openivm-spark covers nested calls and sidecar SQL defensively.                   |
+| `TIMESTAMP WITH TIME ZONE` -> `TIMESTAMP`                       | openivm-spark                                         | LPTS serializes DuckDB's logical type; Spark 3.5 rejects the SQL-standard suffix in emitted cast contexts.                 |
+| `memory.main.<short>` -> `<db>.<short>`                         | openivm-spark                                         | The qualified-DB problem is created by openivm-spark's ephemeral `:memory:` compiler session and Spark catalog resolution. |
+| double-quoted identifiers -> backticks                          | openivm-spark backup; LPTS Spark dialect should do it | LPTS Spark mode backtick-quotes identifiers, but OpenIVM or old cached SQL can still surface DuckDB quotes.                |
+| `expr::TYPE` -> `CAST(expr AS TYPE)`                            | openivm-spark                                         | Postfix casts leak from DuckDB/OpenIVM fragments and Spark does not parse them.                                            |
+| `VARCHAR`, `CHAR`, `TEXT` bare casts -> `STRING`                | openivm-spark                                         | Spark requires sized `VARCHAR(n)` / `CHAR(n)` or unbounded `STRING`; DuckDB often emits bare names.                        |
+| `HUGEINT`, `UHUGEINT` -> `BIGINT`                               | openivm-spark                                         | DuckDB aggregate widening can produce 128-bit types Spark SQL does not recognize.                                          |
+| `count_star()` -> `COUNT(*)`                                    | openivm-spark                                         | DuckDB has `count_star()`; Spark's spelling is standard `COUNT(*)`.                                                        |
+| `generate_series(...)` -> `sequence(...)`                       | openivm-spark                                         | Projection refresh paths can contain DuckDB row-multiplicity expansion; Spark uses `sequence`.                             |
+| `INTERVAL '1 day'` -> `INTERVAL 1 DAY`                          | openivm-spark                                         | DuckDB accepts quoted interval literals; Spark expects tokenized interval quantity and unit.                               |
+| `to_milliseconds(expr)` and friends -> `expr * INTERVAL 1 UNIT` | openivm-spark                                         | LPTS/DuckDB interval helper functions do not exist in Spark.                                                               |
+| `error(...)` -> `raise_error(...)`                              | openivm-spark                                         | DuckDB assertion helper name differs from Spark's built-in.                                                                |
+| Spark shim macro bodies -> original Spark functions             | openivm-spark                                         | OpenIVM serializes DuckDB macro expansions; the Scala post-pass reverses them.                                             |
+| `SELECT * EXCEPT (...)` expansion                               | `SparkRefreshRewriter`                                | This is not just dialect spelling; it needs Spark source schemas supplied by the caller.                                   |
+| `LEFT SEMI JOIN` / `LEFT ANTI JOIN` before compile              | openivm-spark pre-normalization                       | DuckDB parses `SEMI JOIN` / `ANTI JOIN`, while Spark users write `LEFT SEMI/ANTI`.                                         |
 
 Current `LptsSparkDialect.translate` order is:
 
 1. `rewriteNowTimestamp`
-2. `rewriteToTimestampDoubleCast`
-3. `rewriteSparkFunctionInlinings`
-4. `rewriteTimestampWithTimeZone`
-5. `rewriteStructExtract`
-6. `rewritePostfixCasts`
-7. `rewriteBareVarcharCast`
-8. `rewriteBareHugeIntCast`
-9. `rewriteGenerateSeries`
-10. `rewriteToTemporalUnit`
-11. `rewriteIntervalLiterals`
-12. `rewriteCountStar`
-13. `rewriteErrorFn`
-14. `rewriteDoubleQuotedIdentifiers`
+1. `rewriteToTimestampDoubleCast`
+1. `rewriteSparkFunctionInlinings`
+1. `rewriteTimestampWithTimeZone`
+1. `rewriteStructExtract`
+1. `rewritePostfixCasts`
+1. `rewriteBareVarcharCast`
+1. `rewriteBareHugeIntCast`
+1. `rewriteGenerateSeries`
+1. `rewriteToTemporalUnit`
+1. `rewriteIntervalLiterals`
+1. `rewriteCountStar`
+1. `rewriteErrorFn`
+1. `rewriteDoubleQuotedIdentifiers`
 
 Source: `LptsSparkDialect.scala:94-131`.
 
@@ -500,23 +501,23 @@ for the statement-kind dispatch.
 
 ## 8.9 Version compatibility matrix
 
-| Component | Current pin / version | Where pinned | Why it matters |
-| --- | --- | --- | --- |
-| openivm-spark | current repository checkout; benchmark image also pins `OPENIVM_SPARK_COMMIT=6dfe127dc03195bdcf4b1286ee612029ba10b23f` | benchmark Dockerfile ARG | Spark extension jar must match the native compiler artifacts it expects. |
-| OpenIVM | `aab817fcfbfec3545c716df4779f4e6be3cbcb19` | `spark-ext/dev/pins.env:5-7` | Produces `openivm.duckdb_extension` and the matching DuckDB CLI. |
-| LPTS | `21e7e313e52f0e98fe961533e06bffc368878ec6` | `spark-ext/dev/pins.env:10-12` | OpenIVM builds this LPTS commit as its serializer dependency. |
-| DuckDB CLI / extension ABI | DuckDB 1.5.x, OpenIVM CI pin v1.5.2 | OpenIVM build tree; `pins.env:27-28` documents the JDBC match | `openivm.duckdb_extension` must be loaded by a CLI with the same native ABI. |
-| DuckDB JDBC | `1.5.2.1` | `spark-ext/dev/pins.env:27-28`, `project/Dependencies.scala:7-11` | Not the compile execution path, but kept aligned with the native DuckDB ABI. |
-| Spark | `3.5.1` | `spark-ext/dev/pins.env:23`, `project/Dependencies.scala:4` | Determines SQL dialect gaps and Catalyst/Delta behavior. |
-| Delta Lake | `3.2.0` | `spark-ext/dev/pins.env:24`, `project/Dependencies.scala:5` | Determines MERGE, UPDATE, Delta path, and warehouse behavior. |
+| Component                  | Current pin / version                                                                                                  | Where pinned                                                      | Why it matters                                                               |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| openivm-spark              | current repository checkout; benchmark image also pins `OPENIVM_SPARK_COMMIT=6dfe127dc03195bdcf4b1286ee612029ba10b23f` | benchmark Dockerfile ARG                                          | Spark extension jar must match the native compiler artifacts it expects.     |
+| OpenIVM                    | `aab817fcfbfec3545c716df4779f4e6be3cbcb19`                                                                             | `spark-ext/dev/pins.env:5-7`                                      | Produces `openivm.duckdb_extension` and the matching DuckDB CLI.             |
+| LPTS                       | `21e7e313e52f0e98fe961533e06bffc368878ec6`                                                                             | `spark-ext/dev/pins.env:10-12`                                    | OpenIVM builds this LPTS commit as its serializer dependency.                |
+| DuckDB CLI / extension ABI | DuckDB 1.5.x, OpenIVM CI pin v1.5.2                                                                                    | OpenIVM build tree; `pins.env:27-28` documents the JDBC match     | `openivm.duckdb_extension` must be loaded by a CLI with the same native ABI. |
+| DuckDB JDBC                | `1.5.2.1`                                                                                                              | `spark-ext/dev/pins.env:27-28`, `project/Dependencies.scala:7-11` | Not the compile execution path, but kept aligned with the native DuckDB ABI. |
+| Spark                      | `3.5.1`                                                                                                                | `spark-ext/dev/pins.env:23`, `project/Dependencies.scala:4`       | Determines SQL dialect gaps and Catalyst/Delta behavior.                     |
+| Delta Lake                 | `3.2.0`                                                                                                                | `spark-ext/dev/pins.env:24`, `project/Dependencies.scala:5`       | Determines MERGE, UPDATE, Delta path, and warehouse behavior.                |
 
 The key constraints are:
 
 1. openivm-spark requires a specific OpenIVM extension build.
-2. OpenIVM requires a specific LPTS commit in `third_party/lpts`.
-3. Both OpenIVM and LPTS are constrained by the DuckDB version they are built
+1. OpenIVM requires a specific LPTS commit in `third_party/lpts`.
+1. Both OpenIVM and LPTS are constrained by the DuckDB version they are built
    against.
-4. openivm-spark's DuckDB JDBC dependency must not drift away from that ABI
+1. openivm-spark's DuckDB JDBC dependency must not drift away from that ABI
    family even though the compile path is CLI-driven.
 
 ## 8.10 Version triangle
@@ -595,11 +596,11 @@ Source: `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile:38-43`.
 Pinning policy:
 
 1. Change `spark-ext/dev/pins.env` first.
-2. Rebuild the dev image so `openivm.duckdb_extension` and `duckdb` are built
+1. Rebuild the dev image so `openivm.duckdb_extension` and `duckdb` are built
    together.
-3. Sync the benchmark Dockerfile ARGs to the same OpenIVM and LPTS commits.
-4. Keep `DUCKDB_JDBC_VERSION` aligned with OpenIVM's DuckDB ABI family.
-5. Run the openivm-spark verification path before trusting the new triangle.
+1. Sync the benchmark Dockerfile ARGs to the same OpenIVM and LPTS commits.
+1. Keep `DUCKDB_JDBC_VERSION` aligned with OpenIVM's DuckDB ABI family.
+1. Run the openivm-spark verification path before trusting the new triangle.
 
 See `spark-ext/README.md:68-80` for the same operational rule in the dev-loop
 section.

@@ -4,7 +4,6 @@ package org.openivm.spark.common
   *
   * Deliberately independent of `org.openivm.spark.compiler.CompiledRefresh` to avoid a
   * cyclic dependency (ivm-compiler depends on ivm-common, not the other way around).
-  * The bridge is wired in P5.
   */
 final case class AssemblyInput(
     refreshType: Int,

@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6e — ScalaTest port of `openivm/test/sql/ducklake_v1_features.test`.
+/** ScalaTest port of `openivm/test/sql/ducklake_v1_features.test`.
   *
   * The source test exercises DuckLake v1.0 layout features (sorted tables
   * via `ALTER TABLE … SET SORTED BY (…)`, bucket partitioning via

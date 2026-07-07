@@ -2,6 +2,7 @@
 
 > Scope: `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala`
 > plus the small `Assembler` layer used for full-refresh fallbacks.
+
 ## 1. The core insight
 
 The refresh rewriter is **shape-driven**.
@@ -13,6 +14,7 @@ refreshType match {
   case SimpleProjection => ...
 }
 ```
+
 Instead, it says:
 
 ```scala
@@ -20,6 +22,7 @@ split the compiled SQL into statements
 classify each statement by SQL shape
 rewrite each shape with the matching statement assembler
 ```
+
 The dispatch key is `StatementKind`.
 
 The dispatch key is **not** the `RefreshType` ordinal.
@@ -27,6 +30,7 @@ That distinction matters because OpenIVM can emit different SQL shapes for the
 same `RefreshType`.
 
 For example:
+
 - an `AGGREGATE_GROUP` view can be the normal additive path;
 - an `AGGREGATE_GROUP` view with MIN/MAX can additionally emit delete/recompute
   shapes;
@@ -36,9 +40,10 @@ For example:
   alone.
 
 So readers should think in two layers:
+
 1. **OpenIVM classifier**: chooses a coarse refresh type such as
    `AGGREGATE_GROUP`, `SIMPLE_PROJECTION`, or `FULL_REFRESH`.
-2. **SparkRefreshRewriter**: inspects the concrete SQL statements produced by
+1. **SparkRefreshRewriter**: inspects the concrete SQL statements produced by
    that classifier and dispatches on their `StatementKind`.
 
 The relevant source is `SparkRefreshRewriter.rewrite`, which splits statements
@@ -51,6 +56,7 @@ routes by `AssemblyInput.refreshType` in `SparkMergeAssembler.scala:26-48`;
 `SparkRefreshRewriter` routes by SQL shape in `SparkRefreshRewriter.scala:130-164`.
 
 ## 2. End-to-end flow
+
 ```mermaid
 flowchart LR
   A[LptsSparkDialect output\nOpenIVM multi-statement SQL] --> B[splitStatements]
@@ -76,6 +82,7 @@ The final result is `RewrittenRefresh(statements: Seq[String])`.
 The caller executes each statement in order.
 
 ## 3. Where the rewriter begins
+
 `SparkRefreshRewriter.rewrite` takes:
 
 - the compiled OpenIVM refresh program;
@@ -88,7 +95,7 @@ The caller executes each statement in order.
 - source schemas for `SELECT * EXCEPT` expansion;
 - source qualified names for `memory.main.<short>` rewrite;
 - the pre-refresh MV version for recompute cascade snapshots.
-The signature is at `SparkRefreshRewriter.scala:108-119`.
+  The signature is at `SparkRefreshRewriter.scala:108-119`.
 
 The first non-trivial step is to install a per-thread source-qualified-name map.
 That map lets every private assembler rewrite `memory.main.<short>` either to a
@@ -96,9 +103,11 @@ fully-qualified Spark identifier or to the short backticked temp view name. The
 ThreadLocal is declared at `SparkRefreshRewriter.scala:62-65`, populated at
 `SparkRefreshRewriter.scala:125-127`, and restored at
 `SparkRefreshRewriter.scala:176-178`.
+
 ## 4. Statement splitting
 
 The rewriter calls:
+
 ```scala
 val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 ```
@@ -110,6 +119,7 @@ It scans the SQL string character by character.
 It splits only on semicolons that are outside single-quoted string literals.
 
 It handles escaped single quotes using DuckDB/Spark SQL's doubled-quote form:
+
 ```sql
 'it''s ok'
 ```
@@ -124,11 +134,13 @@ OpenIVM emits statement terminators between statements, not semicolon tokens
 inside parenthesized subqueries.
 
 ## 5. Classification
+
 After splitting, each statement is classified by SQL shape:
 
 ```scala
 classify(stmt, viewLogicalName)
 ```
+
 Source: `SparkRefreshRewriter.scala:131`.
 
 The classifier starts at `SparkRefreshRewriter.scala:301` and ends at
@@ -143,11 +155,12 @@ It uses string-shape tests such as:
 - `UPDATE OPENIVM_DATA_<view>`;
 - `DELETE FROM OPENIVM_DATA_<view>`;
 - `IN (SELECT ...)` markers for window-partition recompute.
-The classifier also drops OpenIVM-side compact-delta cleanup shapes. Those
-shapes reference `openivm_old_compact_<view>` and are declared irrelevant to the
-Spark per-refresh view-delta path at `SparkRefreshRewriter.scala:307-316`.
+  The classifier also drops OpenIVM-side compact-delta cleanup shapes. Those
+  shapes reference `openivm_old_compact_<view>` and are declared irrelevant to the
+  Spark per-refresh view-delta path at `SparkRefreshRewriter.scala:307-316`.
 
 ## 6. Dispatch
+
 The dispatcher is a `match` over `StatementKind`.
 
 Source: `SparkRefreshRewriter.scala:130-164`.
@@ -176,6 +189,7 @@ case StatementKind.PartitionScopedInsert =>
 ```
 
 Bookkeeping and unknown shapes are dropped:
+
 ```scala
 case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
 case StatementKind.Unknown => Nil
@@ -183,53 +197,56 @@ case StatementKind.Unknown => Nil
 
 This is why the number of surviving Spark statements is often smaller than the
 OpenIVM docstring statement count.
+
 ## 7. Post-dispatch passes
 
 After shape-specific rewriting, the rewriter applies four generic passes and one
 caller-supplied pass, in this order:
+
 1. `expandSelectStarExcept` for DuckDB-style column exclusion.
-2. `fixMergeAliasRefs` for Spark/Delta merge alias compatibility.
-3. `deduplicateNullSafeMergeSource` to fold duplicate `IS NOT DISTINCT FROM`
+1. `fixMergeAliasRefs` for Spark/Delta merge alias compatibility.
+1. `deduplicateNullSafeMergeSource` to fold duplicate `IS NOT DISTINCT FROM`
    conjuncts that some openivm shapes emit twice over the same merge source.
-4. `rewriteRecomputeWhereExistsAsAffectedKeysJoin` — converts the strict
-   "recompute INSERT MERGE … `WHERE EXISTS (SELECT 1 FROM <ref> _d
-   WHERE _d.<col> IS NOT DISTINCT FROM <outer>.<col> …)`" shape into a
+1. `rewriteRecomputeWhereExistsAsAffectedKeysJoin` — converts the strict
+   "recompute INSERT MERGE … `WHERE EXISTS (SELECT 1 FROM <ref> _d WHERE _d.<col> IS NOT DISTINCT FROM <outer>.<col> …)`" shape into a
    `LEFT SEMI JOIN (SELECT DISTINCT <cols> FROM <ref>) _d ON …` form. See
    section §15 below for the full rationale and applicability conditions.
-5. `postProcess`, usually `LptsSparkDialect.translate`.
+1. `postProcess`, usually `LptsSparkDialect.translate`.
 
 Source: `SparkRefreshRewriter.scala:291-296`.
 The result is then wrapped in `RewrittenRefresh`.
 
 ## 8. StatementKind enumeration and assembler mapping
+
 The enum is private to `SparkRefreshRewriter`.
 
 Source: `SparkRefreshRewriter.scala:183-299`.
 The table below lists every variant in source order.
 
-| StatementKind | Shape recognized | Conceptual assembler | Spark statement form |
-|---|---|---|---|
-| `InProgressFlag` | `UPDATE openivm_views SET refresh_in_progress = ...` | none / dropped | no Spark statement |
-| `ViewDeltaInsert` | main `INSERT INTO openivm_delta_<view>` | `DeltaCtasAssembler` | `CREATE OR REPLACE TABLE delta.<viewDeltaPath> USING DELTA AS ...` |
-| `ViewDeltaCompanion` | cascade companion self-read of `openivm_delta_<view>` | `CascadeEmitAssembler` | `INSERT INTO delta.<viewDeltaPath> (...) SELECT ...` |
-| `MvMerge` | `MERGE INTO openivm_data_<view>` | `MergeAssembler` | `MERGE INTO <mv> ... USING delta.<viewDeltaPath> ...` |
-| `SimpleProjectionDataInsert` | `INSERT INTO openivm_data_<view> SELECT ... FROM openivm_delta_<view>, generate_series(...)` | `InsertAssembler` plus `DeleteByKeysAssembler` | `INSERT INTO <mv> ...`; delete-only `MERGE INTO <mv> ... WHEN MATCHED THEN DELETE` |
-| `ScalarUpdate` | `UPDATE openivm_data_<view> SET ...` | `UpdateAssembler` | `UPDATE <mv> SET ...` or null-reset `MERGE INTO <mv> ... WHEN MATCHED THEN UPDATE` |
-| `ScalarDeleteMv` | `DELETE FROM openivm_data_<view>` | `DeleteByKeysAssembler` | `DELETE FROM <mv>` or delete `MERGE` |
-| `ScalarFullRecomputeInsert` | live-source `INSERT INTO openivm_data_<view> ... memory.main.<src>` | `InsertAssembler` | `INSERT INTO <mv> ...` or insert-only `MERGE ... ON false` |
-| `GroupRecomputeAffectedCreate` | `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS ...` | `DeltaCtasAssembler` / scratch-view assembler | `CREATE OR REPLACE TEMPORARY VIEW openivm_affected_<view> AS ...` |
-| `GroupRecomputeAffectedDrop` | `DROP TABLE IF EXISTS openivm_affected_<view>` | cleanup assembler | `DROP VIEW IF EXISTS openivm_affected_<view>` |
-| `OldSnapshotCreate` | `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS ...` | `CascadeEmitAssembler` / snapshot scratch assembler | `CREATE OR REPLACE TEMPORARY VIEW openivm_old_<view> AS SELECT ... FROM delta.<mvLocation> VERSION AS OF ...` |
-| `NewSnapshotCreate` | `CREATE OR REPLACE TEMP TABLE openivm_new_<view> AS ...` | `CascadeEmitAssembler` / snapshot scratch assembler | `CREATE OR REPLACE TEMPORARY VIEW openivm_new_<view> AS ...` |
-| `SnapshotDataInsert` | `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>` | `InsertAssembler` | `INSERT INTO <mv> SELECT * FROM openivm_new_<view>` |
-| `SnapshotDrop` | `DROP TABLE IF EXISTS openivm_old_<view>` or `openivm_new_<view>` | cleanup assembler | `DROP VIEW IF EXISTS openivm_old_<view>` / `openivm_new_<view>` |
-| `PartitionScopedDelete` | window partition `DELETE ... WHERE k IN (SELECT ...)` | `DeleteByKeysAssembler` | one delete `MERGE` per `IN` clause |
-| `PartitionScopedInsert` | window partition `INSERT ... WHERE k IN (SELECT ...)` | `InsertAssembler` | `INSERT INTO <mv> SELECT ... WHERE k IN (SELECT ...)` |
-| `Cleanup` | OpenIVM bookkeeping cleanup | none / dropped | no Spark statement |
-| `Unknown` | no recognized shape | none / dropped | no Spark statement |
-A single `RefreshType` can produce multiple table rows above.
+| StatementKind                                                 | Shape recognized                                                                             | Conceptual assembler                                | Spark statement form                                                                                          |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `InProgressFlag`                                              | `UPDATE openivm_views SET refresh_in_progress = ...`                                         | none / dropped                                      | no Spark statement                                                                                            |
+| `ViewDeltaInsert`                                             | main `INSERT INTO openivm_delta_<view>`                                                      | `DeltaCtasAssembler`                                | `CREATE OR REPLACE TABLE delta.<viewDeltaPath> USING DELTA AS ...`                                            |
+| `ViewDeltaCompanion`                                          | cascade companion self-read of `openivm_delta_<view>`                                        | `CascadeEmitAssembler`                              | `INSERT INTO delta.<viewDeltaPath> (...) SELECT ...`                                                          |
+| `MvMerge`                                                     | `MERGE INTO openivm_data_<view>`                                                             | `MergeAssembler`                                    | `MERGE INTO <mv> ... USING delta.<viewDeltaPath> ...`                                                         |
+| `SimpleProjectionDataInsert`                                  | `INSERT INTO openivm_data_<view> SELECT ... FROM openivm_delta_<view>, generate_series(...)` | `InsertAssembler` plus `DeleteByKeysAssembler`      | `INSERT INTO <mv> ...`; delete-only `MERGE INTO <mv> ... WHEN MATCHED THEN DELETE`                            |
+| `ScalarUpdate`                                                | `UPDATE openivm_data_<view> SET ...`                                                         | `UpdateAssembler`                                   | `UPDATE <mv> SET ...` or null-reset `MERGE INTO <mv> ... WHEN MATCHED THEN UPDATE`                            |
+| `ScalarDeleteMv`                                              | `DELETE FROM openivm_data_<view>`                                                            | `DeleteByKeysAssembler`                             | `DELETE FROM <mv>` or delete `MERGE`                                                                          |
+| `ScalarFullRecomputeInsert`                                   | live-source `INSERT INTO openivm_data_<view> ... memory.main.<src>`                          | `InsertAssembler`                                   | `INSERT INTO <mv> ...` or insert-only `MERGE ... ON false`                                                    |
+| `GroupRecomputeAffectedCreate`                                | `CREATE OR REPLACE TEMP TABLE openivm_affected_<view> AS ...`                                | `DeltaCtasAssembler` / scratch-view assembler       | `CREATE OR REPLACE TEMPORARY VIEW openivm_affected_<view> AS ...`                                             |
+| `GroupRecomputeAffectedDrop`                                  | `DROP TABLE IF EXISTS openivm_affected_<view>`                                               | cleanup assembler                                   | `DROP VIEW IF EXISTS openivm_affected_<view>`                                                                 |
+| `OldSnapshotCreate`                                           | `CREATE OR REPLACE TEMP TABLE openivm_old_<view> AS ...`                                     | `CascadeEmitAssembler` / snapshot scratch assembler | `CREATE OR REPLACE TEMPORARY VIEW openivm_old_<view> AS SELECT ... FROM delta.<mvLocation> VERSION AS OF ...` |
+| `NewSnapshotCreate`                                           | `CREATE OR REPLACE TEMP TABLE openivm_new_<view> AS ...`                                     | `CascadeEmitAssembler` / snapshot scratch assembler | `CREATE OR REPLACE TEMPORARY VIEW openivm_new_<view> AS ...`                                                  |
+| `SnapshotDataInsert`                                          | `INSERT INTO openivm_data_<view> SELECT * FROM openivm_new_<view>`                           | `InsertAssembler`                                   | `INSERT INTO <mv> SELECT * FROM openivm_new_<view>`                                                           |
+| `SnapshotDrop`                                                | `DROP TABLE IF EXISTS openivm_old_<view>` or `openivm_new_<view>`                            | cleanup assembler                                   | `DROP VIEW IF EXISTS openivm_old_<view>` / `openivm_new_<view>`                                               |
+| `PartitionScopedDelete`                                       | window partition `DELETE ... WHERE k IN (SELECT ...)`                                        | `DeleteByKeysAssembler`                             | one delete `MERGE` per `IN` clause                                                                            |
+| `PartitionScopedInsert`                                       | window partition `INSERT ... WHERE k IN (SELECT ...)`                                        | `InsertAssembler`                                   | `INSERT INTO <mv> SELECT ... WHERE k IN (SELECT ...)`                                                         |
+| `Cleanup`                                                     | OpenIVM bookkeeping cleanup                                                                  | none / dropped                                      | no Spark statement                                                                                            |
+| `Unknown`                                                     | no recognized shape                                                                          | none / dropped                                      | no Spark statement                                                                                            |
+| A single `RefreshType` can produce multiple table rows above. |                                                                                              |                                                     |                                                                                                               |
 
 For example, `WINDOW_PARTITION` can produce:
+
 - `OldSnapshotCreate`;
 - `NewSnapshotCreate`;
 - `PartitionScopedDelete`;
@@ -239,15 +256,18 @@ For example, `WINDOW_PARTITION` can produce:
 - `SnapshotDrop`.
 
 That is one ordinal and many statement shapes.
+
 ## 9. Per-assembler guide
 
 The following subsections use the requested assembler names as a vocabulary for
 statement-shape families. Some of these names are concrete Scala objects
 (`MergeAssembler`, `FullRefreshAssembler`); others are conceptual groupings of
 private methods inside `SparkRefreshRewriter`.
+
 ### 9.1 DeltaCtasAssembler
 
 **Source locations**
+
 - Main shape entry: `SparkRefreshRewriter.scala:408-420`.
 - Column-list CTAS rewrite: `SparkRefreshRewriter.scala:508-548`.
 - Empty-placeholder CTAS fallback: `SparkRefreshRewriter.scala:561-585`.
@@ -255,6 +275,7 @@ private methods inside `SparkRefreshRewriter`.
 - Group-recompute scratch view create: `SparkRefreshRewriter.scala:1591-1600`.
 
 **Input template**
+
 ```sql
 WITH scan_0 (...) AS (...),
      aggregate_1 (...) AS (...),
@@ -264,6 +285,7 @@ SELECT * FROM projection_n
 ```
 
 **Output template**
+
 ```sql
 CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS
 WITH scan_0 (...) AS (...),
@@ -281,20 +303,24 @@ The assembler converts OpenIVM's logical view-delta table write into a Spark
 Delta scratch table under the per-refresh `viewDeltaPath`.
 
 That path is generated by `MaterializedViewCommands.scala:944-955`:
+
 ```text
 <warehouse>/_ivm/view_deltas/<safe-qualified-mv-name>/<uuid>
 ```
 
 The source code does not currently emit a literal `CACHE TABLE` statement in
 this path. The durable Spark form is a temporary scratch CTAS backed by Delta.
+
 ### 9.2 MergeAssembler
 
 **Source locations**
+
 - Statement-shape merge rewrite: `SparkRefreshRewriter.scala:693-740`.
 - Concrete standalone object: `MergeAssembler.scala:17-78`.
 - Standalone refresh-type dispatcher: `SparkMergeAssembler.scala:26-48`.
 
 **Input template**
+
 ```sql
 WITH refresh_cte AS (
   SELECT k, SUM(openivm_multiplicity * total) AS total
@@ -310,6 +336,7 @@ WHEN NOT MATCHED THEN INSERT (k, total) VALUES (d.k, d.total)
 ```
 
 **Output template**
+
 ```sql
 WITH refresh_cte AS (
   SELECT k, SUM(openivm_multiplicity * total) AS total
@@ -337,18 +364,20 @@ is at `MergeAssembler.scala:54-66`; its aggregate-having post-delete is at
 `MergeAssembler.scala:71-77`.
 
 ### 9.3 FullRefreshAssembler
+
 **Source locations**
 
 - Concrete object: `FullRefreshAssembler.scala:12-22`.
 - Full-refresh execution branch: `MaterializedViewCommands.scala:856-873`.
 - Runtime simple-projection fallback: `MaterializedViewCommands.scala:1038-1059`.
-**Input template**
+  **Input template**
 
 ```sql
 SELECT <user projection>
 FROM <live source tables>
 WHERE <user predicate>
 ```
+
 **Output template**
 
 ```sql
@@ -359,6 +388,7 @@ SELECT * FROM (
   WHERE <user predicate>
 )
 ```
+
 **What it does**
 
 Full refresh bypasses the OpenIVM incremental program and re-runs the original
@@ -368,9 +398,11 @@ user query against live source tables.
 ```scala
 INSERT OVERWRITE TABLE <mv> SELECT * FROM (<deltaSql>)
 ```
+
 Source: `FullRefreshAssembler.scala:19-22`.
 
 ### 9.4 DeleteByKeysAssembler
+
 **Source locations**
 
 - SIMPLE_PROJECTION delete-only merge: `SparkRefreshRewriter.scala:817-830`.
@@ -380,7 +412,7 @@ Source: `FullRefreshAssembler.scala:19-22`.
 - `DELETE ... EXISTS (...)` to merge: `SparkRefreshRewriter.scala:1243-1300`.
 - Window partition delete split: `SparkRefreshRewriter.scala:1343-1365`.
 - Single `IN` clause conversion: `SparkRefreshRewriter.scala:1372-1396`.
-**Input template: simple projection retraction**
+  **Input template: simple projection retraction**
 
 ```sql
 INSERT INTO openivm_data_<view>
@@ -389,6 +421,7 @@ FROM openivm_delta_<view>, generate_series(1, openivm_multiplicity::BIGINT)
 WHERE openivm_timestamp >= '<ts>'::TIMESTAMP
   AND openivm_multiplicity > 0
 ```
+
 The rewriter adds a companion delete statement for negative multiplicities:
 
 ```sql
@@ -402,6 +435,7 @@ ON v.c1 IS NOT DISTINCT FROM d.c1
 AND v.c2 IS NOT DISTINCT FROM d.c2
 WHEN MATCHED THEN DELETE
 ```
+
 **Input template: window partition delete**
 
 ```sql
@@ -412,6 +446,7 @@ WHERE k IN (
   WHERE openivm_timestamp > '<ts>'::TIMESTAMP
 )
 ```
+
 **Output template**
 
 ```sql
@@ -423,15 +458,16 @@ USING (
 ON v.k IS NOT DISTINCT FROM d.k
 WHEN MATCHED THEN DELETE
 ```
+
 **What it does**
 
 Delta Lake rejects several forms of `DELETE` with subqueries. The delete
-assembler preserves semantics by converting those deletes into `MERGE ... WHEN
-MATCHED THEN DELETE` statements.
+assembler preserves semantics by converting those deletes into `MERGE ... WHEN MATCHED THEN DELETE` statements.
 For OR-joined window partition predicates, it emits one merge per top-level
 `IN (SELECT ...)` clause.
 
 ### 9.5 InsertAssembler
+
 **Source locations**
 
 - SIMPLE_PROJECTION positive insert: `SparkRefreshRewriter.scala:811-815`.
@@ -439,7 +475,7 @@ For OR-joined window partition predicates, it emits one merge per top-level
 - Insert-star-from-subquery rewrite: `SparkRefreshRewriter.scala:994-1036`.
 - Window partition insert: `SparkRefreshRewriter.scala:1468-1479`.
 - Snapshot data insert: `SparkRefreshRewriter.scala:1525-1535`.
-**Input template: positive simple projection rows**
+  **Input template: positive simple projection rows**
 
 ```sql
 INSERT INTO openivm_data_<view>
@@ -448,6 +484,7 @@ FROM openivm_delta_<view>, generate_series(1, openivm_multiplicity::BIGINT)
 WHERE openivm_timestamp >= '<ts>'::TIMESTAMP
   AND openivm_multiplicity > 0
 ```
+
 **Output template**
 
 ```sql
@@ -456,6 +493,7 @@ SELECT `c1`, `c2`
 FROM delta.`<viewDeltaPath>`
 WHERE `openivm_multiplicity` > 0
 ```
+
 **Input template: recompute insert**
 
 ```sql
@@ -464,6 +502,7 @@ SELECT *
 FROM (<view query over memory.main.<src>>) openivm_recompute
 WHERE EXISTS (... affected keys ...)
 ```
+
 **Output template**
 
 ```sql
@@ -472,18 +511,20 @@ SELECT *
 FROM (<view query over `<src>`>) openivm_recompute
 WHERE EXISTS (... affected keys ...)
 ```
+
 When Spark needs explicit insert columns for `SELECT * FROM (<subquery>)`,
 `rewriteInsertSelectStarFromSubquery` can reshape the insert into an insert-only
 `MERGE ... ON false ... WHEN NOT MATCHED THEN INSERT`. Source:
 `SparkRefreshRewriter.scala:1028-1033`.
 
 ### 9.6 UpdateAssembler
+
 **Source locations**
 
 - Scalar update entry: `SparkRefreshRewriter.scala:851-883`.
 - Null-reset conversion: `SparkRefreshRewriter.scala:1697-1710`.
 - CTE inlining: `SparkRefreshRewriter.scala:1720-1743`.
-**Input template: CTE-prefixed update**
+  **Input template: CTE-prefixed update**
 
 ```sql
 WITH openivm_delta AS (
@@ -494,6 +535,7 @@ WITH openivm_delta AS (
 UPDATE openivm_data_<view>
 SET total = COALESCE(total, 0) + COALESCE((SELECT d_total FROM openivm_delta), 0)
 ```
+
 **Output template**
 
 ```sql
@@ -502,6 +544,7 @@ SET total = COALESCE(total, 0)
           + COALESCE((SELECT SUM(openivm_multiplicity * total)
                       FROM delta.`<viewDeltaPath>`), 0)
 ```
+
 **Input template: null reset**
 
 ```sql
@@ -509,6 +552,7 @@ UPDATE openivm_data_<view>
 SET total = NULL
 WHERE NOT EXISTS (SELECT 1 FROM memory.main.<source> LIMIT 1)
 ```
+
 **Output template**
 
 ```sql
@@ -517,14 +561,17 @@ USING (SELECT COUNT(*) AS _cnt FROM `<source>`) AS _chk
 ON TRUE
 WHEN MATCHED AND _chk._cnt = 0 THEN UPDATE SET total = NULL
 ```
+
 **What it does**
 
 Spark SQL does not support every DuckDB CTE-before-UPDATE or subquery-in-UPDATE
 shape that OpenIVM emits. The update assembler either inlines the CTE into
 scalar subqueries or converts the update into a Delta-compatible merge.
+
 ### 9.7 CascadeEmitAssembler
 
 **Source locations**
+
 - Refresh-type capability predicate: `RefreshTypeCode.scala:73-76`.
 - Per-refresh view-delta path creation: `MaterializedViewCommands.scala:944-955`.
 - Companion view-delta append: `SparkRefreshRewriter.scala:656-689`.
@@ -535,6 +582,7 @@ scalar subqueries or converts the update into a Delta-compatible merge.
 - Staging-catalog persistence: `MaterializedViewCommands.scala:1107-1155`.
 
 **Input template: companion retract rows**
+
 ```sql
 INSERT INTO openivm_delta_<view> (k, total, openivm_multiplicity)
 SELECT d.k, 0, -1
@@ -549,6 +597,7 @@ WHERE d.openivm_multiplicity > 0
 ```
 
 **Output template**
+
 ```sql
 INSERT INTO delta.`<viewDeltaPath>` (k, total, openivm_multiplicity)
 SELECT d.k, 0, -1
@@ -566,6 +615,7 @@ After the SQL statements run, `MaterializedViewCommands` records the view-delta
 path as an `MV_VIEW_DELTA` staging row so downstream MVs can consume it.
 
 The path format is:
+
 ```text
 <warehouse>/_ivm/view_deltas/<safe-qualified-mv-name>/<uuid>
 ```
@@ -574,6 +624,7 @@ Source: `MaterializedViewCommands.scala:944-955`.
 The staging record is written at `MaterializedViewCommands.scala:1143-1153`.
 
 ## 10. Verified surviving statement counts
+
 The source of truth for the basic aggregate-group shrink is
 `SparkRefreshRewriterSpec.scala:59-72`, especially line 71, which asserts that a
 7-statement OpenIVM `AGGREGATE_GROUP` program rewrites to 2 surviving Spark
@@ -583,22 +634,24 @@ The table below records the verified/observed shape-level behavior used by the
 architecture docs. "Docstring claim" is the OpenIVM-program shape described by
 comments or the upstream compiler; "Actual surviving" is what Spark executes
 after dropping bookkeeping and rewriting data-bearing statements.
-| RefreshType | Docstring claim | Actual surviving | Assemblers used |
-|---|---:|---:|---|
-| `FULL_REFRESH` | 1 | 1 | `FullRefreshAssembler` |
-| `SIMPLE_PROJECTION` | 2 | 2 | `DeleteByKeysAssembler` + `InsertAssembler` or 1 `MergeAssembler` shape |
-| `SIMPLE_AGGREGATE` | 8 (A-H) | 4 | `DeltaCtasAssembler` + `MergeAssembler`/`UpdateAssembler` + cleanup drops |
-| `AGGREGATE_GROUP` | 7 (A-G) | 2 | `DeltaCtasAssembler` + `MergeAssembler` |
-| `AGGREGATE_HAVING` | 3 | 3 | `DeltaCtasAssembler` + `MergeAssembler` into `__ivm_data` + user-facing `VIEW` |
-| `DISTINCT_INCREMENTAL` | 2 | 2 | `DeltaCtasAssembler` + `MergeAssembler` count-monoid upsert |
-| `WINDOW_PARTITION` | 2 | 2 | `DeltaCtasAssembler` + `MergeAssembler`/delete+insert over touched partitions |
-| `JOIN_INCREMENTAL` | varies | 2-5 | Möbius-signed `UNION ALL` CTAS + `MergeAssembler` |
-| `SEMI_ANTI` | 2 | 2 | `DeltaCtasAssembler` + `MergeAssembler`/`DeleteByKeysAssembler` |
+
+| RefreshType            | Docstring claim | Actual surviving | Assemblers used                                                                |
+| ---------------------- | --------------: | ---------------: | ------------------------------------------------------------------------------ |
+| `FULL_REFRESH`         |               1 |                1 | `FullRefreshAssembler`                                                         |
+| `SIMPLE_PROJECTION`    |               2 |                2 | `DeleteByKeysAssembler` + `InsertAssembler` or 1 `MergeAssembler` shape        |
+| `SIMPLE_AGGREGATE`     |         8 (A-H) |                4 | `DeltaCtasAssembler` + `MergeAssembler`/`UpdateAssembler` + cleanup drops      |
+| `AGGREGATE_GROUP`      |         7 (A-G) |                2 | `DeltaCtasAssembler` + `MergeAssembler`                                        |
+| `AGGREGATE_HAVING`     |               3 |                3 | `DeltaCtasAssembler` + `MergeAssembler` into `__ivm_data` + user-facing `VIEW` |
+| `DISTINCT_INCREMENTAL` |               2 |                2 | `DeltaCtasAssembler` + `MergeAssembler` count-monoid upsert                    |
+| `WINDOW_PARTITION`     |               2 |                2 | `DeltaCtasAssembler` + `MergeAssembler`/delete+insert over touched partitions  |
+| `JOIN_INCREMENTAL`     |          varies |              2-5 | Möbius-signed `UNION ALL` CTAS + `MergeAssembler`                              |
+| `SEMI_ANTI`            |               2 |                2 | `DeltaCtasAssembler` + `MergeAssembler`/`DeleteByKeysAssembler`                |
 
 The exact number can vary when cascade snapshots are enabled because snapshot
 creation/drop statements are additional executable scratch-view statements.
 The key invariant is that the rewriter does not preserve OpenIVM bookkeeping
 statements such as `UPDATE openivm_views` or `DELETE FROM openivm_delta_tables`.
+
 ## 11. The `hasRealDelta(sql, viewName)` short-circuit
 
 `hasRealDelta` starts at `SparkRefreshRewriter.scala:1879`.
@@ -610,6 +663,7 @@ delta. The demotion branch is at `MaterializedViewCommands.scala:616-618`:
 else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table))
   (RefreshTypeCode.FullRefresh, "no_real_delta")
 ```
+
 The scanner logic is:
 
 ```scala
@@ -627,6 +681,7 @@ val realDeltaStmts = deltaStmts.filterNot { stmt =>
 }
 realDeltaStmts.nonEmpty && !realDeltaStmts.forall(_.toUpperCase.contains("WHERE FALSE"))
 ```
+
 Source: `SparkRefreshRewriter.scala:1880-1903`.
 
 Despite the high-level name, the current scanner is specifically looking for a
@@ -641,9 +696,11 @@ INSERT INTO openivm_delta_<view> (...)
 SELECT CAST(NULL AS ...), ...
 WHERE false
 ```
+
 Those are treated as no real delta.
 
 ## 12. Cascade telemetry
+
 The create-time log field `emits_cascade_view_delta` is true only when both
 conditions hold:
 
@@ -651,10 +708,12 @@ conditions hold:
 RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
   SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 ```
+
 Source: `MaterializedViewCommands.scala:626-628`.
 
 The field is then written into the create-time decision log at
 `MaterializedViewCommands.scala:630-638`:
+
 ```scala
 s"emits_cascade_view_delta='$emitsCascadeViewDelta'"
 ```
@@ -664,6 +723,7 @@ The compiled SQL must also contain a real view-delta statement.
 
 The capability predicate itself is in `RefreshTypeCode.emitsCascadeViewDelta` at
 `RefreshTypeCode.scala:73-76`. It currently returns true for:
+
 - `AGGREGATE_GROUP`;
 - `AGGREGATE_HAVING`;
 - `SIMPLE_PROJECTION`;
@@ -677,6 +737,7 @@ recorded as downstream staging. The recording block is guarded by
 `cleanupMeta.emitsCascadeViewDelta` at `MaterializedViewCommands.scala:1132-1155`.
 
 ## 13. Concrete demo: AGGREGATE_GROUP
+
 Consider:
 
 ```sql
@@ -685,14 +746,17 @@ SELECT region, SUM(amount) AS total
 FROM sales
 GROUP BY region
 ```
+
 The unit test captures an empirical OpenIVM output for this shape in
 `SparkRefreshRewriterSpec.scala:21-41`.
 
 The test asserts:
+
 - the input splits into 7 statements at `SparkRefreshRewriterSpec.scala:60-61`;
 - the output has 2 Spark statements at `SparkRefreshRewriterSpec.scala:63-71`.
 
 ### 13.1 Abbreviated OpenIVM program
+
 Below is the same shape, shortened to the important 6 entries. One source-delta
 cleanup statement from the 7-statement test fixture is omitted for readability.
 
@@ -749,16 +813,18 @@ WHERE view_name = 'mv_r';
 ```
 
 ### 13.2 Classification
-| Program entry | StatementKind | Assembler | Survives? |
-|---|---|---|---|
-| A | `InProgressFlag` | none | no |
-| B | `ViewDeltaInsert` | `DeltaCtasAssembler` | yes |
-| C | `MvMerge` | `MergeAssembler` | yes |
-| D | `Cleanup` | none | no |
-| F | `Cleanup` | none | no |
-| G | `InProgressFlag` | none | no |
+
+| Program entry | StatementKind     | Assembler            | Survives? |
+| ------------- | ----------------- | -------------------- | --------- |
+| A             | `InProgressFlag`  | none                 | no        |
+| B             | `ViewDeltaInsert` | `DeltaCtasAssembler` | yes       |
+| C             | `MvMerge`         | `MergeAssembler`     | yes       |
+| D             | `Cleanup`         | none                 | no        |
+| F             | `Cleanup`         | none                 | no        |
+| G             | `InProgressFlag`  | none                 | no        |
 
 The source classifier rules that make this happen are:
+
 - `UPDATE OPENIVM_VIEWS` -> `InProgressFlag` at `SparkRefreshRewriter.scala:318-320`;
 - `INSERT INTO OPENIVM_DELTA_<view>` -> `ViewDeltaInsert` or companion at
   `SparkRefreshRewriter.scala:335-351`;
@@ -767,6 +833,7 @@ The source classifier rules that make this happen are:
   `SparkRefreshRewriter.scala:399-400`.
 
 ### 13.3 Final Spark statement 1: view-delta CTAS
+
 ```sql
 CREATE OR REPLACE TABLE delta.`<warehouse>/_ivm/view_deltas/mydb_mv_r/<uuid>` USING DELTA AS
 WITH scan_0 (...) AS (
@@ -787,6 +854,7 @@ Source: `SparkRefreshRewriter.scala:408-420` and
 `SparkRefreshRewriter.scala:508-548`.
 
 ### 13.4 Final Spark statement 2: MV merge
+
 ```sql
 WITH refresh_cte AS (
   SELECT region,
@@ -820,20 +888,20 @@ around openivm-emitted SQL. None of them mutate the input string; all return
 booleans (or, for `extractViewDeltaCtasBody`, an `Option[String]`).
 
 ### 14.1 `isRecomputeInsertMerge(sql)`
-Recognises the specific `MERGE INTO <target> USING (<full view body>) AS d
-ON FALSE WHEN NOT MATCHED THEN INSERT …` shape used by SIMPLE_PROJECTION,
+
+Recognises the specific `MERGE INTO <target> USING (<full view body>) AS d ON FALSE WHEN NOT MATCHED THEN INSERT …` shape used by SIMPLE_PROJECTION,
 AGGREGATE_GROUP, WINDOW_PARTITION, GROUP_RECOMPUTE, and DuckLake recompute
-paths. Paren-aware so a `(` inside a `delta.`<path>`` qualifier or string
+paths. Paren-aware so a `(` inside a `delta.`<path>\`\` qualifier or string
 literal cannot fool the matcher. Returns false for non-MERGE statements,
 non-parenthesised USING sources, non-`ON FALSE` predicates, and any MERGE
 whose first matched clause is `WHEN MATCHED` (delete / update merges).
 Source: `SparkRefreshRewriter.scala:117-127`.
 
 ### 14.2 `isMergeStatement(sql)`
+
 Strictly broader than `isRecomputeInsertMerge`: true iff `sql` begins (after
 the execution-marker strip) with `MERGE INTO …`. Used by current callers
-because openivm-emitted MERGEs include not just the `ON FALSE WHEN NOT MATCHED
-INSERT` recompute shape but also `WHEN MATCHED THEN DELETE` (SIMPLE_PROJECTION
+because openivm-emitted MERGEs include not just the `ON FALSE WHEN NOT MATCHED INSERT` recompute shape but also `WHEN MATCHED THEN DELETE` (SIMPLE_PROJECTION
 delete-merge) and `WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT`
 (aggregate upsert). Any of those can trip Spark's 8 GiB
 `BroadcastExchangeExec` cap on a SCD2-shaped MV body — even when the USING
@@ -843,21 +911,21 @@ body for `IS NOT DISTINCT FROM` matching. Source:
 `SparkRefreshRewriter.scala:147-150`.
 
 ### 14.3 `extractViewDeltaCtasBody(stmt, viewDeltaPath)`
-Returns the `SELECT` body of `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>`
-USING DELTA AS …` (whitespace-tolerant, case-insensitive on keywords) iff the
+
+Returns the `SELECT` body of `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS …` (whitespace-tolerant, case-insensitive on keywords) iff the
 statement is a view-delta CTAS for that exact path. Used both for the
 SIMPLE_PROJECTION fuse fast path (swapping the on-disk CTAS for a cached temp
 view) and as a side-channel detector telling the runner "this stmt is the
 view-delta CTAS — wrap it in plan-time broadcast disable." Source:
 `SparkRefreshRewriter.scala:161-168`.
 
-## 15. The `WHERE EXISTS → LEFT SEMI JOIN` rewrite
+## 15. The $WHERE EXISTS \to LEFT SEMI JOIN$ rewrite
 
 ### 15.1 Why this rewrite exists
+
 GROUP_RECOMPUTE / WINDOW_PARTITION / multi-source SIMPLE_PROJECTION refresh
 programs emit a recompute INSERT MERGE whose USING source body ends in
-`WHERE EXISTS (SELECT 1 FROM <ref> _d WHERE _d.<col> IS NOT DISTINCT FROM
-<outer>.<col> [AND …])` for the per-key "affected" filter. Under
+`WHERE EXISTS (SELECT 1 FROM <ref> _d WHERE _d.<col> IS NOT DISTINCT FROM <outer>.<col> [AND …])` for the per-key "affected" filter. Under
 null-tolerant `IS NOT DISTINCT FROM` equality (and especially when the outer
 body contains SCD2 range joins or multi-key composite predicates) Catalyst
 cannot reliably push the correlated EXISTS down through the CTE chain, and
@@ -870,21 +938,22 @@ the affected-keys filter executes as a `ShuffledHashJoinExec` /
 `SortMergeJoinExec` instead.
 
 ### 15.2 Equivalence
+
 `LEFT SEMI JOIN (SELECT DISTINCT k FROM X) ON o.k <=> i.k` is row-by-row
-equivalent to `WHERE EXISTS (SELECT 1 FROM X WHERE x.k IS NOT DISTINCT FROM
-o.k)` because `<=>` is the operator form of `IS NOT DISTINCT FROM` and
+equivalent to `WHERE EXISTS (SELECT 1 FROM X WHERE x.k IS NOT DISTINCT FROM o.k)` because `<=>` is the operator form of `IS NOT DISTINCT FROM` and
 LEFT SEMI preserves outer-row identity (no duplication, no projection
 change). The `DISTINCT` is technically redundant under LEFT SEMI semantics
 but is kept defensively to keep the build side small.
 
 ### 15.3 Applicability conditions
+
 The rewrite is strict and only fires when **all** of these hold:
+
 - the source body is a recompute INSERT MERGE matched by
   `isRecomputeInsertMerge`;
 - the USING source body's outermost `WHERE` clause is **exactly** one
   `EXISTS (...)` clause with no conjuncts before or after EXISTS;
-- the EXISTS body is a single-relation scan `SELECT 1 FROM <ref> _d
-  WHERE <key_preds>` (no joins, no GROUP BY, no aggregation);
+- the EXISTS body is a single-relation scan `SELECT 1 FROM <ref> _d WHERE <key_preds>` (no joins, no GROUP BY, no aggregation);
 - every predicate inside the EXISTS body is
   `_d.<col> IS NOT DISTINCT FROM <outer>.<col>`;
 - the EXISTS subquery uses `_d` as the alias (either explicit `AS _d` or
@@ -895,6 +964,7 @@ program is never silently mis-rewritten. The output no longer matches the
 EXISTS shape, so a second pass cannot re-fire.
 
 ### 15.4 Source locations
+
 - Pipeline step: `SparkRefreshRewriter.scala:294-296`.
 - Top-level rewrite entry: `rewriteRecomputeWhereExistsAsAffectedKeysJoin`
   at `SparkRefreshRewriter.scala:2414-2437`.
@@ -905,23 +975,25 @@ EXISTS shape, so a second pass cannot re-fire.
   `SparkRefreshRewriter.scala:2579-2593`.
 
 ## 16. Practical reading checklist
+
 When debugging a refresh rewrite, do not start by asking only "what
 `RefreshType` is this?"
 
 Ask these questions instead:
+
 1. What exact statements did OpenIVM emit?
-2. How does `splitStatements` divide them?
-3. Which `StatementKind` does each statement match?
-4. Which private rewrite method handles that kind?
-5. Which statements are dropped as bookkeeping?
-6. Which surviving statements still need `postProcess` dialect translation?
-7. Did `hasRealDelta` see a real `INSERT INTO openivm_delta_<view>`?
-8. Does metadata say this MV emits cascade view deltas?
-9. Is the surviving statement gated by `isMergeStatement` or
+1. How does `splitStatements` divide them?
+1. Which `StatementKind` does each statement match?
+1. Which private rewrite method handles that kind?
+1. Which statements are dropped as bookkeeping?
+1. Which surviving statements still need `postProcess` dialect translation?
+1. Did `hasRealDelta` see a real `INSERT INTO openivm_delta_<view>`?
+1. Does metadata say this MV emits cascade view deltas?
+1. Is the surviving statement gated by `isMergeStatement` or
    `extractViewDeltaCtasBody` so the runner wraps it in plan-time
    broadcast disable?
-10. Did `rewriteRecomputeWhereExistsAsAffectedKeysJoin` fire (look for
-    `LEFT SEMI JOIN (SELECT DISTINCT` in the final SQL)?
+1. Did `rewriteRecomputeWhereExistsAsAffectedKeysJoin` fire (look for
+   `LEFT SEMI JOIN (SELECT DISTINCT` in the final SQL)?
 
 This workflow matches the code path and prevents the common mistake of treating
 `RefreshType` as the Spark rewrite dispatch key.

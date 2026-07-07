@@ -18,6 +18,37 @@ object FeatureGate {
 
   val EnabledKey: String = "spark.openivm.enabled"
 
+  /** Optional override for the base directory under which openivm places its
+    * local RocksDB stores (``<base>/_openivm/…/rocksdb`` — the index, per-MV,
+    * per-table, refresh-profile, refresh-sql-log and CDF-watermark DBs).
+    *
+    * Defaults (unset) to `spark.sql.warehouse.dir`, preserving the historical
+    * layout for local / HDFS deployments where the warehouse is already a local
+    * or file: path. Only RocksDB paths honor this; the Delta state (MV tables,
+    * DML staging, view-deltas) always uses `spark.sql.warehouse.dir` so it lands
+    * in durable object storage.
+    *
+    * Managed cloud Spark (e.g. Microsoft Fabric) sets `spark.sql.warehouse.dir`
+    * to a remote object-store URI (`abfss://…`), which RocksDB cannot use —
+    * `RocksDBCodec.requireLocalPath` rejects any non-`file:` scheme. Set this to
+    * a real local path (e.g. `/tmp/openivm-state`); pair it with
+    * [[StateSyncUriKey]] to mirror that local state into OneLake for durability
+    * across the ephemeral Fabric Spark session.
+    */
+  val StatePathKey: String = "spark.openivm.statePath"
+
+  /** Optional OneLake (or any Hadoop FS) URI that the local RocksDB state tree
+    * under ``<statePath>/_openivm`` is mirrored to for durability.
+    *
+    * Fabric Livy sessions have NO ``/lakehouse/default`` FUSE mount and ephemeral
+    * local disk, but the default Hadoop FS IS OneLake (``abfss://…``). When set,
+    * openivm restores the local RocksDB tree from this URI on first open and
+    * incrementally backs it up (immutable-SST dedup) after each CREATE/REFRESH,
+    * so IVM state survives Fabric session recycling. Unset (default) → no sync,
+    * local-only behavior unchanged.
+    */
+  val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -41,23 +72,24 @@ object FeatureGate {
   val DeltaOptimizeWriteKey: String         = "spark.openivm.delta.optimizeWrite"
   val DeltaAutoCompactKey: String           = "spark.openivm.delta.autoCompact"
 
-  /** Fuse `view_delta_ctas` + `insert_into` for leaf SIMPLE_PROJECTION MVs.
+  /** Fuse `view_delta_ctas` + `insert_into` for SIMPLE_PROJECTION MVs.
     *
-    * When a SIMPLE_PROJECTION MV has NO current downstream MV consumer (its
-    * short name does not appear in any other MV's `sourceTables` per
-    * `MvCatalog.list`), the per-refresh scratch Delta table that openivm
-    * emits as stmt[0] is consumed exactly once by stmt[1] (the INSERT INTO
-    * mv_data) and, optionally, stmt[2] (the value-equality delete MERGE).
+    * The per-refresh scratch Delta table that openivm emits as stmt[0] is
+    * consumed by stmt[1] (the INSERT INTO mv_data) and, optionally, stmt[2]
+    * (the value-equality delete MERGE).
     *
     * Writing the scratch to a Delta path then re-reading it costs ~2.8 s on
     * average for the TPC-DI gold layer; fusing — running stmt[0]'s SELECT
-    * as a cached DataFrame + temp view and rewriting subsequent path refs
-    * to read from the cache — saves most of that wall-clock per refresh.
+    * as a cached global-temp view and rewriting subsequent path refs to read
+    * from the cache — saves most of that wall-clock per refresh. If an
+    * intercept-mode downstream MV exists, the same cached view is recorded as
+    * the cascade input and pruned after downstream consumption.
     *
     * Default ON. Flip OFF via `spark.openivm.fuseScratch.enabled=false` to
     * fall back to the on-disk scratch path (e.g. for diagnostics).
     */
-  val FuseScratchEnabledKey: String = "spark.openivm.fuseScratch.enabled"
+  val FuseScratchEnabledKey: String             = "spark.openivm.fuseScratch.enabled"
+  val FuseScratchCascadeCacheEnabledKey: String = "spark.openivm.fuseScratch.cascadeCache.enabled"
 
   /** Capture per-step refresh + create profile rows into the RocksDB
     * `refresh_profile` column family ([[RefreshProfileCatalog]]).
@@ -71,6 +103,13 @@ object FeatureGate {
     * `SELECT * FROM openivm_refresh_profile`).
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
+
+  /** Cache openivm compile/classification results per MV schema + facts tier.
+    * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
+    * the cached shape-stable SQL every time so per-refresh snapshot temp views
+    * are recreated on each execution.
+    */
+  val CompileClassificationCacheEnabledKey: String = "spark.openivm.compile.classificationCache.enabled"
 
   /** Capture every SQL statement actually executed by a CREATE / REFRESH
     * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
@@ -89,6 +128,14 @@ object FeatureGate {
     * joinable.
     */
   val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
+
+  /** Capture a Spark `EXPLAIN FORMATTED` physical plan per executed refresh
+    * statement, recorded alongside the SQL in the query log. Default OFF so it
+    * never adds planning/formatting overhead to a benchmark run — enable it
+    * (together with the query log) only for a diagnostic refresh when you need
+    * to see broadcast-vs-sort-merge join choices and scan sizes.
+    */
+  val ExplainCaptureKey: String = "spark.openivm.explain.capture"
 
   /** Change-propagation mode for tracking what changed on base tables since
     * the last refresh.
@@ -110,11 +157,225 @@ object FeatureGate {
     */
   val ChangeFeedModeKey: String = "spark.openivm.changeFeed.mode"
 
+  /** Let Adaptive Query Execution broadcast the small side of the SCD2
+    * view-delta joins at RUNTIME, even while plan-time broadcast stays disabled.
+    *
+    * The refresh statements that wrap the full MV body — the view-delta CTAS
+    * (refresh stmt[0]) and the recompute INSERT MERGEs — disable PLAN-TIME
+    * broadcast (`spark.sql.autoBroadcastJoinThreshold=-1`) because Catalyst
+    * under-estimates the SCD2 multiplicity: it would auto-broadcast a relation
+    * it thinks is tiny but that explodes past Spark's hard 8 GiB build cap at
+    * execution. That blanket disable, however, is inherited by AQE's adaptive
+    * threshold, so every equi+range SCD2 dimension join falls back to a
+    * sort-merge join that needlessly shuffles the full dimension against the
+    * (always-small) incremental delta — the dominant cost of the heavy
+    * `gold.fact_*` MVs.
+    *
+    * When this gate is ON (default) the disable scope instead raises
+    * `spark.sql.adaptive.autoBroadcastJoinThreshold` to a runtime-safe budget
+    * (see [[AdaptiveBroadcastThresholdKey]]). AQE then converts the small-side
+    * sort-merge joins to broadcast-hash joins using the **actual** materialized
+    * shuffle size — which can never broadcast the genuinely-large exploding
+    * intermediate (it measures it large and keeps the sort-merge join). The
+    * join result is identical, so this is a pure execution speed-up guarded by
+    * the parity suite. Flip OFF via
+    * `spark.openivm.refresh.adaptiveBroadcast.enabled=false` to fall back to the
+    * fully-disabled, sort-merge-only behaviour. Requires AQE
+    * (`spark.sql.adaptive.enabled=true`, the Spark 3.5 default).
+    */
+  val AdaptiveBroadcastEnabledKey: String = "spark.openivm.refresh.adaptiveBroadcast.enabled"
+
+  /** Explicit byte budget for the AQE runtime broadcast described at
+    * [[AdaptiveBroadcastEnabledKey]]. `-1` (default) means "inherit the
+    * session's configured `spark.sql.autoBroadcastJoinThreshold` when positive,
+    * else fall back to 100 MiB" — keeping the operator's stated broadcast
+    * appetite but routing it through the runtime-safe AQE path.
+    */
+  val AdaptiveBroadcastThresholdKey: String = "spark.openivm.refresh.adaptiveBroadcast.thresholdBytes"
+
+  /** Fallback AQE broadcast budget (100 MiB) — 80x under Spark's 8 GiB cap. */
+  val AdaptiveBroadcastDefaultBytes: Long = 104857600L
+
+  /** Add explicit Spark SQL `BROADCAST` hints for refresh join sides whose
+    * backing Delta table size is known to be small. Default OFF: the refresh
+    * executor still disables plan-time auto-broadcast as the safe baseline, and
+    * this gate only opts proven-small relations back into broadcast by hint.
+    */
+  val SelectiveBroadcastEnabledKey: String = "spark.openivm.refresh.selectiveBroadcast.enabled"
+
+  /** Inject exact semi-join prefilters into JOIN_DELTA `full_source` CTEs.
+    *
+    * OpenIVM's range-join delta programs can materialise a full base-table CTE
+    * and only later join it to a tiny changed-source delta. When this gate is
+    * enabled, the Spark rewriter wraps that `full_source` CTE with a
+    * result-invariant `WHERE <fk> IN (SELECT <key> FROM Δsrc)` prefilter derived
+    * from the existing join predicate. Default ON; flip OFF via
+    * `spark.openivm.refresh.semiJoinPrune.enabled=false`.
+    */
+  val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
+
+  /** Enable skew-aware delta fanout join hints. Default OFF: when opted in, the
+    * refresh planner inspects per-refresh delta stats against source column
+    * stats and broadcasts only the narrow/small source-delta side of
+    * delta⋈base joins. This is a safe prototype of histogram-bin overlap
+    * planning: Spark/Delta currently expose min/max/null/NDV here, not actual
+    * histogram bins, so wider hot-bin salting is intentionally not emitted.
+    */
+  val SkewFanoutEnabledKey: String                = "spark.openivm.refresh.skewFanout.enabled"
+  val SkewFanoutNarrowDeltaRowsKey: String        = "spark.openivm.refresh.skewFanout.narrowDeltaRows"
+  val SkewFanoutNarrowOverlapRatioKey: String     = "spark.openivm.refresh.skewFanout.narrowOverlapRatio"
+  val SkewFanoutDefaultNarrowDeltaRows: Long      = 10000L
+  val SkewFanoutDefaultNarrowOverlapRatio: Double = 0.05d
+
+  /** Drop FK-redundant inclusion-exclusion JOIN_DELTA terms in the Spark
+    * rewriter, after Delta batch-shape classification has proven the referenced
+    * tables are insert-only/unchanged. This composes with
+    * [[SemiJoinPruneEnabledKey]] because it operates on the same openivm-emitted
+    * SQL shape instead of changing the compiler output. Default OFF until the
+    * SF10 benchmark validates the combined win.
+    */
+  val FkTermPruneEnabledKey: String = "spark.openivm.refresh.fkTermPrune.enabled"
+
+  /** Declare trusted FK metadata into openivm's per-connection constraints
+    * cache before compiling refresh SQL. Default OFF until the matching
+    * openivm constraints-cache build is pinned.
+    */
+  val DeclareRelyFkEnabledKey: String = "spark.openivm.refresh.declareRelyFk.enabled"
+
+  /** Simplify refresh joins whose right-side join key is known unique from
+    * [[WorkloadFacts.uniqueKeys]]. INNER joins with unused right columns are
+    * demoted to EXISTS probes; LEFT joins with unused right columns are dropped.
+    * Default OFF while shape coverage grows.
+    */
+  val UniqueJoinSimplifyEnabledKey: String = "spark.openivm.refresh.uniqueJoinSimplify.enabled"
+
+  /** Enable runtime-filter (bloom / semi-join) pushdown for the SCD2 view-delta
+    * joins. Every IVM view-delta is a union of delta-rule terms, and the
+    * `FULL_SOURCE ⋈ Δdimension` term scans the entire source table against the
+    * handful of changed dimension rows — the dominant SF10 cost (e.g.
+    * `gold.fact_market_history` scanning all of `daily_market`). A runtime
+    * filter built from the tiny Δ side prunes that scan to the affected keys.
+    * Result-invariant (an exact/superset filter never drops matching rows).
+    * Spark's runtime filters are OFF by default; this turns them on (and lowers
+    * the application-side scan-size threshold so they fire on SF10-scale source
+    * tables) only for the wrapped refresh statements. Flip OFF via
+    * `spark.openivm.refresh.runtimeFilter.enabled=false`.
+    */
+  val RuntimeFilterEnabledKey: String = "spark.openivm.refresh.runtimeFilter.enabled"
+
+  /** Enable Spark-side SCD-2 range-join acceleration for refresh statements.
+    * Default ON: the refresh SQL rewriter adds result-invariant overlap
+    * predicates for `ts BETWEEN effective_timestamp AND end_timestamp` joins
+    * whose probe side is a source delta, and broadcasts the SCD alias by hint.
+    */
+  val Scd2RangeAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeAccel.enabled"
+
+  /** Enable openivm-side SCD-2 range-join acceleration during refresh SQL
+    * compilation. Default OFF: when opted in, openivm narrows SCD-2 dimension
+    * scans with delta-fact bounds filters in the emitted refresh program.
+    */
+  val Scd2RangeJoinAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeJoinAccel.enabled"
+
+  /** Enable bounded recompute for top-K ROW_NUMBER/RANK WINDOW_PARTITION MVs.
+    *
+    * Default OFF: when opted in, eligible top-K ranking refreshes replace the
+    * openivm whole-partition recompute INSERT with a Spark-side equivalent that
+    * ranks only the affected partition's bounded candidate set. This is a
+    * result-invariant execution rewrite; ineligible shapes keep the existing
+    * incremental WINDOW_PARTITION program rather than demoting to FULL_REFRESH.
+    */
+  val BoundedRankEnabledKey: String = "spark.openivm.refresh.boundedRank.enabled"
+
+  /** Enable append-only strict-suffix INSERT rewrite for WINDOW_PARTITION MVs.
+    * Default ON to preserve the existing terminal-MV fast path; in cascade
+    * cases, refresh still materializes the MV view-delta before inserting.
+    */
+  val WindowSuffixSkipEnabledKey: String = "spark.openivm.refresh.windowSuffixSkip.enabled"
+
+  /** Collapse WINDOW_PARTITION's OR-expanded affected-partition DELETE into one
+    * Delta MERGE over the UNION of affected keys. Default OFF: the legacy
+    * one-MERGE-per-source/partition-clause plan remains byte-identical unless
+    * explicitly opted in.
+    */
+  val WindowPartitionSingleDeleteMergeEnabledKey: String =
+    "spark.openivm.refresh.windowPartitionSingleDeleteMerge.enabled"
+
+  /** Liquid-cluster eligible WINDOW_PARTITION MV data tables by their resolved
+    * window PARTITION BY columns at CREATE time. Default OFF so the storage
+    * layout change is opt-in and reversible.
+    */
+  val WindowClusterPruneEnabledKey: String = "spark.openivm.refresh.windowClusterPrune.enabled"
+
+  /** Replace WINDOW_PARTITION delete+insert recompute pairs with one Delta
+    * `INSERT ... REPLACE WHERE` when the affected partition literal list is
+    * small enough to collect safely. Default ON; flip OFF to restore the legacy
+    * MERGE-delete plus INSERT execution path byte-for-byte.
+    */
+  val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
+
+  /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
+    * `REPLACE WHERE` path will consume it twice (cascade view-delta plus MV
+    * data write). Default OFF: flag-off execution remains byte-identical.
+    */
+  val WindowSnapshotCacheEnabledKey: String = "spark.openivm.refresh.windowSnapshotCache.enabled"
+
+  /** Emit the running-window suffix-extend refresh for cumulative
+    * `SUM/MIN/MAX/COUNT/AVG OVER (PARTITION BY k ORDER BY d)` WINDOW MVs on a
+    * proven insert-only batch: affected partitions whose new rows sort strictly
+    * after the existing partition max are extended from the persisted running
+    * value instead of recomputed from base; backdated partitions fall back to
+    * the full window recompute. Default OFF (opt-in, append-only-shape only).
+    */
+  val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
+
+  /** Fast-exit a CDF refresh when every source-table Delta commit since the
+    * last consumed version is metadata-only / dataChange=false NOOP. Default
+    * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
+    * the heavier per-MV refresh phases only when [[DeltaCommitClassifier]]
+    * proves that the advanced Delta versions contain no row changes.
+    */
+  val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
+
+  /** Compile-time cost model observability. Default OFF: when opted in, REFRESH
+    * records the deterministic WorkloadFacts-derived cost hint in MV metadata.
+    */
+  val CostModelEnabledKey: String = "spark.openivm.refresh.costModel.enabled"
+
+  /** Runtime delta-size aware refresh skip. Default OFF: when opted in, REFRESH
+    * probes the already-registered `openivm_delta_<source>` temp views and
+    * consumes the batch without executing the recompute program only when every
+    * materialized source delta is empty.
+    */
+  val RuntimeEmptyDeltaSkipEnabledKey: String = "spark.openivm.refresh.runtimeEmptyDeltaSkip.enabled"
+
+  /** Unified compile/runtime refresh intelligence observability. Default OFF:
+    * when opted in, REFRESH records a single decision surface that combines the
+    * WorkloadFacts cost estimate with the runtime materialized delta size.
+    */
+  val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
   def enabled(spark: SparkSession): Boolean =
     enabled(spark.sparkContext.getConf)
+
+  def statePath(conf: SparkConf): Option[String] =
+    conf.getOption(StatePathKey).map(_.trim).filter(_.nonEmpty)
+
+  def statePath(spark: SparkSession): Option[String] =
+    statePath(spark.sparkContext.getConf)
+
+  /** Base directory for all openivm state paths: the [[StatePathKey]] override
+    * when set, otherwise `spark.sql.warehouse.dir`. */
+  def stateWarehouse(spark: SparkSession): String =
+    statePath(spark).getOrElse(spark.conf.get("spark.sql.warehouse.dir"))
+
+  def stateSyncUri(conf: SparkConf): Option[String] =
+    conf.getOption(StateSyncUriKey).map(_.trim).filter(_.nonEmpty)
+
+  def stateSyncUri(spark: SparkSession): Option[String] =
+    stateSyncUri(spark.sparkContext.getConf)
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)
@@ -129,7 +390,10 @@ object FeatureGate {
     boolConf(spark.sparkContext.getConf, DeltaAutoCompactKey, default = true)
 
   def fuseScratchEnabled(spark: SparkSession): Boolean =
-    boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = true)
+    boolConf(spark.sparkContext.getConf, FuseScratchEnabledKey, default = false)
+
+  def fuseScratchCascadeCacheEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, FuseScratchCascadeCacheEnabledKey, default = false)
 
   def profileRefreshEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ProfileRefreshKey, default = false)
@@ -137,11 +401,189 @@ object FeatureGate {
   def profileRefreshEnabled(conf: SparkConf): Boolean =
     boolConf(conf, ProfileRefreshKey, default = false)
 
+  def compileClassificationCacheEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, CompileClassificationCacheEnabledKey, default = false)
+
+  def compileClassificationCacheEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, CompileClassificationCacheEnabledKey, default = false)
+
   def queryLogEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, QueryLogEnabledKey, default = false)
 
   def queryLogEnabled(conf: SparkConf): Boolean =
     boolConf(conf, QueryLogEnabledKey, default = false)
+
+  def explainCaptureEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)
+
+  def adaptiveBroadcastEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, AdaptiveBroadcastEnabledKey, default = true)
+
+  def adaptiveBroadcastEnabled(spark: SparkSession): Boolean =
+    adaptiveBroadcastEnabled(spark.sparkContext.getConf)
+
+  def selectiveBroadcastEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SelectiveBroadcastEnabledKey, default = false)
+
+  def selectiveBroadcastEnabled(spark: SparkSession): Boolean =
+    selectiveBroadcastEnabled(spark.sparkContext.getConf)
+
+  def semiJoinPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SemiJoinPruneEnabledKey, default = true)
+
+  def semiJoinPruneEnabled(spark: SparkSession): Boolean =
+    semiJoinPruneEnabled(spark.sparkContext.getConf)
+
+  def skewFanoutEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, SkewFanoutEnabledKey, default = false)
+
+  def skewFanoutEnabled(spark: SparkSession): Boolean =
+    skewFanoutEnabled(spark.sparkContext.getConf)
+
+  def skewFanoutNarrowDeltaRows(conf: SparkConf): Long =
+    scala.util
+      .Try(conf.getLong(SkewFanoutNarrowDeltaRowsKey, SkewFanoutDefaultNarrowDeltaRows))
+      .getOrElse(
+        SkewFanoutDefaultNarrowDeltaRows
+      )
+
+  def skewFanoutNarrowOverlapRatio(conf: SparkConf): Double =
+    scala.util
+      .Try(conf.getDouble(SkewFanoutNarrowOverlapRatioKey, SkewFanoutDefaultNarrowOverlapRatio))
+      .getOrElse(
+        SkewFanoutDefaultNarrowOverlapRatio
+      )
+
+  def fkTermPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, FkTermPruneEnabledKey, default = false)
+
+  def fkTermPruneEnabled(spark: SparkSession): Boolean =
+    fkTermPruneEnabled(spark.sparkContext.getConf)
+
+  def declareRelyFkEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, DeclareRelyFkEnabledKey, default = false)
+
+  def declareRelyFkEnabled(spark: SparkSession): Boolean =
+    declareRelyFkEnabled(spark.sparkContext.getConf)
+
+  def uniqueJoinSimplifyEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, UniqueJoinSimplifyEnabledKey, default = false)
+
+  def uniqueJoinSimplifyEnabled(spark: SparkSession): Boolean =
+    uniqueJoinSimplifyEnabled(spark.sparkContext.getConf)
+
+  /** Resolve the AQE runtime-broadcast byte budget. An explicit
+    * [[AdaptiveBroadcastThresholdKey]] > 0 wins; otherwise inherit the supplied
+    * session static broadcast threshold when positive; otherwise fall back to
+    * [[AdaptiveBroadcastDefaultBytes]].
+    */
+  def adaptiveBroadcastThresholdBytes(conf: SparkConf, sessionStaticBytes: Option[Long]): Long = {
+    val explicit = scala.util.Try(conf.getLong(AdaptiveBroadcastThresholdKey, -1L)).getOrElse(-1L)
+    if (explicit > 0) explicit
+    else sessionStaticBytes.filter(_ > 0).getOrElse(AdaptiveBroadcastDefaultBytes)
+  }
+
+  def runtimeFilterEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RuntimeFilterEnabledKey, default = true)
+
+  def runtimeFilterEnabled(spark: SparkSession): Boolean =
+    runtimeFilterEnabled(spark.sparkContext.getConf)
+
+  def scd2RangeAccelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, Scd2RangeAccelEnabledKey, default = true)
+
+  def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
+    scd2RangeAccelEnabled(spark.sparkContext.getConf)
+
+  def scd2RangeJoinAccelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, Scd2RangeJoinAccelEnabledKey, default = false)
+
+  def scd2RangeJoinAccelEnabled(spark: SparkSession): Boolean =
+    scd2RangeJoinAccelEnabled(spark.sparkContext.getConf)
+
+  def boundedRankEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, BoundedRankEnabledKey, default = false)
+
+  def boundedRankEnabled(spark: SparkSession): Boolean =
+    boundedRankEnabled(spark.sparkContext.getConf)
+
+  def windowSuffixSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSuffixSkipEnabledKey, default = true)
+
+  def windowSuffixSkipEnabled(spark: SparkSession): Boolean =
+    windowSuffixSkipEnabled(spark.sparkContext.getConf)
+
+  def windowPartitionSingleDeleteMergeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowPartitionSingleDeleteMergeEnabledKey, default = false)
+
+  def windowPartitionSingleDeleteMergeEnabled(spark: SparkSession): Boolean =
+    windowPartitionSingleDeleteMergeEnabled(spark.sparkContext.getConf)
+
+  def windowClusterPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowClusterPruneEnabledKey, default = false)
+
+  def windowClusterPruneEnabled(spark: SparkSession): Boolean =
+    windowClusterPruneEnabled(spark.sparkContext.getConf)
+
+  def windowSinglePassReplaceEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSinglePassReplaceEnabledKey, default = true)
+
+  def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
+    windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
+
+  def windowSnapshotCacheEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowSnapshotCacheEnabledKey, default = false)
+
+  def windowSnapshotCacheEnabled(spark: SparkSession): Boolean =
+    windowSnapshotCacheEnabled(spark.sparkContext.getConf)
+
+  def windowRunningIncrementalEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowRunningIncrementalEnabledKey, default = false)
+
+  def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
+    windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def noopFastExitEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, NoopFastExitEnabledKey, default = false)
+
+  def noopFastExitEnabled(spark: SparkSession): Boolean =
+    noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def costModelEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, CostModelEnabledKey, default = false)
+
+  def costModelEnabled(spark: SparkSession): Boolean =
+    costModelEnabled(spark.sparkContext.getConf)
+
+  def runtimeEmptyDeltaSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RuntimeEmptyDeltaSkipEnabledKey, default = false)
+
+  def runtimeEmptyDeltaSkipEnabled(spark: SparkSession): Boolean =
+    runtimeEmptyDeltaSkipEnabled(spark.sparkContext.getConf)
+
+  def unifiedRefreshIntelligenceEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, UnifiedRefreshIntelligenceEnabledKey, default = false)
+
+  def unifiedRefreshIntelligenceEnabled(spark: SparkSession): Boolean =
+    unifiedRefreshIntelligenceEnabled(spark.sparkContext.getConf)
+
+  /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
+    * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
+    * application-side threshold is lowered from Spark's 10 GiB default so the
+    * filter fires on SF10-scale source scans; the creation-side default
+    * (10 MiB) still restricts it to joins whose build side is the tiny delta.
+    */
+  def runtimeFilterConfOverrides(conf: SparkConf): Map[String, String] =
+    if (!runtimeFilterEnabled(conf)) Map.empty
+    else
+      Map(
+        "spark.sql.optimizer.runtime.bloomFilter.enabled"                          -> "true",
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB",
+        "spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled"              -> "true"
+      )
+
+  def runtimeFilterConfOverrides(spark: SparkSession): Map[String, String] =
+    runtimeFilterConfOverrides(spark.sparkContext.getConf)
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)

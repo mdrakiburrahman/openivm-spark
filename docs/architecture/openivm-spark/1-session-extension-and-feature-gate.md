@@ -298,11 +298,11 @@ Citations:
 
 ## Per-component gate check table
 
-| Component | Wired in `apply()` | Execution-time gate check | Citation |
-|---|---|---|---|
-| `IvmParser` | unconditional | NO (always intercepts matching DDL) | Wired at `OpenIvmSparkExtensions.scala:28`; branch at `IvmParser.scala:42-44`; keyword match at `IvmParser.scala:143-146`. |
-| `IvmDmlInterceptorRule` | unconditional | YES at `:40-42` | Wired at `OpenIvmSparkExtensions.scala:29`; early return at `IvmDmlInterceptorRule.scala:40-42`. |
-| `IvmStrategy` | unconditional | NO (harmless — no `WithDeltaStaging` when gate off) | Wired at `OpenIvmSparkExtensions.scala:30`; strategy match at `IvmStrategy.scala:17-21`; DML rule returns before wrapping at `IvmDmlInterceptorRule.scala:40-42`. |
+| Component               | Wired in `apply()` | Execution-time gate check                           | Citation                                                                                                                                                          |
+| ----------------------- | ------------------ | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IvmParser`             | unconditional      | NO (always intercepts matching DDL)                 | Wired at `OpenIvmSparkExtensions.scala:28`; branch at `IvmParser.scala:42-44`; keyword match at `IvmParser.scala:143-146`.                                        |
+| `IvmDmlInterceptorRule` | unconditional      | YES at `:40-42`                                     | Wired at `OpenIvmSparkExtensions.scala:29`; early return at `IvmDmlInterceptorRule.scala:40-42`.                                                                  |
+| `IvmStrategy`           | unconditional      | NO (harmless — no `WithDeltaStaging` when gate off) | Wired at `OpenIvmSparkExtensions.scala:30`; strategy match at `IvmStrategy.scala:17-21`; DML rule returns before wrapping at `IvmDmlInterceptorRule.scala:40-42`. |
 
 ## Parser behavior when the gate is false
 
@@ -364,11 +364,11 @@ Read left to right:
 
 1. `FeatureGate.enabled(session)` reads `spark.openivm.enabled` from the
    session's SparkConf.
-2. If that value is false, `!FeatureGate.enabled(session)` is true.
-3. The method returns the original `plan` immediately.
-4. None of the DML pattern matches below are evaluated.
-5. No staging paths are generated.
-6. No `StagedDmlNode` or staging wrapper is inserted by this rule.
+1. If that value is false, `!FeatureGate.enabled(session)` is true.
+1. The method returns the original `plan` immediately.
+1. None of the DML pattern matches below are evaluated.
+1. No staging paths are generated.
+1. No `StagedDmlNode` or staging wrapper is inserted by this rule.
 
 The same early return also applies when the thread-local bypass flag is set.
 
@@ -526,16 +526,16 @@ The safe user-facing guidance is:
 The high-level construction sequence is:
 
 1. User starts `spark-shell`, `spark-submit`, or builds a `SparkSession`.
-2. Spark reads configuration, including `spark.sql.extensions`.
-3. Spark loads each configured extension class.
-4. For `org.openivm.spark.OpenIvmSparkExtensions`, Spark creates the function
+1. Spark reads configuration, including `spark.sql.extensions`.
+1. Spark loads each configured extension class.
+1. For `org.openivm.spark.OpenIvmSparkExtensions`, Spark creates the function
    object.
-5. Spark calls `apply(ext)` with the session's `SparkSessionExtensions` holder.
-6. `apply()` registers the parser builder.
-7. `apply()` registers the resolution-rule builder.
-8. `apply()` registers the planner-strategy builder.
-9. Spark finishes building `SessionState` using those extension hooks.
-10. Later SQL parsing, analysis, and planning use the augmented chains.
+1. Spark calls `apply(ext)` with the session's `SparkSessionExtensions` holder.
+1. `apply()` registers the parser builder.
+1. `apply()` registers the resolution-rule builder.
+1. `apply()` registers the planner-strategy builder.
+1. Spark finishes building `SessionState` using those extension hooks.
+1. Later SQL parsing, analysis, and planning use the augmented chains.
 
 The feature-gate value is not consulted in steps 5-8 by
 `OpenIvmSparkExtensions.apply()`.

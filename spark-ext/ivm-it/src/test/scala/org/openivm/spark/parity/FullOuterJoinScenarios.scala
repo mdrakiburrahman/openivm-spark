@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — 1:1 ScalaTest port of `openivm/test/sql/full_outer_join.test`.
+/** 1:1 ScalaTest port of `openivm/test/sql/full_outer_join.test`.
   *
   * Mirrors the openivm sqllogic file section-by-section, adapted to Spark 3.5
   * + Delta.  Per `.temp/openivm/CLAUDE.md` ("Join Delta Rule"):

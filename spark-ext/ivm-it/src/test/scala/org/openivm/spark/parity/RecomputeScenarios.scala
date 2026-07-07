@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.DataFrame
 
-/** P6f — 1:1 ScalaTest port of openivm `test/sql/recompute.test` (748 lines).
+/** 1:1 ScalaTest port of openivm `test/sql/recompute.test` (748 lines).
   *
   * Exercises IVM RECOMPUTE / GROUP_RECOMPUTE shapes that openivm cannot
   * maintain via additive monoids, but can still scope to a small set of
@@ -109,7 +109,7 @@ abstract class RecomputeScenarios extends IvmParitySpecBase("recompute") {
   //   the rewrite rules' handling of the same base table appearing more than
   //   once in the view body.
   //
-  //   TODO(P6f-B): The openivm DuckDB-side compiler currently fails to
+  //   TODO: The openivm DuckDB-side compiler currently fails to
   //   produce a refresh plan for this 3-way self-join shape when invoked via
   //   `openivm_compile_with_facts('rc_market_rollup', '...')` — the bridge
   //   throws `OpenIvmCompileException: ... produced no result`.  The view

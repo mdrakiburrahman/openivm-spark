@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.MvCatalog
 
-/** P6d — Port of `openivm/test/sql/ducklake_cte.test`.
+/** Port of `openivm/test/sql/ducklake_cte.test`.
   *
   * Translation:
   *   - DuckLake catalog `dl.<table>` → Delta tables in the default Spark

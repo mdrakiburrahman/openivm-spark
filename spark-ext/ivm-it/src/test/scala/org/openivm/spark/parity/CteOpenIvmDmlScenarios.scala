@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-/** P6f — second half of the 1:1 ScalaTest port of openivm `test/sql/cte.test`.
+/** second half of the 1:1 ScalaTest port of openivm `test/sql/cte.test`.
   *
   * Covers sections §9–§16 (joined STDDEV+AVG, CTE-internal HAVING, duplicate
   * column names, CTE self-join regression, JOIN with inner aggregate subquery,
@@ -127,7 +127,7 @@ abstract class CteOpenIvmDmlScenarios extends IvmParitySpecBase("cte-open-ivm-dm
     ignore(
       "DISTINCT/GROUP-BY views with duplicated output columns — Spark rejects duplicate column schema (DuckDB-specific test)"
     ) {
-      // TODO(P6f): Spark's CREATE TABLE AS SELECT rejects schemas with duplicate
+      // TODO: Spark's CREATE TABLE AS SELECT rejects schemas with duplicate
       // column names. openivm/DuckDB rewrites `SELECT w_id, w_id …` to
       // `w_id, w_id_1`; Spark does not. The test is skipped rather than rewritten
       // because the behavior under test (openivm's dedup pass) is internal to

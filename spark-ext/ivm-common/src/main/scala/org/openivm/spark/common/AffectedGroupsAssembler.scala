@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
   *      derived from the delta subquery.
   *   2. DELETE FROM <mv> WHERE <keys> IN (SELECT <keys> FROM affected_keys_<n>)
   *   3. INSERT INTO <mv> SELECT * FROM (<deltaSql>) WHERE <keys> IN (…)
-  *      NOTE: statement 3 is a skeleton placeholder — P5 replaces deltaSql with the
+  *      NOTE: statement 3 is a skeleton placeholder — a follow-up replaces deltaSql with the
   *      full base-table recompute query (GROUP BY over the unmodified source).
   *
   * The counter `_n` ensures temp-view names are unique across multiple MV refreshes
@@ -45,7 +45,7 @@ object AffectedGroupsAssembler extends Assembler with IdentifierOps {
 
     val inCond     = buildInCondition(keys, viewName)
     val deleteStmt = s"DELETE FROM $mv WHERE $inCond"
-    // TODO P5: Replace deltaSql with the full base-table recompute query (SELECT … GROUP BY keys)
+    // TODO: Replace deltaSql with the full base-table recompute query (SELECT … GROUP BY keys)
     val insertStmt = s"INSERT INTO $mv SELECT * FROM (${in.deltaSql}) WHERE $inCond"
 
     AssembledRefresh(Seq(createView, deleteStmt, insertStmt))

@@ -4,7 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
-/** P5.rt6 — Coverage of RefreshType 6 (GROUP_RECOMPUTE).
+/** Coverage of RefreshType 6 (GROUP_RECOMPUTE).
   *
   * GROUP_RECOMPUTE applies whenever openivm cannot maintain an aggregate
   * additively per delta row, but can still scope work to a small set of
