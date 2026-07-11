@@ -109,7 +109,16 @@ object StagingDeltaView {
     }
 
     if (parts.isEmpty) {
-      val nullCols = sourceSchema.fieldNames.map(n => s"NULL AS `${n.replace("`", "``")}`").mkString(", ")
+      // Type each NULL to the source column's DDL type so struct-typed columns
+      // keep their StructType instead of collapsing to VOID. An empty delta of a
+      // struct-typed source (e.g. the immutable batch-1 XML `Customer` in
+      // crm_customer_mgmt at batch 2) otherwise makes the column VOID, and the
+      // openivm-emitted delta scan's `Customer._C_ID` struct extraction then
+      // fails at Spark analysis time (INVALID_EXTRACT_BASE_FIELD_TYPE). WHERE 1=0
+      // still yields zero rows, so the incremental path is unchanged.
+      val nullCols = sourceSchema.fields
+        .map(f => s"CAST(NULL AS ${f.dataType.sql}) AS `${f.name.replace("`", "``")}`")
+        .mkString(", ")
       s"""CREATE OR REPLACE TEMP VIEW $viewName AS
          |SELECT $cols, CURRENT_TIMESTAMP() AS openivm_timestamp, CAST(0 AS INT) AS openivm_multiplicity
          |FROM (SELECT $nullCols) WHERE 1=0""".stripMargin
