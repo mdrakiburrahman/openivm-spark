@@ -122,14 +122,11 @@ final class CdfChangePropagation extends ChangePropagation {
            |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
 
       case None =>
-        // Type each NULL to the source column's DDL type so struct-typed columns
-        // keep their StructType instead of collapsing to VOID (see
-        // StagingDeltaView for the full rationale). An empty CDF range for a
-        // struct-typed source otherwise makes `Customer` VOID and the delta
-        // scan's `Customer._C_ID` extraction fails at Spark analysis time.
-        val nullCols = sourceSchema.fields
-          .map(f => s"CAST(NULL AS ${f.dataType.sql}) AS `${f.name.replace("`", "``")}`")
-          .mkString(", ")
+        // Diagnostic-only SQL rendering of the empty view; the actual empty
+        // view is registered via the DataFrame API in registerSourceDeltaView
+        // (see ChangePropagation.registerEmptyDeltaView) so struct-typed
+        // columns keep their exact native type.
+        val nullCols = sourceSchema.fieldNames.map(n => s"NULL AS `${n.replace("`", "``")}`").mkString(", ")
         s"""CREATE OR REPLACE TEMP VIEW $viewName AS
            |SELECT $cols, CURRENT_TIMESTAMP() AS openivm_timestamp, CAST(0 AS INT) AS openivm_multiplicity
            |FROM (SELECT $nullCols) WHERE 1=0""".stripMargin
@@ -175,9 +172,7 @@ final class CdfChangePropagation extends ChangePropagation {
         sql
 
       case None =>
-        val sql = buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
-        spark.sql(sql)
-        sql
+        registerEmptyDeltaView(spark, sourceTable, sourceSchema)
     }
   }
 
