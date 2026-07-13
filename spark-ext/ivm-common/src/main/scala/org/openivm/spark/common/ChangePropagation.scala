@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.types.{IntegerType, StructType, TimestampType}
 
 /**
  * Abstract source of "what changed on base table X since watermark W".
@@ -92,9 +92,42 @@ trait ChangePropagation {
       sourceSchema: StructType,
       batches: Seq[ChangeBatch]
   ): String = {
-    val sql = buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
-    spark.sql(sql)
-    sql
+    if (batches.isEmpty) {
+      registerEmptyDeltaView(spark, sourceTable, sourceSchema)
+    } else {
+      val sql = buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
+      spark.sql(sql)
+      sql
+    }
+  }
+
+  /**
+   * Register a zero-row `openivm_delta_<short>` TEMP VIEW carrying the EXACT
+   * `sourceSchema` (plus the `openivm_timestamp` / `openivm_multiplicity`
+   * bookkeeping columns) via the DataFrame API.
+   *
+   * Building the empty view from the live `sourceSchema` preserves each
+   * struct-typed column's native `StructType` verbatim.  A SQL
+   * `CAST(NULL AS <ddl>)` round-trip (via `DataType.sql`) can reconstruct a
+   * subtly different nested type, which the openivm-emitted delta scan's
+   * struct-field extraction then mis-resolves — e.g. `crm_customer_mgmt`'s
+   * nested `Customer` struct, where a flattened phone field resolved to the
+   * whole struct and broke `concat_ws` at analysis time.  Zero rows, so the
+   * incremental path is unchanged; column order matches the non-empty views
+   * (source columns, then timestamp, then multiplicity).
+   */
+  protected final def registerEmptyDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType
+  ): String = {
+    val short    = sourceTable.split("\\.").last
+    val viewName = s"openivm_delta_$short"
+    val schema   = sourceSchema.add("openivm_timestamp", TimestampType).add("openivm_multiplicity", IntegerType)
+    spark
+      .createDataFrame(spark.sparkContext.emptyRDD[Row], schema)
+      .createOrReplaceTempView(viewName)
+    s"/* empty typed delta view `$viewName` (${schema.length} cols) registered via DataFrame API */"
   }
 
   /**

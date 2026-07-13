@@ -109,6 +109,13 @@ object StagingDeltaView {
     }
 
     if (parts.isEmpty) {
+      // The common empty case (no pending deltas for this source) is registered
+      // via the DataFrame API in ChangePropagation.registerEmptyDeltaView, which
+      // preserves struct-typed columns' exact native type (a CAST(NULL AS <ddl>)
+      // round-trip can mis-resolve nested struct extraction — e.g. the
+      // crm_customer_mgmt `Customer` struct). This SQL rendering remains for
+      // diagnostic logging and the rare all-unsupported-deltas fallback; WHERE
+      // 1=0 yields zero rows so the incremental path is unchanged.
       val nullCols = sourceSchema.fieldNames.map(n => s"NULL AS `${n.replace("`", "``")}`").mkString(", ")
       s"""CREATE OR REPLACE TEMP VIEW $viewName AS
          |SELECT $cols, CURRENT_TIMESTAMP() AS openivm_timestamp, CAST(0 AS INT) AS openivm_multiplicity
