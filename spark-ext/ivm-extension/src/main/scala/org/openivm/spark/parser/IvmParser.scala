@@ -27,11 +27,13 @@ import org.openivm.spark.parser.gen.IvmSqlBaseParser
  *
  * Routing decision in [[parsePlan]]:
  *  - If the SQL text starts (after stripping leading whitespace / SQL comments) with
+ *    `EXPLAIN CREATE MATERIALIZED VIEW`,
+ *    `SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW`,
  *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`,
  *    `DROP MATERIALIZED VIEW`, `SHOW OPENIVM REFRESH PROFILE`, or
  *    `SHOW OPENIVM QUERY LOG`
  *    (case-insensitive) → parsed by [[IvmSqlBaseParser]] / [[IvmAstBuilder]].
- *  - Everything else → [[delegate]].
+ *  - Everything else (including bare `EXPLAIN <query>` and `OPTIMIZE`) → [[delegate]].
  *
  * All methods other than [[parsePlan]] delegate to [[delegate]] unchanged.
  */
@@ -151,6 +153,8 @@ private object IvmParser {
    */
   val IvmKeyword: Pattern = Pattern.compile(
     "\\A(?:" +
+      "explain\\s+create\\s+materialized\\s+view|" +
+      "show\\s+refresh\\s+sql\\s+for\\s+create\\s+materialized\\s+view|" +
       "(?:create|refresh|drop)\\s+materialized\\s+view|" +
       "show\\s+openivm\\s+refresh\\s+profile|" +
       "show\\s+openivm\\s+query\\s+log" +

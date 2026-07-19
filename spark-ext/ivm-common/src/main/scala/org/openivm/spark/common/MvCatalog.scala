@@ -97,6 +97,15 @@ final case class MvMetadata(
         case "false" => false
       }
       .getOrElse(RefreshTypeCode.emitsCascadeViewDelta(refreshType))
+
+  /** User-supplied `CLUSTER BY` columns (declaration order), or empty when the
+    * MV was created without an explicit `CLUSTER BY` clause.
+    */
+  def clusterColumns: Seq[String] =
+    properties
+      .get(MvMetadata.ClusterColumnsKey)
+      .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toSeq)
+      .getOrElse(Seq.empty)
 }
 
 object MvMetadata {
@@ -118,6 +127,12 @@ object MvMetadata {
     * opt-in compile-classification cache below.
     */
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
+
+  /** Property key recording the user-supplied `CLUSTER BY` columns from
+    * `CREATE MATERIALIZED VIEW ... CLUSTER BY (...)`. Comma-separated, in
+    * declaration order. Empty/absent when the MV has no explicit clustering.
+    */
+  val ClusterColumnsKey: String = "_ivm_cluster_cols"
 
   /** Last observable compile-time cost-model hint captured during REFRESH. */
   val LastCostModelHintKey: String = "_ivm_last_cost_model_hint"
@@ -146,6 +161,13 @@ object MvMetadata {
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
+
+  /** Build the property entry recording the user-supplied `CLUSTER BY` columns.
+    * Returns an empty map when there are no clustering columns.
+    */
+  def clusterColumnsProperties(cols: Seq[String]): Map[String, String] =
+    if (cols.isEmpty) Map.empty
+    else Map(ClusterColumnsKey -> cols.mkString(","))
 
   /** Tier component for the compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative
