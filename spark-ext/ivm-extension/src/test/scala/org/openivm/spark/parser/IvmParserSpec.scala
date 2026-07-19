@@ -11,7 +11,9 @@ import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.types.{IntegerType, LongType, StringType, TimestampType}
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
+import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -100,6 +102,89 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       plan shouldBe a[CreateMaterializedViewCommand]
       val cmd = plan.asInstanceOf[CreateMaterializedViewCommand]
       cmd.originalQueryText shouldBe queryBody
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 10 — CLUSTER BY (#24)
+    // -------------------------------------------------------------------------
+    it("parses a CLUSTER BY clause into clusterColumns (declaration order)") {
+      val sql =
+        "CREATE MATERIALIZED VIEW v CLUSTER BY (region, day) AS SELECT region, day FROM t"
+      val plan = spark.sessionState.sqlParser.parsePlan(sql)
+      plan shouldBe a[CreateMaterializedViewCommand]
+      val cmd = plan.asInstanceOf[CreateMaterializedViewCommand]
+      cmd.clusterColumns shouldBe Seq("region", "day")
+      cmd.originalQueryText shouldBe "SELECT region, day FROM t"
+    }
+
+    it("defaults clusterColumns to empty when no CLUSTER BY clause is present") {
+      val plan = spark.sessionState.sqlParser.parsePlan("CREATE MATERIALIZED VIEW v AS SELECT 1")
+      plan.asInstanceOf[CreateMaterializedViewCommand].clusterColumns shouldBe empty
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 11 — EXPLAIN CREATE MATERIALIZED VIEW (#4)
+  // ---------------------------------------------------------------------------
+  describe("EXPLAIN CREATE MATERIALIZED VIEW") {
+    it("parses to ExplainCreateMaterializedViewCommand with the inner query text") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "EXPLAIN CREATE MATERIALIZED VIEW v AS SELECT id FROM t"
+      )
+      plan shouldBe a[ExplainCreateMaterializedViewCommand]
+      val cmd = plan.asInstanceOf[ExplainCreateMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("v")
+      cmd.queryText shouldBe "SELECT id FROM t"
+      cmd.clusterColumns shouldBe empty
+      cmd.output.map(_.name) shouldBe Seq("explain")
+    }
+
+    it("carries CLUSTER BY columns through the EXPLAIN wrapper") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "EXPLAIN CREATE MATERIALIZED VIEW db.v CLUSTER BY (k) AS SELECT k FROM t"
+      )
+      val cmd = plan.asInstanceOf[ExplainCreateMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("v", Some("db"))
+      cmd.clusterColumns shouldBe Seq("k")
+    }
+
+    it("does not intercept a bare EXPLAIN <query> (delegates to Spark)") {
+      val plan = spark.sessionState.sqlParser.parsePlan("EXPLAIN SELECT 1")
+      plan should not be a[ExplainCreateMaterializedViewCommand]
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 12 — SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW (#25)
+  // ---------------------------------------------------------------------------
+  describe("SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW") {
+    it("parses to ShowMaterializedViewRefreshSqlCommand with the inner query text") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW v AS SELECT id FROM t"
+      )
+      plan shouldBe a[ShowMaterializedViewRefreshSqlCommand]
+      val cmd = plan.asInstanceOf[ShowMaterializedViewRefreshSqlCommand]
+      cmd.name shouldBe TableIdentifier("v")
+      cmd.queryText shouldBe "SELECT id FROM t"
+      cmd.output.map(_.name) shouldBe Seq("refresh_sql")
+    }
+
+    it("does not collide with SHOW OPENIVM REFRESH PROFILE routing") {
+      val plan = spark.sessionState.sqlParser.parsePlan("SHOW OPENIVM REFRESH PROFILE")
+      plan shouldBe a[ShowRefreshProfileCommand]
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 13 — OPTIMIZE is NOT intercepted (falls through to base Spark/Delta)
+  // ---------------------------------------------------------------------------
+  describe("OPTIMIZE passthrough") {
+    it("does not route OPTIMIZE to an IVM node") {
+      // base Spark on the unit-test classpath (no Delta command extension) rejects
+      // OPTIMIZE, which proves IvmParser delegated rather than intercepting it.
+      an[ParseException] should be thrownBy {
+        spark.sessionState.sqlParser.parsePlan("OPTIMIZE v")
+      }
     }
   }
 

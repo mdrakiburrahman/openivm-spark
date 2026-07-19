@@ -31,7 +31,7 @@ import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
-import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
+import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler}
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
@@ -557,6 +557,177 @@ private[commands] object MvCommandHelper {
     viewNames.foreach(n => spark.sql(s"DROP VIEW IF EXISTS `$n`"))
 
   private def escapePath(p: String): String = p.replace("`", "``")
+
+  // ---------------------------------------------------------------------------
+  // Shared refresh-type classification.
+  //
+  // These helpers are the SINGLE source of truth for the effective refresh-type
+  // decision. They are invoked by both the live CREATE path
+  // ([[CreateMaterializedViewCommand.runCreate]]) and the side-effect-free dry
+  // compile ([[MvDryCompile]]) that backs `EXPLAIN CREATE MATERIALIZED VIEW` and
+  // `SHOW REFRESH SQL`. Keeping the decision in one place guarantees the EXPLAIN
+  // verdict is byte-identical to what a real CREATE would classify — so we never
+  // report a query as incrementalizable when CREATE would demote it (or vice
+  // versa). The ivm-it parity suite plus the explicit EXPLAIN==CREATE parity
+  // test guard against drift.
+  // ---------------------------------------------------------------------------
+
+  /** The effective refresh-type verdict for a materialized view. */
+  final case class EffectiveClassification(
+      refreshType: Int,
+      refreshTypeName: String,
+      reason: String,
+      emitsCascadeViewDelta: Boolean
+  )
+
+  /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
+    * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
+    * Read-only: `LIMIT 0` triggers no scan/write.
+    */
+  def computeAggregateHavingDataColumns(
+      spark: SparkSession,
+      compiled: CompiledRefresh,
+      originalQueryText: String
+  ): Option[Set[String]] =
+    if (compiled.refreshType != RefreshTypeCode.AggregateHaving) None
+    else {
+      val incrementalViewBodySql =
+        if (compiled.initialLoadSql.isEmpty) originalQueryText
+        else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+      try
+        Some(
+          spark
+            .sql(s"SELECT * FROM ($incrementalViewBodySql) __openivm_having_preview LIMIT 0")
+            .schema
+            .fieldNames
+            .toSet
+        )
+      catch { case _: Throwable => None }
+    }
+
+  /** True unless the compiled SIMPLE_PROJECTION delta feed rewrites to a single
+    * statement (i.e. a delta feed with no data-table apply, which would make
+    * REFRESH a no-op). Non-SIMPLE_PROJECTION views short-circuit to `true`.
+    * Read-only: the rewrite is a pure string transform against a probe path.
+    */
+  def computeSimpleProjectionHasDataApply(
+      spark: SparkSession,
+      compiled: CompiledRefresh,
+      name: TableIdentifier,
+      location: String,
+      qualSchemas: Map[String, StructType],
+      shortToQual: Map[String, String]
+  ): Boolean =
+    if (compiled.refreshType != RefreshTypeCode.SimpleProjection || compiled.sql.isEmpty) true
+    else {
+      val probeViewDeltaPath = s"${location.stripSuffix("/")}/__openivm_rewrite_probe"
+      try {
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = compiled.sql,
+          mvName = name,
+          mvLocation = location,
+          viewLogicalName = name.table,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = probeViewDeltaPath,
+          postProcess = org.openivm.spark.compiler.LptsSparkDialect.translate,
+          sourceSchemas = qualSchemas.map { case (qual, schema) =>
+            qual.split("\\.").last -> schema.fieldNames.toSeq
+          },
+          sourceQualifiedNames = shortToQual
+        )
+        rewritten.statements.size > 1
+      } catch { case _: Throwable => false }
+    }
+
+  /** Enumerate every source that resolves to a tracked materialized view,
+    * keyed by the qualified source name. Symmetric on `db.table` vs bare-name
+    * so it matches MVs created with or without a db prefix. Read-only.
+    */
+  def computeUpstreamMvByQual(
+      spark: SparkSession,
+      qualNames: Seq[String]
+  ): Map[String, MvMetadata] = {
+    val all: Seq[MvMetadata] =
+      try MvCatalog.list(spark)
+      catch { case _: Throwable => Seq.empty[MvMetadata] }
+    val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
+    qualNames.flatMap { qn =>
+      val short = qn.split("\\.").last
+      byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> m)
+    }.toMap
+  }
+
+  /** `Some(reason)` when any upstream MV cannot feed a downstream-consumable
+    * `openivm_delta_<view>` (currently: an upstream classified FULL_REFRESH),
+    * else `None`. Drives the `non_cascade_upstream` demotion below.
+    */
+  def computeNonCascadeUpstreamReason(upstreamMvByQual: Map[String, MvMetadata]): Option[String] = {
+    val nonCascadeUpstreams: Seq[(String, String)] =
+      upstreamMvByQual.toSeq.collect {
+        case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
+        // Deliberately NOT demoting on `upstream is AGGREGATE_GROUP` or
+        // `upstream MV count >= 2`: two historical guards
+        // (`aggregate_group_into_simple_projection`, `multi_mv_simple_projection`)
+        // were removed because duckdb-openivm emits SIMPLE_PROJECTION refresh as a
+        // positive-only bag-apply and multi-source refresh as ONE UNION-ALL delta
+        // statement — both shapes the Spark rewriter already handles at binary
+        // parity. Re-adding either guard silently regresses incrementalization; the
+        // full rationale lives in git history at this line.
+      }
+    if (nonCascadeUpstreams.isEmpty) None
+    else
+      Some(
+        nonCascadeUpstreams
+          .groupBy(_._2)
+          .toSeq
+          .sortBy(_._1)
+          .map { case (reason, entries) => s"$reason:${entries.map(_._1).mkString(",")}" }
+          .mkString(";")
+      )
+  }
+
+  /** The effective refresh-type decision. Every FULL_REFRESH demotion here is
+    * the ONLY place a compiled incremental type is downgraded, so this is the
+    * function that must never regress. See the reason-key documentation inline.
+    */
+  def classifyEffectiveRefreshType(
+      compiled: CompiledRefresh,
+      viewShortName: String,
+      isTopKView: Boolean,
+      simpleProjectionHasDataApply: Boolean,
+      nonCascadeUpstreamReason: Option[String],
+      rawHavingPred: Option[String],
+      aggregateHavingDataColumns: Option[Set[String]]
+  ): EffectiveClassification = {
+    val (effectiveRefreshType, reason) = {
+      if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
+      else if (!simpleProjectionHasDataApply)
+        (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
+      else if (nonCascadeUpstreamReason.nonEmpty)
+        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason.get}")
+      else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
+        (compiled.refreshType, "window_partition_kept")
+      else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
+        (compiled.refreshType, "group_recompute_kept")
+      else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
+        (RefreshTypeCode.FullRefresh, "having_pred_empty")
+      else if (
+        compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred
+          .exists(pred => aggregateHavingDataColumns.forall(cols => !havingPredicateIsSafe(pred, cols)))
+      )
+        (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
+      else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName))
+        (RefreshTypeCode.FullRefresh, "no_real_delta")
+      else (compiled.refreshType, "kept")
+    }
+    val effectiveRefreshTypeName =
+      if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
+      else compiled.refreshTypeName
+    val emitsCascadeViewDelta =
+      RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+        SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
+    EffectiveClassification(effectiveRefreshType, effectiveRefreshTypeName, reason, emitsCascadeViewDelta)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +739,8 @@ private[commands] object MvCommandHelper {
  *
  * @param originalQueryText  Raw SQL of the SELECT body, captured by the parser.
  *                           Stored verbatim in MvMetadata and passed to the compiler.
+ * @param clusterColumns     User-supplied `CLUSTER BY (...)` columns (declaration
+ *                           order); empty when the DDL had no `CLUSTER BY` clause.
  */
 case class CreateMaterializedViewCommand(
     name: TableIdentifier,
@@ -575,7 +748,8 @@ case class CreateMaterializedViewCommand(
     properties: Map[String, String],
     ifNotExists: Boolean,
     provider: Option[String],
-    originalQueryText: String
+    originalQueryText: String,
+    clusterColumns: Seq[String] = Seq.empty
 ) extends LeafRunnableCommand {
 
   override def run(spark: SparkSession): Seq[Row] = {
@@ -701,47 +875,10 @@ case class CreateMaterializedViewCommand(
     // Storage location
     val location = mvLocation(spark, name)
     val aggregateHavingDataColumns: Option[Set[String]] =
-      if (compiled.refreshType != RefreshTypeCode.AggregateHaving) None
-      else {
-        val incrementalViewBodySql =
-          if (compiled.initialLoadSql.isEmpty) originalQueryText
-          else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
-        try {
-          Some(
-            spark
-              .sql(s"SELECT * FROM ($incrementalViewBodySql) __openivm_having_preview LIMIT 0")
-              .schema
-              .fieldNames
-              .toSet
-          )
-        } catch {
-          case _: Throwable => None
-        }
-      }
+      computeAggregateHavingDataColumns(spark, compiled, originalQueryText)
 
     val simpleProjectionHasDataApply: Boolean =
-      if (compiled.refreshType != RefreshTypeCode.SimpleProjection || compiled.sql.isEmpty) true
-      else {
-        val probeViewDeltaPath = s"${location.stripSuffix("/")}/__openivm_rewrite_probe"
-        try {
-          val rewritten = SparkRefreshRewriter.rewrite(
-            compiledSql = compiled.sql,
-            mvName = name,
-            mvLocation = location,
-            viewLogicalName = name.table,
-            sourceTempViews = Map.empty,
-            viewDeltaPath = probeViewDeltaPath,
-            postProcess = org.openivm.spark.compiler.LptsSparkDialect.translate,
-            sourceSchemas = qualSchemas.map { case (qual, schema) =>
-              qual.split("\\.").last -> schema.fieldNames.toSeq
-            },
-            sourceQualifiedNames = shortToQual
-          )
-          rewritten.statements.size > 1
-        } catch {
-          case _: Throwable => false
-        }
-      }
+      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
 
     // Move the fingerprint computation below the upstream-MV enumeration so we
     // can include each upstream MV's identity hash. This way DROP + recreate
@@ -814,58 +951,14 @@ case class CreateMaterializedViewCommand(
     //
     // Lookup is symmetric on db.table vs bare-name matching to handle MVs
     // created with or without an explicit db prefix.
-    val upstreamMvByQual: Map[String, MvMetadata] = {
-      val all: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
-      val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
-      qualNames.flatMap { qn =>
-        val short = qn.split("\\.").last
-        byMeta.get(qn).orElse(byMeta.get(short)).map(m => qn -> m)
-      }.toMap
-    }
-    val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
+    val upstreamMvByQual: Map[String, MvMetadata] = computeUpstreamMvByQual(spark, qualNames)
+    val sourceIsMv: Boolean                       = upstreamMvByQual.nonEmpty
     val distinctUpstreamMvCount: Int =
       upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
-    val nonCascadeUpstreams: Seq[(String, String)] =
-      upstreamMvByQual.toSeq.collect {
-        case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
-        // NOTE: an earlier `aggregate_group_into_simple_projection` guard demoted any SIMPLE_PROJECTION
-        // whose upstream is AGGREGATE_GROUP, because openivm's NULL-companion retract
-        // (`openivm/src/upsert/refresh_sql.cpp:898-960`) emits `(group_keys, NULL, NULL, ..., -1)`
-        // rows that the downstream's value-equality MERGE cannot match. The guard was relaxed
-        // because duckdb-openivm's compile path emits SIMPLE_PROJECTION refresh as a POSITIVE-ONLY
-        // bag-apply for the data-table path: `INSERT INTO openivm_data_<v> ... WHERE openivm_multiplicity > 0`
-        // — no DELETE/MERGE arm for negatives is generated. Negative-multiplicity rows from the
-        // upstream retract are dropped at the join filter (BETWEEN over NULL → UNKNOWN) before
-        // reaching the apply step. This matches duckdb-openivm's actual behavior, so Spark and
-        // DuckDB agree on the bag at every batch boundary; both engines have the same
-        // correctness footprint at scales where upstream dim deltas remain empty across batches
-        // (the TPC-DI 100/1/1 layout: only fact tables change in batches 2/3). At larger scales
-        // where dimension SCD-2 retracts manifest, both engines exhibit the same drift documented
-        // in `.scratch/OPENIVM_VALIDATE.md` — Failure Mode 1, and the fix lives in openivm itself
-        // (emit pre-merge snapshot retracts instead of NULL-companion). The fact that this
-        // demotion existed only on the Spark side broke binary parity with duckdb-openivm.
-        // NOTE: an earlier `multi_mv_simple_projection` guard demoted every SIMPLE_PROJECTION whose
-        // upstream MV count was >= 2. That guard was over-defensive: openivm emits multi-source
-        // SIMPLE_PROJECTION refresh as ONE `INSERT INTO openivm_delta_<view>` with a UNION ALL of
-        // (Δup1 × cur_up2) ⊎ (cur_up1 × Δup2) ⊎ (-1 × Δup1 × Δup2) arms — all delta terms are
-        // consumed in a single statement. The Spark rewriter handles this shape today:
-        // `MaterializedViewCommands.runRefresh` (L962-972) registers one `openivm_delta_<source>`
-        // temp view per source in `meta.sourceTables`, `SparkRefreshRewriter.rewriteMemoryMainPrefix`
-        // substitutes every `memory.main.openivm_delta_<X>` reference (no single-source assumption),
-        // and `StagingDeltaView.buildSourceDeltaViewSql` UNION-ALL-s base-table staging deltas with
-        // the upstream MV's persisted view-delta (via the `MvViewDelta` opType branch). The TPC-DI
-        // parity suite verifies bag-equality across batch-1/2/3 for 16 MVs that were previously
-        // demoted by these two guards.
-      }
-    val nonCascadeUpstreamReason: String =
-      nonCascadeUpstreams
-        .groupBy(_._2)
-        .toSeq
-        .sortBy(_._1)
-        .map { case (reason, entries) => s"${reason}:${entries.map(_._1).mkString(",")}" }
-        .mkString(";")
+    // Non-cascade-upstream demotion reason (None when every upstream MV can feed
+    // a downstream-consumable view-delta). See computeNonCascadeUpstreamReason.
+    val nonCascadeUpstreamReason: Option[String] =
+      computeNonCascadeUpstreamReason(upstreamMvByQual)
     // ── Effective refresh-type classification with structured logging ──────
     //
     // Every demotion of `compiled.refreshType` to FULL_REFRESH below is
@@ -896,36 +989,22 @@ case class CreateMaterializedViewCommand(
     // INFO-level for "kept" so the per-MV decision is always visible during
     // normal operation; ERROR-level for any demotion so even
     // production-tuned log filters surface it.
-    val (effectiveRefreshType, classifyReason) = {
-      if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
-      else if (!simpleProjectionHasDataApply)
-        (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
-      else if (nonCascadeUpstreams.nonEmpty)
-        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason}")
-      else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
-        (compiled.refreshType, "window_partition_kept")
-      else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
-        (compiled.refreshType, "group_recompute_kept")
-      else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
-        (RefreshTypeCode.FullRefresh, "having_pred_empty")
-      else if (
-        compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred
-          .exists(pred => aggregateHavingDataColumns.forall(cols => !havingPredicateIsSafe(pred, cols)))
-      )
-        (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
-      else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table))
-        (RefreshTypeCode.FullRefresh, "no_real_delta")
-      else (compiled.refreshType, "kept")
-    }
-    // `sourceIsMv` is computed for logging visibility only; the demotion is
-    // now driven by `nonCascadeUpstreams.nonEmpty` (see above).
+    val classification = classifyEffectiveRefreshType(
+      compiled = compiled,
+      viewShortName = name.table,
+      isTopKView = isTopKView,
+      simpleProjectionHasDataApply = simpleProjectionHasDataApply,
+      nonCascadeUpstreamReason = nonCascadeUpstreamReason,
+      rawHavingPred = rawHavingPred,
+      aggregateHavingDataColumns = aggregateHavingDataColumns
+    )
+    val effectiveRefreshType     = classification.refreshType
+    val classifyReason           = classification.reason
+    val effectiveRefreshTypeName = classification.refreshTypeName
+    val emitsCascadeViewDelta    = classification.emitsCascadeViewDelta
+    // `sourceIsMv`/`distinctUpstreamMvCount` are computed for logging visibility
+    // only; the demotion is driven by the shared classifier above.
     val _ = (sourceIsMv, distinctUpstreamMvCount)
-    val effectiveRefreshTypeName =
-      if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
-      else compiled.refreshTypeName
-    val emitsCascadeViewDelta =
-      RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
-        SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 
     {
       val msg =
@@ -954,6 +1033,7 @@ case class CreateMaterializedViewCommand(
     val baseProps         = Map("_ivm_group_keys" -> groupKeys.mkString(","))
     val countProp         = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp        = havingPred.map(p => "_ivm_having_pred" -> p).toMap
+    val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
 
     // Fingerprint the current source schemas + every upstream MV's identity
@@ -997,7 +1077,7 @@ case class CreateMaterializedViewCommand(
     val watermarks     = propagation.currentWatermarks(spark, qualNames)
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
     val allProps =
-      properties ++ baseProps ++ countProp ++ havingProp ++ cascadeDeltaProps ++
+      properties ++ baseProps ++ countProp ++ havingProp ++ clusterColsProp ++ cascadeDeltaProps ++
         compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
@@ -1034,8 +1114,13 @@ case class CreateMaterializedViewCommand(
       if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowClusterPruneEnabled(spark))
         resolvedWindowPartitionColumns(analyzed)
       else None
+    // A user-supplied `CLUSTER BY` (#24) overrides the window-partition
+    // auto-prune columns; otherwise fall back to the window-prune behaviour.
+    val effectiveClusterCols: Option[Seq[String]] =
+      if (clusterColumns.nonEmpty) Some(clusterColumns)
+      else windowClusterCols
     val clusterClause =
-      windowClusterCols
+      effectiveClusterCols
         .filter(_.nonEmpty)
         .map(cols => s"CLUSTER BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
         .getOrElse("")
