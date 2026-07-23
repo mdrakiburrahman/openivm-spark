@@ -1,6 +1,7 @@
 package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
+import org.openivm.spark.common.RefreshSqlLogCatalog
 
 /** Split-off from `AggregateSpec.scala` so that each chunk of ~10 tests runs
   * in its own forked JVM (see `spark-ext/project/Settings.scala`). All table
@@ -9,6 +10,9 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   */
 abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggregate-scalar-avg-min-max") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] =
+    super.extraSparkConf + ("spark.openivm.queryLog.enabled" -> "true")
 
   // openivm test/sql/aggregate.test §UNGROUPED (SCALAR) AGGREGATES
   describe("ungrouped scalar aggregate — aggsmm_scores(SUM(value), COUNT(label))") {
@@ -172,6 +176,210 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
       )
       refreshMv("aggsmm_mv_agg_minmax_null_insert")
       assertMvCorrect("aggsmm_mv_agg_minmax_null_insert", viewBody)
+    }
+  }
+
+  describe("Terminal insert-only MIN/MAX with derived status — watches shape") {
+    it("uses incremental maintenance for inserts and remains correct after a mixed mutating batch") {
+      sql(
+        "CREATE TABLE aggsmm_watch_events " +
+          "(customer_id INT, symbol STRING, action STRING, event_ts TIMESTAMP) USING DELTA"
+      )
+      sql(
+        "INSERT INTO aggsmm_watch_events VALUES " +
+          "(1, 'A', 'Activate', TIMESTAMP'2026-01-01 10:00:00'), " +
+          "(2, 'B', 'Activate', TIMESTAMP'2026-01-01 11:00:00')"
+      )
+      val viewBody =
+        "WITH grouped AS (" +
+          "SELECT customer_id, symbol, " +
+          "MIN(CASE WHEN action = 'Activate' THEN event_ts END) AS placed_at, " +
+          "MAX(CASE WHEN action = 'Cancelled' THEN event_ts END) AS removed_at " +
+          "FROM aggsmm_watch_events GROUP BY customer_id, symbol) " +
+          "SELECT *, 'JOIN' AS sql_text_marker, " +
+          "CASE WHEN removed_at IS NULL THEN 'Active' ELSE 'Inactive' END AS status FROM grouped"
+      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_events AS $viewBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+
+      sql(
+        "INSERT INTO aggsmm_watch_events VALUES " +
+          "(1, 'A', 'Cancelled', TIMESTAMP'2026-01-02 10:00:00'), " +
+          "(3, 'C', 'Activate', TIMESTAMP'2026-01-02 12:00:00'), " +
+          "(3, 'C', 'Activate', TIMESTAMP'2026-01-02 09:00:00')"
+      )
+      refreshMv("aggsmm_mv_watch_events")
+      assertMvCorrect("aggsmm_mv_watch_events", viewBody)
+
+      val insertOnlyRows = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .toSeq
+        .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_events")
+      val rewrittenInsertOnly = insertOnlyRows.filter(_.getString(6) == "rewritten_stmt")
+      if (modeLabel == "cdf") {
+        rewrittenInsertOnly should have size 1
+        rewrittenInsertOnly.head.getString(7) shouldBe "merge"
+        rewrittenInsertOnly.head.getString(9).toUpperCase should include("MERGE INTO")
+        rewrittenInsertOnly.head.getString(9).toUpperCase should not include "CREATE OR REPLACE TABLE"
+        insertOnlyRows.map(_.getString(6)) should not contain "count_monoid_cleanup"
+      }
+
+      RefreshSqlLogCatalog.removeAll(spark)
+
+      sql("DELETE FROM aggsmm_watch_events WHERE customer_id = 3 AND event_ts = TIMESTAMP'2026-01-02 09:00:00'")
+      sql(
+        "UPDATE aggsmm_watch_events SET event_ts = TIMESTAMP'2026-01-03 10:00:00' " +
+          "WHERE customer_id = 1 AND action = 'Cancelled'"
+      )
+      sql(
+        "INSERT INTO aggsmm_watch_events VALUES " +
+          "(2, 'B', 'Cancelled', TIMESTAMP'2026-01-04 10:00:00')"
+      )
+      refreshMv("aggsmm_mv_watch_events")
+      assertMvCorrect("aggsmm_mv_watch_events", viewBody)
+
+      val mixedRows = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .toSeq
+        .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_events")
+        .filter(_.getString(6) == "rewritten_stmt")
+      mixedRows.size should be > 1
+    }
+  }
+
+  describe("Terminal MIN/MAX after an insert-only MERGE") {
+    itCdf("uses the exact CDF rows to prove an otherwise-conservative commit is insert-only") {
+      sql(
+        "CREATE TABLE aggsmm_watch_merge_events " +
+          "(customer_id INT, symbol STRING, action STRING, event_ts TIMESTAMP) USING DELTA"
+      )
+      sql(
+        "INSERT INTO aggsmm_watch_merge_events VALUES " +
+          "(1, 'A', 'Activate', TIMESTAMP'2026-02-01 10:00:00')"
+      )
+      val viewBody =
+        "WITH grouped AS (" +
+          "SELECT customer_id, symbol, " +
+          "MIN(CASE WHEN action = 'Activate' THEN event_ts END) AS placed_at, " +
+          "MAX(CASE WHEN action = 'Cancelled' THEN event_ts END) AS removed_at " +
+          "FROM aggsmm_watch_merge_events GROUP BY customer_id, symbol) " +
+          "SELECT *, CASE WHEN removed_at IS NULL THEN 'Active' ELSE 'Inactive' END AS status FROM grouped"
+      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_merge_events AS $viewBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+
+      sql(
+        "MERGE INTO aggsmm_watch_merge_events AS t USING (" +
+          "SELECT 1 AS customer_id, 'A' AS symbol, 'Cancelled' AS action, " +
+          "TIMESTAMP'2026-02-02 10:00:00' AS event_ts UNION ALL " +
+          "SELECT 2, 'B', 'Activate', TIMESTAMP'2026-02-02 11:00:00') AS s " +
+          "ON t.customer_id = s.customer_id AND t.symbol = s.symbol AND t.action = s.action " +
+          "WHEN NOT MATCHED THEN INSERT (customer_id, symbol, action, event_ts) " +
+          "VALUES (s.customer_id, s.symbol, s.action, s.event_ts)"
+      )
+      refreshMv("aggsmm_mv_watch_merge_events")
+      assertMvCorrect("aggsmm_mv_watch_merge_events", viewBody)
+
+      val rewrittenRows = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .toSeq
+        .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_merge_events")
+        .filter(_.getString(6) == "rewritten_stmt")
+      rewrittenRows should have size 1
+      rewrittenRows.head.getString(7) shouldBe "merge"
+      rewrittenRows.head.getString(9).toUpperCase should include("MERGE INTO")
+      rewrittenRows.head.getString(9).toUpperCase should not include "CREATE OR REPLACE TABLE"
+    }
+  }
+
+  describe("Cascading insert-only MIN/MAX with derived status — watches DAG") {
+    it("uses the MIN/MAX merge while preserving the signed delta for its downstream MV") {
+      sql(
+        "CREATE TABLE aggsmm_watch_dag_events " +
+          "(customer_id INT, symbol STRING, action STRING, event_ts TIMESTAMP) USING DELTA"
+      )
+      sql(
+        "INSERT INTO aggsmm_watch_dag_events VALUES " +
+          "(1, 'A', 'Activate', TIMESTAMP'2026-03-01 10:00:00'), " +
+          "(2, 'B', 'Activate', TIMESTAMP'2026-03-01 11:00:00')"
+      )
+      val watchesBody =
+        "WITH grouped AS (" +
+          "SELECT customer_id, symbol, " +
+          "MIN(CASE WHEN action = 'Activate' THEN event_ts END) AS placed_at, " +
+          "MAX(CASE WHEN action = 'Cancelled' THEN event_ts END) AS removed_at " +
+          "FROM aggsmm_watch_dag_events GROUP BY customer_id, symbol) " +
+          "SELECT *, CASE WHEN removed_at IS NULL THEN 'Active' ELSE 'Inactive' END AS status FROM grouped"
+      val downstreamBody =
+        "SELECT customer_id, symbol, status FROM aggsmm_mv_watch_dag"
+      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_dag AS $watchesBody")
+      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_dag_downstream AS $downstreamBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql(
+        "INSERT INTO aggsmm_watch_dag_events VALUES " +
+          "(1, 'A', 'Cancelled', TIMESTAMP'2026-03-02 10:00:00'), " +
+          "(3, 'C', 'Activate', TIMESTAMP'2026-03-02 12:00:00')"
+      )
+      refreshMv("aggsmm_mv_watch_dag")
+      refreshMv("aggsmm_mv_watch_dag_downstream")
+      assertMvCorrect("aggsmm_mv_watch_dag", watchesBody)
+      assertMvCorrect("aggsmm_mv_watch_dag_downstream", downstreamBody)
+
+      if (modeLabel == "cdf") {
+        val rewrittenSql = sql("SHOW OPENIVM QUERY LOG")
+          .collect()
+          .toSeq
+          .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_dag")
+          .filter(_.getString(6) == "rewritten_stmt")
+          .map(_.getString(9).toUpperCase)
+        rewrittenSql.mkString("\n") should include("MERGE INTO")
+        rewrittenSql.mkString("\n") should include("CREATE OR REPLACE TABLE")
+        rewrittenSql.mkString("\n") should not include "WHEN MATCHED THEN DELETE"
+      }
+
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql(
+        "UPDATE aggsmm_watch_dag_events SET event_ts = TIMESTAMP'2026-03-03 10:00:00' " +
+          "WHERE customer_id = 1 AND action = 'Cancelled'"
+      )
+      sql(
+        "DELETE FROM aggsmm_watch_dag_events " +
+          "WHERE customer_id = 3 AND action = 'Activate'"
+      )
+      refreshMv("aggsmm_mv_watch_dag")
+      refreshMv("aggsmm_mv_watch_dag_downstream")
+      assertMvCorrect("aggsmm_mv_watch_dag", watchesBody)
+      assertMvCorrect("aggsmm_mv_watch_dag_downstream", downstreamBody)
+    }
+  }
+
+  describe("Outer-join aggregate insert batches") {
+    it("keeps the cascade/recompute pipeline because a match retracts the NULL-padded row") {
+      sql("CREATE TABLE aggsmm_outer_left (id INT, grp INT) USING DELTA")
+      sql("CREATE TABLE aggsmm_outer_right (left_id INT, value INT) USING DELTA")
+      sql("INSERT INTO aggsmm_outer_left VALUES (1, 10), (2, 20)")
+      val viewBody =
+        "SELECT l.grp, MIN(r.value) AS min_value, MAX(r.value) AS max_value " +
+          "FROM aggsmm_outer_left l LEFT JOIN aggsmm_outer_right r ON l.id = r.left_id GROUP BY l.grp"
+      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_outer_minmax AS $viewBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql("INSERT INTO aggsmm_outer_right VALUES (1, 9), (1, 4), (2, 7)")
+      refreshMv("aggsmm_mv_outer_minmax")
+      assertMvCorrect("aggsmm_mv_outer_minmax", viewBody)
+
+      val rewrittenRows = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .toSeq
+        .filter(_.getString(1).split("\\.").last == "aggsmm_mv_outer_minmax")
+        .filter(_.getString(6) == "rewritten_stmt")
+      rewrittenRows.size should be > 1
+      rewrittenRows.map(_.getString(9).toUpperCase).mkString("\n") should include("CREATE OR REPLACE TABLE")
     }
   }
 

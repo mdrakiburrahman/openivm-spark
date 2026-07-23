@@ -278,7 +278,9 @@ object SparkRefreshRewriter {
     */
   private[spark] def isMergeStatement(sql: String): Boolean = {
     val stripped = stripExecutionMarker(sql)
-    "(?is)^\\s*MERGE\\s+INTO\\s+".r.findFirstMatchIn(stripped).isDefined
+    findTopLevelSqlKeyword(stripped, 0, stripped.length, "MERGE").exists { mergeIdx =>
+      "(?is)^MERGE\\s+INTO\\b".r.findFirstIn(stripped.substring(mergeIdx)).isDefined
+    }
   }
 
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
@@ -297,6 +299,38 @@ object SparkRefreshRewriter {
       ("(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+delta\\.`" + literalPath +
         "`\\s+USING\\s+DELTA\\s+AS\\s+(.+)$").r
     ctasRe.findFirstMatchIn(stripExecutionMarker(stmt)).map(_.group(1).trim)
+  }
+
+  /** Inline a view-delta CTAS body into its single aggregate MERGE consumer.
+    *
+    * Eligible insert-only terminal aggregates do not need a durable cascade
+    * delta. Replacing the one scratch-path scan with the CTAS query turns the
+    * two-statement write/read program into one Spark pipeline. Return `None`
+    * unless the shape is exact so callers can execute the original program.
+    */
+  private[spark] def inlineViewDeltaCtasIntoMerge(
+      ctas: String,
+      merge: String,
+      viewDeltaPath: String
+  ): Option[String] = {
+    val strippedMerge = stripExecutionMarker(merge)
+    val isMerge       = isMergeStatement(strippedMerge)
+    val escapedPath   = viewDeltaPath.replace("`", "``")
+    val literalRef    = "delta.`" + escapedPath + "`"
+    val refPattern    = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(literalRef))
+    val refMatcher    = refPattern.matcher(strippedMerge)
+    var refCount      = 0
+    while (refMatcher.find()) refCount += 1
+
+    if (!isMerge || refCount != 1) None
+    else
+      extractViewDeltaCtasBody(ctas, viewDeltaPath).map { body =>
+        val subquery = body.stripSuffix(";").trim
+        val replacement = java.util.regex.Matcher.quoteReplacement(
+          s"($subquery) AS __openivm_direct_delta"
+        )
+        refPattern.matcher(strippedMerge).replaceFirst(replacement)
+      }
   }
 
   /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
