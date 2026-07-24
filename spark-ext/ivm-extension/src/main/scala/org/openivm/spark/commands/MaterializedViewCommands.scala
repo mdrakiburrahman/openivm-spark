@@ -3178,7 +3178,7 @@ case class RefreshMaterializedViewCommand(
     // Prove that every affected partition is absent before using append. This
     // stays correct for joined windows, whose affected keys can come from any
     // lineage arm rather than directly from an openivm_delta_* view.
-    val appendOnly      = spark.table(targetRef).where(predicate).head(1).isEmpty
+    val appendOnly = spark.table(targetRef).where(predicate).head(1).isEmpty
     val directSql =
       if (appendOnly)
         s"""|INSERT INTO delta.`$escapedLocation`
