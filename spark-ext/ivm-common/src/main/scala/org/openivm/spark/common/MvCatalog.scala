@@ -106,6 +106,20 @@ final case class MvMetadata(
       .get(MvMetadata.ClusterColumnsKey)
       .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toSeq)
       .getOrElse(Seq.empty)
+
+  /** Whether the analyzed CREATE query contains a logical join. Missing or
+    * malformed metadata is treated conservatively as joined so legacy views
+    * cannot opt into insert-only aggregate shortcuts accidentally.
+    */
+  def queryHasJoin: Boolean =
+    properties
+      .get(MvMetadata.QueryHasJoinKey)
+      .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+      .collect {
+        case "true"  => true
+        case "false" => false
+      }
+      .getOrElse(true)
 }
 
 object MvMetadata {
@@ -120,6 +134,9 @@ object MvMetadata {
     * cascade-usable view-delta at REFRESH time.
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
+
+  /** Property recording whether Spark's analyzed CREATE plan contains a join. */
+  val QueryHasJoinKey: String = "_ivm_query_has_join"
 
   /** Compiled initial-load SQL persisted at CREATE.  The FULL_REFRESH path
     * reads it to reproduce the hidden bookkeeping columns (e.g.
@@ -136,6 +153,9 @@ object MvMetadata {
 
   /** Last observable compile-time cost-model hint captured during REFRESH. */
   val LastCostModelHintKey: String = "_ivm_last_cost_model_hint"
+
+  def queryShapeProperties(hasJoin: Boolean): Map[String, String] =
+    Map(QueryHasJoinKey -> hasJoin.toString)
 
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"

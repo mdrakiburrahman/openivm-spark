@@ -85,6 +85,11 @@ object DeltaCommitClassifier {
       // Predicate-scoped Delta replaceWhere commits still expose row-level CDF
       // deletes/inserts for the affected predicate and are handled as mutating.
       Replace
+    } else if (isProvenInsertOnlyMerge(commitInfo, operation)) {
+      // Delta MERGE rewrites can remove and re-add target files even when the
+      // logical row effect is insert-only. Commit metrics capture that stronger
+      // fact without scanning the change feed.
+      InsertOnly
     } else if (hasDataChangeRemove(actions) || hasDeletionVectorAdd(actions) || isMutatingOperation(operation)) {
       // Any row removal or deletion-vector rewrite must take the mutating path.
       Mutating
@@ -117,6 +122,19 @@ object DeltaCommitClassifier {
 
   private def isMutatingOperation(operation: String): Boolean =
     operation == "DELETE" || operation == "UPDATE" || operation == "MERGE"
+
+  private def isProvenInsertOnlyMerge(commitInfo: Option[CommitInfo], operation: String): Boolean = {
+    def metric(name: String): Option[Long] =
+      commitInfo
+        .flatMap(_.operationMetrics)
+        .flatMap(_.get(name))
+        .flatMap(value => scala.util.Try(value.toLong).toOption)
+
+    operation == "MERGE" &&
+    metric("numTargetRowsInserted").exists(_ > 0L) &&
+    metric("numTargetRowsUpdated").contains(0L) &&
+    metric("numTargetRowsDeleted").contains(0L)
+  }
 
   private def hasDataChangeRemove(actions: Seq[Action]): Boolean =
     actions.exists { case remove: RemoveFile => remove.dataChange; case _ => false }

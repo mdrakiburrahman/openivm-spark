@@ -278,9 +278,9 @@ object SparkRefreshRewriter {
     */
   private[spark] def isMergeStatement(sql: String): Boolean = {
     val stripped = stripExecutionMarker(sql)
-    val start = skipSqlWhitespaceAndComments(stripped, 0)
-    startsWithSqlKeyword(stripped, start, "MERGE") &&
-    startsWithSqlKeyword(stripped, skipSqlWhitespaceAndComments(stripped, start + "MERGE".length), "INTO")
+    findTopLevelSqlKeyword(stripped, 0, stripped.length, "MERGE").exists { mergeIdx =>
+      "(?is)^MERGE\\s+INTO\\b".r.findFirstIn(stripped.substring(mergeIdx)).isDefined
+    }
   }
 
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
@@ -299,6 +299,38 @@ object SparkRefreshRewriter {
       ("(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+delta\\.`" + literalPath +
         "`\\s+USING\\s+DELTA\\s+AS\\s+(.+)$").r
     ctasRe.findFirstMatchIn(stripExecutionMarker(stmt)).map(_.group(1).trim)
+  }
+
+  /** Inline a view-delta CTAS body into its single aggregate MERGE consumer.
+    *
+    * Eligible insert-only terminal aggregates do not need a durable cascade
+    * delta. Replacing the one scratch-path scan with the CTAS query turns the
+    * two-statement write/read program into one Spark pipeline. Return `None`
+    * unless the shape is exact so callers can execute the original program.
+    */
+  private[spark] def inlineViewDeltaCtasIntoMerge(
+      ctas: String,
+      merge: String,
+      viewDeltaPath: String
+  ): Option[String] = {
+    val strippedMerge = stripExecutionMarker(merge)
+    val isMerge       = isMergeStatement(strippedMerge)
+    val escapedPath   = viewDeltaPath.replace("`", "``")
+    val literalRef    = "delta.`" + escapedPath + "`"
+    val refPattern    = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(literalRef))
+    val refMatcher    = refPattern.matcher(strippedMerge)
+    var refCount      = 0
+    while (refMatcher.find()) refCount += 1
+
+    if (!isMerge || refCount != 1) None
+    else
+      extractViewDeltaCtasBody(ctas, viewDeltaPath).map { body =>
+        val subquery = body.stripSuffix(";").trim
+        val replacement = java.util.regex.Matcher.quoteReplacement(
+          s"($subquery) AS __openivm_direct_delta"
+        )
+        refPattern.matcher(strippedMerge).replaceFirst(replacement)
+      }
   }
 
   /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
@@ -2234,12 +2266,12 @@ object SparkRefreshRewriter {
     var i     = start
     while (i < endExclusive) {
       sql.charAt(i) match {
-        case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
-        case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
         case '-' if i + 1 < endExclusive && sql.charAt(i + 1) == '-' =>
           i = consumeSqlLineComment(sql, i).min(endExclusive)
         case '/' if i + 1 < endExclusive && sql.charAt(i + 1) == '*' =>
           i = consumeSqlBlockComment(sql, i).min(endExclusive)
+        case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
+        case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
         case '('  => depth += 1; i += 1
         case ')'  => depth -= 1; i += 1
         case _ if depth == 0 && startsWithSqlKeyword(sql, i, keyword) => return Some(i)
@@ -2269,6 +2301,27 @@ object SparkRefreshRewriter {
     sql.length
   }
 
+  private def consumeSqlLineComment(sql: String, start: Int): Int = {
+    var i = start + 2
+    while (i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i += 1
+    i
+  }
+
+  private def consumeSqlBlockComment(sql: String, start: Int): Int = {
+    var depth = 1
+    var i     = start + 2
+    while (i < sql.length && depth > 0) {
+      if (i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*') {
+        depth += 1
+        i += 2
+      } else if (i + 1 < sql.length && sql.charAt(i) == '*' && sql.charAt(i + 1) == '/') {
+        depth -= 1
+        i += 2
+      } else i += 1
+    }
+    i
+  }
+
   private def consumeSqlDoubleQuoted(sql: String, start: Int): Int = {
     var i = start + 1
     while (i < sql.length) {
@@ -2277,38 +2330,6 @@ object SparkRefreshRewriter {
       else i += 1
     }
     sql.length
-  }
-
-  private def consumeSqlLineComment(sql: String, start: Int): Int = {
-    var i = start + 2
-    while (i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i += 1
-    i
-  }
-
-  private def consumeSqlBlockComment(sql: String, start: Int): Int = {
-    var i = start + 2
-    while (i + 1 < sql.length) {
-      if (sql.charAt(i) == '*' && sql.charAt(i + 1) == '/') return i + 2
-      i += 1
-    }
-    sql.length
-  }
-
-  private def skipSqlWhitespaceAndComments(sql: String, start: Int): Int = {
-    var i        = start
-    var advanced = true
-    while (advanced && i < sql.length) {
-      advanced = false
-      while (i < sql.length && Character.isWhitespace(sql.charAt(i))) i += 1
-      if (i + 1 < sql.length && sql.charAt(i) == '-' && sql.charAt(i + 1) == '-') {
-        i = consumeSqlLineComment(sql, i)
-        advanced = true
-      } else if (i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*') {
-        i = consumeSqlBlockComment(sql, i)
-        advanced = true
-      }
-    }
-    i
   }
 
   /** Rewrites `DELETE FROM <mv> AS t USING <source> s WHERE <match>` into a
