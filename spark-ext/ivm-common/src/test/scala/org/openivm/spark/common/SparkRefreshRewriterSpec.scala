@@ -1607,6 +1607,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.isMergeStatement("SELECT 'MERGE INTO not_a_statement'") shouldBe false
       SparkRefreshRewriter.isMergeStatement("SELECT 1 -- MERGE INTO not_a_statement") shouldBe false
       SparkRefreshRewriter.isMergeStatement("SELECT 1 /* MERGE INTO not_a_statement */") shouldBe false
+      SparkRefreshRewriter.isMergeStatement(s"-- MERGE INTO fake\n$merge") shouldBe true
+      SparkRefreshRewriter.isMergeStatement(s"/* MERGE INTO fake */\n$merge") shouldBe true
     }
 
     it("rejects a non-MERGE consumer") {

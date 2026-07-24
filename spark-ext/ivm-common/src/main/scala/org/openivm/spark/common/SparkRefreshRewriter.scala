@@ -2266,6 +2266,10 @@ object SparkRefreshRewriter {
     var i     = start
     while (i < endExclusive) {
       sql.charAt(i) match {
+        case '-' if i + 1 < endExclusive && sql.charAt(i + 1) == '-' =>
+          i = consumeSqlLineComment(sql, i).min(endExclusive)
+        case '/' if i + 1 < endExclusive && sql.charAt(i + 1) == '*' =>
+          i = consumeSqlBlockComment(sql, i).min(endExclusive)
         case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
         case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
         case '('  => depth += 1; i += 1
@@ -2295,6 +2299,27 @@ object SparkRefreshRewriter {
       else i += 1
     }
     sql.length
+  }
+
+  private def consumeSqlLineComment(sql: String, start: Int): Int = {
+    var i = start + 2
+    while (i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i += 1
+    i
+  }
+
+  private def consumeSqlBlockComment(sql: String, start: Int): Int = {
+    var depth = 1
+    var i     = start + 2
+    while (i < sql.length && depth > 0) {
+      if (i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*') {
+        depth += 1
+        i += 2
+      } else if (i + 1 < sql.length && sql.charAt(i) == '*' && sql.charAt(i + 1) == '/') {
+        depth -= 1
+        i += 2
+      } else i += 1
+    }
+    i
   }
 
   private def consumeSqlDoubleQuoted(sql: String, start: Int): Int = {
