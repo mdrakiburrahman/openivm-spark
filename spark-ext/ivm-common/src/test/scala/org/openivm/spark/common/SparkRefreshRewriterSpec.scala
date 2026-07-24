@@ -1605,6 +1605,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     it("recognizes a CTE-prefixed MERGE without matching string literals") {
       SparkRefreshRewriter.isMergeStatement(merge) shouldBe true
       SparkRefreshRewriter.isMergeStatement("SELECT 'MERGE INTO not_a_statement'") shouldBe false
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 -- MERGE INTO not_a_statement") shouldBe false
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 /* MERGE INTO not_a_statement */") shouldBe false
     }
 
     it("rejects a non-MERGE consumer") {
