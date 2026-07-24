@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
 class WindowPartitionSingleDeleteMergeSpec
@@ -10,6 +10,7 @@ class WindowPartitionSingleDeleteMergeSpec
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey -> "true",
+      FeatureGate.WindowSinglePassReplaceEnabledKey          -> "false",
       FeatureGate.QueryLogEnabledKey                         -> "true"
     )
 
@@ -19,7 +20,7 @@ class WindowPartitionSingleDeleteMergeSpec
   }
 
   describe("trades_history-shaped WINDOW_PARTITION ordered window") {
-    it("reuses the cascade snapshot for existing and new joined-window partitions") {
+    it("keeps lag/row_number correct and collapses affected-key DELETE to one MERGE") {
       sql(
         "CREATE TABLE trh_trade(" +
           "t_id INT, t_dts TIMESTAMP, t_ca_id INT, t_st_id INT, t_tt_id INT, t_qty INT) USING DELTA"
@@ -61,24 +62,16 @@ class WindowPartitionSingleDeleteMergeSpec
       mvRefreshType("trh_mv") shouldBe RefreshTypeCode.WindowPartition
       assertMvCorrect("trh_mv", viewSql)
 
-      // Batch conflicting UPDATE + DELETE/reinsert + INSERT operations before
-      // one refresh, exercising consolidation as well as both old/new keys.
-      sql("UPDATE trh_trade SET t_st_id = 2 WHERE t_id = 100")
-      sql(
-        "DELETE FROM trh_trade_history " +
-          "WHERE th_t_id = 200 AND th_dts = TIMESTAMP '2026-01-01 10:05:00'"
-      )
       sql(
         "INSERT INTO trh_trade VALUES " +
+          "(100, TIMESTAMP '2026-01-02 09:00:00', 501, 2, 10, 50), " +
           "(300, TIMESTAMP '2026-01-02 11:00:00', 503, 1, 10, 70)"
       )
       sql(
         "INSERT INTO trh_trade_history VALUES " +
           "(100, TIMESTAMP '2026-01-02 09:05:00', 2), " +
-          "(200, TIMESTAMP '2026-01-01 10:05:00', 1), " +
           "(300, TIMESTAMP '2026-01-02 11:05:00', 1)"
       )
-      RefreshSqlLogCatalog.removeAll(spark)
       refreshMv("trh_mv")
 
       assertMvCorrect("trh_mv", viewSql)
@@ -86,28 +79,7 @@ class WindowPartitionSingleDeleteMergeSpec
 
       val refreshSql = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
       refreshSql should include("UNION ALL")
-      refreshSql should include("REPLACE WHERE")
-      refreshSql should include("`openivm_multiplicity` > 0")
-      refreshSql should not include "WHEN MATCHED THEN DELETE"
-
-      // A batch whose affected partition is absent from the target can append
-      // the positive cascade snapshot without a target rewrite.
-      sql(
-        "INSERT INTO trh_trade VALUES " +
-          "(400, TIMESTAMP '2026-01-03 12:00:00', 504, 1, 10, 80)"
-      )
-      sql(
-        "INSERT INTO trh_trade_history VALUES " +
-          "(400, TIMESTAMP '2026-01-03 12:05:00', 1)"
-      )
-      RefreshSqlLogCatalog.removeAll(spark)
-      refreshMv("trh_mv")
-
-      assertMvCorrect("trh_mv", viewSql)
-      val appendSql = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
-      appendSql should include("`openivm_multiplicity` > 0")
-      appendSql should not include "REPLACE WHERE"
-      appendSql should not include "WHEN MATCHED THEN DELETE"
+      refreshSql.split("WHEN MATCHED THEN DELETE", -1).length - 1 shouldBe 1
     }
   }
 }

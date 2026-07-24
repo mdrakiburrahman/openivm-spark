@@ -905,11 +905,12 @@ case class CreateMaterializedViewCommand(
     // always sets), `CompileWindowRecompute()` now snapshots the affected
     // pre-refresh rows and recomputed post-refresh rows before mutating
     // `openivm_data_<view>`, then appends them as `-1/+1` rows into
-    // `openivm_delta_<view>`. The PRIMARY execution shape is still the
-    // partition-scoped DELETE+INSERT that refreshes this MV in place; the
-    // new view-delta exists so downstream MV-over-MV chains can consume the
-    // recompute incrementally. The rewriter therefore handles both pieces:
-    // the direct DELETE/INSERT plus the auxiliary cascade delta.
+    // `openivm_delta_<view>`. For a bounded affected-key set and the raw
+    // old×-1/new×+1 cascade shape, Spark materializes that signed snapshot
+    // first and applies its positive rows to the MV with one partition-scoped
+    // `REPLACE WHERE`. Other shapes retain the compiler's DELETE+INSERT
+    // program. The signed snapshot remains the downstream MV-over-MV feed in
+    // both cases.
     //
     // GROUP_RECOMPUTE (RefreshType 6) likewise stopped being a "no view-delta"
     // exception once that CompileFacts flag is set. `CompileGroupRecompute()`
@@ -2597,7 +2598,7 @@ case class RefreshMaterializedViewCommand(
             rewrittenSql.indexWhere(isRawWindowSnapshotCtas(_, mergeTargetId, viewDeltaPath))
           val windowInsertIdx = rewrittenSql.indexWhere(isWindowNewSnapshotInsertSql(_, mergeTargetId))
           lazy val useCascadeFirstWindowPlan =
-            windowSinglePassPlan.exists(_.cascadeSql.nonEmpty) &&
+            windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite]) &&
               !FeatureGate.windowSnapshotCacheEnabled(spark) &&
               windowCascadeCtasIdx > windowInsertIdx &&
               windowInsertIdx >= 0
@@ -2681,27 +2682,24 @@ case class RefreshMaterializedViewCommand(
             } else if (skipWindowSinglePassDelete) {
               logSkippedWindowStmt(idx, "window_replace_delete_skipped")
             } else if (replaceWithWindowSinglePassInsert) {
-              val plan = windowSinglePassPlan.get
-              if (plan.directSql.isEmpty) {
-                logSkippedWindowStmt(idx, "window_replace_empty_skipped")
-              } else if (useCascadeFirstWindowPlan) {
-                deferredWindowTargetSql = Some(idx -> plan.cascadeSql)
-                logInfo(
-                  s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                    "outcome='window_target_write_deferred' reason='reuse_cascade_snapshot'"
-                )
-              } else {
-                val outcome =
-                  if (plan.appendOnly) "window_new_partition_append"
-                  else "window_single_pass_replace"
-                RefreshPerf.emit(refreshId, viewLabel, "fast_path", s"outcome='$outcome'")
-                logInfo(
-                  s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                    s"outcome='$outcome' reason='small_literal_partition_set'"
-                )
-                withPlanTimeBroadcastDisabled {
-                  executeSqlAt(plan.directSql, idx)
-                }
+              windowSinglePassPlan.get match {
+                case WindowSinglePassNoAffectedPartitions =>
+                  logSkippedWindowStmt(idx, "window_replace_empty_skipped")
+                case plan: WindowSinglePassWrite if useCascadeFirstWindowPlan =>
+                  deferredWindowTargetSql = Some(idx -> plan.cascadeSql)
+                  logInfo(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                      "outcome='window_target_write_deferred' reason='reuse_cascade_snapshot'"
+                  )
+                case plan: WindowSinglePassWrite =>
+                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_single_pass_replace'")
+                  logInfo(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                      "outcome='window_single_pass_replace' reason='small_literal_partition_set'"
+                  )
+                  withPlanTimeBroadcastDisabled {
+                    executeSqlAt(plan.directSql, idx)
+                  }
               }
             } else {
               // Apply the per-statement plan-time broadcast disable to BOTH
@@ -2738,14 +2736,10 @@ case class RefreshMaterializedViewCommand(
               }
               if (isViewDeltaCtas && idx == windowCascadeCtasIdx) {
                 deferredWindowTargetSql.foreach { case (targetIdx, targetSql) =>
-                  val plan = windowSinglePassPlan.get
-                  val outcome =
-                    if (plan.appendOnly) "window_cascade_first_append"
-                    else "window_cascade_first_replace"
-                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", s"outcome='$outcome'")
+                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_first_replace'")
                   logInfo(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                      s"outcome='$outcome' reason='reuse_materialized_cascade_snapshot'"
+                      "outcome='window_cascade_first_replace' reason='reuse_materialized_cascade_snapshot'"
                   )
                   withPlanTimeBroadcastDisabled {
                     executeSqlAt(targetSql, targetIdx)
@@ -3119,11 +3113,14 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowReplaceKeySet(targetCol: String, literals: Seq[String], hasNull: Boolean)
 
-  private case class WindowSinglePassPlan(
+  private sealed trait WindowSinglePassPlan
+
+  private case object WindowSinglePassNoAffectedPartitions extends WindowSinglePassPlan
+
+  private case class WindowSinglePassWrite(
       directSql: String,
-      cascadeSql: String,
-      appendOnly: Boolean
-  )
+      cascadeSql: String
+  ) extends WindowSinglePassPlan
 
   private case class BoundedRankShape(
       sourceShort: String,
@@ -3153,7 +3150,7 @@ case class RefreshMaterializedViewCommand(
     val keySets = deleteSqls.flatMap(collectWindowReplaceKeySet(spark, _))
     if (keySets.size != deleteSqls.size || keySets.isEmpty) return None
     if (keySets.forall(keys => keys.literals.isEmpty && !keys.hasNull))
-      return Some(WindowSinglePassPlan("", "", appendOnly = true))
+      return Some(WindowSinglePassNoAffectedPartitions)
 
     val predicates = keySets.flatMap { keys =>
       val inPred =
@@ -3166,7 +3163,7 @@ case class RefreshMaterializedViewCommand(
         case many     => Some(many.mkString("(", " OR ", ")"))
       }
     }
-    if (predicates.isEmpty) return Some(WindowSinglePassPlan("", "", appendOnly = true))
+    if (predicates.isEmpty) return Some(WindowSinglePassNoAffectedPartitions)
 
     val predicate = predicates.mkString("(", " OR ", ")")
     if (predicate.length > WindowReplaceMaxPredicateBytes) return None
@@ -3175,32 +3172,18 @@ case class RefreshMaterializedViewCommand(
     val view            = targetId.table.replace("`", "``")
     val targetRef       = MvCommandHelper.sqlIdent(targetId)
     val targetColumns   = spark.table(targetRef).columns.toSeq.map(quoteCol).mkString(", ")
-    // Prove that every affected partition is absent before using append. This
-    // stays correct for joined windows, whose affected keys can come from any
-    // lineage arm rather than directly from an openivm_delta_* view.
-    val appendOnly = spark.table(targetRef).where(predicate).head(1).isEmpty
     val directSql =
-      if (appendOnly)
-        s"""|INSERT INTO delta.`$escapedLocation`
-            |SELECT * FROM `openivm_new_$view`""".stripMargin
-      else
-        s"""|INSERT INTO delta.`$escapedLocation`
-            |REPLACE WHERE $predicate
-            |SELECT * FROM `openivm_new_$view`""".stripMargin
+      s"""|INSERT INTO delta.`$escapedLocation`
+          |REPLACE WHERE $predicate
+          |SELECT * FROM `openivm_new_$view`""".stripMargin
     val escapedDeltaPath = viewDeltaPath.replace("`", "``")
-    val cascadeSelect =
-      s"""|SELECT $targetColumns
+    val cascadeSql =
+      s"""|INSERT INTO delta.`$escapedLocation`
+          |REPLACE WHERE $predicate
+          |SELECT $targetColumns
           |FROM delta.`$escapedDeltaPath`
           |WHERE `openivm_multiplicity` > 0""".stripMargin
-    val cascadeSql =
-      if (appendOnly)
-        s"""|INSERT INTO delta.`$escapedLocation`
-            |$cascadeSelect""".stripMargin
-      else
-        s"""|INSERT INTO delta.`$escapedLocation`
-            |REPLACE WHERE $predicate
-            |$cascadeSelect""".stripMargin
-    Some(WindowSinglePassPlan(directSql, cascadeSql, appendOnly))
+    Some(WindowSinglePassWrite(directSql, cascadeSql))
   }
 
   private def isWindowNewSnapshotInsertSql(sql: String, targetId: TableIdentifier): Boolean = {
@@ -3211,9 +3194,10 @@ case class RefreshMaterializedViewCommand(
 
   private def collectWindowReplaceKeySet(spark: SparkSession, deleteMergeSql: String): Option[WindowReplaceKeySet] = {
     val (targetCol, subquery) = parseWindowDeleteMerge(deleteMergeSql).getOrElse(return None)
+    val rawKeySql             = rawWindowAffectedKeySql(subquery).getOrElse(return None)
     val probeSql =
-      s"""SELECT DISTINCT * FROM (
-         |$subquery
+      s"""SELECT * FROM (
+         |$rawKeySql
          |) __openivm_window_replace_keys
          |LIMIT ${WindowReplaceMaxLiteralKeys + 1}""".stripMargin
     val df = spark.sql(probeSql)
@@ -3232,6 +3216,19 @@ case class RefreshMaterializedViewCommand(
         }
     }
     Some(WindowReplaceKeySet(targetCol, literals.distinct.toSeq, hasNull))
+  }
+
+  private def rawWindowAffectedKeySql(subquery: String): Option[String] = {
+    val hasRecognizedSource =
+      "(?is)\\bFROM\\s+`?OPENIVM_(?:DELTA|AFFECTED)_[A-Za-z0-9_]+`?".r.findFirstIn(subquery).isDefined
+    val hasExpensiveOperator =
+      "(?is)\\b(?:UNION|INTERSECT|EXCEPT|JOIN)\\b|\\b(?:GROUP|ORDER)\\s+BY\\b|\\bOVER\\s*\\(".r
+        .findFirstIn(subquery)
+        .isDefined
+    if (!hasRecognizedSource || hasExpensiveOperator) return None
+
+    val distinctSelect = "(?is)^\\s*SELECT\\s+DISTINCT\\s+".r
+    distinctSelect.findPrefixMatchOf(subquery).map(m => "SELECT " + subquery.substring(m.end))
   }
 
   private def parseWindowDeleteMerge(sql: String): Option[(String, String)] = {
@@ -3619,6 +3616,7 @@ case class RefreshMaterializedViewCommand(
     val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
     upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS V") &&
     upper.contains("SELECT DISTINCT") &&
+    (upper.contains("OPENIVM_DELTA_") || upper.contains("OPENIVM_AFFECTED_")) &&
     upper.contains("WHEN MATCHED THEN DELETE")
   }
 

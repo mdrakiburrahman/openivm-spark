@@ -314,8 +314,9 @@ object FeatureGate {
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
   /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
-    * `REPLACE WHERE` path will consume it twice (cascade view-delta plus MV
-    * data write). Default OFF: flag-off execution remains byte-identical.
+    * `REPLACE WHERE` fallback will consume it twice. Default OFF: eligible raw
+    * signed-cascade programs instead materialize the cascade first and reuse
+    * its positive rows for the target write.
     */
   val WindowSnapshotCacheEnabledKey: String = "spark.openivm.refresh.windowSnapshotCache.enabled"
 
