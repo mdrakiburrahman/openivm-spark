@@ -1578,6 +1578,14 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  // ── 11b. isMergeStatement — top-level MERGE detector ───────────────────────
+  describe("isMergeStatement") {
+    it("returns false when MERGE appears only inside SQL comments") {
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 -- MERGE INTO t") shouldBe false
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 /* MERGE INTO t */") shouldBe false
+    }
+  }
+
   // ── 12. isRecomputeInsertMerge — recompute INSERT MERGE detector ─────────
   describe("isRecomputeInsertMerge") {
     it("detects the bench-shape MERGE … USING (…) AS d ON FALSE WHEN NOT MATCHED THEN INSERT") {

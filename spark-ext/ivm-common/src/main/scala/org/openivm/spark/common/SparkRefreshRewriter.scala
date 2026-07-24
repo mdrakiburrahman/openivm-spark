@@ -278,7 +278,9 @@ object SparkRefreshRewriter {
     */
   private[spark] def isMergeStatement(sql: String): Boolean = {
     val stripped = stripExecutionMarker(sql)
-    "(?is)^\\s*MERGE\\s+INTO\\s+".r.findFirstMatchIn(stripped).isDefined
+    val start = skipSqlWhitespaceAndComments(stripped, 0)
+    startsWithSqlKeyword(stripped, start, "MERGE") &&
+    startsWithSqlKeyword(stripped, skipSqlWhitespaceAndComments(stripped, start + "MERGE".length), "INTO")
   }
 
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
@@ -2234,6 +2236,10 @@ object SparkRefreshRewriter {
       sql.charAt(i) match {
         case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
         case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
+        case '-' if i + 1 < endExclusive && sql.charAt(i + 1) == '-' =>
+          i = consumeSqlLineComment(sql, i).min(endExclusive)
+        case '/' if i + 1 < endExclusive && sql.charAt(i + 1) == '*' =>
+          i = consumeSqlBlockComment(sql, i).min(endExclusive)
         case '('  => depth += 1; i += 1
         case ')'  => depth -= 1; i += 1
         case _ if depth == 0 && startsWithSqlKeyword(sql, i, keyword) => return Some(i)
@@ -2271,6 +2277,38 @@ object SparkRefreshRewriter {
       else i += 1
     }
     sql.length
+  }
+
+  private def consumeSqlLineComment(sql: String, start: Int): Int = {
+    var i = start + 2
+    while (i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i += 1
+    i
+  }
+
+  private def consumeSqlBlockComment(sql: String, start: Int): Int = {
+    var i = start + 2
+    while (i + 1 < sql.length) {
+      if (sql.charAt(i) == '*' && sql.charAt(i + 1) == '/') return i + 2
+      i += 1
+    }
+    sql.length
+  }
+
+  private def skipSqlWhitespaceAndComments(sql: String, start: Int): Int = {
+    var i        = start
+    var advanced = true
+    while (advanced && i < sql.length) {
+      advanced = false
+      while (i < sql.length && Character.isWhitespace(sql.charAt(i))) i += 1
+      if (i + 1 < sql.length && sql.charAt(i) == '-' && sql.charAt(i + 1) == '-') {
+        i = consumeSqlLineComment(sql, i)
+        advanced = true
+      } else if (i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*') {
+        i = consumeSqlBlockComment(sql, i)
+        advanced = true
+      }
+    }
+    i
   }
 
   /** Rewrites `DELETE FROM <mv> AS t USING <source> s WHERE <match>` into a
