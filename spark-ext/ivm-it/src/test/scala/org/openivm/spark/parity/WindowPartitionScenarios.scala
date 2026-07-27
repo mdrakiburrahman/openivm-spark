@@ -33,9 +33,10 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   * the affected pre-refresh rows into `openivm_old_<view>`, the recomputed
   * post-refresh rows into `openivm_new_<view>`, and emits `-1/+1` rows into
   * `openivm_delta_<view>`. For a bounded affected-key set and this raw signed
-  * snapshot shape, Spark persists the cascade first and applies its positive
-  * rows with one partition-scoped `REPLACE WHERE`; other shapes retain the
-  * compiler's DELETE+INSERT program. The signed view delta also keeps
+  * snapshot shape, Spark materializes the affected-key set once, persists the
+  * cascade, and applies its positive rows. Small literal key sets use one
+  * partition-scoped `REPLACE WHERE`; larger sets use the materialized keys for
+  * DELETE and the cascade for INSERT. The signed view delta also keeps
   * downstream MV-over-MV chains incremental.
   *
   * == Observed `refreshType` per test ==

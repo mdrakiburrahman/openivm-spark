@@ -11,6 +11,7 @@ class WindowPartitionSingleDeleteMergeSpec
     Map(
       FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey -> "true",
       FeatureGate.WindowSinglePassReplaceEnabledKey          -> "false",
+      FeatureGate.WindowCascadeMergeEnabledKey               -> "false",
       FeatureGate.QueryLogEnabledKey                         -> "true"
     )
 

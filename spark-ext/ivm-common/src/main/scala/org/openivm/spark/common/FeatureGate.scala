@@ -308,10 +308,19 @@ object FeatureGate {
 
   /** Replace WINDOW_PARTITION delete+insert recompute pairs with one Delta
     * `INSERT ... REPLACE WHERE` when the affected partition literal list is
-    * small enough to collect safely. Default ON; flip OFF to restore the legacy
-    * MERGE-delete plus INSERT execution path byte-for-byte.
+    * small enough to collect safely. Default ON; flip OFF to disable only the
+    * literal-key `REPLACE WHERE` path. The separately gated materialized-key
+    * cascade path may still optimize the compiler's DELETE+INSERT program.
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
+
+  /** Reuse a materialized affected-partition key set plus the persisted signed
+    * WINDOW_PARTITION cascade for target DELETE+INSERT when the literal-key
+    * `REPLACE WHERE` path is unavailable. Default ON; flip OFF to disable key
+    * materialization/cascade reuse. The independently gated small literal-key
+    * `REPLACE WHERE` path may remain active.
+    */
+  val WindowCascadeMergeEnabledKey: String = "spark.openivm.refresh.windowCascadeMerge.enabled"
 
   /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
     * `REPLACE WHERE` fallback will consume it twice. Default OFF: eligible raw
@@ -531,6 +540,12 @@ object FeatureGate {
 
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
+
+  def windowCascadeMergeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowCascadeMergeEnabledKey, default = true)
+
+  def windowCascadeMergeEnabled(spark: SparkSession): Boolean =
+    windowCascadeMergeEnabled(spark.sparkContext.getConf)
 
   def windowSnapshotCacheEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowSnapshotCacheEnabledKey, default = false)

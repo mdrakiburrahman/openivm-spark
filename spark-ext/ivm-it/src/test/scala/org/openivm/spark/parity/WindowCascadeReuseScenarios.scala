@@ -2,6 +2,7 @@ package org.openivm.spark.parity
 
 import org.apache.spark.sql.Row
 import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.commands.RefreshFailureInjection
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
@@ -13,6 +14,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey -> "true",
+      FeatureGate.WindowCascadeMergeEnabledKey               -> "true",
       FeatureGate.CompileClassificationCacheEnabledKey       -> compileCacheEnabled.toString,
       FeatureGate.QueryLogEnabledKey                         -> "true"
     )
@@ -35,7 +37,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       .filter(_.getString(ColCategory) == "rewritten_stmt")
       .sortBy(_.getInt(ColStmtOrder))
 
-  private def assertCascadeFirstTargetWrite(viewName: String): Unit = {
+  private def cascadeLog(viewName: String): (Seq[Row], Row, String) = {
     val rows = rewrittenRows(viewName)
     val cascadeRow = rows
       .find { row =>
@@ -51,7 +53,11 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       .findFirstMatchIn(cascadeSql)
       .map(_.group(1))
       .getOrElse(fail("missing cascade Delta path"))
+    (rows, cascadeRow, cascadePath)
+  }
 
+  private def assertCascadeFirstTargetWrite(viewName: String): Unit = {
+    val (rows, cascadeRow, cascadePath) = cascadeLog(viewName)
     val targetRows = rows.filter { row =>
       val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
       upper.startsWith("INSERT INTO DELTA.") && upper.contains("REPLACE WHERE")
@@ -68,30 +74,20 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   }
 
   private def assertCascadeMergeTargetWrite(viewName: String): Unit = {
-    val rows = rewrittenRows(viewName)
-    val cascadeRow = rows
-      .find { row =>
-        val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
-        upper.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
-        upper.contains(s"FROM OPENIVM_OLD_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
-        upper.contains(s"FROM OPENIVM_NEW_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
-        upper.contains("UNION ALL")
-      }
-      .getOrElse(fail("missing raw signed window cascade CTAS"))
-    val cascadeSql = cascadeRow.getString(ColSqlText)
-    val cascadePath = "(?is)CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+delta\\.`([^`]+)`".r
-      .findFirstMatchIn(cascadeSql)
-      .map(_.group(1))
-      .getOrElse(fail("missing cascade Delta path"))
+    val (rows, cascadeRow, cascadePath) = cascadeLog(viewName)
+    val affectedView                    = s"openivm_affected_$viewName"
+    val cacheRow = rows
+      .find(_.getString(ColSqlText).equalsIgnoreCase(s"CACHE TABLE `$affectedView`"))
+      .getOrElse(fail("missing affected-key materialization"))
 
     val deleteRow = rows
       .find { row =>
         val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
         upper.startsWith("MERGE INTO") &&
         upper.contains("WHEN MATCHED THEN DELETE") &&
-        row.getString(ColSqlText).contains(s"FROM delta.`$cascadePath`")
+        upper.contains(affectedView.toUpperCase(java.util.Locale.ROOT))
       }
-      .getOrElse(fail("missing cascade-backed target DELETE MERGE"))
+      .getOrElse(fail("missing materialized-key target DELETE MERGE"))
     val insertRow = rows
       .find { row =>
         val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
@@ -101,9 +97,17 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       }
       .getOrElse(fail("missing cascade-backed target INSERT"))
 
+    cacheRow.getInt(ColStmtOrder) should be < cascadeRow.getInt(ColStmtOrder)
     deleteRow.getInt(ColStmtOrder) should be > cascadeRow.getInt(ColStmtOrder)
     insertRow.getInt(ColStmtOrder) should be > deleteRow.getInt(ColStmtOrder)
     rows.map(_.getString(ColSqlText)).mkString("\n") should not include "REPLACE WHERE"
+  }
+
+  private def assertBagEqual(leftSql: String, rightSql: String): Unit = {
+    sql(s"SELECT * FROM ($leftSql) openivm_left EXCEPT ALL SELECT * FROM ($rightSql) openivm_right")
+      .count() shouldBe 0L
+    sql(s"SELECT * FROM ($rightSql) openivm_right EXCEPT ALL SELECT * FROM ($leftSql) openivm_left")
+      .count() shouldBe 0L
   }
 
   describe("joined WINDOW_PARTITION cascade reuse") {
@@ -176,35 +180,46 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertCascadeFirstTargetWrite("wcr_mv")
     }
 
-    if (!compileCacheEnabled) {
-      it("uses the persisted cascade when more than 10,000 partitions change") {
-        sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
-        sql(
-          "INSERT INTO wcm_events " +
-            "SELECT id, 1 AS seq, id AS payload FROM range(10001)"
-        )
+    it("uses the persisted cascade when more than 10,000 partitions change") {
+      sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      sql(
+        "INSERT INTO wcm_events " +
+          "SELECT id, 1 AS seq, id AS payload FROM range(10001)"
+      )
 
-        val viewSql =
-          "SELECT id, seq, payload, " +
-            "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
-            "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
-            "FROM wcm_events"
-        sql(s"CREATE MATERIALIZED VIEW wcm_mv AS $viewSql")
-        mvRefreshType("wcm_mv") shouldBe RefreshTypeCode.WindowPartition
-        assertMvCorrect("wcm_mv", viewSql)
+      val viewSql =
+        "SELECT id, seq, payload, " +
+          "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
+          "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
+          "FROM wcm_events"
+      val downstreamSql = "SELECT id, seq, payload FROM wcm_mv"
+      sql(s"CREATE MATERIALIZED VIEW wcm_mv AS $viewSql")
+      sql(s"CREATE MATERIALIZED VIEW wcm_downstream AS $downstreamSql")
+      sql("CREATE TABLE wcm_before_failure USING DELTA AS SELECT * FROM wcm_mv")
+      mvRefreshType("wcm_mv") shouldBe RefreshTypeCode.WindowPartition
+      assertMvCorrect("wcm_mv", viewSql)
+      assertMvCorrect("wcm_downstream", downstreamSql)
 
-        sql("UPDATE wcm_events SET payload = payload + 100000 WHERE seq = 1")
-        sql(
-          "INSERT INTO wcm_events " +
-            "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(10001)"
-        )
-        sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
-        RefreshSqlLogCatalog.removeAll(spark)
+      sql("UPDATE wcm_events SET payload = payload + 100000 WHERE seq = 1")
+      sql(
+        "INSERT INTO wcm_events " +
+          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(10001)"
+      )
+      sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
+      RefreshSqlLogCatalog.removeAll(spark)
+      RefreshFailureInjection.failNextWindowCascadeInsert(spark)
+      intercept[RuntimeException] {
         refreshMv("wcm_mv")
-
-        assertMvCorrect("wcm_mv", viewSql)
-        assertCascadeMergeTargetWrite("wcm_mv")
       }
+      assertBagEqual("SELECT * FROM wcm_mv", "SELECT * FROM wcm_before_failure")
+
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wcm_mv")
+      refreshMv("wcm_downstream")
+
+      assertMvCorrect("wcm_mv", viewSql)
+      assertMvCorrect("wcm_downstream", downstreamSql)
+      assertCascadeMergeTargetWrite("wcm_mv")
     }
   }
 }
