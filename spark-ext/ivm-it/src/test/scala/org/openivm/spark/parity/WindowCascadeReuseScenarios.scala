@@ -67,6 +67,45 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
     rows.map(_.getString(ColSqlText)).mkString("\n") should not include "WHEN MATCHED THEN DELETE"
   }
 
+  private def assertCascadeMergeTargetWrite(viewName: String): Unit = {
+    val rows = rewrittenRows(viewName)
+    val cascadeRow = rows
+      .find { row =>
+        val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+        upper.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
+        upper.contains(s"FROM OPENIVM_OLD_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
+        upper.contains(s"FROM OPENIVM_NEW_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
+        upper.contains("UNION ALL")
+      }
+      .getOrElse(fail("missing raw signed window cascade CTAS"))
+    val cascadeSql = cascadeRow.getString(ColSqlText)
+    val cascadePath = "(?is)CREATE\\s+OR\\s+REPLACE\\s+TABLE\\s+delta\\.`([^`]+)`".r
+      .findFirstMatchIn(cascadeSql)
+      .map(_.group(1))
+      .getOrElse(fail("missing cascade Delta path"))
+
+    val deleteRow = rows
+      .find { row =>
+        val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+        upper.startsWith("MERGE INTO") &&
+        upper.contains("WHEN MATCHED THEN DELETE") &&
+        row.getString(ColSqlText).contains(s"FROM delta.`$cascadePath`")
+      }
+      .getOrElse(fail("missing cascade-backed target DELETE MERGE"))
+    val insertRow = rows
+      .find { row =>
+        val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+        upper.startsWith("INSERT INTO") &&
+        row.getString(ColSqlText).contains(s"FROM delta.`$cascadePath`") &&
+        row.getString(ColSqlText).contains("`openivm_multiplicity` > 0")
+      }
+      .getOrElse(fail("missing cascade-backed target INSERT"))
+
+    deleteRow.getInt(ColStmtOrder) should be > cascadeRow.getInt(ColStmtOrder)
+    insertRow.getInt(ColStmtOrder) should be > deleteRow.getInt(ColStmtOrder)
+    rows.map(_.getString(ColSqlText)).mkString("\n") should not include "REPLACE WHERE"
+  }
+
   describe("joined WINDOW_PARTITION cascade reuse") {
     it("reuses the persisted signed snapshot for existing and new partitions") {
       sql(
@@ -135,6 +174,37 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
 
       assertMvCorrect("wcr_mv", viewSql)
       assertCascadeFirstTargetWrite("wcr_mv")
+    }
+
+    if (!compileCacheEnabled) {
+      it("uses the persisted cascade when more than 10,000 partitions change") {
+        sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+        sql(
+          "INSERT INTO wcm_events " +
+            "SELECT id, 1 AS seq, id AS payload FROM range(10001)"
+        )
+
+        val viewSql =
+          "SELECT id, seq, payload, " +
+            "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
+            "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
+            "FROM wcm_events"
+        sql(s"CREATE MATERIALIZED VIEW wcm_mv AS $viewSql")
+        mvRefreshType("wcm_mv") shouldBe RefreshTypeCode.WindowPartition
+        assertMvCorrect("wcm_mv", viewSql)
+
+        sql("UPDATE wcm_events SET payload = payload + 100000 WHERE seq = 1")
+        sql(
+          "INSERT INTO wcm_events " +
+            "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(10001)"
+        )
+        sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
+        RefreshSqlLogCatalog.removeAll(spark)
+        refreshMv("wcm_mv")
+
+        assertMvCorrect("wcm_mv", viewSql)
+        assertCascadeMergeTargetWrite("wcm_mv")
+      }
     }
   }
 }
