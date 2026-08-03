@@ -929,6 +929,35 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       deleteMerges.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
       deleteMerges.head should not include "openivm_timestamp"
     }
+
+    it("splits composite-partition OR EXISTS deletes into Delta-compatible MERGEs") {
+      val input =
+        """DELETE FROM openivm_data_mv_r AS openivm_target
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_sales) openivm_aff
+          |  WHERE openivm_target.region <=> openivm_aff.region
+          |) OR EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT product FROM openivm_delta_sales) openivm_aff
+          |  WHERE openivm_target.product <=> openivm_aff.product
+          |);""".stripMargin
+
+      val statements = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+        .statements
+
+      statements should have size 2
+      statements.foreach(_ should include("WHEN MATCHED THEN DELETE"))
+      statements.head should include("openivm_target.region <=> openivm_aff.region")
+      statements(1) should include("openivm_target.product <=> openivm_aff.product")
+      statements.foreach(_ should not startWith "DELETE FROM")
+    }
   }
 
   // ── 8. SIMPLE_PROJECTION delete MERGE is tagged for runtime skip ─────────
@@ -1073,6 +1102,56 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements.head should include("USING (")
       rewritten.statements.head should include("SELECT * FROM openivm_affected")
       rewritten.statements.head should include("WHEN MATCHED THEN DELETE")
+    }
+  }
+
+  describe("indexed GROUP_RECOMPUTE rewrites") {
+    it("materializes recomputed rows and replaces DuckDB's guarded upsert with delete plus insert") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, amount, openivm_multiplicity FROM memory.main.openivm_delta_sales;
+          |CREATE OR REPLACE TEMP TABLE openivm_recompute_mv_r AS
+          |SELECT * FROM (SELECT region, MAX(amount) AS total FROM memory.main.sales GROUP BY region) openivm_recompute
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_mv_r) AS openivm_aff
+          |  WHERE openivm_aff.region IS NOT DISTINCT FROM openivm_recompute.region
+          |);
+          |DELETE FROM openivm_data_mv_r AS openivm_tgt
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_mv_r) AS openivm_aff
+          |  WHERE openivm_aff.region IS NOT DISTINCT FROM openivm_tgt.region
+          |)
+          |  AND ((openivm_tgt.region IS NULL)
+          |    OR NOT EXISTS (
+          |      SELECT 1 FROM openivm_recompute_mv_r AS openivm_keep
+          |      WHERE openivm_keep.region IS NOT DISTINCT FROM openivm_tgt.region
+          |    ));
+          |INSERT OR REPLACE INTO openivm_data_mv_r
+          |SELECT * FROM openivm_recompute_mv_r;
+          |DROP TABLE IF EXISTS openivm_recompute_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 5
+      rewritten.statements(1) should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_recompute_mv_r AS")
+      rewritten.statements(1) should include("FROM `sales`")
+      rewritten.statements(1) should include(s"FROM delta.`$viewDeltaPath`")
+      rewritten.statements(2) should startWith("MERGE INTO `mydb`.`mv_r` AS openivm_tgt")
+      rewritten.statements(2) should include("WHEN MATCHED THEN DELETE")
+      rewritten.statements(2) should not include "openivm_recompute_mv_r"
+      rewritten.statements(3) shouldBe
+        "INSERT INTO `mydb`.`mv_r`\nSELECT * FROM openivm_recompute_mv_r"
+      rewritten.statements(4) shouldBe "DROP VIEW IF EXISTS `openivm_recompute_mv_r`"
     }
   }
 
