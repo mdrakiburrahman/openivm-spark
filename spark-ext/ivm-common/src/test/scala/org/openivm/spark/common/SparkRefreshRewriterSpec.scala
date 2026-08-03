@@ -761,6 +761,52 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stripped.head should not include "openivm_timestamp"
       stripped.head should not include "::TIMESTAMP"
     }
+
+    it("appends additional LEFT JOIN correction deltas and strips metadata-backed refresh horizons") {
+      val input =
+        s"""INSERT INTO openivm_delta_mv_r (region, total, openivm_count_star, openivm_multiplicity)
+           |SELECT CAST(NULL AS STRING), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT), CAST(NULL AS INTEGER)
+           |WHERE false;
+           |INSERT INTO openivm_delta_mv_r (region, total, openivm_count_star, openivm_multiplicity)
+           |SELECT X.region, 0, 1, -1
+           |FROM (
+           |  SELECT customer_id AS __k, SUM(openivm_multiplicity) AS dsum
+           |  FROM `openivm_delta_orders`
+           |  WHERE openivm_timestamp >= (
+           |    SELECT last_update FROM memory.main.openivm_delta_tables
+           |    WHERE view_name = 'mv_r' AND table_name = 'openivm_delta_orders'
+           |  )
+           |  GROUP BY customer_id
+           |) d
+           |JOIN memory.main.customers X ON X.customer_id = d.__k,
+           |LATERAL (SELECT (SELECT COUNT(*) FROM memory.main.orders ib WHERE ib.customer_id = d.__k) AS __newc) __n,
+           |LATERAL (SELECT (SELECT COUNT(*) FROM memory.main.customers pb WHERE pb.customer_id = d.__k) -
+           |  COALESCE((SELECT SUM(__m) FROM (SELECT customer_id AS __k, openivm_multiplicity AS __m
+           |    FROM `openivm_delta_customers`) __pd WHERE __pd.__k = d.__k), 0) AS __old_pres_count) __op
+           |WHERE __newc > 0 AND __old_pres_count > 0;""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("orders" -> "openivm_delta_orders"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 2
+      rewritten.statements.head should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`")
+      rewritten.statements(1) should startWith(s"INSERT INTO delta.`$viewDeltaPath`")
+      rewritten.statements(1) should include("FROM `openivm_delta_orders`")
+      rewritten.statements(1) should include("JOIN `customers` X")
+      rewritten.statements(1) should include("LATERAL (SELECT COUNT(*) AS __newc FROM `orders` ib")
+      rewritten.statements(1) should include("LATERAL (SELECT COUNT(*) AS __pres_count FROM `customers` pb")
+      rewritten.statements(1) should include("COALESCE(SUM(__m), 0) AS __pres_delta")
+      rewritten.statements(1) should include("(__pres_count - __pres_delta) > 0")
+      rewritten.statements(1) should not include "SELECT (SELECT COUNT(*)"
+      rewritten.statements(1) should not include "openivm_timestamp"
+      rewritten.statements(1) should not include "openivm_delta_tables"
+    }
   }
 
   // ── 7. INSERT INTO openivm_delta_<v> becomes CREATE OR REPLACE TABLE CTAS ─

@@ -411,23 +411,29 @@ object SparkRefreshRewriter {
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
+      var viewDeltaMaterialized = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(
-              rewriteViewDeltaInsert(
-                stmt,
-                viewLogicalName,
-                viewDeltaPath,
-                deltaShape,
-                semiJoinPruneEnabled,
-                fkTermPruneEnabled,
-                fkRelations,
-                uniqueKeys,
-                uniqueJoinSimplifyEnabled
-              )
-            )
+            val rewritten =
+              if (!viewDeltaMaterialized) {
+                viewDeltaMaterialized = true
+                rewriteViewDeltaInsert(
+                  stmt,
+                  viewLogicalName,
+                  viewDeltaPath,
+                  deltaShape,
+                  semiJoinPruneEnabled,
+                  fkTermPruneEnabled,
+                  fkRelations,
+                  uniqueKeys,
+                  uniqueJoinSimplifyEnabled
+                )
+              } else {
+                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
+              }
+            Seq(rewritten)
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -1482,7 +1488,7 @@ object SparkRefreshRewriter {
     sql.length
   }
 
-  /** Strip `openivm_timestamp [op] '<ts>'::TIMESTAMP` predicates that openivm
+  /** Strip `openivm_timestamp [op] <refresh horizon>` predicates that openivm
     * emits at the source-scan level.  The Spark-side staging catalog already
     * controls which staging Delta paths are visible, so the inner timestamp
     * filter is redundant (and references a value that's only tracked by
@@ -1503,11 +1509,17 @@ object SparkRefreshRewriter {
     // emitted by openivm when `force_view_delta_cascade=true`).
     val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
     val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
-    val cmp       = "\\s*(?:>=|>|<=|<|=)\\s*"
+    val metadataTable =
+      "(?:(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?openivm_delta_tables`?)"
+    val metadataHorizon =
+      "\\(\\s*SELECT\\s+last_update\\s+FROM\\s+" + metadataTable + "\\s+WHERE\\s+" +
+        "view_name\\s*=\\s*'[^']*'\\s+AND\\s+table_name\\s*=\\s*'[^']*'\\s*\\)"
+    val refreshHorizon = "(?:" + tsLiteral + "|" + metadataHorizon + ")"
+    val cmp            = "\\s*(?:>=|>|<=|<|=)\\s*"
     // LPTS rewrites parenthesises each WHERE conjunct
     // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
     // wrapped in a balanced paren pair or bare (pre-merge single-line form).
-    val tsPred = "(?:\\(\\s*" + qcol + cmp + tsLiteral + "\\s*\\)|" + qcol + cmp + tsLiteral + ")"
+    val tsPred = "(?:\\(\\s*" + qcol + cmp + refreshHorizon + "\\s*\\)|" + qcol + cmp + refreshHorizon + ")"
     // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
     // Case 2: trailing `AND [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
@@ -1522,6 +1534,66 @@ object SparkRefreshRewriter {
       ),
       ""
     )
+  }
+
+  /** Rewrite an additional data-bearing INSERT into the already-materialized
+    * per-refresh view-delta table. OpenIVM can emit these after the primary
+    * delta for LEFT JOIN match-state transitions; replacing the table here
+    * would silently discard the primary delta rows.
+    */
+  private def rewriteAdditionalViewDeltaInsert(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    var s           = rewriteLeftJoinSecondaryLateral(stripTimestampPredicate(stmt))
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?").r
+    s = insertTargetRe.replaceAllIn(
+      s,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
+    )
+    rewriteMemoryMainPrefix(s)
+  }
+
+  /** Spark cannot resolve an outer key through the nested scalar subqueries in
+    * OpenIVM's DuckDB-optimized LEFT JOIN correction shape. Flatten those
+    * scalar aggregates into directly correlated LATERAL aggregates, preserving
+    * the same one-row COUNT/COALESCE(SUM) semantics.
+    */
+  private def rewriteLeftJoinSecondaryLateral(sql: String): String = {
+    val newCount = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+ib\\s+" +
+        "WHERE\\s+(.+?)\\)\\s+AS\\s+__newc\\s*\\)\\s+__n"
+    ).r
+    val withNewCount = newCount.replaceAllIn(
+      sql,
+      m =>
+        java.util.regex.Matcher.quoteReplacement(
+          s"LATERAL (SELECT COUNT(*) AS __newc FROM ${m.group(1)} ib WHERE ${m.group(2)}) __n"
+        )
+    )
+
+    val oldPresence = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+pb\\s+" +
+        "WHERE\\s+(.+?)\\)\\s*-\\s*COALESCE\\s*\\(\\s*\\(\\s*SELECT\\s+SUM\\(__m\\)\\s+FROM\\s+" +
+        "(.+?)\\s+__pd\\s+WHERE\\s+(.+?)\\)\\s*,\\s*0\\s*\\)\\s+AS\\s+__old_pres_count\\s*\\)\\s+__op"
+    ).r
+    if (oldPresence.findFirstIn(withNewCount).isEmpty) withNewCount
+    else {
+      oldPresence
+        .replaceAllIn(
+          withNewCount,
+          m =>
+            java.util.regex.Matcher.quoteReplacement(
+              s"LATERAL (SELECT COUNT(*) AS __pres_count FROM ${m.group(1)} pb WHERE ${m.group(2)}) __pc,\n" +
+                s"LATERAL (SELECT COALESCE(SUM(__m), 0) AS __pres_delta FROM ${m.group(3)} __pd " +
+                s"WHERE ${m.group(4)}) __pdelta"
+            )
+        )
+        .replace("__old_pres_count", "(__pres_count - __pres_delta)")
+    }
   }
 
   /** Replace `memory.main.<identifier>` (bare or backticked) → either
