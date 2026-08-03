@@ -3485,14 +3485,12 @@ case class RefreshMaterializedViewCommand(
     val parsed    = parseWindowDeleteMerge(deleteMergeSql).getOrElse(return None)
     val rawKeySql = rawWindowAffectedKeySql(parsed.subquery).getOrElse(return None)
     val probeSql =
-      s"""SELECT * FROM (
+      s"""SELECT DISTINCT * FROM (
          |$rawKeySql
          |) __openivm_window_replace_keys
          |LIMIT ${WindowReplaceMaxLiteralKeys + 1}""".stripMargin
     val df = spark.sql(probeSql)
-    df.persist()
-    try collectWindowReplaceKeySet(df, parsed.targetCol)
-    finally df.unpersist()
+    collectWindowReplaceKeySet(df, parsed.targetCol)
   }
 
   private def collectWindowReplaceKeySet(
@@ -3500,30 +3498,34 @@ case class RefreshMaterializedViewCommand(
       targetCol: String
   ): Option[WindowReplaceKeySet] = {
     if (df.schema.fields.length != 1) return None
-    val sourceCol = quoteCol(df.schema.fields.head.name)
-    val stats = df
-      .selectExpr(
-        "COUNT(*) AS openivm_key_count",
-        s"COALESCE(SUM(LENGTH(CAST($sourceCol AS STRING))), 0) AS openivm_key_bytes"
-      )
-      .head()
-    if (
-      stats.getAs[Long]("openivm_key_count") > WindowReplaceMaxLiteralKeys ||
-      stats.getAs[Long]("openivm_key_bytes") > WindowReplaceMaxPredicateBytes
-    ) return None
+    val sourceCol    = quoteCol(df.schema.fields.head.name)
+    val distinctKeys = df.selectExpr(sourceCol).distinct().persist()
+    try {
+      val stats = distinctKeys
+        .selectExpr(
+          "COUNT(*) AS openivm_key_count",
+          s"COALESCE(SUM(LENGTH(CAST($sourceCol AS STRING))), 0) AS openivm_key_bytes"
+        )
+        .head()
+      if (
+        stats.getAs[Long]("openivm_key_count") > WindowReplaceMaxLiteralKeys ||
+        stats.getAs[Long]("openivm_key_bytes") > WindowReplaceMaxPredicateBytes
+      ) return None
 
-    val rows     = df.collect()
-    val literals = scala.collection.mutable.ArrayBuffer.empty[String]
-    var hasNull  = false
-    rows.foreach { row =>
-      if (row.isNullAt(0)) hasNull = true
-      else
-        literalSql(row.get(0)) match {
-          case Some(lit) => literals += lit
-          case None      => return None
-        }
+      val literals = scala.collection.mutable.ArrayBuffer.empty[String]
+      var hasNull  = false
+      distinctKeys.collect().foreach { row =>
+        if (row.isNullAt(0)) hasNull = true
+        else
+          literalSql(row.get(0)) match {
+            case Some(lit) => literals += lit
+            case None      => return None
+          }
+      }
+      Some(WindowReplaceKeySet(targetCol, literals.toSeq, hasNull))
+    } finally {
+      distinctKeys.unpersist()
     }
-    Some(WindowReplaceKeySet(targetCol, literals.distinct.toSeq, hasNull))
   }
 
   private def rawWindowAffectedKeySql(subquery: String): Option[String] = {

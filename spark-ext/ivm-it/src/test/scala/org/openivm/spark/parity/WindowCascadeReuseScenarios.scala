@@ -221,5 +221,34 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertMvCorrect("wcm_downstream", downstreamSql)
       assertCascadeMergeTargetWrite("wcm_mv")
     }
+
+    it("keeps duplicate-heavy batches on the bounded distinct-partition fast path") {
+      sql("CREATE TABLE wcd_events(id BIGINT, seq BIGINT, payload BIGINT) USING DELTA")
+      sql(
+        "INSERT INTO wcd_events " +
+          "SELECT id, 20000 AS seq, id AS payload FROM range(8)"
+      )
+
+      val viewSql =
+        "SELECT id, seq, payload, " +
+          "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq, payload) AS rn " +
+          "FROM wcd_events"
+      val downstreamSql = "SELECT id, seq, payload, rn FROM wcd_mv"
+      sql(s"CREATE MATERIALIZED VIEW wcd_mv AS $viewSql")
+      sql(s"CREATE MATERIALIZED VIEW wcd_downstream AS $downstreamSql")
+      mvRefreshType("wcd_mv") shouldBe RefreshTypeCode.WindowPartition
+
+      sql(
+        "INSERT INTO wcd_events " +
+          "SELECT id % 8 AS id, id AS seq, id + 100000 AS payload FROM range(12001)"
+      )
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wcd_mv")
+      refreshMv("wcd_downstream")
+
+      assertMvCorrect("wcd_mv", viewSql)
+      assertMvCorrect("wcd_downstream", downstreamSql)
+      assertCascadeFirstTargetWrite("wcd_mv")
+    }
   }
 }
