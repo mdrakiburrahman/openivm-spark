@@ -2,7 +2,16 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, StagingCatalog, StagingDelta}
+import org.openivm.spark.common.{
+  BatchVerdict,
+  ChangeWatermark,
+  MvCatalog,
+  MvMetadata,
+  RefreshTypeCode,
+  StagingCatalog,
+  StagingChangeBatch,
+  StagingDelta
+}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -113,6 +122,40 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // ---------------------------------------------------------------------------
   // Test 1 — CREATE happy path
   // ---------------------------------------------------------------------------
+  describe("replacement-batch detection") {
+    val timestamp = new Timestamp(0L)
+
+    def stagingBatch(opType: String): StagingChangeBatch = {
+      val delta = StagingDelta(
+        baseTable = "default.source",
+        opType = opType,
+        stagingPath = "/tmp/openivm-test-delta",
+        txnTs = timestamp,
+        consumedBy = Seq.empty
+      )
+      StagingChangeBatch(
+        baseTable = delta.baseTable,
+        deltas = Seq(delta),
+        endWatermark = ChangeWatermark.TxnTs(timestamp)
+      )
+    }
+
+    it("recognizes replacement CDF verdicts and explicit staging overwrites") {
+      MvCommandHelper.hasReplacementBatch(Seq.empty, Seq(BatchVerdict.Replace)) shouldBe true
+      MvCommandHelper.hasReplacementBatch(
+        Seq(stagingBatch(StagingDelta.OpTypes.Overwrite)),
+        Seq.empty
+      ) shouldBe true
+    }
+
+    it("keeps signed cascade view deltas eligible for incremental fast paths") {
+      MvCommandHelper.hasReplacementBatch(
+        Seq(stagingBatch(StagingDelta.OpTypes.MvViewDelta)),
+        Seq.empty
+      ) shouldBe false
+    }
+  }
+
   describe("(1) CREATE MATERIALIZED VIEW — happy path") {
     it("creates the MV table, loads initial data, and registers catalog entry") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1(region STRING, amount INT) USING DELTA")

@@ -292,6 +292,25 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
 // ---------------------------------------------------------------------------
 private[commands] object MvCommandHelper {
 
+  /** Whether the pending changes replace a source snapshot rather than
+    * describe an incremental delta.
+    *
+    * CDF batches expose replacement semantics through their classified
+    * verdict. Intercepted staging batches carry the operation type directly.
+    * In particular, MV_VIEW_DELTA is a complete signed delta and must not be
+    * treated like OVERWRITE merely because it is delivered through staging.
+    */
+  def hasReplacementBatch(
+      changeBatches: Seq[ChangeBatch],
+      cdfBatchVerdicts: Iterable[BatchVerdict]
+  ): Boolean =
+    cdfBatchVerdicts.exists(_ == BatchVerdict.Replace) ||
+      changeBatches.exists {
+        case batch: StagingChangeBatch =>
+          batch.deltas.exists(_.opType == StagingDelta.OpTypes.Overwrite)
+        case _: CdfChangeBatch => false
+      }
+
   /** Fully-qualified dot-separated name used in MvMetadata and SQL strings. */
   def metaName(id: TableIdentifier): String =
     id.database.fold(id.table)(db => s"$db.${id.table}")
@@ -2062,7 +2081,7 @@ case class RefreshMaterializedViewCommand(
       // dimension MV refreshing) does not block the fast path, because the
       // view-delta sign (1) is the authoritative signal for the FACT.
       lazy val batchHasReplace: Boolean =
-        cdfChangeBatches.isEmpty || cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
+        hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
 
       // True when a changed source is on the NULL-producing (optional) side of an
       // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
