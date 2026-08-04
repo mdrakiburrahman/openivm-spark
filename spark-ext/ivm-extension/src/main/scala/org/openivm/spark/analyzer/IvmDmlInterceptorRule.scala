@@ -22,7 +22,8 @@ import java.time.{Instant, ZoneOffset}
  * same "Resolution" batch.  Because Delta is registered before openivm-spark,
  * Delta's rules run first in each pass:
  *   - `AppendData` / `OverwriteByExpression` are NOT lowered by Delta → our
- *     rule sees them directly and wraps their query child with [[WithDeltaStaging]].
+ *     rule sees them directly. Overwrites stage both the replaced target rows
+ *     and the replacement query so downstream MVs receive a complete signed delta.
  *   - `DeleteFromTable` → `ReplaceData`, `UpdateTable` → `ReplaceData`,
  *     `MergeIntoTable` → `WriteDelta` before our rule fires → our rule matches
  *     the Delta-lowered forms and wraps them in [[StagedDmlNode]].
@@ -56,14 +57,23 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         }
 
       // -----------------------------------------------------------------------
-      // OVERWRITE — pre-read staging: capture replacement rows before write
+      // OVERWRITE — pre-read staging: retract replaced rows and add replacement rows
       // -----------------------------------------------------------------------
       case o: OverwriteByExpression =>
         val tableName = extractTableName(o.table)
         if (tableName.isEmpty || !hasDependentMvs(tableName)) o
         else {
-          val sp  = stagingPath(tableName, "OVERWRITE")
-          val ops = Seq((o.query, sp, "OVERWRITE"))
+          // OverwriteByExpression replaces the rows selected by deleteExpr.  The
+          // incoming query alone is not a complete signed delta: treating only
+          // those rows as +1 leaves every replaced row in dependent projection
+          // MVs.  Read both sides before the DML so a full overwrite and a
+          // predicate-scoped overwrite produce the same -old/+new delta that CDF
+          // exposes after the commit.
+          val replacedPlan: LogicalPlan = Filter(o.deleteExpr, o.table)
+          val ops = Seq(
+            (replacedPlan, stagingPath(tableName, "DELETE"), "DELETE"),
+            (o.query, stagingPath(tableName, "OVERWRITE"), "OVERWRITE")
+          )
           StagedDmlNode(o, ops, tableName)
         }
 
