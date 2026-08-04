@@ -584,44 +584,35 @@ Source:
 - `MaterializedViewCommands.scala:1027-1028`
   Retry is therefore around each statement. Retry is not around the whole refresh. If statement 3 fails, statement 3 is retried. The staging snapshot is not recollected for each retry.
 
-### 2.9 Simple-projection forced full recompute branch
+> **Important:** A failure after a target statement commits but before input
+> changes are marked consumed can replay that statement on the next REFRESH.
+> Multi-statement incremental refresh is therefore at-least-once across this
+> failure boundary. This limitation applies to additive projection inserts and
+> other non-idempotent statements.
 
-Simple projection has a REFRESH-time safety branch. The first statement
-(stmt\[0\], the view-delta CTAS) is executed under the per-statement plan-time
-broadcast disable (see §2.9b). Then the command checks whether value-equality
-delete-merge would conflict with signed rows by running two probes
-(`hasNegativesHere`, `hasConflictingSimpleProjectionRows`) — both probes also
-run inside the broadcast-disable scope so the SCD2-shaped CTAS lineage cannot
-broadcast-explode if the cache evicts the fused view.
+### 2.9 Simple-projection signed-bag application
+
+Simple projection applies mixed signed rows incrementally. The first statement
+(stmt\[0\], the view-delta CTAS) runs under the per-statement plan-time
+broadcast disable (see §2.9b). The command probes only for negative rows.
+Positive-only deltas skip the delete merge.
 Source:
 
-- `MaterializedViewCommands.scala:1745-1780`
-  If conflicting signed rows exist, REFRESH logs
-  `outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'`
-  and assembles a one-off `FULL_REFRESH` (`SparkMergeAssembler.assemble` with
-  `refreshType = FullRefresh`), executing its `INSERT OVERWRITE` statements
-  inside another `withPlanTimeBroadcastDisabled` scope.
-  Source:
-- `MaterializedViewCommands.scala:1781-1829`
+- `MaterializedViewCommands.scala`, SIMPLE_PROJECTION execution branch
 
-**Cascade-preservation invariant.** The fallback deliberately does **not**:
+The rewriter consolidates raw signed rows by the complete output tuple. It
+creates one `__openivm_net` value per tuple and drops zero-net groups. Negative
+groups use a value-equality delete merge, followed by replenishment from the
+pre-delete Delta version. Positive groups insert exactly their net
+multiplicity. This program preserves bag semantics without a one-off full
+recompute.
 
-- override `_ivm_emits_cascade_view_delta` to `false`, and
-- delete the view-delta path that stmt\[0\] just wrote.
+stmt\[0\]'s raw signed Δ(MV) remains the downstream cascade feed. Local net
+consolidation changes only how the current MV applies that delta.
 
-stmt\[0\]'s view-delta CTAS is openivm's raw per-tuple Δ(MV) and is
-bag-correct for downstream consumers (which read the cascade view-delta
-path, never the MV body directly). The fallback only fixes the MV's *own*
-bag — the bag-correct rewriter's `net + replenish` strategy can mis-apply
-mixed-sign rows on the local MV, but Δ(MV) is unaffected. Wiping the
-cascade evidence here was the
-$silver.holdings_{\text{history}} \to gold.fact_{\text{holdings}}$ correctness bug fixed by
-commit `56d91e9`: downstream MVs saw `deltas=0` even though the source
-had real change.
-
-This branch is separate from the CREATE-time `simple_projection_no_apply`
-demotion documented in chapter 11 §3.2 — here metadata stays
-`SIMPLE_PROJECTION` and only this refresh is forced to recompute.
+This path is separate from the CREATE-time `simple_projection_no_apply`
+demotion documented in chapter 11 §3.2. Metadata remains
+`SIMPLE_PROJECTION`.
 
 ### 2.9b Refresh-scoped broadcast disables
 
