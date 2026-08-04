@@ -167,8 +167,12 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
 
     it("nets conflicting rows and avoids a full-refresh overwrite") {
       sql("CREATE TABLE IF NOT EXISTS spbd_src5(k INT, payload STRING) USING DELTA")
-      sql("INSERT INTO spbd_src5 VALUES (1,'a'),(1,'b'),(2,'c')")
+      sql("INSERT INTO spbd_src5 VALUES (1,'a'),(1,'b'),(1,'c'),(2,'a'),(2,'b')")
       sql("CREATE MATERIALIZED VIEW spbd_mv5 AS SELECT k FROM spbd_src5")
+      sql(
+        "CREATE MATERIALIZED VIEW spbd_mv5_counts AS " +
+          "SELECT k, COUNT(*) AS cnt FROM spbd_mv5 GROUP BY k"
+      )
 
       val meta = MvCatalog
         .lookup(spark, TableIdentifier("spbd_mv5"))
@@ -180,13 +184,19 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
         .head()
         .getAs[Long]("version")
 
-      // k=1 contributes -1 and +1 in the same refresh, so its net is zero.
-      // k=3 is a real positive change and must still be inserted.
-      sql("DELETE FROM spbd_src5 WHERE k=1 AND payload='a'")
-      sql("INSERT INTO spbd_src5 VALUES (1,'replacement'),(3,'new')")
+      // k=1 contributes -2 and +1 (net -1), while k=2 contributes -1 and
+      // +2 (net +1). Both projected tuples therefore contain opposing raw
+      // signs with a non-zero net. k=3 is an independent positive change.
+      sql("DELETE FROM spbd_src5 WHERE (k=1 AND payload IN ('a','b')) OR (k=2 AND payload='a')")
+      sql("INSERT INTO spbd_src5 VALUES (1,'replacement'),(2,'new-1'),(2,'new-2'),(3,'new')")
       refreshMv("spbd_mv5")
+      refreshMv("spbd_mv5_counts")
 
       assertMvCorrect("spbd_mv5", "SELECT k FROM spbd_src5")
+      assertMvCorrect(
+        "spbd_mv5_counts",
+        "SELECT k, COUNT(*) AS cnt FROM spbd_src5 GROUP BY k"
+      )
 
       val unconditionalOverwrites = spark
         .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")

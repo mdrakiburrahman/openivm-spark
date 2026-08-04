@@ -2448,8 +2448,8 @@ case class RefreshMaterializedViewCommand(
                 }
             else None
 
-          // Negative-row + conflict probes operate against either the cached
-          // temp view (fuse) or the on-disk scratch (existing path).
+          // The negative-row probe operates against either the cached temp
+          // view (fuse) or the on-disk scratch (existing path).
           lazy val hasNegativesHere: Boolean = fusedView match {
             case Some(view) =>
               spark
