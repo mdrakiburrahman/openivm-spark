@@ -2198,8 +2198,6 @@ case class RefreshMaterializedViewCommand(
         }
       }
 
-      var cleanupMeta                = meta
-      var spFullRefreshFallback      = false
       var preserveViewDeltaOnFailure = false
       def deletePathIfExists(pathStr: String): Unit =
         try {
@@ -2474,74 +2472,7 @@ case class RefreshMaterializedViewCommand(
                 } else None
               } catch { case _: Throwable => None }
 
-          val usesValueEqualityDeleteMerge =
-            rewritten.statements.exists(SparkRefreshRewriter.isSimpleProjectionDeleteMerge)
-          // Wrap the negative-row + conflict probes in the same plan-time
-          // broadcast-disable scope as the CTAS that materialised their input.
-          // The `fusedView` lineage is the full CTAS body (SCD2 source joins);
-          // if Spark's storage layer evicts that cache, these probes re-execute
-          // the SCD2 joins and can broadcast-explode. For the on-disk path
-          // (None branch) the input is the materialised `delta.\`<viewDeltaPath>\``
-          // table — broadcast-safe but cheap to wrap anyway.
-          val hasConflictingRows =
-            usesValueEqualityDeleteMerge && withPlanTimeBroadcastDisabled {
-              hasNegativesHere && {
-                fusedView match {
-                  case Some(view) => hasConflictingFusedRows(spark, mergeTargetId, view)
-                  case None       => hasConflictingSimpleProjectionRows(spark, mergeTargetId, viewDeltaPath)
-                }
-              }
-            }
-          if (hasConflictingRows) {
-            logInfo(
-              s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                "outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'"
-            )
-            RefreshPerf.emit(
-              refreshId,
-              viewLabel,
-              "fallback",
-              "outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'"
-            )
-            profile.appendStep(
-              "fallback",
-              "outcome=simple_projection_full_refresh;reason=conflicting_signed_rows",
-              0L
-            )
-            // Fallback recomputes the MV body via INSERT OVERWRITE. We deliberately
-            // do NOT override `_ivm_emits_cascade_view_delta` to false here, and we
-            // do NOT delete the view-delta path stmt[0] just wrote. The fallback is
-            // about the MV's OWN bag (the bag-correct rewriter mishandles mixed-sign
-            // rows), not about the upstream→downstream cascade. stmt[0]'s view-delta
-            // CTAS is openivm's per-tuple Δ(MV) and is bag-correct for downstream
-            // consumers (which only read the cascade view-delta path, never the MV
-            // body directly). Wiping it here was the silver.holdings_history →
-            // gold.fact_holdings IVM correctness bug: downstream saw deltas=0 even
-            // though the source had real change.
-            val fullRefreshMeta = meta.copy(
-              refreshType = RefreshTypeCode.FullRefresh,
-              refreshTypeName = "FULL_REFRESH"
-            )
-            val fullRefresh = SparkMergeAssembler.assemble(
-              AssemblyInput(
-                refreshType = RefreshTypeCode.FullRefresh,
-                refreshTypeName = "FULL_REFRESH",
-                deltaSql = meta.querySql,
-                mvName = metaName(name),
-                mvLocation = meta.location
-              )
-            )
-            cleanupMeta = fullRefreshMeta
-            spFullRefreshFallback = true
-            // The fallback's INSERT OVERWRITE recomputes the FULL MV body
-            // via the same SCD2-shaped joins as the view-delta CTAS, just
-            // on the full sources (not deltas). It can broadcast-explode
-            // identically. Wrap the whole fallback program in a plan-time
-            // broadcast disable scope.
-            withPlanTimeBroadcastDisabled {
-              fullRefresh.statements.foreach(executeSql)
-            }
-          } else if (insertOnlyInsertSql.isDefined) {
+          if (insertOnlyInsertSql.isDefined) {
             RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='insert_only_simple_projection'")
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
@@ -2603,7 +2534,7 @@ case class RefreshMaterializedViewCommand(
           val windowSuffixSafe =
             windowSuffixSql.isDefined && windowSuffixBatchIsStrictSuffix(spark, meta, mergeTargetId)
           val windowSuffixEmitsCascade =
-            windowSuffixSafe && downstreamSourceKeysForThisMv.nonEmpty && cleanupMeta.emitsCascadeViewDelta
+            windowSuffixSafe && downstreamSourceKeysForThisMv.nonEmpty && meta.emitsCascadeViewDelta
           var windowSuffixCascadeWritten = false
           val boundedRankInsertSql: Option[String] =
             if (
@@ -2986,7 +2917,7 @@ case class RefreshMaterializedViewCommand(
         // Only matters for the intercept mode: under CDF the downstream MV
         // discovers our update via the MV data table's own change feed, so
         // there is no need to write an MV_VIEW_DELTA staging row.
-        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta) {
+        if (propagation.requiresDmlInterception && meta.emitsCascadeViewDelta) {
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
@@ -3049,13 +2980,12 @@ case class RefreshMaterializedViewCommand(
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
         RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          postRefreshCleanup(spark, name, cleanupMeta, changeBatches, viewNameStr, sqlLog, qlogOrder)
+          postRefreshCleanup(spark, name, meta, changeBatches, viewNameStr, sqlLog, qlogOrder)
         }
       }
       emitEnd(
-        if (spFullRefreshFallback) "simple_projection_full_refresh_fallback"
-        else "incremental_executed",
-        if (spFullRefreshFallback) "FULL_REFRESH" else meta.refreshTypeName,
+        "incremental_executed",
+        meta.refreshTypeName,
         changeBatches.size
       )
     } finally {
@@ -3209,56 +3139,6 @@ case class RefreshMaterializedViewCommand(
             s"error='${t.getClass.getSimpleName}: ${t.getMessage}'"
         )
     }
-  }
-
-  private def simpleProjectionUserCols(spark: SparkSession, targetId: TableIdentifier): Seq[String] =
-    spark
-      .table(MvCommandHelper.metaName(targetId))
-      .columns
-      .filterNot(_.startsWith("openivm_"))
-      .map(c => s"`${c.replace("`", "``")}`")
-      .toSeq
-
-  private def hasConflictingSimpleProjectionRows(
-      spark: SparkSession,
-      targetId: TableIdentifier,
-      viewDeltaPath: String
-  ): Boolean = {
-    val escapedPath = viewDeltaPath.replace("`", "``")
-    val colList     = simpleProjectionUserCols(spark, targetId).mkString(", ")
-    spark
-      .sql(
-        s"""SELECT 1
-           |FROM delta.`$escapedPath`
-           |GROUP BY $colList
-           |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
-           |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0
-           |LIMIT 1""".stripMargin
-      )
-      .head(1)
-      .nonEmpty
-  }
-
-  /** Same as [[hasConflictingSimpleProjectionRows]] but reads from a cached
-    * temp view (the scratch-CTAS fuse fast path).
-    */
-  private def hasConflictingFusedRows(
-      spark: SparkSession,
-      targetId: TableIdentifier,
-      scratchView: String
-  ): Boolean = {
-    val colList = simpleProjectionUserCols(spark, targetId).mkString(", ")
-    spark
-      .sql(
-        s"""SELECT 1
-           |FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(scratchView)}
-           |GROUP BY $colList
-           |HAVING SUM(CASE WHEN `openivm_multiplicity` > 0 THEN `openivm_multiplicity` ELSE 0 END) > 0
-           |   AND SUM(CASE WHEN `openivm_multiplicity` < 0 THEN -`openivm_multiplicity` ELSE 0 END) > 0
-           |LIMIT 1""".stripMargin
-      )
-      .head(1)
-      .nonEmpty
   }
 
   private case class WindowSuffixShape(sourceShort: String, partitionCols: Seq[String], orderCol: String)
