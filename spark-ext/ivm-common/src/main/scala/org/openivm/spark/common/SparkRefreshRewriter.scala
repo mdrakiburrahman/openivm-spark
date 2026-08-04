@@ -411,23 +411,29 @@ object SparkRefreshRewriter {
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
+      var viewDeltaMaterialized = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(
-              rewriteViewDeltaInsert(
-                stmt,
-                viewLogicalName,
-                viewDeltaPath,
-                deltaShape,
-                semiJoinPruneEnabled,
-                fkTermPruneEnabled,
-                fkRelations,
-                uniqueKeys,
-                uniqueJoinSimplifyEnabled
-              )
-            )
+            val rewritten =
+              if (!viewDeltaMaterialized) {
+                viewDeltaMaterialized = true
+                rewriteViewDeltaInsert(
+                  stmt,
+                  viewLogicalName,
+                  viewDeltaPath,
+                  deltaShape,
+                  semiJoinPruneEnabled,
+                  fkTermPruneEnabled,
+                  fkRelations,
+                  uniqueKeys,
+                  uniqueJoinSimplifyEnabled
+                )
+              } else {
+                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
+              }
+            Seq(rewritten)
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -463,6 +469,12 @@ object SparkRefreshRewriter {
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
             Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+          case StatementKind.GroupRecomputeRowsCreate =>
+            Seq(rewriteGroupRecomputeRowsCreate(stmt, viewLogicalName, viewDeltaPath))
+          case StatementKind.GroupRecomputeRowsInsert =>
+            Seq(rewriteGroupRecomputeRowsInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.GroupRecomputeRowsDrop =>
+            Seq(rewriteGroupRecomputeRowsDrop(viewLogicalName))
           case StatementKind.CurrentSnapshotCreate =>
             Seq(rewriteCurrentSnapshotCreate(stmt))
           case StatementKind.OldSnapshotCreate =>
@@ -557,6 +569,16 @@ object SparkRefreshRewriter {
       * `DROP TABLE IF EXISTS openivm_affected_<view>` → `DROP VIEW IF EXISTS …`. */
     case object GroupRecomputeAffectedDrop extends StatementKind
 
+    /** DuckDB's indexed GROUP_RECOMPUTE path materialises surviving affected
+      * rows, conditionally deletes stale rows, and applies `INSERT OR REPLACE`.
+      * Spark has no corresponding DuckDB unique-index restriction, so it
+      * rewrites the program to delete every affected group and insert this
+      * materialised recompute result.
+      */
+    case object GroupRecomputeRowsCreate extends StatementKind
+    case object GroupRecomputeRowsInsert extends StatementKind
+    case object GroupRecomputeRowsDrop   extends StatementKind
+
     /** Current-diff recompute snapshot of the full post-refresh query result.
       *
       * OpenIVM emits `openivm_current_<view>` before `openivm_affected_<view>`
@@ -632,6 +654,7 @@ object SparkRefreshRewriter {
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
     val upper             = stmt.toUpperCase.trim
     val affectedKeysName  = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val recomputeRowsName = s"OPENIVM_RECOMPUTE_${viewLogicalName.toUpperCase}"
     val currentName       = s"OPENIVM_CURRENT_${viewLogicalName.toUpperCase}"
     val oldSnapshotName   = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
     val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
@@ -658,6 +681,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $recomputeRowsName")) {
+      StatementKind.GroupRecomputeRowsCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $currentName")) {
       StatementKind.CurrentSnapshotCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $oldSnapshotName")) {
@@ -669,6 +694,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
+    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $recomputeRowsName")) {
+      StatementKind.GroupRecomputeRowsDrop
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $currentName")) {
       StatementKind.CurrentSnapshotDrop
     } else if (
@@ -707,6 +734,11 @@ object SparkRefreshRewriter {
       else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
+    } else if (
+      upper.contains(s"INSERT OR REPLACE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains(recomputeRowsName)
+    ) {
+      StatementKind.GroupRecomputeRowsInsert
     } else if (
       upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
       containsInSubquery(upper)
@@ -1482,7 +1514,7 @@ object SparkRefreshRewriter {
     sql.length
   }
 
-  /** Strip `openivm_timestamp [op] '<ts>'::TIMESTAMP` predicates that openivm
+  /** Strip `openivm_timestamp [op] <refresh horizon>` predicates that openivm
     * emits at the source-scan level.  The Spark-side staging catalog already
     * controls which staging Delta paths are visible, so the inner timestamp
     * filter is redundant (and references a value that's only tracked by
@@ -1503,11 +1535,17 @@ object SparkRefreshRewriter {
     // emitted by openivm when `force_view_delta_cascade=true`).
     val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
     val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
-    val cmp       = "\\s*(?:>=|>|<=|<|=)\\s*"
+    val metadataTable =
+      "(?:(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?openivm_delta_tables`?)"
+    val metadataHorizon =
+      "\\(\\s*SELECT\\s+last_update\\s+FROM\\s+" + metadataTable + "\\s+WHERE\\s+" +
+        "view_name\\s*=\\s*'[^']*'\\s+AND\\s+table_name\\s*=\\s*'[^']*'\\s*\\)"
+    val refreshHorizon = "(?:" + tsLiteral + "|" + metadataHorizon + ")"
+    val cmp            = "\\s*(?:>=|>|<=|<|=)\\s*"
     // LPTS rewrites parenthesises each WHERE conjunct
     // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
     // wrapped in a balanced paren pair or bare (pre-merge single-line form).
-    val tsPred = "(?:\\(\\s*" + qcol + cmp + tsLiteral + "\\s*\\)|" + qcol + cmp + tsLiteral + ")"
+    val tsPred = "(?:\\(\\s*" + qcol + cmp + refreshHorizon + "\\s*\\)|" + qcol + cmp + refreshHorizon + ")"
     // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
     // Case 2: trailing `AND [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
@@ -1522,6 +1560,66 @@ object SparkRefreshRewriter {
       ),
       ""
     )
+  }
+
+  /** Rewrite an additional data-bearing INSERT into the already-materialized
+    * per-refresh view-delta table. OpenIVM can emit these after the primary
+    * delta for LEFT JOIN match-state transitions; replacing the table here
+    * would silently discard the primary delta rows.
+    */
+  private def rewriteAdditionalViewDeltaInsert(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    var s           = rewriteLeftJoinSecondaryLateral(stripTimestampPredicate(stmt))
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?").r
+    s = insertTargetRe.replaceAllIn(
+      s,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
+    )
+    rewriteMemoryMainPrefix(s)
+  }
+
+  /** Spark cannot resolve an outer key through the nested scalar subqueries in
+    * OpenIVM's DuckDB-optimized LEFT JOIN correction shape. Flatten those
+    * scalar aggregates into directly correlated LATERAL aggregates, preserving
+    * the same one-row COUNT/COALESCE(SUM) semantics.
+    */
+  private def rewriteLeftJoinSecondaryLateral(sql: String): String = {
+    val newCount = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+ib\\s+" +
+        "WHERE\\s+(.+?)\\)\\s+AS\\s+__newc\\s*\\)\\s+__n"
+    ).r
+    val withNewCount = newCount.replaceAllIn(
+      sql,
+      m =>
+        java.util.regex.Matcher.quoteReplacement(
+          s"LATERAL (SELECT COUNT(*) AS __newc FROM ${m.group(1)} ib WHERE ${m.group(2)}) __n"
+        )
+    )
+
+    val oldPresence = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+pb\\s+" +
+        "WHERE\\s+(.+?)\\)\\s*-\\s*COALESCE\\s*\\(\\s*\\(\\s*SELECT\\s+SUM\\(__m\\)\\s+FROM\\s+" +
+        "(.+?)\\s+__pd\\s+WHERE\\s+(.+?)\\)\\s*,\\s*0\\s*\\)\\s+AS\\s+__old_pres_count\\s*\\)\\s+__op"
+    ).r
+    if (oldPresence.findFirstIn(withNewCount).isEmpty) withNewCount
+    else {
+      oldPresence
+        .replaceAllIn(
+          withNewCount,
+          m =>
+            java.util.regex.Matcher.quoteReplacement(
+              s"LATERAL (SELECT COUNT(*) AS __pres_count FROM ${m.group(1)} pb WHERE ${m.group(2)}) __pc,\n" +
+                s"LATERAL (SELECT COALESCE(SUM(__m), 0) AS __pres_delta FROM ${m.group(3)} __pd " +
+                s"WHERE ${m.group(4)}) __pdelta"
+            )
+        )
+        .replace("__old_pres_count", "(__pres_count - __pres_delta)")
+    }
   }
 
   /** Replace `memory.main.<identifier>` (bare or backticked) → either
@@ -2132,6 +2230,8 @@ object SparkRefreshRewriter {
     if (usingRewritten != s) return Seq(usingRewritten)
     val inRewritten = rewriteDeleteInAsMerge(s, mvRef)
     if (inRewritten.nonEmpty) return inRewritten
+    val existsRewritten = rewriteDeleteExistsDisjunctionAsMerges(s, mvRef)
+    if (existsRewritten.nonEmpty) return existsRewritten
     Seq(rewriteDeleteExistsAsMerge(s, mvRef))
   }
 
@@ -2469,11 +2569,17 @@ object SparkRefreshRewriter {
         if (existsClose < 0) return stmt
         val existsBody = stmt.substring(existsOpen + 1, existsClose).trim
         val trailing   = stmt.substring(existsClose + 1).trim
-        // The trailing text past the EXISTS must be just a terminator (`)` or
-        // empty) — anything else means the surrounding context is more complex
-        // than the inline affected-keys form and we bail out rather than
-        // mangle the SQL.
-        if (trailing.nonEmpty && trailing != ";") return stmt
+        // DuckDB's indexed GROUP_RECOMPUTE path retains target rows that also
+        // occur in openivm_recompute_<view>, then applies INSERT OR REPLACE.
+        // Delta has no matching unique-index restriction, and Spark rewrites
+        // that later upsert to a plain INSERT. Delete every affected group here
+        // so the pair remains equivalent without nesting EXISTS in Delta DELETE.
+        val indexedGroupRecomputeGuard =
+          trailing.toUpperCase.startsWith("AND") && trailing.toUpperCase.contains("NOT EXISTS") &&
+            trailing.toUpperCase.contains("OPENIVM_RECOMPUTE_")
+        // Other trailing predicates mean the surrounding context is more
+        // complex than a supported affected-key form.
+        if (trailing.nonEmpty && trailing != ";" && !indexedGroupRecomputeGuard) return stmt
 
         // EXISTS body forms (from refresh_helpers.cpp:195-218):
         //   (a) inline subquery — `SELECT 1 FROM (<sub>) AS <aff> WHERE <cond>`
@@ -2515,6 +2621,28 @@ object SparkRefreshRewriter {
               }
               .getOrElse(stmt)
         }
+    }
+  }
+
+  /** Rewrites the composite WINDOW_PARTITION delete emitted as one EXISTS per
+    * partition column, joined by top-level OR, into independent Delta MERGEs.
+    * Sequential deletes preserve the original disjunction semantics while
+    * avoiding Delta's unsupported DELETE subqueries.
+    */
+  private def rewriteDeleteExistsDisjunctionAsMerges(stmt: String, mvRef: String): Seq[String] = {
+    val deleteRe = ("(?is)^\\s*DELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+(.+?)\\s*;?\\s*$").r
+    deleteRe.findFirstMatchIn(stmt).toSeq.flatMap { m =>
+      val tgtAlias = Option(m.group(1)).getOrElse("v")
+      val clauses  = splitTopLevelOr(m.group(2).trim)
+      if (clauses.size < 2 || clauses.exists(c => !c.trim.toUpperCase.startsWith("EXISTS"))) Seq.empty
+      else {
+        val rewritten = clauses.map { clause =>
+          val one = s"DELETE FROM $mvRef AS $tgtAlias WHERE ${clause.trim}"
+          rewriteDeleteExistsAsMerge(one, mvRef)
+        }
+        if (rewritten.exists(_.trim.toUpperCase.startsWith("DELETE FROM"))) Seq.empty else rewritten
+      }
     }
   }
 
@@ -3052,6 +3180,44 @@ object SparkRefreshRewriter {
     val affectedName = s"openivm_affected_$viewLogicalName"
     s"DROP VIEW IF EXISTS `$affectedName`"
   }
+
+  /** Materialises the current rows for affected GROUP_RECOMPUTE keys as a
+    * Spark temporary view. The native compiler uses a DuckDB TEMP TABLE here
+    * because it subsequently performs INSERT OR REPLACE; Spark only needs a
+    * stable relation shared by the delete and insert statements.
+    */
+  private def rewriteGroupRecomputeRowsCreate(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = rewriteMemoryMainPrefix(s)
+    s = stripTimestampPredicate(s)
+    s = rewriteExcludeAsExcept(s)
+    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    s
+  }
+
+  /** Replaces DuckDB's `INSERT OR REPLACE` half of indexed GROUP_RECOMPUTE
+    * with a plain append. The preceding Spark MERGE deletes every affected
+    * group, so no target row can conflict with the recomputed survivors.
+    */
+  private def rewriteGroupRecomputeRowsInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String = {
+    val targetRe = ("(?is)\\bINSERT\\s+OR\\s+REPLACE\\s+INTO\\s+openivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    targetRe.replaceFirstIn(stmt, java.util.regex.Matcher.quoteReplacement(s"INSERT INTO ${backtickMvName(mvName)}"))
+  }
+
+  private def rewriteGroupRecomputeRowsDrop(viewLogicalName: String): String =
+    s"DROP VIEW IF EXISTS `openivm_recompute_$viewLogicalName`"
 
   /** Rewrites `SELECT * EXCLUDE (col1, col2)` (DuckDB) by stripping the
     * `EXCLUDE (...)` clause entirely.
