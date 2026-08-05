@@ -392,6 +392,7 @@ object SparkRefreshRewriter {
       postProcess: String => String = identity,
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
+      sourceSnapshotVersions: Map[String, Long] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
       fkTermPruneEnabled: Boolean = false,
@@ -428,7 +429,8 @@ object SparkRefreshRewriter {
                   fkTermPruneEnabled,
                   fkRelations,
                   uniqueKeys,
-                  uniqueJoinSimplifyEnabled
+                  uniqueJoinSimplifyEnabled,
+                  sourceSnapshotVersions
                 )
               } else {
                 rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
@@ -807,7 +809,8 @@ object SparkRefreshRewriter {
       fkTermPruneEnabled: Boolean,
       fkRelations: Seq[ForeignKeyRelation],
       uniqueKeys: Seq[UniqueKey],
-      uniqueJoinSimplifyEnabled: Boolean
+      uniqueJoinSimplifyEnabled: Boolean,
+      sourceSnapshotVersions: Map[String, Long]
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
@@ -816,10 +819,140 @@ object SparkRefreshRewriter {
     s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
+    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
     s
+  }
+
+  private case class ParsedCte(name: String, columns: String, bodyStart: Int, bodyEnd: Int, body: String)
+
+  /** Replace OpenIVM's regular N-term old-state reconstruction
+    *
+    *   current rows with weight +1 UNION ALL source delta with negated weight
+    *
+    * with a direct read of the source's pre-refresh Delta snapshot. The pass
+    * deliberately recognizes only the canonical CTE graph emitted by
+    * `CreateRegularOldNode`: a current scan followed by a literal-one
+    * projection, paired with a single-source negated delta chain. Unknown or
+    * projection-wrapped shapes are left untouched.
+    */
+  private[common] def rewriteRegularOldStateUnions(
+      sql: String,
+      sourceSnapshotVersions: Map[String, Long]
+  ): String = {
+    if (sourceSnapshotVersions.isEmpty) return sql
+
+    val ctes = parseLeadingCtes(sql)
+    if (ctes.isEmpty) return sql
+    val byName = ctes.map(c => c.name.toLowerCase -> c).toMap
+    val versionsByShort = sourceSnapshotVersions.map { case (table, version) =>
+      shortTableName(table).toLowerCase -> version
+    }
+
+    def singleDependency(body: String): Option[String] = {
+      val refs = "(?is)\\b(?:FROM|JOIN)\\s+`?([A-Za-z][A-Za-z0-9_]*)`?".r
+        .findAllMatchIn(body)
+        .map(_.group(1).toLowerCase)
+        .filter(byName.contains)
+        .toVector
+        .distinct
+      if (refs.size == 1) refs.headOption else None
+    }
+
+    def terminalScan(cteName: String, seen: Set[String] = Set.empty): Option[(String, String)] = {
+      if (seen(cteName)) return None
+      byName.get(cteName).flatMap { cte =>
+        val scan =
+          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+        cte.body match {
+          case scan(columns, table) => Some(table -> columns.trim)
+          case _                    => singleDependency(cte.body).flatMap(terminalScan(_, seen + cteName))
+        }
+      }
+    }
+
+    def directSourceScan(cte: ParsedCte): Option[(String, String)] =
+      singleDependency(cte.body).flatMap { dependency =>
+        byName.get(dependency).flatMap { scanCte =>
+          val scan =
+            "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+          scanCte.body match {
+            case scan(columns, table) => Some(table -> columns.trim)
+            case _                    => None
+          }
+        }
+      }
+
+    val union =
+      "(?is)^\\s*SELECT\\s+\\*\\s+FROM\\s+`?([A-Za-z][A-Za-z0-9_]*)`?\\s+UNION\\s+ALL\\s+SELECT\\s+\\*\\s+FROM\\s+`?([A-Za-z][A-Za-z0-9_]*)`?\\s*$".r
+    val replacements = ctes.flatMap { cte =>
+      cte.body match {
+        case union(currentProjectionName, negatedDeltaName) =>
+          val currentProjection = byName.get(currentProjectionName.toLowerCase)
+          val negatedDelta      = byName.get(negatedDeltaName.toLowerCase)
+          val literalOne = currentProjection.exists(c =>
+            "(?is)^\\s*SELECT\\s+.+,\\s*(?:CAST\\s*\\(\\s*)?1(?:\\s+AS\\s+INTEGER\\s*\\))?\\s+FROM\\s+.+$".r
+              .findFirstIn(c.body)
+              .nonEmpty
+          )
+          val negatesMultiplicity = negatedDelta.exists(_.body.matches("(?is).*\\(\\s*-1\\s*\\*.+"))
+          val currentScan         = currentProjection.flatMap(directSourceScan)
+          val deltaScan           = terminalScan(negatedDeltaName.toLowerCase)
+
+          (literalOne, negatesMultiplicity, currentScan, deltaScan) match {
+            case (true, true, Some((source, columns)), Some((deltaSource, _)))
+                if deltaSource.equalsIgnoreCase(s"openivm_delta_$source") =>
+              versionsByShort.get(source.toLowerCase).map { version =>
+                val qualified = activeQualifiedNames
+                  .get()
+                  .collectFirst { case (short, name) if short.equalsIgnoreCase(source) => name }
+                  .getOrElse(source)
+                  .split("\\.")
+                  .map(part => s"`${part.replace("`", "``")}`")
+                  .mkString(".")
+                val body = s"SELECT $columns, CAST(1 AS INT) FROM $qualified VERSION AS OF $version"
+                (cte.bodyStart, cte.bodyEnd, body)
+              }
+            case _ => None
+          }
+        case _ => None
+      }
+    }
+
+    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
+      rewritten.substring(0, start) + body + rewritten.substring(end)
+    }
+  }
+
+  private def parseLeadingCtes(sql: String): Seq[ParsedCte] = {
+    val withMatch = "(?is)^\\s*WITH\\b".r.findFirstMatchIn(sql)
+    if (withMatch.isEmpty) return Seq.empty
+    val parsed = scala.collection.mutable.ArrayBuffer.empty[ParsedCte]
+    var pos    = withMatch.get.end
+    var more   = true
+    while (more) {
+      pos = skipWhitespace(sql, pos)
+      val nameEnd = scanBareToken(sql, pos)
+      if (nameEnd <= pos) return parsed.toVector
+      val name = sql.substring(pos, nameEnd).replace("`", "")
+      pos = skipWhitespace(sql, nameEnd)
+      if (pos >= sql.length || sql.charAt(pos) != '(') return parsed.toVector
+      val columnsEnd = findMatchingCloseParen(sql, pos)
+      if (columnsEnd < 0) return parsed.toVector
+      val columns = sql.substring(pos + 1, columnsEnd)
+      pos = skipWhitespace(sql, columnsEnd + 1)
+      if (!isKeywordAt(sql, pos, "AS")) return parsed.toVector
+      pos = skipWhitespace(sql, pos + 2)
+      if (pos >= sql.length || sql.charAt(pos) != '(') return parsed.toVector
+      val bodyEnd = findMatchingCloseParen(sql, pos)
+      if (bodyEnd < 0) return parsed.toVector
+      parsed += ParsedCte(name, columns, pos + 1, bodyEnd, sql.substring(pos + 1, bodyEnd))
+      pos = skipWhitespace(sql, bodyEnd + 1)
+      if (pos < sql.length && sql.charAt(pos) == ',') pos += 1 else more = false
+    }
+    parsed.toVector
   }
 
   /** Drop inclusion-exclusion UNION ALL arms that select a source delta proven
