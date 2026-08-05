@@ -2193,6 +2193,9 @@ case class RefreshMaterializedViewCommand(
             // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
             // Spark would resolve `<short>` against the current_schema.
             sourceQualifiedNames = shortToQual,
+            sourceSnapshotVersions = sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+              source -> version
+            },
             mvVersionBeforeRefresh = Some(meta.lastVersion)
           )
         }

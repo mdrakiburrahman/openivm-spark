@@ -129,4 +129,36 @@ abstract class JoinsInnerScenarios extends IvmParitySpecBase("joins-inner") {
       )
     }
   }
+
+  describe("(4) regular N-term projection join with conflicting mixed DML") {
+    it("stays bag-equal when old-state arms read pre-refresh Delta snapshots") {
+      sql("CREATE TABLE IF NOT EXISTS j_nterm_a(id INT, k INT, label STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS j_nterm_b(k INT, category STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS j_nterm_c(category STRING, score INT) USING DELTA")
+      sql("INSERT INTO j_nterm_a VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')")
+      sql("INSERT INTO j_nterm_b VALUES (10, 'x'), (20, 'y'), (30, 'z')")
+      sql("INSERT INTO j_nterm_c VALUES ('x', 1), ('y', 2), ('z', 3)")
+
+      val query =
+        "SELECT a.id, a.label, b.category, c.score " +
+          "FROM j_nterm_a a JOIN j_nterm_b b ON a.k = b.k " +
+          "JOIN j_nterm_c c ON b.category = c.category"
+      sql(s"CREATE MATERIALIZED VIEW mv_j_nterm_snapshot AS $query")
+      mvRefreshType("mv_j_nterm_snapshot") shouldBe RefreshTypeCode.SimpleProjection
+
+      // Batch conflicting operations across every source before one refresh.
+      sql("INSERT INTO j_nterm_a VALUES (4, 40, 'temporary'), (5, 50, 'e')")
+      sql("UPDATE j_nterm_a SET label = 'bb', k = 30 WHERE id = 2")
+      sql("DELETE FROM j_nterm_a WHERE id IN (1, 4)")
+      sql("INSERT INTO j_nterm_b VALUES (40, 'w'), (50, 'q')")
+      sql("UPDATE j_nterm_b SET category = 'zz' WHERE k = 30")
+      sql("DELETE FROM j_nterm_b WHERE k = 10")
+      sql("INSERT INTO j_nterm_c VALUES ('q', 5), ('w', 4), ('zz', 33)")
+      sql("UPDATE j_nterm_c SET score = 22 WHERE category = 'y'")
+      sql("DELETE FROM j_nterm_c WHERE category IN ('x', 'w')")
+
+      refreshMv("mv_j_nterm_snapshot")
+      assertMvCorrect("mv_j_nterm_snapshot", query)
+    }
+  }
 }

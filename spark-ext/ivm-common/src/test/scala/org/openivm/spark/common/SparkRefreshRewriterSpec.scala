@@ -1839,4 +1839,52 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
     }
   }
+
+  describe("regular N-term old-state snapshots") {
+    val canonical =
+      """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+        |),
+        |t1_projection (t1_id, t1_value, t1_mul) AS (
+        |  SELECT t0_id, t0_value, 1 FROM t0_scan
+        |),
+        |t2_scan (t2_id, t2_value, t2_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+        |),
+        |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+        |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+        |),
+        |t4_filter (t4_id, t4_value, t4_mul) AS (
+        |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+        |),
+        |t5_projection (t5_id, t5_value, t5_mul) AS (
+        |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+        |),
+        |t6_projection (t6_id, t6_value, t6_mul) AS (
+        |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+        |),
+        |t7_union (t7_id, t7_value, t7_mul) AS (
+        |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+        |)
+        |INSERT INTO openivm_delta_v SELECT * FROM t7_union""".stripMargin
+
+    it("replaces the canonical current-minus-delta arm with a pinned Delta snapshot") {
+      val rewritten = SparkRefreshRewriter.rewriteRegularOldStateUnions(canonical, Map("db.accounts" -> 17L))
+
+      rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
+      rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+    }
+
+    it("leaves non-canonical projection-wrapped source arms unchanged") {
+      val wrapped = canonical
+        .replace(
+          "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0_id, t0_value, 1 FROM t0_scan",
+          "t0_filter (t0f_id, t0f_value) AS (SELECT t0_id, t0_value FROM t0_scan WHERE t0_value > 0),\n" +
+            "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0f_id, t0f_value, 1 FROM t0_filter"
+        )
+
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(wrapped, Map("accounts" -> 17L)) shouldBe wrapped
+    }
+  }
 }
