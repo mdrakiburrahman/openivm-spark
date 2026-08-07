@@ -1310,6 +1310,51 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       )
     }
 
+    it("preserves affected-key projection program order and rewrites its signed cascade delta") {
+      val affectedProjectionInput =
+        """CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
+          |SELECT DISTINCT id FROM openivm_delta_sales;
+          |CREATE OR REPLACE TEMP TABLE openivm_old_mv_r AS
+          |SELECT * FROM openivm_data_mv_r WHERE id IN (SELECT id FROM openivm_affected_mv_r);
+          |CREATE OR REPLACE TEMP TABLE openivm_new_mv_r AS
+          |SELECT id, amount FROM memory.main.sales WHERE id IN (SELECT id FROM openivm_affected_mv_r);
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DELETE FROM openivm_data_mv_r WHERE id IN (SELECT id FROM openivm_affected_mv_r);
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
+          |DROP TABLE IF EXISTS openivm_old_mv_r;
+          |DROP TABLE IF EXISTS openivm_new_mv_r;
+          |DROP TABLE IF EXISTS openivm_affected_mv_r;
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = affectedProjectionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L)
+      )
+
+      rewritten.statements.head should startWith(
+        "CREATE OR REPLACE TEMPORARY VIEW openivm_affected_mv_r AS"
+      )
+      rewritten.statements(1) should include(s"delta.`$mvLocation` VERSION AS OF 7")
+      rewritten.statements(2) should include("`sales`")
+      rewritten.statements(3) should startWith(
+        s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath` USING DELTA AS"
+      )
+      rewritten.statements(4) should startWith("MERGE INTO `mydb`.`mv_r`")
+      rewritten.statements.takeRight(3) shouldBe Seq(
+        "DROP VIEW IF EXISTS `openivm_old_mv_r`",
+        "DROP VIEW IF EXISTS `openivm_new_mv_r`",
+        "DROP VIEW IF EXISTS `openivm_affected_mv_r`"
+      )
+    }
+
     it("keeps current-diff recompute helpers and pins the affected diff to the pre-refresh MV snapshot") {
       val currentDiffInput =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
