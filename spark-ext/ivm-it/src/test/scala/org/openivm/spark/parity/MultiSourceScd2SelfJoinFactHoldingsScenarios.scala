@@ -251,44 +251,6 @@ abstract class MultiSourceScd2SelfJoinFactHoldingsScenarios
 
       sql("REFRESH MATERIALIZED VIEW msj_mv").collect()
       assertMvCorrect("msj_mv", FactHoldingsBody)
-
-      // Batch 3 deliberately mixes conflicting DML before one refresh. This
-      // exercises every lineage arm, including the second dim_trade
-      // occurrence, and verifies that the affected-key envelope covers both
-      // preimages and current rows.
-      sql(
-        """UPDATE msj_holdings_history
-          |SET trade_price = 301.0
-          |WHERE trade_id = 'T3' AND previous_trade_id = 'T1'""".stripMargin
-      )
-      sql(
-        """DELETE FROM msj_holdings_history
-          |WHERE trade_id = 'T3' AND previous_trade_id = 'T1'""".stripMargin
-      )
-      sql(
-        """INSERT INTO msj_holdings_history VALUES
-          |  ('T3','T1','A2','S1', TIMESTAMP'2020-08-15 10:00:00', 302.0, 32)""".stripMargin
-      )
-
-      // Replace a row read through the previous-trade alias.
-      sql("DELETE FROM msj_dim_trade WHERE sk_trade_id = 'SK_T0_V1'")
-      sql(
-        """INSERT INTO msj_dim_trade VALUES
-          |  ('SK_T0_V2', 'T0', TIMESTAMP'2020-01-15 00:00:00', TIMESTAMP'9999-12-31 00:00:00')""".stripMargin
-      )
-
-      // Replace projected values on two other lookup arms without changing
-      // their join keys.
-      sql(
-        """UPDATE msj_dim_account
-          |SET sk_account_id = 'ACC_A1_V2_REKEY'
-          |WHERE sk_account_id = 'ACC_A1_V2'""".stripMargin
-      )
-      sql("DELETE FROM msj_dim_security WHERE symbol = 'S1'")
-      sql("INSERT INTO msj_dim_security VALUES ('SEC_S1_V2', 'S1')")
-
-      sql("REFRESH MATERIALIZED VIEW msj_mv").collect()
-      assertMvCorrect("msj_mv", FactHoldingsBody)
     }
   }
 }

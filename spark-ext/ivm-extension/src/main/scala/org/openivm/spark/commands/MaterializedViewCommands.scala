@@ -1909,12 +1909,11 @@ case class RefreshMaterializedViewCommand(
     val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
     val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
 
-    val byTable                                            = changeBatches.groupBy(_.baseTable)
-    val tempViewShortNames                                 = scala.collection.mutable.ArrayBuffer[String]()
-    var fusedScratchView: Option[String]                   = None
-    var fusedScratchRecordedForCascade: Boolean            = false
-    var materializedWindowAffectedView: Option[String]     = None
-    var materializedProjectionAffectedView: Option[String] = None
+    val byTable                                        = changeBatches.groupBy(_.baseTable)
+    val tempViewShortNames                             = scala.collection.mutable.ArrayBuffer[String]()
+    var fusedScratchView: Option[String]               = None
+    var fusedScratchRecordedForCascade: Boolean        = false
+    var materializedWindowAffectedView: Option[String] = None
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -2210,19 +2209,10 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
-      val simpleProjectionStartsWithViewDeltaCtas =
-        rewritten.statements.headOption.exists { stmt =>
-          SparkRefreshRewriter
-            .extractViewDeltaCtasBody(
-              SparkRefreshRewriter.stripExecutionMarker(stmt),
-              viewDeltaPath
-            )
-            .isDefined
-        }
       val fuseEligible =
         FeatureGate.fuseScratchEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
-          simpleProjectionStartsWithViewDeltaCtas
+          rewritten.statements.nonEmpty
 
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
@@ -2350,7 +2340,7 @@ case class RefreshMaterializedViewCommand(
           withPlanTimeBroadcastDisabled {
             executeSqlAt(directAggregateMerge.get, 1)
           }
-        } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && simpleProjectionStartsWithViewDeltaCtas) {
+        } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
           // ── Scratch-CTAS fuse fast path ────────────────────────────────────
           //
           // openivm emits stmt[0] as `CREATE OR REPLACE TABLE delta.\`<path>\`
@@ -2655,26 +2645,6 @@ case class RefreshMaterializedViewCommand(
               isWindowPartitionInsertSql(sql, mergeTargetId) && windowSinglePassPlan.isDefined
             val materializeWindowAffectedKeys =
               windowCascadeMergeShape.exists(_.affectedStmtIdx.contains(idx))
-            val projectionAffectedView = s"openivm_affected_${mergeTargetId.table}"
-            val projectionAffectedCreatePrefix =
-              "CREATE OR REPLACE TEMPORARY VIEW "
-            val normalizedProjectionSql = sql.trim.toUpperCase(java.util.Locale.ROOT)
-            val normalizedProjectionAffectedView =
-              projectionAffectedView.toUpperCase(java.util.Locale.ROOT)
-            val materializeProjectionAffectedKeys =
-              meta.refreshType == RefreshTypeCode.SimpleProjection &&
-                (normalizedProjectionSql.startsWith(
-                  s"$projectionAffectedCreatePrefix$normalizedProjectionAffectedView AS"
-                ) || normalizedProjectionSql.startsWith(
-                  s"$projectionAffectedCreatePrefix${quoteCol(projectionAffectedView).toUpperCase(java.util.Locale.ROOT)} AS"
-                ))
-            val dropMaterializedProjectionAffectedKeys =
-              materializedProjectionAffectedView.contains(projectionAffectedView) &&
-                (normalizedProjectionSql.startsWith(
-                  s"DROP VIEW IF EXISTS $normalizedProjectionAffectedView"
-                ) || normalizedProjectionSql.startsWith(
-                  s"DROP VIEW IF EXISTS ${quoteCol(projectionAffectedView).toUpperCase(java.util.Locale.ROOT)}"
-                ))
             val cacheWindowSinglePassSnapshot =
               isWindowNewSnapshotCreateSql(sql, mergeTargetId) &&
                 windowSinglePassPlan.isDefined &&
@@ -2685,19 +2655,6 @@ case class RefreshMaterializedViewCommand(
               executeSqlAt(sql, idx)
               val shape = windowCascadeMergeShape.get
               activateMaterializedWindowKeys(shape, idx)
-            } else if (materializeProjectionAffectedKeys) {
-              executeSqlAt(sql, idx)
-              executeSqlAt(s"CACHE TABLE ${quoteCol(projectionAffectedView)}", idx)
-              materializedProjectionAffectedView = Some(projectionAffectedView)
-              logInfo(
-                s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                  s"outcome='projection_affected_keys_materialized' key_view='$projectionAffectedView'"
-              )
-            } else if (dropMaterializedProjectionAffectedKeys) {
-              try spark.catalog.uncacheTable(projectionAffectedView)
-              catch { case _: Throwable => () }
-              materializedProjectionAffectedView = None
-              executeSqlAt(sql, idx)
             } else if (skipDeleteMerge) {
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
@@ -3069,12 +3026,6 @@ case class RefreshMaterializedViewCommand(
         }
       }
       materializedWindowAffectedView.foreach { affectedView =>
-        try spark.catalog.uncacheTable(affectedView)
-        catch { case _: Throwable => () }
-        try spark.catalog.dropTempView(affectedView)
-        catch { case _: Throwable => () }
-      }
-      materializedProjectionAffectedView.foreach { affectedView =>
         try spark.catalog.uncacheTable(affectedView)
         catch { case _: Throwable => () }
         try spark.catalog.dropTempView(affectedView)
