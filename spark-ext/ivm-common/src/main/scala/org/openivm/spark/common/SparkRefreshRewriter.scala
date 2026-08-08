@@ -828,6 +828,16 @@ object SparkRefreshRewriter {
 
   private case class ParsedCte(name: String, columns: String, bodyStart: Int, bodyEnd: Int, body: String)
 
+  final case class RegularNtermKeyRequest(sourceShortName: String, outputColumn: String, castType: Option[String])
+
+  private case class RegularNtermSource(shortName: String, isDelta: Boolean)
+
+  private case class RegularNtermPruneSite(
+      cteName: String,
+      targetExpression: String,
+      request: RegularNtermKeyRequest
+  )
+
   /** Replace OpenIVM's regular N-term old-state reconstruction
     *
     *   current rows with weight +1 UNION ALL source delta with negated weight
@@ -953,6 +963,171 @@ object SparkRefreshRewriter {
       if (pos < sql.length && sql.charAt(pos) == ',') pos += 1 else more = false
     }
     parsed.toVector
+  }
+
+  /** Return the bounded delta-key sets that can prune direct base-table sides
+    * of regular N-term joins. Each request is derived from an equality inside
+    * one generated term, so callers may safely collect the requested delta
+    * column and feed it to [[pruneRegularNtermWithLiteralKeys]].
+    */
+  def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
+    regularNtermPruneSites(sql).map(_.request).distinct
+
+  /** Add literal IN predicates to the direct base-table side of a regular
+    * N-term equality join. Missing requests are left untouched; callers use
+    * that fail-closed behaviour when a key set is too large or cannot be
+    * rendered as portable Spark SQL literals.
+    */
+  def pruneRegularNtermWithLiteralKeys(
+      sql: String,
+      literalsByRequest: Map[RegularNtermKeyRequest, Seq[String]]
+  ): String = {
+    if (literalsByRequest.isEmpty) return sql
+    val ctes  = parseLeadingCtes(sql)
+    val sites = regularNtermPruneSites(sql).groupBy(_.cteName.toLowerCase)
+    val replacements = ctes.flatMap { cte =>
+      val predicates = sites
+        .getOrElse(cte.name.toLowerCase, Seq.empty)
+        .flatMap { site =>
+          literalsByRequest.get(site.request).map { literals =>
+            if (literals.isEmpty) "FALSE"
+            else s"${site.targetExpression} IN (${literals.mkString(", ")})"
+          }
+        }
+        .distinct
+      if (predicates.isEmpty) None
+      else {
+        val body = predicates.foldLeft(cte.body)(addTopLevelWhereConjunct)
+        Some((cte.bodyStart, cte.bodyEnd, body))
+      }
+    }
+    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
+      rewritten.substring(0, start) + body + rewritten.substring(end)
+    }
+  }
+
+  private def regularNtermPruneSites(sql: String): Seq[RegularNtermPruneSite] = {
+    if (!"(?is)\\bVERSION\\s+AS\\s+OF\\b".r.findFirstIn(sql).isDefined) return Seq.empty
+    val ctes   = parseLeadingCtes(sql)
+    val byName = ctes.map(cte => cte.name.toLowerCase -> cte).toMap
+    if (byName.isEmpty) return Seq.empty
+
+    val origins = scala.collection.mutable.Map.empty[String, Option[RegularNtermSource]]
+    def origin(cteName: String, seen: Set[String] = Set.empty): Option[RegularNtermSource] = {
+      val normalized = cteName.toLowerCase
+      if (seen(normalized)) None
+      else
+        origins.getOrElseUpdate(
+          normalized,
+          byName.get(normalized).flatMap { cte =>
+            val refs = collectScd2RelationRefs(cte.body)
+            val resolved = refs.flatMap { ref =>
+              byName.get(ref.shortName.toLowerCase) match {
+                case Some(_) => origin(ref.shortName, seen + normalized)
+                case None =>
+                  ref.deltaSourceShortName
+                    .map(short => RegularNtermSource(short.toLowerCase, isDelta = true))
+                    .orElse(Some(RegularNtermSource(ref.shortName.toLowerCase, isDelta = false)))
+              }
+            }.distinct
+            if (resolved.size == 1) resolved.headOption else None
+          }
+        )
+    }
+
+    val operand =
+      "((?:(?i:CAST)\\s*\\(\\s*)?(?:(`?[A-Za-z][A-Za-z0-9_]*`?)\\s*\\.\\s*)?(`?[A-Za-z][A-Za-z0-9_]*`?)(?:\\s+(?i:AS)\\s+([A-Za-z][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)\\s*\\))?)"
+    val equality = ("(?s)" + operand + "\\s*=\\s*" + operand).r
+
+    ctes.flatMap { cte =>
+      val refs = collectScd2RelationRefs(cte.body).filter(ref => byName.contains(ref.shortName.toLowerCase))
+      if (refs.size < 2 || !"(?is)\\bJOIN\\b".r.findFirstIn(cte.body).isDefined) Seq.empty
+      else {
+        def relationFor(alias: String, column: String): Option[Scd2RelationRef] = {
+          val normalizedAlias = stripBackticks(Option(alias).getOrElse(""))
+          val normalizedCol   = stripBackticks(column)
+          val candidates =
+            if (normalizedAlias.nonEmpty)
+              refs.filter(ref =>
+                stripBackticks(ref.alias).equalsIgnoreCase(normalizedAlias) ||
+                  ref.shortName.equalsIgnoreCase(normalizedAlias)
+              )
+            else
+              refs.filter { ref =>
+                byName
+                  .get(ref.shortName.toLowerCase)
+                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(normalizedCol)))
+              }
+          candidates.distinct match {
+            case Seq(single) => Some(single)
+            case _           => None
+          }
+        }
+
+        equality
+          .findAllMatchIn(cte.body)
+          .flatMap { m =>
+            val leftRef  = relationFor(m.group(2), m.group(3))
+            val rightRef = relationFor(m.group(6), m.group(7))
+            for {
+              left        <- leftRef
+              right       <- rightRef
+              leftOrigin  <- origin(left.shortName)
+              rightOrigin <- origin(right.shortName)
+              site <- (leftOrigin, rightOrigin) match {
+                case (base, delta) if !base.isDelta && delta.isDelta =>
+                  Some(
+                    RegularNtermPruneSite(
+                      cte.name,
+                      m.group(1).trim,
+                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(7)), Option(m.group(8)))
+                    )
+                  )
+                case (delta, base) if delta.isDelta && !base.isDelta =>
+                  Some(
+                    RegularNtermPruneSite(
+                      cte.name,
+                      m.group(5).trim,
+                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(3)), Option(m.group(4)))
+                    )
+                  )
+                case _ => None
+              }
+            } yield site
+          }
+          .toVector
+      }
+    }.distinct
+  }
+
+  private def parsedCteColumns(cte: ParsedCte): Seq[String] =
+    splitTopLevelCsv(cte.columns).map(value => stripBackticks(value.trim))
+
+  private def splitTopLevelCsv(value: String): Seq[String] = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    var start = 0
+    var i     = 0
+    var depth = 0
+    while (i < value.length) {
+      value.charAt(i) match {
+        case '\'' => i = skipSingleQuoted(value, i)
+        case '"'  => i = skipDelimited(value, i, '"')
+        case '`'  => i = skipDelimited(value, i, '`')
+        case '(' =>
+          depth += 1
+          i += 1
+        case ')' =>
+          depth = math.max(0, depth - 1)
+          i += 1
+        case ',' if depth == 0 =>
+          parts += value.substring(start, i).trim
+          i += 1
+          start = i
+        case _ => i += 1
+      }
+    }
+    parts += value.substring(start).trim
+    parts.filter(_.nonEmpty).toVector
   }
 
   /** Drop inclusion-exclusion UNION ALL arms that select a source delta proven
@@ -1188,13 +1363,12 @@ object SparkRefreshRewriter {
             val aliasEnd   = scanBareToken(sql, aliasStart)
             val normalized = normalizeSqlIdentifier(ref)
             val short      = normalized.split("\\.").lastOption.getOrElse(normalized)
-            val alias =
+            val parsedAlias =
               if (aliasEnd > aliasStart) sql.substring(aliasStart, aliasEnd)
               else short
-            if (!stop(alias.toUpperCase)) {
-              val deltaShort = deltaSourceShortName(short)
-              refs += Scd2RelationRef(ref, short, alias, deltaShort)
-            }
+            val alias      = if (stop(parsedAlias.toUpperCase)) short else parsedAlias
+            val deltaShort = deltaSourceShortName(short)
+            refs += Scd2RelationRef(ref, short, alias, deltaShort)
           }
         }
       }

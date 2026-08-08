@@ -1494,6 +1494,24 @@ case class RefreshMaterializedViewCommand(
 
     val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
 
+    // Regular N-term SQL reads unchanged relations from the snapshot immediately
+    // before this refresh.  Metadata watermarks describe MV creation and become
+    // stale after the first CDF refresh, so reconstruct that pre-refresh snapshot:
+    // changed sources start at their consumed version, while unchanged sources
+    // are already at their current version.
+    lazy val sourceSnapshotWatermarks: Map[String, ChangeWatermark] =
+      if (cdfChangeBatches.nonEmpty) {
+        val current = propagation.currentWatermarks(spark, meta.sourceTables)
+        val changed = cdfChangeBatches
+          .groupBy(_.baseTable)
+          .map { case (source, batches) =>
+            source -> ChangeWatermark.DeltaVersion(batches.map(_.startVersionExclusive).min)
+          }
+        current ++ changed
+      } else {
+        sourceWatermarks
+      }
+
     lazy val cdfBatchVerdicts: Map[String, BatchVerdict] =
       cdfChangeBatches
         .groupBy(_.baseTable)
@@ -2161,7 +2179,7 @@ case class RefreshMaterializedViewCommand(
           WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
         else WorkloadConstraintFacts()
 
-      val rewritten = profile.timeStep(
+      val rewrittenBase = profile.timeStep(
         "generate_refresh_sql.assembly",
         s"compiled_sql_bytes=${compiled.sql.length}"
       ) {
@@ -2193,13 +2211,30 @@ case class RefreshMaterializedViewCommand(
             // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
             // Spark would resolve `<short>` against the current_schema.
             sourceQualifiedNames = shortToQual,
-            sourceSnapshotVersions = sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-              source -> version
+            sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
+              case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
             },
             mvVersionBeforeRefresh = Some(meta.lastVersion)
           )
         }
       }
+
+      val rewritten =
+        if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
+          val requests = rewrittenBase.statements.flatMap(SparkRefreshRewriter.regularNtermKeyRequests).distinct
+          val literals = collectRegularNtermLiteralKeys(spark, requests, freshSchemas)
+          if (literals.nonEmpty) {
+            logInfo(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                s"outcome='regular_nterm_literal_prune' key_sets='${literals.size}'"
+            )
+            rewrittenBase.copy(
+              statements = rewrittenBase.statements.map(
+                SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(_, literals)
+              )
+            )
+          } else rewrittenBase
+        } else rewrittenBase
 
       var cleanupMeta                = meta
       var spFullRefreshFallback      = false
@@ -3310,6 +3345,58 @@ case class RefreshMaterializedViewCommand(
 
   private val WindowReplaceMaxLiteralKeys    = 10000
   private val WindowReplaceMaxPredicateBytes = 1024 * 1024
+
+  private def collectRegularNtermLiteralKeys(
+      spark: SparkSession,
+      requests: Seq[SparkRefreshRewriter.RegularNtermKeyRequest],
+      sourceSchemas: Map[String, StructType]
+  ): Map[SparkRefreshRewriter.RegularNtermKeyRequest, Seq[String]] = {
+    val schemasByShort = sourceSchemas.map { case (table, schema) =>
+      table.split("\\.").last.toLowerCase(java.util.Locale.ROOT) -> schema
+    }
+    requests.flatMap { request =>
+      val sourceSchema = schemasByShort.get(request.sourceShortName.toLowerCase(java.util.Locale.ROOT))
+      val outputColumn = request.outputColumn.toLowerCase(java.util.Locale.ROOT)
+      val sourceColumn = sourceSchema.flatMap { schema =>
+        schema.fieldNames
+          .filter { field =>
+            val normalized = field.toLowerCase(java.util.Locale.ROOT)
+            outputColumn == normalized || outputColumn.endsWith(s"_$normalized")
+          }
+          .sortBy(_.length)
+          .lastOption
+      }
+      val safeCastType = request.castType
+        .map(_.trim)
+        .filter(_.matches("(?i)[A-Z][A-Z0-9_]*(?:\\s*\\([0-9,\\s]+\\))?"))
+      sourceColumn.flatMap { column =>
+        if (request.castType.isDefined && safeCastType.isEmpty) None
+        else {
+          val quotedColumn = quoteCol(column)
+          val keyExpression = safeCastType
+            .map(dataType => s"CAST($quotedColumn AS $dataType)")
+            .getOrElse(quotedColumn)
+          val deltaView = quoteCol(s"openivm_delta_${request.sourceShortName}")
+          try {
+            val keys = spark.sql(
+              s"SELECT DISTINCT $keyExpression AS openivm_nterm_key FROM $deltaView " +
+                s"WHERE $quotedColumn IS NOT NULL LIMIT ${WindowReplaceMaxLiteralKeys + 1}"
+            )
+            keys.persist()
+            try collectWindowReplaceKeySet(keys, "openivm_nterm_key").map(keySet => request -> keySet.literals)
+            finally keys.unpersist()
+          } catch {
+            case NonFatal(e) =>
+              logWarning(
+                s"[openivm-mv] regular N-term key collection skipped for " +
+                  s"${request.sourceShortName}.${request.outputColumn}: ${e.getMessage}"
+              )
+              None
+          }
+        }
+      }
+    }.toMap
+  }
 
   private def buildWindowSinglePassPlan(
       spark: SparkSession,
