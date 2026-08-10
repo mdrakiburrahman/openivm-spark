@@ -214,13 +214,6 @@ object FeatureGate {
     */
   val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
 
-  /** Collect bounded equality-key sets from regular N-term delta leaves and
-    * inject them as literal predicates on the directly joined base side. This
-    * enables native Delta data skipping without persistent helper state.
-    * Default OFF until the SF100 workload comparison is complete.
-    */
-  val RegularNtermLiteralPruneEnabledKey: String = "spark.openivm.refresh.regularNtermLiteralPrune.enabled"
-
   /** Enable skew-aware delta fanout join hints. Default OFF: when opted in, the
     * refresh planner inspects per-refresh delta stats against source column
     * stats and broadcasts only the narrow/small source-delta side of
@@ -450,12 +443,6 @@ object FeatureGate {
 
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
-
-  def regularNtermLiteralPruneEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, RegularNtermLiteralPruneEnabledKey, default = false)
-
-  def regularNtermLiteralPruneEnabled(spark: SparkSession): Boolean =
-    regularNtermLiteralPruneEnabled(spark.sparkContext.getConf)
 
   def skewFanoutEnabled(conf: SparkConf): Boolean =
     boolConf(conf, SkewFanoutEnabledKey, default = false)
