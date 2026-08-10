@@ -252,9 +252,10 @@ abstract class MultiSourceScd2SelfJoinFactHoldingsScenarios
       sql("REFRESH MATERIALIZED VIEW msj_mv").collect()
       assertMvCorrect("msj_mv", FactHoldingsBody)
 
-      // A later dimension-only batch verifies that CDF N-term old-state arms
-      // use the snapshot immediately before this refresh, not MV-creation
-      // watermarks left in metadata.
+      // Batch 3 changes only dimensions. This proves the literal predicates
+      // stay term-local: a dim_trade key may prune the directly joined
+      // holdings side, but must not globally restrict the other dim_trade
+      // occurrence in the self-join.
       sql(
         """INSERT INTO msj_dim_trade VALUES
           |  ('SK_T0_V2', 'T0', TIMESTAMP'2020-10-01 00:00:00', TIMESTAMP'9999-12-31 00:00:00')""".stripMargin

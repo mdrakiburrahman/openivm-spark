@@ -1886,5 +1886,56 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
       SparkRefreshRewriter.rewriteRegularOldStateUnions(wrapped, Map("accounts" -> 17L)) shouldBe wrapped
     }
+
+    it("prunes only the direct base side with bounded delta-key literals") {
+      val sql =
+        """CREATE OR REPLACE TABLE delta.`/tmp/openivm_delta_v`
+          |USING DELTA AS
+          |WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_projection (t1_account_id, t1_mul) AS (
+          |  SELECT t0_account_id, t0_mul FROM t0_delta
+          |),
+          |t2_snapshot (t2_account_id, t2_name, t2_mul) AS (
+          |  SELECT `account_id`, `name`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t3_join (t3_name, t3_mul) AS (
+          |  SELECT t2_name, t1_mul * t2_mul
+          |  FROM t1_projection
+          |  INNER JOIN t2_snapshot ON CAST(t1_account_id AS BIGINT) = t2_account_id
+          |)
+          |INSERT INTO openivm_delta_v SELECT * FROM t3_join""".stripMargin
+      val request = SparkRefreshRewriter.RegularNtermKeyRequest("orders", "t1_account_id", Some("BIGINT"))
+
+      SparkRefreshRewriter.regularNtermKeyRequests(sql) shouldBe Seq(request)
+      val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(sql, Map(request -> Seq("10", "20")))
+      rewritten should include("WHERE t2_account_id IN (10, 20)")
+      rewritten should include("FROM t1_projection")
+      rewritten should include("FROM `accounts` VERSION AS OF 17")
+    }
+
+    it("leaves the N-term SQL unchanged when no bounded key set is available") {
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(canonical, Map.empty) shouldBe canonical
+    }
+
+    it("does not derive literal-pruning requests from outer joins") {
+      val outerJoin =
+        """WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_snapshot (t1_account_id, t1_mul) AS (
+          |  SELECT `account_id`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t2_join (t2_account_id, t2_mul) AS (
+          |  SELECT t1_account_id, t0_mul * t1_mul
+          |  FROM t0_delta LEFT JOIN t1_snapshot ON t0_account_id = t1_account_id
+          |)
+          |SELECT * FROM t2_join""".stripMargin
+
+      SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
+    }
   }
 }
