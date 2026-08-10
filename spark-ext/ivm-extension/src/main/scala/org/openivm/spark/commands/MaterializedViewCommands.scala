@@ -1494,6 +1494,24 @@ case class RefreshMaterializedViewCommand(
 
     val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
 
+    // Regular N-term SQL reads unchanged relations from the snapshot immediately
+    // before this refresh. Metadata watermarks describe MV creation and become
+    // stale after the first CDF refresh, so reconstruct that pre-refresh snapshot:
+    // changed sources start at their consumed version, while unchanged sources
+    // are already at their current version.
+    lazy val sourceSnapshotWatermarks: Map[String, ChangeWatermark] =
+      if (cdfChangeBatches.nonEmpty) {
+        val current = propagation.currentWatermarks(spark, meta.sourceTables)
+        val changed = cdfChangeBatches
+          .groupBy(_.baseTable)
+          .map { case (source, batches) =>
+            source -> ChangeWatermark.DeltaVersion(batches.map(_.startVersionExclusive).min)
+          }
+        current ++ changed
+      } else {
+        sourceWatermarks
+      }
+
     lazy val cdfBatchVerdicts: Map[String, BatchVerdict] =
       cdfChangeBatches
         .groupBy(_.baseTable)
@@ -2193,8 +2211,8 @@ case class RefreshMaterializedViewCommand(
             // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
             // Spark would resolve `<short>` against the current_schema.
             sourceQualifiedNames = shortToQual,
-            sourceSnapshotVersions = sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-              source -> version
+            sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
+              case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
             },
             mvVersionBeforeRefresh = Some(meta.lastVersion)
           )

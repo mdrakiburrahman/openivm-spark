@@ -251,6 +251,18 @@ abstract class MultiSourceScd2SelfJoinFactHoldingsScenarios
 
       sql("REFRESH MATERIALIZED VIEW msj_mv").collect()
       assertMvCorrect("msj_mv", FactHoldingsBody)
+
+      // A later dimension-only batch verifies that CDF N-term old-state arms
+      // use the snapshot immediately before this refresh, not MV-creation
+      // watermarks left in metadata.
+      sql(
+        """INSERT INTO msj_dim_trade VALUES
+          |  ('SK_T0_V2', 'T0', TIMESTAMP'2020-10-01 00:00:00', TIMESTAMP'9999-12-31 00:00:00')""".stripMargin
+      )
+      sql("INSERT INTO msj_dim_security VALUES ('SEC_S1_ALT', 'S1')")
+
+      sql("REFRESH MATERIALIZED VIEW msj_mv").collect()
+      assertMvCorrect("msj_mv", FactHoldingsBody)
     }
   }
 }
