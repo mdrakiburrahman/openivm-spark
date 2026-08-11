@@ -511,7 +511,7 @@ Suggested insertion points are direct and low-risk.
 | rewrite           | around `SparkRefreshRewriter.rewrite(...)` in `runUnderLock`                                                          |
 | execute statement | inside the `executeSql` wrapper at `MaterializedViewCommands.scala:1027-1028`                                         |
 | mark consumed     | around `postRefreshCleanup(...)` and `StagingCatalog.markConsumed(...)` at `MaterializedViewCommands.scala:1273-1274` |
-| cascade delta     | immediately after `cleanupMeta.emitsCascadeViewDelta` is evaluated at `MaterializedViewCommands.scala:1132-1155`      |
+| cascade delta     | immediately after `meta.emitsCascadeViewDelta` is evaluated in `MaterializedViewCommands.scala`                       |
 
 Until that instrumentation exists, treat Spark logs as control-plane evidence and Spark SQL metrics as runtime evidence.
 For DuckDB standalone refresh runtime, use `openivm_refresh_profile` directly.
