@@ -3343,7 +3343,8 @@ case class RefreshMaterializedViewCommand(
       limit: Int
   )
 
-  private val WindowReplaceMaxLiteralKeys    = 10000
+  private val WindowReplaceMaxLiteralKeys    = 1000
+  private val RegularNtermMaxLiteralKeys     = 10000
   private val WindowReplaceMaxPredicateBytes = 1024 * 1024
 
   private def collectRegularNtermLiteralKeys(
@@ -3380,10 +3381,12 @@ case class RefreshMaterializedViewCommand(
           try {
             val keys = spark.sql(
               s"SELECT DISTINCT $keyExpression AS openivm_nterm_key FROM $deltaView " +
-                s"WHERE $quotedColumn IS NOT NULL LIMIT ${WindowReplaceMaxLiteralKeys + 1}"
+                s"WHERE $quotedColumn IS NOT NULL LIMIT ${RegularNtermMaxLiteralKeys + 1}"
             )
             keys.persist()
-            try collectWindowReplaceKeySet(keys, "openivm_nterm_key").map(keySet => request -> keySet.literals)
+            try
+              collectWindowReplaceKeySet(keys, "openivm_nterm_key", RegularNtermMaxLiteralKeys)
+                .map(keySet => request -> keySet.literals)
             finally keys.unpersist()
           } catch {
             case NonFatal(e) =>
@@ -3587,7 +3590,8 @@ case class RefreshMaterializedViewCommand(
 
   private def collectWindowReplaceKeySet(
       df: org.apache.spark.sql.DataFrame,
-      targetCol: String
+      targetCol: String,
+      maxLiteralKeys: Int = WindowReplaceMaxLiteralKeys
   ): Option[WindowReplaceKeySet] = {
     if (df.schema.fields.length != 1) return None
     val sourceCol = quoteCol(df.schema.fields.head.name)
@@ -3598,7 +3602,7 @@ case class RefreshMaterializedViewCommand(
       )
       .head()
     if (
-      stats.getAs[Long]("openivm_key_count") > WindowReplaceMaxLiteralKeys ||
+      stats.getAs[Long]("openivm_key_count") > maxLiteralKeys ||
       stats.getAs[Long]("openivm_key_bytes") > WindowReplaceMaxPredicateBytes
     ) return None
 
