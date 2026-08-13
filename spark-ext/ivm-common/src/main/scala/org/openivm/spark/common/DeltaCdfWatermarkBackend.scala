@@ -21,7 +21,7 @@ private[common] object DeltaCdfWatermarkBackend extends CdfWatermarkBackend with
   private def path(spark: SparkSession): String = FeatureGate.catalogPath(spark).stripSuffix("/") + "/cdf_watermarks"
 
   override def ensureTables(spark: SparkSession): Unit = withDeltaRetry {
-    DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).execute()
+    DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(ViewName).execute()
   }
 
   override def get(spark: SparkSession, viewName: String, source: String): Option[Long] = {
@@ -50,7 +50,9 @@ private[common] object DeltaCdfWatermarkBackend extends CdfWatermarkBackend with
         .as("target")
         .merge(
           incoming.as("incoming"),
-          s"target.$ViewName = incoming.$ViewName AND target.$Source = incoming.$Source"
+          col(s"target.$ViewName") === lit(viewName) &&
+            col(s"target.$ViewName") === col(s"incoming.$ViewName") &&
+            col(s"target.$Source") === col(s"incoming.$Source")
         )
         .whenMatched(s"incoming.$Version > target.$Version")
         .updateAll()

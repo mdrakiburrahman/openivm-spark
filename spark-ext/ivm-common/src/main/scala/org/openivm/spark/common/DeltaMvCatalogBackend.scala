@@ -74,16 +74,20 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
     )
 
   override def ensureTables(spark: SparkSession): Unit = withDeltaRetry {
-    DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).execute()
+    DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(Name).execute()
   }
 
   override def upsert(spark: SparkSession, meta: MvMetadata): Unit = withDeltaRetry {
     ensureTables(spark)
-    val incoming = singleRow(spark, meta)
+    val incoming     = singleRow(spark, meta)
+    val expectedName = serializedName(meta.name)
     DeltaTable
       .forPath(spark, path(spark))
       .as("target")
-      .merge(incoming.as("incoming"), s"target.$Name = incoming.$Name")
+      .merge(
+        incoming.as("incoming"),
+        col(s"target.$Name") === lit(expectedName) && col(s"target.$Name") === col(s"incoming.$Name")
+      )
       .whenMatched()
       .updateAll()
       .whenNotMatched()

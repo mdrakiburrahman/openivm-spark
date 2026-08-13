@@ -1,5 +1,6 @@
 package org.openivm.spark.common
 
+import io.delta.tables.DeltaTable
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
@@ -10,6 +11,8 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
@@ -112,6 +115,32 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       RefreshTransactionCatalog.commit(spark, refreshId)
       RefreshTransactionCatalog.lookup(spark, refreshId).map(_.state) shouldBe Some(RefreshTransactionState.Committed)
       RefreshTransactionCatalog.incompleteForView(spark, "db.mv_orders") shouldBe empty
+    }
+
+    it("commits independent MV metadata upserts concurrently") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val entries = (1 to 8).map(index => metadata(s"db.mv_parallel_$index", s"db.source_$index"))
+
+      Await.result(
+        Future.traverse(entries)(entry => Future(MvCatalog.upsert(spark.newSession(), entry))),
+        2.minutes
+      )
+
+      entries.foreach(entry => MvCatalog.lookup(spark, entry.name) shouldBe Some(entry))
+    }
+
+    it("partitions each Delta catalog by its independent write key") {
+      def partitionColumns(relativePath: String): Seq[String] =
+        DeltaTable
+          .forPath(spark, s"$root/catalog/$relativePath")
+          .detail()
+          .select("partitionColumns")
+          .head()
+          .getSeq[String](0)
+
+      partitionColumns("mv_metadata") shouldBe Seq("name")
+      partitionColumns("cdf_watermarks") shouldBe Seq("view_name")
+      partitionColumns("refresh_transactions") shouldBe Seq("refresh_id")
     }
   }
 }

@@ -52,7 +52,7 @@ object RefreshTransactionCatalog extends DeltaRetrySupport {
   def ensureTable(spark: SparkSession): Unit = {
     if (!enabled(spark)) return
     withDeltaRetry {
-      DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).execute()
+      DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(RefreshId).execute()
     }
   }
 
@@ -71,7 +71,11 @@ object RefreshTransactionCatalog extends DeltaRetrySupport {
       DeltaTable
         .forPath(spark, path(spark))
         .as("target")
-        .merge(incoming.as("incoming"), s"target.$RefreshId = incoming.$RefreshId")
+        .merge(
+          incoming.as("incoming"),
+          col(s"target.$RefreshId") === lit(refreshId) &&
+            col(s"target.$RefreshId") === col(s"incoming.$RefreshId")
+        )
         .whenNotMatched()
         .insertAll()
         .execute()
