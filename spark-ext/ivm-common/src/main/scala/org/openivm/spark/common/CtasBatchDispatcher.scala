@@ -68,7 +68,6 @@ final class CtasAdmissionController private (
       didDrop: Boolean
   ): CtasAdmissionDecision = synchronized {
     val before = limit.getLimit
-    limit.onSample(startNanos, durationNanos, inflight, didDrop)
     val decision = CtasAdmissionDecision(
       taskId = taskId,
       durationNanos = durationNanos,
@@ -80,6 +79,13 @@ final class CtasAdmissionController private (
     recorded += decision
     decision
   }
+
+  private[common] def completeBatch(
+      startNanos: Long,
+      durationNanos: Long,
+      admitted: Int,
+      didDrop: Boolean
+  ): Unit = synchronized(limit.onSample(startNanos, durationNanos, admitted, didDrop))
 }
 
 object CtasAdmissionController {
@@ -162,17 +168,19 @@ object CtasBatchDispatcher {
         executor.shutdown()
         executor.awaitTermination(1, TimeUnit.MINUTES)
       }
+    val failures = outcomes.zip(tasks).flatMap { case (outcome, task) =>
+      outcome.failure.map(task.id -> _)
+    }
+    val batchDuration = System.nanoTime() - batchStart
+    controller.completeBatch(batchStart, batchDuration, width, didDrop = failures.nonEmpty)
     val telemetry = CtasBatchTelemetry(
       schedulerMode = schedulerMode,
       initialLimit = controller.initialLimit,
       learnedLimit = controller.currentLimit,
       maxInflight = maxInflight.get(),
-      batchWallNanos = System.nanoTime() - batchStart,
+      batchWallNanos = batchDuration,
       decisions = controller.decisions
     )
-    val failures = outcomes.zip(tasks).flatMap { case (outcome, task) =>
-      outcome.failure.map(task.id -> _)
-    }
     if (failures.nonEmpty) throw new CtasBatchFailedException(failures, telemetry)
     CtasBatchResult(outcomes.flatMap(_.value), telemetry)
   }

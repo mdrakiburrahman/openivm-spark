@@ -28,6 +28,7 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
 
       controller.currentLimit shouldBe 10
       controller.record("slow", 0L, Long.MaxValue, inflight = 10, didDrop = false)
+      controller.completeBatch(0L, Long.MaxValue, admitted = 10, didDrop = false)
       controller.currentLimit shouldBe 10
     }
 
@@ -35,9 +36,10 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       val controller = CtasAdmissionController.optimistic(batchSize = 10)
 
       val decision = controller.record("failed", 0L, 1L, inflight = 10, didDrop = true)
+      controller.completeBatch(0L, 1L, admitted = 10, didDrop = true)
 
       decision.limitBefore shouldBe 10
-      decision.limitAfter shouldBe 5
+      decision.limitAfter shouldBe 10
       controller.currentLimit shouldBe 5
     }
   }
@@ -70,6 +72,7 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
     it("applies a learned limit at the next batch boundary") {
       val controller = CtasAdmissionController.optimistic(batchSize = 4)
       controller.record("pressure", 0L, 1L, inflight = 4, didDrop = true)
+      controller.completeBatch(0L, 1L, admitted = 4, didDrop = true)
       val tasks = (1 to 4).map { index =>
         CtasBatchTask(id = s"mv-$index", run = () => index)
       }
@@ -79,6 +82,34 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       result.telemetry.initialLimit shouldBe 4
       result.telemetry.maxInflight should be <= 2
       result.values shouldBe (1 to 4)
+    }
+
+    it("retains a failed batch's AIMD backoff for the next batch") {
+      val controller = CtasAdmissionController.optimistic(batchSize = 10)
+      val failedTasks = (1 to 10).map { index =>
+        CtasBatchTask(
+          id = s"mv-$index",
+          run = () => {
+            if (index == 1) throw new IllegalStateException("pressure")
+            index
+          }
+        )
+      }
+
+      val failed = intercept[CtasBatchFailedException] {
+        CtasBatchDispatcher.run(spark, failedTasks, controller)
+      }
+
+      failed.telemetry.initialLimit shouldBe 10
+      failed.telemetry.learnedLimit shouldBe 5
+      failed.failures.map(_._1) shouldBe Seq("mv-1")
+
+      val recoveryTasks = (1 to 10).map { index =>
+        CtasBatchTask(id = s"recovery-$index", run = () => index)
+      }
+      val recovered = CtasBatchDispatcher.run(spark, recoveryTasks, controller)
+      recovered.telemetry.maxInflight should be <= 5
+      recovered.telemetry.learnedLimit shouldBe 6
     }
   }
 }
