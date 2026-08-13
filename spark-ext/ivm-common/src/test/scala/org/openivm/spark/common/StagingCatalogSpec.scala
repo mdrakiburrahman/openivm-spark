@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -13,8 +13,7 @@ import java.util.UUID
 
 class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
-  private val IndexDbColumnFamilies = Seq("mv_index", "source_to_mvs", "table_index")
-  private val MvDbColumnFamilies    = Seq("meta", "properties", "consumed")
+  private val MvDbColumnFamilies = OpenIvmStatePaths.PerMvColumnFamilies
 
   private var spark: SparkSession = _
 
@@ -62,32 +61,17 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   ): StagingDelta =
     StagingDelta(baseTable, opType, path, ts(epochMs), consumedBy)
 
-  private def indexDbPath: String =
-    Paths.get(warehouseDir, "_openivm", "index", "rocksdb").toString
-
   private def trackedMvDbPath(viewName: String): String =
     Paths
       .get(warehouseDir, "_openivm", "mvs", RocksDBCodec.safePathSegment(viewName), "rocksdb")
       .toString
 
-  private def openIndexDb(): OpenIvmRocksDB =
-    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath, IndexDbColumnFamilies)
-
   private def openTrackedMvDb(viewName: String): OpenIvmRocksDB =
     OpenIvmRocksDBRegistry.getOrOpen(spark, trackedMvDbPath(viewName), MvDbColumnFamilies)
 
   private def registerTrackedView(viewName: String): Unit = {
-    val indexDb = openIndexDb()
     openTrackedMvDb(viewName)
-    indexDb.withBatch { batch =>
-      OpenIvmRocksDBBatchOps.put(
-        indexDb,
-        batch,
-        "mv_index",
-        RocksDBCodec.utf8(viewName),
-        RocksDBCodec.utf8(trackedMvDbPath(viewName))
-      )
-    }
+    ()
   }
 
   private def consumedPaths(viewName: String): Seq[String] =

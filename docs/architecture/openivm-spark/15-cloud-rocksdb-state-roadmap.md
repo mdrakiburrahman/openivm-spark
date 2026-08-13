@@ -47,8 +47,12 @@ Success criteria:
 
 The MV and base-table database paths are deterministic, so `mv_index` and
 `table_index` are removed. State is partitioned by MV and base table. CDF
-watermarks move into the owning MV shard; the source-to-MV reverse index moves
-to the durable catalog. Unrelated CTAS operations then share no RocksDB lock.
+watermarks move into the owning MV shard. The source-to-MV reverse index is
+temporarily partitioned into one shard per source and later moves to the durable
+catalog in phase 3. Fresh deployments never create the global RocksDB index;
+legacy CDF rows migrate lazily into MV shards. Unrelated CTAS operations then
+share no RocksDB lock, while views over the same source serialize only their
+short dependency-index update.
 
 ## Phase 3: Delta-backed catalog authority
 

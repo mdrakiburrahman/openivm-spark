@@ -9,6 +9,7 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
+import java.nio.file.{Files, Paths}
 import java.sql.Timestamp
 import java.util.UUID
 
@@ -97,6 +98,8 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       m.location shouldBe original.location
       m.createdAt shouldBe original.createdAt
       m.properties shouldBe Map("owner" -> "alice", "tier" -> "gold")
+      Files.exists(Paths.get(OpenIvmStatePaths.indexDbPath(spark), "CURRENT")) shouldBe false
+      OpenIvmStatePaths.isExistingDb(OpenIvmStatePaths.sourceDependencyDbPath(spark, "orders")) shouldBe true
     }
   }
 

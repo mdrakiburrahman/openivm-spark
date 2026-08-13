@@ -285,13 +285,12 @@ object MvCatalog {
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  private val IndexColumnFamilies = IndexDbColumnFamilies.All
-  private val PerMvColumnFamilies = Seq("meta", "properties", "consumed")
+  private val PerMvColumnFamilies            = OpenIvmStatePaths.PerMvColumnFamilies
+  private val SourceDependencyColumnFamilies = OpenIvmStatePaths.SourceDependencyColumnFamilies
 
-  private val MvIndexCf     = "mv_index"
-  private val SourceToMvsCf = "source_to_mvs"
-  private val MetaCf        = "meta"
-  private val PropertiesCf  = "properties"
+  private val DependentMvsCf = "dependent_mvs"
+  private val MetaCf         = "meta"
+  private val PropertiesCf   = "properties"
 
   private val EmptyBytes = Array.emptyByteArray
 
@@ -308,25 +307,18 @@ object MvCatalog {
   private def canonicalLocalPath(path: String): String =
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
-  private def warehouseRoot(spark: SparkSession): Path =
-    Paths.get(canonicalLocalPath(FeatureGate.stateWarehouse(spark)))
-
-  private def indexDbPath(spark: SparkSession): String =
-    warehouseRoot(spark).resolve("_openivm").resolve("index").resolve("rocksdb").toString
-
   private def perMvDbPath(spark: SparkSession, serializedName: String): String =
-    warehouseRoot(spark)
-      .resolve("_openivm")
-      .resolve("mvs")
-      .resolve(RocksDBCodec.safePathSegment(serializedName))
-      .resolve("rocksdb")
-      .toString
-
-  private def openIndexDb(spark: SparkSession): OpenIvmRocksDB =
-    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath(spark), IndexColumnFamilies)
+    OpenIvmStatePaths.perMvDbPath(spark, serializedName)
 
   private def openPerMvDb(spark: SparkSession, serializedName: String): OpenIvmRocksDB =
     OpenIvmRocksDBRegistry.getOrOpen(spark, perMvDbPath(spark, serializedName), PerMvColumnFamilies)
+
+  private def openSourceDependencyDb(spark: SparkSession, sourceTable: String): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable),
+      SourceDependencyColumnFamilies
+    )
 
   private def openExistingPerMvDbAt(spark: SparkSession, path: String): Option[OpenIvmRocksDB] = {
     val canonicalPath = canonicalLocalPath(path)
@@ -386,17 +378,7 @@ object MvCatalog {
     if (encoded.isEmpty) Seq.empty
     else RocksDBCodec.splitComposite(encoded).map(RocksDBCodec.fromUtf8)
 
-  private def sourceToMvKey(sourceTable: String, serializedName: String): Array[Byte] =
-    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(sourceTable), RocksDBCodec.utf8(serializedName)))
-
-  private def sourceToMvsPrefix(sourceTable: String): Array[Byte] =
-    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(sourceTable), EmptyBytes))
-
-  private def lookupPath(indexDb: OpenIvmRocksDB, serializedName: String): Option[String] =
-    indexDb
-      .get(MvIndexCf, RocksDBCodec.utf8(serializedName))
-      .map(RocksDBCodec.fromUtf8)
-      .map(canonicalLocalPath)
+  private def dependentMvKey(serializedName: String): Array[Byte] = RocksDBCodec.utf8(serializedName)
 
   private def readProperties(db: OpenIvmRocksDB): Map[String, String] =
     collectPrefix(db, PropertiesCf, EmptyBytes).map { case (key, value) =>
@@ -446,15 +428,27 @@ object MvCatalog {
   private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
     openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
 
-  private def indexedSources(indexDb: OpenIvmRocksDB, serializedName: String): Set[String] =
-    collectPrefix(indexDb, SourceToMvsCf, EmptyBytes).flatMap { case (key, _) =>
-      RocksDBCodec.splitComposite(key, 2) match {
-        case Seq(sourceBytes, mvBytes) if RocksDBCodec.fromUtf8(mvBytes) == serializedName =>
-          Some(RocksDBCodec.fromUtf8(sourceBytes))
-        case _ =>
-          None
+  private def dependentViewNames(spark: SparkSession, sourceTable: String): Seq[String] = {
+    val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+    if (OpenIvmStatePaths.isExistingDb(path)) {
+      collectPrefix(openSourceDependencyDb(spark, sourceTable), DependentMvsCf, EmptyBytes).map { case (key, _) =>
+        RocksDBCodec.fromUtf8(key)
+      }.sorted
+    } else {
+      val names = list(spark)
+        .filter(_.sourceTables.contains(sourceTable))
+        .map(meta => serializeName(meta.name))
+        .distinct
+        .sorted
+      if (names.nonEmpty) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          names.foreach(name => OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(name), EmptyBytes))
+        }
       }
-    }.toSet
+      names
+    }
+  }
 
   private def rewriteProperties(
       db: OpenIvmRocksDB,
@@ -512,88 +506,60 @@ object MvCatalog {
     }
 
   def ensureTables(spark: SparkSession): Unit = {
-    openIndexDb(spark)
+    Files.createDirectories(OpenIvmStatePaths.mvsRoot(spark))
+    Files.createDirectories(OpenIvmStatePaths.sourcesRoot(spark))
     ()
   }
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit = {
     val serializedName = serializeName(meta.name)
-    val perMvPath      = perMvDbPath(spark, serializedName)
-    val indexDb        = openIndexDb(spark)
     val perMvDb        = openPerMvDb(spark, serializedName)
-    val oldSources =
-      readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
-        indexDb,
-        serializedName
-      )
+    val oldSources = perMvDb.withSession {
+      val existing = readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
+      perMvDb.withBatch { batch =>
+        writeMetadata(perMvDb, batch, meta)
+        rewriteProperties(perMvDb, batch, meta.properties)
+      }
+      existing
+    }
     val newSources = meta.sourceTables.toSet
 
-    perMvDb.withBatch { batch =>
-      writeMetadata(perMvDb, batch, meta)
-      rewriteProperties(perMvDb, batch, meta.properties)
+    (oldSources -- newSources).toSeq.sorted.foreach { sourceTable =>
+      val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+      if (OpenIvmStatePaths.isExistingDb(path)) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          OpenIvmRocksDBBatchOps.delete(db, batch, DependentMvsCf, dependentMvKey(serializedName))
+        }
+      }
     }
-
-    indexDb.withBatch { batch =>
-      (oldSources -- newSources).toSeq.sorted.foreach { sourceTable =>
-        OpenIvmRocksDBBatchOps.delete(indexDb, batch, SourceToMvsCf, sourceToMvKey(sourceTable, serializedName))
+    newSources.toSeq.sorted.foreach { sourceTable =>
+      val db = openSourceDependencyDb(spark, sourceTable)
+      db.withBatch { batch =>
+        OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(serializedName), EmptyBytes)
       }
-      newSources.toSeq.sorted.foreach { sourceTable =>
-        OpenIvmRocksDBBatchOps.put(
-          indexDb,
-          batch,
-          SourceToMvsCf,
-          sourceToMvKey(sourceTable, serializedName),
-          EmptyBytes
-        )
-      }
-      OpenIvmRocksDBBatchOps.put(
-        indexDb,
-        batch,
-        MvIndexCf,
-        RocksDBCodec.utf8(serializedName),
-        RocksDBCodec.utf8(perMvPath)
-      )
     }
   }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
-    lookupPath(indexDb, serializedName).flatMap(path => readMetadataAtPath(spark, path))
+    readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
   def list(spark: SparkSession): Seq[MvMetadata] = {
-    val indexDb = openIndexDb(spark)
-    collectPrefix(indexDb, MvIndexCf, EmptyBytes)
-      .sortBy { case (key, _) => RocksDBCodec.fromUtf8(key) }
-      .flatMap { case (_, value) =>
-        readMetadataAtPath(spark, RocksDBCodec.fromUtf8(value))
-      }
+    OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
   }
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
-    val indexDb = openIndexDb(spark)
-    val names = collectPrefix(indexDb, SourceToMvsCf, sourceToMvsPrefix(table))
-      .flatMap { case (key, _) =>
-        RocksDBCodec.splitComposite(key, 2) match {
-          case Seq(_, mvBytes) => Some(RocksDBCodec.fromUtf8(mvBytes))
-          case _               => None
-        }
-      }
-      .distinct
-      .sorted
-
-    names.flatMap { serializedName =>
-      lookupPath(indexDb, serializedName).flatMap(path => readMetadataAtPath(spark, path))
+    dependentViewNames(spark, table).flatMap { serializedName =>
+      readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
     }
   }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
 
-    lookupPath(indexDb, serializedName)
-      .flatMap(path => openExistingPerMvDbAt(spark, path))
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName))
       .foreach { perMvDb =>
         val current = getLong(perMvDb, MetaCf, LastVersionMetaKey).getOrElse(-1L)
         if (newVersion > current) {
@@ -618,11 +584,9 @@ object MvCatalog {
       name: TableIdentifier,
       properties: Map[String, String]
   ): Unit = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
 
-    lookupPath(indexDb, serializedName)
-      .flatMap(path => openExistingPerMvDbAt(spark, path))
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName))
       .foreach { perMvDb =>
         if (readProperties(perMvDb) != properties) {
           perMvDb.withBatch { batch =>
@@ -634,23 +598,18 @@ object MvCatalog {
 
   def remove(spark: SparkSession, name: TableIdentifier): Unit = {
     val serializedName = serializeName(name)
-    val indexDb        = openIndexDb(spark)
-    val indexedPath    = lookupPath(indexDb, serializedName)
-    val candidatePath  = indexedPath.getOrElse(perMvDbPath(spark, serializedName))
-    val sourceTables =
-      readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
-        indexDb,
-        serializedName
-      )
+    val candidatePath  = perMvDbPath(spark, serializedName)
+    val sourceTables   = readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
 
     OpenIvmRocksDBRegistry.close(candidatePath)
     deleteRecursively(Paths.get(candidatePath))
 
-    if (indexedPath.nonEmpty || sourceTables.nonEmpty) {
-      indexDb.withBatch { batch =>
-        OpenIvmRocksDBBatchOps.delete(indexDb, batch, MvIndexCf, RocksDBCodec.utf8(serializedName))
-        sourceTables.toSeq.sorted.foreach { sourceTable =>
-          OpenIvmRocksDBBatchOps.delete(indexDb, batch, SourceToMvsCf, sourceToMvKey(sourceTable, serializedName))
+    sourceTables.toSeq.sorted.foreach { sourceTable =>
+      val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+      if (OpenIvmStatePaths.isExistingDb(path)) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          OpenIvmRocksDBBatchOps.delete(db, batch, DependentMvsCf, dependentMvKey(serializedName))
         }
       }
     }

@@ -72,46 +72,24 @@ object StagingDelta {
 /** RocksDB-backed catalog for DML staging records. */
 object StagingCatalog {
 
-  private val IndexDbColumnFamilies = org.openivm.spark.common.IndexDbColumnFamilies.All
-  private val MvDbColumnFamilies    = Seq("meta", "properties", "consumed")
-  private val BaseDbColumnFamilies  = Seq("staging")
+  private val MvDbColumnFamilies   = OpenIvmStatePaths.PerMvColumnFamilies
+  private val BaseDbColumnFamilies = OpenIvmStatePaths.BaseTableColumnFamilies
 
-  private val MvIndexCf    = "mv_index"
-  private val TableIndexCf = "table_index"
-  private val StagingCf    = "staging"
-  private val ConsumedCf   = "consumed"
-
-  private def warehouseDir(spark: SparkSession): String =
-    RocksDBCodec.requireLocalPath(FeatureGate.stateWarehouse(spark).stripSuffix("/"))
-
-  private def indexDbPath(spark: SparkSession): String =
-    Paths.get(warehouseDir(spark), "_openivm", "index", "rocksdb").toString
+  private val StagingCf  = "staging"
+  private val ConsumedCf = "consumed"
 
   private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
-    Paths
-      .get(warehouseDir(spark), "_openivm", "tables", RocksDBCodec.safePathSegment(baseTable), "rocksdb")
-      .toString
-
-  private def openIndexDb(spark: SparkSession): OpenIvmRocksDB = {
-    // Request ALL column families hosted by the shared index DB; the registry rejects widening
-    // the CF set on a later reopen of the same path.
-    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath(spark), IndexDbColumnFamilies)
-  }
+    OpenIvmStatePaths.baseTableDbPath(spark, baseTable)
 
   private def openBaseTableDb(spark: SparkSession, baseTable: String): OpenIvmRocksDB =
     OpenIvmRocksDBRegistry.getOrOpen(spark, baseTableDbPath(spark, baseTable), BaseDbColumnFamilies)
 
-  private def openTrackedMvDb(
-      spark: SparkSession,
-      indexDb: OpenIvmRocksDB,
-      viewName: String
-  ): Option[OpenIvmRocksDB] =
-    indexDb.get(MvIndexCf, RocksDBCodec.utf8(viewName)).map { pathBytes =>
-      val mvDbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
-      // Request ALL column families hosted by the per-MV DB even though StagingCatalog only
-      // touches `consumed`; the registry enforces subset-safe reopen semantics per path.
-      OpenIvmRocksDBRegistry.getOrOpen(spark, mvDbPath, MvDbColumnFamilies)
-    }
+  private def openTrackedMvDb(spark: SparkSession, viewName: String): Option[OpenIvmRocksDB] = {
+    val path = OpenIvmStatePaths.perMvDbPath(spark, viewName)
+    if (OpenIvmStatePaths.isExistingDb(path)) {
+      Some(OpenIvmRocksDBRegistry.getOrOpen(spark, path, MvDbColumnFamilies))
+    } else None
+  }
 
   private def decodeStagingKey(key: Array[Byte]): (Long, String) = {
     val parts = RocksDBCodec.splitComposite(key, 2)
@@ -144,25 +122,21 @@ object StagingCatalog {
       )
     }
 
-  private def stagingPathStillTracked(spark: SparkSession, indexDb: OpenIvmRocksDB, stagingPath: String): Boolean =
-    indexDb.prefixScan(TableIndexCf, Array.emptyByteArray).exists { case (_, pathBytes) =>
-      val dbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
-      Files.exists(Paths.get(dbPath)) && {
-        val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
-        baseDb.prefixScan(StagingCf, Array.emptyByteArray).exists { case (key, _) =>
-          decodeStagingKey(key)._2 == stagingPath
-        }
+  private def stagingPathStillTracked(spark: SparkSession, stagingPath: String): Boolean =
+    OpenIvmStatePaths.existingBaseTableDbPaths(spark).exists { dbPath =>
+      val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+      baseDb.prefixScan(StagingCf, Array.emptyByteArray).exists { case (key, _) =>
+        decodeStagingKey(key)._2 == stagingPath
       }
     }
 
   def ensureTables(spark: SparkSession): Unit = {
-    openIndexDb(spark)
+    Files.createDirectories(OpenIvmStatePaths.tablesRoot(spark))
     ()
   }
 
   def record(spark: SparkSession, delta: StagingDelta): Unit = {
-    val baseDbPath = baseTableDbPath(spark, delta.baseTable)
-    val baseDb     = openBaseTableDb(spark, delta.baseTable)
+    val baseDb = openBaseTableDb(spark, delta.baseTable)
     // `consumedBy` is intentionally ignored on write: consumed state now lives in each MV's
     // dedicated RocksDB under the `consumed` column family.
     val stagingKey = RocksDBCodec.compositeKey(
@@ -176,19 +150,6 @@ object StagingCatalog {
     baseDb.withBatch { batch =>
       OpenIvmRocksDBBatchOps.put(baseDb, batch, StagingCf, stagingKey, stagingValue)
     }
-
-    val indexDb = openIndexDb(spark)
-    if (indexDb.get(TableIndexCf, RocksDBCodec.utf8(delta.baseTable)).isEmpty) {
-      indexDb.withBatch { batch =>
-        OpenIvmRocksDBBatchOps.put(
-          indexDb,
-          batch,
-          TableIndexCf,
-          RocksDBCodec.utf8(delta.baseTable),
-          RocksDBCodec.utf8(baseDbPath)
-        )
-      }
-    }
   }
 
   def hasPendingDeltas(
@@ -199,8 +160,7 @@ object StagingCatalog {
   ): Boolean = {
     if (sources.isEmpty) return false
 
-    val indexDb   = openIndexDb(spark)
-    val maybeMvDb = openTrackedMvDb(spark, indexDb, viewName)
+    val maybeMvDb = openTrackedMvDb(spark, viewName)
     sources.distinct.exists { source =>
       val dbPath = baseTableDbPath(spark, source)
       Files.exists(Paths.get(dbPath)) && {
@@ -223,8 +183,7 @@ object StagingCatalog {
   ): Seq[StagingDelta] = {
     if (sources.isEmpty) return Seq.empty
 
-    val indexDb   = openIndexDb(spark)
-    val maybeMvDb = openTrackedMvDb(spark, indexDb, viewName)
+    val maybeMvDb = openTrackedMvDb(spark, viewName)
     val deltas = sources.distinct.iterator.flatMap { source =>
       val dbPath = baseTableDbPath(spark, source)
       if (!Files.exists(Paths.get(dbPath))) {
@@ -281,26 +240,22 @@ object StagingCatalog {
   def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
     if (paths.isEmpty) return
 
-    val indexDb = openIndexDb(spark)
-    openTrackedMvDb(spark, indexDb, viewName).foreach { mvDb =>
+    openTrackedMvDb(spark, viewName).foreach { mvDb =>
       mvDb.withBatch { batch =>
         paths.distinct.foreach { path =>
           OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
         }
       }
     }
-    // Corner case: if `mv_index` does not yet contain `viewName`, we intentionally skip the mark.
-    // There is no back-fill mechanism today; the owning MvCatalog rewrite writes that index entry.
   }
 
   def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     if (viewsByTable.isEmpty) return
 
-    val indexDb   = openIndexDb(spark)
     val mvDbCache = mutable.HashMap.empty[String, Option[OpenIvmRocksDB]]
 
     def trackedMvDb(viewName: String): Option[OpenIvmRocksDB] =
-      mvDbCache.getOrElseUpdate(viewName, openTrackedMvDb(spark, indexDb, viewName))
+      mvDbCache.getOrElseUpdate(viewName, openTrackedMvDb(spark, viewName))
 
     viewsByTable.foreach { case (baseTable, rawMvs) =>
       val mvs    = rawMvs.distinct
@@ -325,7 +280,7 @@ object StagingCatalog {
           toDelete
             .map { case (_, stagingPath) => stagingPath }
             .flatMap(p => StagingDeltaView.CachedViewDeltaRef.decode(p).map(p -> _))
-            .filterNot { case (stagingPath, _) => stagingPathStillTracked(spark, indexDb, stagingPath) }
+            .filterNot { case (stagingPath, _) => stagingPathStillTracked(spark, stagingPath) }
             .foreach { case (_, globalView) =>
               try spark.catalog.uncacheTable(s"global_temp.$globalView")
               catch { case _: Throwable => () }
@@ -338,14 +293,10 @@ object StagingCatalog {
   }
 
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
-    val indexDb = openIndexDb(spark)
-    indexDb.get(TableIndexCf, RocksDBCodec.utf8(baseTable)).foreach { pathBytes =>
-      val dbPath = RocksDBCodec.requireLocalPath(RocksDBCodec.fromUtf8(pathBytes))
+    val dbPath = baseTableDbPath(spark, baseTable)
+    if (OpenIvmStatePaths.isExistingDb(dbPath)) {
       OpenIvmRocksDBRegistry.close(dbPath)
       deleteRecursively(Paths.get(dbPath))
-      indexDb.withBatch { batch =>
-        OpenIvmRocksDBBatchOps.delete(indexDb, batch, TableIndexCf, RocksDBCodec.utf8(baseTable))
-      }
     }
   }
 }
