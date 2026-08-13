@@ -229,6 +229,28 @@ by query-shape history because CTAS jobs are heterogeneous. Before such history
 exists, loss-based AIMD driven by spill, GC, commit conflicts, and failures is a
 safer guardrail than treating a naturally long CTAS as congestion.
 
+The first dispatcher prototype reuses Netflix `concurrency-limits` for batch-level
+AIMD. It submits the complete cold batch into distinct Spark FAIR pools. One
+failed batch halves the next admission window. One successful recovery batch
+increases the window by one. The controller samples once per batch so successful
+requests cannot erase a failure signal from the same batch.
+
+A clean deployed comparison used ten CTAS jobs over a one-million-row source:
+
+| Dispatcher | Batch wall | Initial limit | Maximum in flight | Learned limit |
+|---|---:|---:|---:|---:|
+| Fixed FAIR width 10 | 9.141 s | 10 | 10 | Not applicable |
+| Optimistic AIMD | 9.112 s | 10 | 10 | 10 |
+
+Both runs produced ten materialized views with exactly 1,000,000 rows each. The
+0.029-second difference is benchmark noise. Optimistic admission therefore
+avoids the first-batch penalty without adding measurable dispatcher overhead.
+
+The prototype treats task failure as the only pressure signal. Spill, GC, heap,
+and Delta commit pressure remain planned inputs. Learned-window persistence also
+remains planned. Until those inputs exist, the controller is a failure guardrail,
+not a complete saturation detector.
+
 Concurrency does not reduce or increase the logical output required by CTAS.
 Each independent materialized view still writes its own Delta table. In the
 width sweep, every configuration produced 170 Parquet files and approximately
