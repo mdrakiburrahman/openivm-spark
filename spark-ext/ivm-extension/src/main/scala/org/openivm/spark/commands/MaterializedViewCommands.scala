@@ -3073,7 +3073,7 @@ case class RefreshMaterializedViewCommand(
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
         RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          finalizeRefresh(cleanupMeta)
+          finalizeRefresh(meta)
         }
       }
       emitEnd(
