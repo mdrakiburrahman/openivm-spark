@@ -281,7 +281,7 @@ object MvMetadata {
 }
 
 /** RocksDB-backed catalog for materialized-view metadata. */
-object MvCatalog {
+private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
 
   private val log = LoggerFactory.getLogger(getClass)
 
@@ -656,4 +656,38 @@ object MvCatalog {
     val digest     = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
     digest.map("%02x".format(_)).mkString
   }
+}
+
+/** Session-selected facade over the local RocksDB and shared Delta catalog backends. */
+object MvCatalog {
+  private def backend(spark: SparkSession): MvCatalogBackend = MvCatalogBackend.forSession(spark)
+
+  def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
+
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit = backend(spark).upsert(spark, meta)
+
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
+
+  def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
+
+  def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
+    backend(spark).viewsForSource(spark, table)
+
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+    backend(spark).advance(spark, name, newVersion)
+
+  def updateProperties(
+      spark: SparkSession,
+      name: TableIdentifier,
+      properties: Map[String, String]
+  ): Unit = backend(spark).updateProperties(spark, name, properties)
+
+  def remove(spark: SparkSession, name: TableIdentifier): Unit = backend(spark).remove(spark, name)
+
+  def schemaFingerprint(
+      sources: Map[String, StructType],
+      mvIdentityBySource: Map[String, String] = Map.empty
+  ): String = RocksDbMvCatalogBackend.schemaFingerprint(sources, mvIdentityBySource)
+
+  def mvIdentity(meta: MvMetadata): String = RocksDbMvCatalogBackend.mvIdentity(meta)
 }

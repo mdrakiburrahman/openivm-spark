@@ -62,6 +62,20 @@ dependencies, watermarks, and refresh transaction state. Refreshes use an
 idempotent `PREPARED -> DATA_COMMITTED -> COMMITTED` protocol so recovery can
 reconcile a driver failure between the data and catalog commits.
 
+Select it with:
+
+```properties
+spark.openivm.catalog.backend=delta
+spark.openivm.catalog.path=abfss://container@account/path/openivm-catalog
+```
+
+The path contains separate Delta tables for MV metadata, CDF watermarks, and
+refresh transactions. The default remains `rocksdb` for local compatibility.
+With the Delta backend enabled, a real refresh creates `PREPARED` before data
+execution, records the observed MV Delta version as `DATA_COMMITTED`, advances
+metadata and watermarks, and publishes `COMMITTED` last. Incomplete rows remain
+queryable through `RefreshTransactionCatalog.incompleteForView` for recovery.
+
 ## Phase 5: versioned checkpoint publication
 
 Any RocksDB state retained after phase 3 is checkpointed through a stable

@@ -49,6 +49,15 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Authoritative MV catalog backend. `rocksdb` preserves the local
+    * compatibility layout; `delta` stores shared metadata in a Delta table and
+    * is the production setting for multi-driver/object-store deployments.
+    */
+  val CatalogBackendKey: String = "spark.openivm.catalog.backend"
+
+  /** Root URI for Delta-backed OpenIVM catalog tables. */
+  val CatalogPathKey: String = "spark.openivm.catalog.path"
+
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -393,6 +402,24 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def catalogBackend(spark: SparkSession): String = {
+    val backend = spark.conf.getOption(CatalogBackendKey).getOrElse("rocksdb").trim.toLowerCase(java.util.Locale.ROOT)
+    require(
+      backend == "rocksdb" || backend == "delta",
+      s"$CatalogBackendKey must be 'rocksdb' or 'delta', found '$backend'."
+    )
+    backend
+  }
+
+  def deltaCatalogEnabled(spark: SparkSession): Boolean = catalogBackend(spark) == "delta"
+
+  def catalogPath(spark: SparkSession): String =
+    spark.conf
+      .getOption(CatalogPathKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .getOrElse(spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/") + "/_openivm_catalog")
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)

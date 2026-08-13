@@ -1539,6 +1539,25 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
+    RefreshTransactionCatalog.prepare(spark, refreshId, viewNameStr)
+
+    def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
+      val dataVersion =
+        DeltaTable.forPath(spark, cleanupMeta.location).history(1).collect().head.getAs[Long]("version")
+      RefreshTransactionCatalog.markDataCommitted(spark, refreshId, dataVersion)
+      postRefreshCleanup(
+        spark,
+        name,
+        cleanupMeta,
+        changeBatches,
+        viewNameStr,
+        sqlLog,
+        qlogOrder,
+        Some(dataVersion)
+      )
+      RefreshTransactionCatalog.commit(spark, refreshId)
+    }
+
     // Once we know we'll be doing real work, record the user-supplied CREATE-MV
     // body as the leading row of this refresh's query log. Not executed by us
     // (stmt_order = -1, duration_ms = -1) but invaluable for the benchmarker
@@ -1778,7 +1797,7 @@ case class RefreshMaterializedViewCommand(
         }
         profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
           RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-            postRefreshCleanup(spark, name, meta, changeBatches, viewNameStr, sqlLog, qlogOrder)
+            finalizeRefresh(meta)
           }
         }
         emitEnd("full_refresh_executed", "FULL_REFRESH", changeBatches.size)
@@ -2063,7 +2082,11 @@ case class RefreshMaterializedViewCommand(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='runtime_empty_delta_skip' " +
               "reason='all_source_delta_views_empty'"
           )
+          val unchangedVersion =
+            DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+          RefreshTransactionCatalog.markDataCommitted(spark, refreshId, unchangedVersion)
           consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
+          RefreshTransactionCatalog.commit(spark, refreshId)
           emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
           return Seq.empty
         }
@@ -3018,7 +3041,7 @@ case class RefreshMaterializedViewCommand(
 
       profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
         RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-          postRefreshCleanup(spark, name, meta, changeBatches, viewNameStr, sqlLog, qlogOrder)
+          finalizeRefresh(cleanupMeta)
         }
       }
       emitEnd(
@@ -4005,12 +4028,14 @@ case class RefreshMaterializedViewCommand(
       changeBatches: Seq[ChangeBatch],
       viewNameStr: String,
       sqlLog: RefreshSqlLog = RefreshSqlLog.NoOp,
-      qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0)
+      qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0),
+      committedDataVersion: Option[Long] = None
   ): Unit = {
     import MvCommandHelper._
     val propagation = ChangePropagationFactory.forSession(spark)
-    val newVersion =
+    val newVersion = committedDataVersion.getOrElse {
       DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+    }
     MvCatalog.advance(spark, name, newVersion)
 
     propagation.markConsumed(spark, viewNameStr, changeBatches)

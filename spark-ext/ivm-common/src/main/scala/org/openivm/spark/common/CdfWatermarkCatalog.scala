@@ -13,7 +13,7 @@ import java.nio.file.Files
  * contend on a global watermark database. Reads lazily migrate legacy rows
  * from the former shared index DB.
  */
-object CdfWatermarkCatalog {
+private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
 
   private val Cf: String       = IndexDbColumnFamilies.CdfWatermarks
   private val LegacyCf: String = IndexDbColumnFamilies.CdfWatermarks
@@ -119,4 +119,25 @@ object CdfWatermarkCatalog {
       }
     }
   }
+}
+
+object CdfWatermarkCatalog {
+  private def backend(spark: SparkSession): CdfWatermarkBackend = CdfWatermarkBackend.forSession(spark)
+
+  def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
+
+  def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
+    backend(spark).get(spark, viewName, source)
+
+  def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
+    backend(spark).put(spark, viewName, source, version)
+
+  def putAll(spark: SparkSession, viewName: String, versionsBySource: Map[String, Long]): Unit =
+    backend(spark).putAll(spark, viewName, versionsBySource)
+
+  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
+    backend(spark).removeForBaseTable(spark, baseTable)
+
+  def removeForView(spark: SparkSession, viewName: String): Unit =
+    backend(spark).removeForView(spark, viewName)
 }
