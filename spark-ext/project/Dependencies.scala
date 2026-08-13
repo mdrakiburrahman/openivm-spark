@@ -11,20 +11,21 @@ object Dependencies {
   val duckdbV = "1.5.2.1"
   val scalaTV = "3.2.18"
 
-  val sparkCore = "org.apache.spark" %% "spark-core"     % sparkV   % Provided
-  val sparkSql  = "org.apache.spark" %% "spark-sql"      % sparkV   % Provided
-  val sparkHive = "org.apache.spark" %% "spark-hive"     % sparkV   % Provided
-  val sparkCat  = "org.apache.spark" %% "spark-catalyst" % sparkV   % Provided
-  val delta     = "io.delta"         %% "delta-spark"    % deltaV   % Provided
-  val duckdb    = "org.duckdb"        % "duckdb_jdbc"    % duckdbV
-  val rocksdb   = "org.rocksdb"       % "rocksdbjni"     % "8.3.2"
-  val antlr     = "org.antlr"         % "antlr4-runtime" % antlrV
-  val slf4j     = "org.slf4j"         % "slf4j-api"      % "2.0.12" % Provided
-  val scalaTest = "org.scalatest"    %% "scalatest"      % scalaTV  % Test
-  val scalaMock = "org.scalamock"    %% "scalamock"      % "5.2.0"  % Test
+  val sparkCore         = "org.apache.spark"              %% "spark-core"              % sparkV   % Provided
+  val sparkSql          = "org.apache.spark"              %% "spark-sql"               % sparkV   % Provided
+  val sparkHive         = "org.apache.spark"              %% "spark-hive"              % sparkV   % Provided
+  val sparkCat          = "org.apache.spark"              %% "spark-catalyst"          % sparkV   % Provided
+  val delta             = "io.delta"                      %% "delta-spark"             % deltaV   % Provided
+  val duckdb            = "org.duckdb"                     % "duckdb_jdbc"             % duckdbV
+  val rocksdb           = "org.rocksdb"                    % "rocksdbjni"              % "8.3.2"
+  val antlr             = "org.antlr"                      % "antlr4-runtime"          % antlrV
+  val slf4j             = "org.slf4j"                      % "slf4j-api"               % "2.0.12" % Provided
+  val concurrencyLimits = "com.netflix.concurrency-limits" % "concurrency-limits-core" % "0.5.4"
+  val scalaTest         = "org.scalatest"                 %% "scalatest"               % scalaTV  % Test
+  val scalaMock         = "org.scalamock"                 %% "scalamock"               % "5.2.0"  % Test
 
   val executor  = Seq(sparkCore, sparkSql, sparkCat, delta, slf4j, scalaTest, scalaMock)
-  val common    = Seq(sparkCore, sparkSql, sparkCat, delta, rocksdb, slf4j, scalaTest, scalaMock)
+  val common    = Seq(sparkCore, sparkSql, sparkCat, delta, rocksdb, concurrencyLimits, slf4j, scalaTest, scalaMock)
   val compiler  = Seq(sparkSql, sparkCat, slf4j, scalaTest, scalaMock)
   val extension = Seq(sparkCore, sparkSql, sparkCat, sparkHive, delta, antlr, slf4j, scalaTest, scalaMock)
   val it        = Seq(sparkCore, sparkSql, sparkCat, sparkHive, delta, scalaTest)
