@@ -99,7 +99,6 @@ RocksDB time from Spark analysis and the initial Delta write.
 | Original RocksDB design | 33.31 s | 28.76 s | Not recorded | 6.80 s | 7.95 s |
 | Current branch, cold, 32 threads per driver | 30.32 s | 26.85 s | 8.79 s | 0.35 s | 12.78 s |
 | Current branch, warm, 32 threads per driver | 26.34 s | 19.19 s | 0.04 s | 0.21 s | 16.06 s |
-| Current branch, warm, 3 threads per driver | 24.21 s | 17.17 s | 0.05 s | 0.23 s | 14.56 s |
 
 Source warming is diagnostic. It takes 11--13 seconds and is excluded from the
 reported batch wall. It shows that cold Spark and Hive-metastore resolution, not
@@ -110,18 +109,58 @@ a Delta file-statistics Spark job whose output does not affect OpenIVM compilati
 Refresh still collects current table and delta statistics for its cost model.
 
 RocksDB is no longer the dominant CTAS bottleneck. The remaining timed work is
-Spark process startup and catalog resolution for cold sessions, followed by ten
-concurrent Delta writes to independent destinations. The benchmark exposes
-`SPARK_LOCAL_THREADS` so each local-mode driver can receive a bounded CPU share.
-The default preserves `local[*]` behavior.
+Spark process startup and catalog resolution for cold sessions, followed by Delta
+writes to independent destinations.
 
-Further CTAS work must target the execution topology:
+### CTAS lower bound and concurrency
 
-- reuse warm, long-lived Spark driver sessions;
-- allocate local worker threads across concurrent drivers;
-- dispatch concurrent CTAS jobs through fewer Spark contexts where the service
-  architecture permits it;
-- tune Delta output partitioning only after profiling file counts and task time.
+A clean concurrency sweep used full `local[32]` execution and a fresh RocksDB
+catalog for every point. The source has 16 partitions because
+`spark.default.parallelism=16`.
+
+| Concurrent CTAS jobs | Batch wall | Median CREATE | Median initial load |
+|---:|---:|---:|---:|
+| 1 | 6.02 s | 5.17 s | 4.21 s |
+| 2 | 8.06 s | 6.56 s | 5.53 s |
+| 4 | 11.06 s | 9.43 s | 8.26 s |
+| 8 | 18.16 s | 14.25 s | 12.84 s |
+| 10 | 22.22 s | 17.46 s | 15.43 s |
+
+The single-CTAS floor is about 5.2 seconds inside OpenIVM. The harness adds up
+to one second of Livy polling delay. The 4.2-second initial load includes Spark
+job setup, Delta commit work, and a 16-task file write. It is not all indivisible
+CPU work, so multiplying it by five overestimates the ten-CTAS lower bound.
+
+The execution topology is more important than a per-process thread cap:
+
+| Topology | Jobs | Batch wall | Result |
+|---|---:|---:|---|
+| Independent Spark contexts | 10 | 22.22 s | Jobs overlap, but ten schedulers and JVMs compete for one host |
+| One Livy SQL session | 2 | 8.03 s | Livy queues the SQL statements before Spark execution |
+| One Spark context, driver thread pool | 2 | 7.07 s | Both CTAS jobs execute concurrently |
+| One Spark context, driver thread pool | 10 | 10.08 s | All ten jobs overlap inside Spark |
+| Same, cached single-process RocksDB | 10 | 9.09 s | Removes cross-process locking and repeated native close/open |
+
+All ten views in the fastest run contained exactly 1,000,000 rows. Their CREATE
+critical paths completed in at most 8.19 seconds. The remaining difference is
+Livy submission and polling overhead.
+
+Use one warm, long-lived Spark application with an in-driver CTAS dispatcher.
+Each request must execute from its own driver thread. Spark can then schedule the
+jobs concurrently through one thread-safe `SparkContext`. Configure FAIR
+scheduling when concurrent requests need latency fairness; FIFO remains
+work-conserving but favors earlier jobs. A single Livy SQL interpreter does not
+provide this concurrency because it serializes statements before they reach
+Spark.
+
+This topology also restores the intended single-process RocksDB model. RocksDB
+handles remain local and cached while Spark tasks execute in parallel. Phase 3
+remains the durable multi-driver catalog when deployments require more than one
+Spark application.
+
+The dispatcher can run CTAS jobs concurrently only when their output locations
+are independent. Operations targeting the same MV still require explicit
+serialization or transactional conflict handling.
 
 ## Verification
 
