@@ -177,15 +177,21 @@ storage bandwidth.
 
 Use this feedback loop:
 
-1. Start with one admitted CTAS when no workload history exists.
-2. Track executor cores, active and pending tasks, JVM heap and GC pressure,
-   spill bytes, input throughput, output throughput, and Delta commit latency.
-3. Increase the admission limit while completed CTAS throughput improves and
-   normalized service-time inflation remains low.
-4. Reduce the limit when throughput stops improving, service time inflates,
-   spill or GC rises, or Delta commit conflicts occur.
-5. Cache the learned limit by query-shape and storage endpoint. Re-probe after
-   executor capacity, workload shape, or storage behavior changes.
+1. When no workload history exists, optimistically submit the complete finite
+   batch of independent CTAS jobs. Spark FAIR scheduling, rather than a
+   one-query warm-up, allocates executor task slots between them.
+2. Run admission feedback in observation-only mode during this cold batch.
+   Track active and pending tasks, JVM heap and GC pressure, spill bytes, input
+   and output throughput, Delta commit latency, and explicit failures.
+3. Apply multiplicative backoff immediately if hard pressure appears. Otherwise,
+   do not delay the first batch merely to find a latency-optimal concurrency.
+4. For a continuous request stream, increase the admission window while
+   completed throughput improves and normalized service-time inflation remains
+   low, and reduce it when throughput stops improving, spill or GC rises, or
+   Delta commit conflicts occur.
+5. Persist the learned window by Spark application, query-shape class, and
+   storage endpoint. Re-probe after executor capacity, workload shape, or
+   storage behavior changes.
 
 The control signals use ratios against the workload's own recent baseline, not
 machine-specific core counts or bandwidth constants. Executor changes and cloud
@@ -205,6 +211,23 @@ Four active jobs are near the throughput knee on the measured host. Ten active
 jobs minimize this finite batch's makespan but increase individual CTAS latency.
 The controller must optimize an explicit objective such as throughput, latency,
 or a weighted combination.
+
+Starting at width one would make a cold ten-view benchmark take 20.10 seconds,
+roughly twice the 10.07-second all-at-once result. No feedback controller can
+infer an unseen machine's optimum before receiving samples. The cold-start
+choice must therefore express the objective: optimize finite-batch makespan by
+starting wide, or protect interactive tail latency by starting conservatively.
+OpenIVM's CTAS batch path uses the former. Benchmark reports must label cold and
+learned runs separately so persisted controller state cannot silently improve a
+reported result.
+
+This does not require a Spark query cost model. A reusable implementation can
+take the concurrency-window algorithm from Netflix `concurrency-limits` and add
+a small OpenIVM adapter for FAIR-pool assignment, observation-only sampling,
+persisted limits, and pressure signals. Latency-only samples should be normalized
+by query-shape history because CTAS jobs are heterogeneous. Before such history
+exists, loss-based AIMD driven by spill, GC, commit conflicts, and failures is a
+safer guardrail than treating a naturally long CTAS as congestion.
 
 Concurrency does not reduce or increase the logical output required by CTAS.
 Each independent materialized view still writes its own Delta table. In the
