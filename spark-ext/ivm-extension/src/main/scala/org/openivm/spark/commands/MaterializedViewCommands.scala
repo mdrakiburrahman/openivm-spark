@@ -833,7 +833,9 @@ case class CreateMaterializedViewCommand(
     val propagation = ChangePropagationFactory.forSession(spark)
 
     // Existence guard
-    MvCatalog.lookup(spark, name) match {
+    profile.timeStep("create_catalog_lookup") {
+      MvCatalog.lookup(spark, name)
+    } match {
       case Some(_) if ifNotExists => return Seq.empty
       case Some(_) =>
         throw new AnalysisException(
@@ -845,17 +847,23 @@ case class CreateMaterializedViewCommand(
 
     // Resolve source schemas
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
-      collectSourceSchemas(spark, originalQueryText)
+      profile.timeStep("create_resolve_sources") {
+        collectSourceSchemas(spark, originalQueryText)
+      }
 
     // Validate that every source is configured correctly for the active
     // change-propagation mode (e.g. under CDF mode: requires
     // `delta.enableChangeDataFeed = true` on every source).  Fails fast at
     // CREATE so users see a clear error before paying for the openivm
     // compile + initial CTAS.
-    propagation.validateSources(spark, qualNames)
+    profile.timeStep("create_validate_sources") {
+      propagation.validateSources(spark, qualNames)
+    }
 
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
-    val analyzed       = spark.sql(originalQueryText).queryExecution.analyzed
+    val analyzed = profile.timeStep("create_analyze_query") {
+      spark.sql(originalQueryText).queryExecution.analyzed
+    }
     val groupKeys      = extractGroupKeys(analyzed)
     val countStarAlias = extractCountStarAlias(analyzed)
     val queryShapeProps = MvMetadata.queryShapeProperties(analyzed.exists {
@@ -871,13 +879,15 @@ case class CreateMaterializedViewCommand(
     // incrementality for correctness: the MV stays bag-equal to the live
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
-    val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
-    val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
-    val workloadFacts = statsFacts.copy(
-      fkRelations = constraintFacts.fkRelations,
-      uniqueKeys = constraintFacts.uniqueKeys,
-      declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
-    )
+    val workloadFacts = profile.timeStep("create_collect_workload_facts", s"sources=${qualNames.size}") {
+      val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
+      val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
+      statsFacts.copy(
+        fkRelations = constraintFacts.fkRelations,
+        uniqueKeys = constraintFacts.uniqueKeys,
+        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
+      )
+    }
     val compiler = OpenIvmCompilers.forSession(spark)
     val compiled = profile.timeStep(
       "create_compile_classification",
@@ -914,10 +924,14 @@ case class CreateMaterializedViewCommand(
     // Storage location
     val location = mvLocation(spark, name)
     val aggregateHavingDataColumns: Option[Set[String]] =
-      computeAggregateHavingDataColumns(spark, compiled, originalQueryText)
+      profile.timeStep("create_classification_inputs") {
+        computeAggregateHavingDataColumns(spark, compiled, originalQueryText)
+      }
 
     val simpleProjectionHasDataApply: Boolean =
-      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
+      profile.timeStep("create_simple_projection_check") {
+        computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
+      }
 
     // Move the fingerprint computation below the upstream-MV enumeration so we
     // can include each upstream MV's identity hash. This way DROP + recreate
@@ -991,8 +1005,10 @@ case class CreateMaterializedViewCommand(
     //
     // Lookup is symmetric on db.table vs bare-name matching to handle MVs
     // created with or without an explicit db prefix.
-    val upstreamMvByQual: Map[String, MvMetadata] = computeUpstreamMvByQual(spark, qualNames)
-    val sourceIsMv: Boolean                       = upstreamMvByQual.nonEmpty
+    val upstreamMvByQual: Map[String, MvMetadata] = profile.timeStep("create_resolve_upstream_mvs") {
+      computeUpstreamMvByQual(spark, qualNames)
+    }
+    val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
     val distinctUpstreamMvCount: Int =
       upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
     // Non-cascade-upstream demotion reason (None when every upstream MV can feed
@@ -1114,7 +1130,9 @@ case class CreateMaterializedViewCommand(
     // (otherwise we'd double-apply upstream view-deltas this MV already
     // absorbed via the CTAS).  Encoded opaquely so the same property key
     // round-trips both `intercept`-mode timestamps and `cdf`-mode versions.
-    val watermarks     = propagation.currentWatermarks(spark, qualNames)
+    val watermarks = profile.timeStep("create_capture_watermarks", s"sources=${qualNames.size}") {
+      propagation.currentWatermarks(spark, qualNames)
+    }
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
     val allProps =
       properties ++ baseProps ++ countProp ++ havingProp ++ clusterColsProp ++ cascadeDeltaProps ++
@@ -1177,7 +1195,9 @@ case class CreateMaterializedViewCommand(
     // retries after an OOM-aborted initial load (see exp-000 SF=100
     // forensics — trades_history failed 24× over 87 minutes because the
     // location had non-Delta Parquet from a prior partial write).
-    cleanupStaleMvLocation(spark, location)
+    profile.timeStep("create_cleanup_stale_location") {
+      cleanupStaleMvLocation(spark, location)
+    }
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       profile.timeStep(
