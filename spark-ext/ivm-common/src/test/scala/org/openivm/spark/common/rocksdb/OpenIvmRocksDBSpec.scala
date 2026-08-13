@@ -408,6 +408,12 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("labels sharded telemetry paths without exposing identifiers") {
+      OpenIvmRocksDBTelemetry.scopeForPath("/tmp/warehouse/_openivm/mvs/private-mv/rocksdb") shouldBe "mv"
+      OpenIvmRocksDBTelemetry.scopeForPath("/tmp/warehouse/_openivm/tables/private-table/rocksdb") shouldBe "table"
+      OpenIvmRocksDBTelemetry.scopeForPath("/tmp/warehouse/_openivm/sources/private-source/rocksdb") shouldBe "source"
+    }
+
     it("allows concurrent multi-process writers with multiProcess=true") {
       val dir       = newDbDir("multi-process")
       val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString

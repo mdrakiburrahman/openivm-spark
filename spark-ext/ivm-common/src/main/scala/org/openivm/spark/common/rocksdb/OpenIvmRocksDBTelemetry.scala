@@ -145,6 +145,7 @@ object OpenIvmRocksDBTelemetry {
       if (relative.startsWith("index/")) "index"
       else if (relative.startsWith("mvs/")) "mv"
       else if (relative.startsWith("tables/")) "table"
+      else if (relative.startsWith("sources/")) "source"
       else if (relative.startsWith("refresh_profile/")) "refresh_profile"
       else if (relative.startsWith("refresh_sql_log/")) "refresh_sql_log"
       else "other"

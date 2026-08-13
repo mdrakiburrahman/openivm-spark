@@ -101,7 +101,8 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
 
       val rocksdbDetails = detailsForStep(rows, "rocksdb_operation")
       rocksdbDetails should not be empty
-      rocksdbDetails.exists(_.contains("db_scope=index")) shouldBe true
+      rocksdbDetails.exists(_.contains("db_scope=mv")) shouldBe true
+      rocksdbDetails.exists(_.contains("db_scope=index")) shouldBe false
       rocksdbDetails.exists(_.contains("operation=get")) shouldBe true
       rocksdbDetails.foreach { detail =>
         detail should include("operation_count=")
