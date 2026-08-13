@@ -269,6 +269,75 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("reports per-operation JVM lock contention to the active telemetry session") {
+      val dir = newDbDir("telemetry-contention")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+
+      val holderEntered = new CountDownLatch(1)
+      val releaseHolder = new CountDownLatch(1)
+
+      try {
+        db.load()
+        val holder = Future {
+          db.withBatch { batch =>
+            holderEntered.countDown()
+            releaseHolder.await(5, TimeUnit.SECONDS) shouldBe true
+            db.put(batch, "meta", RocksDBCodec.utf8("held"), RocksDBCodec.utf8("value"))
+          }
+        }
+
+        holderEntered.await(5, TimeUnit.SECONDS) shouldBe true
+        val waiter = Future {
+          val telemetry = OpenIvmRocksDBTelemetry.start()
+          db.get("meta", RocksDBCodec.utf8("held"))
+          telemetry.finish()
+        }
+
+        // Keep the holder in its batch long enough that the waiter must park
+        // on writeMutex. The assertion leaves a wide margin for scheduler
+        // jitter while still distinguishing real contention from lock-call
+        // bookkeeping overhead.
+        Thread.sleep(100L)
+        releaseHolder.countDown()
+
+        Await.result(holder, 10.seconds)
+        val summaries  = Await.result(waiter, 10.seconds)
+        val getSummary = summaries.find(_.operation == "get").getOrElse(fail("missing get telemetry"))
+        getSummary.operationCount shouldBe 1L
+        getSummary.failedCount shouldBe 0L
+        getSummary.jvmLockWaitNanos should be >= 50000000L
+        getSummary.jvmLockHeldNanos should be > 0L
+      } finally {
+        releaseHolder.countDown()
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("reports multi-process native open and close costs without exposing the DB path") {
+      val root = newDbDir("telemetry-multi-process")
+      val dir  = new File(root, "_openivm/index/rocksdb")
+      val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        val telemetry = OpenIvmRocksDBTelemetry.start()
+        db.get("meta", RocksDBCodec.utf8("missing")) shouldBe None
+        val summaries  = telemetry.finish()
+        val getSummary = summaries.find(_.operation == "get").getOrElse(fail("missing get telemetry"))
+
+        getSummary.dbScope shouldBe "index"
+        getSummary.multiProcess shouldBe true
+        getSummary.operationCount shouldBe 1L
+        getSummary.nativeOpenNanos should be > 0L
+        getSummary.nativeCloseNanos should be > 0L
+        getSummary.externalLockWaitNanos should be >= 0L
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(root)
+      }
+    }
+
     it("allows reentrant catalog ops within withBatch under multiProcess=true") {
       val dir  = newDbDir("mp-reentrant")
       val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)

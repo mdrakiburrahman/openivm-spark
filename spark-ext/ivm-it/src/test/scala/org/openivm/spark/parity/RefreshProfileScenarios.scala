@@ -79,7 +79,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
   }
 
   describe("RefreshProfile — REFRESH with deltas") {
-    it("emits execute_refresh_sql_stmt rows with stmt_kind in detail") {
+    it("emits statement and RocksDB contention telemetry") {
       clearProfile()
       sql("CREATE TABLE profile_t3 (k INT, v INT) USING DELTA")
       sql("INSERT INTO profile_t3 VALUES (1, 10)")
@@ -98,6 +98,21 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       val dispatchDetails = detailsForStep(rows, "generate_refresh_sql.dispatch")
       dispatchDetails should not be empty
       dispatchDetails.head should include("refresh_type=")
+
+      val rocksdbDetails = detailsForStep(rows, "rocksdb_operation")
+      rocksdbDetails should not be empty
+      rocksdbDetails.exists(_.contains("db_scope=index")) shouldBe true
+      rocksdbDetails.exists(_.contains("operation=get")) shouldBe true
+      rocksdbDetails.foreach { detail =>
+        detail should include("operation_count=")
+        detail should include("jvm_lock_wait_ns=")
+        detail should include("max_jvm_lock_wait_ns=")
+        detail should include("external_lock_wait_ns=")
+        detail should include("native_open_ns=")
+        detail should include("native_close_ns=")
+        detail should include("body_ns=")
+        detail should not include spark.conf.get("spark.sql.warehouse.dir")
+      }
     }
   }
 

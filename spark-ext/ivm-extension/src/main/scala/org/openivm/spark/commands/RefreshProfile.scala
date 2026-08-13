@@ -2,6 +2,7 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
+import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
 
 import java.sql.Timestamp
 import java.util.concurrent.atomic.AtomicInteger
@@ -28,7 +29,8 @@ final class RefreshProfile private (
     spark: SparkSession,
     val refreshId: String,
     val viewName: String,
-    private val active: Boolean
+    private val active: Boolean,
+    private val rocksdbTelemetry: Option[OpenIvmRocksDBTelemetry.Session]
 ) {
 
   private val stepOrder = new AtomicInteger(0)
@@ -76,7 +78,30 @@ final class RefreshProfile private (
     * flush.
     */
   def flush(): Unit = {
-    if (!active || buffer.isEmpty) return
+    if (!active) return
+    rocksdbTelemetry.toSeq.flatMap(_.finish()).foreach { summary =>
+      appendStep(
+        stepName = "rocksdb_operation",
+        detail = Seq(
+          s"db_scope=${summary.dbScope}",
+          s"operation=${summary.operation}",
+          s"multi_process=${summary.multiProcess}",
+          s"operation_count=${summary.operationCount}",
+          s"failed_count=${summary.failedCount}",
+          s"total_ns=${summary.totalNanos}",
+          s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
+          s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
+          s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
+          s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
+          s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
+          s"native_open_ns=${summary.nativeOpenNanos}",
+          s"native_close_ns=${summary.nativeCloseNanos}",
+          s"body_ns=${summary.bodyNanos}"
+        ).mkString(";"),
+        durationMs = summary.totalNanos / 1000000L
+      )
+    }
+    if (buffer.isEmpty) return
     val rows = buffer.toVector
     buffer.clear()
     try RefreshProfileCatalog.record(spark, rows)
@@ -107,15 +132,16 @@ object RefreshProfile {
   def start(spark: SparkSession, viewName: String, mode: Mode): RefreshProfile = {
     val active = FeatureGate.profileRefreshEnabled(spark)
     if (active) RefreshProfileCatalog.ensureTables(spark)
+    val rocksdbTelemetry = if (active) Some(OpenIvmRocksDBTelemetry.start()) else None
     val suffix = mode match {
       case Mode.Refresh => s"_${System.nanoTime()}"
       case Mode.Create  => s"_create_mv_${System.nanoTime()}"
     }
-    new RefreshProfile(spark, viewName + suffix, viewName, active)
+    new RefreshProfile(spark, viewName + suffix, viewName, active, rocksdbTelemetry)
   }
 
   /** Inactive instance for code paths that never opt into profiling. */
-  val NoOp: RefreshProfile = new RefreshProfile(null, "", "", active = false)
+  val NoOp: RefreshProfile = new RefreshProfile(null, "", "", active = false, rocksdbTelemetry = None)
 }
 
 /** Side-channel for `RefreshProfile` to emit its own failure diagnostics

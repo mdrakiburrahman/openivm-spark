@@ -253,9 +253,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   @volatile private var externalLockOwner: Thread = _
   private var externalLockDepth: Int              = 0
 
-  private def withExternalLock[A](body: => A): A = {
+  private def withExternalLock[A](measureWait: Boolean)(recordWaitNanos: Long => Unit)(body: => A): A = {
     val current = Thread.currentThread()
     if (externalLockOwner eq current) {
+      if (measureWait) recordWaitNanos(0L)
       externalLockDepth += 1
       try body
       finally externalLockDepth -= 1
@@ -263,6 +264,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       Files.createDirectories(dbDir)
       val ch = FileChannel.open(externalLockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
       try {
+        val waitStarted          = if (measureWait) System.nanoTime() else 0L
         val deadline             = System.currentTimeMillis() + conf.lockTimeoutMs
         var acquired: FileLock   = null
         var lastError: Throwable = null
@@ -282,6 +284,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
             catch { case _: InterruptedException => () }
           }
         }
+        if (measureWait) recordWaitNanos(System.nanoTime() - waitStarted)
         if (acquired == null) {
           throw new RuntimeException(
             s"OpenIVM RocksDB external lock acquisition timed out after ${conf.lockTimeoutMs}ms on $externalLockPath",
@@ -371,30 +374,102 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * Always holds the in-JVM `writeMutex` so within one JVM concurrent
     * threads serialise; the external lock then mutexes other JVMs.
     */
-  private[rocksdb] def withNativeHandle[A](body: => A): A = withWriteLock {
-    if (closed) {
-      throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
-    }
-    if (conf.multiProcess) {
-      withExternalLock {
-        if (dbHandle != null) {
-          // Reentry from a callback running inside an outer withNativeHandle
-          // (e.g. MvCatalog.rewriteProperties calls collectPrefix inside
-          // withBatch). The outer frame owns the open/close; we just run.
-          body
+  private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A = {
+    if (!OpenIvmRocksDBTelemetry.isActive) {
+      return withWriteLock {
+        if (closed) {
+          throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
+        }
+        if (conf.multiProcess) {
+          withExternalLock(measureWait = false)(_ => ()) {
+            if (dbHandle != null) {
+              body
+            } else {
+              openInternal()
+              try body
+              finally closeInternal()
+            }
+          }
         } else {
-          openInternal()
-          try body
-          finally closeInternal()
+          if (dbHandle == null) openInternal()
+          body
         }
       }
-    } else {
-      if (dbHandle == null) openInternal()
-      body
+    }
+
+    val totalStarted = System.nanoTime()
+    val lockStarted  = System.nanoTime()
+    writeMutex.lock()
+    val lockAcquired = System.nanoTime()
+
+    var externalLockWaitNanos = 0L
+    var nativeOpenNanos       = 0L
+    var nativeCloseNanos      = 0L
+    var bodyNanos             = 0L
+    var failed                = true
+
+    def timedBody(): A = {
+      val started = System.nanoTime()
+      try body
+      finally bodyNanos += System.nanoTime() - started
+    }
+
+    def timedOpen(): Unit = {
+      val started = System.nanoTime()
+      try openInternal()
+      finally nativeOpenNanos += System.nanoTime() - started
+    }
+
+    def timedClose(): Unit = {
+      val started = System.nanoTime()
+      try closeInternal()
+      finally nativeCloseNanos += System.nanoTime() - started
+    }
+
+    try {
+      if (closed) {
+        throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
+      }
+      val result =
+        if (conf.multiProcess) {
+          withExternalLock(measureWait = true)(waitNanos => externalLockWaitNanos += waitNanos) {
+            if (dbHandle != null) {
+              // Reentry from a callback running inside an outer withNativeHandle
+              // (e.g. MvCatalog.rewriteProperties calls collectPrefix inside
+              // withBatch). The outer frame owns the open/close; we just run.
+              timedBody()
+            } else {
+              timedOpen()
+              try timedBody()
+              finally timedClose()
+            }
+          }
+        } else {
+          if (dbHandle == null) timedOpen()
+          timedBody()
+        }
+      failed = false
+      result
+    } finally {
+      val lockReleased = System.nanoTime()
+      writeMutex.unlock()
+      OpenIvmRocksDBTelemetry.record(
+        dbPath = normalizedDbPath,
+        operation = operation,
+        multiProcess = conf.multiProcess,
+        failed = failed,
+        totalNanos = lockReleased - totalStarted,
+        jvmLockWaitNanos = lockAcquired - lockStarted,
+        jvmLockHeldNanos = lockReleased - lockAcquired,
+        externalLockWaitNanos = externalLockWaitNanos,
+        nativeOpenNanos = nativeOpenNanos,
+        nativeCloseNanos = nativeCloseNanos,
+        bodyNanos = bodyNanos
+      )
     }
   }
 
-  def withBatch[A](f: WriteBatch => A): Long = withNativeHandle {
+  def withBatch[A](f: WriteBatch => A): Long = withNativeHandle("with_batch") {
     val batch = new WriteBatch()
     try {
       f(batch)
@@ -404,7 +479,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle {
+  def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle("get") {
     Option(dbHandle.get(cf(columnFamily), key))
   }
 
@@ -418,7 +493,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     */
   def prefixScan(columnFamily: String, prefix: Array[Byte]): Iterator[(Array[Byte], Array[Byte])] =
     if (conf.multiProcess) {
-      withNativeHandle {
+      withNativeHandle("prefix_scan") {
         val it = new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
         try {
           val buffer = scala.collection.mutable.ArrayBuffer.empty[(Array[Byte], Array[Byte])]
@@ -429,16 +504,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         }
       }
     } else {
-      withNativeHandle {
+      withNativeHandle("prefix_scan") {
         new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
       }
     }
 
-  def currentVersion: Long = withNativeHandle {
+  def currentVersion: Long = withNativeHandle("current_version") {
     versionValue
   }
 
-  def load(): Long = withNativeHandle {
+  def load(): Long = withNativeHandle("load") {
     versionValue
   }
 
@@ -451,10 +526,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
       }
     }
-    if (conf.multiProcess) withExternalLock(body()) else body()
+    if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
   }
 
-  def compactRange(): Unit = withNativeHandle {
+  def compactRange(): Unit = withNativeHandle("compact_range") {
     dbHandle.compactRange()
     compactCalls.incrementAndGet()
     ()
@@ -473,7 +548,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def sstFileCount: Int = {
     if (closed) 0
     else if (conf.multiProcess) {
-      withNativeHandle(sstFileCountInternal(dbHandle))
+      withNativeHandle("sst_file_count")(sstFileCountInternal(dbHandle))
     } else {
       sstFileCountInternal(ensureLoaded())
     }

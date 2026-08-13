@@ -1,7 +1,8 @@
 # 9. Profiling OpenIVM refreshes: `openivm_refresh_profile` and Spark logs
 
 Question D7 asks how to profile OpenIVM refreshes across the two execution modes used by this repository.
-The short answer is that standalone DuckDB/OpenIVM has a real profile table, while openivm-spark mostly has log evidence.
+Both modes expose step-oriented refresh profiles. Spark persists its profile in
+a dedicated RocksDB catalog and exposes it through SQL.
 
 ## 9.1 TL;DR
 
@@ -14,7 +15,10 @@ The short answer is that standalone DuckDB/OpenIVM has a real profile table, whi
 - That means DuckDB compiles refresh SQL and returns without running the refresh program.
 - Spark executes the rewritten SQL itself.
 - Therefore the DuckDB `openivm_refresh_profile` table is not the place to look for Spark refresh runtime.
-- Today, Spark refresh evidence comes from `[openivm-mv]` log lines in `MaterializedViewCommands.scala` and normal Spark SQL/job logs.
+- Set `spark.openivm.profile.refresh=true` to capture Spark CREATE and REFRESH steps.
+- Query Spark profiles with `SHOW OPENIVM REFRESH PROFILE`.
+- Spark profiles include aggregated `rocksdb_operation` contention rows.
+- Spark also emits `[openivm-mv]` log lines and normal Spark SQL/job metrics.
 - The requested structured tokens such as `compile_start`, `collect_staging_end`, and `stmt_duration_ms` are not emitted in this checkout.
 - Use the actual `[openivm-mv]` prefix and the helper below.
 
@@ -144,6 +148,32 @@ There is no long-lived DuckDB database whose `openivm_refresh_profile` table rep
 The DuckDB compile subprocess is ephemeral, and its profile table is not a Spark telemetry sink.
 
 ## 9.7 Spark-side profiling evidence that exists today
+
+Enable the Spark profile and query it after a refresh:
+
+```sql
+SET spark.openivm.profile.refresh=true;
+
+REFRESH MATERIALIZED VIEW daily_sales;
+
+SHOW OPENIVM REFRESH PROFILE;
+```
+
+`RefreshProfile` buffers lifecycle steps on the driver thread. It writes the
+rows to `<state_path>/_openivm/refresh_profile/rocksdb` after the command ends.
+The profile uses the same seven-column schema as standalone OpenIVM.
+
+RocksDB access adds one `rocksdb_operation` row for each database scope,
+operation, and multi-process mode. Its `duration_ms` is the aggregated
+operation time. The `detail` field preserves exact nanosecond timing for JVM
+lock waits, external lock waits, native open/close, and the operation body.
+
+The collector is thread-local. Concurrent materialized views cannot mix their
+metrics through process-global counters. Collection stops before the profile
+catalog write, so a profile does not measure its own persistence.
+
+The profile complements Spark event metrics. Use event metrics for records,
+files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.
 
 The current Spark source emits operational log lines with the prefix `[openivm-mv]`.
 The emit sites found by `grep -rn "logInfo.*refresh" spark-ext/` and related `logError`/`logWarning` searches are below.
