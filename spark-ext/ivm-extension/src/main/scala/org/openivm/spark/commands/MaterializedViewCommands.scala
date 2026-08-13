@@ -406,29 +406,34 @@ private[commands] object MvCommandHelper {
   def collectSourceSchemas(
       spark: SparkSession,
       querySql: String
-  ): (Seq[String], Map[String, StructType], Map[String, StructType], Map[String, String]) = {
-    val analyzed = spark.sql(querySql).queryExecution.analyzed
+  ): (Seq[String], Map[String, StructType], Map[String, StructType], Map[String, String]) =
+    collectSourceSchemas(spark.sql(querySql).queryExecution.analyzed)
 
-    // Extract (qualifiedName, shortName) pairs from a single plan, non-recursively.
-    def pairsFromPlan(plan: LogicalPlan): Seq[(String, String)] =
+  def collectSourceSchemas(
+      analyzed: LogicalPlan
+  ): (Seq[String], Map[String, StructType], Map[String, StructType], Map[String, String]) = {
+    // Extract (qualifiedName, shortName, schema) tuples from the already-analyzed
+    // relation nodes. Re-querying spark.table for every source duplicates catalog
+    // resolution and becomes a severe metastore bottleneck across concurrent drivers.
+    def sourcesFromPlan(plan: LogicalPlan): Seq[(String, String, StructType)] =
       plan.collect {
         case r: LogicalRelation if r.catalogTable.isDefined =>
           val id        = r.catalogTable.get.identifier
           val qualified = id.database.fold(id.table)(db => s"$db.${id.table}")
-          (qualified, id.table)
+          (qualified, id.table, r.schema)
         case r: DataSourceV2Relation if r.identifier.isDefined =>
           val ident     = r.identifier.get
           val ns        = ident.namespace()
           val short     = ident.name()
           val qualified = if (ns.nonEmpty) (ns :+ short).mkString(".") else short
-          (qualified, short)
+          (qualified, short, r.schema)
       }
 
     // Collect table pairs from a plan AND from any SubqueryExpression plans nested
     // within node expressions (covers WHERE EXISTS / IN subqueries whose inner plan
     // is not reachable via LogicalPlan.children alone).
-    def collectAllPairs(plan: LogicalPlan): Seq[(String, String)] = {
-      val direct = pairsFromPlan(plan)
+    def collectAllSources(plan: LogicalPlan): Seq[(String, String, StructType)] = {
+      val direct = sourcesFromPlan(plan)
       // plan.collect { case p => p } enumerates every LogicalPlan node in the tree.
       // For each node we look inside its expressions for SubqueryExpression instances
       // (Exists, ListQuery, ScalarSubquery, etc.) and recurse into their inner plans.
@@ -439,19 +444,19 @@ private[commands] object MvCommandHelper {
             expr.collect { case s: SubqueryExpression => s }
           }
         }
-        .flatMap(s => collectAllPairs(s.plan))
+        .flatMap(s => collectAllSources(s.plan))
       (direct ++ fromSubqueries).distinct
     }
 
-    val pairs: Seq[(String, String)] = collectAllPairs(analyzed)
+    val sources = collectAllSources(analyzed)
 
-    val qualNames = pairs.map(_._1).distinct
-    // Fetch full table schemas from the Spark catalog (not projected/pruned).
-    val qualSchemas = qualNames.map(n => n -> spark.table(n).schema).toMap
+    val qualNames = sources.map(_._1).distinct
+    val qualSchemas: Map[String, StructType] =
+      sources.map { case (qualified, _, schema) => qualified -> schema }.toMap
     val compileSchemas: Map[String, StructType] =
-      pairs.map { case (q, s) => s -> qualSchemas(q) }.toMap
+      sources.map { case (qualified, short, _) => short -> qualSchemas(qualified) }.toMap
     val shortToQual: Map[String, String] =
-      pairs.map { case (q, s) => s -> q }.toMap
+      sources.map { case (qualified, short, _) => short -> qualified }.toMap
     (qualNames, qualSchemas, compileSchemas, shortToQual)
   }
 
@@ -845,10 +850,16 @@ case class CreateMaterializedViewCommand(
       case None => // proceed
     }
 
-    // Resolve source schemas
+    // Analyze once and reuse the resolved relation nodes for source discovery,
+    // query-shape extraction, and full source schemas.
+    val analyzed = profile.timeStep("create_analyze_query") {
+      spark.sql(originalQueryText).queryExecution.analyzed
+    }
+
+    // Resolve source schemas without issuing duplicate catalog lookups.
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       profile.timeStep("create_resolve_sources") {
-        collectSourceSchemas(spark, originalQueryText)
+        collectSourceSchemas(analyzed)
       }
 
     // Validate that every source is configured correctly for the active
@@ -861,9 +872,6 @@ case class CreateMaterializedViewCommand(
     }
 
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
-    val analyzed = profile.timeStep("create_analyze_query") {
-      spark.sql(originalQueryText).queryExecution.analyzed
-    }
     val groupKeys      = extractGroupKeys(analyzed)
     val countStarAlias = extractCountStarAlias(analyzed)
     val queryShapeProps = MvMetadata.queryShapeProperties(analyzed.exists {
@@ -881,8 +889,12 @@ case class CreateMaterializedViewCommand(
     // they wrote.
     val workloadFacts = profile.timeStep("create_collect_workload_facts", s"sources=${qualNames.size}") {
       val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
-      val statsFacts      = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, qualNames)
-      statsFacts.copy(
+      // Quantitative Delta statistics are consumed by Spark's refresh-time cost
+      // model and rewriter, which collect current table and delta stats for every
+      // refresh. OpenIVM's compile-facts parser ignores table/column stats, and
+      // compileCacheTier deliberately excludes them. Scanning snapshot.allFiles
+      // here therefore adds a Spark job to CTAS without affecting CREATE output.
+      WorkloadFacts(
         fkRelations = constraintFacts.fkRelations,
         uniqueKeys = constraintFacts.uniqueKeys,
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
