@@ -1,5 +1,7 @@
 package org.openivm.spark.parity
 
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.MvCatalog
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Regression spec for the SF=10 `gold.fact_holdings diff=18` failure.
@@ -129,9 +131,8 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
 
   // ─────────────────────────────────────────────────────────────────────────
   // (4) Insert + delete mixed batch — non-conflicting (no value-tuple has
-  //     both positive and negative net). Pre-fix logic does
-  //     `hasConflictingSimpleProjectionRows = false` so no FULL_REFRESH
-  //     fallback, and the over-delete fires on the negative-net side.
+  //     both positive and negative net). This exercises both sides of the
+  //     net-multiplicity program in one refresh.
   // ─────────────────────────────────────────────────────────────────────────
 
   describe("(4) SIMPLE_PROJECTION mixed insert + partial-retract batch") {
@@ -152,6 +153,62 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
       sql("INSERT INTO spbd_src4 VALUES (3,'a'),(3,'b')")
       sql("REFRESH MATERIALIZED VIEW spbd_mv4").collect()
       assertMvCorrect("spbd_mv4", "SELECT k FROM spbd_src4")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // (5) Positive and negative rows for the same projected tuple. The raw
+  //     signed delta conflicts, but consolidation makes it net zero. The
+  //     bag-correct net-view refresh must stay incremental rather than
+  //     routing the whole MV through INSERT OVERWRITE.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("(5) SIMPLE_PROJECTION conflicting signs for one value-tuple") {
+
+    it("nets conflicting rows and avoids a full-refresh overwrite") {
+      sql("CREATE TABLE IF NOT EXISTS spbd_src5(k INT, payload STRING) USING DELTA")
+      sql("INSERT INTO spbd_src5 VALUES (1,'a'),(1,'b'),(1,'c'),(2,'a'),(2,'b')")
+      sql("CREATE MATERIALIZED VIEW spbd_mv5 AS SELECT k FROM spbd_src5")
+      sql(
+        "CREATE MATERIALIZED VIEW spbd_mv5_counts AS " +
+          "SELECT k, COUNT(*) AS cnt FROM spbd_mv5 GROUP BY k"
+      )
+
+      val meta = MvCatalog
+        .lookup(spark, TableIdentifier("spbd_mv5"))
+        .getOrElse(fail("spbd_mv5 metadata missing"))
+      val escapedLocation = meta.location.replace("`", "``")
+      val preRefreshVersion = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .selectExpr("max(version) AS version")
+        .head()
+        .getAs[Long]("version")
+
+      // k=1 contributes -2 and +1 (net -1), while k=2 contributes -1 and
+      // +2 (net +1). Both projected tuples therefore contain opposing raw
+      // signs with a non-zero net. k=3 is an independent positive change.
+      sql("DELETE FROM spbd_src5 WHERE (k=1 AND payload IN ('a','b')) OR (k=2 AND payload='a')")
+      sql("INSERT INTO spbd_src5 VALUES (1,'replacement'),(2,'new-1'),(2,'new-2'),(3,'new')")
+      refreshMv("spbd_mv5")
+      refreshMv("spbd_mv5_counts")
+
+      assertMvCorrect("spbd_mv5", "SELECT k FROM spbd_src5")
+      assertMvCorrect(
+        "spbd_mv5_counts",
+        "SELECT k, COUNT(*) AS cnt FROM spbd_src5 GROUP BY k"
+      )
+
+      val unconditionalOverwrites = spark
+        .sql(s"DESCRIBE HISTORY delta.`$escapedLocation`")
+        .where(s"version > $preRefreshVersion")
+        .collect()
+        .filter { row =>
+          val operation  = row.getAs[String]("operation")
+          val parameters = Option(row.getAs[Map[String, String]]("operationParameters")).getOrElse(Map.empty)
+          operation == "WRITE" && parameters.get("mode").contains("Overwrite")
+        }
+
+      unconditionalOverwrites shouldBe empty
     }
   }
 }

@@ -734,7 +734,7 @@ It returns false for full refresh, simple aggregate, distinct incremental,
 semi/anti recompute, and TopK.
 At refresh time, persisted metadata controls whether the view-delta path is
 recorded as downstream staging. The recording block is guarded by
-`cleanupMeta.emitsCascadeViewDelta` at `MaterializedViewCommands.scala:1132-1155`.
+`meta.emitsCascadeViewDelta` in `MaterializedViewCommands.scala`.
 
 ## 13. Concrete demo: AGGREGATE_GROUP
 

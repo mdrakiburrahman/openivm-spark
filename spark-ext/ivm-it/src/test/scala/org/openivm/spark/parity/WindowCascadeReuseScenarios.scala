@@ -180,11 +180,11 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertCascadeFirstTargetWrite("wcr_mv")
     }
 
-    it("uses the persisted cascade when more than 10,000 partitions change") {
+    it("uses the persisted cascade when more than 1,000 partitions change") {
       sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql(
         "INSERT INTO wcm_events " +
-          "SELECT id, 1 AS seq, id AS payload FROM range(10001)"
+          "SELECT id, 1 AS seq, id AS payload FROM range(1001)"
       )
 
       val viewSql =
@@ -203,7 +203,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       sql("UPDATE wcm_events SET payload = payload + 100000 WHERE seq = 1")
       sql(
         "INSERT INTO wcm_events " +
-          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(10001)"
+          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001)"
       )
       sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
       RefreshSqlLogCatalog.removeAll(spark)

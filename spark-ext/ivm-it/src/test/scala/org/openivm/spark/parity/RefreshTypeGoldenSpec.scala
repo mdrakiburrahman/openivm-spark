@@ -18,7 +18,7 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
   private var sharedCompiler: OpenIvmCompiler = _
 
   private val goldenHashes: Map[String, String] = Map(
-    "aggregate-group"   -> "fdc37fe948e9418ffd03051eedef9430c18ba1533d8284cef75de18cf665ef82",
+    "aggregate-group"   -> "e97c15c65f33f3b86e639730168329f6fc8ea70e8f5e14e7680c538a67bb1ffe",
     "simple-aggregate"  -> "108481a860d35483f049c32b210763003138a219cf84514873ce7c49f65a61ae",
     "simple-projection" -> "2a64a3ec7ef8bee115b0a5eff4bd8e35381681d745b351a34ea2e26cbcb633bc",
     "window-partition"  -> "7f04c471446e1e80d0936487d82b9ab948a7659f00cf16be9890dc99da95e88d",

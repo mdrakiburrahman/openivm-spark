@@ -177,7 +177,7 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
   // Test 3 — OVERWRITE with dependent MV
   // -------------------------------------------------------------------------
   describe("Test 3: OVERWRITE with dependent MV") {
-    it("writes a staging OVERWRITE entry and replaces the base table contents") {
+    it("stages replaced rows as DELETE and replacement rows as OVERWRITE") {
       val tbl = "overwrite_base"
       val qn  = createBaseWithMv(tbl)
       spark.sql(s"INSERT INTO $tbl VALUES (1, 'old')")
@@ -185,12 +185,25 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       spark.sql(s"INSERT OVERWRITE $tbl VALUES (2, 'new')")
 
       val rows = spark.sql(s"SELECT * FROM $tbl").collect()
-      rows.map(_.getAs[Int]("id")) should contain(2)
+      rows.map(_.getAs[Int]("id")) should contain only (2)
 
       val staged = stagingRows(qn)
-      // One OVERWRITE entry (from the INSERT OVERWRITE); the initial INSERT also
-      // produced a staging entry so filter by OVERWRITE.
+      // The initial INSERT also produced a staging entry. The overwrite itself
+      // must contribute both halves of the signed replacement delta.
       staged.filter(_.opType == "OVERWRITE") should have size 1
+      staged.filter(_.opType == "DELETE") should have size 1
+
+      val deletedRows = spark.read
+        .format("delta")
+        .load(staged.filter(_.opType == "DELETE").head.stagingPath)
+        .collect()
+      deletedRows.map(_.getAs[Int]("id")) should contain only (1)
+
+      val replacementRows = spark.read
+        .format("delta")
+        .load(staged.filter(_.opType == "OVERWRITE").head.stagingPath)
+        .collect()
+      replacementRows.map(_.getAs[Int]("id")) should contain only (2)
     }
   }
 

@@ -1839,4 +1839,103 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
     }
   }
+
+  describe("regular N-term old-state snapshots") {
+    val canonical =
+      """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+        |),
+        |t1_projection (t1_id, t1_value, t1_mul) AS (
+        |  SELECT t0_id, t0_value, 1 FROM t0_scan
+        |),
+        |t2_scan (t2_id, t2_value, t2_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+        |),
+        |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+        |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+        |),
+        |t4_filter (t4_id, t4_value, t4_mul) AS (
+        |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+        |),
+        |t5_projection (t5_id, t5_value, t5_mul) AS (
+        |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+        |),
+        |t6_projection (t6_id, t6_value, t6_mul) AS (
+        |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+        |),
+        |t7_union (t7_id, t7_value, t7_mul) AS (
+        |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+        |)
+        |INSERT INTO openivm_delta_v SELECT * FROM t7_union""".stripMargin
+
+    it("replaces the canonical current-minus-delta arm with a pinned Delta snapshot") {
+      val rewritten = SparkRefreshRewriter.rewriteRegularOldStateUnions(canonical, Map("db.accounts" -> 17L))
+
+      rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
+      rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+    }
+
+    it("leaves non-canonical projection-wrapped source arms unchanged") {
+      val wrapped = canonical
+        .replace(
+          "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0_id, t0_value, 1 FROM t0_scan",
+          "t0_filter (t0f_id, t0f_value) AS (SELECT t0_id, t0_value FROM t0_scan WHERE t0_value > 0),\n" +
+            "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0f_id, t0f_value, 1 FROM t0_filter"
+        )
+
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(wrapped, Map("accounts" -> 17L)) shouldBe wrapped
+    }
+
+    it("prunes only the direct base side with bounded delta-key literals") {
+      val sql =
+        """CREATE OR REPLACE TABLE delta.`/tmp/openivm_delta_v`
+          |USING DELTA AS
+          |WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_projection (t1_account_id, t1_mul) AS (
+          |  SELECT t0_account_id, t0_mul FROM t0_delta
+          |),
+          |t2_snapshot (t2_account_id, t2_name, t2_mul) AS (
+          |  SELECT `account_id`, `name`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t3_join (t3_name, t3_mul) AS (
+          |  SELECT t2_name, t1_mul * t2_mul
+          |  FROM t1_projection
+          |  INNER JOIN t2_snapshot ON CAST(t1_account_id AS BIGINT) = t2_account_id
+          |)
+          |INSERT INTO openivm_delta_v SELECT * FROM t3_join""".stripMargin
+      val request = SparkRefreshRewriter.RegularNtermKeyRequest("orders", "t1_account_id", Some("BIGINT"))
+
+      SparkRefreshRewriter.regularNtermKeyRequests(sql) shouldBe Seq(request)
+      val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(sql, Map(request -> Seq("10", "20")))
+      rewritten should include("WHERE t2_account_id IN (10, 20)")
+      rewritten should include("FROM t1_projection")
+      rewritten should include("FROM `accounts` VERSION AS OF 17")
+    }
+
+    it("leaves the N-term SQL unchanged when no bounded key set is available") {
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(canonical, Map.empty) shouldBe canonical
+    }
+
+    it("does not derive literal-pruning requests from outer joins") {
+      val outerJoin =
+        """WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_snapshot (t1_account_id, t1_mul) AS (
+          |  SELECT `account_id`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t2_join (t2_account_id, t2_mul) AS (
+          |  SELECT t1_account_id, t0_mul * t1_mul
+          |  FROM t0_delta LEFT JOIN t1_snapshot ON t0_account_id = t1_account_id
+          |)
+          |SELECT * FROM t2_join""".stripMargin
+
+      SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
+    }
+  }
 }
