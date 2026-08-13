@@ -58,6 +58,7 @@ The Scala/sbt SessionExtension that wires OpenIVM into Spark.
 | 12  | [Parity gap forensics](architecture/openivm-spark/12-parity-gap-forensics.md)                                             | Contributor's guide to closing Spark↔DuckDB parity gaps                         |
 | 13  | [⭐ **End-to-end trace: `AggregateSumSpec`**](architecture/openivm-spark/13-end-to-end-trace-aggregatesumspec.md)         | The flagship demo — real, executed walkthrough of every `it(...)`               |
 | 14  | [TPC-DI deep dive: live warehouse state](architecture/openivm-spark/14-tpcdi-deep-dive-live-state.md)                     | Bronze → silver → gold cascade, decoded base64 dirs, real row data              |
+| 15  | [Cloud RocksDB state roadmap](architecture/openivm-spark/15-cloud-rocksdb-state-roadmap.md)                              | Sessions, sharding, Delta catalog authority, versioned checkpoint publication   |
 
 ---
 

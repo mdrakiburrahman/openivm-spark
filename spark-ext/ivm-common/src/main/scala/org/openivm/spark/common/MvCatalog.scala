@@ -404,28 +404,44 @@ object MvCatalog {
     }.toMap
 
   private def readMetadata(db: OpenIvmRocksDB): Option[MvMetadata] =
-    for {
-      serializedName          <- getUtf8(db, MetaCf, NameMetaKey)
-      querySql                <- getUtf8(db, MetaCf, QuerySqlMetaKey)
-      refreshType             <- getInt(db, MetaCf, RefreshTypeMetaKey)
-      refreshTypeName         <- getUtf8(db, MetaCf, RefreshTypeNameMetaKey)
-      lastVersion             <- getLong(db, MetaCf, LastVersionMetaKey)
-      sourceTablesEncoded     <- db.get(MetaCf, SourceTablesMetaKey)
-      sourceSchemaFingerprint <- getUtf8(db, MetaCf, SourceSchemaFingerprintMetaKey)
-      location                <- getUtf8(db, MetaCf, LocationMetaKey)
-      createdAtMillis         <- getLong(db, MetaCf, CreatedAtMetaKey)
-    } yield MvMetadata(
-      name = deserializeName(serializedName),
-      querySql = querySql,
-      refreshType = refreshType,
-      refreshTypeName = refreshTypeName,
-      lastVersion = lastVersion,
-      sourceTables = decodeSourceTables(sourceTablesEncoded),
-      sourceSchemaFingerprint = sourceSchemaFingerprint,
-      location = location,
-      createdAt = new Timestamp(createdAtMillis),
-      properties = readProperties(db)
-    )
+    db.withSession {
+      val keys = Seq(
+        NameMetaKey,
+        QuerySqlMetaKey,
+        RefreshTypeMetaKey,
+        RefreshTypeNameMetaKey,
+        LastVersionMetaKey,
+        SourceTablesMetaKey,
+        SourceSchemaFingerprintMetaKey,
+        LocationMetaKey,
+        CreatedAtMetaKey
+      )
+      val values                           = db.multiGet(MetaCf, keys)
+      def utf8(index: Int): Option[String] = values(index).map(RocksDBCodec.fromUtf8)
+
+      for {
+        serializedName          <- utf8(0)
+        querySql                <- utf8(1)
+        refreshType             <- utf8(2).flatMap(value => Try(value.toInt).toOption)
+        refreshTypeName         <- utf8(3)
+        lastVersion             <- utf8(4).flatMap(value => Try(value.toLong).toOption)
+        sourceTablesEncoded     <- values(5)
+        sourceSchemaFingerprint <- utf8(6)
+        location                <- utf8(7)
+        createdAtMillis         <- utf8(8).flatMap(value => Try(value.toLong).toOption)
+      } yield MvMetadata(
+        name = deserializeName(serializedName),
+        querySql = querySql,
+        refreshType = refreshType,
+        refreshTypeName = refreshTypeName,
+        lastVersion = lastVersion,
+        sourceTables = decodeSourceTables(sourceTablesEncoded),
+        sourceSchemaFingerprint = sourceSchemaFingerprint,
+        location = location,
+        createdAt = new Timestamp(createdAtMillis),
+        properties = readProperties(db)
+      )
+    }
 
   private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
     openExistingPerMvDbAt(spark, path).flatMap(readMetadata)

@@ -479,8 +479,33 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
+  /** Keep this database's native handle open for one short, logical catalog
+    * operation. Nested reads, scans, and batches reuse the handle and the
+    * cross-process lock instead of reopening RocksDB for every key.
+    *
+    * Callers must not run Spark jobs or acquire sessions for other databases
+    * inside this scope. A session deliberately serializes access to this one
+    * RocksDB shard in multi-process mode.
+    */
+  def withSession[A](body: => A): A = withNativeHandle("session")(body)
+
   def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle("get") {
     Option(dbHandle.get(cf(columnFamily), key))
+  }
+
+  /** Fetch several keys from one column family under one native-handle scope.
+    * The result preserves input order and represents missing keys as `None`.
+    */
+  def multiGet(columnFamily: String, keys: Seq[Array[Byte]]): Seq[Option[Array[Byte]]] = {
+    if (keys.isEmpty) return Seq.empty
+    withNativeHandle("multi_get") {
+      val handles = java.util.Collections.nCopies(keys.size, cf(columnFamily))
+      dbHandle
+        .multiGetAsList(handles, keys.map(_.clone()).asJava)
+        .asScala
+        .map(value => Option(value))
+        .toVector
+    }
   }
 
   /** Returns a snapshot iterator of `(key,value)` pairs for the prefix.

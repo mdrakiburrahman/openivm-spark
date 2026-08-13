@@ -338,6 +338,46 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("reuses one native open and close for a multi-process catalog session") {
+      val root = newDbDir("catalog-session")
+      val dir  = new File(root, "_openivm/mvs/test/rocksdb")
+      val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        db.withBatch { batch =>
+          db.put(batch, "meta", RocksDBCodec.utf8("one"), RocksDBCodec.utf8("1"))
+          db.put(batch, "meta", RocksDBCodec.utf8("two"), RocksDBCodec.utf8("2"))
+        }
+
+        val telemetry = OpenIvmRocksDBTelemetry.start()
+        val values = db.withSession {
+          val first = db.multiGet(
+            "meta",
+            Seq(RocksDBCodec.utf8("one"), RocksDBCodec.utf8("missing"), RocksDBCodec.utf8("two"))
+          )
+          db.get("meta", RocksDBCodec.utf8("one")) shouldBe defined
+          first
+        }
+        val summaries = telemetry.finish()
+
+        values.map(_.map(RocksDBCodec.fromUtf8)) shouldBe Seq(Some("1"), None, Some("2"))
+        val session = summaries.find(_.operation == "session").getOrElse(fail("missing session telemetry"))
+        session.operationCount shouldBe 1L
+        session.nativeOpenNanos should be > 0L
+        session.nativeCloseNanos should be > 0L
+
+        val nested = summaries.filter(summary => summary.operation == "get" || summary.operation == "multi_get")
+        nested.map(_.operation).toSet shouldBe Set("get", "multi_get")
+        nested.map(_.nativeOpenNanos).sum shouldBe 0L
+        nested.map(_.nativeCloseNanos).sum shouldBe 0L
+        nested.map(_.externalLockWaitNanos).sum shouldBe 0L
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(root)
+      }
+    }
+
     it("allows reentrant catalog ops within withBatch under multiProcess=true") {
       val dir  = newDbDir("mp-reentrant")
       val conf = OpenIvmRocksDBConf.default.copy(multiProcess = true, lockTimeoutMs = 60000L)
