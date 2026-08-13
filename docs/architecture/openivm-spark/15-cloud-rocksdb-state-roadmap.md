@@ -162,6 +162,63 @@ The dispatcher can run CTAS jobs concurrently only when their output locations
 are independent. Operations targeting the same MV still require explicit
 serialization or transactional conflict handling.
 
+### Adaptive admission policy
+
+Do not configure one CTAS thread or one fixed concurrency value per machine.
+Queue every request and let one Spark application admit work through a bounded
+executor. The bound changes at runtime.
+
+Spark already performs hardware-aware task scheduling. An admitted CTAS can
+expose every runnable partition without reserving a fixed core count for that
+query. FAIR scheduler pools divide available task slots across active CTAS jobs.
+The dispatcher controls query-level pressure that Spark's task scheduler does
+not bound, including driver memory, concurrent planning, output commits, and
+storage bandwidth.
+
+Use this feedback loop:
+
+1. Start with one admitted CTAS when no workload history exists.
+2. Track executor cores, active and pending tasks, JVM heap and GC pressure,
+   spill bytes, input throughput, output throughput, and Delta commit latency.
+3. Increase the admission limit while completed CTAS throughput improves and
+   normalized service-time inflation remains low.
+4. Reduce the limit when throughput stops improving, service time inflates,
+   spill or GC rises, or Delta commit conflicts occur.
+5. Cache the learned limit by query-shape and storage endpoint. Re-probe after
+   executor capacity, workload shape, or storage behavior changes.
+
+The control signals use ratios against the workload's own recent baseline, not
+machine-specific core counts or bandwidth constants. Executor changes and cloud
+autoscaling therefore cause the controller to converge on a new limit.
+
+A ten-job width sweep demonstrates why the limit cannot be fixed:
+
+| Maximum active CTAS | Batch wall | Median CTAS critical path |
+|---:|---:|---:|
+| 1 | 20.10 s | 1.48 s |
+| 2 | 14.09 s | 1.76 s |
+| 4 | 11.11 s | 2.18 s |
+| 8 | 11.09 s | 7.51 s |
+| 10 | 10.07 s | 8.41 s |
+
+Four active jobs are near the throughput knee on the measured host. Ten active
+jobs minimize this finite batch's makespan but increase individual CTAS latency.
+The controller must optimize an explicit objective such as throughput, latency,
+or a weighted combination.
+
+Concurrency does not reduce or increase the logical output required by CTAS.
+Each independent materialized view still writes its own Delta table. In the
+width sweep, every configuration produced 170 Parquet files and approximately
+164 MB across the source and ten views. Higher concurrency changes when those
+bytes are written, not how many bytes or files are produced.
+
+Spark does not fuse independent CTAS statements or share their scans by default.
+Ten views over the same source perform ten logical reads and ten required output
+writes. The operating-system and storage caches can reduce physical source reads.
+Explicit source caching or multi-query optimization can remove repeated reads,
+but it is a separate optimization and must account for cache capacity and query
+snapshot consistency.
+
 ## Verification
 
 All phases and telemetry are maintained on one issue branch. The multi-driver
