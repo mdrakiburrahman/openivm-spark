@@ -12,6 +12,9 @@ import scala.collection.JavaConverters._
 /** Delta-backed authoritative MV catalog for multi-driver deployments. */
 private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with DeltaRetrySupport {
 
+  override def withDeltaRetry[T](operation: => T): T =
+    RetryPolicy.DeltaCatalogConflicts.execute(operation)
+
   private val Name                    = "name"
   private val QuerySql                = "query_sql"
   private val RefreshType             = "refresh_type"
