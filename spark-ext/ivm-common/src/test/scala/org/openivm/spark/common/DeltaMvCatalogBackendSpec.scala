@@ -126,7 +126,10 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
           MvCatalog.updateProperties(spark.newSession(), entry.name, Map("revision" -> index.toString))
         )
       }
-      Await.result(Future.sequence(Seq(advances, propertyUpdates)), 2.minutes)
+      // A full parallel Spark test run can saturate a small executor for well
+      // over two minutes even though this race completes in under a minute in
+      // isolation. Keep the assertion bounded without making it load-flaky.
+      Await.result(Future.sequence(Seq(advances, propertyUpdates)), 5.minutes)
 
       val updated = MvCatalog.lookup(spark, entry.name).get
       updated.lastVersion shouldBe 20L
