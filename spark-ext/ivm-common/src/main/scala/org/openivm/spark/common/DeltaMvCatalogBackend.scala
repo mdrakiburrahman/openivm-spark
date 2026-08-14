@@ -3,7 +3,7 @@ package org.openivm.spark.common
 import io.delta.tables.DeltaTable
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.functions.{array_contains, col, lit, typedLit}
+import org.apache.spark.sql.functions.{array_contains, col, lit}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SparkSession}
 
@@ -139,9 +139,23 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       properties: Map[String, String]
   ): Unit = withDeltaRetry {
     ensureTables(spark)
+    val updateSchema = StructType(
+      Seq(
+        StructField(Name, StringType, nullable = false),
+        StructField(Properties, MapType(StringType, StringType, valueContainsNull = false), nullable = false)
+      )
+    )
+    val incoming = spark.createDataFrame(
+      spark.sparkContext.parallelize(Seq(Row(serializedName(name), properties)), 1),
+      updateSchema
+    )
     DeltaTable
       .forPath(spark, path(spark))
-      .update(col(Name) === lit(serializedName(name)), Map(Properties -> typedLit(properties)))
+      .as("target")
+      .merge(incoming.as("incoming"), col(s"target.$Name") === col(s"incoming.$Name"))
+      .whenMatched()
+      .update(Map(Properties -> col(s"incoming.$Properties")))
+      .execute()
   }
 
   override def remove(spark: SparkSession, name: TableIdentifier): Unit = withDeltaRetry {

@@ -179,6 +179,9 @@ catalog write, so a profile does not measure its own persistence.
 bar per `refresh_id`, from start to end, to compare overlap between an A baseline
 and a B run. A failure before the normal end marker is recorded as
 `outcome=failed_before_end`, and the thread-local collector is still detached.
+Export profile rows as JSON or JSON Lines and run
+`python3 tools/openivm_trace.py spans.jsonl openivm-trace.json`; load the result
+in Chrome tracing or Perfetto to inspect overlap visually.
 
 The profile complements Spark event metrics. Use event metrics for records,
 files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.

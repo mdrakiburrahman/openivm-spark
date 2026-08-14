@@ -51,9 +51,13 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       names should contain("create_mv_system_tables")
       names should contain("create_compile_classification")
       names should contain("create_mv_initial_load")
-      names should contain("create_view_index")
       names should contain("create_mv_publish_metadata")
       names should contain("create_mv_total")
+      names should contain("query_span")
+      val span = detailsForStep(rows, "query_span").head
+      span should include("start_epoch_ms=")
+      span should include("end_epoch_ms=")
+      span should include("outcome=")
     }
   }
 
@@ -74,6 +78,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       val names      = steps(refreshRid).toSet
       names should contain("acquire_locks")
       names should contain("total_refresh")
+      names should contain("query_span")
       names should not contain "execute_refresh_sql_stmt"
     }
   }

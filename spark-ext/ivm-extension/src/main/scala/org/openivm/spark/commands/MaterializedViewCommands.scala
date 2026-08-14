@@ -799,6 +799,7 @@ case class CreateMaterializedViewCommand(
     val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
     val sqlLog =
       RefreshSqlLog.start(spark, profile.refreshId, metaName(name), RefreshSqlLog.ModeCreate)
+    var createOutcome = "create_failed"
     // Record the user-supplied CREATE-MV body up front. Not executed by us
     // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
     // because it's the verbatim user query.
@@ -813,10 +814,12 @@ case class CreateMaterializedViewCommand(
     try {
       val rows = runCreate(spark, profile, sqlLog)
       OpenIvmStateSync.backupAsync(spark)
+      createOutcome = "create_executed"
       rows
     } finally {
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
+      profile.completeSpan(createOutcome, Thread.currentThread().getName)
       profile.flush()
       sqlLog.flush()
     }

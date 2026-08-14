@@ -113,6 +113,26 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       entries.foreach(entry => MvCatalog.lookup(spark, entry.name) shouldBe Some(entry))
     }
 
+    it("does not regress lastVersion while properties are updated concurrently") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val entry = metadata("db.mv_property_race", "db.source_property_race")
+      MvCatalog.upsert(spark, entry)
+
+      val advances = Future {
+        (2L to 20L).foreach(version => MvCatalog.advance(spark.newSession(), entry.name, version))
+      }
+      val propertyUpdates = Future {
+        (1 to 20).foreach(index =>
+          MvCatalog.updateProperties(spark.newSession(), entry.name, Map("revision" -> index.toString))
+        )
+      }
+      Await.result(Future.sequence(Seq(advances, propertyUpdates)), 2.minutes)
+
+      val updated = MvCatalog.lookup(spark, entry.name).get
+      updated.lastVersion shouldBe 20L
+      updated.properties.keySet shouldBe Set("revision")
+    }
+
     it("partitions each Delta catalog by its independent write key") {
       def partitionColumns(relativePath: String): Seq[String] =
         DeltaTable
