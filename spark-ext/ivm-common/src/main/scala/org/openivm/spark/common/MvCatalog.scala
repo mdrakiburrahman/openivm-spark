@@ -557,9 +557,11 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
   }
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
-    dependentViewNames(spark, table).flatMap { serializedName =>
-      readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
-    }.filter(_.sourceTables.contains(table))
+    dependentViewNames(spark, table)
+      .flatMap { serializedName =>
+        readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
+      }
+      .filter(_.sourceTables.contains(table))
   }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {

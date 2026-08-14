@@ -115,7 +115,7 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
     it("does not regress lastVersion while properties are updated concurrently") {
       implicit val executionContext: ExecutionContext = ExecutionContext.global
-      val entry = metadata("db.mv_property_race", "db.source_property_race")
+      val entry                                       = metadata("db.mv_property_race", "db.source_property_race")
       MvCatalog.upsert(spark, entry)
 
       val advances = Future {

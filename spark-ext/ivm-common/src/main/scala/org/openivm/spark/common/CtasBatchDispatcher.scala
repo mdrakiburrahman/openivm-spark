@@ -144,13 +144,12 @@ object CtasBatchDispatcher {
           sc.setLocalProperty(SchedulerPoolKey, s"$poolPrefix-${task.id}")
           sc.setLocalProperty(JobDescriptionKey, s"OpenIVM CTAS ${task.id}")
           var failure: Throwable = null
-          var value: Option[T]    = None
+          var value: Option[T]   = None
           try value = Some(task.run())
           catch {
             case error: OutOfMemoryError => failure = error
             case NonFatal(error)         => failure = error
-          }
-          finally {
+          } finally {
             sc.setLocalProperty(SchedulerPoolKey, previousPool)
             sc.setLocalProperty(JobDescriptionKey, previousDescription)
             inflight.decrementAndGet()
@@ -189,10 +188,10 @@ object CtasBatchDispatcher {
         if (!executor.awaitTermination(1, TimeUnit.MINUTES)) executor.shutdownNow()
       }
 
-    val failures = outcomes.zip(tasks).flatMap { case (outcome, task) => outcome.failure.map(task.id -> _) }
-    val batchDuration              = System.nanoTime() - batchStart
-    val capacityDrop               = outcomes.exists(_.span.capacityDrop)
-    val (limitBefore, limitAfter)  = controller.completeBatch(tasks.size, capacityDrop)
+    val failures      = outcomes.zip(tasks).flatMap { case (outcome, task) => outcome.failure.map(task.id -> _) }
+    val batchDuration = System.nanoTime() - batchStart
+    val capacityDrop  = outcomes.exists(_.span.capacityDrop)
+    val (limitBefore, limitAfter) = controller.completeBatch(tasks.size, capacityDrop)
     val telemetry = CtasBatchTelemetry(
       schedulerMode = schedulerMode,
       limitBefore = limitBefore,

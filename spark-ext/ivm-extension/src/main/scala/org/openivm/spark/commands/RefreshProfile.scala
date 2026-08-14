@@ -35,8 +35,8 @@ final class RefreshProfile private (
     private val spanStartNanos: Long
 ) {
 
-  private val stepOrder = new AtomicInteger(0)
-  private val buffer    = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
+  private val stepOrder     = new AtomicInteger(0)
+  private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
   private var spanCompleted = false
 
   /** True when this profile is wired to a real RocksDB sink. False instances
@@ -100,20 +100,20 @@ final class RefreshProfile private (
         appendStep(
           stepName = "rocksdb_operation",
           detail = Seq(
-          s"db_scope=${summary.dbScope}",
-          s"operation=${summary.operation}",
-          s"multi_process=${summary.multiProcess}",
-          s"operation_count=${summary.operationCount}",
-          s"failed_count=${summary.failedCount}",
-          s"total_ns=${summary.totalNanos}",
-          s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
-          s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
-          s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
-          s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
-          s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
-          s"native_open_ns=${summary.nativeOpenNanos}",
-          s"native_close_ns=${summary.nativeCloseNanos}",
-          s"body_ns=${summary.bodyNanos}"
+            s"db_scope=${summary.dbScope}",
+            s"operation=${summary.operation}",
+            s"multi_process=${summary.multiProcess}",
+            s"operation_count=${summary.operationCount}",
+            s"failed_count=${summary.failedCount}",
+            s"total_ns=${summary.totalNanos}",
+            s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
+            s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
+            s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
+            s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
+            s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
+            s"native_open_ns=${summary.nativeOpenNanos}",
+            s"native_close_ns=${summary.nativeCloseNanos}",
+            s"body_ns=${summary.bodyNanos}"
           ).mkString(";"),
           durationMs = summary.totalNanos / 1000000L
         )

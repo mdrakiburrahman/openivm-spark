@@ -1310,7 +1310,7 @@ case class RefreshMaterializedViewCommand(
     val lockT0 = System.nanoTime()
     try {
       val rows = RefreshMutex.withLock(metaName(name)) {
-        val cloned = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
+        val cloned    = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         // Clone the SparkSession so every refresh gets its own temp-view namespace.
         runUnderLock(cloned, lockAcqMs)
@@ -4076,58 +4076,58 @@ case class RefreshMaterializedViewCommand(
       propagation.pruneConsumed(spark, viewsByTable)
 
       if (!meta.emitsCascadeViewDelta) {
-      val upstreamShortName = name.identifier
-      val downstreamSourceKeys = allMvs
-        .filterNot(m => metaName(m.name) == viewNameStr)
-        .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
-        .distinct
+        val upstreamShortName = name.identifier
+        val downstreamSourceKeys = allMvs
+          .filterNot(m => metaName(m.name) == viewNameStr)
+          .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
+          .distinct
 
-      if (downstreamSourceKeys.nonEmpty) {
-        val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-        val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
-        val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
-        // The actual write goes through the DataFrame API (Delta needs the
-        // `.write.format("delta")…save(triggerPath)` shape, not `spark.sql`).
-        // Synthesize an INSERT OVERWRITE representation so the query log
-        // captures the user-readable intent.
-        val syntheticSql =
-          s"-- synthetic representation of postRefreshCleanup trigger write\n" +
-            s"INSERT OVERWRITE delta.`$triggerPath`\n" +
-            s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0"
-        val t0 = System.nanoTime()
-        try {
-          spark
-            .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
-            .write
-            .format("delta")
-            .mode("overwrite")
-            .save(triggerPath)
-        } finally {
-          val ms = (System.nanoTime() - t0) / 1000000L
-          sqlLog.record(
-            category = "post_cleanup_stage",
-            stmtOrder = qlogOrder.getAndIncrement(),
-            attemptIdx = 0,
-            stmtKind = "insert_overwrite",
-            sql = syntheticSql,
-            durationMs = ms
-          )
-        }
-
-        val txnTs = new Timestamp(System.currentTimeMillis())
-        downstreamSourceKeys.foreach { sourceKey =>
-          StagingCatalog.record(
-            spark,
-            StagingDelta(
-              baseTable = sourceKey,
-              opType = StagingDelta.OpTypes.Overwrite,
-              stagingPath = triggerPath,
-              txnTs = txnTs,
-              consumedBy = Seq.empty
+        if (downstreamSourceKeys.nonEmpty) {
+          val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+          val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
+          val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
+          // The actual write goes through the DataFrame API (Delta needs the
+          // `.write.format("delta")…save(triggerPath)` shape, not `spark.sql`).
+          // Synthesize an INSERT OVERWRITE representation so the query log
+          // captures the user-readable intent.
+          val syntheticSql =
+            s"-- synthetic representation of postRefreshCleanup trigger write\n" +
+              s"INSERT OVERWRITE delta.`$triggerPath`\n" +
+              s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0"
+          val t0 = System.nanoTime()
+          try {
+            spark
+              .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
+              .write
+              .format("delta")
+              .mode("overwrite")
+              .save(triggerPath)
+          } finally {
+            val ms = (System.nanoTime() - t0) / 1000000L
+            sqlLog.record(
+              category = "post_cleanup_stage",
+              stmtOrder = qlogOrder.getAndIncrement(),
+              attemptIdx = 0,
+              stmtKind = "insert_overwrite",
+              sql = syntheticSql,
+              durationMs = ms
             )
-          )
+          }
+
+          val txnTs = new Timestamp(System.currentTimeMillis())
+          downstreamSourceKeys.foreach { sourceKey =>
+            StagingCatalog.record(
+              spark,
+              StagingDelta(
+                baseTable = sourceKey,
+                opType = StagingDelta.OpTypes.Overwrite,
+                stagingPath = triggerPath,
+                txnTs = txnTs,
+                consumedBy = Seq.empty
+              )
+            )
+          }
         }
-      }
       }
     }
   }
