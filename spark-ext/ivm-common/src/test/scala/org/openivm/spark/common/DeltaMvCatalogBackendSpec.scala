@@ -101,39 +101,6 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       CdfWatermarkCatalog.get(spark, "db.mv_orders", "db.orders") shouldBe None
     }
 
-    it("persists PREPARED to DATA_COMMITTED to COMMITTED refresh transitions") {
-      val refreshId = "refresh-protocol-1"
-      RefreshTransactionCatalog.prepare(
-        spark,
-        refreshId,
-        "db.mv_orders",
-        s"$root/data/db.mv_orders",
-        30L,
-        Map("db.orders" -> 8L)
-      )
-      RefreshTransactionCatalog.lookup(spark, refreshId).map(_.state) shouldBe Some(RefreshTransactionState.Prepared)
-
-      RefreshTransactionCatalog.markDataCommitted(spark, refreshId, 31L)
-      val dataCommitted = RefreshTransactionCatalog.lookup(spark, refreshId).get
-      dataCommitted.state shouldBe RefreshTransactionState.DataCommitted
-      dataCommitted.dataVersion shouldBe Some(31L)
-      RefreshTransactionCatalog.incompleteForView(spark, "db.mv_orders").map(_.refreshId) should contain(refreshId)
-
-      RefreshTransactionCatalog.commit(spark, refreshId)
-      RefreshTransactionCatalog.lookup(spark, refreshId).map(_.state) shouldBe Some(RefreshTransactionState.Committed)
-      RefreshTransactionCatalog.incompleteForView(spark, "db.mv_orders") shouldBe empty
-    }
-
-    it("excludes a second distributed refresh owner") {
-      RefreshLeaseCatalog.withLease(spark, "db.mv_lease") { lease =>
-        lease.assertOwned()
-        intercept[IllegalStateException] {
-          RefreshLeaseCatalog.withLease(spark.newSession(), "db.mv_lease")(_ => ())
-        }.getMessage should include("already being refreshed")
-      }
-      RefreshLeaseCatalog.withLease(spark.newSession(), "db.mv_lease")(_.assertOwned())
-    }
-
     it("commits independent MV metadata upserts concurrently") {
       implicit val executionContext: ExecutionContext = ExecutionContext.global
       val entries = (1 to 8).map(index => metadata(s"db.mv_parallel_$index", s"db.source_$index"))
@@ -157,8 +124,6 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
       partitionColumns("mv_metadata") shouldBe Seq("name")
       partitionColumns("cdf_watermarks") shouldBe Seq("view_name")
-      partitionColumns("refresh_transactions") shouldBe Seq("view_name")
-      partitionColumns("refresh_leases") shouldBe Seq("view_name")
     }
   }
 }

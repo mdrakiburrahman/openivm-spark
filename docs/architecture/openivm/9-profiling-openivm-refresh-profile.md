@@ -18,6 +18,8 @@ a dedicated RocksDB catalog and exposes it through SQL.
 - Set `spark.openivm.profile.refresh=true` to capture Spark CREATE and REFRESH steps.
 - Query Spark profiles with `SHOW OPENIVM REFRESH PROFILE`.
 - Spark profiles include aggregated `rocksdb_operation` contention rows.
+- Spark profiles include one `query_span` row with start/end epoch milliseconds,
+  thread name, outcome, and duration for trace/Gantt views.
 - Spark also emits `[openivm-mv]` log lines and normal Spark SQL/job metrics.
 - The requested structured tokens such as `compile_start`, `collect_staging_end`, and `stmt_duration_ms` are not emitted in this checkout.
 - Use the actual `[openivm-mv]` prefix and the helper below.
@@ -171,6 +173,12 @@ lock waits, external lock waits, native open/close, and the operation body.
 The collector is thread-local. Concurrent materialized views cannot mix their
 metrics through process-global counters. Collection stops before the profile
 catalog write, so a profile does not measure its own persistence.
+
+`query_span.detail` has the stable shape
+`start_epoch_ms=...;end_epoch_ms=...;thread=...;outcome=...`. Plot one horizontal
+bar per `refresh_id`, from start to end, to compare overlap between an A baseline
+and a B run. A failure before the normal end marker is recorded as
+`outcome=failed_before_end`, and the thread-local collector is still detached.
 
 The profile complements Spark event metrics. Use event metrics for records,
 files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.

@@ -829,7 +829,6 @@ case class CreateMaterializedViewCommand(
   ): Seq[Row] = {
     import MvCommandHelper._
 
-    FeatureGate.validateCatalogChangeFeedCompatibility(spark)
     val propagation = ChangePropagationFactory.forSession(spark)
 
     profile.timeStep("create_mv_system_tables", "scope=mv_and_staging") {
@@ -1274,16 +1273,13 @@ case class CreateMaterializedViewCommand(
         }
       }
 
-      profile.timeStep("create_view_index", s"sources=${meta.sourceTables.size}") {
-        // Write metadata catalog entry
-        MvCatalog.upsert(spark, meta)
-      }
-
-      profile.timeStep("create_mv_publish_metadata", "phase=advance_version") {
-        // Record the Delta version of the initial snapshot
+      profile.timeStep("create_mv_publish_metadata", s"sources=${meta.sourceTables.size}") {
+        // Publish complete metadata only after CTAS (and the optional HAVING
+        // view) succeeded. A failed catalog write is safely retryable because
+        // CREATE TABLE IF NOT EXISTS reuses the completed Delta table.
         val version =
           DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
-        MvCatalog.advance(spark, name, version)
+        MvCatalog.upsert(spark, meta.copy(lastVersion = version))
       }
     } finally {
       IvmDmlInterceptorRule.bypass.set(false)
@@ -1312,12 +1308,9 @@ case class RefreshMaterializedViewCommand(
     try {
       val rows = RefreshMutex.withLock(metaName(name)) {
         val cloned = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
-        RefreshLeaseCatalog.withLease(cloned, metaName(name)) { _ =>
-          RefreshTransactionCatalog.recoverIncomplete(cloned, metaName(name))
-          val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-          // Clone the SparkSession so every refresh gets its own temp-view namespace.
-          runUnderLock(cloned, lockAcqMs)
-        }
+        val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
+        // Clone the SparkSession so every refresh gets its own temp-view namespace.
+        runUnderLock(cloned, lockAcqMs)
       }
       OpenIvmStateSync.backupAsync(spark)
       rows
@@ -1481,7 +1474,6 @@ case class RefreshMaterializedViewCommand(
 
     val viewNameStr      = metaName(name)
     val propagation      = ChangePropagationFactory.forSession(spark)
-    FeatureGate.validateCatalogChangeFeedCompatibility(spark)
     val sourceWatermarks = meta.changeWatermarks
 
     // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
@@ -1574,26 +1566,9 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
-    RefreshLeaseCatalog.assertActive()
-    val startDataVersion =
-      DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
-    val sourceVersions = cdfChangeBatches
-      .groupBy(_.baseTable)
-      .map { case (source, batches) => source -> batches.map(_.endVersionInclusive).max }
-    RefreshTransactionCatalog.prepare(
-      spark,
-      refreshId,
-      viewNameStr,
-      meta.location,
-      startDataVersion,
-      sourceVersions
-    )
-
     def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
-      RefreshLeaseCatalog.assertActive()
       val dataVersion =
         DeltaTable.forPath(spark, cleanupMeta.location).history(1).collect().head.getAs[Long]("version")
-      RefreshTransactionCatalog.markDataCommitted(spark, refreshId, dataVersion)
       postRefreshCleanup(
         spark,
         name,
@@ -1604,8 +1579,6 @@ case class RefreshMaterializedViewCommand(
         qlogOrder,
         Some(dataVersion)
       )
-      RefreshTransactionCatalog.commit(spark, refreshId)
-      RefreshLeaseCatalog.assertActive()
     }
 
     // Once we know we'll be doing real work, record the user-supplied CREATE-MV
@@ -1819,7 +1792,6 @@ case class RefreshMaterializedViewCommand(
       var stmtCounter = 0
       try {
         assembled.statements.foreach { sql =>
-          RefreshLeaseCatalog.assertActive()
           val kind     = RefreshPerf.classify(sql, "")
           val sqlBytes = sql.length
           val qOrder   = qlogOrder.getAndIncrement()
@@ -2135,9 +2107,7 @@ case class RefreshMaterializedViewCommand(
           )
           val unchangedVersion =
             DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
-          RefreshTransactionCatalog.markDataCommitted(spark, refreshId, unchangedVersion)
           consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
-          RefreshTransactionCatalog.commit(spark, refreshId)
           emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
           return Seq.empty
         }
@@ -2368,7 +2338,6 @@ case class RefreshMaterializedViewCommand(
           }
         }
         def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
-          RefreshLeaseCatalog.assertActive()
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
           val sqlBytes = sql.length
@@ -2969,7 +2938,6 @@ case class RefreshMaterializedViewCommand(
               s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
             ) {
               RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
-                RefreshLeaseCatalog.assertActive()
                 RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                   val t0 = System.nanoTime()
                   try {

@@ -58,9 +58,9 @@ short dependency-index update.
 
 Introduce a catalog-backend interface with local RocksDB compatibility and a
 Delta implementation for cloud deployments. Delta owns MV definitions,
-dependencies, watermarks, and refresh transaction state. Refreshes use an
-idempotent `PREPARED -> DATA_COMMITTED -> COMMITTED` protocol so recovery can
-reconcile a driver failure between the data and catalog commits.
+dependencies, and watermarks. CREATE publishes one complete metadata row only
+after the initial CTAS succeeds; a failed publication is safely retryable
+because the completed Delta table is reused.
 
 Select it with:
 
@@ -69,12 +69,10 @@ spark.openivm.catalog.backend=delta
 spark.openivm.catalog.path=abfss://container@account/path/openivm-catalog
 ```
 
-The path contains separate Delta tables for MV metadata, CDF watermarks, and
-refresh transactions. The default remains `rocksdb` for local compatibility.
-With the Delta backend enabled, a real refresh creates `PREPARED` before data
-execution, records the observed MV Delta version as `DATA_COMMITTED`, advances
-metadata and watermarks, and publishes `COMMITTED` last. Incomplete rows remain
-queryable through `RefreshTransactionCatalog.incompleteForView` for recovery.
+The path contains separate Delta tables for MV metadata and CDF watermarks. The
+default remains `rocksdb` for local compatibility. Analytical refreshes retain
+their existing retry semantics rather than adding a distributed transaction
+coordinator around every multi-statement refresh.
 
 ## Phase 5: versioned checkpoint publication (planned)
 
@@ -217,23 +215,20 @@ roughly twice the 10.07-second all-at-once result. No feedback controller can
 infer an unseen machine's optimum before receiving samples. The cold-start
 choice must therefore express the objective: optimize finite-batch makespan by
 starting wide, or protect interactive tail latency by starting conservatively.
-OpenIVM's CTAS batch path uses the former. Benchmark reports must label cold and
-learned runs separately so persisted controller state cannot silently improve a
-reported result.
+The dispatcher utility uses the former. OpenIVM-Spark itself owns one CREATE
+command at a time; the HTTP or benchmark ingress that owns the batch must call
+the utility. Benchmark reports must label cold and learned runs separately.
 
-This does not require a Spark query cost model. A reusable implementation can
-take the concurrency-window algorithm from Netflix `concurrency-limits` and add
-a small OpenIVM adapter for FAIR-pool assignment, observation-only sampling,
-persisted limits, and pressure signals. Latency-only samples should be normalized
-by query-shape history because CTAS jobs are heterogeneous. Before such history
-exists, loss-based AIMD driven by spill, GC, commit conflicts, and failures is a
-safer guardrail than treating a naturally long CTAS as congestion.
+This does not require a Spark query cost model. The utility uses a small
+batch-boundary AIMD controller plus FAIR-pool assignment. Ordinary SQL failures
+are reported without reducing admission; only capacity-classified failures such
+as executor loss, OOM, throttling, or disk exhaustion back off the next batch.
 
-The first dispatcher prototype reuses Netflix `concurrency-limits` for batch-level
-AIMD. It submits the complete cold batch into distinct Spark FAIR pools. One
-failed batch halves the next admission window. One successful recovery batch
-increases the window by one. The controller samples once per batch so successful
-requests cannot erase a failure signal from the same batch.
+The dispatcher submits the complete cold batch into distinct Spark FAIR pools.
+One capacity-constrained batch halves the next admission window. One successful
+recovery batch increases the window by one. Each task emits submitted/start/end
+timestamps, queue delay, thread, outcome, and observed in-flight concurrency for
+an A/B trace view.
 
 A clean deployed comparison used ten CTAS jobs over a one-million-row source:
 
@@ -246,10 +241,9 @@ Both runs produced ten materialized views with exactly 1,000,000 rows each. The
 0.029-second difference is benchmark noise. Optimistic admission therefore
 avoids the first-batch penalty without adding measurable dispatcher overhead.
 
-The prototype treats task failure as the only pressure signal. Spill, GC, heap,
-and Delta commit pressure remain planned inputs. Learned-window persistence also
-remains planned. Until those inputs exist, the controller is a failure guardrail,
-not a complete saturation detector.
+Spill, GC, heap, and Delta commit pressure remain planned inputs. Learned-window
+persistence also remains planned. Until those inputs exist, the controller is a
+capacity-failure guardrail, not a complete saturation detector.
 
 Concurrency does not reduce or increase the logical output required by CTAS.
 Each independent materialized view still writes its own Delta table. In the

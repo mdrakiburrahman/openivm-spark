@@ -414,15 +414,6 @@ object FeatureGate {
 
   def deltaCatalogEnabled(spark: SparkSession): Boolean = catalogBackend(spark) == "delta"
 
-  /** Delta metadata is shared across drivers, while intercept-mode staging is
-    * intentionally local RocksDB state. Refuse that unsafe combination rather
-    * than allowing one driver to miss changes captured by another. */
-  def validateCatalogChangeFeedCompatibility(spark: SparkSession): Unit =
-    require(
-      !deltaCatalogEnabled(spark) || changeFeedMode(spark) == ChangeFeedMode.Cdf,
-      s"$CatalogBackendKey=delta requires $ChangeFeedModeKey=cdf for multi-driver safety."
-    )
-
   def catalogPath(spark: SparkSession): String =
     spark.conf
       .getOption(CatalogPathKey)
