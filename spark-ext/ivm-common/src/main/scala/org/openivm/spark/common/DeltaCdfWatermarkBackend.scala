@@ -25,15 +25,21 @@ private[common] object DeltaCdfWatermarkBackend extends CdfWatermarkBackend with
   }
 
   override def get(spark: SparkSession, viewName: String, source: String): Option[Long] = {
+    getAll(spark, viewName, Seq(source)).get(source)
+  }
+
+  override def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] = {
+    val distinctSources = sources.distinct
+    if (distinctSources.isEmpty) return Map.empty
     ensureTables(spark)
     spark.read
       .format("delta")
       .load(path(spark))
-      .filter(col(ViewName) === lit(viewName) && col(Source) === lit(source))
-      .select(Version)
-      .take(1)
-      .headOption
-      .map(_.getLong(0))
+      .filter(col(ViewName) === lit(viewName) && col(Source).isin(distinctSources: _*))
+      .select(Source, Version)
+      .collect()
+      .map(row => row.getString(0) -> row.getLong(1))
+      .toMap
   }
 
   override def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =

@@ -829,13 +829,14 @@ case class CreateMaterializedViewCommand(
   ): Seq[Row] = {
     import MvCommandHelper._
 
+    FeatureGate.validateCatalogChangeFeedCompatibility(spark)
+    val propagation = ChangePropagationFactory.forSession(spark)
+
     profile.timeStep("create_mv_system_tables", "scope=mv_and_staging") {
       MvCatalog.ensureTables(spark)
-      StagingCatalog.ensureTables(spark)
+      if (propagation.requiresDmlInterception) StagingCatalog.ensureTables(spark)
       CdfWatermarkCatalog.ensureTables(spark)
     }
-
-    val propagation = ChangePropagationFactory.forSession(spark)
 
     // Existence guard
     profile.timeStep("create_catalog_lookup") {
@@ -1308,23 +1309,23 @@ case class RefreshMaterializedViewCommand(
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
     val lockT0 = System.nanoTime()
-    val rows = RefreshMutex.withLock(metaName(name)) {
-      val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-      // Clone the SparkSession so every refresh gets its own temp-view
-      // namespace.  Concurrent refresh waves (e.g. TpcDiSpec's
-      // `runWaveParallel`) routinely register session-global
-      // `openivm_delta_<source>` temp views; without isolation, sibling MVs
-      // racing through CREATE OR REPLACE TEMP VIEW + DROP VIEW can yank or
-      // replace a temp view mid-MERGE in another refresh, surfacing as
-      // `[TABLE_OR_VIEW_NOT_FOUND] openivm_delta_<source>` or returning
-      // rows from the wrong refresh's deltas.  `cloneSession` copies
-      // SessionState (temp catalog, SQLConf, registered extensions) but
-      // shares SparkContext and table cache, so the cost is microseconds
-      // per refresh.
-      runUnderLock(org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark), lockAcqMs)
+    try {
+      val rows = RefreshMutex.withLock(metaName(name)) {
+        val cloned = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
+        RefreshLeaseCatalog.withLease(cloned, metaName(name)) { _ =>
+          RefreshTransactionCatalog.recoverIncomplete(cloned, metaName(name))
+          val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
+          // Clone the SparkSession so every refresh gets its own temp-view namespace.
+          runUnderLock(cloned, lockAcqMs)
+        }
+      }
+      OpenIvmStateSync.backupAsync(spark)
+      rows
+    } finally {
+      // runUnderLock has many early returns and failure paths. Always detach
+      // its telemetry collector from the reusable driver thread.
+      RefreshProfile.flushActive()
     }
-    OpenIvmStateSync.backupAsync(spark)
-    rows
   }
 
   private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
@@ -1463,6 +1464,7 @@ case class RefreshMaterializedViewCommand(
         s"refresh_type=$refreshTypeName;outcome=$outcome;pending_deltas=$pendingDeltas",
         totalMs
       )
+      profile.completeSpan(outcome, threadName)
       profile.flush()
       sqlLog.flush()
     }
@@ -1479,6 +1481,7 @@ case class RefreshMaterializedViewCommand(
 
     val viewNameStr      = metaName(name)
     val propagation      = ChangePropagationFactory.forSession(spark)
+    FeatureGate.validateCatalogChangeFeedCompatibility(spark)
     val sourceWatermarks = meta.changeWatermarks
 
     // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
@@ -1571,9 +1574,23 @@ case class RefreshMaterializedViewCommand(
       return Seq.empty
     }
 
-    RefreshTransactionCatalog.prepare(spark, refreshId, viewNameStr)
+    RefreshLeaseCatalog.assertActive()
+    val startDataVersion =
+      DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+    val sourceVersions = cdfChangeBatches
+      .groupBy(_.baseTable)
+      .map { case (source, batches) => source -> batches.map(_.endVersionInclusive).max }
+    RefreshTransactionCatalog.prepare(
+      spark,
+      refreshId,
+      viewNameStr,
+      meta.location,
+      startDataVersion,
+      sourceVersions
+    )
 
     def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
+      RefreshLeaseCatalog.assertActive()
       val dataVersion =
         DeltaTable.forPath(spark, cleanupMeta.location).history(1).collect().head.getAs[Long]("version")
       RefreshTransactionCatalog.markDataCommitted(spark, refreshId, dataVersion)
@@ -1588,6 +1605,7 @@ case class RefreshMaterializedViewCommand(
         Some(dataVersion)
       )
       RefreshTransactionCatalog.commit(spark, refreshId)
+      RefreshLeaseCatalog.assertActive()
     }
 
     // Once we know we'll be doing real work, record the user-supplied CREATE-MV
@@ -1801,6 +1819,7 @@ case class RefreshMaterializedViewCommand(
       var stmtCounter = 0
       try {
         assembled.statements.foreach { sql =>
+          RefreshLeaseCatalog.assertActive()
           val kind     = RefreshPerf.classify(sql, "")
           val sqlBytes = sql.length
           val qOrder   = qlogOrder.getAndIncrement()
@@ -2349,6 +2368,7 @@ case class RefreshMaterializedViewCommand(
           }
         }
         def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+          RefreshLeaseCatalog.assertActive()
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
           val sqlBytes = sql.length
@@ -2949,6 +2969,7 @@ case class RefreshMaterializedViewCommand(
               s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
             ) {
               RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
+                RefreshLeaseCatalog.assertActive()
                 RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                   val t0 = System.nanoTime()
                   try {
@@ -4072,17 +4093,18 @@ case class RefreshMaterializedViewCommand(
 
     propagation.markConsumed(spark, viewNameStr, changeBatches)
 
-    val allMvs = MvCatalog.list(spark)
-    val viewsByTable = allMvs
-      .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
-      .groupBy(_._1)
-      .map { case (t, pairs) => t -> pairs.map(_._2) }
-    propagation.pruneConsumed(spark, viewsByTable)
-
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
     // the downstream MV's next REFRESH naturally sees the new MV-data Delta
     // version via its own [[CdfChangePropagation.hasPendingChanges]] probe.
-    if (propagation.requiresDmlInterception && !meta.emitsCascadeViewDelta) {
+    if (propagation.requiresDmlInterception) {
+      val allMvs = MvCatalog.list(spark)
+      val viewsByTable = allMvs
+        .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+        .groupBy(_._1)
+        .map { case (t, pairs) => t -> pairs.map(_._2) }
+      propagation.pruneConsumed(spark, viewsByTable)
+
+      if (!meta.emitsCascadeViewDelta) {
       val upstreamShortName = name.identifier
       val downstreamSourceKeys = allMvs
         .filterNot(m => metaName(m.name) == viewNameStr)
@@ -4135,6 +4157,7 @@ case class RefreshMaterializedViewCommand(
           )
         }
       }
+      }
     }
   }
 
@@ -4153,12 +4176,14 @@ case class RefreshMaterializedViewCommand(
 
     val propagation = ChangePropagationFactory.forSession(spark)
     propagation.markConsumed(spark, viewNameStr, changeBatches)
-    val viewsByTable = MvCatalog
-      .list(spark)
-      .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
-      .groupBy(_._1)
-      .map { case (t, pairs) => t -> pairs.map(_._2) }
-    propagation.pruneConsumed(spark, viewsByTable)
+    if (propagation.requiresDmlInterception) {
+      val viewsByTable = MvCatalog
+        .list(spark)
+        .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+        .groupBy(_._1)
+        .map { case (t, pairs) => t -> pairs.map(_._2) }
+      propagation.pruneConsumed(spark, viewsByTable)
+    }
   }
 
   /** True for refresh types whose openivm-emitted MERGE preserves rows whose

@@ -103,7 +103,14 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
     it("persists PREPARED to DATA_COMMITTED to COMMITTED refresh transitions") {
       val refreshId = "refresh-protocol-1"
-      RefreshTransactionCatalog.prepare(spark, refreshId, "db.mv_orders")
+      RefreshTransactionCatalog.prepare(
+        spark,
+        refreshId,
+        "db.mv_orders",
+        s"$root/data/db.mv_orders",
+        30L,
+        Map("db.orders" -> 8L)
+      )
       RefreshTransactionCatalog.lookup(spark, refreshId).map(_.state) shouldBe Some(RefreshTransactionState.Prepared)
 
       RefreshTransactionCatalog.markDataCommitted(spark, refreshId, 31L)
@@ -115,6 +122,16 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       RefreshTransactionCatalog.commit(spark, refreshId)
       RefreshTransactionCatalog.lookup(spark, refreshId).map(_.state) shouldBe Some(RefreshTransactionState.Committed)
       RefreshTransactionCatalog.incompleteForView(spark, "db.mv_orders") shouldBe empty
+    }
+
+    it("excludes a second distributed refresh owner") {
+      RefreshLeaseCatalog.withLease(spark, "db.mv_lease") { lease =>
+        lease.assertOwned()
+        intercept[IllegalStateException] {
+          RefreshLeaseCatalog.withLease(spark.newSession(), "db.mv_lease")(_ => ())
+        }.getMessage should include("already being refreshed")
+      }
+      RefreshLeaseCatalog.withLease(spark.newSession(), "db.mv_lease")(_.assertOwned())
     }
 
     it("commits independent MV metadata upserts concurrently") {
@@ -140,7 +157,8 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
       partitionColumns("mv_metadata") shouldBe Seq("name")
       partitionColumns("cdf_watermarks") shouldBe Seq("view_name")
-      partitionColumns("refresh_transactions") shouldBe Seq("refresh_id")
+      partitionColumns("refresh_transactions") shouldBe Seq("view_name")
+      partitionColumns("refresh_leases") shouldBe Seq("view_name")
     }
   }
 }

@@ -27,19 +27,17 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       val controller = CtasAdmissionController.optimistic(batchSize = 10)
 
       controller.currentLimit shouldBe 10
-      controller.record("slow", 0L, Long.MaxValue, inflight = 10, didDrop = false)
-      controller.completeBatch(0L, Long.MaxValue, admitted = 10, didDrop = false)
+      controller.completeBatch(batchSize = 10, capacityDrop = false)
       controller.currentLimit shouldBe 10
     }
 
     it("backs off on explicit pressure") {
       val controller = CtasAdmissionController.optimistic(batchSize = 10)
 
-      val decision = controller.record("failed", 0L, 1L, inflight = 10, didDrop = true)
-      controller.completeBatch(0L, 1L, admitted = 10, didDrop = true)
+      val (before, after) = controller.completeBatch(batchSize = 10, capacityDrop = true)
 
-      decision.limitBefore shouldBe 10
-      decision.limitAfter shouldBe 10
+      before shouldBe 10
+      after shouldBe 5
       controller.currentLimit shouldBe 5
     }
   }
@@ -63,23 +61,23 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
 
       result.values.toSet shouldBe (1 to taskCount).map(index => s"openivm-ctas-mv-$index").toSet
       result.telemetry.schedulerMode shouldBe "FAIR"
-      result.telemetry.initialLimit shouldBe taskCount
-      result.telemetry.learnedLimit shouldBe taskCount
+      result.telemetry.limitBefore shouldBe taskCount
+      result.telemetry.limitAfter shouldBe taskCount
       result.telemetry.maxInflight shouldBe taskCount
-      result.telemetry.decisions should have size taskCount
+      result.telemetry.spans should have size taskCount
+      all(result.telemetry.spans.map(_.startedEpochMs)) should be >= result.telemetry.spans.map(_.submittedEpochMs).min
     }
 
     it("applies a learned limit at the next batch boundary") {
       val controller = CtasAdmissionController.optimistic(batchSize = 4)
-      controller.record("pressure", 0L, 1L, inflight = 4, didDrop = true)
-      controller.completeBatch(0L, 1L, admitted = 4, didDrop = true)
+      controller.completeBatch(batchSize = 4, capacityDrop = true)
       val tasks = (1 to 4).map { index =>
         CtasBatchTask(id = s"mv-$index", run = () => index)
       }
 
       val result = CtasBatchDispatcher.run(spark, tasks, controller)
 
-      result.telemetry.initialLimit shouldBe 4
+      result.telemetry.limitBefore shouldBe 2
       result.telemetry.maxInflight should be <= 2
       result.values shouldBe (1 to 4)
     }
@@ -97,11 +95,11 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       }
 
       val failed = intercept[CtasBatchFailedException] {
-        CtasBatchDispatcher.run(spark, failedTasks, controller)
+        CtasBatchDispatcher.run(spark, failedTasks, controller, isCapacityFailure = _ => true)
       }
 
-      failed.telemetry.initialLimit shouldBe 10
-      failed.telemetry.learnedLimit shouldBe 5
+      failed.telemetry.limitBefore shouldBe 10
+      failed.telemetry.limitAfter shouldBe 5
       failed.failures.map(_._1) shouldBe Seq("mv-1")
 
       val recoveryTasks = (1 to 10).map { index =>
@@ -109,7 +107,22 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       }
       val recovered = CtasBatchDispatcher.run(spark, recoveryTasks, controller)
       recovered.telemetry.maxInflight should be <= 5
-      recovered.telemetry.learnedLimit shouldBe 6
+      recovered.telemetry.limitAfter shouldBe 6
+      recovered.telemetry.spans should have size 10
+    }
+
+    it("does not interpret ordinary SQL failures as capacity pressure") {
+      val controller = CtasAdmissionController.optimistic(batchSize = 4)
+      val failed = intercept[CtasBatchFailedException] {
+        CtasBatchDispatcher.run(
+          spark,
+          Seq(CtasBatchTask("bad-sql", () => throw new IllegalArgumentException("missing table"))),
+          controller
+        )
+      }
+
+      failed.telemetry.spans.head.capacityDrop shouldBe false
+      controller.currentLimit shouldBe 4
     }
   }
 }

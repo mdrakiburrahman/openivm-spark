@@ -515,14 +515,26 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     val serializedName = serializeName(meta.name)
     val perMvDb        = openPerMvDb(spark, serializedName)
     val oldSources = perMvDb.withSession {
-      val existing = readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
+      readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
+    }
+    val newSources = meta.sourceTables.toSet
+
+    // Reverse-index entries are published first. viewsForSource validates
+    // them against authoritative per-MV metadata, so an interrupted update
+    // can leave a harmless extra entry but cannot hide a real dependency.
+    newSources.toSeq.sorted.foreach { sourceTable =>
+      val db = openSourceDependencyDb(spark, sourceTable)
+      db.withBatch { batch =>
+        OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(serializedName), EmptyBytes)
+      }
+    }
+
+    perMvDb.withSession {
       perMvDb.withBatch { batch =>
         writeMetadata(perMvDb, batch, meta)
         rewriteProperties(perMvDb, batch, meta.properties)
       }
-      existing
     }
-    val newSources = meta.sourceTables.toSet
 
     (oldSources -- newSources).toSeq.sorted.foreach { sourceTable =>
       val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
@@ -531,12 +543,6 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
         db.withBatch { batch =>
           OpenIvmRocksDBBatchOps.delete(db, batch, DependentMvsCf, dependentMvKey(serializedName))
         }
-      }
-    }
-    newSources.toSeq.sorted.foreach { sourceTable =>
-      val db = openSourceDependencyDb(spark, sourceTable)
-      db.withBatch { batch =>
-        OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(serializedName), EmptyBytes)
       }
     }
   }
@@ -553,7 +559,7 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
     dependentViewNames(spark, table).flatMap { serializedName =>
       readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
-    }
+    }.filter(_.sourceTables.contains(table))
   }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {

@@ -201,9 +201,9 @@ final class CdfChangePropagation extends ChangePropagation {
       sources: Seq[String],
       persisted: Map[String, ChangeWatermark]
   ): Map[String, Long] = {
-    CdfWatermarkCatalog.ensureTables(spark)
+    val liveBySource = CdfWatermarkCatalog.getAll(spark, viewName, sources)
     sources.distinct.flatMap { src =>
-      val live = CdfWatermarkCatalog.get(spark, viewName, src)
+      val live = liveBySource.get(src)
       val seed = persisted.get(src).collect { case ChangeWatermark.DeltaVersion(v) => v }
       (live, seed) match {
         case (Some(l), Some(s)) => Some(src -> math.max(l, s))

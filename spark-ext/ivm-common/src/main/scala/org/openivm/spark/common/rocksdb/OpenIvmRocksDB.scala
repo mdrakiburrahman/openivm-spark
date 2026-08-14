@@ -58,6 +58,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   @volatile private var columnFamilyHandles: Map[String, ColumnFamilyHandle] = Map.empty
   @volatile private var versionValue: Long                                   = 0L
   @volatile private var closed                                               = false
+  @volatile private var dirtySinceFlush                                      = false
 
   private val compactCalls = new AtomicLong(0L)
 
@@ -105,6 +106,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     } finally {
       flushOptions.close()
     }
+    dirtySinceFlush = false
   }
 
   private def sstFileCountInternal(localDb: RocksDB): Int =
@@ -131,6 +133,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     val writeOptions = new WriteOptions().setSync(false).setDisableWAL(!conf.walEnabled)
     try {
       localDb.write(writeOptions, batch)
+      dirtySinceFlush = true
     } finally {
       writeOptions.close()
     }
@@ -339,7 +342,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     var firstError: Throwable = null
 
     try {
-      if (localDb != null) flushAll(localDb)
+      if (localDb != null && dirtySinceFlush) flushAll(localDb)
     } catch { case t: Throwable => firstError = t }
 
     try localHandles.foreach(closeQuietly)

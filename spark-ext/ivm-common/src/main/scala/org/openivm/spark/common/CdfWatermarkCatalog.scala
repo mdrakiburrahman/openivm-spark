@@ -57,6 +57,9 @@ private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
     }
   }
 
+  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
+    sources.distinct.flatMap(source => get(spark, viewName, source).map(source -> _)).toMap
+
   def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
     putAll(spark, viewName, Map(source -> version))
 
@@ -128,6 +131,9 @@ object CdfWatermarkCatalog {
 
   def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
     backend(spark).get(spark, viewName, source)
+
+  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
+    backend(spark).getAll(spark, viewName, sources)
 
   def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
     backend(spark).put(spark, viewName, source, version)

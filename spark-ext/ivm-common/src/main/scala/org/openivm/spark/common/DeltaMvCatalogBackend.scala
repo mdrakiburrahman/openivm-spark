@@ -3,7 +3,7 @@ package org.openivm.spark.common
 import io.delta.tables.DeltaTable
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.functions.{array_contains, col, lit}
+import org.apache.spark.sql.functions.{array_contains, col, lit, typedLit}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SparkSession}
 
@@ -137,7 +137,12 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       spark: SparkSession,
       name: TableIdentifier,
       properties: Map[String, String]
-  ): Unit = lookup(spark, name).foreach(meta => upsert(spark, meta.copy(properties = properties)))
+  ): Unit = withDeltaRetry {
+    ensureTables(spark)
+    DeltaTable
+      .forPath(spark, path(spark))
+      .update(col(Name) === lit(serializedName(name)), Map(Properties -> typedLit(properties)))
+  }
 
   override def remove(spark: SparkSession, name: TableIdentifier): Unit = withDeltaRetry {
     ensureTables(spark)
