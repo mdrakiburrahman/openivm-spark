@@ -116,7 +116,7 @@ class CtasBatchDispatcherSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       val failed = intercept[CtasBatchFailedException] {
         CtasBatchDispatcher.run(
           spark,
-          Seq(CtasBatchTask("bad-sql", () => throw new IllegalArgumentException("missing table"))),
+          Seq(CtasBatchTask[Int]("bad-sql", () => throw new IllegalArgumentException("missing table"))),
           controller
         )
       }
