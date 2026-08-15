@@ -22,10 +22,12 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 object OpenIvmRocksDB {
   RocksDB.loadLibrary()
 
-  private val ManifestPrefix = "MANIFEST-"
+  private val ManifestPrefix     = "MANIFEST-"
+  private val ManifestTxnPattern = """"txnId"\s*:\s*"([^"]+)"""".r
 
   private[rocksdb] val DefaultColumnFamilyName: String =
     RocksDBCodec.fromUtf8(RocksDB.DEFAULT_COLUMN_FAMILY)
+  private[rocksdb] val InternalTxnColumnFamilyName: String = "__openivm_txn"
 
   private[rocksdb] def parseManifestVersion(fileName: String): Option[Long] =
     if (fileName.startsWith(ManifestPrefix)) {
@@ -48,18 +50,37 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private val writeMutex = new ReentrantLock()
   private final class BatchStats {
-    var keys: Long  = 0L
-    var bytes: Long = 0L
+    var activeKeys: Long   = 0L
+    var activeBytes: Long  = 0L
+    var logicalKeys: Long  = 0L
+    var logicalBytes: Long = 0L
+    val txnId: String      = s"${Thread.currentThread().getId}-${System.nanoTime()}"
+    var undoSeq: Long      = 0L
+    var manifestWritten    = false
 
-    def reset(): Unit = {
-      keys = 0L
-      bytes = 0L
+    def add(bytes: Long): Unit = {
+      activeKeys += 1L
+      activeBytes += bytes
+      logicalKeys += 1L
+      logicalBytes += bytes
+    }
+
+    def resetActive(): Unit = {
+      activeKeys = 0L
+      activeBytes = 0L
+    }
+
+    def addPhysical(bytes: Long): Unit = {
+      activeKeys += 1L
+      activeBytes += bytes
     }
   }
   private val activeBatchStats = new ThreadLocal[BatchStats]()
 
   private val declaredColumnFamilies: Seq[String] =
-    (DefaultColumnFamilyName +: columnFamilies.filterNot(_ == DefaultColumnFamilyName)).distinct
+    (DefaultColumnFamilyName +: InternalTxnColumnFamilyName +: columnFamilies.filterNot(
+      _ == DefaultColumnFamilyName
+    )).distinct
 
   private val normalizedDbPath = RocksDBCodec.requireLocalPath(dbPath)
   private val dbDir            = Paths.get(normalizedDbPath)
@@ -123,14 +144,14 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private def sstFileCountInternal(localDb: RocksDB): Int =
     localDb.getLiveFilesMetaData.size()
 
-  private def writeManifest(newVersion: Long, sstCount: Int): Unit = {
+  private def writeManifest(newVersion: Long, sstCount: Int, txnId: String): Unit = {
     Files.createDirectories(manifestsDir)
     val manifestPath = manifestsDir.resolve(s"$ManifestPrefix$newVersion")
     val tmpPath = manifestsDir.resolve(
       s".$ManifestPrefix$newVersion.${Thread.currentThread().getId}.${System.nanoTime()}.tmp"
     )
     val payload =
-      s"""{"version":$newVersion,"timestampMs":${System.currentTimeMillis()},"sstCount":$sstCount}"""
+      s"""{"version":$newVersion,"timestampMs":${System.currentTimeMillis()},"sstCount":$sstCount,"txnId":"$txnId"}"""
     Files.write(tmpPath, RocksDBCodec.utf8(payload))
     try {
       Files.move(tmpPath, manifestPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
@@ -139,7 +160,24 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def commitBatch(batch: WriteBatch, stats: BatchStats): Long = {
+  private def readManifestTxnIds(): Set[String] = {
+    Files.createDirectories(manifestsDir)
+    val stream = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+    try {
+      stream
+        .iterator()
+        .asScala
+        .flatMap { path =>
+          scala.util.Try(RocksDBCodec.fromUtf8(Files.readAllBytes(path))).toOption
+        }
+        .flatMap(payload => ManifestTxnPattern.findFirstMatchIn(payload).map(_.group(1)))
+        .toSet
+    } finally {
+      stream.close()
+    }
+  }
+
+  private def writePhysicalBatch(batch: WriteBatch, stats: BatchStats): Int = {
     val started      = System.nanoTime()
     val localDb      = ensureLoaded()
     val writeOptions = new WriteOptions().setSync(false).setDisableWAL(!conf.walEnabled)
@@ -154,31 +192,191 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
       flushAll(localDb)
 
-      val nextVersion = versionValue + 1L
       sstCount = sstFileCountInternal(localDb)
-      writeManifest(nextVersion, sstCount)
-      versionValue = nextVersion
-      nextVersion
+      sstCount
     } finally {
-      OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.bytes)
+      OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.logicalBytes)
       OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
       OpenIvmMetrics.recordRocksDbCommit(
         OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
         System.nanoTime() - started,
-        stats.keys,
-        stats.bytes,
+        stats.activeKeys,
+        stats.activeBytes,
         sstCount
       )
     }
   }
 
-  private def maybeCommitActiveBatch(batch: WriteBatch, stats: BatchStats): Unit = {
-    OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(stats.bytes)
-    if (conf.maxWriteBatchBytes > 0L && stats.bytes >= conf.maxWriteBatchBytes) {
-      commitBatch(batch, stats)
+  private def commitLogicalBatch(batch: WriteBatch, stats: BatchStats): Long = {
+    var sstCount = 0
+    if (stats.activeKeys > 0L) {
+      sstCount = writePhysicalBatch(batch, stats)
       batch.clear()
-      stats.reset()
+      stats.resetActive()
+    } else {
+      sstCount = sstFileCountInternal(ensureLoaded())
+    }
+    val nextVersion = versionValue + 1L
+    writeManifest(nextVersion, sstCount, stats.txnId)
+    stats.manifestWritten = true
+    versionValue = nextVersion
+    markTxnCommitted(stats.txnId)
+    cleanupTxn(stats.txnId)
+    OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.logicalBytes)
+    nextVersion
+  }
+
+  private def markTxnCommitted(txnId: String): Unit = {
+    val batch = new WriteBatch()
+    try {
+      batch.put(cf(InternalTxnColumnFamilyName), committedKey(txnId), Array.emptyByteArray)
+      val stats = new BatchStats
+      stats.addPhysical(committedKey(txnId).length.toLong)
+      writePhysicalBatch(batch, stats)
+    } finally {
+      batch.close()
+    }
+  }
+
+  private def cleanupTxn(txnId: String): Unit = {
+    val batch = new WriteBatch()
+    try {
+      batch.deleteRange(cf(InternalTxnColumnFamilyName), txnPrefix(txnId), txnPrefixEnd(txnId))
+      val stats = new BatchStats
+      stats.addPhysical(txnPrefix(txnId).length.toLong + txnPrefixEnd(txnId).length.toLong)
+      writePhysicalBatch(batch, stats)
+    } finally {
+      batch.close()
+    }
+  }
+
+  private def maybeWritePhysicalBatch(batch: WriteBatch, stats: BatchStats): Unit = {
+    OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(stats.activeBytes)
+    if (conf.maxWriteBatchBytes > 0L && stats.activeBytes >= conf.maxWriteBatchBytes) {
+      writePhysicalBatch(batch, stats)
+      batch.clear()
+      stats.resetActive()
       OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
+    }
+  }
+
+  private def txnPrefix(txnId: String): Array[Byte] =
+    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(txnId)))
+
+  private def txnPrefixEnd(txnId: String): Array[Byte] =
+    txnPrefix(txnId) ++ Array(0xff.toByte)
+
+  private def undoKey(txnId: String, sequence: Long, columnFamily: String, key: Array[Byte]): Array[Byte] =
+    RocksDBCodec.compositeKey(
+      Seq(
+        RocksDBCodec.utf8(txnId),
+        RocksDBCodec.encodeLongBE(Long.MaxValue - sequence),
+        RocksDBCodec.utf8(columnFamily),
+        key
+      )
+    )
+
+  private def committedKey(txnId: String): Array[Byte] =
+    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(txnId), RocksDBCodec.utf8("committed")))
+
+  private def recordUndo(batch: WriteBatch, stats: BatchStats, columnFamily: String, key: Array[Byte]): Unit = {
+    if (columnFamily == InternalTxnColumnFamilyName) return
+    val localDb = ensureLoaded()
+    val old     = Option(localDb.get(cf(columnFamily), key))
+    val value = old match {
+      case Some(bytes) => RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8("put"), bytes))
+      case None        => RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8("delete")))
+    }
+    val logKey = undoKey(stats.txnId, stats.undoSeq, columnFamily, key)
+    stats.undoSeq += 1L
+    stats.addPhysical(logKey.length.toLong + value.length.toLong)
+    batch.put(cf(InternalTxnColumnFamilyName), logKey, value)
+  }
+
+  private def recordRangeUndo(
+      batch: WriteBatch,
+      stats: BatchStats,
+      columnFamily: String,
+      startKey: Array[Byte],
+      endKey: Array[Byte]
+  ): Unit = {
+    if (columnFamily == InternalTxnColumnFamilyName) return
+    val localDb = ensureLoaded()
+    val it      = localDb.newIterator(cf(columnFamily))
+    try {
+      it.seek(startKey)
+      while (it.isValid && java.util.Arrays.compareUnsigned(it.key(), endKey) < 0) {
+        recordUndo(batch, stats, columnFamily, it.key())
+        it.next()
+        maybeWritePhysicalBatch(batch, stats)
+      }
+    } finally {
+      it.close()
+    }
+  }
+
+  private def rollbackTxn(txnId: String): Unit = {
+    val localDb = ensureLoaded()
+    val it      = localDb.newIterator(cf(InternalTxnColumnFamilyName))
+    val batch   = new WriteBatch()
+    val stats   = new BatchStats
+    try {
+      it.seek(txnPrefix(txnId))
+      while (it.isValid && startsWith(it.key(), txnPrefix(txnId))) {
+        val parts = RocksDBCodec.splitComposite(it.key(), maxParts = 4)
+        if (parts.length == 4) {
+          val columnFamily = RocksDBCodec.fromUtf8(parts(2))
+          val key          = parts(3)
+          val valueParts   = RocksDBCodec.splitComposite(it.value(), maxParts = 2)
+          RocksDBCodec.fromUtf8(valueParts.headOption.getOrElse(Array.emptyByteArray)) match {
+            case "put" if valueParts.length == 2 =>
+              batch.put(cf(columnFamily), key, valueParts(1))
+              stats.addPhysical(key.length.toLong + valueParts(1).length.toLong)
+            case "delete" =>
+              batch.delete(cf(columnFamily), key)
+              stats.addPhysical(key.length.toLong)
+            case _ => ()
+          }
+          maybeWritePhysicalBatch(batch, stats)
+        }
+        it.next()
+      }
+      if (stats.activeKeys > 0L) {
+        writePhysicalBatch(batch, stats)
+        batch.clear()
+        stats.resetActive()
+      }
+    } finally {
+      it.close()
+      batch.close()
+    }
+    cleanupTxn(txnId)
+  }
+
+  private def recoverLogicalTransactions(): Unit = {
+    if (!columnFamilyHandles.contains(InternalTxnColumnFamilyName)) return
+    val manifested = readManifestTxnIds()
+    val localDb    = ensureLoaded()
+    val it         = localDb.newIterator(cf(InternalTxnColumnFamilyName))
+    val txns       = scala.collection.mutable.Set.empty[String]
+    val committed  = scala.collection.mutable.Set.empty[String]
+    try {
+      it.seekToFirst()
+      while (it.isValid) {
+        val parts = RocksDBCodec.splitComposite(it.key(), maxParts = 2)
+        if (parts.nonEmpty) {
+          val txnId = RocksDBCodec.fromUtf8(parts.head)
+          txns += txnId
+          if (parts.length == 2 && RocksDBCodec.fromUtf8(parts(1)) == "committed") committed += txnId
+        }
+        it.next()
+      }
+    } finally {
+      it.close()
+    }
+    txns.foreach { txnId =>
+      if (manifested.contains(txnId) || committed.contains(txnId)) cleanupTxn(txnId)
+      else rollbackTxn(txnId)
     }
   }
 
@@ -258,12 +456,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     stats match {
       case null => ()
       case s =>
-        s.keys += 1L
-        s.bytes += key.length.toLong + value.length.toLong
+        recordUndo(batch, s, columnFamily, key)
+        s.add(key.length.toLong + value.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong + value.length.toLong)
     batch.put(cf(columnFamily), key, value)
-    if (stats != null) maybeCommitActiveBatch(batch, stats)
+    if (stats != null) maybeWritePhysicalBatch(batch, stats)
   }
 
   private[common] def delete(batch: WriteBatch, columnFamily: String, key: Array[Byte]): Unit = {
@@ -271,12 +469,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     stats match {
       case null => ()
       case s =>
-        s.keys += 1L
-        s.bytes += key.length.toLong
+        recordUndo(batch, s, columnFamily, key)
+        s.add(key.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong)
     batch.delete(cf(columnFamily), key)
-    if (stats != null) maybeCommitActiveBatch(batch, stats)
+    if (stats != null) maybeWritePhysicalBatch(batch, stats)
   }
 
   private[common] def deleteRange(
@@ -289,12 +487,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     stats match {
       case null => ()
       case s =>
-        s.keys += 1L
-        s.bytes += startKey.length.toLong + endKey.length.toLong
+        recordRangeUndo(batch, s, columnFamily, startKey, endKey)
+        s.add(startKey.length.toLong + endKey.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, startKey.length.toLong + endKey.length.toLong)
     batch.deleteRange(cf(columnFamily), startKey, endKey)
-    if (stats != null) maybeCommitActiveBatch(batch, stats)
+    if (stats != null) maybeWritePhysicalBatch(batch, stats)
   }
 
   private[rocksdb] def manifestVersions: Seq[Long] = {
@@ -395,6 +593,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       openedDb = RocksDB.open(options, normalizedDbPath, descriptors.asJava, handles)
       dbHandle = openedDb
       columnFamilyHandles = allColumnFamilies.zip(handles.asScala).toMap
+      recoverLogicalTransactions()
       versionValue = readCurrentVersion()
     } catch {
       case t: Throwable =>
@@ -562,8 +761,17 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     activeBatchStats.set(stats)
     try {
       f(batch)
-      if (stats.keys > 0L) commitBatch(batch, stats)
+      if (stats.logicalKeys > 0L) commitLogicalBatch(batch, stats)
       else versionValue
+    } catch {
+      case t: Throwable =>
+        if (stats.logicalKeys > 0L && !stats.manifestWritten) {
+          try rollbackTxn(stats.txnId)
+          catch {
+            case rollbackError: Throwable => t.addSuppressed(rollbackError)
+          }
+        }
+        throw t
     } finally {
       activeBatchStats.remove()
       batch.close()

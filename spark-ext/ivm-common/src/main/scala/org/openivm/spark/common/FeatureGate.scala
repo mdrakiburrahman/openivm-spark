@@ -395,6 +395,8 @@ object FeatureGate {
   val DriverAdmissionEnabledKey: String = "spark.openivm.driverAdmission.enabled"
   val DriverAdmissionMaxConcurrentKey: String =
     "spark.openivm.driverAdmission.maxConcurrentHeavyStatements"
+  val DriverAdmissionMinHeapHeadroomKey: String =
+    "spark.openivm.driverAdmission.minHeapHeadroom"
 
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
@@ -653,12 +655,27 @@ object FeatureGate {
 
   def driverAdmissionMaxConcurrent(conf: SparkConf): Int =
     scala.util
-      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, 2))
-      .getOrElse(2)
+      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, 32))
+      .getOrElse(32)
       .max(1)
 
   def driverAdmissionMaxConcurrent(spark: SparkSession): Int =
-    driverAdmissionMaxConcurrent(spark.sparkContext.getConf)
+    spark.sparkContext.getConf
+      .getOption(DriverAdmissionMaxConcurrentKey)
+      .flatMap(raw => scala.util.Try(raw.toInt).toOption)
+      .getOrElse(math.min(32, spark.sparkContext.defaultParallelism.max(1)))
+      .max(1)
+
+  def driverAdmissionMinHeapHeadroomBytes(conf: SparkConf): Long =
+    scala.util
+      .Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(conf.get(DriverAdmissionMinHeapHeadroomKey)))
+      .getOrElse {
+        val runtime = Runtime.getRuntime
+        math.max(4L * 1024L * 1024L * 1024L, runtime.maxMemory() / 5L)
+      }
+
+  def driverAdmissionMinHeapHeadroomBytes(spark: SparkSession): Long =
+    driverAdmissionMinHeapHeadroomBytes(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
