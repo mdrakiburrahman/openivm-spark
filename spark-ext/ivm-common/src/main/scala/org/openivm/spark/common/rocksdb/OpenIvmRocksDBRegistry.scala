@@ -2,6 +2,7 @@ package org.openivm.spark.common.rocksdb
 
 import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd}
 import org.apache.spark.sql.SparkSession
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.slf4j.LoggerFactory
 
 import java.io.File
@@ -39,6 +40,7 @@ object OpenIvmRocksDBRegistry {
     this.synchronized {
       entries.get(canonicalPath) match {
         case Some(entry) =>
+          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.hit")
           assertSubset(canonicalPath, entry, requestedColumnFamilies)
           val updatedEntry =
             if (entry.appIds.contains(appId)) entry else entry.copy(appIds = entry.appIds + appId)
@@ -46,6 +48,7 @@ object OpenIvmRocksDBRegistry {
           entry.db
 
         case None =>
+          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.miss")
           val conf = OpenIvmRocksDBConf.fromSpark(spark)
           val db = new OpenIvmRocksDB(
             canonicalPath,
@@ -56,6 +59,7 @@ object OpenIvmRocksDBRegistry {
             db.load()
             OpenIvmMaintenanceCoordinator.register(db, conf)
             entries.put(canonicalPath, Entry(db, conf, requestedColumnFamilies, Set(appId)))
+            OpenIvmMetrics.OpenDbHandles.set(entries.size)
             db
           } catch {
             case error: Throwable =>
@@ -70,6 +74,7 @@ object OpenIvmRocksDBRegistry {
     val entry = this.synchronized {
       entries.remove(canonicalPath)
     }
+    OpenIvmMetrics.OpenDbHandles.set(this.synchronized(entries.size))
     entry.foreach(closeEntry(canonicalPath, _))
   }
 
@@ -83,6 +88,7 @@ object OpenIvmRocksDBRegistry {
           val remainingAppIds = entry.appIds - appId
           if (remainingAppIds.isEmpty) {
             entries.remove(path)
+            OpenIvmMetrics.OpenDbHandles.set(entries.size)
             Some(path -> entry)
           } else {
             entries.update(path, entry.copy(appIds = remainingAppIds))
@@ -102,6 +108,7 @@ object OpenIvmRocksDBRegistry {
       val snapshot = entries.toSeq
       entries.clear()
       listenerAppIds.clear()
+      OpenIvmMetrics.OpenDbHandles.set(0)
       snapshot
     }
 

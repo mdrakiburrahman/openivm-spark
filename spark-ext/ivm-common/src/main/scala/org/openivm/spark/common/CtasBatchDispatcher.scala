@@ -2,6 +2,7 @@ package org.openivm.spark.common
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.SparkSession
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{Callable, ExecutionException, Executors, TimeUnit}
@@ -120,6 +121,8 @@ object CtasBatchDispatcher {
     val inflight    = new AtomicInteger(0)
     val maxInflight = new AtomicInteger(0)
     val batchStart  = System.nanoTime()
+    OpenIvmMetrics.CtasQueueDepth.set(tasks.size)
+    OpenIvmMetrics.CtasAdmissionWidth.set(width)
 
     final case class Outcome(index: Int, value: Option[T], failure: Option[Throwable], span: CtasTaskSpan)
 
@@ -137,9 +140,11 @@ object CtasBatchDispatcher {
           val previousPool        = sc.getLocalProperty(SchedulerPoolKey)
           val previousDescription = sc.getLocalProperty(JobDescriptionKey)
           val active              = inflight.incrementAndGet()
-          val startedNanos        = System.nanoTime()
-          val startedEpochMs      = System.currentTimeMillis()
-          val threadName          = Thread.currentThread().getName
+          OpenIvmMetrics.CtasActiveThreads.set(active)
+          OpenIvmMetrics.CtasQueueDepth.decrementAndGet()
+          val startedNanos   = System.nanoTime()
+          val startedEpochMs = System.currentTimeMillis()
+          val threadName     = Thread.currentThread().getName
           recordMax(active)
           sc.setLocalProperty(SchedulerPoolKey, s"$poolPrefix-${task.id}")
           sc.setLocalProperty(JobDescriptionKey, s"OpenIVM CTAS ${task.id}")
@@ -152,7 +157,7 @@ object CtasBatchDispatcher {
           } finally {
             sc.setLocalProperty(SchedulerPoolKey, previousPool)
             sc.setLocalProperty(JobDescriptionKey, previousDescription)
-            inflight.decrementAndGet()
+            OpenIvmMetrics.CtasActiveThreads.set(inflight.decrementAndGet())
           }
           val endedNanos   = System.nanoTime()
           val capacityDrop = failure != null && isCapacityFailure(failure)
@@ -168,6 +173,9 @@ object CtasBatchDispatcher {
             outcome = if (failure == null) "success" else "failure",
             capacityDrop = capacityDrop
           )
+          OpenIvmMetrics.updateTimer("ctas.task.queue_wait", span.queueNanos)
+          OpenIvmMetrics.updateTimer("ctas.task.execution", span.durationNanos)
+          if (capacityDrop) OpenIvmMetrics.increment("ctas.task.retry")
           Outcome(index, value, Option(failure), span)
         }
       })
@@ -184,6 +192,8 @@ object CtasBatchDispatcher {
           executor.shutdownNow()
           throw Option(execution.getCause).getOrElse(execution)
       } finally {
+        OpenIvmMetrics.CtasQueueDepth.set(0)
+        OpenIvmMetrics.CtasActiveThreads.set(0)
         executor.shutdown()
         if (!executor.awaitTermination(1, TimeUnit.MINUTES)) executor.shutdownNow()
       }

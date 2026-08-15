@@ -3,6 +3,7 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 import java.util.concurrent.atomic.AtomicInteger
@@ -14,12 +15,11 @@ import java.util.concurrent.atomic.AtomicInteger
   * [[appendStep]], then calls [[flush]] in a finally block to persist all
   * collected rows in a single RocksDB batch.
   *
-  * The collector is silent (no allocation, no measurement overhead) when
-  * `spark.openivm.profile.refresh=false` (the default). When enabled it
+  * When `spark.openivm.profile.refresh=false` (the default), this collector
+  * skips RocksDB profile rows but still bridges phase timers into Spark's
+  * native metrics if `spark.openivm.metrics.enabled=true`. When enabled it
   * mirrors DuckDB-OpenIVM's `openivm_refresh_profile` table 1:1, including
-  * the `<view>_<nanos>` / `<view>_create_mv_<nanos>` refresh-id convention
-  * (see `.temp/openivm/src/upsert/refresh.cpp:44-46` and
-  * `.temp/openivm/src/core/parser_ddl.cpp:38-46`).
+  * the `<view>_<nanos>` / `<view>_create_mv_<nanos>` refresh-id convention.
   *
   * Dual-write semantics: when active, every emitted step is ALSO recorded in
   * the existing [[RefreshPerf]] Log4j stream so log-based debug workflows
@@ -29,6 +29,7 @@ final class RefreshProfile private (
     spark: SparkSession,
     val refreshId: String,
     val viewName: String,
+    private val mode: RefreshProfile.Mode,
     private val active: Boolean,
     private val rocksdbTelemetry: Option[OpenIvmRocksDBTelemetry.Session],
     private val spanStartEpochMs: Long,
@@ -45,16 +46,23 @@ final class RefreshProfile private (
   def isActive: Boolean = active
 
   /** Time `body` and append a profile row tagged with `stepName` + `detail`.
-    * Body is always executed even when the profile is inactive (zero overhead
-    * other than two `System.nanoTime` calls).
+    * Body is always executed even when the profile is inactive. The inactive
+    * path only measures when Spark-native metrics are enabled.
     */
   def timeStep[A](stepName: String, detail: String = "")(body: => A): A = {
-    if (!active) return body
+    if (!active && !OpenIvmMetrics.enabled) return body
     val t0 = System.nanoTime()
     try body
     finally {
-      val elapsedMs = (System.nanoTime() - t0) / 1000000L
-      appendStep(stepName, detail, elapsedMs)
+      val elapsedNanos = System.nanoTime() - t0
+      val elapsedMs    = elapsedNanos / 1000000L
+      if (active) appendStep(stepName, detail, elapsedMs)
+      else
+        OpenIvmMetrics.recordLifecyclePhase(
+          if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
+          stepName,
+          elapsedNanos
+        )
     }
   }
 
@@ -64,6 +72,11 @@ final class RefreshProfile private (
     * outside the lock body).
     */
   def appendStep(stepName: String, detail: String, durationMs: Long): Unit = {
+    OpenIvmMetrics.recordLifecyclePhase(
+      if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
+      stepName,
+      durationMs * 1000000L
+    )
     if (!active) return
     buffer += RefreshProfileRow(
       refreshId = refreshId,
@@ -167,6 +180,7 @@ object RefreshProfile {
       spark,
       viewName + suffix,
       viewName,
+      mode,
       active,
       rocksdbTelemetry,
       System.currentTimeMillis(),
@@ -178,7 +192,7 @@ object RefreshProfile {
 
   /** Inactive instance for code paths that never opt into profiling. */
   val NoOp: RefreshProfile =
-    new RefreshProfile(null, "", "", active = false, rocksdbTelemetry = None, 0L, 0L)
+    new RefreshProfile(null, "", "", Mode.Refresh, active = false, rocksdbTelemetry = None, 0L, 0L)
 }
 
 /** Side-channel for `RefreshProfile` to emit its own failure diagnostics

@@ -2,6 +2,7 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshSqlLogAsyncFlusher, RefreshSqlLogCatalog, RefreshSqlLogRow}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 
@@ -70,6 +71,8 @@ final class RefreshSqlLog private (
       sql: String,
       durationMs: Long
   ): Unit = {
+    if (durationMs >= 0L)
+      OpenIvmMetrics.recordSqlStatement(stmtKind, durationMs * 1000000L, Option(sql).fold(0)(_.length), attemptIdx)
     if (!active) return
     try {
       buffer += RefreshSqlLogRow(
