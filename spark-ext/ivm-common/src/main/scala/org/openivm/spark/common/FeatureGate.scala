@@ -138,6 +138,12 @@ object FeatureGate {
     */
   val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
 
+  /** Register and update Spark-native OpenIVM Dropwizard metrics.
+    * Default ON so benchmark containers only need to add the SparkPlugin and
+    * Prometheus sink wiring; flip OFF to remove hot-path metric updates.
+    */
+  val MetricsEnabledKey: String = "spark.openivm.metrics.enabled"
+
   /** Capture a Spark `EXPLAIN FORMATTED` physical plan per executed refresh
     * statement, recorded alongside the SQL in the query log. Default OFF so it
     * never adds planning/formatting overhead to a benchmark run — enable it
@@ -456,6 +462,12 @@ object FeatureGate {
 
   def queryLogEnabled(conf: SparkConf): Boolean =
     boolConf(conf, QueryLogEnabledKey, default = false)
+
+  def metricsEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, MetricsEnabledKey, default = true)
+
+  def metricsEnabled(spark: SparkSession): Boolean =
+    metricsEnabled(spark.sparkContext.getConf)
 
   def explainCaptureEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)

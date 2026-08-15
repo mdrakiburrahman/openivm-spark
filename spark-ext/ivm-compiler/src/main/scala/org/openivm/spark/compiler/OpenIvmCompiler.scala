@@ -7,6 +7,7 @@ import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -71,6 +72,9 @@ class OpenIvmCompiler private (
     */
   def compile(req: CompileRequest): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
+    OpenIvmMetrics.increment("compiler.compile.count")
+    OpenIvmMetrics.CompilerInflight.incrementAndGet()
+    val compileStarted = System.nanoTime()
 
     // Compute CREATE TABLE DDLs *before* any try-catch so that a
     // NotImplementedError from an unsupported type propagates directly to the
@@ -82,10 +86,12 @@ class OpenIvmCompiler private (
 
     val tmpDir = Files.createTempDirectory("openivm_compiler_")
     try {
-      val script           = buildScript(req, tableDdls, tmpDir)
-      val (stdout, stderr) = runCli(script)
-      val partial          = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad         = parseInitialLoadSql(tmpDir, req)
+      val script = buildScript(req, tableDdls, tmpDir)
+      val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+        runCli(script)
+      }
+      val partial  = parseCompileResult(stdout, req.viewName, stderr)
+      val initLoad = parseInitialLoadSql(tmpDir, req)
       partial.copy(initialLoadSql = initLoad)
     } catch {
       case e: OpenIvmCompileException => throw e
@@ -96,6 +102,8 @@ class OpenIvmCompiler private (
           e
         )
     } finally {
+      OpenIvmMetrics.updateTimer("compiler.compile", System.nanoTime() - compileStarted)
+      OpenIvmMetrics.CompilerInflight.decrementAndGet()
       deleteDirRecursively(tmpDir)
     }
   }

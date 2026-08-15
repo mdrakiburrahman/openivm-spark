@@ -30,6 +30,10 @@ final case class RetryPolicy(
     */
   def execute[T](operation: => T): T = executeInternal(operation, attempt = 1)
 
+  /** Execute `operation` and notify `onRetry` before each retry sleep. */
+  def executeWithRetryCallback[T](onRetry: (Int, Throwable) => Unit)(operation: => T): T =
+    executeInternal(operation, attempt = 1, onRetry = onRetry)
+
   /** Execute `operation` with this retry policy, passing the 1-based attempt
     * number on each invocation. Use this when the body needs to record
     * per-attempt telemetry (e.g. query-log rows tagged with `attempt_idx`).
@@ -67,7 +71,11 @@ final case class RetryPolicy(
     }
   }
 
-  private def executeInternal[T](operation: => T, attempt: Int): T = {
+  private def executeInternal[T](
+      operation: => T,
+      attempt: Int,
+      onRetry: (Int, Throwable) => Unit = (_, _) => ()
+  ): T = {
     Try(operation) match {
       case Success(result) =>
         if (attempt > 1) {
@@ -77,13 +85,14 @@ final case class RetryPolicy(
 
       case Failure(exception) if attempt < maxAttempts && matchesPattern(exception) =>
         val sleep = retryDelayMs(attempt)
+        onRetry(attempt, exception)
         log.warn(
           s"openivm-spark retry: retryable error on attempt $attempt/$maxAttempts " +
             s"— sleeping ${sleep}ms then retrying. Cause: ${exception.getClass.getSimpleName}: " +
             Option(exception.getMessage).getOrElse("<no message>").linesIterator.next()
         )
         Thread.sleep(sleep)
-        executeInternal(operation, attempt + 1)
+        executeInternal(operation, attempt + 1, onRetry)
 
       case Failure(exception) =>
         if (attempt > 1) {

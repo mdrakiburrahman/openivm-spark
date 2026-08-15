@@ -6,6 +6,7 @@ import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.functions.{array_contains, col, lit}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SparkSession}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.collection.JavaConverters._
 
@@ -13,7 +14,9 @@ import scala.collection.JavaConverters._
 private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with DeltaRetrySupport {
 
   override def withDeltaRetry[T](operation: => T): T =
-    RetryPolicy.DeltaCatalogConflicts.execute(operation)
+    RetryPolicy.DeltaCatalogConflicts.executeWithRetryCallback((_, _) =>
+      OpenIvmMetrics.recordCatalogRetry("mv_catalog")
+    )(operation)
 
   private val Name                    = "name"
   private val QuerySql                = "query_sql"
@@ -76,26 +79,30 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       properties = row.getJavaMap[String, String](row.fieldIndex(Properties)).asScala.toMap
     )
 
-  override def ensureTables(spark: SparkSession): Unit = withDeltaRetry {
-    DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(Name).execute()
+  override def ensureTables(spark: SparkSession): Unit = OpenIvmMetrics.time("catalog.mv_catalog.ensure_tables") {
+    withDeltaRetry {
+      DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(Name).execute()
+    }
   }
 
-  override def upsert(spark: SparkSession, meta: MvMetadata): Unit = withDeltaRetry {
-    ensureTables(spark)
-    val incoming     = singleRow(spark, meta)
-    val expectedName = serializedName(meta.name)
-    DeltaTable
-      .forPath(spark, path(spark))
-      .as("target")
-      .merge(
-        incoming.as("incoming"),
-        col(s"target.$Name") === lit(expectedName) && col(s"target.$Name") === col(s"incoming.$Name")
-      )
-      .whenMatched()
-      .updateAll()
-      .whenNotMatched()
-      .insertAll()
-      .execute()
+  override def upsert(spark: SparkSession, meta: MvMetadata): Unit = OpenIvmMetrics.time("catalog.mv_catalog.upsert") {
+    withDeltaRetry {
+      ensureTables(spark)
+      val incoming     = singleRow(spark, meta)
+      val expectedName = serializedName(meta.name)
+      DeltaTable
+        .forPath(spark, path(spark))
+        .as("target")
+        .merge(
+          incoming.as("incoming"),
+          col(s"target.$Name") === lit(expectedName) && col(s"target.$Name") === col(s"incoming.$Name")
+        )
+        .whenMatched()
+        .updateAll()
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+    }
   }
 
   override def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
@@ -126,43 +133,52 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       .map(decode)
   }
 
-  override def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = withDeltaRetry {
-    ensureTables(spark)
-    DeltaTable
-      .forPath(spark, path(spark))
-      .update(
-        col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
-        Map(LastVersion -> lit(newVersion))
-      )
+  override def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = OpenIvmMetrics.time(
+    "catalog.mv_catalog.advance"
+  ) {
+    withDeltaRetry {
+      ensureTables(spark)
+      DeltaTable
+        .forPath(spark, path(spark))
+        .update(
+          col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
+          Map(LastVersion -> lit(newVersion))
+        )
+    }
   }
 
   override def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
       properties: Map[String, String]
-  ): Unit = withDeltaRetry {
-    ensureTables(spark)
-    val updateSchema = StructType(
-      Seq(
-        StructField(Name, StringType, nullable = false),
-        StructField(Properties, MapType(StringType, StringType, valueContainsNull = false), nullable = false)
+  ): Unit = OpenIvmMetrics.time("catalog.mv_catalog.update_properties") {
+    withDeltaRetry {
+      ensureTables(spark)
+      val updateSchema = StructType(
+        Seq(
+          StructField(Name, StringType, nullable = false),
+          StructField(Properties, MapType(StringType, StringType, valueContainsNull = false), nullable = false)
+        )
       )
-    )
-    val incoming = spark.createDataFrame(
-      spark.sparkContext.parallelize(Seq(Row(serializedName(name), properties)), 1),
-      updateSchema
-    )
-    DeltaTable
-      .forPath(spark, path(spark))
-      .as("target")
-      .merge(incoming.as("incoming"), col(s"target.$Name") === col(s"incoming.$Name"))
-      .whenMatched()
-      .update(Map(Properties -> col(s"incoming.$Properties")))
-      .execute()
+      val incoming = spark.createDataFrame(
+        spark.sparkContext.parallelize(Seq(Row(serializedName(name), properties)), 1),
+        updateSchema
+      )
+      DeltaTable
+        .forPath(spark, path(spark))
+        .as("target")
+        .merge(incoming.as("incoming"), col(s"target.$Name") === col(s"incoming.$Name"))
+        .whenMatched()
+        .update(Map(Properties -> col(s"incoming.$Properties")))
+        .execute()
+    }
   }
 
-  override def remove(spark: SparkSession, name: TableIdentifier): Unit = withDeltaRetry {
-    ensureTables(spark)
-    DeltaTable.forPath(spark, path(spark)).delete(col(Name) === lit(serializedName(name)))
-  }
+  override def remove(spark: SparkSession, name: TableIdentifier): Unit =
+    OpenIvmMetrics.time("catalog.mv_catalog.remove") {
+      withDeltaRetry {
+        ensureTables(spark)
+        DeltaTable.forPath(spark, path(spark)).delete(col(Name) === lit(serializedName(name)))
+      }
+    }
 }

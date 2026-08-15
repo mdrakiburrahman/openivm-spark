@@ -2,7 +2,7 @@ package org.openivm.spark.commands
 
 import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
-import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions.{
@@ -33,6 +33,7 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
@@ -49,7 +50,9 @@ private[commands] object OpenIvmCompilers {
   def forSession(spark: SparkSession): OpenIvmCompiler = {
     val existing = cache.get(spark)
     if (existing != null) return existing
+    val waitStarted = System.nanoTime()
     cache.synchronized {
+      OpenIvmMetrics.updateTimer("compiler.cache.lock.wait", System.nanoTime() - waitStarted)
       val existing2 = cache.get(spark)
       if (existing2 != null) return existing2
       val c = buildForSession(spark)
@@ -156,7 +159,13 @@ private[commands] object RefreshMutex {
             l
           }
         }
-    lock.synchronized(body)
+    OpenIvmMetrics.RefreshQueued.incrementAndGet()
+    val waitStarted = System.nanoTime()
+    lock.synchronized {
+      OpenIvmMetrics.RefreshQueued.decrementAndGet()
+      OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
+      body
+    }
   }
 }
 
@@ -310,6 +319,19 @@ private[commands] object MvCommandHelper {
           batch.deltas.exists(_.opType == StagingDelta.OpTypes.Overwrite)
         case _: CdfChangeBatch => false
       }
+
+  def recordPlanMetrics(df: DataFrame, stmtKind: String): Unit =
+    try {
+      val values = scala.collection.mutable.ArrayBuffer.empty[(String, Long)]
+      df.queryExecution.executedPlan.foreach { node =>
+        node.metrics.foreach { case (key, metric) =>
+          values += metric.name.getOrElse(key) -> metric.value
+        }
+      }
+      OpenIvmMetrics.recordSparkPlanMetrics(stmtKind, values)
+    } catch {
+      case NonFatal(_) => ()
+    }
 
   /** Fully-qualified dot-separated name used in MvMetadata and SQL strings. */
   def metaName(id: TableIdentifier): String =
@@ -795,6 +817,7 @@ case class CreateMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
+    OpenIvmMetrics.CreateInflight.incrementAndGet()
     val createT0 = System.nanoTime()
     val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
     val sqlLog =
@@ -817,6 +840,7 @@ case class CreateMaterializedViewCommand(
       createOutcome = "create_executed"
       rows
     } finally {
+      OpenIvmMetrics.CreateInflight.decrementAndGet()
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
       profile.completeSpan(createOutcome, Thread.currentThread().getName)
@@ -1221,7 +1245,8 @@ case class CreateMaterializedViewCommand(
       ) {
         val t0 = System.nanoTime()
         try {
-          spark.sql(initSql)
+          val df = spark.sql(initSql)
+          recordPlanMetrics(df, RefreshPerf.classify(initSql, ""))
         } finally {
           val ms = (System.nanoTime() - t0) / 1000000L
           sqlLog.record(
@@ -1310,10 +1335,12 @@ case class RefreshMaterializedViewCommand(
     val lockT0 = System.nanoTime()
     try {
       val rows = RefreshMutex.withLock(metaName(name)) {
+        OpenIvmMetrics.RefreshInflight.incrementAndGet()
         val cloned    = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         // Clone the SparkSession so every refresh gets its own temp-view namespace.
-        runUnderLock(cloned, lockAcqMs)
+        try runUnderLock(cloned, lockAcqMs)
+        finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
       OpenIvmStateSync.backupAsync(spark)
       rows
@@ -1806,7 +1833,9 @@ case class RefreshMaterializedViewCommand(
               RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                 val t0 = System.nanoTime()
                 try {
-                  val r  = spark.sql(sql).collect()
+                  val df = spark.sql(sql)
+                  val r  = df.collect()
+                  recordPlanMetrics(df, kind)
                   val ms = (System.nanoTime() - t0) / 1000000L
                   sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
                   r
@@ -1903,6 +1932,7 @@ case class RefreshMaterializedViewCommand(
           .getOrElse("")
       } else ""
     val compileCacheHit = cachedCompiledSql.isDefined
+    OpenIvmMetrics.recordCompileCache(compileCacheHit)
     val compiled = profile.timeStep(
       "generate_refresh_sql.compile",
       s"compile_cache_hit=$compileCacheHit;compile_cache_tier=$compileCacheTier"
@@ -2355,6 +2385,7 @@ case class RefreshMaterializedViewCommand(
                 try {
                   val df = spark.sql(sql)
                   val r  = df.collect()
+                  recordPlanMetrics(df, kind)
                   val ms = (System.nanoTime() - t0) / 1000000L
                   sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
                   // Diagnostic-only physical-plan capture (FeatureGate default OFF).
@@ -2944,7 +2975,9 @@ case class RefreshMaterializedViewCommand(
                 RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                   val t0 = System.nanoTime()
                   try {
-                    val r  = spark.sql(deleteSql).collect()
+                    val df = spark.sql(deleteSql)
+                    val r  = df.collect()
+                    recordPlanMetrics(df, "delete")
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record(
                       "count_monoid_cleanup",

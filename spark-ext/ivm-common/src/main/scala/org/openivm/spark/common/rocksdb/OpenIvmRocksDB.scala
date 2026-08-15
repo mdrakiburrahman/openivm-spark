@@ -17,6 +17,7 @@ import java.nio.file.{Files, Paths, StandardCopyOption, StandardOpenOption}
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import scala.collection.JavaConverters._
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 object OpenIvmRocksDB {
   RocksDB.loadLibrary()
@@ -46,6 +47,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   import OpenIvmRocksDB._
 
   private val writeMutex = new ReentrantLock()
+  private final class BatchStats {
+    var keys: Long  = 0L
+    var bytes: Long = 0L
+  }
+  private val activeBatchStats = new ThreadLocal[BatchStats]()
 
   private val declaredColumnFamilies: Seq[String] =
     (DefaultColumnFamilyName +: columnFamilies.filterNot(_ == DefaultColumnFamilyName)).distinct
@@ -128,22 +134,35 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def commitBatch(batch: WriteBatch): Long = {
+  private def commitBatch(batch: WriteBatch, stats: BatchStats): Long = {
+    val started      = System.nanoTime()
     val localDb      = ensureLoaded()
     val writeOptions = new WriteOptions().setSync(false).setDisableWAL(!conf.walEnabled)
+    var sstCount     = 0
     try {
-      localDb.write(writeOptions, batch)
-      dirtySinceFlush = true
+      try {
+        localDb.write(writeOptions, batch)
+        dirtySinceFlush = true
+      } finally {
+        writeOptions.close()
+      }
+
+      flushAll(localDb)
+
+      val nextVersion = versionValue + 1L
+      sstCount = sstFileCountInternal(localDb)
+      writeManifest(nextVersion, sstCount)
+      versionValue = nextVersion
+      nextVersion
     } finally {
-      writeOptions.close()
+      OpenIvmMetrics.recordRocksDbCommit(
+        OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
+        System.nanoTime() - started,
+        stats.keys,
+        stats.bytes,
+        sstCount
+      )
     }
-
-    flushAll(localDb)
-
-    val nextVersion = versionValue + 1L
-    writeManifest(nextVersion, sstFileCountInternal(localDb))
-    versionValue = nextVersion
-    nextVersion
   }
 
   private def startsWith(bytes: Array[Byte], prefix: Array[Byte]): Boolean = {
@@ -158,8 +177,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     true
   }
 
-  private final class PrefixScanIterator(localDb: RocksDB, handle: ColumnFamilyHandle, prefix: Array[Byte])
-      extends Iterator[(Array[Byte], Array[Byte])]
+  private final class PrefixScanIterator(
+      localDb: RocksDB,
+      handle: ColumnFamilyHandle,
+      columnFamily: String,
+      prefix: Array[Byte]
+  ) extends Iterator[(Array[Byte], Array[Byte])]
       with AutoCloseable {
 
     private val iterator = localDb.newIterator(handle)
@@ -185,6 +208,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
       val key   = iterator.key()
       val value = iterator.value()
+      OpenIvmMetrics.recordColumnFamilyRead(columnFamily, key.length.toLong + value.length.toLong)
       iterator.next()
       if (!(iterator.isValid && startsWith(iterator.key(), prefix))) {
         close()
@@ -212,19 +236,43 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private[rocksdb] def path: String = normalizedDbPath
 
-  private[common] def put(batch: WriteBatch, columnFamily: String, key: Array[Byte], value: Array[Byte]): Unit =
+  private[common] def put(batch: WriteBatch, columnFamily: String, key: Array[Byte], value: Array[Byte]): Unit = {
+    activeBatchStats.get() match {
+      case null => ()
+      case stats =>
+        stats.keys += 1L
+        stats.bytes += key.length.toLong + value.length.toLong
+    }
+    OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong + value.length.toLong)
     batch.put(cf(columnFamily), key, value)
+  }
 
-  private[common] def delete(batch: WriteBatch, columnFamily: String, key: Array[Byte]): Unit =
+  private[common] def delete(batch: WriteBatch, columnFamily: String, key: Array[Byte]): Unit = {
+    activeBatchStats.get() match {
+      case null => ()
+      case stats =>
+        stats.keys += 1L
+        stats.bytes += key.length.toLong
+    }
+    OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong)
     batch.delete(cf(columnFamily), key)
+  }
 
   private[common] def deleteRange(
       batch: WriteBatch,
       columnFamily: String,
       startKey: Array[Byte],
       endKey: Array[Byte]
-  ): Unit =
+  ): Unit = {
+    activeBatchStats.get() match {
+      case null => ()
+      case stats =>
+        stats.keys += 1L
+        stats.bytes += startKey.length.toLong + endKey.length.toLong
+    }
+    OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, startKey.length.toLong + endKey.length.toLong)
     batch.deleteRange(cf(columnFamily), startKey, endKey)
+  }
 
   private[rocksdb] def manifestVersions: Seq[Long] = {
     Files.createDirectories(manifestsDir)
@@ -378,7 +426,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * threads serialise; the external lock then mutexes other JVMs.
     */
   private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A = {
-    if (!OpenIvmRocksDBTelemetry.isActive) {
+    if (!OpenIvmRocksDBTelemetry.isActive && !OpenIvmMetrics.enabled) {
       return withWriteLock {
         if (closed) {
           throw new IllegalStateException(s"OpenIVM RocksDB at $normalizedDbPath is already closed.")
@@ -469,15 +517,31 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         nativeCloseNanos = nativeCloseNanos,
         bodyNanos = bodyNanos
       )
+      OpenIvmMetrics.recordRocksDbOperation(
+        dbScope = OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
+        operation = operation,
+        multiProcess = conf.multiProcess,
+        failed = failed,
+        totalNanos = lockReleased - totalStarted,
+        jvmLockWaitNanos = lockAcquired - lockStarted,
+        jvmLockHeldNanos = lockReleased - lockAcquired,
+        externalLockWaitNanos = externalLockWaitNanos,
+        nativeOpenNanos = nativeOpenNanos,
+        nativeCloseNanos = nativeCloseNanos,
+        bodyNanos = bodyNanos
+      )
     }
   }
 
   def withBatch[A](f: WriteBatch => A): Long = withNativeHandle("with_batch") {
     val batch = new WriteBatch()
+    val stats = new BatchStats
+    activeBatchStats.set(stats)
     try {
       f(batch)
-      commitBatch(batch)
+      commitBatch(batch, stats)
     } finally {
+      activeBatchStats.remove()
       batch.close()
     }
   }
@@ -493,7 +557,9 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def withSession[A](body: => A): A = withNativeHandle("session")(body)
 
   def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle("get") {
-    Option(dbHandle.get(cf(columnFamily), key))
+    val value = Option(dbHandle.get(cf(columnFamily), key))
+    value.foreach(bytes => OpenIvmMetrics.recordColumnFamilyRead(columnFamily, key.length.toLong + bytes.length.toLong))
+    value
   }
 
   /** Fetch several keys from one column family under one native-handle scope.
@@ -506,7 +572,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       dbHandle
         .multiGetAsList(handles, keys.map(_.clone()).asJava)
         .asScala
-        .map(value => Option(value))
+        .map { value =>
+          Option(value).foreach(bytes => OpenIvmMetrics.recordColumnFamilyRead(columnFamily, bytes.length.toLong))
+          Option(value)
+        }
         .toVector
     }
   }
@@ -522,7 +591,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def prefixScan(columnFamily: String, prefix: Array[Byte]): Iterator[(Array[Byte], Array[Byte])] =
     if (conf.multiProcess) {
       withNativeHandle("prefix_scan") {
-        val it = new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
+        val it = new PrefixScanIterator(dbHandle, cf(columnFamily), columnFamily, prefix.clone())
         try {
           val buffer = scala.collection.mutable.ArrayBuffer.empty[(Array[Byte], Array[Byte])]
           while (it.hasNext) buffer += it.next()
@@ -533,7 +602,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
     } else {
       withNativeHandle("prefix_scan") {
-        new PrefixScanIterator(dbHandle, cf(columnFamily), prefix.clone())
+        new PrefixScanIterator(dbHandle, cf(columnFamily), columnFamily, prefix.clone())
       }
     }
 
