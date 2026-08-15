@@ -119,6 +119,21 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.driverAdmission") {
+    it("defaults OFF and leaves maxConcurrent effectively unbounded unless explicitly set") {
+      val conf = new SparkConf(false)
+
+      FeatureGate.driverAdmissionEnabled(conf) shouldBe false
+      FeatureGate.driverAdmissionMaxConcurrent(conf) shouldBe Int.MaxValue
+      FeatureGate.driverAdmissionEnabled(
+        new SparkConf(false).set(FeatureGate.DriverAdmissionEnabledKey, "true")
+      ) shouldBe true
+      FeatureGate.driverAdmissionMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.DriverAdmissionMaxConcurrentKey, "7")
+      ) shouldBe 7
+    }
+  }
+
   describe("FeatureGate.scd2RangeAccelEnabled") {
     it("defaults ON and honours an explicit OFF flag") {
       FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true
