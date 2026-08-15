@@ -243,6 +243,28 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  // ── Test 6b: Reserved-word source column ──────────────────────────────────
+
+  it should "compile when a source table has a DuckDB reserved-word column name" in {
+    // `collation` is a DuckDB reserved word; unquoted it fails CREATE TABLE parsing.
+    val schema = StructType(
+      Seq(
+        StructField("id", IntegerType),
+        StructField("collation", StringType),
+        StructField("region", StringType)
+      )
+    )
+    val req = CompileRequest(
+      viewName = "mv_reserved_col",
+      viewSql = "SELECT id, region FROM reserved_src WHERE id > 0",
+      sources = Map("reserved_src" -> schema)
+    )
+    // Before the fix this threw a DuckDB "syntax error at or near collation".
+    val result = sharedCompiler.compile(req)
+    result.sql should not be empty
+    result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+  }
+
   // ── Test 7: Unsupported type ──────────────────────────────────────────────
 
   it should "throw NotImplementedError for a schema containing a UserDefinedType" in {
