@@ -386,6 +386,16 @@ object FeatureGate {
     */
   val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
 
+  /** Process-wide admission for driver-heavy CREATE/REFRESH work. dbt can submit
+    * many independent CREATE MATERIALIZED VIEW statements against one Livy
+    * driver, outside [[CtasBatchDispatcher]]'s batch boundary. This gate bounds
+    * those cross-statement Spark jobs while still allowing configured driver
+    * parallelism. Default ON.
+    */
+  val DriverAdmissionEnabledKey: String = "spark.openivm.driverAdmission.enabled"
+  val DriverAdmissionMaxConcurrentKey: String =
+    "spark.openivm.driverAdmission.maxConcurrentHeavyStatements"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -634,6 +644,21 @@ object FeatureGate {
 
   def unifiedRefreshIntelligenceEnabled(spark: SparkSession): Boolean =
     unifiedRefreshIntelligenceEnabled(spark.sparkContext.getConf)
+
+  def driverAdmissionEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, DriverAdmissionEnabledKey, default = true)
+
+  def driverAdmissionEnabled(spark: SparkSession): Boolean =
+    driverAdmissionEnabled(spark.sparkContext.getConf)
+
+  def driverAdmissionMaxConcurrent(conf: SparkConf): Int =
+    scala.util
+      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, 2))
+      .getOrElse(2)
+      .max(1)
+
+  def driverAdmissionMaxConcurrent(spark: SparkSession): Int =
+    driverAdmissionMaxConcurrent(spark.sparkContext.getConf)
 
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The

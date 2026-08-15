@@ -107,6 +107,29 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("streams oversized write batches into bounded commits") {
+      val dir  = newDbDir("bounded-batch")
+      val conf = OpenIvmRocksDBConf.default.copy(maxWriteBatchBytes = 32L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        db.load()
+        db.withBatch { batch =>
+          (1 to 5).foreach { idx =>
+            db.put(batch, "meta", RocksDBCodec.utf8(s"k$idx"), RocksDBCodec.utf8("v" * 32))
+          }
+        }
+
+        (1 to 5).foreach { idx =>
+          db.get("meta", RocksDBCodec.utf8(s"k$idx")).map(RocksDBCodec.fromUtf8) shouldBe Some("v" * 32)
+        }
+        db.currentVersion should be > 1L
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
     it("returns prefix scans in lexicographic key order") {
       val dir = newDbDir("prefix-scan")
       val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("scan"))

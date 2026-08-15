@@ -5,7 +5,7 @@ import org.apache.spark.internal.Logging
 
 import java.util.HashMap
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.collection.concurrent.TrieMap
 import scala.util.control.NonFatal
 
@@ -24,6 +24,16 @@ object OpenIvmMetrics extends Logging {
   val CtasQueueDepth: AtomicInteger     = atomicIntegerGauge("ctas.queue_depth")
   val CtasAdmissionWidth: AtomicInteger = atomicIntegerGauge("ctas.admission_width")
   val CtasActiveThreads: AtomicInteger  = atomicIntegerGauge("ctas.active_threads")
+  val DriverAdmissionWidth: AtomicInteger =
+    atomicIntegerGauge("driver_admission.width")
+  val DriverAdmissionQueued: AtomicInteger =
+    atomicIntegerGauge("driver_admission.queued")
+  val DriverAdmissionInflight: AtomicInteger =
+    atomicIntegerGauge("driver_admission.inflight")
+  val RocksDbCommitBatchActiveBytes: AtomicLong =
+    atomicLongGauge("rocksdb.commit_batch.active_bytes")
+  val RocksDbCommitBatchLastBytes: AtomicLong =
+    atomicLongGauge("rocksdb.commit_batch.last_bytes")
 
   precreateKnownMetrics()
 
@@ -162,6 +172,12 @@ object OpenIvmMetrics extends Logging {
     value
   }
 
+  private def atomicLongGauge(name: String): AtomicLong = {
+    val value = new AtomicLong(0L)
+    gauge(name, (() => value.get()): Gauge[Long])
+    value
+  }
+
   private def metric(name: String, create: => Metric): Metric = {
     val safeName = sanitizePath(name)
     metrics.getOrElseUpdate(
@@ -246,7 +262,7 @@ final class OpenIvmMetricSet extends MetricSet {
 final class OpenIvmMetricGroupSet extends MetricSet {
   override def getMetrics: HashMap[String, Metric] = {
     val metrics = new HashMap[String, Metric]
-    Seq("rocksdb", "refresh", "create", "compiler", "catalog", "ctas").foreach { group =>
+    Seq("rocksdb", "refresh", "create", "compiler", "catalog", "ctas", "driver_admission").foreach { group =>
       metrics.put(group, new OpenIvmPrefixMetricSet(group + "."))
     }
     metrics

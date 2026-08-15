@@ -835,7 +835,9 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     try {
-      val rows = runCreate(spark, profile, sqlLog)
+      val rows = DriverHeavyOperationAdmission.withPermit(spark, "create") {
+        runCreate(spark, profile, sqlLog)
+      }
       OpenIvmStateSync.backupAsync(spark)
       createOutcome = "create_executed"
       rows
@@ -1339,7 +1341,7 @@ case class RefreshMaterializedViewCommand(
         val cloned    = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         // Clone the SparkSession so every refresh gets its own temp-view namespace.
-        try runUnderLock(cloned, lockAcqMs)
+        try DriverHeavyOperationAdmission.withPermit(spark, "refresh")(runUnderLock(cloned, lockAcqMs))
         finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
       OpenIvmStateSync.backupAsync(spark)

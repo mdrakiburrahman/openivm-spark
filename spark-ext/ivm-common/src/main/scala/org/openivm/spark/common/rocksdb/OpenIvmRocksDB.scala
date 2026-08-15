@@ -50,6 +50,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private final class BatchStats {
     var keys: Long  = 0L
     var bytes: Long = 0L
+
+    def reset(): Unit = {
+      keys = 0L
+      bytes = 0L
+    }
   }
   private val activeBatchStats = new ThreadLocal[BatchStats]()
 
@@ -155,6 +160,8 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       versionValue = nextVersion
       nextVersion
     } finally {
+      OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.bytes)
+      OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
       OpenIvmMetrics.recordRocksDbCommit(
         OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
         System.nanoTime() - started,
@@ -162,6 +169,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         stats.bytes,
         sstCount
       )
+    }
+  }
+
+  private def maybeCommitActiveBatch(batch: WriteBatch, stats: BatchStats): Unit = {
+    OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(stats.bytes)
+    if (conf.maxWriteBatchBytes > 0L && stats.bytes >= conf.maxWriteBatchBytes) {
+      commitBatch(batch, stats)
+      batch.clear()
+      stats.reset()
+      OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
     }
   }
 
@@ -237,25 +254,29 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private[rocksdb] def path: String = normalizedDbPath
 
   private[common] def put(batch: WriteBatch, columnFamily: String, key: Array[Byte], value: Array[Byte]): Unit = {
-    activeBatchStats.get() match {
+    val stats = activeBatchStats.get()
+    stats match {
       case null => ()
-      case stats =>
-        stats.keys += 1L
-        stats.bytes += key.length.toLong + value.length.toLong
+      case s =>
+        s.keys += 1L
+        s.bytes += key.length.toLong + value.length.toLong
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong + value.length.toLong)
     batch.put(cf(columnFamily), key, value)
+    if (stats != null) maybeCommitActiveBatch(batch, stats)
   }
 
   private[common] def delete(batch: WriteBatch, columnFamily: String, key: Array[Byte]): Unit = {
-    activeBatchStats.get() match {
+    val stats = activeBatchStats.get()
+    stats match {
       case null => ()
-      case stats =>
-        stats.keys += 1L
-        stats.bytes += key.length.toLong
+      case s =>
+        s.keys += 1L
+        s.bytes += key.length.toLong
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong)
     batch.delete(cf(columnFamily), key)
+    if (stats != null) maybeCommitActiveBatch(batch, stats)
   }
 
   private[common] def deleteRange(
@@ -264,14 +285,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       startKey: Array[Byte],
       endKey: Array[Byte]
   ): Unit = {
-    activeBatchStats.get() match {
+    val stats = activeBatchStats.get()
+    stats match {
       case null => ()
-      case stats =>
-        stats.keys += 1L
-        stats.bytes += startKey.length.toLong + endKey.length.toLong
+      case s =>
+        s.keys += 1L
+        s.bytes += startKey.length.toLong + endKey.length.toLong
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, startKey.length.toLong + endKey.length.toLong)
     batch.deleteRange(cf(columnFamily), startKey, endKey)
+    if (stats != null) maybeCommitActiveBatch(batch, stats)
   }
 
   private[rocksdb] def manifestVersions: Seq[Long] = {
@@ -539,7 +562,8 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     activeBatchStats.set(stats)
     try {
       f(batch)
-      commitBatch(batch, stats)
+      if (stats.keys > 0L) commitBatch(batch, stats)
+      else versionValue
     } finally {
       activeBatchStats.remove()
       batch.close()
