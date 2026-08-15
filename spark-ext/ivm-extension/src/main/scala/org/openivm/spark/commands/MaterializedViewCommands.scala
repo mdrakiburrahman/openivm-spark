@@ -414,6 +414,16 @@ private[commands] object MvCommandHelper {
     }
   }
 
+  def isCtasCleanupMissingTarget(error: Throwable, target: TableIdentifier): Boolean =
+    error match {
+      case e: AnalysisException =>
+        val message = Option(e.getMessage).getOrElse("")
+        Option(e.getErrorClass).contains("TABLE_OR_VIEW_NOT_FOUND") &&
+        message.contains(target.table) &&
+        message.contains("To tolerate the error on drop")
+      case _ => false
+    }
+
   /**
    * Analyze `querySql` in the current session and return
    * (qualifiedNames, qualifiedSchemas, compileSchemas, shortToQualMap).
@@ -1245,20 +1255,36 @@ case class CreateMaterializedViewCommand(
         "create_mv_initial_load",
         s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${initSql.length}"
       ) {
-        val t0 = System.nanoTime()
-        try {
-          val df = spark.sql(initSql)
-          recordPlanMetrics(df, RefreshPerf.classify(initSql, ""))
-        } finally {
-          val ms = (System.nanoTime() - t0) / 1000000L
-          sqlLog.record(
-            category = "initial_load_ctas",
-            stmtOrder = 0,
-            attemptIdx = 0,
-            stmtKind = RefreshPerf.classify(initSql, ""),
-            sql = initSql,
-            durationMs = ms
-          )
+        val t0      = System.nanoTime()
+        var attempt = 0
+        var done    = false
+        while (!done) {
+          val currentAttempt = attempt
+          try {
+            val df = spark.sql(initSql)
+            recordPlanMetrics(df, RefreshPerf.classify(initSql, ""))
+            done = true
+          } catch {
+            case t: Throwable if attempt < 3 && isCtasCleanupMissingTarget(t, dataIdent) =>
+              attempt += 1
+              try Thread.sleep(100L * attempt)
+              catch {
+                case _: InterruptedException =>
+                  Thread.currentThread().interrupt()
+                  throw t
+              }
+            case t: Throwable => throw t
+          } finally {
+            val ms = (System.nanoTime() - t0) / 1000000L
+            sqlLog.record(
+              category = "initial_load_ctas",
+              stmtOrder = 0,
+              attemptIdx = currentAttempt,
+              stmtKind = RefreshPerf.classify(initSql, ""),
+              sql = initSql,
+              durationMs = ms
+            )
+          }
         }
       }
 
