@@ -80,7 +80,7 @@ class OpenIvmCompiler private (
     // NotImplementedError from an unsupported type propagates directly to the
     // caller without being caught or wrapped by the CLI error handler below.
     val tableDdls: Seq[(String, String)] = req.sources.toSeq.map { case (name, schema) =>
-      val cols = schema.fields.map(f => s"${f.name} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
+      val cols = schema.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       name -> s"CREATE TABLE $name ($cols)"
     }
 
@@ -113,6 +113,14 @@ class OpenIvmCompiler private (
     */
   def close(): Unit = { closed = true }
 
+  /** Quotes an identifier for DuckDB DDL using double quotes, escaping any
+    * embedded double quote by doubling it.  Source columns may be named with
+    * DuckDB reserved words (e.g. `collation`), which fail to parse unquoted in
+    * a `CREATE TABLE` column list.
+    */
+  private[compiler] def quoteDuckdbIdent(name: String): String =
+    "\"" + name.replace("\"", "\"\"") + "\""
+
   /** Maps a Spark [[DataType]] to its DuckDB SQL type string.
     *
     * Covers all primitive types, DECIMAL(p,s), arrays, structs, maps, and
@@ -142,7 +150,7 @@ class OpenIvmCompiler private (
     case a: ArrayType =>
       s"${sparkToDuckdbType(a.elementType)}[]"
     case s: StructType =>
-      val fields = s.fields.map(f => s"${f.name} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
+      val fields = s.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       s"STRUCT($fields)"
     case m: MapType =>
       s"MAP(${sparkToDuckdbType(m.keyType)}, ${sparkToDuckdbType(m.valueType)})"
