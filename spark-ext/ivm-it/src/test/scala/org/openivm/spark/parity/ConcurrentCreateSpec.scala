@@ -28,7 +28,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
       .config("spark.sql.warehouse.dir", warehouseDir)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "4")
-      .config("spark.openivm.driverAdmission.maxConcurrentHeavyStatements", "8")
+      .config("spark.openivm.driverAdmission.maxConcurrentHeavyStatements", "1")
       .config("spark.openivm.driverAdmission.minHeapHeadroom", "512m")
     extraConf.foreach { case (k, v) => builder.config(k, v) }
     spark = builder.getOrCreate()

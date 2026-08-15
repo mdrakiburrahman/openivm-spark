@@ -386,11 +386,10 @@ object FeatureGate {
     */
   val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
 
-  /** Process-wide admission for driver-heavy CREATE/REFRESH work. dbt can submit
-    * many independent CREATE MATERIALIZED VIEW statements against one Livy
-    * driver, outside [[CtasBatchDispatcher]]'s batch boundary. This gate bounds
-    * those cross-statement Spark jobs while still allowing configured driver
-    * parallelism. Default ON.
+  /** Optional process-wide admission for driver-heavy CREATE/REFRESH work.
+    * Default OFF: normal dbt concurrency should scale like vanilla Spark CTAS.
+    * Operators may opt in only for pathological data-volume runs where driver
+    * heap headroom needs a pressure gate.
     */
   val DriverAdmissionEnabledKey: String = "spark.openivm.driverAdmission.enabled"
   val DriverAdmissionMaxConcurrentKey: String =
@@ -648,23 +647,19 @@ object FeatureGate {
     unifiedRefreshIntelligenceEnabled(spark.sparkContext.getConf)
 
   def driverAdmissionEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, DriverAdmissionEnabledKey, default = true)
+    boolConf(conf, DriverAdmissionEnabledKey, default = false)
 
   def driverAdmissionEnabled(spark: SparkSession): Boolean =
     driverAdmissionEnabled(spark.sparkContext.getConf)
 
   def driverAdmissionMaxConcurrent(conf: SparkConf): Int =
     scala.util
-      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, 32))
-      .getOrElse(32)
+      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, Int.MaxValue))
+      .getOrElse(Int.MaxValue)
       .max(1)
 
   def driverAdmissionMaxConcurrent(spark: SparkSession): Int =
-    spark.sparkContext.getConf
-      .getOption(DriverAdmissionMaxConcurrentKey)
-      .flatMap(raw => scala.util.Try(raw.toInt).toOption)
-      .getOrElse(math.min(32, spark.sparkContext.defaultParallelism.max(1)))
-      .max(1)
+    driverAdmissionMaxConcurrent(spark.sparkContext.getConf)
 
   def driverAdmissionMinHeapHeadroomBytes(conf: SparkConf): Long =
     scala.util
