@@ -194,7 +194,7 @@ class OpenIvmCompiler private (
     // Each macro is type-correct (returns a value of the type Spark would
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
-    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
+    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(stripSparkBacktickIdentifiers(req.viewSql), req.sourceQualifiedNames))};\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
     // takes the view name plus a JSON CompileFacts payload and returns one
     // row per top-level refresh statement without mutating openivm aux
@@ -248,6 +248,77 @@ class OpenIvmCompiler private (
       val pattern = "(?i)\\b" + java.util.regex.Pattern.quote(qual) + "\\b"
       acc.replaceAll(pattern, java.util.regex.Matcher.quoteReplacement(short))
     }
+  }
+
+  /** Rewrites Spark backtick-quoted identifiers into a form DuckDB's parser
+    * accepts, so the compile-bridge copy of the MV body binds cleanly.
+    *
+    * dbt-style Spark SQL qualifies sources as `` `db`.table `` (the whole
+    * dbt-server corpus does this). DuckDB uses double-quote identifier quoting
+    * and rejects backticks outright with `Parser Error: syntax error at or near
+    * "`"`, which silently demotes every affected view to
+    * COMPILE_FAILED -> FULL_REFRESH — defeating incremental maintenance. The
+    * backtick also hides the `db.` prefix from [[stripDbQualifiers]] (its
+    * pattern matches the unquoted qualified name), so the source is never
+    * reduced to the short table registered in DuckDB.
+    *
+    * A simple bare identifier (`[A-Za-z_][A-Za-z0-9_]*`) is emitted unquoted so
+    * the downstream [[stripDbQualifiers]] rewrite still matches the now-plain
+    * `db.table` reference; anything else is emitted double-quoted (with internal
+    * double-quotes escaped). Backticks inside single-quoted string literals are
+    * left untouched. `` `` `` (a doubled backtick) is the Spark escape for a
+    * literal backtick within an identifier.
+    */
+  private[compiler] def stripSparkBacktickIdentifiers(sql: String): String = {
+    val out = new StringBuilder(sql.length)
+    val n   = sql.length
+    var i   = 0
+    while (i < n) {
+      sql.charAt(i) match {
+        case '\'' =>
+          // Copy a single-quoted string literal verbatim, honoring '' escapes.
+          out += '\''
+          i += 1
+          var closed = false
+          while (i < n && !closed) {
+            val ch = sql.charAt(i)
+            out += ch
+            if (ch == '\'' && i + 1 < n && sql.charAt(i + 1) == '\'') {
+              out += '\''
+              i += 2
+            } else if (ch == '\'') {
+              closed = true
+              i += 1
+            } else {
+              i += 1
+            }
+          }
+        case '`' =>
+          val ident = new StringBuilder
+          i += 1
+          var closed = false
+          while (i < n && !closed) {
+            val ch = sql.charAt(i)
+            if (ch == '`' && i + 1 < n && sql.charAt(i + 1) == '`') {
+              ident += '`'
+              i += 2
+            } else if (ch == '`') {
+              closed = true
+              i += 1
+            } else {
+              ident += ch
+              i += 1
+            }
+          }
+          val id = ident.toString
+          if (id.matches("[A-Za-z_][A-Za-z0-9_]*")) out ++= id
+          else { out += '"'; out ++= id.replace("\"", "\"\""); out += '"' }
+        case other =>
+          out += other
+          i += 1
+      }
+    }
+    out.toString
   }
 
   /** Spark-specific pre-normalizations applied before the MV body is handed to

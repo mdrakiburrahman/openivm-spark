@@ -439,4 +439,51 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       Map("sales" -> "spark_catalog.tpcdi.sales", "audit" -> "tpcdi.audit")
     ) shouldBe "SELECT * FROM sales s JOIN audit a ON s.id = a.id"
   }
+
+  // ── Test 12: stripSparkBacktickIdentifiers (dbt backtick-quoted sources) ──
+
+  "stripSparkBacktickIdentifiers" should "unquote a simple backtick-quoted db qualifier" in {
+    val sql = "SELECT region FROM `arc_sql_db_bi`.machine_infrastructure_dim"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "SELECT region FROM arc_sql_db_bi.machine_infrastructure_dim"
+  }
+
+  it should "unquote every backtick-quoted identifier segment" in {
+    val sql = "SELECT d.id FROM `lakehouse_openivm`.arc_sql_server_pit_28d_mat_view d"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "SELECT d.id FROM lakehouse_openivm.arc_sql_server_pit_28d_mat_view d"
+  }
+
+  it should "double-quote a non-simple identifier and escape internal quotes" in {
+    val sql = "SELECT `weird col` FROM t"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "SELECT \"weird col\" FROM t"
+  }
+
+  it should "honor `` as an escaped backtick inside an identifier" in {
+    val sql = "SELECT `a``b` FROM t"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "SELECT \"a`b\" FROM t"
+  }
+
+  it should "leave backticks inside single-quoted string literals untouched" in {
+    val sql = "SELECT region FROM t WHERE note = 'use `backticks` here'"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe sql
+  }
+
+  it should "be a no-op for SQL with no backticks" in {
+    val sql = "SELECT region FROM sales WHERE amount > 0"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe sql
+  }
+
+  it should "compose with stripDbQualifiers to reduce a backtick-quoted source to its short name" in {
+    // Reproduces the dbt-server benchmark corpus pattern that silently demoted
+    // every MV to COMPILE_FAILED -> FULL_REFRESH before the backtick fix.
+    val raw      = "SELECT region FROM `arc_sql_db_bi`.machine_infrastructure_dim WHERE is_row_effective = TRUE"
+    val unticked = sharedCompiler.stripSparkBacktickIdentifiers(raw)
+    sharedCompiler.stripDbQualifiers(
+      unticked,
+      Map("machine_infrastructure_dim" -> "arc_sql_db_bi.machine_infrastructure_dim")
+    ) shouldBe "SELECT region FROM machine_infrastructure_dim WHERE is_row_effective = TRUE"
+  }
 }
