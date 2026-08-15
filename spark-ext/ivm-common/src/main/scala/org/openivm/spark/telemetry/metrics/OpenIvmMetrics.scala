@@ -30,6 +30,10 @@ object OpenIvmMetrics extends Logging {
     atomicIntegerGauge("driver_admission.queued")
   val DriverAdmissionInflight: AtomicInteger =
     atomicIntegerGauge("driver_admission.inflight")
+  val DriverAdmissionHeapHeadroomBytes: AtomicLong =
+    atomicLongGauge("driver_admission.heap_headroom_bytes")
+  val DriverAdmissionBackoffEvents: AtomicLong =
+    atomicLongGauge("driver_admission.backoff_events")
   val RocksDbCommitBatchActiveBytes: AtomicLong =
     atomicLongGauge("rocksdb.commit_batch.active_bytes")
   val RocksDbCommitBatchLastBytes: AtomicLong =

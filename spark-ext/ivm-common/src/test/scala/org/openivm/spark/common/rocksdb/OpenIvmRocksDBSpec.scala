@@ -123,7 +123,43 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
         (1 to 5).foreach { idx =>
           db.get("meta", RocksDBCodec.utf8(s"k$idx")).map(RocksDBCodec.fromUtf8) shouldBe Some("v" * 32)
         }
-        db.currentVersion should be > 1L
+        db.currentVersion shouldBe 1L
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("rolls back streamed writes that fail before the logical manifest") {
+      val dir  = newDbDir("bounded-rollback")
+      val conf = OpenIvmRocksDBConf.default.copy(maxWriteBatchBytes = 32L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        db.load()
+        val thrown = intercept[RuntimeException] {
+          db.withBatch { batch =>
+            (1 to 5).foreach { idx =>
+              db.put(batch, "meta", RocksDBCodec.utf8(s"k$idx"), RocksDBCodec.utf8("v" * 32))
+            }
+            throw new RuntimeException("abort before manifest")
+          }
+        }
+        thrown.getMessage shouldBe "abort before manifest"
+        (1 to 5).foreach { idx =>
+          db.get("meta", RocksDBCodec.utf8(s"k$idx")) shouldBe None
+        }
+        closeQuietly(db)
+
+        val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+        try {
+          reopened.load() shouldBe 0L
+          (1 to 5).foreach { idx =>
+            reopened.get("meta", RocksDBCodec.utf8(s"k$idx")) shouldBe None
+          }
+        } finally {
+          closeQuietly(reopened)
+        }
       } finally {
         closeQuietly(db)
         deleteRecursively(dir)
