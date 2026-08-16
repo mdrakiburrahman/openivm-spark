@@ -493,6 +493,22 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe sql
   }
 
+  it should "not let an apostrophe in a -- line comment desync backtick stripping" in {
+    // A `--` comment with an apostrophe (e.g. possessive "consumer's") must not
+    // be treated as an open string literal, or real backtick-quoted identifiers
+    // after it are skipped (the MV-over-MV COMPILE_FAILED regression).
+    val sql =
+      "-- consumer's note\nSELECT region FROM `lakehouse_openivm`.foo_mat_view"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "-- consumer's note\nSELECT region FROM lakehouse_openivm.foo_mat_view"
+  }
+
+  it should "not let an apostrophe in a /* */ block comment desync backtick stripping" in {
+    val sql = "/* it's fine */ SELECT a FROM `db`.t"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "/* it's fine */ SELECT a FROM db.t"
+  }
+
   it should "be a no-op for SQL with no backticks" in {
     val sql = "SELECT region FROM sales WHERE amount > 0"
     sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe sql
