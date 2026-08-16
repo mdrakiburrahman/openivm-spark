@@ -1286,10 +1286,8 @@ object SparkRefreshRewriter {
     val relations = collectScd2RelationRefs(sql)
     val byAlias = relations
       .groupBy(r => stripBackticks(r.alias))
-    val equalityRe =
-      "(?is)(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*=\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)".r
 
-    equalityRe
+    DottedEqualityRe
       .findAllMatchIn(sql)
       .flatMap { m =>
         val lhsAlias = stripBackticks(m.group(1))
@@ -1418,10 +1416,13 @@ object SparkRefreshRewriter {
     }
   }
 
-  private def equalityPredicates(sql: String): Seq[(String, String, String, String)] = {
-    val equalityRe =
-      "(?is)(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)\\s*=\\s*(\\w+|`[^`]+`)\\s*\\.\\s*(\\w+|`[^`]+`)".r
-    equalityRe
+  private val SqlIdentToken = "(?:`[^`]++`|\\w++)"
+  private val DottedEqualityRe =
+    ("(?is)(?<![\\w`])(" + SqlIdentToken + ")\\s*+\\.\\s*+(" + SqlIdentToken + ")\\s*+=\\s*+(" +
+      SqlIdentToken + ")\\s*+\\.\\s*+(" + SqlIdentToken + ")").r
+
+  private[common] def equalityPredicates(sql: String): Seq[(String, String, String, String)] = {
+    DottedEqualityRe
       .findAllMatchIn(sql)
       .map(m => (stripBackticks(m.group(1)), m.group(2), stripBackticks(m.group(3)), m.group(4)))
       .toVector
@@ -1835,25 +1836,27 @@ object SparkRefreshRewriter {
     *   3. Leading AND: `WHERE openivm_timestamp OP '...'::TIMESTAMP AND <filter>`
     *      — strip only the `openivm_timestamp … AND ` prefix.
     */
-  private def stripTimestampPredicate(sql: String): String = {
+  private[common] def stripTimestampPredicate(sql: String): String = {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
-    val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
-    val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
+    val qcol      = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
+    val tsLiteral = "(?:'[^']*+'::\\s*+TIMESTAMP|CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\))"
     val metadataTable =
-      "(?:(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?openivm_delta_tables`?)"
+      "(?:(?:`?memory`?\\s*+\\.\\s*+`?main`?\\s*+\\.\\s*+)?`?openivm_delta_tables`?)"
     val metadataHorizon =
-      "\\(\\s*SELECT\\s+last_update\\s+FROM\\s+" + metadataTable + "\\s+WHERE\\s+" +
-        "view_name\\s*=\\s*'[^']*'\\s+AND\\s+table_name\\s*=\\s*'[^']*'\\s*\\)"
-    val refreshHorizon = "(?:" + tsLiteral + "|" + metadataHorizon + ")"
-    val cmp            = "\\s*(?:>=|>|<=|<|=)\\s*"
+      "\\(\\s*+SELECT\\s++last_update\\s++FROM\\s++" + metadataTable + "\\s++WHERE\\s++" +
+        "view_name\\s*+=\\s*+'[^']*+'\\s++AND\\s++table_name\\s*+=\\s*+'[^']*+'\\s*+\\)"
+    val refreshHorizon = "(?:" + tsLiteral + "|(?>" + metadataHorizon + "))"
+    val cmp            = "\\s*+(?:>=|>|<=|<|=)\\s*+"
     // LPTS rewrites parenthesises each WHERE conjunct
     // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
     // wrapped in a balanced paren pair or bare (pre-merge single-line form).
     val tsPred = "(?:\\(\\s*" + qcol + cmp + refreshHorizon + "\\s*\\)|" + qcol + cmp + refreshHorizon + ")"
     // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
+    // Case 3a: leading `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
+    val whereLeadingAnd = ("(?i)\\s+WHERE\\s+" + tsPred + "\\s+AND\\s+").r
     // Case 2: trailing `AND [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val trailingAnd = ("(?i)\\s+AND\\s+" + tsPred).r
     // Case 3: leading `[(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
@@ -1861,7 +1864,7 @@ object SparkRefreshRewriter {
 
     leadingAnd.replaceAllIn(
       trailingAnd.replaceAllIn(
-        standalone.replaceAllIn(sql, ""),
+        standalone.replaceAllIn(whereLeadingAnd.replaceAllIn(sql, " WHERE "), ""),
         ""
       ),
       ""
@@ -1944,10 +1947,10 @@ object SparkRefreshRewriter {
     * Hive-qualified table — otherwise Spark resolves `<short>` against the
     * session's current_schema (typically `default`) and fails to find it.
     */
-  private def rewriteMemoryMainPrefix(sql: String): String = {
+  private[common] def rewriteMemoryMainPrefix(sql: String): String = {
     val qualifiedMap = activeQualifiedNames.get()
     val re =
-      """(?i)(?:`?memory`?\s*\.\s*`?main`?\s*\.\s*`?([A-Za-z0-9_]+)`?)""".r
+      """(?i)(?:`?memory`?\s*+\.\s*+`?main`?\s*+\.\s*+`?([A-Za-z0-9_]++)`?)""".r
     re.replaceAllIn(
       sql,
       m => {
@@ -1978,14 +1981,14 @@ object SparkRefreshRewriter {
     * The aliases match openivm's INSERT column list so downstream readers see
     * the user-facing column names.
     */
-  private def rewriteInsertToCtas(
+  private[common] def rewriteInsertToCtas(
       stmt: String,
       viewLogicalName: String,
       viewDeltaPath: String
   ): String = {
     val insertRe = ("(?is)\\bINSERT\\s+INTO\\s+(?:`?openivm_delta_" +
       java.util.regex.Pattern.quote(viewLogicalName) +
-      "`?)\\s*\\(([^)]+)\\)\\s+SELECT\\s+\\*\\s+FROM\\s+(\\w+)\\s*$").r
+      "`?)\\s*+\\(([^)]++)\\)\\s++SELECT\\s++\\*\\s++FROM\\s++(\\w++)\\s*+$").r
 
     insertRe.findFirstMatchIn(stmt) match {
       case None =>
@@ -2002,7 +2005,7 @@ object SparkRefreshRewriter {
         val ctePrefix   = stmt.substring(0, m.start).trim
 
         val cteColRe = ("(?i)\\b" + java.util.regex.Pattern.quote(lastCteName) +
-          "\\s*\\(([^)]+)\\)\\s+AS\\s+\\(").r
+          "\\s*+\\(([^)]++)\\)\\s++AS\\s++\\(").r
         val cteCols = cteColRe
           .findFirstMatchIn(ctePrefix)
           .map(_.group(1).split(",").map(_.trim).toSeq)
@@ -2038,7 +2041,7 @@ object SparkRefreshRewriter {
   ): String = {
     val fallbackRe = ("(?is)^\\s*INSERT\\s+INTO\\s+(?:`?openivm_delta_" +
       java.util.regex.Pattern.quote(viewLogicalName) +
-      "`?)\\s*\\(([^)]+)\\)\\s+(SELECT\\b.+)$").r
+      "`?)\\s*+\\(([^)]++)\\)\\s++(SELECT\\b.++)$").r
 
     fallbackRe.findFirstMatchIn(stmt) match {
       case None => stmt
@@ -2078,7 +2081,7 @@ object SparkRefreshRewriter {
   ): String = {
     val bareInsertRe = ("(?is)^\\s*INSERT\\s+INTO\\s+(?:`?openivm_delta_" +
       java.util.regex.Pattern.quote(viewLogicalName) +
-      "`?)\\s+(SELECT\\b.+)$").r
+      "`?)\\s++(SELECT\\b.++)$").r
 
     bareInsertRe.findFirstMatchIn(stmt) match {
       case None => stmt
