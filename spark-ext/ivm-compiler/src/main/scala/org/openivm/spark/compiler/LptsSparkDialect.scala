@@ -37,9 +37,20 @@ object LptsSparkDialect {
     *
     * Type (group 2): one or more uppercase letters optionally followed by
     * `(digits[, digits])`, e.g. `TIMESTAMP`, `DECIMAL(10,2)`.
+    *
+    * The leading `(?<![a-zA-Z0-9_.])` negative lookbehind anchors the match to a
+    * token boundary. Without it, `Matcher.find` restarts one character at a time
+    * inside a long identifier-class run (the group-1 class includes `.`), and the
+    * greedy `[a-zA-Z0-9_.]*` re-scans to the run's end from every offset — O(L^2)
+    * on a single long token that is NOT followed by `::`. A large LPTS refresh SQL
+    * that contained such a token drove a single `translate` call to spend 30+
+    * minutes here (openivm SIMPLE_PROJECTION has-data probe). The lookbehind makes
+    * interior offsets fail in O(1), restoring linear scanning; leftmost-match
+    * semantics are unchanged for all well-formed SQL (tokens always begin at a
+    * non-token-char boundary).
     */
   private val CastRe =
-    """((?:[a-zA-Z_][a-zA-Z0-9_.]*|[0-9]+(?:\.[0-9]+)?|__STRLIT_[0-9]+__))::([A-Z]+(?:\([0-9]+(?:,\s*[0-9]+)?\))?)""".r
+    """(?<![a-zA-Z0-9_.])((?:[a-zA-Z_][a-zA-Z0-9_.]*|[0-9]+(?:\.[0-9]+)?|__STRLIT_[0-9]+__))::([A-Z]+(?:\([0-9]+(?:,\s*[0-9]+)?\))?)""".r
 
   /** Matches a closing paren immediately followed by `::TYPE`.
     *
