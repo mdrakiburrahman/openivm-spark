@@ -301,6 +301,14 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
 // ---------------------------------------------------------------------------
 private[commands] object MvCommandHelper {
 
+  /** Upper bound on `compiled.sql` length for which the SIMPLE_PROJECTION
+    * has-data-apply probe runs the full (allocation-heavy) rewrite. Feeds larger
+    * than this are assumed to have a data apply — see
+    * [[computeSimpleProjectionHasDataApply]]. 8 MB comfortably exceeds every
+    * normal compiled feed while capping the probe's peak allocation.
+    */
+  private[commands] val SimpleProjectionProbeMaxSqlChars: Int = 8 * 1024 * 1024
+
   /** Whether the pending changes replace a source snapshot rather than
     * describe an incremental delta.
     *
@@ -691,6 +699,16 @@ private[commands] object MvCommandHelper {
       shortToQual: Map[String, String]
   ): Boolean =
     if (compiled.refreshType != RefreshTypeCode.SimpleProjection || compiled.sql.isEmpty) true
+    // The probe runs the full SparkRefreshRewriter pipeline purely to answer
+    // `statements.size > 1`. Each pass allocates copies of the whole SQL, so for
+    // the pathologically large compiled feeds emitted by wide fact models
+    // (multi-hundred-MB) it drives the driver JVM into a tens-of-GB allocation
+    // storm and OOMs. Above this bound, skip the probe and assume the feed has a
+    // data apply (keep the compiled incremental type). This never wrongly keeps
+    // a no-op feed incremental because `hasRealDelta` independently backstops
+    // the decision in `classifyEffectiveRefreshType`, and a feed this large is
+    // never a bare single-statement no-op.
+    else if (compiled.sql.length > SimpleProjectionProbeMaxSqlChars) true
     else {
       val probeViewDeltaPath = s"${location.stripSuffix("/")}/__openivm_rewrite_probe"
       try {
