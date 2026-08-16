@@ -1938,4 +1938,35 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
     }
   }
+
+  describe("deduplicateCteColumnAliases") {
+    it("renames duplicate CTE column aliases while leaving unique ones intact") {
+      val sql =
+        "prefix scan_0 (t3_mul, t3_mul, t3_region) AS (SELECT openivm_multiplicity, " +
+          "openivm_multiplicity, region FROM x)"
+      val out = SparkRefreshRewriter.deduplicateCteColumnAliases(sql)
+      out should include("scan_0 (t3_mul, t3_mul_1, t3_region) AS (")
+    }
+
+    it("is a no-op when there are no duplicate column aliases") {
+      val sql = "cte_a (c1, c2, c3) AS (SELECT 1, 2, 3)"
+      SparkRefreshRewriter.deduplicateCteColumnAliases(sql) shouldBe sql
+    }
+
+    it("does NOT hang on a long word-run token before a CTE column list (ReDoS guard)") {
+      // Regression: the group-1 `\w+` char class caused Matcher.find to restart
+      // inside a long word-run and re-scan to its end from every offset — O(L^2).
+      // A single multi-MB compiled openivm SQL drove one has-data-probe rewrite
+      // to 4+ minutes. A token-boundary lookbehind + possessive quantifiers make
+      // this linear.
+      val huge = "a" * 500000 + " scan_0 (c, c) AS (SELECT 1)"
+      val deadlineNanos = System.nanoTime() + 5000000000L // 5s ceiling
+      val out           = SparkRefreshRewriter.deduplicateCteColumnAliases(huge)
+      assert(
+        System.nanoTime() < deadlineNanos,
+        "deduplicateCteColumnAliases took too long — O(n^2) regression"
+      )
+      out should include("scan_0 (c, c_1) AS (")
+    }
+  }
 }

@@ -3754,8 +3754,8 @@ object SparkRefreshRewriter {
     * The renamed copies are never referenced by downstream CTEs, so renaming
     * them is safe.
     */
-  private def deduplicateCteColumnAliases(sql: String): String = {
-    val cteColListRe = ("""(\w+)\s*\(([^)]+)\)\s+AS\s+\(""").r
+  private[common] def deduplicateCteColumnAliases(sql: String): String = {
+    val cteColListRe = ("""(?<![\w])(\w++)\s*\(([^)]++)\)\s+AS\s+\(""").r
     cteColListRe.replaceAllIn(
       sql,
       mm => {
