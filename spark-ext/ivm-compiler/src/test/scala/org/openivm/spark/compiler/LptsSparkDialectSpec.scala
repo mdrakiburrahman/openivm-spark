@@ -133,6 +133,25 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     it("preserves CAST(NULL AS INTEGER) untouched (non-string type)") {
       LptsSparkDialect.rewritePostfixCasts("NULL::INTEGER") shouldBe "CAST(NULL AS INTEGER)"
     }
+
+    it("rewrites a deeply-qualified identifier a.b.c.d::BIGINT (dotted token)") {
+      LptsSparkDialect.rewritePostfixCasts("a.b.c.d::BIGINT") shouldBe
+        "CAST(a.b.c.d AS BIGINT)"
+    }
+
+    it("does NOT hang on a long identifier-class token that is not a cast (ReDoS guard)") {
+      // Regression: the group-1 char class includes '.', so before the
+      // token-boundary lookbehind was added, Matcher.find restarted inside a
+      // long run and re-scanned to its end from every offset — O(L^2). A single
+      // large LPTS SQL token drove one translate() call to 30+ minutes. This
+      // must now complete effectively instantly (linear scan).
+      val huge = "a" * 500000 + " , x::INT"
+      val deadlineNanos = System.nanoTime() + 5000000000L // 5s ceiling
+      val out = LptsSparkDialect.rewritePostfixCasts(huge)
+      assert(System.nanoTime() < deadlineNanos, "rewritePostfixCasts took too long — O(n^2) regression")
+      out should endWith("CAST(x AS INT)")
+      out should startWith("aaaa")
+    }
   }
 
   // ── 3b. Parenthesised postfix casts (func(...)::TYPE) ───────────────────────
