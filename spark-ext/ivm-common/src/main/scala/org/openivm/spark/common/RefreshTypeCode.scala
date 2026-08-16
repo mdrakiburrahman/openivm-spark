@@ -45,22 +45,13 @@ object RefreshTypeCode {
     *     them as `-1/+1` rows into `openivm_delta_<view>`. The old
     *     `WINDOW_PARTITION / GROUP_RECOMPUTE do not cascade` explanation is now
     *     obsolete once `force_view_delta_cascade=true` is set in CompileFacts.
-    *
-    * SIMPLE_AGGREGATE (1) is intentionally EXCLUDED. The openivm compile-only
-    * mode does not emit a snapshot companion (refresh_sql.cpp build_snapshot_companion)
-    * unless the registered downstream metadata is non-empty — and openivm-spark
-    * compiles each MV in an isolated DuckDB subprocess where that metadata is
-    * always absent. The view-delta we'd persist would carry only the +1
-    * add rows, missing the -1 retract for the pre-refresh scalar value (e.g.
-    * the initial-CTAS NULL row). Downstream cascade over a SIMPLE_AGGREGATE
-    * upstream would therefore double-emit (initial NULL + new value both
-    * present in the downstream MV). The right fix requires also rewriting
-    * the snapshot pre/post-companion on the Spark side, which is out of
-    * scope; for now SIMPLE_AGGREGATE upstreams force downstream
-    * FullRefresh-demotion.
+    *   - **SIMPLE_AGGREGATE**: Spark pins the pre-refresh Delta version and,
+    *     after the scalar update succeeds, materializes the exact old/new
+    *     snapshot pair as `-1/+1`. This does not depend on isolated DuckDB
+    *     compilation knowing the downstream catalog.
     *
     * The remaining complement set — DISTINCT_INCREMENTAL,
-    * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH, SIMPLE_AGGREGATE — does NOT
+    * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH — does NOT
     * emit a cascade-usable view-delta. Downstream MVs over a
     * non-cascade-delta-capable upstream MUST be FullRefresh-demoted at CREATE
     * time.
@@ -70,7 +61,8 @@ object RefreshTypeCode {
     * `CreateMaterializedViewCommand`.
     */
   def emitsCascadeViewDelta(rt: Int): Boolean = rt match {
-    case AggregateGroup | AggregateHaving | SimpleProjection | WindowPartition | GroupRecompute => true
-    case _                                                                                      => false
+    case AggregateGroup | AggregateHaving | SimpleAggregate | SimpleProjection | WindowPartition | GroupRecompute =>
+      true
+    case _ => false
   }
 }

@@ -278,13 +278,11 @@ User SQL that triggers it:
 CREATE TABLE agg_src(k INT, v INT) USING DELTA;
 INSERT INTO agg_src VALUES (1, 10), (1, 20), (2, 5);
 
-CREATE MATERIALIZED VIEW mv_scalar AS
-SELECT SUM(v) AS total_v
-FROM agg_src;
+CREATE MATERIALIZED VIEW mv_top AS
+SELECT k, v FROM agg_src ORDER BY v DESC LIMIT 1;
 
 CREATE MATERIALIZED VIEW mv_downstream AS
-SELECT total_v
-FROM mv_scalar;
+SELECT k, v FROM mv_top;
 ```
 
 A downstream MV over another MV needs the upstream refresh to emit a
@@ -294,30 +292,34 @@ when the downstream shape has a known unsafe cascade combination; see
 `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:522-559`.
 
 The coarse capability rule lives in `RefreshTypeCode.emitsCascadeViewDelta`.
-It includes `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, `SIMPLE_PROJECTION`,
-`WINDOW_PARTITION`, and `GROUP_RECOMPUTE`, and excludes `SIMPLE_AGGREGATE`,
-`FULL_REFRESH`, `DISTINCT_INCREMENTAL`, `SEMI_ANTI_RECOMPUTE`, and `TOP_K`; see
+It includes `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, `SIMPLE_AGGREGATE`,
+`SIMPLE_PROJECTION`, `WINDOW_PARTITION`, and `GROUP_RECOMPUTE`. Scalar
+aggregates pin the pre-refresh Delta version and publish `-old/+new` in
+intercept mode; CDF supplies the same update pre/post images natively. The rule
+excludes `FULL_REFRESH`, `DISTINCT_INCREMENTAL`, `SEMI_ANTI_RECOMPUTE`, and the
+user-visible `TOP_K` wrapper; see
 `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/RefreshTypeCode.scala:20-76`.
 
 Expected metadata:
 
 | field                                      | value                                       |
 | ------------------------------------------ | ------------------------------------------- |
-| upstream `mv_scalar.refreshTypeName`       | often `SIMPLE_AGGREGATE`                    |
+| upstream `mv_top.refreshTypeName`          | inner type, often `SIMPLE_PROJECTION`       |
+| upstream `mv_top.emitsCascadeViewDelta`    | `false`                                     |
 | downstream `mv_downstream.refreshTypeName` | `FULL_REFRESH`                              |
 | `demotionReason` concept                   | `non_cascade_upstream:non_cascade:<source>` |
 
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='non_cascade_upstream:non_cascade:default.mv_scalar' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='non_cascade_upstream:non_cascade:default.mv_top' emits_cascade_view_delta='false'
 ```
 
 Expected refresh SQL:
 
 ```sql
 INSERT OVERWRITE TABLE `mv_downstream`
-SELECT * FROM (SELECT total_v FROM mv_scalar)
+SELECT * FROM (SELECT k, v FROM mv_top)
 ```
 
 Recovery:

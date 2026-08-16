@@ -214,6 +214,14 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
           properties = Map.empty
         )
         .emitsCascadeViewDelta shouldBe false
+
+      sampleMeta("cascade_scalar")
+        .copy(
+          refreshType = RefreshTypeCode.SimpleAggregate,
+          refreshTypeName = "SIMPLE_AGGREGATE",
+          properties = Map.empty
+        )
+        .emitsCascadeViewDelta shouldBe true
     }
 
     it("honors the persisted per-MV override when present") {

@@ -7,6 +7,8 @@ import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.{ChangeFeedMode, MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
 
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
@@ -132,8 +134,33 @@ abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-casc
       sql(
         "CREATE MATERIALIZED VIEW plc_up_l2 AS SELECT total * 2 AS doubled FROM plc_up_l1"
       )
+      val upstreamMeta = MvCatalog.lookup(spark, TableIdentifier("plc_up_l1")).get
+      val leafMeta     = MvCatalog.lookup(spark, TableIdentifier("plc_up_l2")).get
+      upstreamMeta.refreshType shouldBe RefreshTypeCode.SimpleAggregate
+      upstreamMeta.emitsCascadeViewDelta shouldBe true
+      leafMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
       sql("INSERT INTO plc_up_base VALUES (10),(20)")
-      refreshChain("plc_up_l1", "plc_up_l2")
+      refreshChain("plc_up_l1")
+      if (changeFeedMode == ChangeFeedMode.Intercept) {
+        val leafName = leafMeta.name.database.fold(leafMeta.name.table)(db => s"$db.${leafMeta.name.table}")
+        val cascade = StagingCatalog
+          .collectFor(spark, leafName, leafMeta.sourceTables, leafMeta.sourceWatermarks)
+          .filter(_.opType == StagingDelta.OpTypes.MvViewDelta)
+          .lastOption
+          .getOrElse(fail("missing SIMPLE_AGGREGATE cascade staging row"))
+        val signedTotals = spark.read
+          .format("delta")
+          .load(cascade.stagingPath)
+          .select("total", "openivm_multiplicity")
+          .collect()
+          .map { row =>
+            Option(row.getAs[java.lang.Long]("total")).map(_.longValue()) ->
+              row.getAs[Int]("openivm_multiplicity")
+          }
+          .toSet
+        signedTotals shouldBe Set(None -> -1, Some(30L) -> 1)
+      }
+      refreshChain("plc_up_l2")
       assertMvCorrect("plc_up_l1", "SELECT SUM(x) AS total FROM plc_up_base")
       assertMvCorrect(
         "plc_up_l2",
@@ -143,6 +170,26 @@ abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-casc
 
     it("second batch: additional row propagates to both MVs") {
       sql("INSERT INTO plc_up_base VALUES (5)")
+      refreshChain("plc_up_l1", "plc_up_l2")
+      assertMvCorrect("plc_up_l1", "SELECT SUM(x) AS total FROM plc_up_base")
+      assertMvCorrect(
+        "plc_up_l2",
+        "SELECT total * 2 AS doubled FROM (SELECT SUM(x) AS total FROM plc_up_base) t"
+      )
+    }
+
+    it("retracts the old scalar and propagates NULL when the base becomes empty") {
+      sql("DELETE FROM plc_up_base")
+      refreshChain("plc_up_l1", "plc_up_l2")
+      assertMvCorrect("plc_up_l1", "SELECT SUM(x) AS total FROM plc_up_base")
+      assertMvCorrect(
+        "plc_up_l2",
+        "SELECT total * 2 AS doubled FROM (SELECT SUM(x) AS total FROM plc_up_base) t"
+      )
+    }
+
+    it("retracts NULL and propagates the new scalar when the base is repopulated") {
+      sql("INSERT INTO plc_up_base VALUES (7),(8)")
       refreshChain("plc_up_l1", "plc_up_l2")
       assertMvCorrect("plc_up_l1", "SELECT SUM(x) AS total FROM plc_up_base")
       assertMvCorrect(

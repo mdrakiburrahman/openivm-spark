@@ -2262,6 +2262,19 @@ case class RefreshMaterializedViewCommand(
       val mergeTargetId: TableIdentifier =
         if (meta.usesBackingDataTable) dataTableId(name) else name
 
+      // The exact scalar value to retract must be pinned before any refresh SQL
+      // mutates the target. Intercept mode needs an explicit signed cascade
+      // table; CDF mode obtains the same pre/post images from Delta CDF.
+      val simpleAggregateVersionBeforeRefresh: Option[Long] =
+        if (
+          propagation.requiresDmlInterception &&
+          meta.refreshType == RefreshTypeCode.SimpleAggregate &&
+          meta.emitsCascadeViewDelta &&
+          downstreamSourceKeysForThisMv.nonEmpty
+        )
+          Some(DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version"))
+        else None
+
       // Workload-aware insert-only fast path. For a SIMPLE_PROJECTION on the
       // recompute path (DELETE by openivm_left_key + recompute), when this batch
       // changes NO existing MV row, openivm's view-delta is purely net-new rows,
@@ -3114,12 +3127,39 @@ case class RefreshMaterializedViewCommand(
           }
         }
 
+        // Isolated OpenIVM compilation cannot see Spark's downstream MV
+        // catalog, so SIMPLE_AGGREGATE does not get OpenIVM's snapshot
+        // companion. Build the exact logical delta here: retract the one-row
+        // pre-refresh scalar snapshot, then add the post-refresh snapshot.
+        // This runs before StagingCatalog.record and before source watermarks
+        // or MV metadata advance, so downstream propagation never observes a
+        // trigger without its complete signed data.
+        simpleAggregateVersionBeforeRefresh.foreach { oldVersion =>
+          val targetColumns = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
+          val colList = targetColumns
+            .map(c => s"`${c.replace("`", "``")}`")
+            .mkString(", ")
+          val escapedLocation = meta.location.replace("`", "``")
+          val escapedDelta    = viewDeltaPath.replace("`", "``")
+          val cascadeSql =
+            s"""INSERT OVERWRITE TABLE delta.`$escapedDelta`
+               |SELECT $colList, CAST(-1 AS INT) AS `openivm_multiplicity`
+               |FROM delta.`$escapedLocation` VERSION AS OF $oldVersion
+               |UNION ALL
+               |SELECT $colList, CAST(1 AS INT) AS `openivm_multiplicity`
+               |FROM delta.`$escapedLocation`""".stripMargin
+          executeSql(cascadeSql)
+          if (diagnosticsEnabled)
+            logViewDeltaDiagnostics(spark, name, viewDeltaPath, stmtCounter.get() - 1)
+        }
+
         // MV-over-MV cascade: persist this MV's view-delta as a
         // `StagingDelta` row so any downstream MV's next REFRESH consumes it.
-        // Only refresh types that actually emit `INSERT INTO openivm_delta_<view>`
-        // (per RefreshTypeCode.emitsCascadeViewDelta) produce a view-delta on
-        // disk; for the others the rewriter writes the MV directly without a
-        // view-delta CTAS, so there is nothing to persist.
+        // Refresh types accepted by RefreshTypeCode.emitsCascadeViewDelta
+        // produce a view-delta on disk. Most are emitted by OpenIVM as
+        // `INSERT INTO openivm_delta_<view>`; SIMPLE_AGGREGATE is synthesized
+        // above from Spark's pinned pre/post snapshots. For all other refresh
+        // types there is nothing to persist.
         //
         // Strict ordering for crash safety:
         //   1. refresh program executes (writes data table + view-delta CTAS)
@@ -3147,7 +3187,12 @@ case class RefreshMaterializedViewCommand(
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
               val keysToRecord =
-                if (triggerKeys.isEmpty && fusedScratchView.isEmpty) {
+                if (triggerKeys.isEmpty && meta.refreshType == RefreshTypeCode.SimpleAggregate) {
+                  // A scalar snapshot delta is only needed for concrete current
+                  // consumers. A downstream created later absorbs the current
+                  // scalar in its initial CTAS and starts from a fresh watermark.
+                  Set.empty[String]
+                } else if (triggerKeys.isEmpty && fusedScratchView.isEmpty) {
                   // Keep the legacy on-disk breadcrumb for non-fused refreshes.
                   Set(viewNameStr)
                 } else triggerKeys
@@ -4167,8 +4212,8 @@ case class RefreshMaterializedViewCommand(
     *    pick up that row via `StagingCatalog.collectFor`.
     *
     *  - **NOT cascade-delta-capable** (e.g. FullRefresh,
-    *    SIMPLE_AGGREGATE, DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K,
-    *    or a recompute MV whose compiled SQL emitted no real view-delta):
+    *    DISTINCT_INCREMENTAL, SEMI_ANTI_RECOMPUTE, TOP_K, or a recompute MV
+    *    whose compiled SQL emitted no real view-delta):
     *    is no persisted upstream delta downstream can consume. Synthesise a
     *    **unique per-refresh trigger** row so the downstream's
     *    next REFRESH fires. The unique suffix prevents
