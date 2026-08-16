@@ -120,6 +120,17 @@ final case class MvMetadata(
         case "false" => false
       }
       .getOrElse(true)
+
+  /** SQL suffix applied by the user-facing Spark VIEW when the physical Delta
+    * table stores a larger incremental state (currently Top-K). Empty for a
+    * materialized view whose user-facing object is the Delta table itself.
+    */
+  def backingViewSuffix: Option[String] =
+    properties.get(MvMetadata.BackingViewSuffixKey).map(_.trim).filter(_.nonEmpty)
+
+  /** Whether writes must target the sibling `<mv>__ivm_data` Delta table. */
+  def usesBackingDataTable: Boolean =
+    refreshType == RefreshTypeCode.AggregateHaving || backingViewSuffix.nonEmpty
 }
 
 object MvMetadata {
@@ -134,6 +145,11 @@ object MvMetadata {
     * cascade-usable view-delta at REFRESH time.
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
+
+  /** SQL suffix (for example `ORDER BY ... LIMIT ...`) evaluated by the
+    * user-facing VIEW over an unlimited incremental backing table.
+    */
+  val BackingViewSuffixKey: String = "_ivm_backing_view_suffix"
 
   /** Property recording whether Spark's analyzed CREATE plan contains a join. */
   val QueryHasJoinKey: String = "_ivm_query_has_join"

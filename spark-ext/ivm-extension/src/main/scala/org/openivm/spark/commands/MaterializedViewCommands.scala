@@ -508,8 +508,10 @@ private[commands] object MvCommandHelper {
       .map(_.groupingExpressions.collect { case ne: NamedExpression => ne.name })
       .getOrElse(Nil)
 
-  /** Detects a top-level Top-K wrapper (`ORDER BY … [LIMIT k] [OFFSET m]`) in the
-    * user-supplied view body.
+  final case class TopKViewSpec(detected: Boolean, suffixSql: Option[String])
+
+  /** Extracts a top-level Top-K wrapper (`ORDER BY … [LIMIT k] [OFFSET m]`) from
+    * the user-supplied view body.
     *
     * Parses `querySql` with Spark's unresolved parser and inspects the root of
     * the resulting [[LogicalPlan]].  We look for any combination of
@@ -519,19 +521,80 @@ private[commands] object MvCommandHelper {
     * `ORDER BY … LIMIT k`; `Offset -> GlobalLimit -> LocalLimit -> Sort -> …`
     * for `ORDER BY … LIMIT k OFFSET m`).
     *
-    * Returns `false` if parsing fails for any reason (e.g. dialect-specific
-    * syntax), in which case the caller falls through to openivm's
-    * classification.
+    * `Tail` is detected but intentionally not translated: unlike LIMIT/OFFSET,
+    * its ordering semantics cannot be reconstructed as a SQL suffix without
+    * inspecting the child ordering. Such a query remains a full refresh.
     */
-  def hasTopLevelTopK(spark: SparkSession, querySql: String): Boolean = {
+  def extractTopKViewSpec(spark: SparkSession, querySql: String): TopKViewSpec = {
     try {
       val parsed = spark.sessionState.sqlParser.parsePlan(querySql)
-      parsed match {
-        case _: GlobalLimit | _: LocalLimit | _: Sort | _: Offset | _: Tail => true
-        case _                                                              => false
+
+      var detected        = false
+      var unsupportedTail = false
+      var orderBy         = Option.empty[String]
+      var limit           = Option.empty[String]
+      var offset          = Option.empty[String]
+
+      def peel(plan: LogicalPlan): Unit = plan match {
+        case GlobalLimit(expr, child) =>
+          detected = true
+          if (limit.isEmpty) limit = Some(expr.sql)
+          peel(child)
+        case LocalLimit(expr, child) =>
+          detected = true
+          if (limit.isEmpty) limit = Some(expr.sql)
+          peel(child)
+        case Offset(expr, child) =>
+          detected = true
+          if (offset.isEmpty) offset = Some(expr.sql)
+          peel(child)
+        case Sort(order, _, child) =>
+          detected = true
+          if (orderBy.isEmpty) orderBy = Some(order.map(_.sql).mkString(", "))
+          peel(child)
+        case _: Tail =>
+          detected = true
+          unsupportedTail = true
+        case _ => ()
       }
-    } catch { case _: Throwable => false }
+
+      peel(parsed)
+      val suffix =
+        if (!detected || unsupportedTail) None
+        else {
+          val parts = Seq(
+            orderBy.map(sql => s"ORDER BY $sql"),
+            limit.map(sql => s"LIMIT $sql"),
+            offset.map(sql => s"OFFSET $sql")
+          ).flatten
+          if (parts.nonEmpty) Some(parts.mkString(" ")) else None
+        }
+      TopKViewSpec(detected, suffix)
+    } catch { case _: Throwable => TopKViewSpec(detected = false, suffixSql = None) }
   }
+
+  /** Verify that the extracted suffix resolves against the compiler's unlimited
+    * inner result. Spark SQL permits ordering a query by a non-projected source
+    * column, but that column is unavailable to the outer backing-table VIEW.
+    * The analyzer probe is schema-only and launches no Spark job.
+    */
+  def validateTopKViewSpec(
+      spark: SparkSession,
+      spec: TopKViewSpec,
+      compiled: CompiledRefresh,
+      userOutputColumns: Seq[String]
+  ): TopKViewSpec =
+    spec.suffixSql match {
+      case None                                       => spec
+      case Some(_) if compiled.initialLoadSql.isEmpty => spec.copy(suffixSql = None)
+      case Some(suffix) =>
+        val inner = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val cols  = userOutputColumns.map(c => s"`${c.replace("`", "``")}`").mkString(", ")
+        try {
+          spark.sql(s"SELECT $cols FROM ($inner) __openivm_topk_preview $suffix").queryExecution.analyzed
+          spec
+        } catch { case _: Throwable => spec.copy(suffixSql = None) }
+    }
 
   /** If the view's aggregate has a `COUNT(*)` aggregate expression, return the
     * alias it projects under (e.g. `cnt` from `COUNT(*) AS cnt`).  This alias
@@ -557,11 +620,9 @@ private[commands] object MvCommandHelper {
     }
   }
 
-  /** Sibling Delta table name for an AGGREGATE_HAVING materialized view. The
-    * data table stores every group (no HAVING filter) so that a group whose
-    * aggregate later crosses the threshold can be promoted back into the
-    * HAVING-passing set via the incremental MERGE. The user-facing object is
-    * a Spark VIEW that applies the HAVING predicate at read time.
+  /** Sibling Delta table name for a materialized view whose user-facing object
+    * is a Spark VIEW. The data table stores the complete incremental state: all
+    * groups for AGGREGATE_HAVING and the unlimited inner result for Top-K.
     *
     * Convention: `<table>__ivm_data` in the same database. Stays in lock-step
     * between CREATE / REFRESH / DROP so the three commands address the same
@@ -783,14 +844,15 @@ private[commands] object MvCommandHelper {
   def classifyEffectiveRefreshType(
       compiled: CompiledRefresh,
       viewShortName: String,
-      isTopKView: Boolean,
+      topKViewSpec: TopKViewSpec,
       simpleProjectionHasDataApply: Boolean,
       nonCascadeUpstreamReason: Option[String],
       rawHavingPred: Option[String],
       aggregateHavingDataColumns: Option[Set[String]]
   ): EffectiveClassification = {
     val (effectiveRefreshType, reason) = {
-      if (isTopKView) (RefreshTypeCode.FullRefresh, "top_k")
+      if (topKViewSpec.detected && topKViewSpec.suffixSql.isEmpty)
+        (RefreshTypeCode.FullRefresh, "top_k_unsupported")
       else if (!simpleProjectionHasDataApply)
         (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
       else if (nonCascadeUpstreamReason.nonEmpty)
@@ -808,13 +870,15 @@ private[commands] object MvCommandHelper {
         (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
       else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName))
         (RefreshTypeCode.FullRefresh, "no_real_delta")
+      else if (topKViewSpec.detected) (compiled.refreshType, "top_k_kept")
       else (compiled.refreshType, "kept")
     }
     val effectiveRefreshTypeName =
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
       else compiled.refreshTypeName
     val emitsCascadeViewDelta =
-      RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+      !topKViewSpec.detected &&
+        RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
         SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
     EffectiveClassification(effectiveRefreshType, effectiveRefreshTypeName, reason, emitsCascadeViewDelta)
   }
@@ -1040,26 +1104,17 @@ case class CreateMaterializedViewCommand(
     // persisting the new signed view-delta. See CLAUDE.md: "Do not fix OpenIVM
     // correctness bugs by avoiding incrementalization."
     //
-    // Top-K views (`ORDER BY … [LIMIT k] [OFFSET m]`) are also routed to FULL_REFRESH.
-    // openivm classifies the *inner* stripped query as SIMPLE_PROJECTION (2) or
-    // AGGREGATE_GROUP (0) and applies the ORDER BY/LIMIT in a thin user-facing VIEW
-    // wrapper at read time (parser.cpp:239-291). The Spark side has no equivalent
-    // table+view split today: the MV is a single Delta table addressed by `<name>`,
-    // and the refresh rewriter writes directly into that table by name. Storing the
-    // *unlimited* inner result there would make `SELECT * FROM <mv>` return every
-    // row, ignoring the user's LIMIT; storing the *limited* result would produce an
-    // incrementally-broken state (rows that fell out of the top-k can't come back
-    // after a DELETE/UPDATE without reading the live source). FULL_REFRESH avoids
-    // both pitfalls: every refresh runs `INSERT OVERWRITE TABLE <mv> SELECT * FROM
-    // (<originalQueryText>)`, which evaluates `ORDER BY … LIMIT k` over the live
-    // source and atomically replaces the MV with the correct k-row snapshot.
-    //
-    // This is an explicit (NOT silent) demotion. A future refinement could mirror
-    // openivm's pattern — maintain an inner data table incrementally and create a
-    // Spark VIEW on top with the ORDER BY/LIMIT applied at read time — but that
-    // requires schema changes to `MvMetadata`, the refresh rewriter, and the drop
-    // path that are out of scope here.
-    val isTopKView = hasTopLevelTopK(spark, originalQueryText)
+    // Top-K views mirror OpenIVM's table/view split: the compiler classifies and
+    // maintains the unlimited inner query, while Spark exposes a user-facing VIEW
+    // that applies ORDER BY/LIMIT/OFFSET. Keeping rows outside the current K in the
+    // sibling table is what lets a DELETE or UPDATE promote the next-best row
+    // without recomputing the full query.
+    val topKViewSpec = validateTopKViewSpec(
+      spark,
+      extractTopKViewSpec(spark, originalQueryText),
+      compiled,
+      analyzed.output.map(_.name)
+    )
     // For AGGREGATE_HAVING (type 4) we need to extract the HAVING predicate up
     // front so we can build the user-facing VIEW that filters the data table.
     // If extraction fails (e.g. HAVING references a hidden aggregate not in
@@ -1090,7 +1145,10 @@ case class CreateMaterializedViewCommand(
     // surfaced via [[logError]] with a `reason=<key>` tag so the operator can
     // see WHY each MV ended up FULL_REFRESH in the spark-ext / dbt-server
     // container log. The reason keys mirror the if-else branches:
-    //   - top_k                       Top-K view (ORDER BY ... LIMIT ...) forced to FULL_REFRESH
+    //   - top_k_unsupported           Top-K wrapper (currently Tail) could not be
+    //                                 represented by the backing-table VIEW
+    //   - top_k_kept                  Top-K inner query remains incremental; the
+    //                                 user-facing VIEW applies its SQL suffix
     //   - simple_projection_no_apply  compiler emitted a SIMPLE_PROJECTION delta
     //                                 feed but no data-table apply statement after
     //                                 rewrite, so REFRESH would be a no-op
@@ -1117,7 +1175,7 @@ case class CreateMaterializedViewCommand(
     val classification = classifyEffectiveRefreshType(
       compiled = compiled,
       viewShortName = name.table,
-      isTopKView = isTopKView,
+      topKViewSpec = topKViewSpec,
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
       nonCascadeUpstreamReason = nonCascadeUpstreamReason,
       rawHavingPred = rawHavingPred,
@@ -1148,16 +1206,21 @@ case class CreateMaterializedViewCommand(
     // applies the HAVING predicate at read time. Mirrors openivm's
     // `openivm_data_<v>` + user-facing VIEW pattern in `CompileAggregateGroups`.
     val isHavingViewIncremental = effectiveRefreshType == RefreshTypeCode.AggregateHaving
+    val topKViewSuffix =
+      if (effectiveRefreshType != RefreshTypeCode.FullRefresh) topKViewSpec.suffixSql else None
+    val usesBackingDataTable = isHavingViewIncremental || topKViewSuffix.nonEmpty
     val dataIdent: TableIdentifier =
-      if (isHavingViewIncremental) dataTableId(name) else name
+      if (usesBackingDataTable) dataTableId(name) else name
     val havingPred: Option[String] = if (isHavingViewIncremental) rawHavingPred else None
     val userOutputCols: Seq[String] =
-      if (isHavingViewIncremental) analyzed.output.map(_.name) else Nil
+      if (usesBackingDataTable) analyzed.output.map(_.name) else Nil
 
     // Persist internal metadata alongside any user-provided properties.
-    val baseProps         = Map("_ivm_group_keys" -> groupKeys.mkString(","))
-    val countProp         = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
-    val havingProp        = havingPred.map(p => "_ivm_having_pred" -> p).toMap
+    val baseProps  = Map("_ivm_group_keys" -> groupKeys.mkString(","))
+    val countProp  = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
+    val havingProp = havingPred.map(p => "_ivm_having_pred" -> p).toMap
+    val backingViewProp =
+      topKViewSuffix.map(MvMetadata.BackingViewSuffixKey -> _).toMap
     val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
 
@@ -1204,7 +1267,7 @@ case class CreateMaterializedViewCommand(
     }
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
     val allProps =
-      properties ++ baseProps ++ countProp ++ havingProp ++ clusterColsProp ++ cascadeDeltaProps ++
+      properties ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
         queryShapeProps ++ compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
@@ -1306,13 +1369,10 @@ case class CreateMaterializedViewCommand(
         }
       }
 
-      // For AGGREGATE_HAVING we additionally create the user-facing Spark VIEW
-      // that projects only the user columns from the data table and applies the
-      // HAVING predicate. The post-pass DELETE during refresh removes zero-count
-      // rows from the data table so this VIEW does not need a separate
-      // `openivm_count_star > 0` guard.
-      if (isHavingViewIncremental) {
-        profile.timeStep("create_mv_user_view", "kind=aggregate_having") {
+      // Backing-table layouts expose a Spark VIEW that hides OpenIVM bookkeeping
+      // columns and applies HAVING and/or Top-K only at read time.
+      if (usesBackingDataTable) {
+        profile.timeStep("create_mv_user_view", s"having=$isHavingViewIncremental;top_k=${topKViewSuffix.nonEmpty}") {
           val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
           val pred     = havingPred.getOrElse("TRUE")
           if (!havingPredicateIsSafe(pred, dataCols)) {
@@ -1327,16 +1387,18 @@ case class CreateMaterializedViewCommand(
           val colList = userOutputCols
             .map(c => s"`${c.replace("`", "``")}`")
             .mkString(", ")
+          val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
+          val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
           val viewSql =
             s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
-              s"SELECT $colList FROM ${sqlIdent(dataIdent)} WHERE ($pred)"
+              s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
           val t0 = System.nanoTime()
           try {
             spark.sql(viewSql)
           } finally {
             val ms = (System.nanoTime() - t0) / 1000000L
             sqlLog.record(
-              category = "aggregate_having_view",
+              category = "backing_user_view",
               stmtOrder = 1,
               attemptIdx = 0,
               stmtKind = "ddl",
@@ -2198,8 +2260,7 @@ case class RefreshMaterializedViewCommand(
       // group whose aggregate later crosses the threshold can be re-promoted
       // back into the HAVING-passing set incrementally.
       val mergeTargetId: TableIdentifier =
-        if (meta.refreshType == RefreshTypeCode.AggregateHaving) dataTableId(name)
-        else name
+        if (meta.usesBackingDataTable) dataTableId(name) else name
 
       // Workload-aware insert-only fast path. For a SIMPLE_PROJECTION on the
       // recompute path (DELETE by openivm_left_key + recompute), when this batch
@@ -4297,7 +4358,7 @@ case class DropMaterializedViewCommand(
         // For AGGREGATE_HAVING the user-facing name is a Spark VIEW and the
         // data lives in a sibling Delta table. Drop both so no orphan storage
         // or stale catalog entry survives.
-        if (meta.refreshType == RefreshTypeCode.AggregateHaving) {
+        if (meta.usesBackingDataTable) {
           spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
           spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
         } else {

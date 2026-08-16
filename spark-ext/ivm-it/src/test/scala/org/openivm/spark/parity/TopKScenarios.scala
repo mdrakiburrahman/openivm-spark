@@ -86,6 +86,9 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
         "CREATE MATERIALIZED VIEW mv_topk_1 AS " +
           "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
       )
+      spark.catalog.getTable("mv_topk_1").tableType shouldBe "VIEW"
+      spark.catalog.getTable("mv_topk_1__ivm_data").tableType should not be "VIEW"
+      spark.table("mv_topk_1__ivm_data").count() shouldBe 5L
       assertMvCorrect(
         "mv_topk_1",
         "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
@@ -94,6 +97,7 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
       // one that does not.  After REFRESH, the MV should reflect the new top-3.
       sql("INSERT INTO sales_t1 VALUES (6,'south',45),(7,'south',5)")
       refreshMv("mv_topk_1")
+      spark.table("mv_topk_1__ivm_data").count() shouldBe 7L
       assertMvCorrect(
         "mv_topk_1",
         "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
@@ -351,6 +355,65 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
         "mv_topk_9",
         "SELECT id, region, amount FROM sales_t9 ORDER BY amount DESC LIMIT 2"
       )
+    }
+  }
+
+  // ── (10) HAVING + Top-K share one backing-table VIEW ─────────────────────
+
+  describe("(10) HAVING composed with ORDER BY aggregate LIMIT") {
+    it("filters all maintained groups before applying Top-K") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t10(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t10 VALUES ('a',10),('b',30),('c',40),('d',50)")
+      val query =
+        "SELECT region, SUM(amount) AS total FROM sales_t10 GROUP BY region " +
+          "HAVING SUM(amount) >= 30 ORDER BY total DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_10 AS $query")
+
+      spark.catalog.getTable("mv_topk_10").tableType shouldBe "VIEW"
+      spark.table("mv_topk_10__ivm_data").count() shouldBe 4L
+      assertMvCorrect("mv_topk_10", query)
+
+      sql("INSERT INTO sales_t10 VALUES ('a',60)")
+      refreshMv("mv_topk_10")
+      assertMvCorrect("mv_topk_10", query)
+    }
+  }
+
+  // ── (11) DROP removes the logical and physical objects ───────────────────
+
+  describe("(11) DROP MATERIALIZED VIEW cleanup") {
+    it("drops both the user VIEW and unlimited backing table") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t11(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t11 VALUES (1,10),(2,20),(3,30)")
+      sql(
+        "CREATE MATERIALIZED VIEW mv_topk_11 AS " +
+          "SELECT id, amount FROM sales_t11 ORDER BY amount DESC LIMIT 2"
+      )
+
+      spark.catalog.tableExists("mv_topk_11") shouldBe true
+      spark.catalog.tableExists("mv_topk_11__ivm_data") shouldBe true
+      sql("DROP MATERIALIZED VIEW mv_topk_11")
+      spark.catalog.tableExists("mv_topk_11") shouldBe false
+      spark.catalog.tableExists("mv_topk_11__ivm_data") shouldBe false
+    }
+  }
+
+  // ── (12) ORDER BY a non-projected column falls back safely ───────────────
+
+  describe("(12) ORDER BY a column absent from the backing-table schema") {
+    it("uses full refresh instead of publishing an invalid Spark VIEW") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t12(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t12 VALUES (1,10),(2,30),(3,20)")
+      val query = "SELECT id FROM sales_t12 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_12 AS $query")
+
+      spark.catalog.getTable("mv_topk_12").tableType should not be "VIEW"
+      spark.catalog.tableExists("mv_topk_12__ivm_data") shouldBe false
+      assertMvCorrect("mv_topk_12", query)
+
+      sql("INSERT INTO sales_t12 VALUES (4,40)")
+      refreshMv("mv_topk_12")
+      assertMvCorrect("mv_topk_12", query)
     }
   }
 }

@@ -122,7 +122,12 @@ object MvDryCompile {
     val aggregateHavingDataColumns = computeAggregateHavingDataColumns(spark, compiled, queryText)
     val simpleProjectionHasDataApply =
       computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
-    val isTopKView = hasTopLevelTopK(spark, queryText)
+    val topKViewSpec = validateTopKViewSpec(
+      spark,
+      extractTopKViewSpec(spark, queryText),
+      compiled,
+      analyzed.output.map(_.name)
+    )
     val rawHavingPred =
       if (compiled.refreshType == RefreshTypeCode.AggregateHaving) extractHavingPredicateSql(analyzed)
       else None
@@ -132,7 +137,7 @@ object MvDryCompile {
     val classification = classifyEffectiveRefreshType(
       compiled = compiled,
       viewShortName = name.table,
-      isTopKView = isTopKView,
+      topKViewSpec = topKViewSpec,
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
       nonCascadeUpstreamReason = nonCascadeUpstreamReason,
       rawHavingPred = rawHavingPred,
@@ -140,7 +145,17 @@ object MvDryCompile {
     )
 
     val rewrittenStatements =
-      dryRewrite(spark, name, location, compiled, classification, queryText, qualSchemas, shortToQual)
+      dryRewrite(
+        spark,
+        name,
+        location,
+        compiled,
+        classification,
+        topKViewSpec,
+        queryText,
+        qualSchemas,
+        shortToQual
+      )
 
     DryCompileResult(name, classification, compiled, qualNames, rewrittenStatements, outputSchema)
   }
@@ -156,6 +171,7 @@ object MvDryCompile {
       location: String,
       compiled: CompiledRefresh,
       classification: MvCommandHelper.EffectiveClassification,
+      topKViewSpec: MvCommandHelper.TopKViewSpec,
       queryText: String,
       qualSchemas: Map[String, StructType],
       shortToQual: Map[String, String]
@@ -180,10 +196,14 @@ object MvDryCompile {
       Seq.empty
     } else {
       val viewDeltaPath = s"${location.stripSuffix("/")}/__openivm_view_delta"
+      val writeTarget =
+        if (classification.refreshType == RefreshTypeCode.AggregateHaving || topKViewSpec.suffixSql.nonEmpty)
+          dataTableId(name)
+        else name
       SparkRefreshRewriter
         .rewrite(
           compiledSql = compiled.sql,
-          mvName = name,
+          mvName = writeTarget,
           mvLocation = location,
           viewLogicalName = name.table,
           sourceTempViews = Map.empty,

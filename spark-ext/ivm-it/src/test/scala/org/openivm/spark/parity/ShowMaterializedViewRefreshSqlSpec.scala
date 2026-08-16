@@ -44,7 +44,7 @@ class ShowMaterializedViewRefreshSqlSpec extends IvmParitySpecBase("show-refresh
       mvExists("srs_mv_agg") shouldBe false
     }
 
-    it("emits an INSERT OVERWRITE program for a FULL_REFRESH (Top-K) view") {
+    it("emits an incremental program targeting the Top-K backing table") {
       sql("CREATE TABLE srs_topk_src (region STRING, amount INT) USING DELTA")
       sql("INSERT INTO srs_topk_src VALUES ('east', 10), ('west', 20), ('north', 30)")
 
@@ -52,8 +52,8 @@ class ShowMaterializedViewRefreshSqlSpec extends IvmParitySpecBase("show-refresh
       val program =
         refreshSql(s"SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW srs_mv_topk AS $q")
 
-      program.toUpperCase should include("INSERT OVERWRITE")
-      program should include("srs_mv_topk")
+      program.toUpperCase should include("MERGE INTO")
+      program should include("srs_mv_topk__ivm_data")
       mvExists("srs_mv_topk") shouldBe false
     }
 

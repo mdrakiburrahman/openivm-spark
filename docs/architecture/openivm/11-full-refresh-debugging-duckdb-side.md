@@ -523,7 +523,7 @@ current source.
 | `LOGICAL_JOIN` with SEMI/ANTI/MARK                                                        | `SEMI_ANTI_RECOMPUTE` for extracted projection-only shapes                                           | SEMI/ANTI plus aggregation is `FULL_REFRESH`; extractor failure can be `FULL_REFRESH`.                                                                       |
 | `LOGICAL_DEPENDENT_JOIN` / `LOGICAL_DELIM_JOIN`                                           | Delim/dependent rewrite or group recompute for correlated shapes                                     | Some lateral/correlated forms fail extraction or later Spark execution; unhandled forms can become `FULL_REFRESH` or compile failure.                        |
 | `LOGICAL_WINDOW`                                                                          | `WINDOW_PARTITION`                                                                                   | Single-source partition recompute is OK; multi-source lineage gaps keep the label but emit full-recompute-shaped SQL.                                        |
-| `LOGICAL_TOP_N` / `LOGICAL_LIMIT` / `LOGICAL_ORDER_BY`                                    | `TOP_K` or top-k wrapper over child                                                                  | Non-column ORDER BY marks incompatible; Spark currently demotes top-k to `FULL_REFRESH`.                                                                     |
+| `LOGICAL_TOP_N` / `LOGICAL_LIMIT` / `LOGICAL_ORDER_BY`                                    | `TOP_K` or top-k wrapper over child                                                                  | Non-column ORDER BY can mark the DuckDB plan incompatible; Spark otherwise maintains the inner type behind a user-facing VIEW.                               |
 | `LOGICAL_UNION`                                                                           | Preserves or combines child family                                                                   | Volatile union expressions mark incompatible; unsupported set operations are `INTERSECT` and `EXCEPT`, not `UNION ALL`.                                      |
 | `LOGICAL_INTERSECT` / `LOGICAL_EXCEPT`                                                    | none                                                                                                 | `parser_plan_helpers.cpp` marks unsupported set operation, then parser selects `FULL_REFRESH`.                                                               |
 | `LOGICAL_MATERIALIZED_CTE`                                                                | Inherit the inlined/consumer family                                                                  | Non-inlinable or recursive-like CTE shapes can expose unsupported operators and fall back.                                                                   |
@@ -612,7 +612,7 @@ Interpretation:
 | Spark metadata                     | Cache / reason                                                    | Diagnosis                                     |
 | ---------------------------------- | ----------------------------------------------------------------- | --------------------------------------------- |
 | `refreshTypeName=FULL_REFRESH`     | no reason, DuckDB standalone also returns `FULL_REFRESH`          | OpenIVM emitted full refresh naturally.       |
-| `refreshTypeName=FULL_REFRESH`     | reason `top_k`, `no_real_delta`, `compile_failed`, etc.           | Spark-side demotion; use the Spark chapter.   |
+| `refreshTypeName=FULL_REFRESH`     | reason `top_k_unsupported`, `no_real_delta`, `compile_failed`, etc. | Spark-side demotion; use the Spark chapter. |
 | `refreshTypeName=WINDOW_PARTITION` | SQL performs full recompute                                       | DuckDB window refresh fallback, not demotion. |
 | `refreshTypeName=AGGREGATE_GROUP`  | SQL performs full recompute because `openivm_refresh_mode='full'` | Force-full SQL shape, not classifier change.  |
 
@@ -687,14 +687,13 @@ operator falls through to `incremental_compatible=false` and then
 For openivm-spark parity, use a shared-dialect shape such as `EXCEPT ALL` when
 you need a reproducible `FULL_REFRESH` example.
 
-### 14.5 Why did `TOP_K` become `FULL_REFRESH` in Spark?
+### 14.5 How does Spark execute Top-K?
 
-That is usually Spark-side.
-OpenIVM has a `TOP_K` enum and a top-k rule, but the Spark architecture chapter
-records that top-k is effectively dead for Spark execution and is demoted to
-`FULL_REFRESH` by Spark-side checks.
-If the standalone DuckDB JSON says `TOP_K` and Spark metadata says
-`FULL_REFRESH`, read the Spark-side demotion chapter.
+The direct enum is legacy. OpenIVM strips the wrapper and classifies its inner
+query; Spark maintains that unlimited inner result in `<mv>__ivm_data` and
+applies the Top-K suffix in the public Spark VIEW. A `FULL_REFRESH` with
+`top_k_unsupported` currently means Spark encountered `TAIL`, not ordinary
+`ORDER BY`/`LIMIT`/`OFFSET`.
 
 ## 15. Cross-links
 

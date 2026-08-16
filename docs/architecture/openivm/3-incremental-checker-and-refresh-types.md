@@ -145,7 +145,7 @@ flowchart TD
   J --> JT[no JOIN_INCREMENTAL enum; join feeds projection/aggregate type]
   R --> SJ[SEMI/ANTI JOIN] --> SAR[SEMI_ANTI_RECOMPUTE]
   R --> W[WINDOW] --> WP[WINDOW_PARTITION]
-  R --> T[ORDER BY + LIMIT] --> TK[TOP_K legacy; Spark demotes to FULL_REFRESH]
+  R --> T[ORDER BY + LIMIT] --> TK[Classify inner query; Spark backing table + VIEW]
   R --> O[otherwise] --> FR[FULL_REFRESH]
 ```
 
@@ -497,22 +497,23 @@ WHERE EXISTS (SELECT 1 FROM openivm_affected_mv_distinct_amounts a WHERE a.custo
 With `openivm_emit_cascade_delta_for_recompute=true`, OpenIVM can also emit a
 signed old/new snapshot delta for downstream MV-over-MV refresh.
 
-## 3.13 Ordinal 7: TOP_K is dead on Spark
+## 3.13 Ordinal 7: TOP_K is a dead direct type on Spark
 
 `TOP_K` is a legacy enum value.
 OpenIVM can detect top-k wrappers and strip them from the stored inner data
 query, then apply ORDER BY/LIMIT in a user-facing DuckDB view.
-Spark does not currently store MVs as an inner table plus a separate view
-wrapper, so openivm-spark explicitly demotes top-level top-k MVs to
-`FULL_REFRESH` at CREATE time.
+OpenIVM-Spark mirrors that layout: it incrementally maintains the inner query
+under `<mv>__ivm_data` using the projection/aggregate refresh type and exposes
+the public MV as a separate Spark VIEW. Only unsupported `TAIL` extraction is
+demoted to `FULL_REFRESH`.
 OpenIVM sources:
 
 - `incremental_checker.cpp:332-380` detects TOP_N/ORDER/LIMIT;
 - `parser.cpp:243-290` strips a top-level top-k wrapper;
 - `openivm_constants.hpp:75` marks `TOP_K` as legacy.
-  Spark demotion sources:
-- `MaterializedViewCommands.scala:183-206` defines `hasTopLevelTopK`;
-- `MaterializedViewCommands.scala:488-507` explains why Spark demotes;
+  Spark integration source:
+- `MaterializedViewCommands.scala` defines `extractTopKViewSpec` and the
+  backing-table CREATE/REFRESH/DROP path;
 - `MaterializedViewCommands.scala:597-599` sets effective type to
   `FullRefresh` with reason `top_k`.
   Representative MV:
@@ -757,8 +758,8 @@ For Spark cascade context, see
    been normalized before `IncrementalChecker` sees the plan.
 1. For joins, do not look for `JOIN_INCREMENTAL`.
    Ask whether the root is projection, grouped aggregate, HAVING, or recompute.
-1. For top-k on Spark, expect `FULL_REFRESH` by design.
-   The demotion source is `MaterializedViewCommands.scala:597-599`.
+1. For top-k on Spark, expect the inner projection/aggregate refresh type and
+   `reason='top_k_kept'`; `TAIL` remains `top_k_unsupported` full refresh.
 1. For Duck-side full refresh, inspect `parser.cpp:610-800` and
    `refresh_sql.cpp:401-412`.
 1. For Spark-side full refresh, inspect chapter 11 of openivm-spark docs and the
