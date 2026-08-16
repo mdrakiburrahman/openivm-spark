@@ -13,6 +13,7 @@ import org.openivm.spark.common.{
   StagingDelta
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
+import org.openivm.spark.compiler.CompiledRefresh
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -153,6 +154,24 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         Seq(stagingBatch(StagingDelta.OpTypes.MvViewDelta)),
         Seq.empty
       ) shouldBe false
+    }
+
+    it("skips the SIMPLE_PROJECTION apply probe for pathologically large compiled SQL") {
+      val compiled = CompiledRefresh(
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        sql = "x" * (MvCommandHelper.SimpleProjectionProbeMaxSqlChars + 1),
+        initialLoadSql = ""
+      )
+
+      MvCommandHelper.computeSimpleProjectionHasDataApply(
+        spark = null,
+        compiled = compiled,
+        name = TableIdentifier("mv_large_probe"),
+        location = "target/mv_large_probe",
+        qualSchemas = Map.empty,
+        shortToQual = Map.empty
+      ) shouldBe true
     }
   }
 
