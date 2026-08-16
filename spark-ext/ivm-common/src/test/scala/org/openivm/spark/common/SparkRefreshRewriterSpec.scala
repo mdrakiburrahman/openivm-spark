@@ -1959,7 +1959,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       // A single multi-MB compiled openivm SQL drove one has-data-probe rewrite
       // to 4+ minutes. A token-boundary lookbehind + possessive quantifiers make
       // this linear.
-      val huge = "a" * 500000 + " scan_0 (c, c) AS (SELECT 1)"
+      val huge          = "a" * 500000 + " scan_0 (c, c) AS (SELECT 1)"
       val deadlineNanos = System.nanoTime() + 5000000000L // 5s ceiling
       val out           = SparkRefreshRewriter.deduplicateCteColumnAliases(huge)
       assert(
@@ -1967,6 +1967,64 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "deduplicateCteColumnAliases took too long — O(n^2) regression"
       )
       out should include("scan_0 (c, c_1) AS (")
+    }
+  }
+
+  describe("stripTimestampPredicate") {
+    it("strips standalone, leading-AND, and trailing-AND timestamp predicates") {
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
+      ) shouldBe "SELECT * FROM t"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE region = 'r' AND d.openivm_timestamp >= CAST('2024-01-01' AS TIMESTAMP)"
+      ) shouldBe "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE (openivm_timestamp >= '2024-01-01'::TIMESTAMP) AND region = 'r'"
+      ) shouldBe "SELECT * FROM t WHERE region = 'r'"
+    }
+
+    it("does NOT hang on a long identifier before a timestamp predicate (ReDoS guard)") {
+      val huge          = "a" * 500000 + " SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.stripTimestampPredicate(huge)
+      assert(System.nanoTime() < deadlineNanos, "stripTimestampPredicate took too long — regex backtracking regression")
+      out should endWith(" SELECT * FROM t")
+    }
+  }
+
+  describe("equalityPredicates") {
+    it("extracts dotted equality predicates with bare and backtick identifiers") {
+      SparkRefreshRewriter.equalityPredicates("a.b = `c`.`d`") shouldBe Seq(("a", "b", "c", "`d`"))
+    }
+
+    it("does NOT hang on a long identifier before a dotted equality (ReDoS guard)") {
+      val huge          = "a" * 500000 + " x.y = z.w"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.equalityPredicates(huge)
+      assert(System.nanoTime() < deadlineNanos, "equalityPredicates took too long — O(n^2) regression")
+      out shouldBe Seq(("x", "y", "z", "w"))
+    }
+  }
+
+  describe("rewriteMemoryMainPrefix") {
+    it("does NOT hang on a long identifier before a memory.main reference (ReDoS guard)") {
+      val huge          = "a" * 500000 + " SELECT * FROM memory.main.openivm_delta_orders"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.rewriteMemoryMainPrefix(huge)
+      assert(System.nanoTime() < deadlineNanos, "rewriteMemoryMainPrefix took too long — regex regression")
+      out should endWith(" SELECT * FROM `openivm_delta_orders`")
+    }
+  }
+
+  describe("rewriteInsertToCtas") {
+    it("rewrites the INSERT column-list CTAS form after a long non-match prefix without hanging") {
+      val sql = "a" * 500000 +
+        " WITH scan_0 (c, m) AS (SELECT c, m FROM src) INSERT INTO openivm_delta_mv (c, m) SELECT * FROM scan_0"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.rewriteInsertToCtas(sql, "mv", "target/openivm-view-delta")
+      assert(System.nanoTime() < deadlineNanos, "rewriteInsertToCtas took too long — regex regression")
+      out should include("CREATE OR REPLACE TABLE delta.`target/openivm-view-delta` USING DELTA AS")
+      out should include("SELECT c AS c, m AS m FROM scan_0")
     }
   }
 }
