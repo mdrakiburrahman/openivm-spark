@@ -340,4 +340,33 @@ abstract class PipelineCascadeScenarios extends IvmParitySpecBase("pipeline-casc
       assertMvCorrect("plc_fuse_down", "SELECT id, name FROM plc_fuse_src WHERE age >= 25")
     }
   }
+
+  describe("(O) multi-column SIMPLE_AGGREGATE cascade") {
+
+    it("propagates every old and new scalar column to a downstream projection") {
+      sql("CREATE TABLE IF NOT EXISTS plc_scalar_multi_src(x INT) USING DELTA")
+      sql("INSERT INTO plc_scalar_multi_src VALUES (10),(20),(NULL)")
+      sql(
+        "CREATE MATERIALIZED VIEW plc_scalar_multi_up AS " +
+          "SELECT SUM(x) AS total, COUNT(*) AS row_count, COUNT(x) AS value_count FROM plc_scalar_multi_src"
+      )
+      sql(
+        "CREATE MATERIALIZED VIEW plc_scalar_multi_down AS " +
+          "SELECT total, row_count, value_count FROM plc_scalar_multi_up"
+      )
+
+      sql("DELETE FROM plc_scalar_multi_src WHERE x = 10 OR x IS NULL")
+      sql("INSERT INTO plc_scalar_multi_src VALUES (5),(NULL)")
+      refreshChain("plc_scalar_multi_up", "plc_scalar_multi_down")
+
+      assertMvCorrect(
+        "plc_scalar_multi_up",
+        "SELECT SUM(x) AS total, COUNT(*) AS row_count, COUNT(x) AS value_count FROM plc_scalar_multi_src"
+      )
+      assertMvCorrect(
+        "plc_scalar_multi_down",
+        "SELECT SUM(x) AS total, COUNT(*) AS row_count, COUNT(x) AS value_count FROM plc_scalar_multi_src"
+      )
+    }
+  }
 }

@@ -530,7 +530,7 @@ private[commands] object MvCommandHelper {
       val parsed = spark.sessionState.sqlParser.parsePlan(querySql)
 
       var detected        = false
-      var unsupportedTail = false
+      var unsupportedWrapper = false
       var orderBy         = Option.empty[String]
       var limit           = Option.empty[String]
       var offset          = Option.empty[String]
@@ -548,19 +548,20 @@ private[commands] object MvCommandHelper {
           detected = true
           if (offset.isEmpty) offset = Some(expr.sql)
           peel(child)
-        case Sort(order, _, child) =>
+        case Sort(order, global, child) =>
           detected = true
-          if (orderBy.isEmpty) orderBy = Some(order.map(_.sql).mkString(", "))
+          if (!global) unsupportedWrapper = true
+          else if (orderBy.isEmpty) orderBy = Some(order.map(_.sql).mkString(", "))
           peel(child)
         case _: Tail =>
           detected = true
-          unsupportedTail = true
+          unsupportedWrapper = true
         case _ => ()
       }
 
       peel(parsed)
       val suffix =
-        if (!detected || unsupportedTail) None
+        if (!detected || unsupportedWrapper) None
         else {
           val parts = Seq(
             orderBy.map(sql => s"ORDER BY $sql"),
@@ -570,7 +571,7 @@ private[commands] object MvCommandHelper {
           if (parts.nonEmpty) Some(parts.mkString(" ")) else None
         }
       TopKViewSpec(detected, suffix)
-    } catch { case _: Throwable => TopKViewSpec(detected = false, suffixSql = None) }
+    } catch { case NonFatal(_) => TopKViewSpec(detected = false, suffixSql = None) }
   }
 
   /** Verify that the extracted suffix resolves against the compiler's unlimited
@@ -593,7 +594,7 @@ private[commands] object MvCommandHelper {
         try {
           spark.sql(s"SELECT $cols FROM ($inner) __openivm_topk_preview $suffix").queryExecution.analyzed
           spec
-        } catch { case _: Throwable => spec.copy(suffixSql = None) }
+        } catch { case NonFatal(_) => spec.copy(suffixSql = None) }
     }
 
   /** If the view's aggregate has a `COUNT(*)` aggregate expression, return the
@@ -1266,8 +1267,9 @@ case class CreateMaterializedViewCommand(
       propagation.currentWatermarks(spark, qualNames)
     }
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
+    val userProps = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
-      properties ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
+      userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
         queryShapeProps ++ compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
@@ -1918,11 +1920,13 @@ case class RefreshMaterializedViewCommand(
           org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
         else meta.querySql
       }
+      val fullRefreshTarget =
+        if (meta.usesBackingDataTable) dataTableId(name) else name
       val input = AssemblyInput(
         refreshType = RefreshTypeCode.FullRefresh,
         refreshTypeName = "FULL_REFRESH",
         deltaSql = fullRefreshSql,
-        mvName = metaName(name),
+        mvName = metaName(fullRefreshTarget),
         mvLocation = meta.location
       )
       val assembled = SparkMergeAssembler.assemble(input)
@@ -2272,7 +2276,11 @@ case class RefreshMaterializedViewCommand(
           meta.emitsCascadeViewDelta &&
           downstreamSourceKeysForThisMv.nonEmpty
         )
-          Some(DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version"))
+          Some(
+            profile.timeStep("pin_simple_aggregate_version", "source=delta_history") {
+              DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+            }
+          )
         else None
 
       // Workload-aware insert-only fast path. For a SIMPLE_PROJECTION on the
@@ -3148,9 +3156,11 @@ case class RefreshMaterializedViewCommand(
                |UNION ALL
                |SELECT $colList, CAST(1 AS INT) AS `openivm_multiplicity`
                |FROM delta.`$escapedLocation`""".stripMargin
-          executeSql(cascadeSql)
-          if (diagnosticsEnabled)
-            logViewDeltaDiagnostics(spark, name, viewDeltaPath, stmtCounter.get() - 1)
+          profile.timeStep("simple_aggregate_cascade_snapshot", s"old_version=$oldVersion") {
+            executeSql(cascadeSql)
+            if (diagnosticsEnabled)
+              logViewDeltaDiagnostics(spark, name, viewDeltaPath, stmtCounter.get() - 1)
+          }
         }
 
         // MV-over-MV cascade: persist this MV's view-delta as a

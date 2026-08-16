@@ -3,6 +3,8 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
 /** End-to-end parity tests for Top-K materialized views
   * (`ORDER BY … LIMIT k`).
@@ -414,6 +416,60 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
       sql("INSERT INTO sales_t12 VALUES (4,40)")
       refreshMv("mv_topk_12")
       assertMvCorrect("mv_topk_12", query)
+    }
+  }
+
+  // ── (13) Top-K as an upstream MV ─────────────────────────────────────────
+
+  describe("(13) downstream MV over a Top-K backing-table view") {
+    it("refreshes the downstream snapshot after the Top-K membership changes") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t13(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t13 VALUES (1,10),(2,20),(3,30),(4,40)")
+      val topKQuery = "SELECT id, amount FROM sales_t13 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_13 AS $topKQuery")
+      sql("CREATE MATERIALIZED VIEW mv_topk_13_down AS SELECT id, amount FROM mv_topk_13")
+
+      sql("INSERT INTO sales_t13 VALUES (5,50)")
+      refreshMv("mv_topk_13")
+      refreshMv("mv_topk_13_down")
+
+      assertMvCorrect("mv_topk_13", topKQuery)
+      assertMvCorrect("mv_topk_13_down", topKQuery)
+    }
+  }
+
+  // ── (14) Source overwrite fallback targets backing state ────────────────
+
+  describe("(14) source overwrite followed by Top-K refresh") {
+    it("recomputes the unlimited backing table instead of overwriting the public view") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t14(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t14 VALUES (1,10),(2,20),(3,30)")
+      val query = "SELECT id, amount FROM sales_t14 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_14 AS $query")
+
+      sql("INSERT OVERWRITE TABLE sales_t14 VALUES (4,40),(5,50),(6,60),(7,70)")
+      refreshMv("mv_topk_14")
+
+      spark.catalog.getTable("mv_topk_14").tableType shouldBe "VIEW"
+      spark.table("mv_topk_14__ivm_data").count() shouldBe 4L
+      assertMvCorrect("mv_topk_14", query)
+    }
+  }
+
+  // ── (15) Partition-local sort is not rewritten as global ORDER BY ────────
+
+  describe("(15) SORT BY with LIMIT") {
+    it("falls back instead of changing a partition-local sort into global ordering") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t15(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t15 VALUES (1,10),(2,20),(3,30),(4,40)")
+      sql(
+        "CREATE MATERIALIZED VIEW mv_topk_15 AS " +
+          "SELECT id, amount FROM sales_t15 SORT BY amount DESC LIMIT 2"
+      )
+
+      spark.catalog.getTable("mv_topk_15").tableType should not be "VIEW"
+      spark.catalog.tableExists("mv_topk_15__ivm_data") shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_topk_15")).get.refreshType shouldBe RefreshTypeCode.FullRefresh
     }
   }
 }

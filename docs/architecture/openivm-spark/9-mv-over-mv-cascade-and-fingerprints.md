@@ -607,7 +607,8 @@ Therefore a downstream MV can detect that its upstream MV was dropped and recrea
 At CREATE time the compiler's refresh type is converted to an effective refresh type.
 The effective refresh type can be demoted to `FULL_REFRESH` for reasons such as:
 
-- Top-K view;
+- unsupported Top-K wrapper (for example, `TAIL`; supported ORDER/LIMIT
+  wrappers retain the inner refresh type);
 - simple projection with no data-apply statement;
 - non-cascade-capable upstream;
 - window initial-load mismatch;

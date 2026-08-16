@@ -160,7 +160,7 @@ flowchart TD
 |       4 | `AGGREGATE_HAVING`     | yes below HAVING                     | all groups stored below wrapper                     | `aggregate.cpp`, `filter.cpp`                    | `CompileAggregateGroups`                                | MERGE + HAVING view/filter           |
 |       5 | `WINDOW_PARTITION`     | partition recompute, not pure linear | partition keys/lineage                              | `window.cpp`                                     | `BuildWindowPartitionRefresh`; `CompileWindowRecompute` | partition DELETE+INSERT              |
 |       6 | `GROUP_RECOMPUTE`      | affected-key recompute               | group keys; optional cascade snapshots              | child rules; no single rule                      | `CompileGroupRecompute`                                 | affected-key DELETE+INSERT           |
-|       7 | `TOP_K`                | no for deletes/updates               | ranking state would be needed                       | `topk.cpp`                                       | legacy; no Spark incremental compiler                   | dead on Spark; FULL_REFRESH demotion |
+|       7 | `TOP_K`                | legacy direct ordinal                | unlimited inner backing state                       | `topk.cpp`                                       | wrapper uses the inner query's compiler                  | dead ordinal; wrapper rides inner type |
 |       8 | `DISTINCT_INCREMENTAL` | yes for transition-count shape       | per-distinct-tuple counts                           | `distinct.cpp`, `aggregate.cpp`                  | `CompileDistinctIncremental`                            | aux MERGE / count monoid             |
 |       9 | `SEMI_ANTI_RECOMPUTE`  | transition-scoped                    | left counts and match counts                        | `join.cpp`                                       | `CompileSemiAntiRecompute`                              | `AuxStateAssembler`                  |
 
@@ -514,8 +514,8 @@ OpenIVM sources:
   Spark integration source:
 - `MaterializedViewCommands.scala` defines `extractTopKViewSpec` and the
   backing-table CREATE/REFRESH/DROP path;
-- `MaterializedViewCommands.scala:597-599` sets effective type to
-  `FullRefresh` with reason `top_k`.
+- `MaterializedViewCommands.scala` keeps the inner refresh type with reason
+  `top_k_kept`; unsupported wrappers use `top_k_unsupported` and full refresh.
   Representative MV:
 
 ```sql
@@ -529,19 +529,22 @@ LIMIT 10;
 Expected Spark refresh SQL shape:
 
 ```sql
-INSERT OVERWRITE TABLE mv_top_orders
-SELECT * FROM (
-  SELECT order_id, amount FROM orders ORDER BY amount DESC LIMIT 10
-);
+MERGE INTO mv_top_orders__ivm_data AS v
+USING (<incremental delta for the unlimited inner query>) AS d
+ON <inner-query key equality>
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
 ```
 
 Math:
 
 - top-k is non-monotone under deletes and updates;
 - removing the current rank 1 row may require reading rank 11;
-- without ranking boundary state, visible top-k rows are insufficient.
-  Chapter 8 of the openivm-spark docs should treat `TOP_K` as unreachable for
-  incremental Spark refresh.
+- without ranking boundary state, visible top-k rows are insufficient;
+- Spark therefore stores the unlimited inner result and evaluates the
+  user-facing ORDER BY/LIMIT in a VIEW. The direct ordinal `TOP_K` remains
+  unreachable, but Top-K wrappers can still be incrementally maintained under
+  their inner projection or aggregate refresh type.
 
 ## 3.14 Ordinal 8: DISTINCT_INCREMENTAL
 
