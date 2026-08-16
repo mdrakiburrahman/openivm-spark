@@ -529,11 +529,11 @@ private[commands] object MvCommandHelper {
     try {
       val parsed = spark.sessionState.sqlParser.parsePlan(querySql)
 
-      var detected        = false
+      var detected           = false
       var unsupportedWrapper = false
-      var orderBy         = Option.empty[String]
-      var limit           = Option.empty[String]
-      var offset          = Option.empty[String]
+      var orderBy            = Option.empty[String]
+      var limit              = Option.empty[String]
+      var offset             = Option.empty[String]
 
       def peel(plan: LogicalPlan): Unit = plan match {
         case GlobalLimit(expr, child) =>
@@ -1267,7 +1267,7 @@ case class CreateMaterializedViewCommand(
       propagation.currentWatermarks(spark, qualNames)
     }
     val watermarkProps = MvMetadata.changeWatermarkProperties(watermarks)
-    val userProps = properties - MvMetadata.BackingViewSuffixKey
+    val userProps      = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
         queryShapeProps ++ compiledProps ++ watermarkProps
