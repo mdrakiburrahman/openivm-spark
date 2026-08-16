@@ -131,11 +131,35 @@ object OpenIvmMetrics extends Logging {
   def recordLifecyclePhase(mode: String, phase: String, nanos: Long): Unit =
     updateTimer(s"$mode.phase.${sanitize(phase)}", nanos)
 
+  // Pre-resolved metric handles for the per-SQL-statement hot path. record() can fire
+  // once per emitted statement, so resolving metrics by name each call (sanitize + split
+  // + regex per path segment + string allocs) dominated the cost; cache by raw kind.
+  private final class SqlStmtHandles(
+      val timer: Timer,
+      val bytesHistogram: Histogram,
+      val retryCounter: Counter
+  )
+
+  private val sqlStmtHandles = TrieMap.empty[String, SqlStmtHandles]
+
+  private def sqlStmtHandlesFor(kind: String): SqlStmtHandles =
+    sqlStmtHandles.getOrElseUpdate(
+      if (kind == null) "null" else kind, {
+        val safeKind = sanitize(kind)
+        new SqlStmtHandles(
+          timer(s"refresh.sql_stmt.$safeKind"),
+          histogram(s"refresh.sql_stmt.$safeKind.bytes"),
+          counter(s"refresh.sql_stmt.$safeKind.retry")
+        )
+      }
+    )
+
   def recordSqlStatement(kind: String, nanos: Long, bytes: Int, retryAttempt: Int): Unit = {
-    val safeKind = sanitize(kind)
-    updateTimer(s"refresh.sql_stmt.$safeKind", nanos)
-    updateHistogram(s"refresh.sql_stmt.$safeKind.bytes", bytes.toLong)
-    if (retryAttempt > 0) increment(s"refresh.sql_stmt.$safeKind.retry")
+    if (!enabled) return
+    val handles = sqlStmtHandlesFor(kind)
+    if (nanos >= 0L) handles.timer.update(nanos, TimeUnit.NANOSECONDS)
+    handles.bytesHistogram.update(bytes.toLong)
+    if (retryAttempt > 0) handles.retryCounter.inc()
   }
 
   def recordSparkPlanMetrics(kind: String, planMetrics: Iterable[(String, Long)]): Unit = {
