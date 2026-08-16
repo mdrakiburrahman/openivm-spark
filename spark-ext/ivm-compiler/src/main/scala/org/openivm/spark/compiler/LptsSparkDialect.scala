@@ -60,6 +60,16 @@ object LptsSparkDialect {
     */
   private val CountStarRe = """(?i)\bcount_star\s*\(\s*\)""".r
 
+  /** Bare `count()` (empty argument list) — DuckDB serializes a windowed
+    * `COUNT(*) OVER (...)` as an argument-less `count()` window function (the
+    * star is implicit in its plan node). Re-emitted verbatim this is invalid in
+    * Spark, which rejects a zero-arg `count` (`WRONG_NUM_ARGS`). A zero-arg
+    * `count()` is never legal SQL, so it is unambiguously the star form and is
+    * rewritten to `COUNT(*)`. The `_star` spelling is matched separately above;
+    * `\bcount` won't match inside `approx_count_distinct` / `bit_count(x)`.
+    */
+  private val CountEmptyRe = """(?i)\bcount\s*\(\s*\)""".r
+
   /** `error(<args>)` — DuckDB function used by lpts when emitting assertion-style
     * checks (e.g. divide-by-zero guards in scalar-subquery rewrites).  Spark has
     * no `error` builtin; the equivalent is `raise_error(<args>)`.
@@ -484,7 +494,7 @@ object LptsSparkDialect {
 
   /** Rewrites DuckDB's `count_star()` to standard SQL `COUNT(*)`. */
   private[compiler] def rewriteCountStar(sql: String): String =
-    CountStarRe.replaceAllIn(sql, "COUNT(*)")
+    CountEmptyRe.replaceAllIn(CountStarRe.replaceAllIn(sql, "COUNT(*)"), "COUNT(*)")
 
   /** Rewrites bare `error(...)` to Spark's `raise_error(...)`.
     *

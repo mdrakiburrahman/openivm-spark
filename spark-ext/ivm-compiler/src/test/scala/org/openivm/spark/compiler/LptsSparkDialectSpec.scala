@@ -273,6 +273,24 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val twice = LptsSparkDialect.rewriteCountStar(once)
       once shouldBe twice
     }
+
+    it("rewrites a bare count() (windowed COUNT(*) OVER serialization) to COUNT(*)") {
+      LptsSparkDialect.rewriteCountStar("count() OVER (PARTITION BY x)") shouldBe "COUNT(*) OVER (PARTITION BY x)"
+    }
+
+    it("rewrites bare count() case-insensitively and with inner whitespace") {
+      LptsSparkDialect.rewriteCountStar("COUNT(  )") shouldBe "COUNT(*)"
+    }
+
+    it("does not touch count(<expr>) with an argument") {
+      val sql = "SELECT count(x) FROM t"
+      LptsSparkDialect.rewriteCountStar(sql) shouldBe sql
+    }
+
+    it("does not match approx_count_distinct() or bit_count(x)") {
+      val sql = "SELECT approx_count_distinct(x), bit_count(y) FROM t"
+      LptsSparkDialect.rewriteCountStar(sql) shouldBe sql
+    }
   }
 
   // ── 4b. struct_extract → dot-notation field access ────────────────────────
