@@ -283,6 +283,30 @@ class OpenIvmCompiler private (
     var i   = 0
     while (i < n) {
       sql.charAt(i) match {
+        case '-' if i + 1 < n && sql.charAt(i + 1) == '-' =>
+          // Copy a -- line comment verbatim so apostrophes/backticks inside it
+          // never desync the string-literal / identifier scanner.
+          while (i < n && sql.charAt(i) != '\n') {
+            out += sql.charAt(i)
+            i += 1
+          }
+        case '/' if i + 1 < n && sql.charAt(i + 1) == '*' =>
+          // Copy a /* */ block comment verbatim.
+          out += '/'
+          out += '*'
+          i += 2
+          var closed = false
+          while (i < n && !closed) {
+            if (sql.charAt(i) == '*' && i + 1 < n && sql.charAt(i + 1) == '/') {
+              out += '*'
+              out += '/'
+              i += 2
+              closed = true
+            } else {
+              out += sql.charAt(i)
+              i += 1
+            }
+          }
         case '\'' =>
           // Copy a single-quoted string literal verbatim, honoring '' escapes.
           out += '\''
