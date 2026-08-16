@@ -906,6 +906,13 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
       rewritten.filter(_.contains("WHEN MATCHED THEN DELETE")) should have size 2
       rewritten.mkString("\n") should not include "UNION ALL"
+      // Even in the legacy one-MERGE-per-IN shape, the affected-key subquery
+      // must alias the source column (t_id) to the MV key (trade_id) so the
+      // `d.trade_id` reference in the ON clause resolves.
+      val legacyDeletes = rewritten.filter(_.contains("WHEN MATCHED THEN DELETE"))
+      legacyDeletes.head should include("t_id AS trade_id")
+      legacyDeletes.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
+      legacyDeletes.head should not include "d.t_id"
     }
 
     it("collapses same-target partition deletes to one MERGE over unioned affected keys when enabled") {

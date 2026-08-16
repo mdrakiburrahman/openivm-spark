@@ -3103,6 +3103,33 @@ object SparkRefreshRewriter {
     val close = findMatchingCloseParen(rest, 0)
     if (close < 0) return None
     val subq = rest.substring(1, close).trim
+
+    // Single-column IN: align the affected-key subquery's projection with the
+    // target (MV) column name.  The DELETE LHS is the MV column, but the
+    // subquery projects the *source* column; when the MV renames the base
+    // column (`<src> AS <mvKey>`, e.g. `t_id AS trade_id`) the two differ, so
+    // the ON clause's `d.<mvKey>` would reference a column the subquery never
+    // exposes (UNRESOLVED_COLUMN).  Alias the source expression to the MV
+    // column name so `d.<mvKey>` resolves — mirroring
+    // `combinedPartitionDeleteMerge`.  This also keeps the shape valid after a
+    // later dedup wrap (`rewriteDeleteMergeWithDedup`), whose outer projection
+    // selects the MV key name from this source.
+    if (!(lhs.startsWith("(") && lhs.endsWith(")"))) {
+      parseSingleColumnInClause(clause) match {
+        case Some(parsed) =>
+          val keyAlias = quoteIfNeeded(parsed.targetCol)
+          val aliasedSub =
+            s"SELECT DISTINCT ${parsed.sourceExpr} AS $keyAlias FROM (${parsed.subquery}) openivm_key_src"
+          return Some(
+            s"""|MERGE INTO $mvRef AS v
+                |USING ($aliasedSub) AS d
+                |ON v.$keyAlias IS NOT DISTINCT FROM d.$keyAlias
+                |WHEN MATCHED THEN DELETE""".stripMargin
+          )
+        case None => // fall through to the generic (composite / unparsable) shape
+      }
+    }
+
     // Strip surrounding parens on lhs (composite tuple form) if present —
     // although openivm's non-DuckLake path only emits single-column IN clauses.
     val lhsCols = if (lhs.startsWith("(") && lhs.endsWith(")")) {
