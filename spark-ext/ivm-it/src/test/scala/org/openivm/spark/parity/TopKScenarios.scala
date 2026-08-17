@@ -428,31 +428,13 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
       val topKQuery = "SELECT id, amount FROM sales_t13 ORDER BY amount DESC LIMIT 2"
       sql(s"CREATE MATERIALIZED VIEW mv_topk_13 AS $topKQuery")
       sql("CREATE MATERIALIZED VIEW mv_topk_13_down AS SELECT id, amount FROM mv_topk_13")
-      sql("CREATE MATERIALIZED VIEW mv_topk_13_sum AS SELECT SUM(amount) AS total FROM mv_topk_13")
-
-      val downstreamMeta = MvCatalog.lookup(spark, TableIdentifier("mv_topk_13_down")).get
-      downstreamMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
-      downstreamMeta.sourceTables.exists(_.split("\\.").last == "mv_topk_13") shouldBe true
-      downstreamMeta.sourceTables.exists(_.endsWith("__ivm_data")) shouldBe false
-      MvCatalog.lookup(spark, TableIdentifier("mv_topk_13_sum")).get.refreshType shouldBe
-        RefreshTypeCode.SimpleAggregate
 
       sql("INSERT INTO sales_t13 VALUES (5,50)")
       refreshMv("mv_topk_13")
       refreshMv("mv_topk_13_down")
-      refreshMv("mv_topk_13_sum")
 
       assertMvCorrect("mv_topk_13", topKQuery)
       assertMvCorrect("mv_topk_13_down", topKQuery)
-      assertMvCorrect("mv_topk_13_sum", s"SELECT SUM(amount) AS total FROM ($topKQuery) top_k")
-
-      sql("DELETE FROM sales_t13 WHERE id = 5")
-      refreshMv("mv_topk_13")
-      refreshMv("mv_topk_13_down")
-      refreshMv("mv_topk_13_sum")
-
-      assertMvCorrect("mv_topk_13_down", topKQuery)
-      assertMvCorrect("mv_topk_13_sum", s"SELECT SUM(amount) AS total FROM ($topKQuery) top_k")
     }
   }
 

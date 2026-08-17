@@ -143,37 +143,8 @@ final class CdfChangePropagation extends ChangePropagation {
     val viewName = s"openivm_delta_$short"
 
     val cdfBatch = batches.collectFirst { case b: CdfChangeBatch => b }
-    val topKMeta = CdfChangePropagation.topKBackingMeta(spark, sourceTable)
 
     cdfBatch match {
-      case Some(b) if topKMeta.nonEmpty =>
-        val meta             = topKMeta.get
-        val escapedLocation  = meta.location.replace("`", "``")
-        val suffix           = meta.backingViewSuffix.get
-        val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
-        val oldVisible =
-          if (b.startVersionExclusive >= 0)
-            s"""SELECT $userCols,
-               |       CURRENT_TIMESTAMP() AS openivm_timestamp,
-               |       CAST(-1 AS INT) AS openivm_multiplicity
-               |FROM (
-               |  SELECT $userCols
-               |  FROM delta.`$escapedLocation` VERSION AS OF ${b.startVersionExclusive} $suffix
-               |) __openivm_top_k_old""".stripMargin
-          else ""
-        val newVisible =
-          s"""SELECT $userCols,
-             |       CURRENT_TIMESTAMP() AS openivm_timestamp,
-             |       CAST(1 AS INT) AS openivm_multiplicity
-             |FROM (
-             |  SELECT $userCols
-             |  FROM delta.`$escapedLocation` VERSION AS OF ${b.endVersionInclusive} $suffix
-             |) __openivm_top_k_new""".stripMargin
-        val body = if (oldVisible.nonEmpty) s"$oldVisible\nUNION ALL\n$newVisible" else newVisible
-        val sql  = s"CREATE OR REPLACE TEMP VIEW `$viewName` AS\n$body"
-        spark.sql(sql)
-        sql
-
       case Some(b) =>
         val from = b.startVersionExclusive + 1L
         val to   = b.endVersionInclusive
@@ -246,19 +217,6 @@ final class CdfChangePropagation extends ChangePropagation {
 
 object CdfChangePropagation {
 
-  private[common] def topKBackingMeta(spark: SparkSession, name: String): Option[MvMetadata] = {
-    val candidates = MvCatalog.list(spark).filter(_.backingViewSuffix.nonEmpty)
-    val exact = candidates.find { meta =>
-      val qualified = meta.name.database.fold(meta.name.identifier)(db => s"$db.${meta.name.identifier}")
-      qualified.equalsIgnoreCase(name)
-    }
-    exact.orElse {
-      val short   = name.split("\\.").last
-      val matches = candidates.filter(_.name.identifier.equalsIgnoreCase(short))
-      if (matches.size == 1) matches.headOption else None
-    }
-  }
-
   /**
    * `true` when the Delta table identified by `name` has
    * `delta.enableChangeDataFeed` set to `true`.  Names are resolved through
@@ -268,19 +226,6 @@ object CdfChangePropagation {
    * upstream).
    */
   def tableHasCdf(spark: SparkSession, name: String): Boolean = {
-    topKBackingMeta(spark, name) match {
-      case Some(meta) =>
-        val detailRow = DeltaTable
-          .forPath(spark, meta.location)
-          .detail()
-          .collect()
-          .head
-        val properties = detailRow.getMap[String, String](detailRow.fieldIndex("properties"))
-        return properties.exists { case (k, v) =>
-          k.equalsIgnoreCase("delta.enableChangeDataFeed") && v.trim.equalsIgnoreCase("true")
-        }
-      case None => ()
-    }
     val identifier = CatalystSqlParser.parseTableIdentifier(name)
     val resolved = identifier.database match {
       case Some(_) => name
@@ -300,10 +245,9 @@ object CdfChangePropagation {
 
   /** Current Delta `version` of `name`, or `None` if the table cannot be loaded as Delta. */
   def tableLatestVersion(spark: SparkSession, name: String): Option[Long] = {
+    val resolved = name
     try {
-      val dt = topKBackingMeta(spark, name)
-        .map(meta => DeltaTable.forPath(spark, meta.location))
-        .getOrElse(DeltaTable.forName(spark, name))
+      val dt   = DeltaTable.forName(spark, resolved)
       val hist = dt.history(1).collect()
       hist.headOption.map(_.getAs[Long]("version"))
     } catch {
