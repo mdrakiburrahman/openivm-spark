@@ -176,8 +176,12 @@ How Spark keeps this query incremental:
   as a Spark VIEW that projects user columns and applies `ORDER BY ... LIMIT`.
 - Refresh writes target the backing Delta table. This preserves rows outside
   the current K so deletes and updates can promote the next-best rows.
-- Top-K does not advertise a cascade view-delta because the inner-table delta
-  is not the same as the user-visible Top-K output delta.
+- When another MV depends on `mv_top3`, Spark publishes the logical boundary
+  delta: the old visible Top-K rows with multiplicity `-1`, followed by the new
+  visible Top-K rows with multiplicity `+1`. Interception mode materializes
+  this snapshot during the upstream refresh; CDF mode reconstructs it from the
+  two backing-table versions. Raw unlimited-inner changes are never exposed as
+  the public view's delta.
 
 Expected metadata:
 
@@ -190,7 +194,7 @@ Expected metadata:
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='top_k_kept' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='top_k_kept' emits_cascade_view_delta='true'
 ```
 
 Expected refresh SQL:

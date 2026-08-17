@@ -4,7 +4,7 @@ import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   AttributeReference,
@@ -500,6 +500,49 @@ private[commands] object MvCommandHelper {
     (qualNames, qualSchemas, compileSchemas, shortToQual)
   }
 
+  /** Spark expands a tracked Top-K backing-table VIEW during analysis, so the raw
+    * source collector sees `<mv>__ivm_data` even though the user query names
+    * `<mv>`. Restore that logical source boundary for compilation, dependency
+    * tracking, and cascade propagation.
+    */
+  def restoreBackingViewSources(
+      spark: SparkSession,
+      querySql: String,
+      collected: (Seq[String], Map[String, StructType], Map[String, StructType], Map[String, String])
+  ): (Seq[String], Map[String, StructType], Map[String, StructType], Map[String, String]) = {
+    val (qualNames, qualSchemas, compileSchemas, shortToQual) = collected
+    val referencedNames = spark.sessionState.sqlParser
+      .parsePlan(querySql)
+      .collect { case r: UnresolvedRelation => r.multipartIdentifier.mkString(".") }
+      .toSet
+    val referencedShortNames = referencedNames.map(_.split("\\.").last)
+    val backingMvs = MvCatalog
+      .list(spark)
+      .filter(m => m.backingViewSuffix.nonEmpty && referencedShortNames.contains(m.name.identifier))
+
+    backingMvs.foldLeft((qualNames, qualSchemas, compileSchemas, shortToQual)) {
+      case ((names, schemas, compile, qualified), meta) =>
+        val logicalShort = meta.name.identifier
+        val backingShort = dataTableId(meta.name).identifier
+        val backingQual = names.find(_.split("\\.").last == backingShort)
+        backingQual match {
+          case None => (names, schemas, compile, qualified)
+          case Some(physicalName) =>
+            val physicalPrefix = physicalName.split("\\.").dropRight(1)
+            val logicalName =
+              if (physicalPrefix.nonEmpty) (physicalPrefix :+ logicalShort).mkString(".")
+              else logicalShort
+            val logicalSchema = spark.table(logicalName).schema
+            (
+              names.map(n => if (n == physicalName) logicalName else n).distinct,
+              (schemas - physicalName) + (logicalName -> logicalSchema),
+              (compile - backingShort) + (logicalShort -> logicalSchema),
+              (qualified - backingShort) + (logicalShort -> logicalName)
+            )
+        }
+    }
+  }
+
   /** Extract the GROUP BY key column names from an analyzed LogicalPlan. */
   def extractGroupKeys(analyzed: LogicalPlan): Seq[String] =
     analyzed
@@ -878,9 +921,11 @@ private[commands] object MvCommandHelper {
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
       else compiled.refreshTypeName
     val emitsCascadeViewDelta =
-      !topKViewSpec.detected &&
+      if (topKViewSpec.detected)
+        topKViewSpec.suffixSql.nonEmpty && effectiveRefreshType != RefreshTypeCode.FullRefresh
+      else
         RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
-        SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
+          SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
     EffectiveClassification(effectiveRefreshType, effectiveRefreshTypeName, reason, emitsCascadeViewDelta)
   }
 }
@@ -981,7 +1026,7 @@ case class CreateMaterializedViewCommand(
     // Resolve source schemas without issuing duplicate catalog lookups.
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       profile.timeStep("create_resolve_sources") {
-        collectSourceSchemas(analyzed)
+        restoreBackingViewSources(spark, originalQueryText, collectSourceSchemas(analyzed))
       }
 
     // Validate that every source is configured correctly for the active
@@ -2283,6 +2328,24 @@ case class RefreshMaterializedViewCommand(
           )
         else None
 
+      // The backing table stores the unlimited inner result, but downstream
+      // MVs observe the public Top-K VIEW. Intercept mode therefore pins the
+      // old backing version and later publishes old-visible × -1 plus
+      // new-visible × +1, rather than leaking raw inner-table changes.
+      val topKVersionBeforeRefresh: Option[Long] =
+        if (
+          propagation.requiresDmlInterception &&
+          meta.backingViewSuffix.nonEmpty &&
+          meta.emitsCascadeViewDelta &&
+          downstreamSourceKeysForThisMv.nonEmpty
+        )
+          Some(
+            profile.timeStep("pin_top_k_version", "source=delta_history") {
+              DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+            }
+          )
+        else None
+
       // Workload-aware insert-only fast path. For a SIMPLE_PROJECTION on the
       // recompute path (DELETE by openivm_left_key + recompute), when this batch
       // changes NO existing MV row, openivm's view-delta is purely net-new rows,
@@ -3157,6 +3220,32 @@ case class RefreshMaterializedViewCommand(
                |SELECT $colList, CAST(1 AS INT) AS `openivm_multiplicity`
                |FROM delta.`$escapedLocation`""".stripMargin
           profile.timeStep("simple_aggregate_cascade_snapshot", s"old_version=$oldVersion") {
+            executeSql(cascadeSql)
+            if (diagnosticsEnabled)
+              logViewDeltaDiagnostics(spark, name, viewDeltaPath, stmtCounter.get() - 1)
+          }
+        }
+
+        topKVersionBeforeRefresh.foreach { oldVersion =>
+          val targetColumns = spark.table(sqlIdent(name)).columns.toSeq
+          val colList = targetColumns
+            .map(c => s"`${c.replace("`", "``")}`")
+            .mkString(", ")
+          val escapedLocation = meta.location.replace("`", "``")
+          val escapedDelta    = viewDeltaPath.replace("`", "``")
+          val suffix          = meta.backingViewSuffix.get
+          val cascadeSql =
+            s"""INSERT OVERWRITE TABLE delta.`$escapedDelta`
+               |SELECT $colList, CAST(-1 AS INT) AS `openivm_multiplicity`
+               |FROM (
+               |  SELECT $colList FROM delta.`$escapedLocation` VERSION AS OF $oldVersion $suffix
+               |) __openivm_top_k_old
+               |UNION ALL
+               |SELECT $colList, CAST(1 AS INT) AS `openivm_multiplicity`
+               |FROM (
+               |  SELECT $colList FROM delta.`$escapedLocation` $suffix
+               |) __openivm_top_k_new""".stripMargin
+          profile.timeStep("top_k_cascade_snapshot", s"old_version=$oldVersion") {
             executeSql(cascadeSql)
             if (diagnosticsEnabled)
               logViewDeltaDiagnostics(spark, name, viewDeltaPath, stmtCounter.get() - 1)

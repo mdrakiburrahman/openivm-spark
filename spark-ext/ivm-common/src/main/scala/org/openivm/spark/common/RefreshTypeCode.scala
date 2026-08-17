@@ -51,8 +51,10 @@ object RefreshTypeCode {
     *     compilation knowing the downstream catalog.
     *
     * The remaining complement set — DISTINCT_INCREMENTAL,
-    * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH — does NOT
-    * emit a cascade-usable view-delta. Downstream MVs over a
+    * SEMI_ANTI_RECOMPUTE, the legacy direct TOP_K ordinal, and FULL_REFRESH —
+    * does NOT emit a cascade-usable view-delta. Supported Top-K wrappers ride
+    * an inner refresh type and synthesize their public boundary delta in the
+    * command layer. Downstream MVs over a
     * non-cascade-delta-capable upstream MUST be FullRefresh-demoted at CREATE
     * time.
     *
