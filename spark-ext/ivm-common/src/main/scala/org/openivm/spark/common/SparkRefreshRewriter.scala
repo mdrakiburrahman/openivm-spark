@@ -2903,11 +2903,11 @@ object SparkRefreshRewriter {
               .findFirstMatchIn(tail)
               .map { t =>
                 val affAlias = t.group(1)
-                val onCond   = t.group(2)
-                s"""|MERGE INTO $mvRef AS $tgtAlias
+                val onCond   = normalizeDeleteExistsMatchAliases(t.group(2), tgtAlias, affAlias)
+                s"""|MERGE INTO $mvRef AS v
                   |USING (
                   |$subBody
-                  |) AS $affAlias
+                  |) AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -2919,9 +2919,9 @@ object SparkRefreshRewriter {
               .map { t =>
                 val src      = t.group(1)
                 val affAlias = t.group(2)
-                val onCond   = t.group(3)
-                s"""|MERGE INTO $mvRef AS $tgtAlias
-                  |USING $src AS $affAlias
+                val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                s"""|MERGE INTO $mvRef AS v
+                  |USING $src AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -2951,6 +2951,13 @@ object SparkRefreshRewriter {
       }
     }
   }
+
+  private def normalizeDeleteExistsMatchAliases(
+      onCond: String,
+      targetAlias: String,
+      affectedAlias: String
+  ): String =
+    qualifyAlias(qualifyAlias(onCond, targetAlias, "v"), affectedAlias, "d")
 
   // ── WINDOW_PARTITION (RefreshType 5) statement rewrites ───────────────────
 

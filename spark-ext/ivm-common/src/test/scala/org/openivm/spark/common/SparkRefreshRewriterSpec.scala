@@ -1263,6 +1263,34 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
+    it("canonicalizes NULL-safe materialized window keys for cascade reuse") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |DELETE FROM openivm_data_mv_r AS openivm_target
+          |WHERE EXISTS (
+          |  SELECT 1 FROM openivm_affected_mv_r AS openivm_aff
+          |  WHERE openivm_aff.region <=> openivm_target.region
+          |);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 1
+      val deleteMerge = rewritten.statements.head
+      deleteMerge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      deleteMerge should include("USING openivm_affected_mv_r AS d")
+      deleteMerge should include("ON d.region <=> v.region")
+      deleteMerge should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
       val windowCascadeInput =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';

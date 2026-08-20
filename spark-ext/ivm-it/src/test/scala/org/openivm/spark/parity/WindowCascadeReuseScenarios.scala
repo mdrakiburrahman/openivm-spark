@@ -62,7 +62,9 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
       upper.startsWith("INSERT INTO DELTA.") && upper.contains("REPLACE WHERE")
     }
-    targetRows should have size 1
+    withClue(rows.map(_.getString(ColSqlText)).mkString("\n---\n")) {
+      targetRows should have size 1
+    }
     val targetRow = targetRows.head
     val targetSql = targetRow.getString(ColSqlText)
     targetSql should include(s"FROM delta.`$cascadePath`")
@@ -184,7 +186,8 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql(
         "INSERT INTO wcm_events " +
-          "SELECT id, 1 AS seq, id AS payload FROM range(1001)"
+          "SELECT id, 1 AS seq, id AS payload FROM range(1001) " +
+          "UNION ALL SELECT CAST(NULL AS BIGINT), 1, -1"
       )
 
       val viewSql =
@@ -203,7 +206,8 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       sql("UPDATE wcm_events SET payload = payload + 100000 WHERE seq = 1")
       sql(
         "INSERT INTO wcm_events " +
-          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001)"
+          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001) " +
+          "UNION ALL SELECT CAST(NULL AS BIGINT), 2, -2"
       )
       sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
       RefreshSqlLogCatalog.removeAll(spark)
