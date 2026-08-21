@@ -1578,6 +1578,57 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("inlineViewDeltaCtasIntoMerge") {
+    val path = "/tmp/view-delta/abc"
+    val ctas =
+      s"""CREATE OR REPLACE TABLE delta.`$path` USING DELTA AS
+         |SELECT k, v, openivm_multiplicity FROM source_delta""".stripMargin
+    val merge =
+      s"""WITH refresh_cte AS (
+         |  SELECT k, MAX(v) AS v FROM delta.`$path` GROUP BY k
+         |)
+         |MERGE INTO `db`.`mv` v USING refresh_cte d
+         |ON v.k <=> d.k
+         |WHEN MATCHED THEN UPDATE SET v.v = GREATEST(v.v, d.v)
+         |WHEN NOT MATCHED THEN INSERT (k, v) VALUES (d.k, d.v)""".stripMargin
+
+    it("inlines the exact single scratch scan into an aggregate MERGE") {
+      val result = SparkRefreshRewriter
+        .inlineViewDeltaCtasIntoMerge(ctas, merge, path)
+        .getOrElse(fail("eligible aggregate merge was not inlined"))
+
+      result should include("FROM (SELECT k, v, openivm_multiplicity FROM source_delta) AS __openivm_direct_delta")
+      result should not include s"delta.`$path`"
+      result should include("MERGE INTO `db`.`mv`")
+    }
+
+    it("recognizes a CTE-prefixed MERGE without matching string literals") {
+      SparkRefreshRewriter.isMergeStatement(merge) shouldBe true
+      SparkRefreshRewriter.isMergeStatement("SELECT 'MERGE INTO not_a_statement'") shouldBe false
+    }
+
+    it("rejects a non-MERGE consumer") {
+      SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(ctas, s"SELECT * FROM delta.`$path`", path) shouldBe None
+      SparkRefreshRewriter
+        .inlineViewDeltaCtasIntoMerge(ctas, s"SELECT 'MERGE INTO fake' FROM delta.`$path`", path) shouldBe None
+    }
+
+    it("rejects a MERGE that scans the scratch more than once") {
+      val twice = merge + s"\n-- second reference delta.`$path`"
+      SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(ctas, twice, path) shouldBe None
+    }
+
+    it("preserves an explicit alias on the generated scratch scan") {
+      val aliased = merge.replace(s"delta.`$path`", s"delta.`$path` AS source_delta")
+      val result = SparkRefreshRewriter
+        .inlineViewDeltaCtasIntoMerge(ctas, aliased, path)
+        .getOrElse(fail("eligible aliased aggregate merge was not inlined"))
+
+      result should include("FROM (SELECT k, v, openivm_multiplicity FROM source_delta) AS source_delta")
+      result should not include "AS __openivm_direct_delta AS source_delta"
+    }
+  }
+
   // ── 12. isRecomputeInsertMerge — recompute INSERT MERGE detector ─────────
   describe("isRecomputeInsertMerge") {
     it("detects the bench-shape MERGE … USING (…) AS d ON FALSE WHEN NOT MATCHED THEN INSERT") {

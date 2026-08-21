@@ -114,6 +114,32 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
       classify(table, before) shouldBe Mutating
     }
 
+    it("keeps an insert-only MERGE conservative when the writer omits row metrics") {
+      val mergeInfo = CommitInfo
+        .empty(None)
+        .copy(operation = "MERGE", operationParameters = Map.empty, operationMetrics = None)
+
+      DeltaCommitClassifier.classifyCommit(Seq(mergeInfo)) shouldBe Mutating
+    }
+
+    it("uses MERGE row metrics when the writer records a complete insert-only proof") {
+      val mergeInfo = CommitInfo
+        .empty(None)
+        .copy(
+          operation = "MERGE",
+          operationParameters = Map.empty,
+          operationMetrics = Some(
+            Map(
+              "numTargetRowsInserted" -> "2",
+              "numTargetRowsUpdated"  -> "0",
+              "numTargetRowsDeleted"  -> "0"
+            )
+          )
+        )
+
+      DeltaCommitClassifier.classifyCommit(Seq(mergeInfo)) shouldBe InsertOnly
+    }
+
     it("classifies insert overwrite commits as Replace") {
       val table = createTable("overwrite")
       spark.sql(s"INSERT INTO $table VALUES (1, 'a'), (2, 'b')")

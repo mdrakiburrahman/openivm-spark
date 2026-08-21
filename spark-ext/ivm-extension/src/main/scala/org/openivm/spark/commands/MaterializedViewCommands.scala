@@ -18,6 +18,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
   Aggregate,
   Filter,
   GlobalLimit,
+  Join,
   LocalLimit,
   LogicalPlan,
   Offset,
@@ -248,7 +249,7 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
   def classify(sql: String, viewDeltaPath: String): String = {
     val trimmed = sql.replaceAll("(?s)^\\s*(--[^\\n]*\\n|/\\*.*?\\*/)+", "").trim
     val upper   = trimmed.toUpperCase
-    if (upper.startsWith("MERGE")) "merge"
+    if (SparkRefreshRewriter.isMergeStatement(trimmed)) "merge"
     else if (upper.startsWith("DELETE")) "delete"
     else if (upper.startsWith("INSERT OVERWRITE")) "insert_overwrite"
     else if (upper.startsWith("INSERT INTO")) "insert_into"
@@ -285,6 +286,38 @@ private[commands] object MvCommandHelper {
     val parts = id.catalog.toSeq ++ id.database.toSeq ++ Seq(id.table)
     parts.map(p => s"`${p.replace("`", "``")}`").mkString(".")
   }
+
+  /** Resolve a persisted source name and an MV identifier through Spark's
+    * catalog before comparing them. `sourceTables` contains qualified names,
+    * while parser-produced MV identifiers may omit the current database.
+    */
+  def refersToTable(spark: SparkSession, source: String, table: TableIdentifier): Boolean = {
+    def resolved(id: TableIdentifier): TableIdentifier =
+      try spark.sessionState.catalog.getTableMetadata(id).identifier
+      catch { case _: AnalysisException => id }
+
+    val sourceId = resolved(spark.sessionState.sqlParser.parseTableIdentifier(source))
+    val tableId  = resolved(table)
+    val resolver = spark.sessionState.conf.resolver
+
+    resolver(sourceId.table, tableId.table) &&
+    ((sourceId.database, tableId.database) match {
+      case (Some(left), Some(right)) => resolver(left, right)
+      case (None, None)              => true
+      case _                         => false
+    })
+  }
+
+  /** Exact source keys used by downstream MVs for a given upstream MV. */
+  def downstreamSourceKeys(
+      spark: SparkSession,
+      upstream: TableIdentifier,
+      allMvs: Seq[MvMetadata]
+  ): Set[String] =
+    allMvs
+      .filterNot(other => refersToTable(spark, metaName(other.name), upstream))
+      .flatMap(_.sourceTables.filter(source => refersToTable(spark, source, upstream)))
+      .toSet
 
   /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
   def mvLocation(spark: SparkSession, id: TableIdentifier): String = {
@@ -1499,6 +1532,67 @@ case class RefreshMaterializedViewCommand(
         }.toMap
       } else Map.empty
 
+    lazy val batchInsertOnly: Boolean =
+      sourceDeltaShape.nonEmpty &&
+        sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
+        sourceDeltaShape.values.forall(_ != DeltaShape.General)
+
+    lazy val downstreamSourceKeysForThisMv: Set[String] =
+      downstreamSourceKeys(spark, name, allMvsCached)
+
+    // Base-table inserts are not sufficient to prove a view delta monotone:
+    // an outer join can retract a NULL-padded row, and multi-source joins can
+    // generate cross terms. Restrict insert-only aggregate compilation to the
+    // single-source, join-free shape whose output is monotone under inserts.
+    // Downstream consumers do not affect this proof; they only determine
+    // whether the cascade delta must remain materialized.
+    lazy val insertOnlyAggregateShapeCandidate: Boolean =
+      !propagation.requiresDmlInterception &&
+        meta.refreshType == RefreshTypeCode.AggregateGroup &&
+        meta.sourceTables.size == 1 &&
+        !spark.sql(meta.querySql).queryExecution.analyzed.exists(_.isInstanceOf[Join])
+
+    // Commit metrics classify most insert-only MERGEs without reading CDF.
+    // For an otherwise eligible aggregate, retain a bounded fallback
+    // for older Delta writers that omit those metrics. Failure is conservative.
+    lazy val cdfRowsInsertOnly: Boolean =
+      insertOnlyAggregateShapeCandidate &&
+        !batchInsertOnly &&
+        cdfChangeBatches.nonEmpty &&
+        cdfChangeBatches.size == changeBatches.size &&
+        profile.timeStep(
+          "generate_refresh_sql.cdf_insert_only_probe",
+          s"sources=${cdfChangeBatches.map(_.baseTable).distinct.size}"
+        ) {
+          RefreshPerf.timePhase(refreshId, viewLabel, "cdf_insert_only_probe") {
+            cdfBatchesContainOnlyInserts(spark, cdfChangeBatches)
+          }
+        }
+
+    lazy val insertOnlyAggregate: Boolean =
+      insertOnlyAggregateShapeCandidate &&
+        (batchInsertOnly || cdfRowsInsertOnly) &&
+        changeBatches.nonEmpty
+
+    // CDF consumers discover an upstream MV through its Delta change feed.
+    // Only a grouped aggregate with no consumer may inline and discard its
+    // durable cascade delta. Non-terminal aggregates still use the same
+    // insert-only MIN/MAX merge, but retain OpenIVM's signed cascade output.
+    lazy val terminalInsertOnlyAggregate: Boolean =
+      insertOnlyAggregate && downstreamSourceKeysForThisMv.isEmpty
+
+    profile.appendStep(
+      "generate_refresh_sql.eligibility",
+      s"batch_insert_only=$batchInsertOnly;cdf_rows_insert_only=$cdfRowsInsertOnly;" +
+        s"insert_only_aggregate_shape_candidate=$insertOnlyAggregateShapeCandidate;" +
+        s"insert_only_aggregate=$insertOnlyAggregate;" +
+        s"terminal_insert_only_aggregate=$terminalInsertOnlyAggregate;" +
+        s"requires_dml_interception=${propagation.requiresDmlInterception};" +
+        s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
+        s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
+      0L
+    )
+
     // -----------------------------------------------------------------------
     // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
     // A REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
@@ -1599,6 +1693,10 @@ case class RefreshMaterializedViewCommand(
     val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
     val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
     val cacheTierFacts = WorkloadFacts(
+      forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+      assumeInsertOnly = insertOnlyAggregate ||
+        (FeatureGate.windowRunningIncrementalEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
       deltaShape = sourceDeltaShape,
       fkRelations = constraintFacts.fkRelations,
       uniqueKeys = constraintFacts.uniqueKeys,
@@ -1619,11 +1717,10 @@ case class RefreshMaterializedViewCommand(
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
         runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
         scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
-        assumeInsertOnly = FeatureGate.windowRunningIncrementalEnabled(spark) &&
-          meta.refreshType == RefreshTypeCode.WindowPartition &&
-          sourceDeltaShape.nonEmpty &&
-          sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
-          sourceDeltaShape.values.forall(_ != DeltaShape.General)
+        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+        assumeInsertOnly = insertOnlyAggregate ||
+          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
+            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly)
       )
       observedCompileFacts = Some(facts)
       facts
@@ -1887,11 +1984,6 @@ case class RefreshMaterializedViewCommand(
       lazy val batchHasReplace: Boolean =
         cdfChangeBatches.isEmpty || cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
 
-      lazy val batchInsertOnly: Boolean =
-        sourceDeltaShape.nonEmpty &&
-          sourceDeltaShape.values.exists(_ == DeltaShape.InsertOnly) &&
-          sourceDeltaShape.values.forall(_ != DeltaShape.General)
-
       // True when a changed source is on the NULL-producing (optional) side of an
       // outer join in the MV body. An INSERT there re-affects EXISTING MV rows
       // (e.g. a previously NULL-extended left row gains a right match), which
@@ -2016,18 +2108,6 @@ case class RefreshMaterializedViewCommand(
           if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
         } catch { case _: Throwable => () }
 
-      // Downstream MVs whose next REFRESH must consume this MV's view-delta
-      // under intercept mode.  The same set drives cascade staging and whether
-      // a fused scratch cache must outlive this refresh.
-      def downstreamSourceKeysForThisMv: Set[String] = {
-        val mvShortName = name.identifier
-        allMvsCached
-          .filter(other => metaName(other.name) != metaName(name))
-          .filter(_.sourceTables.exists(_.split("\\.").last == mvShortName))
-          .flatMap(_.sourceTables.filter(_.split("\\.").last == mvShortName))
-          .toSet
-      }
-
       val fuseEligible =
         FeatureGate.fuseScratchEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
@@ -2035,6 +2115,15 @@ case class RefreshMaterializedViewCommand(
 
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
+
+        val directAggregateMerge: Option[String] =
+          if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
+            SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(
+              rewritten.statements.head,
+              rewritten.statements(1),
+              viewDeltaPath
+            )
+          else None
 
         // Log the rewritten SQL at DEBUG so cascade-related issues are
         // observable when -Dlog4j2.logger.org.openivm.spark.commands=DEBUG
@@ -2134,7 +2223,23 @@ case class RefreshMaterializedViewCommand(
           )
         }
 
-        if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
+        if (directAggregateMerge.isDefined) {
+          advanceStmtCounterPast(0)
+          RefreshPerf.logStmt(refreshId, viewLabel, 0, "view_delta_inlined", 0L)
+          profile.appendStep(
+            "execute_refresh_sql_stmt",
+            "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
+            0L
+          )
+          RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
+          logInfo(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+              "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
+          )
+          withPlanTimeBroadcastDisabled {
+            executeSqlAt(directAggregateMerge.get, 1)
+          }
+        } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
           // ── Scratch-CTAS fuse fast path ────────────────────────────────────
           //
           // openivm emits stmt[0] as `CREATE OR REPLACE TABLE delta.\`<path>\`
@@ -2564,7 +2669,7 @@ case class RefreshMaterializedViewCommand(
         // used as the bookkeeping count is either openivm_count_star
         // (added by openivm when the user query has no COUNT(*)) or the
         // user's COUNT(*) alias (extracted at CREATE time).
-        if (isCountMonoid(meta.refreshType)) {
+        if (isCountMonoid(meta.refreshType) && !terminalInsertOnlyAggregate) {
           countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
             val q         = col.replace("`", "``")
             val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
@@ -2764,6 +2869,25 @@ case class RefreshMaterializedViewCommand(
       .head(1)
       .nonEmpty
   }
+
+  private def cdfBatchesContainOnlyInserts(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
+    try {
+      batches
+        .groupBy(_.baseTable)
+        .forall { case (source, sourceBatches) =>
+          val startVersion = sourceBatches.map(_.startVersionExclusive).min + 1L
+          val endVersion   = sourceBatches.map(_.endVersionInclusive).max
+          spark.read
+            .format("delta")
+            .option("readChangeFeed", "true")
+            .option("startingVersion", startVersion)
+            .option("endingVersion", endVersion)
+            .table(source)
+            .filter("_change_type IS NULL OR _change_type <> 'insert'")
+            .head(1)
+            .isEmpty
+        }
+    } catch { case scala.util.control.NonFatal(_) => false }
 
   /** Diagnostic gated by OPENIVM_REFRESH_DIAGNOSTICS=1 or
     * -Dopenivm.refresh.diagnostics=1. After the view-delta CTAS, log row counts
@@ -3435,11 +3559,7 @@ case class RefreshMaterializedViewCommand(
     // the downstream MV's next REFRESH naturally sees the new MV-data Delta
     // version via its own [[CdfChangePropagation.hasPendingChanges]] probe.
     if (propagation.requiresDmlInterception && !meta.emitsCascadeViewDelta) {
-      val upstreamShortName = name.identifier
-      val downstreamSourceKeys = allMvs
-        .filterNot(m => metaName(m.name) == viewNameStr)
-        .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
-        .distinct
+      val downstreamSourceKeys = MvCommandHelper.downstreamSourceKeys(spark, name, allMvs).toSeq.sorted
 
       if (downstreamSourceKeys.nonEmpty) {
         val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
