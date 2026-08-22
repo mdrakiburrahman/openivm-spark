@@ -32,6 +32,8 @@ import scala.util.control.NonFatal
 object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
 
+  private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
+
   private final class BackupState {
     val requested     = new AtomicBoolean(false)
     val running       = new AtomicBoolean(false)
@@ -53,6 +55,8 @@ object OpenIvmStateSync {
 
   private val restoreStates = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
   private val backupStates  = new ConcurrentHashMap[String, BackupState]()
+  @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
+  @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -71,6 +75,11 @@ object OpenIvmStateSync {
   private def stateSyncKey(spark: SparkSession, uri: String): String =
     s"${spark.sparkContext.applicationId}|${canonicalLocalRoot(spark)}|$uri"
 
+  private def effectiveStateSyncKey(spark: SparkSession, uri: String): String = {
+    val hook = stateSyncKeyHookForTesting
+    if (hook == null) stateSyncKey(spark, uri) else hook(spark, uri)
+  }
+
   private def backupStateFor(key: String): BackupState = {
     val fresh    = new BackupState
     val existing = backupStates.putIfAbsent(key, fresh)
@@ -86,7 +95,7 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    val key    = stateSyncKey(spark, uri)
+    val key    = effectiveStateSyncKey(spark, uri)
     val waiter = new CompletableFuture[Unit]()
     val prior  = restoreStates.putIfAbsent(key, waiter)
     if (prior != null) {
@@ -113,7 +122,7 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    val key   = stateSyncKey(spark, uri)
+    val key   = effectiveStateSyncKey(spark, uri)
     val state = backupStateFor(key)
     state.capture(OpenIvmExecutionSpan.captureCurrent())
     state.requested.set(true)
@@ -122,17 +131,18 @@ object OpenIvmStateSync {
 
   private def scheduleBackupIfNeeded(state: BackupState, spark: SparkSession, uri: String): Unit =
     if (state.running.compareAndSet(false, true)) {
-      backupExecutor.execute(() => runBackupLoop(state, spark, uri))
+      val key = effectiveStateSyncKey(spark, uri)
+      backupExecutor.execute(() => runBackupLoop(key, state, spark, uri))
     }
 
-  private def runBackupLoop(state: BackupState, spark: SparkSession, uri: String): Unit =
+  private def runBackupLoop(key: String, state: BackupState, spark: SparkSession, uri: String): Unit =
     try {
       var continue = true
       while (continue) {
         state.requested.set(false)
         val spans   = state.drainSpans()
         val started = System.nanoTime()
-        try backupNow(spark, uri)
+        try runBackupPass(key, spark, uri)
         catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
         finally {
           val durationMs = (System.nanoTime() - started) / 1000000L
@@ -143,7 +153,7 @@ object OpenIvmStateSync {
     } finally {
       state.running.set(false)
       if (state.requested.get() && state.running.compareAndSet(false, true)) {
-        backupExecutor.execute(() => runBackupLoop(state, spark, uri))
+        backupExecutor.execute(() => runBackupLoop(key, state, spark, uri))
       }
     }
 
@@ -156,11 +166,17 @@ object OpenIvmStateSync {
       )
     val span    = OpenIvmExecutionSpan.captureCurrent()
     val started = System.nanoTime()
-    try backupNow(spark, uri)
+    try backupNowInternal(spark, uri)
     finally {
       val durationMs = (System.nanoTime() - started) / 1000000L
       span.foreach(_.recordRocksDbBackup(durationMs))
     }
+  }
+
+  private def runBackupPass(key: String, spark: SparkSession, uri: String): Unit = {
+    val hook = backupPassHookForTesting
+    if (hook == null) backupNowInternal(spark, uri)
+    else hook(key, spark, uri)
   }
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {
@@ -195,7 +211,7 @@ object OpenIvmStateSync {
     log.info(s"openivm state-sync: restored $restored files from $uri to $local")
   }
 
-  private def backupNow(spark: SparkSession, uri: String): Unit = {
+  private def backupNowInternal(spark: SparkSession, uri: String): Unit = {
     val local = localRoot(spark)
     if (!local.exists()) return
 
@@ -227,6 +243,35 @@ object OpenIvmStateSync {
       }
     }
     if (uploaded > 0) log.info(s"openivm state-sync: backed up $uploaded files to $uri")
+  }
+
+  private[rocksdb] def setBackupPassHookForTesting(hook: (String, SparkSession, String) => Unit): Unit =
+    backupPassHookForTesting = hook
+
+  private[rocksdb] def setStateSyncKeyHookForTesting(hook: (SparkSession, String) => String): Unit =
+    stateSyncKeyHookForTesting = hook
+
+  private[rocksdb] def backupStateSnapshotForTesting(spark: SparkSession): Option[BackupStateSnapshot] =
+    FeatureGate
+      .stateSyncUri(spark)
+      .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
+      .map(state => BackupStateSnapshot(running = state.running.get(), requested = state.requested.get()))
+
+  private[rocksdb] def allBackupStatesIdleForTesting: Boolean = {
+    val it   = backupStates.values().iterator()
+    var idle = true
+    while (idle && it.hasNext) {
+      val state = it.next()
+      idle = !state.running.get() && !state.requested.get()
+    }
+    idle
+  }
+
+  private[rocksdb] def resetForTesting(): Unit = {
+    backupPassHookForTesting = null
+    stateSyncKeyHookForTesting = null
+    restoreStates.clear()
+    backupStates.clear()
   }
 
   private def relativize(root: Path, child: Path): String = {

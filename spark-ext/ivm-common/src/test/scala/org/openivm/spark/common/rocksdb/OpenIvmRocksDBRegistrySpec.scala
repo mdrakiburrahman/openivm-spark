@@ -1,5 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
+import org.openivm.spark.common.FeatureGate
 import org.apache.spark.sql.SparkSession
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
@@ -7,6 +8,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.UUID
 
@@ -16,6 +18,7 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
 
 class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with Matchers {
+  private val TestStateSyncKey = "spark.openivm.test.stateSync.key"
 
   private val sparks = ArrayBuffer.empty[SparkSession]
   private val dirs   = ArrayBuffer.empty[File]
@@ -30,6 +33,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     }
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
+    OpenIvmStateSync.resetForTesting()
     sparks.clear()
     dirs.reverse.foreach(deleteRecursively)
     dirs.clear()
@@ -51,12 +55,12 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     ()
   }
 
-  private def newSpark(appName: String): SparkSession = {
+  private def newSpark(appName: String, extraConf: Seq[(String, String)] = Seq.empty): SparkSession = {
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
 
     val warehouse = newDir(s"$appName-warehouse")
-    val spark = SparkSession
+    val builder = SparkSession
       .builder()
       .master("local[1]")
       .appName(appName)
@@ -64,11 +68,35 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       .config("spark.driver.host", "localhost")
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
-      .getOrCreate()
+    extraConf.foreach { case (key, value) => builder.config(key, value) }
+    val spark = builder.getOrCreate()
 
     sparks += spark
     spark
   }
+
+  private def newStateSyncSession(base: SparkSession, key: String): SparkSession = {
+    val session = base.newSession()
+    session.conf.set(TestStateSyncKey, key)
+    session
+  }
+
+  private def waitUntil(timeout: FiniteDuration = 10.seconds)(condition: => Boolean): Unit = {
+    val deadline = timeout.fromNow
+    while (!condition && deadline.hasTimeLeft()) {
+      Thread.sleep(25L)
+    }
+    condition shouldBe true
+  }
+
+  private def waitForStateSyncIdle(session: SparkSession, timeout: FiniteDuration = 10.seconds): Unit =
+    waitUntil(timeout) {
+      OpenIvmStateSync
+        .backupStateSnapshotForTesting(session)
+        .contains(
+          OpenIvmStateSync.BackupStateSnapshot(running = false, requested = false)
+        )
+    }
 
   describe("OpenIvmRocksDBRegistry") {
     it("returns the same instance for repeated opens of the same path") {
@@ -192,6 +220,107 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
 
       OpenIvmMaintenanceCoordinator.isRunning shouldBe true
       noException should be thrownBy survivor.currentVersion
+    }
+  }
+
+  describe("OpenIvmStateSync") {
+    it("coalesces in-flight requests into one follow-up pass and stays bounded while eventually becoming idle") {
+      val spark = newSpark(
+        "state-sync-coalesce",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val stateSession = newStateSyncSession(spark, "coalesce")
+      val passCount    = new AtomicInteger(0)
+      val entered      = Array.fill(3)(new CountDownLatch(1))
+      val release      = Array.fill(3)(new CountDownLatch(1))
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val pass = passCount.incrementAndGet()
+        if (pass <= entered.length) {
+          entered(pass - 1).countDown()
+          release(pass - 1).await(10, TimeUnit.SECONDS)
+        }
+      }
+
+      try {
+        OpenIvmStateSync.backupAsync(stateSession)
+        entered(0).await(5, TimeUnit.SECONDS) shouldBe true
+
+        OpenIvmStateSync.backupAsync(stateSession)
+        release(0).countDown()
+
+        entered(1).await(5, TimeUnit.SECONDS) shouldBe true
+        passCount.get() shouldBe 2
+
+        (1 to 64).foreach(_ => OpenIvmStateSync.backupAsync(stateSession))
+        release(1).countDown()
+
+        entered(2).await(5, TimeUnit.SECONDS) shouldBe true
+        passCount.get() shouldBe 3
+
+        release(2).countDown()
+        waitForStateSyncIdle(stateSession)
+        OpenIvmStateSync.allBackupStatesIdleForTesting shouldBe true
+        passCount.get() shouldBe 3
+      } finally {
+        release.foreach(_.countDown())
+        waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
+      }
+    }
+
+    it("allows different state-sync keys to overlap and eventually returns both to idle") {
+      val spark = newSpark(
+        "state-sync-overlap",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val leftSession  = newStateSyncSession(spark, "overlap-left")
+      val rightSession = newStateSyncSession(spark, "overlap-right")
+      val leftEntered  = new CountDownLatch(1)
+      val rightEntered = new CountDownLatch(1)
+      val releaseLeft  = new CountDownLatch(1)
+      val releaseRight = new CountDownLatch(1)
+      val active       = new AtomicInteger(0)
+      val maxActive    = new AtomicInteger(0)
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (key, _, _) =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        try {
+          key match {
+            case "overlap-left" =>
+              leftEntered.countDown()
+              releaseLeft.await(10, TimeUnit.SECONDS)
+            case "overlap-right" =>
+              rightEntered.countDown()
+              releaseRight.await(10, TimeUnit.SECONDS)
+            case _ => ()
+          }
+        } finally {
+          active.decrementAndGet()
+        }
+      }
+
+      try {
+        OpenIvmStateSync.backupAsync(leftSession)
+        OpenIvmStateSync.backupAsync(rightSession)
+
+        leftEntered.await(5, TimeUnit.SECONDS) shouldBe true
+        rightEntered.await(5, TimeUnit.SECONDS) shouldBe true
+        maxActive.get() shouldBe 2
+
+        releaseLeft.countDown()
+        releaseRight.countDown()
+
+        waitForStateSyncIdle(leftSession)
+        waitForStateSyncIdle(rightSession)
+        OpenIvmStateSync.allBackupStatesIdleForTesting shouldBe true
+      } finally {
+        releaseLeft.countDown()
+        releaseRight.countDown()
+        waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
+      }
     }
   }
 }
