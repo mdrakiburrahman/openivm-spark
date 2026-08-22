@@ -6,6 +6,7 @@ import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
+import org.slf4j.MDC
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -66,10 +67,21 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
 
   private def millis(value: Long): Long = TimeUnit.MILLISECONDS.toNanos(value)
 
+  private def withMdc[A](entries: (String, String)*)(body: => A): A = {
+    entries.foreach { case (key, value) => MDC.put(key, value) }
+    try body
+    finally entries.foreach { case (key, _) => MDC.remove(key) }
+  }
+
   describe("OpenIvmExecutionSpan") {
     it("emits a completed span with isolated metrics and optional backup timing") {
       val payloads = withLogCapture { appender =>
-        val span = OpenIvmExecutionSpan.start("default.sales_mv", "refresh", Some("req-123"))
+        val span = OpenIvmExecutionSpan.start(
+          "default.sales_mv",
+          "refresh",
+          requestId = Some("req-123"),
+          dbtNodeId = Some("model.sales_mv")
+        )
         span.recordProfileStep("acquire_locks", "thread=driver-1", 3L)
         OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(7L))
         OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(13L))
@@ -85,6 +97,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payloads should have size 1
       val payload = payloads.head
       payload.get("request_id").asText() shouldBe "req-123"
+      payload.get("dbt_node_id").asText() shouldBe "model.sales_mv"
       payload.get("materialized_view").asText() shouldBe "default.sales_mv"
       payload.get("operation").asText() shouldBe "refresh"
       payload.get("driver_thread").asText() shouldBe "driver-1"
@@ -111,6 +124,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payloads should have size 1
       val payload = payloads.head
       payload.has("request_id") shouldBe false
+      payload.has("dbt_node_id") shouldBe false
       payload.get("materialized_view").asText() shouldBe "default.fail_mv"
       payload.get("operation").asText() shouldBe "create"
       payload.get("driver_thread").asText() shouldBe "driver-create"
@@ -119,26 +133,68 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.has("compiler_ms") shouldBe false
     }
 
+    it("prefers openivm.node_id and falls back to spark.jobGroup.id for dbt_node_id") {
+      val (requestId, explicitNodeId) = OpenIvmExecutionSpan.correlationIdsFromLookups(
+        localPropertyLookup = key =>
+          Map(
+            "openivm.request_id" -> "req-local",
+            "openivm.node_id"    -> "model.explicit",
+            "spark.jobGroup.id"  -> "job-group-explicit"
+          ).get(key),
+        mdcLookup = _ => None
+      )
+      requestId shouldBe Some("req-local")
+      explicitNodeId shouldBe Some("model.explicit")
+
+      val (_, fallbackNodeId) = OpenIvmExecutionSpan.correlationIdsFromLookups(
+        localPropertyLookup = key => Map("spark.jobGroup.id" -> "job-group-fallback").get(key),
+        mdcLookup = _ => None
+      )
+      fallbackNodeId shouldBe Some("job-group-fallback")
+    }
+
     it("keeps concurrent spans isolated across threads") {
       val payloads = withLogCapture { appender =>
         val pool = Executors.newFixedThreadPool(2)
         try {
           val refreshTask = new Runnable {
             override def run(): Unit = {
-              OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(9L))
-              val span = OpenIvmExecutionSpan.start("default.concurrent_refresh_mv", "refresh", Some("req-refresh"))
-              span.recordProfileStep("acquire_locks", "thread=refresh-worker", 4L)
-              span.complete("refresh_done", Thread.currentThread().getName)
-              span.emitIfNeeded("failed_before_end", "unused")
+              withMdc("request_id" -> "req-refresh", "openivm.node_id" -> "model.refresh_mv") {
+                val (requestId, dbtNodeId) = OpenIvmExecutionSpan.correlationIdsFromLookups(
+                  localPropertyLookup = _ => None,
+                  mdcLookup = key => Option(MDC.get(key))
+                )
+                OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(9L))
+                val span = OpenIvmExecutionSpan.start(
+                  "default.concurrent_refresh_mv",
+                  "refresh",
+                  requestId = requestId,
+                  dbtNodeId = dbtNodeId
+                )
+                span.recordProfileStep("acquire_locks", "thread=refresh-worker", 4L)
+                span.complete("refresh_done", Thread.currentThread().getName)
+                span.emitIfNeeded("failed_before_end", "unused")
+              }
             }
           }
           val createTask = new Runnable {
             override def run(): Unit = {
-              val span = OpenIvmExecutionSpan.start("default.concurrent_create_mv", "create", Some("req-create"))
-              OpenIvmExecutionSpan.observeTimer("driver_admission.create.wait", millis(6L))
-              OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(12L))
-              span.complete("create_done", Thread.currentThread().getName)
-              span.emitIfNeeded("failed_before_end", "unused")
+              withMdc("openivm.request_id" -> "req-create", "spark.jobGroup.id" -> "job-group-create") {
+                val (requestId, dbtNodeId) = OpenIvmExecutionSpan.correlationIdsFromLookups(
+                  localPropertyLookup = _ => None,
+                  mdcLookup = key => Option(MDC.get(key))
+                )
+                val span = OpenIvmExecutionSpan.start(
+                  "default.concurrent_create_mv",
+                  "create",
+                  requestId = requestId,
+                  dbtNodeId = dbtNodeId
+                )
+                OpenIvmExecutionSpan.observeTimer("driver_admission.create.wait", millis(6L))
+                OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(12L))
+                span.complete("create_done", Thread.currentThread().getName)
+                span.emitIfNeeded("failed_before_end", "unused")
+              }
             }
           }
 
@@ -157,12 +213,14 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
 
       val refresh = byView("default.concurrent_refresh_mv")
       refresh.get("request_id").asText() shouldBe "req-refresh"
+      refresh.get("dbt_node_id").asText() shouldBe "model.refresh_mv"
       refresh.get("driver_admission_wait_ms").asLong() shouldBe 9L
       refresh.get("same_mv_lock_wait_ms").asLong() shouldBe 4L
       refresh.has("compiler_ms") shouldBe false
 
       val create = byView("default.concurrent_create_mv")
       create.get("request_id").asText() shouldBe "req-create"
+      create.get("dbt_node_id").asText() shouldBe "job-group-create"
       create.get("driver_admission_wait_ms").asLong() shouldBe 6L
       create.get("compiler_ms").asLong() shouldBe 12L
       create.has("same_mv_lock_wait_ms") shouldBe false

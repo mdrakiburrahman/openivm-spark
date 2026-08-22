@@ -187,6 +187,7 @@ Independently of the profile gate, the driver now emits a single-line
 `OPENIVM_EXECUTION_SPAN {json}` record for each CREATE / REFRESH lifecycle.
 The JSON fields are stable and intentionally low-cardinality:
 `request_id` (when present from Spark local properties / MDC),
+`dbt_node_id` (from `openivm.node_id`, else `spark.jobGroup.id`, including MDC),
 `materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
 `duration_ms`, `driver_thread`, `outcome`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,

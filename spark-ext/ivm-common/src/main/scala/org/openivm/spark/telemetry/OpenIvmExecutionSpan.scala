@@ -14,6 +14,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
     val materializedView: String,
     val operation: String,
     private val requestId: Option[String],
+    private val dbtNodeId: Option[String],
     private val startedAtEpochMs: Long,
     private val startedAtNanos: Long,
     private val enabled: Boolean
@@ -119,6 +120,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
             Some(
               OpenIvmExecutionSpan.renderJson(
                 requestId = requestId,
+                dbtNodeId = dbtNodeId,
                 materializedView = materializedView,
                 operation = operation,
                 startedAtEpochMs = startedAtEpochMs,
@@ -189,22 +191,32 @@ object OpenIvmExecutionSpan extends Logging {
   private val current           = new ThreadLocal[OpenIvmExecutionSpan]()
   private val pending           = new ThreadLocal[PendingDurations]()
   private val RequestIdKeys     = Seq("openivm.request_id", "request_id", "requestId")
+  private val DbtNodeIdKeys     = Seq("openivm.node_id", "spark.jobGroup.id")
   private val PendingTtlNanos   = TimeUnit.SECONDS.toNanos(30L)
   private val LogPrefix: String = "OPENIVM_EXECUTION_SPAN "
 
   val NoOp: OpenIvmExecutionSpan =
-    new OpenIvmExecutionSpan("", "refresh", None, 0L, 0L, enabled = false)
+    new OpenIvmExecutionSpan("", "refresh", None, None, 0L, 0L, enabled = false)
 
   def start(spark: SparkSession, materializedView: String, operation: String): OpenIvmExecutionSpan =
-    start(materializedView, operation, requestIdFrom(spark))
+    correlationIdsFromSpark(spark) match {
+      case (requestId, dbtNodeId) =>
+        start(materializedView, operation, requestId, dbtNodeId)
+    }
 
-  def start(materializedView: String, operation: String, requestId: Option[String] = None): OpenIvmExecutionSpan = {
+  def start(
+      materializedView: String,
+      operation: String,
+      requestId: Option[String] = None,
+      dbtNodeId: Option[String] = None
+  ): OpenIvmExecutionSpan = {
     val nowEpochMs = System.currentTimeMillis()
     val nowNanos   = System.nanoTime()
     val span = new OpenIvmExecutionSpan(
       materializedView = normalizeString(materializedView),
       operation = normalizeOperation(operation),
       requestId = requestId.map(normalizeString).filter(_.nonEmpty),
+      dbtNodeId = dbtNodeId.map(normalizeString).filter(_.nonEmpty),
       startedAtEpochMs = nowEpochMs,
       startedAtNanos = nowNanos,
       enabled = true
@@ -294,20 +306,42 @@ object OpenIvmExecutionSpan extends Logging {
   private[telemetry] def normalizeString(value: String): String =
     Option(value).map(_.trim).getOrElse("")
 
-  private def requestIdFrom(spark: SparkSession): Option[String] =
-    (RequestIdKeys.iterator.flatMap { key =>
-      Option(spark.sparkContext.getLocalProperty(key)).filter(_.trim.nonEmpty)
-    } ++
-      RequestIdKeys.iterator.flatMap { key =>
-        Option(MDC.get(key)).filter(_.trim.nonEmpty)
-      } ++
-      Seq(
-        spark.conf.getOption("spark.openivm.request_id"),
-        sys.props.get("openivm.request_id")
-      ).iterator.flatten.filter(_.trim.nonEmpty)).toSeq.headOption
+  private[telemetry] def correlationIdsFromLookups(
+      localPropertyLookup: String => Option[String],
+      mdcLookup: String => Option[String],
+      confLookup: String => Option[String] = _ => None,
+      sysPropLookup: String => Option[String] = _ => None
+  ): (Option[String], Option[String]) = {
+    val requestId = firstNonBlank(
+      valuesFor(RequestIdKeys, localPropertyLookup),
+      valuesFor(RequestIdKeys, mdcLookup),
+      valuesFor(Seq("spark.openivm.request_id"), confLookup),
+      valuesFor(Seq("openivm.request_id"), sysPropLookup)
+    )
+    val dbtNodeId = firstNonBlank(
+      valuesFor(DbtNodeIdKeys, localPropertyLookup),
+      valuesFor(DbtNodeIdKeys, mdcLookup)
+    )
+    requestId -> dbtNodeId
+  }
+
+  private def correlationIdsFromSpark(spark: SparkSession): (Option[String], Option[String]) =
+    correlationIdsFromLookups(
+      localPropertyLookup = key => Option(spark.sparkContext.getLocalProperty(key)),
+      mdcLookup = key => Option(MDC.get(key)),
+      confLookup = key => spark.conf.getOption(key),
+      sysPropLookup = key => sys.props.get(key)
+    )
+
+  private def valuesFor(keys: Seq[String], lookup: String => Option[String]): Iterator[String] =
+    keys.iterator.flatMap(key => lookup(key).iterator.map(normalizeString).filter(_.nonEmpty))
+
+  private def firstNonBlank(sources: Iterator[String]*): Option[String] =
+    sources.iterator.flatten.find(_.nonEmpty)
 
   private def renderJson(
       requestId: Option[String],
+      dbtNodeId: Option[String],
       materializedView: String,
       operation: String,
       startedAtEpochMs: Long,
@@ -324,6 +358,7 @@ object OpenIvmExecutionSpan extends Logging {
   ): String = {
     val fields = new LinkedHashMap[String, AnyRef]()
     requestId.foreach(fields.put("request_id", _))
+    dbtNodeId.foreach(fields.put("dbt_node_id", _))
     fields.put("materialized_view", materializedView)
     fields.put("operation", operation)
     fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
