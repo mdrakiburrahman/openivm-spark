@@ -192,6 +192,9 @@ The JSON fields are stable and intentionally low-cardinality:
 `duration_ms`, `driver_thread`, `outcome`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
 `catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`.
+`rocksdb_backup_ms` is best-effort only: async state backup may finish after the
+primary span is emitted, and that late completion does NOT trigger a duplicate
+`OPENIVM_EXECUTION_SPAN` line.
 
 The profile complements Spark event metrics. Use event metrics for records,
 files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.

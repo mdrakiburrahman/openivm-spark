@@ -133,6 +133,39 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.has("compiler_ms") shouldBe false
     }
 
+    it("reuses the same command span and does not re-emit for late async backup timing") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start(
+          "default.reused_mv",
+          "refresh",
+          requestId = Some("req-reused"),
+          dbtNodeId = Some("model.reused")
+        )
+        val reused = OpenIvmExecutionSpan.start(
+          "default.reused_mv",
+          "refresh",
+          requestId = Some("ignored-request"),
+          dbtNodeId = Some("ignored-node")
+        )
+
+        reused should be theSameInstanceAs span
+
+        OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(8L))
+        span.complete("refresh_done", "driver-reused")
+        span.emitIfNeeded("failed_before_end", "unused")
+        OpenIvmExecutionSpan.observeRocksDbBackup(millis(21L))
+        OpenIvmExecutionSpan.finishActive("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.get("request_id").asText() shouldBe "req-reused"
+      payload.get("dbt_node_id").asText() shouldBe "model.reused"
+      payload.get("driver_admission_wait_ms").asLong() shouldBe 8L
+      payload.has("rocksdb_backup_ms") shouldBe false
+    }
+
     it("prefers openivm.node_id and falls back to spark.jobGroup.id for dbt_node_id") {
       val (requestId, explicitNodeId) = OpenIvmExecutionSpan.correlationIdsFromLookups(
         localPropertyLookup = key =>

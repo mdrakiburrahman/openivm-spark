@@ -34,6 +34,13 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var driverThread       = Option.empty[String]
   private var emitted            = false
 
+  private[telemetry] def matchesCommand(expectedView: String, expectedOperation: String): Boolean =
+    lock.synchronized {
+      !emitted &&
+      materializedView == OpenIvmExecutionSpan.normalizeString(expectedView) &&
+      operation == OpenIvmExecutionSpan.normalizeOperation(expectedOperation)
+    }
+
   private def addDuration(current: Option[Long], deltaMs: Long): Option[Long] =
     Some(current.getOrElse(0L) + math.max(0L, deltaMs))
 
@@ -210,6 +217,9 @@ object OpenIvmExecutionSpan extends Logging {
       requestId: Option[String] = None,
       dbtNodeId: Option[String] = None
   ): OpenIvmExecutionSpan = {
+    Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
+      return existing
+    }
     val nowEpochMs = System.currentTimeMillis()
     val nowNanos   = System.nanoTime()
     val span = new OpenIvmExecutionSpan(
@@ -225,6 +235,12 @@ object OpenIvmExecutionSpan extends Logging {
     current.set(span)
     span
   }
+
+  def finishActive(defaultOutcome: String, defaultDriverThread: String): Unit =
+    Option(current.get()).foreach { span =>
+      try span.emitIfNeeded(defaultOutcome, defaultDriverThread)
+      finally current.remove()
+    }
 
   def hasCurrentSpan: Boolean = current.get() != null
 

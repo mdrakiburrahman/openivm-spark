@@ -1,5 +1,11 @@
 package org.openivm.spark.commands
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{
@@ -33,6 +39,8 @@ import scala.concurrent.{Await, ExecutionContext, Future}
  * OPENIVM_EXTENSION_PATH / OPENIVM_CLI_PATH (propagated via build.sbt envVars).
  */
 class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
+
+  private val Json = new ObjectMapper()
 
   private val warehouseDir: String = {
     val d = new File(s"target/test-warehouse-cmds-${UUID.randomUUID().toString.take(8)}")
@@ -101,6 +109,54 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   private def awaitResult[A](future: Future[A], timeout: FiniteDuration = 600.seconds): A =
     Await.result(future, timeout)
 
+  private final class BufferingAppender(name: String)
+      extends AbstractAppender(
+        name,
+        null,
+        PatternLayout.createDefaultLayout(),
+        false,
+        Property.EMPTY_ARRAY
+      ) {
+    private val buffer = scala.collection.mutable.ArrayBuffer.empty[String]
+
+    override def append(event: LogEvent): Unit =
+      buffer.synchronized {
+        buffer += event.getMessage.getFormattedMessage
+      }
+
+    def messages: Seq[String] = buffer.synchronized(buffer.toVector)
+  }
+
+  private def withLogCapture[A](body: BufferingAppender => A): A = {
+    val appender = new BufferingAppender(s"commands-span-${UUID.randomUUID()}")
+    val root     = LogManager.getRootLogger.asInstanceOf[Logger]
+    appender.start()
+    root.addAppender(appender)
+    try body(appender)
+    finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
+
+  private def executionSpanPayloads(messages: Seq[String], materializedView: String): Seq[JsonNode] =
+    messages
+      .collect {
+        case line if line.startsWith("OPENIVM_EXECUTION_SPAN ") =>
+          Json.readTree(line.stripPrefix("OPENIVM_EXECUTION_SPAN "))
+      }
+      .filter(_.path("materialized_view").asText() == materializedView)
+
+  private def withSparkLocalProperties[A](entries: (String, String)*)(body: => A): A = {
+    val previous = entries.map { case (key, _) => key -> spark.sparkContext.getLocalProperty(key) }
+    entries.foreach { case (key, value) => spark.sparkContext.setLocalProperty(key, value) }
+    try body
+    finally
+      previous.foreach { case (key, value) =>
+        spark.sparkContext.setLocalProperty(key, value)
+      }
+  }
+
   private def assertBagEqual(tableName: String, expectedSql: String): Unit = {
     val expected = spark.sql(expectedSql)
     val cols     = expected.columns.toSeq
@@ -138,7 +194,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       stagingSubPath: String,
       rows: Seq[(String, Int)]
   ): String = {
-    val stagingPath = s"$warehouseDir/_ivm/staging/$stagingSubPath"
+    val stagingPath    = s"$warehouseDir/_ivm/staging/$stagingSubPath"
     val previousBypass = IvmDmlInterceptorRule.bypass.get()
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -579,8 +635,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("INSERT INTO sales_t14_create VALUES ('east', 10), ('west', 20), ('north', 30)")
       spark.sql("INSERT INTO sales_t14_refresh VALUES ('east', 5), ('west', 7)")
 
-      val createSql     = "SELECT region, SUM(amount) AS total FROM sales_t14_create GROUP BY region"
-      val refreshSql    = "SELECT region, SUM(amount) AS total FROM sales_t14_refresh GROUP BY region"
+      val createSql  = "SELECT region, SUM(amount) AS total FROM sales_t14_create GROUP BY region"
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM sales_t14_refresh GROUP BY region"
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_refresh AS $refreshSql")
       spark.sql("INSERT INTO sales_t14_refresh VALUES ('north', 11)")
 
@@ -609,6 +665,60 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
   }
 
+  describe("(14a) Same-MV CREATE execution spans") {
+    it("emit one primary span per CREATE and capture queued same-MV lock waits") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14a_create(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t14a_create VALUES ('east', 10), ('west', 20)")
+
+      val createSql     = "SELECT region, SUM(amount) AS total FROM sales_t14a_create GROUP BY region"
+      val createEntered = new CountDownLatch(1)
+      val releaseCreate = new CountDownLatch(1)
+
+      val payloads = withLogCapture { appender =>
+        CommandConcurrencyInjection.withBeforeCreateBody({
+          createEntered.countDown()
+          releaseCreate.await(30, TimeUnit.SECONDS) shouldBe true
+        }) {
+          withPool(2) { implicit ec =>
+            val create1 = Future {
+              withSparkLocalProperties(
+                "openivm.request_id" -> "req-create-1",
+                "openivm.node_id"    -> "model.create.one"
+              ) {
+                spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+              }
+            }
+            createEntered.await(30, TimeUnit.SECONDS) shouldBe true
+            val create2 = Future {
+              withSparkLocalProperties(
+                "openivm.request_id" -> "req-create-2",
+                "openivm.node_id"    -> "model.create.two"
+              ) {
+                spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+              }
+            }
+            Thread.sleep(150L)
+            create2.isCompleted shouldBe false
+            releaseCreate.countDown()
+            awaitResult(create1, 600.seconds)
+            awaitResult(create2, 600.seconds)
+          }
+        }
+        executionSpanPayloads(appender.messages, "mv_t14a_create_span")
+      }
+
+      val byRequest = payloads.groupBy(_.path("request_id").asText())
+      byRequest.keySet shouldBe Set("req-create-1", "req-create-2")
+      byRequest.values.foreach(_.size shouldBe 1)
+      byRequest("req-create-1").head.path("dbt_node_id").asText() shouldBe "model.create.one"
+      val waitingCreate = byRequest("req-create-2").head
+      waitingCreate.path("dbt_node_id").asText() shouldBe "model.create.two"
+      waitingCreate.path("same_mv_lock_wait_ms").asLong() should be > 0L
+
+      assertBagEqual("mv_t14a_create_span", createSql)
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Test 15 — same-MV refreshes serialize and the queued one sees newer deltas
   // ---------------------------------------------------------------------------
@@ -630,25 +740,50 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           "CAST(id AS INT) AS amount FROM range(250000)"
       )
 
-      withPool(2) { implicit ec =>
-        val refresh1 = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect() }
-        Thread.sleep(150L)
-        val refresh2 = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect() }
-        Thread.sleep(150L)
-        spark.sql(
-          "INSERT INTO sales_t15 " +
-            "SELECT CASE " +
-            "  WHEN id % 4 = 0 THEN 'east' " +
-            "  WHEN id % 4 = 1 THEN 'west' " +
-            "  WHEN id % 4 = 2 THEN 'north' " +
-            "  ELSE 'south' END AS region, " +
-            "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
-        )
+      val payloads = withLogCapture { appender =>
+        withPool(2) { implicit ec =>
+          val refresh1 = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-refresh-1",
+              "openivm.node_id"    -> "model.refresh.one"
+            ) {
+              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+            }
+          }
+          Thread.sleep(150L)
+          val refresh2 = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-refresh-2",
+              "openivm.node_id"    -> "model.refresh.two"
+            ) {
+              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+            }
+          }
+          Thread.sleep(150L)
+          spark.sql(
+            "INSERT INTO sales_t15 " +
+              "SELECT CASE " +
+              "  WHEN id % 4 = 0 THEN 'east' " +
+              "  WHEN id % 4 = 1 THEN 'west' " +
+              "  WHEN id % 4 = 2 THEN 'north' " +
+              "  ELSE 'south' END AS region, " +
+              "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+          )
 
-        awaitResult(refresh1, 600.seconds)
-        refresh2.isCompleted shouldBe false
-        awaitResult(refresh2, 600.seconds)
+          awaitResult(refresh1, 600.seconds)
+          refresh2.isCompleted shouldBe false
+          awaitResult(refresh2, 600.seconds)
+        }
+        executionSpanPayloads(appender.messages, "mv_t15_serial")
       }
+
+      val byRequest = payloads.groupBy(_.path("request_id").asText())
+      byRequest.keySet shouldBe Set("req-refresh-1", "req-refresh-2")
+      byRequest.values.foreach(_.size shouldBe 1)
+      byRequest("req-refresh-1").head.path("dbt_node_id").asText() shouldBe "model.refresh.one"
+      val waitingRefresh = byRequest("req-refresh-2").head
+      waitingRefresh.path("dbt_node_id").asText() shouldBe "model.refresh.two"
+      waitingRefresh.path("same_mv_lock_wait_ms").asLong() should be > 0L
 
       assertBagEqual("mv_t15_serial", refreshSql)
     }
@@ -665,7 +800,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("INSERT INTO sales_t16_keep VALUES ('east', 8), ('west', 9)")
 
       val keepSql = "SELECT region, SUM(amount) AS total FROM sales_t16_keep GROUP BY region"
-      spark.sql("CREATE MATERIALIZED VIEW mv_t16_drop AS SELECT region, SUM(amount) AS total FROM sales_t16_drop GROUP BY region")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t16_drop AS SELECT region, SUM(amount) AS total FROM sales_t16_drop GROUP BY region"
+      )
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t16_keep AS $keepSql")
       spark.sql(
         "INSERT INTO sales_t16_keep " +

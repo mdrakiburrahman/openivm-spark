@@ -33,6 +33,7 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler}
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -939,10 +940,11 @@ case class CreateMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    val createT0 = System.nanoTime()
-    val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
+    val createT0    = System.nanoTime()
+    val commandName = metaName(name)
+    val profile     = RefreshProfile.start(spark, commandName, RefreshProfile.Mode.Create)
     val sqlLog =
-      RefreshSqlLog.start(spark, profile.refreshId, metaName(name), RefreshSqlLog.ModeCreate)
+      RefreshSqlLog.start(spark, profile.refreshId, commandName, RefreshSqlLog.ModeCreate)
     var createOutcome = "create_failed"
     // Record the user-supplied CREATE-MV body up front. Not executed by us
     // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
@@ -956,7 +958,11 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     try {
-      val rows = RefreshMutex.withLock(metaName(name)) {
+      val lockWaitT0 = System.nanoTime()
+      val rows = RefreshMutex.withLock(commandName) {
+        val threadName = Thread.currentThread().getName
+        val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+        profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
         org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
           OpenIvmMetrics.CreateInflight.incrementAndGet()
           try {
@@ -971,11 +977,13 @@ case class CreateMaterializedViewCommand(
       createOutcome = "create_executed"
       rows
     } finally {
-      val totalMs = (System.nanoTime() - createT0) / 1000000L
-      profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
-      profile.completeSpan(createOutcome, Thread.currentThread().getName)
-      profile.flush()
-      sqlLog.flush()
+      try {
+        val totalMs = (System.nanoTime() - createT0) / 1000000L
+        profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
+        profile.completeSpan(createOutcome, Thread.currentThread().getName)
+        profile.flush()
+        sqlLog.flush()
+      } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
     }
   }
 
@@ -1474,9 +1482,11 @@ case class RefreshMaterializedViewCommand(
     // RefreshMutex above. Without this, two threads that both read the
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
+    val viewMeta = metaName(name)
+    OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0 = System.nanoTime()
     try {
-      val rows = RefreshMutex.withLock(metaName(name)) {
+      val rows = RefreshMutex.withLock(viewMeta) {
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         OpenIvmMetrics.RefreshInflight.incrementAndGet()
         try {
@@ -1492,7 +1502,8 @@ case class RefreshMaterializedViewCommand(
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
-      RefreshProfile.flushActive()
+      try RefreshProfile.flushActive()
+      finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
     }
   }
 
