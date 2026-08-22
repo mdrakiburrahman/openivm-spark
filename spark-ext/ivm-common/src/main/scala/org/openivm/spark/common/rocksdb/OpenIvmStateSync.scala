@@ -33,8 +33,8 @@ object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
 
   private final class BackupState {
-    val requested = new AtomicBoolean(false)
-    val running   = new AtomicBoolean(false)
+    val requested     = new AtomicBoolean(false)
+    val running       = new AtomicBoolean(false)
     private val spans = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
 
     def capture(span: Option[OpenIvmExecutionSpan]): Unit =
