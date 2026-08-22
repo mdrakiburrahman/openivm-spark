@@ -90,8 +90,8 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
   }
 
   protected def runSqlEventually(sqlText: String, maxAttempts: Int = 10): Unit = {
-    var attempt   = 0
-    var succeeded = false
+    var attempt              = 0
+    var succeeded            = false
     var lastError: Throwable = null
     while (!succeeded && attempt < maxAttempts) {
       try {
