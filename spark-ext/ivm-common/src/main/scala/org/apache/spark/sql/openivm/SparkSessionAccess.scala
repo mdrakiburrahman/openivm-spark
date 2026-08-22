@@ -23,4 +23,32 @@ object SparkSessionAccess {
     * `org.openivm.*`.
     */
   def cloneSession(spark: SparkSession): SparkSession = spark.cloneSession()
+
+  /** Run `body` with `spark` installed as the thread-local active session,
+    * restoring the caller's prior active session afterwards.
+    *
+    * We intentionally do NOT touch Spark's default session: the active
+    * session is thread-local and therefore request-scoped, while mutating the
+    * process-wide default session would leak across concurrent Privy workers.
+    */
+  def withActiveSession[A](spark: SparkSession)(body: => A): A = {
+    val previous = SparkSession.getActiveSession
+    SparkSession.setActiveSession(spark)
+    try body
+    finally
+      previous match {
+        case Some(session) => SparkSession.setActiveSession(session)
+        case None          => SparkSession.clearActiveSession()
+      }
+  }
+
+  /** Clone `spark`, install the clone as the active session for this thread,
+    * and run `body` with that isolated session.
+    */
+  def withIsolatedSession[A](spark: SparkSession)(body: SparkSession => A): A = {
+    val cloned = cloneSession(spark)
+    withActiveSession(cloned) {
+      body(cloned)
+    }
+  }
 }

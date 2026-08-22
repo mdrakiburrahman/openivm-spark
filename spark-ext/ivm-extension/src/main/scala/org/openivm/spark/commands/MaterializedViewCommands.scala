@@ -127,13 +127,15 @@ private[commands] object OpenIvmCompilers {
 }
 
 // ---------------------------------------------------------------------------
-// Per-MV refresh mutex — JVM-wide. openivm itself uses a per-view mutex
+// Per-MV command mutex — JVM-wide. openivm itself uses a per-view mutex
 // (see openivm/test/sql/concurrency.test prologue), and we replicate that
 // invariant here because the Spark-side incremental refresh path is NOT
-// safe under naive Delta OCC + retry: the per-statement retry harness
-// re-executes the same MERGE without re-reading the staging-delta
-// snapshot, so two threads that both observed the same unconsumed delta
-// can each apply it once, double-counting the count-monoid aggregates.
+// safe under naive Delta OCC + retry: re-executing the same refresh body
+// without re-reading the staging-delta snapshot lets two threads that both
+// observed the same unconsumed delta each apply it once, double-counting
+// count-monoid aggregates. The key is the fully-qualified MV name, so
+// CREATE/REFRESH/DROP on the SAME logical MV serialize while unrelated MVs
+// proceed independently.
 // ---------------------------------------------------------------------------
 private[commands] object RefreshMutex {
 
@@ -181,6 +183,33 @@ private[spark] object RefreshFailureInjection {
       spark.sparkContext.setLocalProperty(FailWindowCascadeInsertKey, null)
       throw new RuntimeException("injected failure after WINDOW_PARTITION target delete")
     }
+}
+
+private[spark] object CommandConcurrencyInjection {
+
+  @volatile private var beforeCreateBody: () => Unit = null
+
+  def withBeforeCreateBody[A](hook: => Unit)(body: => A): A = synchronized {
+    val previous = beforeCreateBody
+    beforeCreateBody = () => hook
+    try body
+    finally beforeCreateBody = previous
+  }
+
+  private[commands] def maybePauseBeforeCreate(): Unit = {
+    val hook = beforeCreateBody
+    if (hook != null) hook()
+  }
+}
+
+private[commands] object CommandLocalState {
+
+  def withDmlBypass[A](body: => A): A = {
+    val previous = IvmDmlInterceptorRule.bypass.get()
+    IvmDmlInterceptorRule.bypass.set(true)
+    try body
+    finally IvmDmlInterceptorRule.bypass.set(previous)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -910,7 +939,6 @@ case class CreateMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    OpenIvmMetrics.CreateInflight.incrementAndGet()
     val createT0 = System.nanoTime()
     val profile  = RefreshProfile.start(spark, metaName(name), RefreshProfile.Mode.Create)
     val sqlLog =
@@ -928,14 +956,21 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     try {
-      val rows = DriverHeavyOperationAdmission.withPermit(spark, "create") {
-        runCreate(spark, profile, sqlLog)
+      val rows = RefreshMutex.withLock(metaName(name)) {
+        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+          OpenIvmMetrics.CreateInflight.incrementAndGet()
+          try {
+            CommandConcurrencyInjection.maybePauseBeforeCreate()
+            DriverHeavyOperationAdmission.withPermit(spark, "create") {
+              runCreate(isolated, profile, sqlLog)
+            }
+          } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+        }
       }
       OpenIvmStateSync.backupAsync(spark)
       createOutcome = "create_executed"
       rows
     } finally {
-      OpenIvmMetrics.CreateInflight.decrementAndGet()
       val totalMs = (System.nanoTime() - createT0) / 1000000L
       profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
       profile.completeSpan(createOutcome, Thread.currentThread().getName)
@@ -1332,8 +1367,7 @@ case class CreateMaterializedViewCommand(
     profile.timeStep("create_cleanup_stale_location") {
       cleanupStaleMvLocation(spark, location)
     }
-    IvmDmlInterceptorRule.bypass.set(true)
-    try {
+    CommandLocalState.withDmlBypass {
       profile.timeStep(
         "create_mv_initial_load",
         s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${initSql.length}"
@@ -1419,8 +1453,6 @@ case class CreateMaterializedViewCommand(
           DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
         MvCatalog.upsert(spark, meta.copy(lastVersion = version))
       }
-    } finally {
-      IvmDmlInterceptorRule.bypass.set(false)
     }
 
     Seq.empty
@@ -1445,12 +1477,15 @@ case class RefreshMaterializedViewCommand(
     val lockT0 = System.nanoTime()
     try {
       val rows = RefreshMutex.withLock(metaName(name)) {
-        OpenIvmMetrics.RefreshInflight.incrementAndGet()
-        val cloned    = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-        // Clone the SparkSession so every refresh gets its own temp-view namespace.
-        try DriverHeavyOperationAdmission.withPermit(spark, "refresh")(runUnderLock(cloned, lockAcqMs))
-        finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
+        OpenIvmMetrics.RefreshInflight.incrementAndGet()
+        try {
+          DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
+            org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
+              runUnderLock(cloned, lockAcqMs)
+            }
+          }
+        } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
       OpenIvmStateSync.backupAsync(spark)
       rows
@@ -1582,26 +1617,33 @@ case class RefreshMaterializedViewCommand(
     val qlogOrder = new java.util.concurrent.atomic.AtomicInteger(0)
     profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
     RefreshPerf.emit(refreshId, viewLabel, "start", s"thread='$threadName'")
+    var endEmitted             = false
+    var refreshTypeForFailure  = "UNKNOWN"
+    var pendingDeltasForFailure = 0
 
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
-      val totalMs = (System.nanoTime() - refreshT0) / 1000000L
-      RefreshPerf.emit(
-        refreshId,
-        viewLabel,
-        "end",
-        s"total_ms=$totalMs refresh_type='$refreshTypeName' " +
-          s"outcome='$outcome' pending_deltas=$pendingDeltas"
-      )
-      profile.appendStep(
-        "total_refresh",
-        s"refresh_type=$refreshTypeName;outcome=$outcome;pending_deltas=$pendingDeltas",
-        totalMs
-      )
-      profile.completeSpan(outcome, threadName)
-      profile.flush()
-      sqlLog.flush()
+      if (!endEmitted) {
+        endEmitted = true
+        val totalMs = (System.nanoTime() - refreshT0) / 1000000L
+        RefreshPerf.emit(
+          refreshId,
+          viewLabel,
+          "end",
+          s"total_ms=$totalMs refresh_type='$refreshTypeName' " +
+            s"outcome='$outcome' pending_deltas=$pendingDeltas"
+        )
+        profile.appendStep(
+          "total_refresh",
+          s"refresh_type=$refreshTypeName;outcome=$outcome;pending_deltas=$pendingDeltas",
+          totalMs
+        )
+        profile.completeSpan(outcome, threadName)
+        profile.flush()
+        sqlLog.flush()
+      }
     }
 
+    try {
     val meta = MvCatalog
       .lookup(spark, name)
       .getOrElse {
@@ -1611,6 +1653,7 @@ case class RefreshMaterializedViewCommand(
           Map("relationName" -> sqlIdent(name))
         )
       }
+    refreshTypeForFailure = meta.refreshTypeName
 
     val viewNameStr      = metaName(name)
     val propagation      = ChangePropagationFactory.forSession(spark)
@@ -1647,6 +1690,7 @@ case class RefreshMaterializedViewCommand(
         )
       }
     }
+    pendingDeltasForFailure = changeBatches.size
 
     // Defensive backstop: the cheap existence probe above and the full collect
     // can diverge if another refresh consumes the same rows before we collect.
@@ -1930,37 +1974,38 @@ case class RefreshMaterializedViewCommand(
         mvLocation = meta.location
       )
       val assembled = SparkMergeAssembler.assemble(input)
-      IvmDmlInterceptorRule.bypass.set(true)
       var stmtCounter = 0
       try {
-        assembled.statements.foreach { sql =>
-          val kind     = RefreshPerf.classify(sql, "")
-          val sqlBytes = sql.length
-          val qOrder   = qlogOrder.getAndIncrement()
-          profile.timeStep(
-            "execute_refresh_sql_stmt",
-            s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
-          ) {
-            RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
-              RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                val t0 = System.nanoTime()
-                try {
-                  val df = spark.sql(sql)
-                  val r  = df.collect()
-                  recordPlanMetrics(df, kind)
-                  val ms = (System.nanoTime() - t0) / 1000000L
-                  sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
-                  r
-                } catch {
-                  case t: Throwable =>
+        CommandLocalState.withDmlBypass {
+          assembled.statements.foreach { sql =>
+            val kind     = RefreshPerf.classify(sql, "")
+            val sqlBytes = sql.length
+            val qOrder   = qlogOrder.getAndIncrement()
+            profile.timeStep(
+              "execute_refresh_sql_stmt",
+              s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
+            ) {
+              RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
+                RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                  val t0 = System.nanoTime()
+                  try {
+                    val df = spark.sql(sql)
+                    val r  = df.collect()
+                    recordPlanMetrics(df, kind)
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
-                    throw t
+                    r
+                  } catch {
+                    case t: Throwable =>
+                      val ms = (System.nanoTime() - t0) / 1000000L
+                      sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
+                      throw t
+                  }
                 }
               }
             }
+            stmtCounter += 1
           }
-          stmtCounter += 1
         }
         profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
           RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
@@ -1976,8 +2021,6 @@ case class RefreshMaterializedViewCommand(
             s"Full refresh of '${sqlIdent(name)}' failed: ${t.getMessage}\nAssembled SQL:\n$sqlSnippet",
             t
           )
-      } finally {
-        IvmDmlInterceptorRule.bypass.set(false)
       }
       return Seq.empty
     }
@@ -2120,34 +2163,34 @@ case class RefreshMaterializedViewCommand(
     var fusedScratchRecordedForCascade: Boolean        = false
     var materializedWindowAffectedView: Option[String] = None
 
-    IvmDmlInterceptorRule.bypass.set(true)
-    try {
-      // Register a delta temp view for every source table.  Tables that have
-      // pending staging deltas get a real view; tables with no pending deltas
-      // get an empty view so that multi-source compiled SQL (e.g. UNION DISTINCT
-      // across two tables) can reference all delta views without a NOT_FOUND error.
-      profile.timeStep("metadata_pre_sql", "phase=register_views") {
-        RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
-          for (qualTable <- meta.sourceTables) {
-            val schema       = freshSchemas(qualTable)
-            val tableBatches = byTable.getOrElse(qualTable, Seq.empty)
-            val t0           = System.nanoTime()
-            val viewSql =
-              try {
-                propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
-              } finally {
-                val ms = (System.nanoTime() - t0) / 1000000L
-                sqlLog.record(
-                  category = "register_source_delta",
-                  stmtOrder = qlogOrder.getAndIncrement(),
-                  attemptIdx = 0,
-                  stmtKind = "temp_view",
-                  sql = propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches),
-                  durationMs = ms
-                )
-              }
-            // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
-            val _ = viewSql
+    CommandLocalState.withDmlBypass {
+      try {
+        // Register a delta temp view for every source table.  Tables that have
+        // pending staging deltas get a real view; tables with no pending deltas
+        // get an empty view so that multi-source compiled SQL (e.g. UNION DISTINCT
+        // across two tables) can reference all delta views without a NOT_FOUND error.
+        profile.timeStep("metadata_pre_sql", "phase=register_views") {
+          RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
+            for (qualTable <- meta.sourceTables) {
+              val schema       = freshSchemas(qualTable)
+              val tableBatches = byTable.getOrElse(qualTable, Seq.empty)
+              val t0           = System.nanoTime()
+              val viewSql =
+                try {
+                  propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                } finally {
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record(
+                    category = "register_source_delta",
+                    stmtOrder = qlogOrder.getAndIncrement(),
+                    attemptIdx = 0,
+                    stmtKind = "temp_view",
+                    sql = propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches),
+                    durationMs = ms
+                  )
+                }
+              // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
+              val _ = viewSql
             tempViewShortNames += qualTable.split("\\.").last
 
             if (diagnosticsEnabled) {
@@ -2484,12 +2527,15 @@ case class RefreshMaterializedViewCommand(
               sql.replace('\n', ' ').take(limit)
           )
         }
-        // Wraps every spark.sql(...).collect() under DeltaConflict retry, AND
-        // emits an `[openivm-perf] phase='stmt'` line with a kind classifier
+        // Emits an `[openivm-perf] phase='stmt'` line with a kind classifier
         // plus elapsed_ms so a parser can attribute time to view-delta CTAS /
-        // MERGE / DELETE / INSERT OVERWRITE / etc. The stmt_idx is monotonic
-        // across all statements executed by this refresh (rewritten + any
-        // fallback + count-monoid cleanup).
+        // MERGE / DELETE / INSERT OVERWRITE / etc. Incremental data-apply
+        // statements intentionally do NOT auto-retry here: a fresh retry must
+        // re-read source watermarks, staging snapshots, and temp-view state
+        // from the top of the command, never by replaying the same rewritten
+        // statement in place after a sibling attempt may already have applied
+        // the batch. The stmt_idx is monotonic across all statements executed
+        // by this refresh (rewritten + any fallback + count-monoid cleanup).
         val stmtCounter = new java.util.concurrent.atomic.AtomicInteger(0)
         def advanceStmtCounterPast(stmtIdx: Int): Unit = {
           var done = false
@@ -2508,36 +2554,34 @@ case class RefreshMaterializedViewCommand(
             s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
           ) {
             RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
-              RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                val t0 = System.nanoTime()
-                try {
-                  val df = spark.sql(sql)
-                  val r  = df.collect()
-                  recordPlanMetrics(df, kind)
-                  val ms = (System.nanoTime() - t0) / 1000000L
-                  sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
-                  // Diagnostic-only physical-plan capture (FeatureGate default OFF).
-                  // After the timer + reusing the executed plan, so zero overhead
-                  // unless explicitly enabled for a diagnostic refresh.
-                  if (sqlLog.isActive && FeatureGate.explainCaptureEnabled(spark)) {
-                    try
-                      sqlLog.record(
-                        "explain_formatted",
-                        qOrder,
-                        attempt - 1,
-                        kind,
-                        df.queryExecution.explainString(org.apache.spark.sql.execution.FormattedMode),
-                        0L
-                      )
-                    catch { case _: Throwable => () }
-                  }
-                  r
-                } catch {
-                  case t: Throwable =>
-                    val ms = (System.nanoTime() - t0) / 1000000L
-                    sqlLog.record("rewritten_stmt", qOrder, attempt - 1, kind, sql, ms)
-                    throw t
+              val t0 = System.nanoTime()
+              try {
+                val df = spark.sql(sql)
+                val r  = df.collect()
+                recordPlanMetrics(df, kind)
+                val ms = (System.nanoTime() - t0) / 1000000L
+                sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
+                // Diagnostic-only physical-plan capture (FeatureGate default OFF).
+                // After the timer + reusing the executed plan, so zero overhead
+                // unless explicitly enabled for a diagnostic refresh.
+                if (sqlLog.isActive && FeatureGate.explainCaptureEnabled(spark)) {
+                  try
+                    sqlLog.record(
+                      "explain_formatted",
+                      qOrder,
+                      0,
+                      kind,
+                      df.queryExecution.explainString(org.apache.spark.sql.execution.FormattedMode),
+                      0L
+                    )
+                  catch { case _: Throwable => () }
                 }
+                r
+              } catch {
+                case t: Throwable =>
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
+                  throw t
               }
             }
           }
@@ -3269,7 +3313,6 @@ case class RefreshMaterializedViewCommand(
         changeBatches.size
       )
     } finally {
-      IvmDmlInterceptorRule.bypass.set(false)
       tempViewShortNames.foreach { n =>
         val dropSql = StagingDeltaView.dropSourceDeltaViewSql(n)
         val t0      = System.nanoTime()
@@ -3314,8 +3357,14 @@ case class RefreshMaterializedViewCommand(
       // in RocksDB before SHOW OPENIVM QUERY LOG observes the lifecycle.
       sqlLog.flush()
     }
+    }
 
     Seq.empty
+    } catch {
+      case t: Throwable =>
+        emitEnd("refresh_failed", refreshTypeForFailure, pendingDeltasForFailure)
+        throw t
+    }
   }
 
   private def hasNegativeSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
@@ -4401,67 +4450,68 @@ case class DropMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    MvCatalog.lookup(spark, name) match {
-      case None if ifExists =>
-        return Seq.empty
-      case None =>
-        throw new AnalysisException(
-          "TABLE_OR_VIEW_NOT_FOUND",
-          Map("relationName" -> sqlIdent(name))
-        )
-      case Some(meta) =>
-        // For AGGREGATE_HAVING the user-facing name is a Spark VIEW and the
-        // data lives in a sibling Delta table. Drop both so no orphan storage
-        // or stale catalog entry survives.
-        if (meta.usesBackingDataTable) {
-          spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
-          spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
-        } else {
-          // Drop the catalog table entry (Delta table registration in Spark)
-          spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
-        }
+    RefreshMutex.withLock(metaName(name)) {
+      MvCatalog.lookup(spark, name) match {
+        case None if ifExists =>
+          Seq.empty
+        case None =>
+          throw new AnalysisException(
+            "TABLE_OR_VIEW_NOT_FOUND",
+            Map("relationName" -> sqlIdent(name))
+          )
+        case Some(meta) =>
+          // For AGGREGATE_HAVING the user-facing name is a Spark VIEW and the
+          // data lives in a sibling Delta table. Drop both so no orphan storage
+          // or stale catalog entry survives.
+          if (meta.usesBackingDataTable) {
+            spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
+            spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
+          } else {
+            // Drop the catalog table entry (Delta table registration in Spark)
+            spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
+          }
 
-        // Delete the physical Delta files
-        val hadoopPath = new Path(meta.location)
-        val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
-        if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+          // Delete the physical Delta files
+          val hadoopPath = new Path(meta.location)
+          val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+          if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
 
-        // MV-over-MV cleanup: remove every `StagingCatalog` row whose
-        // `base_table` could reference this MV. Without this, a subsequent
-        // CREATE of the SAME name with a different body could consume stale
-        // view-deltas from the old incarnation. Two forms are pruned:
-        //   - exact match on `metaName(name)` (qualified `db.table`)
-        //   - bare short-name match (downstream MVs created without a db
-        //     prefix store their source as the bare name)
-        //
-        // Also delete the per-MV view-delta namespace on disk so view-delta
-        // Delta paths from previous refreshes are gone.
-        val mvQual      = metaName(name)
-        val mvShort     = name.identifier
-        val propagation = ChangePropagationFactory.forSession(spark)
-        propagation.removeForBaseTable(spark, mvQual)
-        if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
-        // Also evict any CDF watermark rows scoped to this MV instance.  These
-        // are independent of intercept-mode staging rows and are pruned even
-        // if the active mode is `intercept` (defensive cleanup so a later
-        // mode flip never re-uses stale watermarks).
-        CdfWatermarkCatalog.removeForView(spark, mvQual)
-        if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
-        CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
-        if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
+          // MV-over-MV cleanup: remove every `StagingCatalog` row whose
+          // `base_table` could reference this MV. Without this, a subsequent
+          // CREATE of the SAME name with a different body could consume stale
+          // view-deltas from the old incarnation. Two forms are pruned:
+          //   - exact match on `metaName(name)` (qualified `db.table`)
+          //   - bare short-name match (downstream MVs created without a db
+          //     prefix store their source as the bare name)
+          //
+          // Also delete the per-MV view-delta namespace on disk so view-delta
+          // Delta paths from previous refreshes are gone.
+          val mvQual      = metaName(name)
+          val mvShort     = name.identifier
+          val propagation = ChangePropagationFactory.forSession(spark)
+          propagation.removeForBaseTable(spark, mvQual)
+          if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
+          // Also evict any CDF watermark rows scoped to this MV instance.  These
+          // are independent of intercept-mode staging rows and are pruned even
+          // if the active mode is `intercept` (defensive cleanup so a later
+          // mode flip never re-uses stale watermarks).
+          CdfWatermarkCatalog.removeForView(spark, mvQual)
+          if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
+          CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
+          if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
 
-        val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-        val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
-        val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
-        try {
-          val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
-          if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
-        } catch { case _: Throwable => () }
+          val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+          val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
+          val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
+          try {
+            val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
+            if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
+          } catch { case _: Throwable => () }
 
-        // Remove the tracking row from the MV catalog
-        MvCatalog.remove(spark, name)
+          // Remove the tracking row from the MV catalog
+          MvCatalog.remove(spark, name)
+          Seq.empty
+      }
     }
-
-    Seq.empty
   }
 }

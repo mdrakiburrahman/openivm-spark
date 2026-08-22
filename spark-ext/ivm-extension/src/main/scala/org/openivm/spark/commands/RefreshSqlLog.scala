@@ -36,9 +36,8 @@ final class RefreshSqlLog private (
     private val active: Boolean
 ) {
 
-  // Per-instance, per-thread buffer. RefreshMutex serialises refreshes of
-  // the same MV in the same JVM, and CREATE is never concurrent with itself
-  // on the same MV, so no contention here.
+  // Per-instance, per-thread buffer. RefreshMutex serialises CREATE /
+  // REFRESH / DROP of the same MV in the same JVM, so no contention here.
   private val buffer = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
 
   def isActive: Boolean = active

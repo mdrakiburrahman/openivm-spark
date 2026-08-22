@@ -21,6 +21,9 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 /**
  * End-to-end integration tests for the three materialized-view DDL commands.
@@ -43,7 +46,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     super.beforeAll()
     spark = SparkSession
       .builder()
-      .master("local[1]")
+      .master("local[4]")
       .appName("openivm-spark-CommandsSpec")
       .config(
         "spark.sql.extensions",
@@ -64,7 +67,11 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   override def afterAll(): Unit =
     try {
-      if (spark != null) spark.stop()
+      if (spark != null) {
+        spark.stop()
+        SparkSession.clearActiveSession()
+        SparkSession.clearDefaultSession()
+      }
       deleteDir(new File(warehouseDir))
     } finally {
       super.afterAll()
@@ -81,6 +88,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     ()
   }
 
+  private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A = {
+    val pool = Executors.newFixedThreadPool(parallelism)
+    try {
+      body(ExecutionContext.fromExecutorService(pool))
+    } finally {
+      pool.shutdown()
+      pool.awaitTermination(30, TimeUnit.SECONDS)
+    }
+  }
+
+  private def awaitResult[A](future: Future[A], timeout: FiniteDuration = 600.seconds): A =
+    Await.result(future, timeout)
+
+  private def assertBagEqual(tableName: String, expectedSql: String): Unit = {
+    val expected = spark.sql(expectedSql)
+    val cols     = expected.columns.toSeq
+    val actual   = spark.table(tableName).select(cols.head, cols.tail: _*)
+    val wanted   = expected.select(cols.head, cols.tail: _*)
+    withClue(s"$tableName EXCEPT ALL <expected>: ") {
+      actual.exceptAll(wanted).count() shouldBe 0L
+    }
+    withClue(s"<expected> EXCEPT ALL $tableName: ") {
+      wanted.exceptAll(actual).count() shouldBe 0L
+    }
+  }
+
+  private def assertSqlBagEqual(actualSql: String, expectedSql: String): Unit = {
+    val actual   = spark.sql(actualSql)
+    val expected = spark.sql(expectedSql)
+    withClue(s"$actualSql EXCEPT ALL $expectedSql: ") {
+      actual.exceptAll(expected).count() shouldBe 0L
+    }
+    withClue(s"$expectedSql EXCEPT ALL $actualSql: ") {
+      expected.exceptAll(actual).count() shouldBe 0L
+    }
+  }
+
   /**
    * Create a staging Delta table that holds `rows` and register it in
    * StagingCatalog.  Returns the staging path so tests can track it.
@@ -95,6 +139,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       rows: Seq[(String, Int)]
   ): String = {
     val stagingPath = s"$warehouseDir/_ivm/staging/$stagingSubPath"
+    val previousBypass = IvmDmlInterceptorRule.bypass.get()
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       spark.sql(
@@ -115,7 +160,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         )
       )
     } finally {
-      IvmDmlInterceptorRule.bypass.set(false)
+      IvmDmlInterceptorRule.bypass.set(previousBypass)
     }
     stagingPath
   }
@@ -277,10 +322,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(
         "CREATE MATERIALIZED VIEW mv_t5 AS SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
       )
-      val countBefore = spark.table("mv_t5").count()
       // No staging records → REFRESH must be a no-op
       noException should be thrownBy { spark.sql("REFRESH MATERIALIZED VIEW mv_t5") }
-      spark.table("mv_t5").count() shouldBe countBefore
+      assertBagEqual(
+        "mv_t5",
+        "SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
+      )
     }
   }
 
@@ -519,6 +566,185 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val mvRefresh       = spark.table("mv_t13_value_join").select("id", "last_name", "priority")
       mvRefresh.exceptAll(expectedRefresh).count() shouldBe 0L
       expectedRefresh.exceptAll(mvRefresh).count() shouldBe 0L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 14 — unrelated CREATE and REFRESH must overlap
+  // ---------------------------------------------------------------------------
+  describe("(14) Unrelated CREATE and REFRESH overlap") {
+    it("CREATE on one MV does not take a global lock that blocks REFRESH on another MV") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14_create(region STRING, amount INT) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14_refresh(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t14_create VALUES ('east', 10), ('west', 20), ('north', 30)")
+      spark.sql("INSERT INTO sales_t14_refresh VALUES ('east', 5), ('west', 7)")
+
+      val createSql     = "SELECT region, SUM(amount) AS total FROM sales_t14_create GROUP BY region"
+      val refreshSql    = "SELECT region, SUM(amount) AS total FROM sales_t14_refresh GROUP BY region"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_refresh AS $refreshSql")
+      spark.sql("INSERT INTO sales_t14_refresh VALUES ('north', 11)")
+
+      val createEntered = new CountDownLatch(1)
+      val releaseCreate = new CountDownLatch(1)
+
+      CommandConcurrencyInjection.withBeforeCreateBody({
+        createEntered.countDown()
+        releaseCreate.await(30, TimeUnit.SECONDS) shouldBe true
+      }) {
+        withPool(2) { implicit ec =>
+          val createFuture =
+            Future { spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_create AS $createSql").collect() }
+          createEntered.await(30, TimeUnit.SECONDS) shouldBe true
+          val refreshFuture =
+            Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t14_refresh").collect() }
+          awaitResult(refreshFuture, 300.seconds)
+          createFuture.isCompleted shouldBe false
+          releaseCreate.countDown()
+          awaitResult(createFuture, 600.seconds)
+        }
+      }
+
+      assertBagEqual("mv_t14_refresh", refreshSql)
+      assertBagEqual("mv_t14_create", createSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 15 — same-MV refreshes serialize and the queued one sees newer deltas
+  // ---------------------------------------------------------------------------
+  describe("(15) Same-MV REFRESH requests serialize and re-read queued deltas") {
+    it("queues by fully-qualified MV name so the waiting refresh sees a later batch exactly once") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t15(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t15 VALUES ('seed', 1)")
+
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM sales_t15 GROUP BY region"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t15_serial AS $refreshSql")
+
+      spark.sql(
+        "INSERT INTO sales_t15 " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
+      )
+
+      withPool(2) { implicit ec =>
+        val refresh1 = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect() }
+        Thread.sleep(150L)
+        val refresh2 = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect() }
+        Thread.sleep(150L)
+        spark.sql(
+          "INSERT INTO sales_t15 " +
+            "SELECT CASE " +
+            "  WHEN id % 4 = 0 THEN 'east' " +
+            "  WHEN id % 4 = 1 THEN 'west' " +
+            "  WHEN id % 4 = 2 THEN 'north' " +
+            "  ELSE 'south' END AS region, " +
+            "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+        )
+
+        awaitResult(refresh1, 600.seconds)
+        refresh2.isCompleted shouldBe false
+        awaitResult(refresh2, 600.seconds)
+      }
+
+      assertBagEqual("mv_t15_serial", refreshSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 16 — DROP beside an unrelated REFRESH must not share a global lock
+  // ---------------------------------------------------------------------------
+  describe("(16) DROP beside an unrelated REFRESH") {
+    it("drops one MV while another refresh is in flight without cross-MV blocking") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t16_drop(region STRING, amount INT) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t16_keep(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t16_drop VALUES ('east', 3), ('west', 4)")
+      spark.sql("INSERT INTO sales_t16_keep VALUES ('east', 8), ('west', 9)")
+
+      val keepSql = "SELECT region, SUM(amount) AS total FROM sales_t16_keep GROUP BY region"
+      spark.sql("CREATE MATERIALIZED VIEW mv_t16_drop AS SELECT region, SUM(amount) AS total FROM sales_t16_drop GROUP BY region")
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t16_keep AS $keepSql")
+      spark.sql(
+        "INSERT INTO sales_t16_keep " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
+      )
+
+      withPool(2) { implicit ec =>
+        val refreshFuture = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t16_keep").collect() }
+        Thread.sleep(150L)
+        val dropFuture = Future { spark.sql("DROP MATERIALIZED VIEW mv_t16_drop").collect() }
+        awaitResult(dropFuture, 300.seconds)
+        refreshFuture.isCompleted shouldBe false
+        awaitResult(refreshFuture, 600.seconds)
+      }
+
+      spark.catalog.tableExists("mv_t16_drop") shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_t16_drop")) shouldBe empty
+      assertBagEqual("mv_t16_keep", keepSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 17 — failed REFRESH can retry without replaying a successful batch
+  // ---------------------------------------------------------------------------
+  describe("(17) REFRESH failure + retry does not double-apply staged changes") {
+    it("retries a compensated WINDOW_PARTITION refresh from a fresh command state") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t18_window(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      spark.sql(
+        "INSERT INTO sales_t18_window " +
+          "SELECT id, 1 AS seq, id AS payload FROM range(1001)"
+      )
+
+      val viewSql =
+        "SELECT id, seq, payload, " +
+          "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
+          "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
+          "FROM sales_t18_window"
+      val downstreamSql = "SELECT id, seq, payload FROM mv_t18_window"
+
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t18_window AS $viewSql")
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t18_downstream AS $downstreamSql")
+      spark.sql(
+        "CREATE TABLE mv_t18_before_failure USING DELTA AS " +
+          "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_window"
+      )
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t18_window")).get
+      meta.refreshType shouldBe RefreshTypeCode.WindowPartition
+      meta.refreshTypeName shouldBe "WINDOW_PARTITION"
+
+      assertBagEqual("mv_t18_window", viewSql)
+      assertBagEqual("mv_t18_downstream", downstreamSql)
+
+      spark.sql("UPDATE sales_t18_window SET payload = payload + 100000 WHERE seq = 1")
+      spark.sql(
+        "INSERT INTO sales_t18_window " +
+          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001)"
+      )
+      spark.sql("DELETE FROM sales_t18_window WHERE seq = 1 AND id % 11 = 0")
+
+      RefreshFailureInjection.failNextWindowCascadeInsert(spark)
+      intercept[RuntimeException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t18_window")
+      }
+
+      assertSqlBagEqual(
+        "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_window",
+        "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_before_failure"
+      )
+
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t18_window")
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t18_downstream")
+
+      assertBagEqual("mv_t18_window", viewSql)
+      assertBagEqual("mv_t18_downstream", downstreamSql)
     }
   }
 

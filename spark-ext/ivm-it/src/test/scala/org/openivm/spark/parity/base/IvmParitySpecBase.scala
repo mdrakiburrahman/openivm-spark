@@ -48,6 +48,12 @@ abstract class IvmParitySpecBase(val specSlug: String) extends AnyFunSpec with M
     */
   protected def extraSparkConf: Map[String, String] = Map.empty
 
+  /** Test-local Spark master. Most specs are single-threaded and stay on
+    * `local[1]`; concurrency-focused specs override this to admit parallel
+    * driver work.
+    */
+  protected def sparkMaster: String = "local[1]"
+
   override def beforeAll(): Unit = {
     super.beforeAll()
     startSpark(extraSparkConf)
@@ -70,7 +76,7 @@ abstract class IvmParitySpecBase(val specSlug: String) extends AnyFunSpec with M
   protected def startSpark(extraConf: Map[String, String] = Map.empty): Unit = {
     val builder = SparkSession
       .builder()
-      .master("local[1]")
+      .master(sparkMaster)
       .appName(s"openivm-spark-$specSlug-$modeLabel")
       .config(
         "spark.sql.extensions",
