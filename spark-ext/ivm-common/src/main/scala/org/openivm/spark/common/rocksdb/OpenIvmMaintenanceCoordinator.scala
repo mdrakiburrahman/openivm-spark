@@ -44,11 +44,29 @@ object OpenIvmMaintenanceCoordinator {
       current
     }
 
+    joinDaemon(threadToJoin)
+  }
+
+  def shutdownIfIdle(): Unit = {
+    val threadToJoin = this.synchronized {
+      if (registrations.nonEmpty) {
+        null
+      } else {
+        running = false
+        val current = daemonThread
+        daemonThread = null
+        current
+      }
+    }
+
+    joinDaemon(threadToJoin)
+  }
+
+  private def joinDaemon(threadToJoin: Thread): Unit =
     if (threadToJoin != null) {
       threadToJoin.interrupt()
       threadToJoin.join(1000L)
     }
-  }
 
   private def startDaemonIfNeededLocked(): Unit =
     if (daemonThread == null || !daemonThread.isAlive) {

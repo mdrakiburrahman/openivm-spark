@@ -6,9 +6,14 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.UUID
 
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Future}
 
 class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with Matchers {
 
@@ -118,6 +123,75 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       OpenIvmRocksDBRegistry.closeAll()
 
       an[IllegalStateException] should be thrownBy db.currentVersion
+    }
+
+    it("waits for same-path reopen while allowing other paths to open") {
+      val spark    = newSpark("registry-reopen-race")
+      val dbDir    = newDir("reopen-db")
+      val otherDir = newDir("reopen-other-db")
+      val db       = OpenIvmRocksDBRegistry.getOrOpen(spark, dbDir.getAbsolutePath, Seq("meta"))
+
+      val closeEntered = new CountDownLatch(1)
+      val releaseClose = new CountDownLatch(1)
+      db.setBeforeCloseHookForTesting(() => {
+        closeEntered.countDown()
+        releaseClose.await(5, TimeUnit.SECONDS) shouldBe true
+      })
+
+      val closeFuture = Future {
+        OpenIvmRocksDBRegistry.close(dbDir.getAbsolutePath)
+      }
+      closeEntered.await(5, TimeUnit.SECONDS) shouldBe true
+
+      val reopened = new AtomicBoolean(false)
+      val reopenFuture = Future {
+        val reopenedDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbDir.getAbsolutePath, Seq("meta"))
+        reopened.set(true)
+        reopenedDb
+      }
+
+      Thread.sleep(100L)
+      reopened.get() shouldBe false
+
+      val otherDb = OpenIvmRocksDBRegistry.getOrOpen(spark, otherDir.getAbsolutePath, Seq("meta"))
+      noException should be thrownBy otherDb.currentVersion
+
+      releaseClose.countDown()
+      Await.result(closeFuture, 10.seconds)
+      val reopenedDb = Await.result(reopenFuture, 10.seconds)
+
+      reopenedDb should not be theSameInstanceAs(db)
+      noException should be thrownBy reopenedDb.currentVersion
+    }
+
+    it("does not shut down active users opened while closeAll is in progress") {
+      val spark       = newSpark("registry-close-all-race")
+      val closingDir  = newDir("close-all-race-db")
+      val survivorDir = newDir("close-all-survivor-db")
+      val closingDb   = OpenIvmRocksDBRegistry.getOrOpen(spark, closingDir.getAbsolutePath, Seq("meta"))
+
+      val closeEntered = new CountDownLatch(1)
+      val releaseClose = new CountDownLatch(1)
+      closingDb.setBeforeCloseHookForTesting(() => {
+        closeEntered.countDown()
+        releaseClose.await(5, TimeUnit.SECONDS) shouldBe true
+      })
+
+      val closeAllFuture = Future {
+        OpenIvmRocksDBRegistry.closeAll()
+      }
+      closeEntered.await(5, TimeUnit.SECONDS) shouldBe true
+
+      val survivor = OpenIvmRocksDBRegistry.getOrOpen(spark, survivorDir.getAbsolutePath, Seq("meta"))
+      survivor.withBatch { batch =>
+        survivor.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+      }
+
+      releaseClose.countDown()
+      Await.result(closeAllFuture, 10.seconds)
+
+      OpenIvmMaintenanceCoordinator.isRunning shouldBe true
+      noException should be thrownBy survivor.currentVersion
     }
   }
 }

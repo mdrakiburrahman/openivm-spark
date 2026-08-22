@@ -10,6 +10,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.sql.Timestamp
+import java.util.concurrent.CyclicBarrier
 import java.util.UUID
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -24,6 +25,8 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
   }
 
   override def beforeAll(): Unit = {
+    SparkSession.clearActiveSession()
+    SparkSession.clearDefaultSession()
     spark = SparkSession
       .builder()
       .master("local[2]")
@@ -39,13 +42,24 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
 
   override def afterAll(): Unit = {
     try if (spark != null) spark.stop()
-    finally deleteDir(new File(root))
+    finally {
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+      deleteDir(new File(root))
+    }
   }
 
   private def deleteDir(file: File): Unit = {
     if (file.isDirectory) Option(file.listFiles()).foreach(_.foreach(deleteDir))
     file.delete()
     ()
+  }
+
+  private def withNewSession[A](f: SparkSession => A): A = {
+    val session = spark.newSession()
+    SparkSession.setActiveSession(session)
+    try f(session)
+    finally SparkSession.clearActiveSession()
   }
 
   private def metadata(name: String, source: String): MvMetadata =
@@ -101,12 +115,36 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       CdfWatermarkCatalog.get(spark, "db.mv_orders", "db.orders") shouldBe None
     }
 
+    it("keeps shared watermark rows monotonic under synchronized concurrent puts") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val barrier                                     = new CyclicBarrier(2)
+
+      val lower = Future {
+        barrier.await()
+        withNewSession(session => CdfWatermarkCatalog.put(session, "db.mv_orders_race", "db.orders_race", 3L))
+      }
+      val higher = Future {
+        barrier.await()
+        withNewSession(session => CdfWatermarkCatalog.put(session, "db.mv_orders_race", "db.orders_race", 9L))
+      }
+
+      Await.result(Future.sequence(Seq(lower, higher)), 2.minutes)
+
+      CdfWatermarkCatalog.get(spark, "db.mv_orders_race", "db.orders_race") shouldBe Some(9L)
+    }
+
     it("commits independent MV metadata upserts concurrently") {
       implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val barrier                                     = new CyclicBarrier(8)
       val entries = (1 to 8).map(index => metadata(s"db.mv_parallel_$index", s"db.source_$index"))
 
       Await.result(
-        Future.traverse(entries)(entry => Future(MvCatalog.upsert(spark.newSession(), entry))),
+        Future.traverse(entries)(entry =>
+          Future {
+            barrier.await()
+            withNewSession(session => MvCatalog.upsert(session, entry))
+          }
+        ),
         2.minutes
       )
 
@@ -119,11 +157,11 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       MvCatalog.upsert(spark, entry)
 
       val advances = Future {
-        (2L to 20L).foreach(version => MvCatalog.advance(spark.newSession(), entry.name, version))
+        withNewSession(session => (2L to 20L).foreach(version => MvCatalog.advance(session, entry.name, version)))
       }
       val propertyUpdates = Future {
-        (1 to 20).foreach(index =>
-          MvCatalog.updateProperties(spark.newSession(), entry.name, Map("revision" -> index.toString))
+        withNewSession(session =>
+          (1 to 20).foreach(index => MvCatalog.updateProperties(session, entry.name, Map("revision" -> index.toString)))
         )
       }
       // A full parallel Spark test run can saturate a small executor for well

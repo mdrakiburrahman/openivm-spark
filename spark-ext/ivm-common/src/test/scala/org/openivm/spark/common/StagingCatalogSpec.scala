@@ -9,7 +9,10 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.nio.file.Paths
 import java.sql.Timestamp
+import java.util.concurrent.CyclicBarrier
 import java.util.UUID
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
@@ -24,6 +27,8 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   }
 
   override def beforeAll(): Unit = {
+    SparkSession.clearActiveSession()
+    SparkSession.clearDefaultSession()
     spark = SparkSession
       .builder()
       .master("local[1]")
@@ -39,6 +44,8 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
     try {
       if (spark != null) spark.stop()
     } finally {
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
       OpenIvmRocksDBRegistry.closeAll()
       deleteDir(new File(warehouseDir))
     }
@@ -154,6 +161,42 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
         StagingCatalog.collectFor(spark, "__probe_remaining__", Seq(baseTable)).map(_.stagingPath).toSet
 
       remaining shouldBe Set(dPartial.stagingPath, dNone.stagingPath)
+    }
+  }
+
+  describe("StagingCatalog concurrent MV consumers") {
+    it("keeps per-MV consumed markers isolated under synchronized starts") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      StagingCatalog.ensureTables(spark)
+      val leftMv    = "mv_concurrent_left"
+      val rightMv   = "mv_concurrent_right"
+      val baseTable = "orders_concurrent_consumers"
+      val barrier   = new CyclicBarrier(2)
+
+      registerTrackedView(leftMv)
+      registerTrackedView(rightMv)
+
+      val staged = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/concurrent", 9000L)
+      StagingCatalog.record(spark, staged)
+
+      Await.result(
+        Future.sequence(
+          Seq(leftMv, rightMv).map { mvName =>
+            Future {
+              barrier.await()
+              StagingCatalog.markConsumed(spark, mvName, Seq(staged.stagingPath))
+            }
+          }
+        ),
+        30.seconds
+      )
+
+      consumedPaths(leftMv) shouldBe Seq(staged.stagingPath)
+      consumedPaths(rightMv) shouldBe Seq(staged.stagingPath)
+
+      StagingCatalog.pruneFullyConsumed(spark, Map(baseTable -> Seq(leftMv, rightMv)))
+
+      StagingCatalog.collectFor(spark, "__probe_concurrent__", Seq(baseTable)) shouldBe empty
     }
   }
 }

@@ -9,6 +9,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
+import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
@@ -101,6 +102,47 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
 
         db.get("meta", RocksDBCodec.utf8("mv-a")).map(RocksDBCodec.fromUtf8) shouldBe Some("v1")
         db.get("props", RocksDBCodec.utf8("mv-a.owner")).map(RocksDBCodec.fromUtf8) shouldBe Some("alice")
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("flushes only the column families touched by the batch") {
+      val dir = newDbDir("flush-targets")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta", "props"))
+
+      try {
+        val flushed = ArrayBuffer.empty[Seq[String]]
+        db.setBeforeFlushHookForTesting(columnFamilies => flushed.synchronized { flushed += columnFamilies.sorted })
+        db.load()
+        db.withBatch { batch =>
+          db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+        }
+
+        flushed should not be empty
+        flushed.exists(_.contains("props")) shouldBe false
+        flushed.head.toSet shouldBe Set("meta", OpenIvmRocksDB.InternalTxnColumnFamilyName)
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("propagates close failures instead of swallowing them") {
+      val dir = newDbDir("close-propagation")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+
+      try {
+        db.load()
+        db.setBeforeCloseHookForTesting(() => throw new RuntimeException("close boom"))
+
+        val thrown = intercept[RuntimeException] {
+          db.close()
+        }
+
+        thrown.getMessage shouldBe "close boom"
+        an[IllegalStateException] should be thrownBy db.currentVersion
       } finally {
         closeQuietly(db)
         deleteRecursively(dir)

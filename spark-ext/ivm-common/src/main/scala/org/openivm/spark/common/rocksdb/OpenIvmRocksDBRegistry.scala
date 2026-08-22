@@ -6,7 +6,10 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.slf4j.LoggerFactory
 
 import java.io.File
-import scala.collection.mutable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.locks.ReentrantLock
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 object OpenIvmRocksDBRegistry {
@@ -14,15 +17,110 @@ object OpenIvmRocksDBRegistry {
 
   private final case class Entry(
       db: OpenIvmRocksDB,
-      conf: OpenIvmRocksDBConf,
       columnFamilies: Set[String],
       appIds: Set[String]
   )
 
-  private val entries        = mutable.HashMap.empty[String, Entry]
-  private val listenerAppIds = mutable.HashSet.empty[String]
+  private final class Slot(canonicalPath: String) {
+    private val lock         = new ReentrantLock()
+    private var entry: Entry = null
 
-  @volatile private var shutdownHookInstalled = false
+    def getOrOpen(spark: SparkSession, appId: String, requestedColumnFamilies: Set[String]): OpenIvmRocksDB = {
+      lock.lock()
+      try {
+        val current = entry
+        if (current != null) {
+          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.hit")
+          assertSubset(canonicalPath, current, requestedColumnFamilies)
+          if (!current.appIds.contains(appId)) {
+            entry = current.copy(appIds = current.appIds + appId)
+          }
+          current.db
+        } else {
+          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.miss")
+          val conf = OpenIvmRocksDBConf.fromSpark(spark)
+          val db = new OpenIvmRocksDB(
+            canonicalPath,
+            conf,
+            requestedColumnFamilies.toSeq.sorted.filterNot(_ == OpenIvmRocksDB.DefaultColumnFamilyName)
+          )
+          try {
+            db.load()
+            OpenIvmMaintenanceCoordinator.register(db, conf)
+            entry = Entry(db, requestedColumnFamilies, Set(appId))
+            publishOpenEntryCount(openEntryCount.incrementAndGet())
+            db
+          } catch {
+            case error: Throwable =>
+              cleanupFailedOpen(db, error)
+          }
+        }
+      } finally {
+        lock.unlock()
+      }
+    }
+
+    def closeNow(): Boolean = {
+      lock.lock()
+      try {
+        if (entry != null) {
+          closeEntry(canonicalPath, entry)
+          entry = null
+          publishOpenEntryCount(openEntryCount.decrementAndGet())
+        }
+        entry == null
+      } finally {
+        lock.unlock()
+      }
+    }
+
+    def closeForAppId(appId: String): Boolean = {
+      lock.lock()
+      try {
+        val current = entry
+        if (current != null && current.appIds.contains(appId)) {
+          val remainingAppIds = current.appIds - appId
+          if (remainingAppIds.isEmpty) {
+            closeEntry(canonicalPath, current)
+            entry = null
+            publishOpenEntryCount(openEntryCount.decrementAndGet())
+          } else {
+            entry = current.copy(appIds = remainingAppIds)
+          }
+        }
+        entry == null
+      } finally {
+        lock.unlock()
+      }
+    }
+
+    def overrideAppIds(appIds: Set[String]): Unit = {
+      lock.lock()
+      try {
+        val current = entry
+        if (current == null) {
+          throw new IllegalArgumentException(s"No open RocksDB registry entry found for $canonicalPath")
+        }
+        entry = current.copy(appIds = appIds)
+      } finally {
+        lock.unlock()
+      }
+    }
+
+    def isEmpty: Boolean = {
+      lock.lock()
+      try {
+        entry == null
+      } finally {
+        lock.unlock()
+      }
+    }
+  }
+
+  private val entries               = new ConcurrentHashMap[String, Slot]()
+  private val listenerAppIds        = ConcurrentHashMap.newKeySet[String]()
+  private val openEntryCount        = new AtomicInteger(0)
+  private val shutdownHookInstalled = new AtomicBoolean(false)
 
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
@@ -36,127 +134,77 @@ object OpenIvmRocksDBRegistry {
       ))
 
     registerSparkListenerIfNeeded(spark, appId)
-
-    this.synchronized {
-      entries.get(canonicalPath) match {
-        case Some(entry) =>
-          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.hit")
-          assertSubset(canonicalPath, entry, requestedColumnFamilies)
-          val updatedEntry =
-            if (entry.appIds.contains(appId)) entry else entry.copy(appIds = entry.appIds + appId)
-          entries.update(canonicalPath, updatedEntry)
-          entry.db
-
-        case None =>
-          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.miss")
-          val conf = OpenIvmRocksDBConf.fromSpark(spark)
-          val db = new OpenIvmRocksDB(
-            canonicalPath,
-            conf,
-            requestedColumnFamilies.toSeq.sorted.filterNot(_ == OpenIvmRocksDB.DefaultColumnFamilyName)
-          )
-          try {
-            db.load()
-            OpenIvmMaintenanceCoordinator.register(db, conf)
-            entries.put(canonicalPath, Entry(db, conf, requestedColumnFamilies, Set(appId)))
-            OpenIvmMetrics.OpenDbHandles.set(entries.size)
-            db
-          } catch {
-            case error: Throwable =>
-              cleanupFailedOpen(db, error)
-          }
-      }
-    }
+    slotFor(canonicalPath).getOrOpen(spark, appId, requestedColumnFamilies)
   }
 
   def close(dbPath: String): Unit = {
     val canonicalPath = canonicalLocalPath(dbPath)
-    val entry = this.synchronized {
-      entries.remove(canonicalPath)
+    val slot          = entries.get(canonicalPath)
+    if (slot != null) {
+      slot.closeNow()
+      pruneSlotIfEmpty(canonicalPath)
     }
-    OpenIvmMetrics.OpenDbHandles.set(this.synchronized(entries.size))
-    entry.foreach(closeEntry(canonicalPath, _))
+    OpenIvmMaintenanceCoordinator.shutdownIfIdle()
   }
 
   def closeAllForSparkContext(appId: String): Unit = {
-    val toClose = this.synchronized {
-      listenerAppIds -= appId
-      entries.toSeq.flatMap { case (path, entry) =>
-        if (!entry.appIds.contains(appId)) {
-          None
-        } else {
-          val remainingAppIds = entry.appIds - appId
-          if (remainingAppIds.isEmpty) {
-            entries.remove(path)
-            OpenIvmMetrics.OpenDbHandles.set(entries.size)
-            Some(path -> entry)
-          } else {
-            entries.update(path, entry.copy(appIds = remainingAppIds))
-            None
-          }
-        }
-      }
+    listenerAppIds.remove(appId)
+    entries.entrySet().asScala.toSeq.foreach { mapEntry =>
+      mapEntry.getValue.closeForAppId(appId)
+      pruneSlotIfEmpty(mapEntry.getKey)
     }
-
-    toClose.foreach { case (path, entry) =>
-      closeEntry(path, entry)
-    }
+    OpenIvmMaintenanceCoordinator.shutdownIfIdle()
   }
 
   def closeAll(): Unit = {
-    val toClose = this.synchronized {
-      val snapshot = entries.toSeq
-      entries.clear()
-      listenerAppIds.clear()
-      OpenIvmMetrics.OpenDbHandles.set(0)
-      snapshot
+    entries.entrySet().asScala.toSeq.foreach { mapEntry =>
+      mapEntry.getValue.closeNow()
+      pruneSlotIfEmpty(mapEntry.getKey)
     }
-
-    try {
-      toClose.foreach { case (path, entry) =>
-        closeEntry(path, entry)
-      }
-    } finally {
-      OpenIvmMaintenanceCoordinator.shutdown()
-    }
+    OpenIvmMaintenanceCoordinator.shutdownIfIdle()
   }
+
+  private def slotFor(canonicalPath: String): Slot = {
+    val fresh    = new Slot(canonicalPath)
+    val existing = entries.putIfAbsent(canonicalPath, fresh)
+    if (existing != null) existing else fresh
+  }
+
+  private def publishOpenEntryCount(count: Int): Unit =
+    OpenIvmMetrics.OpenDbHandles.set(count)
+
+  private def pruneSlotIfEmpty(canonicalPath: String): Unit =
+    entries.computeIfPresent(
+      canonicalPath,
+      new java.util.function.BiFunction[String, Slot, Slot] {
+        override def apply(path: String, slot: Slot): Slot =
+          if (slot.isEmpty) null else slot
+      }
+    )
 
   private def canonicalLocalPath(path: String): String =
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
-  private[rocksdb] def overrideAppIdsForTesting(dbPath: String, appIds: Set[String]): Unit = this.synchronized {
+  private[rocksdb] def overrideAppIdsForTesting(dbPath: String, appIds: Set[String]): Unit = {
     val canonicalPath = canonicalLocalPath(dbPath)
-    val entry = entries.getOrElse(
-      canonicalPath,
+    val slot = Option(entries.get(canonicalPath)).getOrElse(
       throw new IllegalArgumentException(s"No open RocksDB registry entry found for $canonicalPath")
     )
-    entries.update(canonicalPath, entry.copy(appIds = appIds))
+    slot.overrideAppIds(appIds)
   }
 
-  private def installShutdownHookIfNeeded(): Unit = this.synchronized {
-    if (!shutdownHookInstalled) {
+  private def installShutdownHookIfNeeded(): Unit =
+    if (shutdownHookInstalled.compareAndSet(false, true)) {
       Runtime.getRuntime.addShutdownHook(new Thread(() => closeAll()))
-      shutdownHookInstalled = true
-    }
-  }
-
-  private def registerSparkListenerIfNeeded(spark: SparkSession, appId: String): Unit = {
-    val shouldRegister = this.synchronized {
-      if (listenerAppIds.contains(appId)) {
-        false
-      } else {
-        listenerAppIds += appId
-        true
-      }
     }
 
-    if (shouldRegister) {
+  private def registerSparkListenerIfNeeded(spark: SparkSession, appId: String): Unit =
+    if (listenerAppIds.add(appId)) {
       spark.sparkContext.addSparkListener(new SparkListener {
         override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit =
           OpenIvmRocksDBRegistry.closeAllForSparkContext(appId)
       })
     }
-  }
 
   private def assertSubset(canonicalPath: String, entry: Entry, requestedColumnFamilies: Set[String]): Unit = {
     val missing = requestedColumnFamilies.diff(entry.columnFamilies)

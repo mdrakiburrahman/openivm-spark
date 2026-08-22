@@ -17,6 +17,7 @@ import java.nio.file.{Files, Paths, StandardCopyOption, StandardOpenOption}
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 object OpenIvmRocksDB {
@@ -50,13 +51,14 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private val writeMutex = new ReentrantLock()
   private final class BatchStats {
-    var activeKeys: Long   = 0L
-    var activeBytes: Long  = 0L
-    var logicalKeys: Long  = 0L
-    var logicalBytes: Long = 0L
-    val txnId: String      = s"${Thread.currentThread().getId}-${System.nanoTime()}"
-    var undoSeq: Long      = 0L
-    var manifestWritten    = false
+    var activeKeys: Long                                    = 0L
+    var activeBytes: Long                                   = 0L
+    var logicalKeys: Long                                   = 0L
+    var logicalBytes: Long                                  = 0L
+    val activeColumnFamilies: mutable.LinkedHashSet[String] = mutable.LinkedHashSet.empty[String]
+    val txnId: String                                       = s"${Thread.currentThread().getId}-${System.nanoTime()}"
+    var undoSeq: Long                                       = 0L
+    var manifestWritten                                     = false
 
     def add(bytes: Long): Unit = {
       activeKeys += 1L
@@ -65,9 +67,14 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       logicalBytes += bytes
     }
 
+    def touch(columnFamily: String): Unit = {
+      activeColumnFamilies += columnFamily
+    }
+
     def resetActive(): Unit = {
       activeKeys = 0L
       activeBytes = 0L
+      activeColumnFamilies.clear()
     }
 
     def addPhysical(bytes: Long): Unit = {
@@ -91,8 +98,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   @volatile private var versionValue: Long                                   = 0L
   @volatile private var closed                                               = false
   @volatile private var dirtySinceFlush                                      = false
+  @volatile private var dirtyColumnFamilies                                  = Set.empty[String]
 
-  private val compactCalls = new AtomicLong(0L)
+  private val compactCalls                                             = new AtomicLong(0L)
+  @volatile private var beforeFlushHookForTesting: Seq[String] => Unit = (_: Seq[String]) => ()
+  @volatile private var beforeCloseHookForTesting: () => Unit          = () => ()
 
   private def cf(name: String): ColumnFamilyHandle =
     columnFamilyHandles.getOrElse(
@@ -131,15 +141,24 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def flushAll(localDb: RocksDB): Unit = {
+  private def flushColumnFamilies(localDb: RocksDB, columnFamilies: Iterable[String]): Unit = {
+    val targetColumnFamilies = columnFamilies.iterator.filter(columnFamilyHandles.contains).toSeq.distinct match {
+      case Seq() => columnFamilyHandles.keys.toSeq.sorted
+      case names => names
+    }
+    beforeFlushHookForTesting(targetColumnFamilies)
     val flushOptions = new FlushOptions().setWaitForFlush(true)
     try {
-      columnFamilyHandles.values.foreach(handle => localDb.flush(flushOptions, handle))
+      targetColumnFamilies.foreach(name => localDb.flush(flushOptions, cf(name)))
     } finally {
       flushOptions.close()
     }
     dirtySinceFlush = false
+    dirtyColumnFamilies = Set.empty
   }
+
+  private def flushDirtyColumnFamilies(localDb: RocksDB): Unit =
+    flushColumnFamilies(localDb, dirtyColumnFamilies)
 
   private def sstFileCountInternal(localDb: RocksDB): Int =
     localDb.getLiveFilesMetaData.size()
@@ -186,11 +205,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       try {
         localDb.write(writeOptions, batch)
         dirtySinceFlush = true
+        dirtyColumnFamilies = dirtyColumnFamilies ++ stats.activeColumnFamilies
       } finally {
         writeOptions.close()
       }
 
-      flushAll(localDb)
+      flushColumnFamilies(localDb, stats.activeColumnFamilies)
 
       sstCount = sstFileCountInternal(localDb)
       sstCount
@@ -231,6 +251,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     try {
       batch.put(cf(InternalTxnColumnFamilyName), committedKey(txnId), Array.emptyByteArray)
       val stats = new BatchStats
+      stats.touch(InternalTxnColumnFamilyName)
       stats.addPhysical(committedKey(txnId).length.toLong)
       writePhysicalBatch(batch, stats)
     } finally {
@@ -243,6 +264,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     try {
       batch.deleteRange(cf(InternalTxnColumnFamilyName), txnPrefix(txnId), txnPrefixEnd(txnId))
       val stats = new BatchStats
+      stats.touch(InternalTxnColumnFamilyName)
       stats.addPhysical(txnPrefix(txnId).length.toLong + txnPrefixEnd(txnId).length.toLong)
       writePhysicalBatch(batch, stats)
     } finally {
@@ -289,6 +311,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
     val logKey = undoKey(stats.txnId, stats.undoSeq, columnFamily, key)
     stats.undoSeq += 1L
+    stats.touch(InternalTxnColumnFamilyName)
     stats.addPhysical(logKey.length.toLong + value.length.toLong)
     batch.put(cf(InternalTxnColumnFamilyName), logKey, value)
   }
@@ -330,9 +353,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
           val valueParts   = RocksDBCodec.splitComposite(it.value(), maxParts = 2)
           RocksDBCodec.fromUtf8(valueParts.headOption.getOrElse(Array.emptyByteArray)) match {
             case "put" if valueParts.length == 2 =>
+              stats.touch(columnFamily)
               batch.put(cf(columnFamily), key, valueParts(1))
               stats.addPhysical(key.length.toLong + valueParts(1).length.toLong)
             case "delete" =>
+              stats.touch(columnFamily)
               batch.delete(cf(columnFamily), key)
               stats.addPhysical(key.length.toLong)
             case _ => ()
@@ -451,12 +476,24 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private[rocksdb] def path: String = normalizedDbPath
 
+  private[rocksdb] def setBeforeFlushHookForTesting(hook: Seq[String] => Unit): Unit =
+    beforeFlushHookForTesting = hook
+
+  private[rocksdb] def setBeforeCloseHookForTesting(hook: () => Unit): Unit =
+    beforeCloseHookForTesting = hook
+
+  private[rocksdb] def markDirtyForTesting(columnFamilies: Seq[String]): Unit = withWriteLock {
+    dirtySinceFlush = true
+    dirtyColumnFamilies = dirtyColumnFamilies ++ columnFamilies
+  }
+
   private[common] def put(batch: WriteBatch, columnFamily: String, key: Array[Byte], value: Array[Byte]): Unit = {
     val stats = activeBatchStats.get()
     stats match {
       case null => ()
       case s =>
         recordUndo(batch, s, columnFamily, key)
+        s.touch(columnFamily)
         s.add(key.length.toLong + value.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong + value.length.toLong)
@@ -470,6 +507,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       case null => ()
       case s =>
         recordUndo(batch, s, columnFamily, key)
+        s.touch(columnFamily)
         s.add(key.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, key.length.toLong)
@@ -488,6 +526,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       case null => ()
       case s =>
         recordRangeUndo(batch, s, columnFamily, startKey, endKey)
+        s.touch(columnFamily)
         s.add(startKey.length.toLong + endKey.length.toLong)
     }
     OpenIvmMetrics.recordColumnFamilyWrite(columnFamily, startKey.length.toLong + endKey.length.toLong)
@@ -593,6 +632,8 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       openedDb = RocksDB.open(options, normalizedDbPath, descriptors.asJava, handles)
       dbHandle = openedDb
       columnFamilyHandles = allColumnFamilies.zip(handles.asScala).toMap
+      dirtySinceFlush = false
+      dirtyColumnFamilies = Set.empty
       recoverLogicalTransactions()
       versionValue = readCurrentVersion()
     } catch {
@@ -612,7 +653,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     var firstError: Throwable = null
 
     try {
-      if (localDb != null && dirtySinceFlush) flushAll(localDb)
+      if (localDb != null) {
+        beforeCloseHookForTesting()
+      }
+      if (localDb != null && dirtySinceFlush) flushDirtyColumnFamilies(localDb)
     } catch { case t: Throwable => firstError = t }
 
     try localHandles.foreach(closeQuietly)
@@ -626,6 +670,8 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         else firstError.addSuppressed(t)
     } finally {
       dbHandle = null
+      dirtySinceFlush = false
+      dirtyColumnFamilies = Set.empty
     }
 
     if (firstError != null) throw firstError
@@ -869,8 +915,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     closed = true
 
     if (dbHandle != null) {
-      try closeInternal()
-      catch { case _: Throwable => () }
+      closeInternal()
     }
   }
 
