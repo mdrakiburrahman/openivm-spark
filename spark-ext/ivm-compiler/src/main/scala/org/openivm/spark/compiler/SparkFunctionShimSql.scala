@@ -52,6 +52,21 @@ private[compiler] object SparkFunctionShimSql {
       Map(
         1 -> "__sparkfn_last_value"
       )
+    ),
+    "first_value" -> RenameRule(
+      Map(
+        1 -> "__sparkfn_first_value"
+      )
+    ),
+    "current_date" -> RenameRule(
+      Map(
+        0 -> "__sparkfn_current_date"
+      )
+    ),
+    "current_timestamp" -> RenameRule(
+      Map(
+        0 -> "__sparkfn_current_timestamp"
+      )
     )
   )
 
@@ -60,14 +75,17 @@ private[compiler] object SparkFunctionShimSql {
     * `__sparkfn_*` spellings before the SQL reaches DuckDB.
     *
     * Only the function NAME is rewritten for generic shim calls; argument text is
-    * preserved verbatim. The Spark-only literal-boolean
-    * `last_value(expr, ignoreNulls)` spelling is instead translated to DuckDB's
-    * native window modifier so ignore-null semantics survive planning.
-    * Current coverage:
+    * preserved verbatim. The Spark-only literal-boolean `last_value(expr,
+    * ignoreNulls)` / `first_value(expr, ignoreNulls)` spellings are instead
+    * translated to DuckDB's native window modifier so ignore-null semantics
+    * survive planning. Current coverage:
     *   - 1-arg / 2-arg `to_date(...)`
     *   - 1-arg / 2-arg `to_timestamp(...)`
     *   - 2-arg `date_format(...)`
     *   - 2-arg `last_value(expr, true|false)`
+    *   - 2-arg `first_value(expr, true|false)`
+    *   - 0-arg `current_date()`
+    *   - 0-arg `current_timestamp()`
     */
   def renameSparkFunctionShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
@@ -75,12 +93,14 @@ private[compiler] object SparkFunctionShimSql {
       else {
         val identEnd = readIdentifierEnd(sql, i)
         val lower    = sql.substring(i, identEnd).toLowerCase(Locale.ROOT)
-        parseSparkLastValueLiteralBoolRewrite(sql, i, identEnd).orElse {
-          sparkFunctionRenameRules.get(lower).flatMap { rule =>
-            parseFunctionCall(sql, identEnd)
-              .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
+        parseSparkWindowLiteralBoolRewrite(sql, i, identEnd, "last_value")
+          .orElse(parseSparkWindowLiteralBoolRewrite(sql, i, identEnd, "first_value"))
+          .orElse {
+            sparkFunctionRenameRules.get(lower).flatMap { rule =>
+              parseFunctionCall(sql, identEnd)
+                .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
+            }
           }
-        }
       }
     }
 
@@ -97,6 +117,10 @@ private[compiler] object SparkFunctionShimSql {
     *   - `strftime(d, fmt)`                                                               -> `date_format(d, fmt)`
     *   - `last_value(expr IGNORE NULLS) OVER (...)`                                      -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                                                          -> `last_value(expr) OVER (...)`
+    *   - `first_value(expr IGNORE NULLS) OVER (...)`                                     -> `first_value(expr, true) OVER (...)`
+    *   - `first(expr) OVER (...)`                                                         -> `first_value(expr) OVER (...)`
+    *   - `CAST(get_current_timestamp() AS TIMESTAMP)`                                     -> `current_timestamp()`
+    *   - `CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)`                       -> `current_date()`
     *
     * The 1-arg date/time rewrites trigger when the inlined body matches either
     * the legacy fixed-format `strptime` shim or the current polymorphic
@@ -111,17 +135,223 @@ private[compiler] object SparkFunctionShimSql {
       parseCastTemporalShim(sql, i)
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
-        .orElse(parseLastValueIgnoreNullsRewrite(sql, i))
+        .orElse(parseWindowIgnoreNullsRewrite(sql, i, "last_value"))
+        .orElse(parseWindowIgnoreNullsRewrite(sql, i, "first_value"))
         .orElse(parseWindowFunctionNameRewrite(sql, i, "last", "last_value"))
+        .orElse(parseWindowFunctionNameRewrite(sql, i, "first", "first_value"))
     }
 
-  private def parseSparkLastValueLiteralBoolRewrite(
+  /** Rewrites DuckDB's native positional 2-arg `trim(<str>, <chars>)` call
+    * (bare, or backtick-quoted as `` `trim`(<str>, <chars>) `` once
+    * [[LptsSparkDialect.rewriteDoubleQuotedIdentifiers]] has already turned
+    * DuckDB's own `"trim"(...)` spelling into a Spark-legal identifier) into
+    * Spark's unambiguous ANSI `TRIM(<chars> FROM <str>)` form.
+    *
+    * DuckDB's `trim(string, characters)` builtin takes the source string
+    * first and the trim-character set second. Spark's parser instead
+    * resolves a *positional* 2-arg `trim(a, b)` call to `TRIM(a FROM b)` --
+    * the OPPOSITE argument order -- so re-parsing DuckDB's serialized call
+    * verbatim under Spark silently swaps the operands with no parse error:
+    * `` `trim`(<longExpr>, '_') `` becomes "trim every character that
+    * occurs in `<longExpr>` off the two-character string `'_'`", which
+    * erases it to an empty string for every row (this is how the nested
+    * `normalize_os_name` REPLACE/TRIM fragment produced empty strings after
+    * a CREATE/refresh round-trip, even though its literal escaping was
+    * already correct).
+    *
+    * The rewritten ANSI `TRIM(... FROM ...)` form is not itself a 2-arg
+    * positional call (no top-level comma), so re-running this pass over its
+    * own output is a no-op.
+    *
+    * Only the 2-arg positional shape is rewritten -- 1-arg `trim(s)`
+    * (whitespace trim) and the native `TRIM([BOTH|LEADING|TRAILING] chars
+    * FROM str)` spelling (zero top-level commas) already match between the
+    * two dialects and are left untouched.
+    */
+  def rewriteTrimTwoArgToAnsiFrom(sql: String): String =
+    rewriteOutsideProtected(sql) { i =>
+      parseTrimIdentifier(sql, i).flatMap { nameEnd =>
+        parseFunctionCall(sql, nameEnd)
+          .filter(_.topLevelCommaCount == 1)
+          .flatMap { call =>
+            splitTopLevelArgs(sql, call).collect { case Seq((s1, e1), (s2, e2)) =>
+              val strArg   = sql.substring(s1, e1).trim
+              val charsArg = sql.substring(s2, e2).trim
+              call.closeParen + 1 -> s"TRIM($charsArg FROM $strArg)"
+            }
+          }
+      }
+    }
+
+  /** Matches the identifier `trim` at `start`, either bare or
+    * backtick-quoted (e.g. `` `trim` ``), returning the index immediately
+    * after the name (including the closing backtick, if quoted) provided a
+    * legal identifier boundary follows. Case-insensitive, matching Spark's
+    * identifier resolution.
+    */
+  private def parseTrimIdentifier(sql: String, start: Int): Option[Int] =
+    if (sql.charAt(start) == '`') {
+      val nameStart = start + 1
+      val nameEnd   = nameStart + 4
+      if (nameEnd < sql.length && sql.regionMatches(true, nameStart, "trim", 0, 4) && sql.charAt(nameEnd) == '`')
+        Some(nameEnd + 1)
+      else None
+    } else if (isIdentifierStart(sql.charAt(start)) && hasLeftIdentifierBoundary(sql, start)) {
+      val nameEnd = start + 4
+      if (
+        nameEnd <= sql.length && sql
+          .regionMatches(true, start, "trim", 0, 4) && hasRightIdentifierBoundary(sql, nameEnd)
+      )
+        Some(nameEnd)
+      else None
+    } else None
+
+  /** Pre-pass step that translates Spark single-quoted string literals into
+    * DuckDB-compatible syntax before any other rewriting happens.
+    *
+    * Spark string literals accept both the SQL-standard doubled-quote escape
+    * (`''`) AND backslash escapes (`\\`, `\'`, `\n`, ... — see
+    * https://spark.apache.org/docs/latest/sql-ref-literals.html). DuckDB has
+    * no backslash-escape convention at all: a bare `\` is an ordinary
+    * character and only `''` represents an embedded quote. Left unrewritten,
+    * a Spark literal like `'\''` (one embedded quote character) is rejected
+    * outright by DuckDB's parser (`Parser Error: syntax error at or near
+    * "\"`), and `'\\'` (one embedded backslash character) is silently
+    * misread as containing TWO backslash characters — no exception, wrong
+    * value. This decodes each literal's Spark-escaped value and re-encodes
+    * it using DuckDB's doubled-quote convention so both failure modes are
+    * fixed (e.g. the nested `REPLACE(..., '\\', '_'), ..., '\'', '_')`
+    * fragment in the dbt `normalize_os_name` macro).
+    *
+    * Recognized Spark escapes (per the Spark SQL literal grammar):
+    *   `\0 \b \n \r \t \Z \\ \' \"` -> the corresponding literal character
+    *   `\%` `\_`                    -> preserved verbatim (Spark keeps the
+    *                                   backslash for LIKE-pattern escapes)
+    *   `\<any other char>`          -> that character, backslash dropped
+    *   `''`                        -> a literal quote (already valid in both
+    *                                   dialects; copied through unchanged)
+    *
+    * Comments and double-quoted identifiers are left untouched. Only
+    * genuinely Spark-dialect source SQL should be passed to this function —
+    * SQL already emitted by DuckDB (e.g. the "sql" payload from
+    * `openivm_compile_with_facts`, processed by
+    * [[rewriteInlinedSparkShimCalls]]) has no backslash-escape convention and
+    * must NOT be re-scanned here.
+    */
+  def translateSparkStringLiteralEscapes(sql: String): String = {
+    val out = new StringBuilder(sql.length)
+    var i   = 0
+    while (i < sql.length) {
+      if (startsLineComment(sql, i)) {
+        val end = consumeLineComment(sql, i)
+        out ++= sql.substring(i, end)
+        i = end
+      } else if (startsBlockComment(sql, i)) {
+        val end = consumeBlockComment(sql, i)
+        out ++= sql.substring(i, end)
+        i = end
+      } else if (sql.charAt(i) == '"') {
+        val end = consumeDoubleQuoted(sql, i)
+        out ++= sql.substring(i, end)
+        i = end
+      } else if (sql.charAt(i) == '\'') {
+        val (literal, end) = reencodeSparkSingleQuotedLiteral(sql, i)
+        out ++= literal
+        i = end
+      } else {
+        out += sql.charAt(i)
+        i += 1
+      }
+    }
+    out.toString
+  }
+
+  /** Decodes a single Spark single-quoted literal starting at `sql(start)`
+    * (which must be `'`) and re-encodes it using DuckDB's doubled-quote-only
+    * convention. Returns the re-encoded literal (including surrounding
+    * quotes) and the index just past the literal's closing quote.
+    */
+  private def reencodeSparkSingleQuotedLiteral(sql: String, start: Int): (String, Int) = {
+    val body = new StringBuilder
+    var i    = start + 1
+    var done = false
+    while (i < sql.length && !done) {
+      val ch = sql.charAt(i)
+      if (ch == '\\' && i + 1 < sql.length) {
+        body ++= decodeSparkEscapeForDuckdb(sql.charAt(i + 1))
+        i += 2
+      } else if (ch == '\'') {
+        if (i + 1 < sql.length && sql.charAt(i + 1) == '\'') {
+          body ++= "''"
+          i += 2
+        } else {
+          done = true
+          i += 1
+        }
+      } else {
+        body += ch
+        i += 1
+      }
+    }
+    ("'" + body.toString + "'", i)
+  }
+
+  /** Decodes one Spark backslash-escaped character (the character following
+    * `\`) and re-encodes the result for DuckDB's single-quoted literal
+    * syntax (only `'` needs doubling; every other character is literal).
+    */
+  private def decodeSparkEscapeForDuckdb(escaped: Char): String = escaped match {
+    case '0'   => "\u0000"
+    case 'b'   => "\b"
+    case 'n'   => "\n"
+    case 'r'   => "\r"
+    case 't'   => "\t"
+    case 'Z'   => "\u001A"
+    case '\\'  => "\\"
+    case '\''  => "''"
+    case '"'   => "\""
+    case '%'   => "\\%"
+    case '_'   => "\\_"
+    case other => other.toString
+  }
+
+  /** Spark-dialect single-quoted literal boundary scanner: unlike
+    * [[consumeSingleQuoted]] (DuckDB dialect — doubled-quote only), this
+    * additionally recognizes Spark's backslash-escape convention so a
+    * two-character escape pair (`\` + any character, including `\'` and
+    * `\\`) is never mistaken for the closing quote. Used to keep the outer
+    * identifier scan in [[OpenIvmCompiler.stripSparkBacktickIdentifiers]]
+    * correctly positioned when it must skip over — but not otherwise touch —
+    * a Spark-dialect string literal.
+    */
+  private[compiler] def consumeSparkSingleQuoted(sql: String, start: Int): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      val ch = sql.charAt(i)
+      if (ch == '\\' && i + 1 < sql.length) {
+        i += 2
+      } else if (ch == '\'') {
+        if (i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 2
+        else return i + 1
+      } else {
+        i += 1
+      }
+    }
+    sql.length
+  }
+
+  /** Matches Spark's literal-boolean `<functionName>(expr, true|false)`
+    * spelling (only ever meaningful for `last_value` / `first_value`) and
+    * rewrites it to DuckDB's native `IGNORE NULLS` window-function modifier.
+    */
+  private def parseSparkWindowLiteralBoolRewrite(
       sql: String,
       start: Int,
-      identEnd: Int
+      identEnd: Int,
+      functionName: String
   ): Option[(Int, String)] = {
     if (
-      identEnd - start != "last_value".length || !sql.regionMatches(true, start, "last_value", 0, "last_value".length)
+      identEnd - start != functionName.length || !sql.regionMatches(true, start, functionName, 0, functionName.length)
     ) None
     else {
       parseFunctionCall(sql, identEnd)
@@ -132,8 +362,8 @@ private[compiler] object SparkFunctionShimSql {
               parseBooleanLiteralArg(sql, boolRange).map { ignoreNulls =>
                 val expr = sql.substring(exprRange._1, exprRange._2).trim
                 val replacement =
-                  if (ignoreNulls) s"last_value($expr IGNORE NULLS)"
-                  else s"last_value($expr)"
+                  if (ignoreNulls) s"$functionName($expr IGNORE NULLS)"
+                  else s"$functionName($expr)"
                 call.closeParen + 1 -> replacement
               }
             case _ => None
@@ -142,8 +372,8 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private def parseLastValueIgnoreNullsRewrite(sql: String, start: Int): Option[(Int, String)] =
-    parseFunctionCallAt(sql, start, "last_value")
+  private def parseWindowIgnoreNullsRewrite(sql: String, start: Int, functionName: String): Option[(Int, String)] =
+    parseFunctionCallAt(sql, start, functionName)
       .filter(_.topLevelCommaCount == 0)
       .filter(call => hasOverClause(sql, call.closeParen + 1))
       .flatMap { call =>
@@ -152,7 +382,7 @@ private[compiler] object SparkFunctionShimSql {
           val expr       = sql.substring(call.openParen + 1, ignoreStart).trim
           if (expr.isEmpty || !isKeywordAt(sql, nullsStart, "NULLS")) None
           else if (!isTriviaOnly(sql, nullsStart + "NULLS".length, call.closeParen)) None
-          else Some(call.closeParen + 1 -> s"last_value(${rewriteInlinedSparkShimCalls(expr)}, true)")
+          else Some(call.closeParen + 1 -> s"$functionName(${rewriteInlinedSparkShimCalls(expr)}, true)")
         }
       }
 
@@ -171,9 +401,13 @@ private[compiler] object SparkFunctionShimSql {
             val replacement =
               sql.substring(typeStart, typeEnd).toUpperCase(Locale.ROOT) match {
                 case "DATE" =>
-                  rewriteCastTemporalBody(sql, exprStart, asStart, "to_date", Some(OneArgToDateLiteral))
+                  parseCurrentDateShim(sql, exprStart, asStart)
+                    .orElse(rewriteCastTemporalBody(sql, exprStart, asStart, "to_date", Some(OneArgToDateLiteral)))
                 case "TIMESTAMP" =>
-                  rewriteCastTemporalBody(sql, exprStart, asStart, "to_timestamp", Some(OneArgToTimestampLiteral))
+                  parseCurrentTimestampShim(sql, exprStart, asStart)
+                    .orElse(
+                      rewriteCastTemporalBody(sql, exprStart, asStart, "to_timestamp", Some(OneArgToTimestampLiteral))
+                    )
                 case _ =>
                   None
               }
@@ -182,6 +416,37 @@ private[compiler] object SparkFunctionShimSql {
         }
       }
     }
+
+  /** Matches `CAST(get_current_timestamp() AS TIMESTAMP)` — the inlined body
+    * of the `__sparkfn_current_timestamp` macro registered by
+    * [[OpenIvmCompiler.sparkFunctionShimsPrologue]] — and restores Spark's
+    * `current_timestamp()` spelling.
+    */
+  private def parseCurrentTimestampShim(sql: String, exprStart: Int, exprEndExclusive: Int): Option[String] =
+    if (isGetCurrentTimestampCall(sql, exprStart, exprEndExclusive)) Some("current_timestamp()") else None
+
+  /** Matches `CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)` — the
+    * inlined body of the `__sparkfn_current_date` macro — and restores
+    * Spark's `current_date()` spelling.
+    *
+    * The inner `CAST(get_current_timestamp() AS TIMESTAMP)` is itself a
+    * [[parseCastTemporalShim]] match, so the cheap `CAST(` prefix guard below
+    * avoids wastefully recursing into ordinary `to_date` shim shapes (which
+    * never start with a nested `CAST`), and the recursive
+    * [[rewriteInlinedSparkShimCalls]] call normalizes the inner expression
+    * before comparing — it always terminates after exactly one extra level
+    * since the inner text bottoms out at the direct-equality check in
+    * [[parseCurrentTimestampShim]].
+    */
+  private def parseCurrentDateShim(sql: String, exprStart: Int, exprEndExclusive: Int): Option[String] = {
+    val trimmedExpr = sql.substring(exprStart, exprEndExclusive).trim
+    if (!trimmedExpr.regionMatches(true, 0, "CAST(", 0, "CAST(".length)) None
+    else if (rewriteInlinedSparkShimCalls(trimmedExpr).equalsIgnoreCase("current_timestamp()")) Some("current_date()")
+    else None
+  }
+
+  private def isGetCurrentTimestampCall(sql: String, start: Int, endExclusive: Int): Boolean =
+    sql.substring(start, endExclusive).trim.equalsIgnoreCase("get_current_timestamp()")
 
   private def rewriteCastTemporalBody(
       sql: String,

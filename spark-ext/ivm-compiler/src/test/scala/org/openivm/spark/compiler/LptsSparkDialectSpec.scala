@@ -571,12 +571,173 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "date_format(to_date(coalesce(a, b)), 'yyyy-MM')"
     }
 
+    it("rewrites first(expr) OVER (...) to first_value(expr) OVER (...)") {
+      val sql = "first(name) OVER (PARTITION BY grp ORDER BY ts)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "first_value(name) OVER (PARTITION BY grp ORDER BY ts)"
+    }
+
+    it("rewrites first_value(expr IGNORE NULLS) OVER (...) to Spark's two-arg spelling") {
+      val sql = "first_value(coalesce(name, alt_name) IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "first_value(coalesce(name, alt_name), true) OVER (PARTITION BY grp ORDER BY ts)"
+    }
+
+    it("rewrites the inlined current_timestamp() shim body back to current_timestamp()") {
+      val sql = "CAST(get_current_timestamp() AS TIMESTAMP)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_timestamp()"
+    }
+
+    it("rewrites the inlined current_date() shim body back to current_date()") {
+      val sql = "CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_date()"
+    }
+
+    it("does not misfire current_date()'s shim detection on an unrelated nested CAST") {
+      val sql = "CAST(CAST(some_col AS TIMESTAMP) AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe sql
+    }
+
+    it("does not touch first_value/current_date/current_timestamp inside string literals or comments") {
+      val sql =
+        """SELECT 'CAST(get_current_timestamp() AS TIMESTAMP)' AS raw_txt,
+          |       -- first(name) OVER (PARTITION BY grp ORDER BY ts)
+          |       CAST(get_current_timestamp() AS TIMESTAMP) AS now_ts
+          |FROM src""".stripMargin
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        """SELECT 'CAST(get_current_timestamp() AS TIMESTAMP)' AS raw_txt,
+          |       -- first(name) OVER (PARTITION BY grp ORDER BY ts)
+          |       current_timestamp() AS now_ts
+          |FROM src""".stripMargin
+    }
+
     it("is idempotent for the date/time shim translations") {
       val sql =
-        "CAST(CASE WHEN coalesce(a, b) IS NOT NULL THEN NULL WHEN coalesce(a, b) IS NULL THEN NULL ELSE NULL END AS DATE), CAST(strptime(raw, 'yyyyMMdd') AS DATE), CAST(CASE WHEN epoch_s IS NOT NULL THEN NULL WHEN epoch_s IS NULL THEN NULL ELSE NULL END AS TIMESTAMP), strptime(raw3, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd'), last(name) OVER (PARTITION BY grp ORDER BY ts)"
+        "CAST(CASE WHEN coalesce(a, b) IS NOT NULL THEN NULL WHEN coalesce(a, b) IS NULL THEN NULL ELSE NULL END AS DATE), CAST(strptime(raw, 'yyyyMMdd') AS DATE), CAST(CASE WHEN epoch_s IS NOT NULL THEN NULL WHEN epoch_s IS NULL THEN NULL ELSE NULL END AS TIMESTAMP), strptime(raw3, 'yyyy-MM-dd HH:mm:ss'), strftime(ts, 'yyyyMMdd'), last(name) OVER (PARTITION BY grp ORDER BY ts), first(name) OVER (PARTITION BY grp ORDER BY ts), CAST(get_current_timestamp() AS TIMESTAMP), CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)"
       val once  = LptsSparkDialect.translate(sql)
       val twice = LptsSparkDialect.translate(once)
       twice shouldBe once
+    }
+  }
+
+  describe("rewriteTrimTwoArg") {
+    it("swaps DuckDB's positional 2-arg trim(str, chars) to Spark's ANSI TRIM(chars FROM str)") {
+      val sql = "trim(os_name, '_')"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe "TRIM('_' FROM os_name)"
+    }
+
+    it("recognizes the backtick-quoted spelling left by rewriteDoubleQuotedIdentifiers") {
+      val sql = "`trim`(os_name, '_')"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe "TRIM('_' FROM os_name)"
+    }
+
+    it("is case-insensitive") {
+      val sql = "TRIM(os_name, '_')"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe "TRIM('_' FROM os_name)"
+    }
+
+    it("splits at the correct top-level comma when the source expression itself contains commas") {
+      // The real normalize_os_name shape: the first (source) argument is a
+      // deeply nested REPLACE(...) call whose OWN commas must not be
+      // confused with the trim call's own argument separator.
+      val sql = "`trim`(replace(replace(os_name, ' ', '_'), '-', '_'), '_')"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe
+        "TRIM('_' FROM replace(replace(os_name, ' ', '_'), '-', '_'))"
+    }
+
+    it("leaves 1-arg trim(s) (whitespace trim) unchanged") {
+      val sql = "trim(os_name)"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe sql
+    }
+
+    it("leaves the native ANSI TRIM(chars FROM str) spelling unchanged (no top-level comma)") {
+      val sql = "TRIM('_' FROM os_name)"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe sql
+    }
+
+    it("does not misfire on identifiers that merely contain trim as a substring") {
+      val sql = "my_trim(os_name, '_'), trimmed_col"
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe sql
+    }
+
+    it("does not touch trim(...) inside string literals or comments") {
+      val sql =
+        """SELECT 'trim(a, b)' AS raw_txt,
+          |       -- trim(x, y)
+          |       trim(os_name, '_') AS cleaned
+          |FROM src""".stripMargin
+      LptsSparkDialect.rewriteTrimTwoArg(sql) shouldBe
+        """SELECT 'trim(a, b)' AS raw_txt,
+          |       -- trim(x, y)
+          |       TRIM('_' FROM os_name) AS cleaned
+          |FROM src""".stripMargin
+    }
+
+    it("is idempotent: the rewritten ANSI form is not itself re-matched") {
+      val sql   = "`trim`(replace(os_name, ' ', '_'), '_')"
+      val once  = LptsSparkDialect.rewriteTrimTwoArg(sql)
+      val twice = LptsSparkDialect.rewriteTrimTwoArg(once)
+      twice shouldBe once
+    }
+  }
+
+  describe("rewriteBareBackslashLiterals") {
+    it("rewrites a bare backslash literal to a concat(chr(92)) expression") {
+      val sql = "REPLACE(s, '\\', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat(chr(92)), '_')"
+    }
+
+    it("leaves literals without backslashes or quotes unchanged") {
+      val sql = "REPLACE(REPLACE(s, ' ', '_'), '-', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe sql
+    }
+
+    it("rewrites a doubled single-quote escape to a concat(chr(39)) expression") {
+      // DuckDB's native `''''` (a lone `'` character) is NOT reliably
+      // decoded as an escaped quote by this Spark build, so it is lifted
+      // out of literal syntax entirely rather than re-escaped in place.
+      val sql = "REPLACE(s, '''', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat(chr(39)), '_')"
+    }
+
+    it("rewrites multiple backslashes within the same literal to repeated chr(92) args") {
+      val sql = "REPLACE(s, '\\\\', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat(chr(92), chr(92)), '_')"
+    }
+
+    it("rewrites a literal containing both a raw backslash and an escaped quote") {
+      val sql = "REPLACE(s, '\\''', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat(chr(92), chr(39)), '_')"
+    }
+
+    it("preserves surrounding plain-text segments around an embedded quote") {
+      val sql = "REPLACE(s, 'it''s', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat('it', chr(39), 's'), '_')"
+    }
+
+    it("is idempotent: applying it a second time to its own output is a no-op") {
+      val sql   = "REPLACE(REPLACE(s, '\\', '_'), '''', '_')"
+      val once  = LptsSparkDialect.rewriteBareBackslashLiterals(sql)
+      val twice = LptsSparkDialect.rewriteBareBackslashLiterals(once)
+      twice shouldBe once
+    }
+
+    it("round-trips the full normalize_os_name fragment to a Spark-safe form") {
+      // This is the emitted-refresh-SQL counterpart of the normalize_os_name
+      // fragment: DuckDB has already re-serialized the decoded '\\' Spark
+      // literal (one backslash character) as a single raw backslash '\',
+      // and the decoded '\'' Spark literal as DuckDB's native doubled quote
+      // ''''. Both are lifted out of literal syntax into concat(chr(...))
+      // expressions Spark can re-parse unambiguously.
+      val sql =
+        "REPLACE(REPLACE(os_name, '\\', '_'), '''', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(REPLACE(os_name, concat(chr(92)), '_'), concat(chr(39)), '_')"
     }
   }
 
@@ -649,6 +810,32 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
     it("is idempotent for a literal-heavy SQL") {
       val s = "SELECT '2024-01-01'::TIMESTAMP, 'foo::bar' AS raw, generate_series(0, 5)"
+      LptsSparkDialect.translate(LptsSparkDialect.translate(s)) shouldBe
+        LptsSparkDialect.translate(s)
+    }
+
+    it("is idempotent for SQL containing backslash/quote literals (double translate, as happens in production)") {
+      // OpenIvmCompiler.parseInitialLoadSql already calls translate() once
+      // before storing initialLoadSql; MaterializedViewCommands then calls
+      // translate() again on that already-translated value at every CREATE
+      // call site. This must be a safe no-op on the second call.
+      val s =
+        "SELECT id, REPLACE(REPLACE(os_name, '\\', '_'), '''', '_') AS cleaned FROM t"
+      LptsSparkDialect.translate(LptsSparkDialect.translate(s)) shouldBe
+        LptsSparkDialect.translate(s)
+    }
+
+    it("swaps the trim argument order to ANSI form as part of the full pipeline") {
+      val s = """SELECT id, `trim`(replace(os_name, ' ', '_'), '_') AS cleaned FROM t"""
+      LptsSparkDialect.translate(s) shouldBe
+        """SELECT id, TRIM('_' FROM replace(os_name, ' ', '_')) AS cleaned FROM t"""
+    }
+
+    it(
+      "is idempotent for the full normalize_os_name fragment (trim reorder + literal escaping, double translate)"
+    ) {
+      val s =
+        """SELECT id, `trim`(replace(replace(os_name, '\', '_'), '''', '_'), '_') AS cleaned FROM t"""
       LptsSparkDialect.translate(LptsSparkDialect.translate(s)) shouldBe
         LptsSparkDialect.translate(s)
     }

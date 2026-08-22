@@ -18,7 +18,11 @@ import org.scalatest.matchers.should.Matchers
   *     translated form (when openivm inlines the macro body — see
   *     `rewriteSparkFunctionInlinings`).
   *  3. The classification is not FULL_REFRESH (the shim unblocks
-  *     incrementalization).
+  *     incrementalization) — EXCEPT `current_date()` / `current_timestamp()`,
+  *     which are inherently non-deterministic per invocation, so a
+  *     FULL_REFRESH classification for those two is expected and acceptable;
+  *     the only requirement for them is that compile succeeds (no binder
+  *     error) and the emitted SQL round-trips back to Spark's own spelling.
   */
 class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAfterAll {
 
@@ -190,6 +194,101 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should include(", true)")
   }
 
+  "shim first_value(expr, ignoreNulls)" should "compile, stay incremental, and emit Spark's ignore-null first_value at refresh time" in {
+    val r = compileBody(
+      viewName = "shim_first_value_v1",
+      sources = Map("winsrc" -> windowSchema),
+      body =
+        "SELECT id, grp, ts, first_value(name, true) OVER (PARTITION BY grp ORDER BY ts) AS carried_name FROM winsrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should not include "__sparkfn_first_value"
+    translated should include("first_value(")
+    translated should include(", true)")
+  }
+
+  "shim current_date()" should "compile without a binder error and translate back to Spark's current_date()" in {
+    val r = compileBody(
+      viewName = "shim_current_date_v1",
+      sources = Map("datesrc" -> rawDateSchema),
+      body = "SELECT id, current_date() AS today FROM datesrc"
+    )
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("current_date()")
+    translated should not include "get_current_timestamp"
+  }
+
+  "shim current_timestamp()" should "compile without a binder error and translate back to Spark's current_timestamp()" in {
+    val r = compileBody(
+      viewName = "shim_current_timestamp_v1",
+      sources = Map("datesrc" -> rawDateSchema),
+      body = "SELECT id, current_timestamp() AS now_ts FROM datesrc"
+    )
+
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should include("current_timestamp()")
+    translated should not include "get_current_timestamp"
+  }
+
+  "shim Spark backslash-escaped string literals (normalize_os_name fragment)" should
+    "compile, stay incremental, and preserve Spark-safe literal escaping through the refresh SQL" in {
+      val r = compileBody(
+        viewName = "shim_os_name_v1",
+        sources = Map("textsrc" -> textSchema),
+        body = """SELECT id,
+            |  TRIM('_' FROM
+            |    REPLACE(REPLACE(REPLACE(REPLACE(
+            |      LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(txt,
+            |        ' ', '_'), '-', '_'), '.', '_'), '/', '_'), '\\', '_'), '(', '_'), ')', '_'), ',', '_'), ':', '_'), '\'', '_'))
+            |    , '____', '_'), '___', '_'), '__', '_'), '__', '_')
+            |  ) AS cleaned_txt
+            |FROM textsrc""".stripMargin
+      )
+      // A nested scalar REPLACE/TRIM projection over a single base table stays
+      // incremental -- unlike current_date()/current_timestamp(), there is
+      // nothing non-deterministic here.
+      r.refreshTypeName should not equal "FULL_REFRESH"
+
+      // The initial-load SQL must rewrite DuckDB's serialized positional
+      // 2-arg `trim(<expr>, '_')` call into Spark's unambiguous ANSI
+      // `TRIM('_' FROM <expr>)` form. Left as a plain positional call, Spark
+      // resolves the two arguments in the OPPOSITE order from DuckDB (trim
+      // chars first, source string second), silently trimming every
+      // character that appears in `<expr>` off the two-character string
+      // `'_'` -- erasing every row to an empty string with no parse error.
+      r.initialLoadSql should include("TRIM('_' FROM")
+      r.initialLoadSql should not include "trim(replace"
+      r.initialLoadSql should not include "`trim`("
+
+      // The initial-load SQL is translated exactly once by the compiler and
+      // once more by the extension when it materializes the CREATE; both
+      // the trim-argument-order fix and the literal-escaping fix must be
+      // stable under that double application.
+      LptsSparkDialect.translate(r.initialLoadSql) shouldBe r.initialLoadSql
+
+      // The refresh SQL must be safe for SPARK to re-parse: a literal
+      // backslash and a literal quote must be lifted out of string-literal
+      // syntax into unambiguous concat(chr(...)) expressions, since neither
+      // Spark's backslash-escape pairing nor DuckDB's native doubled-quote
+      // escaping survive this translation being applied twice (once when
+      // the compiler first parses the initial-load SQL, again when the
+      // extension materializes it).
+      val translated = LptsSparkDialect.translate(r.sql)
+      translated should include("concat(chr(92))")
+      translated should include("concat(chr(39))")
+      translated should not include "'\\'"
+      translated should not include "''''"
+
+      // The refresh SQL's own `trim(<expr>, '_')` call must also be swapped
+      // to the ANSI form, and stable under a second translate application.
+      translated should include("TRIM('_' FROM")
+      translated should not include "`trim`("
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
   // ── sparkFunctionShimsPrologue contract ──────────────────────────────────────
 
   "sparkFunctionShimsPrologue" should "register the regexp_like and __sparkfn_* shim macros" in {
@@ -205,5 +304,12 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     p should include("CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);")
+    p should include("CREATE OR REPLACE MACRO __sparkfn_first_value(expr, ignore_nulls) AS first(expr);")
+    p should include(
+      "CREATE OR REPLACE MACRO __sparkfn_current_timestamp() AS CAST(get_current_timestamp() AS TIMESTAMP);"
+    )
+    p should include(
+      "CREATE OR REPLACE MACRO __sparkfn_current_date() AS CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE);"
+    )
   }
 }

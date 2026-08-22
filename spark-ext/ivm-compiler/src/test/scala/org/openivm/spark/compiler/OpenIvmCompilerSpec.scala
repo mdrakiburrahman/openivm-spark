@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import java.nio.file.Files
 import java.util.concurrent.{CountDownLatch, Executors}
 
 import org.apache.spark.sql.types._
@@ -412,6 +413,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     sharedCompiler.normalizeSparkSqlForDuckdb(in) shouldBe in
   }
 
+  it should "translate Spark backslash-escaped string literals to DuckDB's doubled-quote convention first" in {
+    // '\\' (Spark: one backslash value) and '\'' (Spark: one quote value) must
+    // both be DuckDB-parseable before any other pass scans the SQL for quotes.
+    val in = "SELECT REPLACE(REPLACE(txt, '\\\\', '_'), '\\'', '_') AS cleaned FROM t"
+    sharedCompiler.normalizeSparkSqlForDuckdb(in) shouldBe
+      "SELECT REPLACE(REPLACE(txt, '\\', '_'), '''', '_') AS cleaned FROM t"
+  }
+
   // ── Test 11: stripDbQualifiers (Hive/dbt qualified-name handling) ─────────
 
   "stripDbQualifiers" should "be a no-op when the qualified map is empty" in {
@@ -493,6 +502,16 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe sql
   }
 
+  it should "correctly skip a Spark backslash-escaped quote inside a literal without desyncing a later backtick identifier" in {
+    // The Spark literal `'it\'s here'` contains a backslash-escaped quote.
+    // A scanner unaware of Spark's backslash-escape convention would treat
+    // the escaped quote as the literal's close, desyncing everything after
+    // it -- including a genuine backtick-quoted identifier later in the SQL.
+    val sql = "SELECT region FROM t WHERE note = 'it\\'s here' AND x = `lakehouse_openivm`.foo"
+    sharedCompiler.stripSparkBacktickIdentifiers(sql) shouldBe
+      "SELECT region FROM t WHERE note = 'it\\'s here' AND x = lakehouse_openivm.foo"
+  }
+
   it should "not let an apostrophe in a -- line comment desync backtick stripping" in {
     // A `--` comment with an apostrophe (e.g. possessive "consumer's") must not
     // be treated as an open string literal, or real backtick-quoted identifiers
@@ -524,4 +543,59 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       Map("machine_infrastructure_dim" -> "arc_sql_db_bi.machine_infrastructure_dim")
     ) shouldBe "SELECT region FROM machine_infrastructure_dim WHERE is_row_effective = TRUE"
   }
+
+  // ── Test 13: compile-failure diagnostics ──────────────────────────────────
+
+  "classifyCompileFailureStage" should
+    "classify as CompileWithFacts when CREATE succeeded (stdout carries the MV-creation marker)" in {
+      val stdout = """{"MATERIALIZED VIEW CREATION":"true"}"""
+      OpenIvmCompiler.classifyCompileFailureStage(stdout) shouldBe OpenIvmCompiler.CompileFailureStage.CompileWithFacts
+    }
+
+  it should "classify as CreateOrBind when CREATE itself never succeeded (no marker in stdout)" in {
+    OpenIvmCompiler.classifyCompileFailureStage("") shouldBe OpenIvmCompiler.CompileFailureStage.CreateOrBind
+    OpenIvmCompiler.classifyCompileFailureStage(
+      """{"some_other_row":"true"}"""
+    ) shouldBe OpenIvmCompiler.CompileFailureStage.CreateOrBind
+  }
+
+  "compile" should "surface the classified failure stage in the exception message for a CREATE/bind failure" in {
+    val req = CompileRequest(
+      viewName = "mv_diag_bad_fn",
+      viewSql = "SELECT totally_bogus_fn_xyz(id) AS d FROM t",
+      sources = Map("t" -> tSchema)
+    )
+    val ex = the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req)
+    ex.getMessage should include("CREATE MATERIALIZED VIEW (bind)")
+  }
+
+  it should "persist a diagnostic bundle (original/normalized SQL, facts, stdout/stderr, stage) when a bundle dir is configured" in {
+    val bundleRoot   = Files.createTempDirectory("openivm-failure-bundle-test")
+    val diagCompiler = OpenIvmCompiler.build(extensionPath, failureBundleDir = Some(bundleRoot.toString))
+    try {
+      val req = CompileRequest(
+        viewName = "mv_diag_bundle",
+        viewSql = "SELECT totally_bogus_fn_xyz(id) AS d FROM t",
+        sources = Map("t" -> tSchema)
+      )
+      a[OpenIvmCompileException] should be thrownBy diagCompiler.compile(req)
+
+      val bundleDirs = bundleRoot.toFile.listFiles(_.isDirectory)
+      bundleDirs should not be null
+      bundleDirs should have length 1
+      val dir = bundleDirs.head.toPath
+
+      def read(name: String): String = new String(Files.readAllBytes(dir.resolve(name)), "UTF-8")
+
+      dir.getFileName.toString should startWith("mv_diag_bundle-")
+      read("original.sql") should include("totally_bogus_fn_xyz")
+      read("normalized.sql") should not be empty
+      read("facts.json") should include("\"target_dialect\"")
+      read("stderr.log") should include("totally_bogus_fn_xyz")
+      read("stage.txt").trim shouldBe "CREATE MATERIALIZED VIEW (bind)"
+    } finally {
+      diagCompiler.close()
+    }
+  }
+
 }
