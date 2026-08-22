@@ -181,6 +181,11 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
   }
 
+  private def realDeltaSql(viewLogicalName: String): String =
+    s"""INSERT INTO openivm_delta_$viewLogicalName
+       |SELECT 1 AS id, CAST(1 AS INTEGER) AS openivm_multiplicity
+       |""".stripMargin
+
   /**
    * Create a staging Delta table that holds `rows` and register it in
    * StagingCatalog.  Returns the staging path so tests can track it.
@@ -273,6 +278,110 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         qualSchemas = Map.empty,
         shortToQual = Map.empty
       ) shouldBe true
+    }
+  }
+
+  describe("effective refresh classification") {
+    it("keeps incremental classifications when the compiled delta is real") {
+      val viewShortName = "mv_incremental_kept"
+      val compiled = CompiledRefresh(
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        sql = realDeltaSql(viewShortName),
+        initialLoadSql = ""
+      )
+
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiled,
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.compileRefreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      classification.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.reason shouldBe "kept"
+      classification.isDemotionToFullRefresh shouldBe false
+    }
+
+    it("surfaces the non_cascade_upstream detail in the final classification reason") {
+      val upstream = MvMetadata(
+        name = TableIdentifier("upstream_mv", Some("default")),
+        querySql = "SELECT 1",
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        lastVersion = 0L,
+        sourceTables = Seq.empty,
+        sourceSchemaFingerprint = "fp-upstream",
+        location = "target/upstream_mv",
+        createdAt = new Timestamp(0L),
+        properties = Map(MvMetadata.EmitsCascadeViewDeltaKey -> "false")
+      )
+      val reason =
+        MvCommandHelper.computeNonCascadeUpstreamReason(Map("default.upstream_mv" -> upstream))
+
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.SimpleProjection,
+          refreshTypeName = "SIMPLE_PROJECTION",
+          sql = realDeltaSql("mv_non_cascade"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_non_cascade",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = reason,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      reason shouldBe Some("non_cascade:default.upstream_mv")
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.reason shouldBe "non_cascade_upstream:non_cascade:default.upstream_mv"
+    }
+
+    it("keeps compile_failed authoritative over the generic full-refresh fallback") {
+      val compiledFallback = CompiledRefresh(
+        refreshType = RefreshTypeCode.FullRefresh,
+        refreshTypeName = "FULL_REFRESH",
+        sql = "",
+        initialLoadSql = ""
+      )
+
+      val generic = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiledFallback,
+        viewShortName = "mv_compile_failed",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+      val authoritative = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiledFallback,
+        viewShortName = "mv_compile_failed",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None,
+        authoritativeClassification = Some(
+          MvCommandHelper.authoritativeFullRefreshClassification(
+            compileRefreshTypeName = "COMPILE_FAILED",
+            refreshReason = "compile_failed"
+          )
+        )
+      )
+
+      generic.reason shouldBe "no_real_delta"
+      authoritative.compileRefreshTypeName shouldBe "COMPILE_FAILED"
+      authoritative.refreshTypeName shouldBe "FULL_REFRESH"
+      authoritative.reason shouldBe "compile_failed"
+      authoritative.isDemotionToFullRefresh shouldBe true
     }
   }
 
@@ -384,6 +493,40 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         "mv_t5",
         "SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
       )
+    }
+  }
+
+  describe("(5a) REFRESH execution spans reconstruct persisted classification on refresh-only runs") {
+    it("reads compile/effective type and reason from metadata without recompiling") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5a(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5a VALUES ('east', 100), ('west', 200)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t5a_span AS " +
+          "SELECT region, SUM(amount) AS total FROM sales_t5a GROUP BY region"
+      )
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5a_span")).get
+      meta.properties.contains(MvMetadata.CompileRefreshTypeKey) shouldBe true
+      meta.properties.contains(MvMetadata.RefreshReasonKey) shouldBe true
+
+      val payloads = withLogCapture { appender =>
+        withSparkLocalProperties(
+          "openivm.request_id" -> "req-refresh-only",
+          "openivm.node_id"    -> "model.refresh.only"
+        ) {
+          spark.sql("REFRESH MATERIALIZED VIEW mv_t5a_span").collect()
+        }
+        executionSpanPayloads(appender.messages, "mv_t5a_span")
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("operation").asText() shouldBe "refresh"
+      payload.path("request_id").asText() shouldBe "req-refresh-only"
+      payload.path("dbt_node_id").asText() shouldBe "model.refresh.only"
+      payload.path("compile_refresh_type").asText() shouldBe meta.properties(MvMetadata.CompileRefreshTypeKey)
+      payload.path("effective_refresh_type").asText() shouldBe meta.refreshTypeName
+      payload.path("refresh_reason").asText() shouldBe meta.properties(MvMetadata.RefreshReasonKey)
     }
   }
 

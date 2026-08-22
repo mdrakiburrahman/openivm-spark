@@ -173,6 +173,12 @@ object MvMetadata {
   def queryShapeProperties(hasJoin: Boolean): Map[String, String] =
     Map(QueryHasJoinKey -> hasJoin.toString)
 
+  /** CREATE-time compiled refresh type captured for refresh-span correlation. */
+  val CompileRefreshTypeKey: String = "_ivm_compile_refresh_type"
+
+  /** CREATE-time refresh classification reason captured for refresh-span correlation. */
+  val RefreshReasonKey: String = "_ivm_refresh_reason"
+
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
 
@@ -204,6 +210,18 @@ object MvMetadata {
   def clusterColumnsProperties(cols: Seq[String]): Map[String, String] =
     if (cols.isEmpty) Map.empty
     else Map(ClusterColumnsKey -> cols.mkString(","))
+
+  /** Build the property entries recording the CREATE-time classification
+    * metadata that REFRESH spans can reconstruct later without recompiling.
+    */
+  def refreshClassificationProperties(
+      compileRefreshTypeName: String,
+      refreshReason: String
+  ): Map[String, String] = {
+    val compile = Option(compileRefreshTypeName).map(_.trim).filter(_.nonEmpty).map(CompileRefreshTypeKey -> _).toMap
+    val reason  = Option(refreshReason).map(_.trim).filter(_.nonEmpty).map(RefreshReasonKey -> _).toMap
+    compile ++ reason
+  }
 
   /** Tier component for the compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative

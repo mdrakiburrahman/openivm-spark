@@ -22,17 +22,18 @@ final class OpenIvmExecutionSpan private[telemetry] (
 
   private val lock = new Object
 
-  private var sameMvLockWaitMs   = Option.empty[Long]
-  private var driverAdmissionMs  = Option.empty[Long]
-  private var compilerMs         = Option.empty[Long]
-  private var catalogMs          = Option.empty[Long]
-  private var rocksDbFlushMs     = Option.empty[Long]
-  private var rocksDbBackupMs    = Option.empty[Long]
-  private var completedAtEpochMs = Option.empty[Long]
-  private var completedAtNanos   = Option.empty[Long]
-  private var outcome            = Option.empty[String]
-  private var driverThread       = Option.empty[String]
-  private var emitted            = false
+  private var refreshClassification = OpenIvmExecutionSpan.RefreshClassification.empty
+  private var sameMvLockWaitMs      = Option.empty[Long]
+  private var driverAdmissionMs     = Option.empty[Long]
+  private var compilerMs            = Option.empty[Long]
+  private var catalogMs             = Option.empty[Long]
+  private var rocksDbFlushMs        = Option.empty[Long]
+  private var rocksDbBackupMs       = Option.empty[Long]
+  private var completedAtEpochMs    = Option.empty[Long]
+  private var completedAtNanos      = Option.empty[Long]
+  private var outcome               = Option.empty[String]
+  private var driverThread          = Option.empty[String]
+  private var emitted               = false
 
   private[telemetry] def matchesCommand(expectedView: String, expectedOperation: String): Boolean =
     lock.synchronized {
@@ -88,6 +89,21 @@ final class OpenIvmExecutionSpan private[telemetry] (
       rocksDbBackupMs = addDuration(rocksDbBackupMs, durationMs)
     }
 
+  def recordRefreshClassification(
+      compileRefreshType: Option[String] = None,
+      effectiveRefreshType: Option[String] = None,
+      refreshReason: Option[String] = None
+  ): Unit =
+    recordBeforeEmit {
+      refreshClassification = refreshClassification.merge(
+        OpenIvmExecutionSpan.RefreshClassification.fromOptions(
+          compileRefreshType = compileRefreshType,
+          effectiveRefreshType = effectiveRefreshType,
+          refreshReason = refreshReason
+        )
+      )
+    }
+
   def recordProfileStep(stepName: String, detail: String, durationMs: Long): Unit =
     if (enabled) {
       if (detail eq null) ()
@@ -135,6 +151,9 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 durationMs = TimeUnit.NANOSECONDS.toMillis(completedAtNanos.getOrElse(startedAtNanos) - startedAtNanos),
                 driverThread = driverThread.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultDriverThread)),
                 outcome = outcome.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultOutcome)),
+                compileRefreshType = refreshClassification.compileRefreshType,
+                effectiveRefreshType = refreshClassification.effectiveRefreshType,
+                refreshReason = refreshClassification.refreshReason,
                 sameMvLockWaitMs = sameMvLockWaitMs,
                 driverAdmissionWaitMs = driverAdmissionMs,
                 compilerMs = compilerMs,
@@ -154,6 +173,47 @@ final class OpenIvmExecutionSpan private[telemetry] (
 object OpenIvmExecutionSpan extends Logging {
 
   private final case class PendingDuration(durationMs: Long, observedAtNanos: Long)
+  private final case class RefreshClassification(
+      compileRefreshType: Option[String] = None,
+      effectiveRefreshType: Option[String] = None,
+      refreshReason: Option[String] = None
+  ) {
+    private def isAuthoritative: Boolean =
+      compileRefreshType.contains(CompileFailedRefreshType) || refreshReason.contains(CompileFailedReason)
+
+    def merge(incoming: RefreshClassification): RefreshClassification =
+      if (incoming == RefreshClassification.empty) this
+      else if (isAuthoritative && !incoming.isAuthoritative) this
+      else {
+        val preferred =
+          if (incoming.isAuthoritative && !isAuthoritative) incoming
+          else this
+        val fallback =
+          if (preferred eq this) incoming
+          else this
+        RefreshClassification(
+          compileRefreshType = preferred.compileRefreshType.orElse(fallback.compileRefreshType),
+          effectiveRefreshType = preferred.effectiveRefreshType.orElse(fallback.effectiveRefreshType),
+          refreshReason = preferred.refreshReason.orElse(fallback.refreshReason)
+        )
+      }
+  }
+
+  private object RefreshClassification {
+    val empty: RefreshClassification = RefreshClassification()
+
+    def fromOptions(
+        compileRefreshType: Option[String],
+        effectiveRefreshType: Option[String],
+        refreshReason: Option[String]
+    ): RefreshClassification =
+      RefreshClassification(
+        compileRefreshType = normalizeOption(compileRefreshType),
+        effectiveRefreshType = normalizeOption(effectiveRefreshType),
+        refreshReason = normalizeOption(refreshReason)
+      )
+  }
+
   private final case class PendingDurations(
       createDriverAdmission: Option[PendingDuration] = None,
       refreshDriverAdmission: Option[PendingDuration] = None
@@ -194,13 +254,15 @@ object OpenIvmExecutionSpan extends Logging {
     }
   }
 
-  private val Json              = new ObjectMapper()
-  private val current           = new ThreadLocal[OpenIvmExecutionSpan]()
-  private val pending           = new ThreadLocal[PendingDurations]()
-  private val RequestIdKeys     = Seq("openivm.request_id", "request_id", "requestId")
-  private val DbtNodeIdKeys     = Seq("openivm.node_id", "spark.jobGroup.id")
-  private val PendingTtlNanos   = TimeUnit.SECONDS.toNanos(30L)
-  private val LogPrefix: String = "OPENIVM_EXECUTION_SPAN "
+  private val Json                     = new ObjectMapper()
+  private val current                  = new ThreadLocal[OpenIvmExecutionSpan]()
+  private val pending                  = new ThreadLocal[PendingDurations]()
+  private val RequestIdKeys            = Seq("openivm.request_id", "request_id", "requestId")
+  private val DbtNodeIdKeys            = Seq("openivm.node_id", "spark.jobGroup.id")
+  private val PendingTtlNanos          = TimeUnit.SECONDS.toNanos(30L)
+  private val LogPrefix: String        = "OPENIVM_EXECUTION_SPAN "
+  private val CompileFailedRefreshType = "COMPILE_FAILED"
+  private val CompileFailedReason      = "compile_failed"
 
   val NoOp: OpenIvmExecutionSpan =
     new OpenIvmExecutionSpan("", "refresh", None, None, 0L, 0L, enabled = false)
@@ -245,6 +307,19 @@ object OpenIvmExecutionSpan extends Logging {
   def hasCurrentSpan: Boolean = current.get() != null
 
   def captureCurrent(): Option[OpenIvmExecutionSpan] = Option(current.get())
+
+  def recordActiveRefreshClassification(
+      compileRefreshType: Option[String] = None,
+      effectiveRefreshType: Option[String] = None,
+      refreshReason: Option[String] = None
+  ): Unit =
+    Option(current.get()).foreach(
+      _.recordRefreshClassification(
+        compileRefreshType = compileRefreshType,
+        effectiveRefreshType = effectiveRefreshType,
+        refreshReason = refreshReason
+      )
+    )
 
   def withCaptured[A](captured: Option[OpenIvmExecutionSpan])(body: => A): A = {
     val previous = Option(current.get())
@@ -322,6 +397,9 @@ object OpenIvmExecutionSpan extends Logging {
   private[telemetry] def normalizeString(value: String): String =
     Option(value).map(_.trim).getOrElse("")
 
+  private def normalizeOption(value: Option[String]): Option[String] =
+    value.map(normalizeString).filter(_.nonEmpty)
+
   private[telemetry] def correlationIdsFromLookups(
       localPropertyLookup: String => Option[String],
       mdcLookup: String => Option[String],
@@ -365,6 +443,9 @@ object OpenIvmExecutionSpan extends Logging {
       durationMs: Long,
       driverThread: String,
       outcome: String,
+      compileRefreshType: Option[String],
+      effectiveRefreshType: Option[String],
+      refreshReason: Option[String],
       sameMvLockWaitMs: Option[Long],
       driverAdmissionWaitMs: Option[Long],
       compilerMs: Option[Long],
@@ -382,6 +463,9 @@ object OpenIvmExecutionSpan extends Logging {
     fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
     fields.put("driver_thread", driverThread)
     fields.put("outcome", outcome)
+    compileRefreshType.foreach(fields.put("compile_refresh_type", _))
+    effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
+    refreshReason.foreach(fields.put("refresh_reason", _))
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
     compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))

@@ -746,11 +746,27 @@ private[commands] object MvCommandHelper {
 
   /** The effective refresh-type verdict for a materialized view. */
   final case class EffectiveClassification(
+      compileRefreshTypeName: String,
       refreshType: Int,
       refreshTypeName: String,
       reason: String,
       emitsCascadeViewDelta: Boolean
-  )
+  ) {
+    def isDemotionToFullRefresh: Boolean =
+      refreshType == RefreshTypeCode.FullRefresh && compileRefreshTypeName != refreshTypeName
+  }
+
+  def authoritativeFullRefreshClassification(
+      compileRefreshTypeName: String,
+      refreshReason: String
+  ): EffectiveClassification =
+    EffectiveClassification(
+      compileRefreshTypeName = compileRefreshTypeName,
+      refreshType = RefreshTypeCode.FullRefresh,
+      refreshTypeName = "FULL_REFRESH",
+      reason = refreshReason,
+      emitsCascadeViewDelta = false
+    )
 
   /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
     * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
@@ -879,40 +895,48 @@ private[commands] object MvCommandHelper {
       simpleProjectionHasDataApply: Boolean,
       nonCascadeUpstreamReason: Option[String],
       rawHavingPred: Option[String],
-      aggregateHavingDataColumns: Option[Set[String]]
-  ): EffectiveClassification = {
-    val (effectiveRefreshType, reason) = {
-      if (topKViewSpec.detected && topKViewSpec.suffixSql.isEmpty)
-        (RefreshTypeCode.FullRefresh, "top_k_unsupported")
-      else if (!simpleProjectionHasDataApply)
-        (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
-      else if (nonCascadeUpstreamReason.nonEmpty)
-        (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason.get}")
-      else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
-        (compiled.refreshType, "window_partition_kept")
-      else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
-        (compiled.refreshType, "group_recompute_kept")
-      else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
-        (RefreshTypeCode.FullRefresh, "having_pred_empty")
-      else if (
-        compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred
-          .exists(pred => aggregateHavingDataColumns.forall(cols => !havingPredicateIsSafe(pred, cols)))
+      aggregateHavingDataColumns: Option[Set[String]],
+      authoritativeClassification: Option[EffectiveClassification] = None
+  ): EffectiveClassification =
+    authoritativeClassification.getOrElse {
+      val (effectiveRefreshType, reason) = {
+        if (topKViewSpec.detected && topKViewSpec.suffixSql.isEmpty)
+          (RefreshTypeCode.FullRefresh, "top_k_unsupported")
+        else if (!simpleProjectionHasDataApply)
+          (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
+        else if (nonCascadeUpstreamReason.nonEmpty)
+          (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason.get}")
+        else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
+          (compiled.refreshType, "window_partition_kept")
+        else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
+          (compiled.refreshType, "group_recompute_kept")
+        else if (compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred.isEmpty)
+          (RefreshTypeCode.FullRefresh, "having_pred_empty")
+        else if (
+          compiled.refreshType == RefreshTypeCode.AggregateHaving && rawHavingPred
+            .exists(pred => aggregateHavingDataColumns.forall(cols => !havingPredicateIsSafe(pred, cols)))
+        )
+          (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
+        else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName))
+          (RefreshTypeCode.FullRefresh, "no_real_delta")
+        else if (topKViewSpec.detected) (compiled.refreshType, "top_k_kept")
+        else (compiled.refreshType, "kept")
+      }
+      val effectiveRefreshTypeName =
+        if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
+        else compiled.refreshTypeName
+      val emitsCascadeViewDelta =
+        !topKViewSpec.detected &&
+          RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+          SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
+      EffectiveClassification(
+        compileRefreshTypeName = compiled.refreshTypeName,
+        refreshType = effectiveRefreshType,
+        refreshTypeName = effectiveRefreshTypeName,
+        reason = reason,
+        emitsCascadeViewDelta = emitsCascadeViewDelta
       )
-        (RefreshTypeCode.FullRefresh, "having_pred_hidden_agg")
-      else if (!SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName))
-        (RefreshTypeCode.FullRefresh, "no_real_delta")
-      else if (topKViewSpec.detected) (compiled.refreshType, "top_k_kept")
-      else (compiled.refreshType, "kept")
     }
-    val effectiveRefreshTypeName =
-      if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
-      else compiled.refreshTypeName
-    val emitsCascadeViewDelta =
-      !topKViewSpec.detected &&
-        RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
-        SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
-    EffectiveClassification(effectiveRefreshType, effectiveRefreshTypeName, reason, emitsCascadeViewDelta)
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,7 +1089,8 @@ case class CreateMaterializedViewCommand(
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
       )
     }
-    val compiler = OpenIvmCompilers.forSession(spark)
+    val compiler                    = OpenIvmCompilers.forSession(spark)
+    var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
       "create_compile_classification",
       s"sources=${qualNames.size};group_cols=${groupKeys.size}"
@@ -1082,6 +1107,17 @@ case class CreateMaterializedViewCommand(
         )
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
+          val compileFailedClassification =
+            authoritativeFullRefreshClassification(
+              compileRefreshTypeName = "COMPILE_FAILED",
+              refreshReason = "compile_failed"
+            )
+          authoritativeClassification = Some(compileFailedClassification)
+          OpenIvmExecutionSpan.recordActiveRefreshClassification(
+            compileRefreshType = Some(compileFailedClassification.compileRefreshTypeName),
+            effectiveRefreshType = Some(compileFailedClassification.refreshTypeName),
+            refreshReason = Some(compileFailedClassification.reason)
+          )
           // ERROR-level so the demotion is visible in the dbt-server / Livy
           // container log. Structured shape — operator can grep on
           // `[openivm-mv]` to enumerate all demotions for a run.
@@ -1223,22 +1259,28 @@ case class CreateMaterializedViewCommand(
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
       nonCascadeUpstreamReason = nonCascadeUpstreamReason,
       rawHavingPred = rawHavingPred,
-      aggregateHavingDataColumns = aggregateHavingDataColumns
+      aggregateHavingDataColumns = aggregateHavingDataColumns,
+      authoritativeClassification = authoritativeClassification
     )
     val effectiveRefreshType     = classification.refreshType
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
     val emitsCascadeViewDelta    = classification.emitsCascadeViewDelta
+    OpenIvmExecutionSpan.recordActiveRefreshClassification(
+      compileRefreshType = Some(classification.compileRefreshTypeName),
+      effectiveRefreshType = Some(effectiveRefreshTypeName),
+      refreshReason = Some(classifyReason)
+    )
     // `sourceIsMv`/`distinctUpstreamMvCount` are computed for logging visibility
     // only; the demotion is driven by the shared classifier above.
     val _ = (sourceIsMv, distinctUpstreamMvCount)
 
     {
       val msg =
-        s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${compiled.refreshTypeName}' " +
+        s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
           s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
           s"emits_cascade_view_delta='$emitsCascadeViewDelta'"
-      if (effectiveRefreshType == RefreshTypeCode.FullRefresh && compiled.refreshType != RefreshTypeCode.FullRefresh)
+      if (classification.isDemotionToFullRefresh)
         logError(msg)
       else
         logInfo(msg)
@@ -1267,6 +1309,11 @@ case class CreateMaterializedViewCommand(
       topKViewSuffix.map(MvMetadata.BackingViewSuffixKey -> _).toMap
     val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
+    val classificationProps =
+      MvMetadata.refreshClassificationProperties(
+        compileRefreshTypeName = classification.compileRefreshTypeName,
+        refreshReason = classifyReason
+      )
 
     // Fingerprint the current source schemas + every upstream MV's identity
     // hash. Captures schema drift AND upstream-body drift (DROP + recreate
@@ -1313,7 +1360,7 @@ case class CreateMaterializedViewCommand(
     val userProps      = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ compiledProps ++ watermarkProps
+        queryShapeProps ++ classificationProps ++ compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -1665,6 +1712,16 @@ case class RefreshMaterializedViewCommand(
         )
       }
     refreshTypeForFailure = meta.refreshTypeName
+    OpenIvmExecutionSpan.recordActiveRefreshClassification(
+      compileRefreshType =
+        meta.properties
+          .get(MvMetadata.CompileRefreshTypeKey)
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .orElse(Option(meta.refreshTypeName).map(_.trim).filter(_.nonEmpty)),
+      effectiveRefreshType = Option(meta.refreshTypeName).map(_.trim).filter(_.nonEmpty),
+      refreshReason = meta.properties.get(MvMetadata.RefreshReasonKey).map(_.trim).filter(_.nonEmpty)
+    )
 
     val viewNameStr      = metaName(name)
     val propagation      = ChangePropagationFactory.forSession(spark)

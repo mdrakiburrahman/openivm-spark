@@ -82,6 +82,11 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
           requestId = Some("req-123"),
           dbtNodeId = Some("model.sales_mv")
         )
+        span.recordRefreshClassification(
+          compileRefreshType = Some("AGGREGATE_GROUP"),
+          effectiveRefreshType = Some("AGGREGATE_GROUP"),
+          refreshReason = Some("kept")
+        )
         span.recordProfileStep("acquire_locks", "thread=driver-1", 3L)
         OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(7L))
         OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(13L))
@@ -102,6 +107,9 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("operation").asText() shouldBe "refresh"
       payload.get("driver_thread").asText() shouldBe "driver-1"
       payload.get("outcome").asText() shouldBe "refresh_executed"
+      payload.get("compile_refresh_type").asText() shouldBe "AGGREGATE_GROUP"
+      payload.get("effective_refresh_type").asText() shouldBe "AGGREGATE_GROUP"
+      payload.get("refresh_reason").asText() shouldBe "kept"
       payload.get("same_mv_lock_wait_ms").asLong() shouldBe 3L
       payload.get("driver_admission_wait_ms").asLong() shouldBe 7L
       payload.get("compiler_ms").asLong() shouldBe 13L
@@ -131,6 +139,36 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("outcome").asText() shouldBe "failed_before_end"
       payload.get("driver_admission_wait_ms").asLong() shouldBe 2L
       payload.has("compiler_ms") shouldBe false
+    }
+
+    it("keeps compile_failed classification sticky against later generic fallbacks") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.sticky_mv", "create")
+        span.recordRefreshClassification(
+          compileRefreshType = Some("FULL_REFRESH"),
+          effectiveRefreshType = Some("FULL_REFRESH"),
+          refreshReason = Some("no_real_delta")
+        )
+        span.recordRefreshClassification(
+          compileRefreshType = Some("COMPILE_FAILED"),
+          effectiveRefreshType = Some("FULL_REFRESH"),
+          refreshReason = Some("compile_failed")
+        )
+        span.recordRefreshClassification(
+          compileRefreshType = Some("FULL_REFRESH"),
+          effectiveRefreshType = Some("FULL_REFRESH"),
+          refreshReason = Some("no_real_delta")
+        )
+        span.complete("create_failed", "driver-sticky")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.get("compile_refresh_type").asText() shouldBe "COMPILE_FAILED"
+      payload.get("effective_refresh_type").asText() shouldBe "FULL_REFRESH"
+      payload.get("refresh_reason").asText() shouldBe "compile_failed"
     }
 
     it("reuses the same command span and does not re-emit for late async backup timing") {

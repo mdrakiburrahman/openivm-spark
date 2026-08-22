@@ -189,9 +189,15 @@ The JSON fields are stable and intentionally low-cardinality:
 `request_id` (when present from Spark local properties / MDC),
 `dbt_node_id` (from `openivm.node_id`, else `spark.jobGroup.id`, including MDC),
 `materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
-`duration_ms`, `driver_thread`, `outcome`, plus optional
+`duration_ms`, `driver_thread`, `outcome`, optional
+`compile_refresh_type`, `effective_refresh_type`, and `refresh_reason`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
 `catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`.
+CREATE records the authoritative classification once it is known. REFRESH reads
+the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
+runs still emit the same three fields without recompiling. Legacy metadata rows
+that pre-date these properties fall back to `effective_refresh_type=refreshTypeName`,
+set `compile_refresh_type` to that same value, and omit `refresh_reason`.
 `rocksdb_backup_ms` is best-effort only: async state backup may finish after the
 primary span is emitted, and that late completion does NOT trigger a duplicate
 `OPENIVM_EXECUTION_SPAN` line.
