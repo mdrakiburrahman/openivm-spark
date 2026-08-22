@@ -1,12 +1,14 @@
 package org.openivm.spark.plugin.metrics
 
+import com.codahale.metrics.MetricRegistry
+
 import scala.util.control.NonFatal
 
 import org.apache.spark.SparkContext
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
 import org.apache.spark.internal.Logging
 import org.openivm.spark.plugin.metrics.conf.OpenIvmMetricsConf
-import org.openivm.spark.telemetry.metrics.{OpenIvmMetricSet, OpenIvmMetrics}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** SparkPlugin that exports OpenIVM metrics through Spark's native registry. */
 class OpenIvmMetricsPlugin extends SparkPlugin with Logging {
@@ -29,9 +31,11 @@ class OpenIvmMetricsPlugin extends SparkPlugin with Logging {
 
 object OpenIvmMetricsPlugin extends Logging {
   def registerMetrics(ctx: PluginContext): Unit =
+    registerMetrics(ctx.metricRegistry)
+
+  def registerMetrics(registry: MetricRegistry): Unit =
     try {
-      OpenIvmMetrics.bindRegistry(ctx.metricRegistry)
-      ctx.metricRegistry.registerAll(new OpenIvmMetricSet)
+      OpenIvmMetrics.bindRegistry(registry)
       logInfo("registered OpenIVM metrics")
     } catch {
       case NonFatal(e) => logWarning("failed to register OpenIVM metrics", e)

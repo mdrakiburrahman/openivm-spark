@@ -3,10 +3,11 @@ package org.openivm.spark.common.rocksdb
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.slf4j.LoggerFactory
 
 import java.io.File
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, Executors}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.util.control.NonFatal
 
@@ -34,6 +35,20 @@ object OpenIvmStateSync {
   private final class BackupState {
     val requested = new AtomicBoolean(false)
     val running   = new AtomicBoolean(false)
+    private val spans = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
+
+    def capture(span: Option[OpenIvmExecutionSpan]): Unit =
+      span.foreach(spans.add)
+
+    def drainSpans(): Seq[OpenIvmExecutionSpan] = {
+      val drained = scala.collection.mutable.ArrayBuffer.empty[OpenIvmExecutionSpan]
+      var span    = spans.poll()
+      while (span != null) {
+        drained += span
+        span = spans.poll()
+      }
+      drained.toSeq
+    }
   }
 
   private val restoreStates = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
@@ -100,6 +115,7 @@ object OpenIvmStateSync {
       )
     val key   = stateSyncKey(spark, uri)
     val state = backupStateFor(key)
+    state.capture(OpenIvmExecutionSpan.captureCurrent())
     state.requested.set(true)
     scheduleBackupIfNeeded(state, spark, uri)
   }
@@ -114,8 +130,14 @@ object OpenIvmStateSync {
       var continue = true
       while (continue) {
         state.requested.set(false)
+        val spans   = state.drainSpans()
+        val started = System.nanoTime()
         try backupNow(spark, uri)
         catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
+        finally {
+          val durationMs = (System.nanoTime() - started) / 1000000L
+          spans.foreach(_.recordRocksDbBackup(durationMs))
+        }
         continue = state.requested.get()
       }
     } finally {
@@ -132,7 +154,13 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    backupNow(spark, uri)
+    val span    = OpenIvmExecutionSpan.captureCurrent()
+    val started = System.nanoTime()
+    try backupNow(spark, uri)
+    finally {
+      val durationMs = (System.nanoTime() - started) / 1000000L
+      span.foreach(_.recordRocksDbBackup(durationMs))
+    }
   }
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {

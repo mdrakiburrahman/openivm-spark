@@ -3,6 +3,7 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -33,7 +34,8 @@ final class RefreshProfile private (
     private val active: Boolean,
     private val rocksdbTelemetry: Option[OpenIvmRocksDBTelemetry.Session],
     private val spanStartEpochMs: Long,
-    private val spanStartNanos: Long
+    private val spanStartNanos: Long,
+    private val executionSpan: OpenIvmExecutionSpan
 ) {
 
   private val stepOrder     = new AtomicInteger(0)
@@ -50,19 +52,23 @@ final class RefreshProfile private (
     * path only measures when Spark-native metrics are enabled.
     */
   def timeStep[A](stepName: String, detail: String = "")(body: => A): A = {
-    if (!active && !OpenIvmMetrics.enabled) return body
+    val needsTiming = active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName)
+    if (!needsTiming) return body
     val t0 = System.nanoTime()
     try body
     finally {
       val elapsedNanos = System.nanoTime() - t0
       val elapsedMs    = elapsedNanos / 1000000L
       if (active) appendStep(stepName, detail, elapsedMs)
-      else
+      else {
+        if (OpenIvmExecutionSpan.needsProfileStepTiming(stepName))
+          executionSpan.recordProfileStep(stepName, detail, elapsedMs)
         OpenIvmMetrics.recordLifecyclePhase(
           if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
           stepName,
           elapsedNanos
         )
+      }
     }
   }
 
@@ -72,6 +78,7 @@ final class RefreshProfile private (
     * outside the lock body).
     */
   def appendStep(stepName: String, detail: String, durationMs: Long): Unit = {
+    executionSpan.recordProfileStep(stepName, detail, durationMs)
     OpenIvmMetrics.recordLifecyclePhase(
       if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
       stepName,
@@ -91,13 +98,16 @@ final class RefreshProfile private (
 
   /** Record one wall-clock span suitable for a trace/Gantt view. */
   def completeSpan(outcome: String, threadName: String): Unit = synchronized {
-    if (!active || spanCompleted) return
+    if (spanCompleted) return
     val endEpochMs = System.currentTimeMillis()
-    appendStep(
-      "query_span",
-      s"start_epoch_ms=$spanStartEpochMs;end_epoch_ms=$endEpochMs;thread=$threadName;outcome=$outcome",
-      (System.nanoTime() - spanStartNanos) / 1000000L
-    )
+    if (active) {
+      appendStep(
+        "query_span",
+        s"start_epoch_ms=$spanStartEpochMs;end_epoch_ms=$endEpochMs;thread=$threadName;outcome=$outcome",
+        (System.nanoTime() - spanStartNanos) / 1000000L
+      )
+    }
+    executionSpan.complete(outcome, threadName)
     spanCompleted = true
   }
 
@@ -106,42 +116,46 @@ final class RefreshProfile private (
     * flush.
     */
   def flush(): Unit = {
-    if (!active) return
     try {
       completeSpan("failed_before_end", Thread.currentThread().getName)
-      rocksdbTelemetry.toSeq.flatMap(_.finish()).foreach { summary =>
-        appendStep(
-          stepName = "rocksdb_operation",
-          detail = Seq(
-            s"db_scope=${summary.dbScope}",
-            s"operation=${summary.operation}",
-            s"multi_process=${summary.multiProcess}",
-            s"operation_count=${summary.operationCount}",
-            s"failed_count=${summary.failedCount}",
-            s"total_ns=${summary.totalNanos}",
-            s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
-            s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
-            s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
-            s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
-            s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
-            s"native_open_ns=${summary.nativeOpenNanos}",
-            s"native_close_ns=${summary.nativeCloseNanos}",
-            s"body_ns=${summary.bodyNanos}"
-          ).mkString(";"),
-          durationMs = summary.totalNanos / 1000000L
-        )
-      }
-      if (buffer.nonEmpty) {
-        val rows = buffer.toVector
-        buffer.clear()
-        try RefreshProfileCatalog.record(spark, rows)
-        catch {
-          case t: Throwable =>
-            // Telemetry must never fail the refresh — log the error and move on.
-            RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
+      if (active) {
+        rocksdbTelemetry.toSeq.flatMap(_.finish()).foreach { summary =>
+          appendStep(
+            stepName = "rocksdb_operation",
+            detail = Seq(
+              s"db_scope=${summary.dbScope}",
+              s"operation=${summary.operation}",
+              s"multi_process=${summary.multiProcess}",
+              s"operation_count=${summary.operationCount}",
+              s"failed_count=${summary.failedCount}",
+              s"total_ns=${summary.totalNanos}",
+              s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
+              s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
+              s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
+              s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
+              s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
+              s"native_open_ns=${summary.nativeOpenNanos}",
+              s"native_close_ns=${summary.nativeCloseNanos}",
+              s"body_ns=${summary.bodyNanos}"
+            ).mkString(";"),
+            durationMs = summary.totalNanos / 1000000L
+          )
+        }
+        if (buffer.nonEmpty) {
+          val rows = buffer.toVector
+          buffer.clear()
+          try RefreshProfileCatalog.record(spark, rows)
+          catch {
+            case t: Throwable =>
+              // Telemetry must never fail the refresh — log the error and move on.
+              RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
+          }
         }
       }
-    } finally RefreshProfile.clearActive(this)
+    } finally {
+      executionSpan.emitIfNeeded("failed_before_end", Thread.currentThread().getName)
+      RefreshProfile.clearActive(this)
+    }
   }
 }
 
@@ -149,8 +163,10 @@ object RefreshProfile {
 
   private val current = new ThreadLocal[RefreshProfile]()
 
-  private[commands] def clearActive(profile: RefreshProfile): Unit =
+  private[commands] def clearActive(profile: RefreshProfile): Unit = {
     if (current.get() eq profile) current.remove()
+    OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
+  }
 
   def flushActive(): Unit = Option(current.get()).foreach(_.flush())
 
@@ -176,6 +192,14 @@ object RefreshProfile {
       case Mode.Refresh => s"_${System.nanoTime()}"
       case Mode.Create  => s"_create_mv_${System.nanoTime()}"
     }
+    val executionSpan = OpenIvmExecutionSpan.start(
+      spark,
+      viewName,
+      mode match {
+        case Mode.Create  => "create"
+        case Mode.Refresh => "refresh"
+      }
+    )
     val profile = new RefreshProfile(
       spark,
       viewName + suffix,
@@ -184,15 +208,26 @@ object RefreshProfile {
       active,
       rocksdbTelemetry,
       System.currentTimeMillis(),
-      System.nanoTime()
+      System.nanoTime(),
+      executionSpan
     )
-    if (active) current.set(profile)
+    current.set(profile)
     profile
   }
 
   /** Inactive instance for code paths that never opt into profiling. */
   val NoOp: RefreshProfile =
-    new RefreshProfile(null, "", "", Mode.Refresh, active = false, rocksdbTelemetry = None, 0L, 0L)
+    new RefreshProfile(
+      null,
+      "",
+      "",
+      Mode.Refresh,
+      active = false,
+      rocksdbTelemetry = None,
+      0L,
+      0L,
+      OpenIvmExecutionSpan.NoOp
+    )
 }
 
 /** Side-channel for `RefreshProfile` to emit its own failure diagnostics

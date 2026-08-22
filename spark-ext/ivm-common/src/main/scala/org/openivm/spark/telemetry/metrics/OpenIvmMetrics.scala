@@ -2,19 +2,25 @@ package org.openivm.spark.telemetry.metrics
 
 import com.codahale.metrics.{Counter, Gauge, Histogram, Metric, MetricRegistry, MetricSet, Timer}
 import org.apache.spark.internal.Logging
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 
 import java.util.HashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import scala.collection.JavaConverters._
 import scala.collection.concurrent.TrieMap
 import scala.util.control.NonFatal
 
 /** Process-wide OpenIVM metrics backed by Spark's Dropwizard registry. */
 object OpenIvmMetrics extends Logging {
 
-  private val metrics       = TrieMap.empty[String, Metric]
-  @volatile private var reg = Option.empty[MetricRegistry]
-  private val enabledFlag   = new AtomicBoolean(true)
+  private val metrics        = TrieMap.empty[String, Metric]
+  private val metricInitLock = new Object
+  private val registryNames =
+    java.util.Collections.synchronizedMap(
+      new java.util.WeakHashMap[MetricRegistry, java.util.Set[String]]()
+    )
+  private val enabledFlag = new AtomicBoolean(true)
 
   val OpenDbHandles: AtomicInteger      = atomicIntegerGauge("rocksdb.registry.open_handles")
   val RefreshInflight: AtomicInteger    = atomicIntegerGauge("refresh.inflight")
@@ -43,7 +49,9 @@ object OpenIvmMetrics extends Logging {
 
   /** Bind the Spark metrics registry for dynamic metrics created after plugin init. */
   def bindRegistry(registry: MetricRegistry): Unit = {
-    reg = Some(registry)
+    if (registry == null) return
+    registeredNamesFor(registry)
+    metrics.foreach { case (name, metric) => registerMetric(registry, name, metric) }
   }
 
   /** Enable or disable hot-path metric updates. */
@@ -66,10 +74,13 @@ object OpenIvmMetrics extends Logging {
   def updateHistogram(name: String, value: Long): Unit = if (enabled) histogram(name).update(value)
 
   def updateTimer(name: String, nanos: Long): Unit =
-    if (enabled && nanos >= 0L) timer(name).update(nanos, TimeUnit.NANOSECONDS)
+    if (nanos >= 0L) {
+      OpenIvmExecutionSpan.observeTimer(name, nanos)
+      if (enabled) timer(name).update(nanos, TimeUnit.NANOSECONDS)
+    }
 
   def time[A](name: String)(body: => A): A = {
-    if (!enabled) return body
+    if (!enabled && !OpenIvmExecutionSpan.hasCurrentSpan) return body
     val started = System.nanoTime()
     try body
     finally updateTimer(name, System.nanoTime() - started)
@@ -105,6 +116,8 @@ object OpenIvmMetrics extends Logging {
   }
 
   def recordRocksDbCommit(dbScope: String, nanos: Long, keys: Long, bytes: Long, sstCount: Int): Unit = {
+    if (!enabled && !OpenIvmExecutionSpan.hasCurrentSpan) return
+    OpenIvmExecutionSpan.observeRocksDbCommit(nanos)
     if (!enabled) return
     val prefix = s"rocksdb.scope.${sanitize(dbScope)}.commit_batch"
     updateTimer(s"$prefix.latency", nanos)
@@ -208,18 +221,54 @@ object OpenIvmMetrics extends Logging {
 
   private def metric(name: String, create: => Metric): Metric = {
     val safeName = sanitizePath(name)
-    metrics.getOrElseUpdate(
-      safeName, {
-        val created = create
-        reg.foreach(registerDynamic(safeName, created, _))
-        created
+    metrics.get(safeName).getOrElse {
+      metricInitLock.synchronized {
+        metrics.getOrElseUpdate(
+          safeName, {
+            val created = create
+            registryNames.synchronized {
+              registryNames.keySet().asScala.foreach(registerMetric(_, safeName, created))
+            }
+            created
+          }
+        )
       }
-    )
+    }
   }
 
-  private def registerDynamic(name: String, metric: Metric, registry: MetricRegistry): Unit = {
-    try registry.register(MetricRegistry.name("openivm", name), metric)
-    catch { case NonFatal(_) => () }
+  private def registeredNamesFor(registry: MetricRegistry): java.util.Set[String] =
+    registryNames.synchronized {
+      val existing = registryNames.get(registry)
+      if (existing != null) existing
+      else {
+        val created =
+          java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]())
+        registryNames.put(registry, created)
+        created
+      }
+    }
+
+  private def registerMetric(registry: MetricRegistry, name: String, metric: Metric): Unit = {
+    val fullName = MetricRegistry.name("openivm", name)
+    if (registeredNamesFor(registry).add(fullName)) {
+      try registry.register(fullName, metric)
+      catch { case NonFatal(_) => () }
+    }
+  }
+
+  private[metrics] def clearRegistriesForTesting(): Unit =
+    registryNames.synchronized {
+      registryNames.clear()
+    }
+
+  private[metrics] def boundRegistryCountForTesting(): Int =
+    registryNames.synchronized {
+      registryNames.keySet().size()
+    }
+
+  private[metrics] def hasBoundMetricForTesting(registry: MetricRegistry, fullName: String): Boolean = {
+    val names = registeredNamesFor(registry)
+    names.contains(fullName)
   }
 
   private def precreateKnownMetrics(): Unit = {

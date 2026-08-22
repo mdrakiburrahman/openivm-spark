@@ -183,6 +183,15 @@ Export profile rows as JSON or JSON Lines and run
 `python3 tools/openivm_trace.py spans.jsonl openivm-trace.json`; load the result
 in Chrome tracing or Perfetto to inspect overlap visually.
 
+Independently of the profile gate, the driver now emits a single-line
+`OPENIVM_EXECUTION_SPAN {json}` record for each CREATE / REFRESH lifecycle.
+The JSON fields are stable and intentionally low-cardinality:
+`request_id` (when present from Spark local properties / MDC),
+`materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
+`duration_ms`, `driver_thread`, `outcome`, plus optional
+`same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
+`catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`.
+
 The profile complements Spark event metrics. Use event metrics for records,
 files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.
 

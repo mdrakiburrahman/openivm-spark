@@ -1,0 +1,345 @@
+package org.openivm.spark.telemetry
+
+import com.fasterxml.jackson.databind.ObjectMapper
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.SparkSession
+import org.slf4j.MDC
+
+import java.time.Instant
+import java.util.LinkedHashMap
+import java.util.concurrent.TimeUnit
+
+/** Structured one-line execution-span contract for CREATE / REFRESH MV work. */
+final class OpenIvmExecutionSpan private[telemetry] (
+    val materializedView: String,
+    val operation: String,
+    private val requestId: Option[String],
+    private val startedAtEpochMs: Long,
+    private val startedAtNanos: Long,
+    private val enabled: Boolean
+) {
+
+  private val lock = new Object
+
+  private var sameMvLockWaitMs   = Option.empty[Long]
+  private var driverAdmissionMs  = Option.empty[Long]
+  private var compilerMs         = Option.empty[Long]
+  private var catalogMs          = Option.empty[Long]
+  private var rocksDbFlushMs     = Option.empty[Long]
+  private var rocksDbBackupMs    = Option.empty[Long]
+  private var completedAtEpochMs = Option.empty[Long]
+  private var completedAtNanos   = Option.empty[Long]
+  private var outcome            = Option.empty[String]
+  private var driverThread       = Option.empty[String]
+  private var emitted            = false
+
+  private def addDuration(current: Option[Long], deltaMs: Long): Option[Long] =
+    Some(current.getOrElse(0L) + math.max(0L, deltaMs))
+
+  private def recordBeforeComplete(update: => Unit): Unit =
+    if (enabled) {
+      lock.synchronized {
+        if (completedAtNanos.isEmpty) update
+      }
+    }
+
+  private def recordBeforeEmit(update: => Unit): Unit =
+    if (enabled) {
+      lock.synchronized {
+        if (!emitted) update
+      }
+    }
+
+  def recordSameMvLockWait(durationMs: Long): Unit =
+    recordBeforeComplete {
+      sameMvLockWaitMs = addDuration(sameMvLockWaitMs, durationMs)
+    }
+
+  def recordDriverAdmissionWait(durationMs: Long): Unit =
+    recordBeforeComplete {
+      driverAdmissionMs = addDuration(driverAdmissionMs, durationMs)
+    }
+
+  def recordCompiler(durationMs: Long): Unit =
+    recordBeforeComplete {
+      compilerMs = addDuration(compilerMs, durationMs)
+    }
+
+  def recordCatalog(durationMs: Long): Unit =
+    recordBeforeComplete {
+      catalogMs = addDuration(catalogMs, durationMs)
+    }
+
+  def recordRocksDbFlush(durationMs: Long): Unit =
+    recordBeforeComplete {
+      rocksDbFlushMs = addDuration(rocksDbFlushMs, durationMs)
+    }
+
+  def recordRocksDbBackup(durationMs: Long): Unit =
+    recordBeforeEmit {
+      rocksDbBackupMs = addDuration(rocksDbBackupMs, durationMs)
+    }
+
+  def recordProfileStep(stepName: String, detail: String, durationMs: Long): Unit =
+    if (enabled) {
+      if (detail eq null) ()
+      stepName match {
+        case "acquire_locks"         => recordSameMvLockWait(durationMs)
+        case "create_catalog_lookup" => recordCatalog(durationMs)
+        case _                       => ()
+      }
+    }
+
+  def complete(finalOutcome: String, finalDriverThread: String): Unit =
+    if (enabled) {
+      lock.synchronized {
+        if (completedAtNanos.isEmpty) {
+          completedAtEpochMs = Some(System.currentTimeMillis())
+          completedAtNanos = Some(System.nanoTime())
+          outcome = Some(OpenIvmExecutionSpan.normalizeString(finalOutcome))
+          driverThread = Some(OpenIvmExecutionSpan.normalizeString(finalDriverThread))
+        }
+      }
+    }
+
+  def emitIfNeeded(defaultOutcome: String, defaultDriverThread: String): Unit = {
+    val payload =
+      if (!enabled) None
+      else {
+        lock.synchronized {
+          if (emitted) None
+          else {
+            if (completedAtNanos.isEmpty) {
+              completedAtEpochMs = Some(System.currentTimeMillis())
+              completedAtNanos = Some(System.nanoTime())
+              outcome = Some(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
+              driverThread = Some(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
+            }
+            emitted = true
+            Some(
+              OpenIvmExecutionSpan.renderJson(
+                requestId = requestId,
+                materializedView = materializedView,
+                operation = operation,
+                startedAtEpochMs = startedAtEpochMs,
+                completedAtEpochMs = completedAtEpochMs.getOrElse(startedAtEpochMs),
+                durationMs = TimeUnit.NANOSECONDS.toMillis(completedAtNanos.getOrElse(startedAtNanos) - startedAtNanos),
+                driverThread = driverThread.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultDriverThread)),
+                outcome = outcome.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultOutcome)),
+                sameMvLockWaitMs = sameMvLockWaitMs,
+                driverAdmissionWaitMs = driverAdmissionMs,
+                compilerMs = compilerMs,
+                catalogMs = catalogMs,
+                rocksDbFlushMs = rocksDbFlushMs,
+                rocksDbBackupMs = rocksDbBackupMs
+              )
+            )
+          }
+        }
+      }
+
+    payload.foreach(OpenIvmExecutionSpan.logSpan)
+  }
+}
+
+object OpenIvmExecutionSpan extends Logging {
+
+  private final case class PendingDuration(durationMs: Long, observedAtNanos: Long)
+  private final case class PendingDurations(
+      createDriverAdmission: Option[PendingDuration] = None,
+      refreshDriverAdmission: Option[PendingDuration] = None
+  ) {
+    def record(operation: String, durationMs: Long, observedAtNanos: Long): PendingDurations = {
+      def merge(current: Option[PendingDuration]): Option[PendingDuration] =
+        Some(
+          PendingDuration(
+            current.fold(0L)(_.durationMs) + math.max(0L, durationMs),
+            observedAtNanos
+          )
+        )
+
+      operation match {
+        case "create"  => copy(createDriverAdmission = merge(createDriverAdmission))
+        case "refresh" => copy(refreshDriverAdmission = merge(refreshDriverAdmission))
+        case _         => this
+      }
+    }
+
+    def consume(operation: String, nowNanos: Long): (Option[Long], PendingDurations) = {
+      def take(current: Option[PendingDuration]): (Option[Long], Option[PendingDuration]) =
+        current match {
+          case Some(value) if nowNanos - value.observedAtNanos <= PendingTtlNanos => (Some(value.durationMs), None)
+          case Some(_)                                                            => (None, None)
+          case None                                                               => (None, None)
+        }
+
+      operation match {
+        case "create" =>
+          val (duration, nextCreate) = take(createDriverAdmission)
+          duration -> copy(createDriverAdmission = nextCreate)
+        case "refresh" =>
+          val (duration, nextRefresh) = take(refreshDriverAdmission)
+          duration -> copy(refreshDriverAdmission = nextRefresh)
+        case _ => None -> this
+      }
+    }
+  }
+
+  private val Json              = new ObjectMapper()
+  private val current           = new ThreadLocal[OpenIvmExecutionSpan]()
+  private val pending           = new ThreadLocal[PendingDurations]()
+  private val RequestIdKeys     = Seq("openivm.request_id", "request_id", "requestId")
+  private val PendingTtlNanos   = TimeUnit.SECONDS.toNanos(30L)
+  private val LogPrefix: String = "OPENIVM_EXECUTION_SPAN "
+
+  val NoOp: OpenIvmExecutionSpan =
+    new OpenIvmExecutionSpan("", "refresh", None, 0L, 0L, enabled = false)
+
+  def start(spark: SparkSession, materializedView: String, operation: String): OpenIvmExecutionSpan =
+    start(materializedView, operation, requestIdFrom(spark))
+
+  def start(materializedView: String, operation: String, requestId: Option[String] = None): OpenIvmExecutionSpan = {
+    val nowEpochMs = System.currentTimeMillis()
+    val nowNanos   = System.nanoTime()
+    val span = new OpenIvmExecutionSpan(
+      materializedView = normalizeString(materializedView),
+      operation = normalizeOperation(operation),
+      requestId = requestId.map(normalizeString).filter(_.nonEmpty),
+      startedAtEpochMs = nowEpochMs,
+      startedAtNanos = nowNanos,
+      enabled = true
+    )
+    consumePending(span, nowNanos)
+    current.set(span)
+    span
+  }
+
+  def hasCurrentSpan: Boolean = current.get() != null
+
+  def captureCurrent(): Option[OpenIvmExecutionSpan] = Option(current.get())
+
+  def withCaptured[A](captured: Option[OpenIvmExecutionSpan])(body: => A): A = {
+    val previous = Option(current.get())
+    captured match {
+      case Some(span) => current.set(span)
+      case None       => current.remove()
+    }
+    try body
+    finally {
+      previous match {
+        case Some(span) => current.set(span)
+        case None       => current.remove()
+      }
+    }
+  }
+
+  def observeTimer(metricName: String, nanos: Long): Unit = {
+    if (nanos < 0L) return
+    val durationMs = TimeUnit.NANOSECONDS.toMillis(nanos)
+    metricName match {
+      case "driver_admission.create.wait" =>
+        withCurrentOrPending("create", durationMs)
+      case "driver_admission.refresh.wait" =>
+        withCurrentOrPending("refresh", durationMs)
+      case "compiler.compile" =>
+        Option(current.get()).foreach(_.recordCompiler(durationMs))
+      case name if isCatalogMetric(name) =>
+        Option(current.get()).foreach(_.recordCatalog(durationMs))
+      case _ => ()
+    }
+  }
+
+  def observeRocksDbCommit(nanos: Long): Unit =
+    if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbFlush(TimeUnit.NANOSECONDS.toMillis(nanos)))
+
+  def observeRocksDbBackup(nanos: Long): Unit =
+    if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbBackup(TimeUnit.NANOSECONDS.toMillis(nanos)))
+
+  def needsProfileStepTiming(stepName: String): Boolean =
+    stepName == "create_catalog_lookup"
+
+  private[spark] def clearCurrent(span: OpenIvmExecutionSpan): Unit =
+    if (current.get() eq span) current.remove()
+
+  private[telemetry] def resetForTesting(): Unit = {
+    current.remove()
+    pending.remove()
+  }
+
+  private def consumePending(span: OpenIvmExecutionSpan, nowNanos: Long): Unit = {
+    val currentPending          = Option(pending.get()).getOrElse(PendingDurations())
+    val (duration, nextPending) = currentPending.consume(span.operation, nowNanos)
+    pending.set(nextPending)
+    duration.foreach(span.recordDriverAdmissionWait)
+  }
+
+  private def withCurrentOrPending(operation: String, durationMs: Long): Unit =
+    Option(current.get()) match {
+      case Some(span) => span.recordDriverAdmissionWait(durationMs)
+      case None =>
+        val next = Option(pending.get()).getOrElse(PendingDurations()).record(operation, durationMs, System.nanoTime())
+        pending.set(next)
+    }
+
+  private def isCatalogMetric(metricName: String): Boolean =
+    metricName.startsWith("catalog.") && !metricName.endsWith(".ensure_tables")
+
+  private def normalizeOperation(operation: String): String =
+    normalizeString(operation).toLowerCase(java.util.Locale.ROOT) match {
+      case "create"  => "create"
+      case "refresh" => "refresh"
+      case other     => other
+    }
+
+  private[telemetry] def normalizeString(value: String): String =
+    Option(value).map(_.trim).getOrElse("")
+
+  private def requestIdFrom(spark: SparkSession): Option[String] =
+    (RequestIdKeys.iterator.flatMap { key =>
+      Option(spark.sparkContext.getLocalProperty(key)).filter(_.trim.nonEmpty)
+    } ++
+      RequestIdKeys.iterator.flatMap { key =>
+        Option(MDC.get(key)).filter(_.trim.nonEmpty)
+      } ++
+      Seq(
+        spark.conf.getOption("spark.openivm.request_id"),
+        sys.props.get("openivm.request_id")
+      ).iterator.flatten.filter(_.trim.nonEmpty)).toSeq.headOption
+
+  private def renderJson(
+      requestId: Option[String],
+      materializedView: String,
+      operation: String,
+      startedAtEpochMs: Long,
+      completedAtEpochMs: Long,
+      durationMs: Long,
+      driverThread: String,
+      outcome: String,
+      sameMvLockWaitMs: Option[Long],
+      driverAdmissionWaitMs: Option[Long],
+      compilerMs: Option[Long],
+      catalogMs: Option[Long],
+      rocksDbFlushMs: Option[Long],
+      rocksDbBackupMs: Option[Long]
+  ): String = {
+    val fields = new LinkedHashMap[String, AnyRef]()
+    requestId.foreach(fields.put("request_id", _))
+    fields.put("materialized_view", materializedView)
+    fields.put("operation", operation)
+    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
+    fields.put("engine_completed_at", Instant.ofEpochMilli(completedAtEpochMs).toString)
+    fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
+    fields.put("driver_thread", driverThread)
+    fields.put("outcome", outcome)
+    sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
+    driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
+    compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
+    catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
+    rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
+    rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))
+    Json.writeValueAsString(fields)
+  }
+
+  private def logSpan(payload: String): Unit =
+    logInfo(LogPrefix + payload)
+}
