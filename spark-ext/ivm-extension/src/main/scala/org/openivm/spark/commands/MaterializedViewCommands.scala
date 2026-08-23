@@ -1729,90 +1729,98 @@ case class CreateMaterializedViewCommand(
     try {
       CommandLocalState.withDmlBypass {
         try {
-          profile.timeStep(
-            "create_mv_initial_load",
-            s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
-          ) {
-            reusedDeltaPath = DeltaTable.isDeltaTable(spark, location)
-            if (!reusedDeltaPath) {
-              var attempt = 0
-              var done    = false
-              while (!done) {
-                val currentAttempt = attempt
-                val attemptT0      = System.nanoTime()
-                try {
-                  CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
-                  val dataWriteT0 = System.nanoTime()
-                  val df          = spark.sql(dataWriteSql)
-                  dataWriteMs = (System.nanoTime() - dataWriteT0) / 1000000L
-                  recordPlanMetrics(df, RefreshPerf.classify(dataWriteSql, ""))
-                  done = true
-                } catch {
-                  case t: Throwable
-                      if attempt < 3 &&
-                        isCtasCleanupMissingTarget(t, dataIdent.identifier, location) =>
-                    attempt += 1
-                    try Thread.sleep(100L * attempt)
-                    catch {
-                      case _: InterruptedException =>
-                        Thread.currentThread().interrupt()
-                        throw t
+          try {
+            profile.timeStep(
+              "create_mv_initial_load",
+              s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
+            ) {
+              reusedDeltaPath = DeltaTable.isDeltaTable(spark, location)
+              if (!reusedDeltaPath) {
+                val ctasStmtKind = RefreshPerf.classify(dataWriteSql, "")
+                var attempt      = 0
+                var done         = false
+                while (!done) {
+                  val currentAttempt = attempt
+                  val attemptT0      = System.nanoTime()
+                  try {
+                    CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
+                    val dataWriteT0 = System.nanoTime()
+                    val dataWriteOutcome =
+                      try Right(spark.sql(dataWriteSql))
+                      catch { case t: Throwable => Left(t) }
+                    dataWriteMs = (System.nanoTime() - dataWriteT0) / 1000000L
+                    dataWriteOutcome match {
+                      case Right(df) =>
+                        recordPlanMetrics(df, ctasStmtKind)
+                        done = true
+                      case Left(t)
+                          if attempt < 3 &&
+                            isCtasCleanupMissingTarget(t, dataIdent.identifier, location) =>
+                        attempt += 1
+                        try Thread.sleep(100L * attempt)
+                        catch {
+                          case _: InterruptedException =>
+                            Thread.currentThread().interrupt()
+                            throw t
+                        }
+                      case Left(t) => throw t
                     }
-                  case t: Throwable => throw t
+                  } finally {
+                    val ms = (System.nanoTime() - attemptT0) / 1000000L
+                    sqlLog.record(
+                      category = "initial_load_ctas",
+                      stmtOrder = 0,
+                      attemptIdx = currentAttempt,
+                      stmtKind = ctasStmtKind,
+                      sql = dataWriteSql,
+                      durationMs = ms
+                    )
+                  }
+                }
+              }
+            }
+          } finally {
+            profile.appendStep(
+              "create_ctas_data_write",
+              s"reused_delta_path=$reusedDeltaPath",
+              dataWriteMs
+            )
+          }
+
+          CommandConcurrencyInjection.maybePauseAfterCreateDataWrite()
+
+          try {
+            profile.timeStep(
+              "create_mv_catalog_registration",
+              s"data_table=${sqlIdent(dataIdent)}"
+            ) {
+              CreateCatalogPublicationAdmission.withPermit(spark) {
+                val publicationT0 = System.nanoTime()
+                try {
+                  spark.sql(catalogRegistrationSql)
+                  validateCatalogRegistration(spark, dataIdent, location, requireExists = true)
+                  publicationCommitted = true
                 } finally {
-                  val ms = (System.nanoTime() - attemptT0) / 1000000L
+                  catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
                   sqlLog.record(
-                    category = "initial_load_ctas",
-                    stmtOrder = 0,
-                    attemptIdx = currentAttempt,
-                    stmtKind = RefreshPerf.classify(dataWriteSql, ""),
-                    sql = dataWriteSql,
-                    durationMs = ms
+                    category = "catalog_registration",
+                    stmtOrder = 1,
+                    attemptIdx = 0,
+                    stmtKind = "ddl",
+                    sql = catalogRegistrationSql,
+                    durationMs = catalogPublicationMs
                   )
                 }
               }
             }
+          } finally {
+            profile.appendStep(
+              "create_hive_catalog_publication",
+              s"data_table=${sqlIdent(dataIdent)}",
+              catalogPublicationMs
+            )
           }
         } finally {
-          profile.appendStep(
-            "create_ctas_data_write",
-            s"reused_delta_path=$reusedDeltaPath",
-            dataWriteMs
-          )
-        }
-
-        CommandConcurrencyInjection.maybePauseAfterCreateDataWrite()
-
-        try {
-          profile.timeStep(
-            "create_mv_catalog_registration",
-            s"data_table=${sqlIdent(dataIdent)}"
-          ) {
-            CreateCatalogPublicationAdmission.withPermit(spark) {
-              val publicationT0 = System.nanoTime()
-              try {
-                spark.sql(catalogRegistrationSql)
-                validateCatalogRegistration(spark, dataIdent, location, requireExists = true)
-                publicationCommitted = true
-              } finally {
-                catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
-                sqlLog.record(
-                  category = "catalog_registration",
-                  stmtOrder = 1,
-                  attemptIdx = 0,
-                  stmtKind = "ddl",
-                  sql = catalogRegistrationSql,
-                  durationMs = catalogPublicationMs
-                )
-              }
-            }
-          }
-        } finally {
-          profile.appendStep(
-            "create_hive_catalog_publication",
-            s"data_table=${sqlIdent(dataIdent)}",
-            catalogPublicationMs
-          )
           profile.appendStep(
             "create_ctas_total",
             s"reused_delta_path=$reusedDeltaPath",

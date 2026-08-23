@@ -1041,6 +1041,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual("mv_t1a_publish", "SELECT id, label FROM sales_t1a_publish")
     }
 
+    it("records non-zero CTAS timing when the initial save fails before returning") {
+      val udfName = s"sleep_then_divzero_${UUID.randomUUID().toString.replace("-", "")}"
+      spark.udf.register(
+        udfName,
+        (_: Long) => {
+          Thread.sleep(50L)
+          1 / 0
+        }
+      )
+
+      val payloads =
+        withLogCapture { appender =>
+          intercept[Throwable] {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-create-save-fail",
+              "openivm.node_id"    -> "model.create.save_fail"
+            ) {
+              spark
+                .sql(s"CREATE MATERIALIZED VIEW mv_t1a_save_fail AS SELECT $udfName(id) AS id FROM range(1)")
+                .collect()
+            }
+          }
+          executionSpanPayloads(appender.messages, "mv_t1a_save_fail")
+        }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("request_id").asText() shouldBe "req-create-save-fail"
+      payload.path("dbt_node_id").asText() shouldBe "model.create.save_fail"
+      payload.path("outcome").asText() shouldBe "create_failed"
+      payload.has("ctas_ms") shouldBe true
+      payload.has("ctas_data_write_ms") shouldBe true
+      payload.path("ctas_data_write_ms").asLong() should be > 0L
+      payload.path("ctas_ms").asLong() shouldBe payload.path("ctas_data_write_ms").asLong()
+      payload.has("hive_catalog_publication_ms") shouldBe false
+    }
+
     it("rolls back a newly-created Delta path after failure before named registration") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_retry(id INT, label STRING) USING DELTA")
       spark.sql("INSERT INTO sales_t1a_retry VALUES (1, 'one'), (2, 'two'), (2, 'two')")
