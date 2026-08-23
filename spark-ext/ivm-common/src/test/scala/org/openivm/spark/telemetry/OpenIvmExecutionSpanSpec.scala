@@ -131,6 +131,32 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("engine_completed_at").asText() should endWith("Z")
     }
 
+    it("keeps delta version lookups out of catalog_ms") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.version_mv", "create")
+        OpenIvmExecutionSpan.observeTimer("catalog.delta_version.lookup", millis(4L))
+        OpenIvmExecutionSpan.observeTimer("catalog.delta_version.lookup", millis(6L))
+        OpenIvmExecutionSpan.observeTimer("catalog.mv_catalog.upsert", millis(5L))
+        span.complete("create_executed", "driver-create")
+        span.emitIfNeeded("create_executed", "driver-create")
+
+        val untouched = OpenIvmExecutionSpan.start("default.no_version_mv", "create")
+        untouched.complete("create_executed", "driver-create")
+        untouched.emitIfNeeded("create_executed", "driver-create")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 2
+      val withLookups = payloads.head
+      withLookups.get("delta_version_lookup_ms").asLong() shouldBe 10L
+      withLookups.get("delta_version_lookup_count").asLong() shouldBe 2L
+      withLookups.get("catalog_ms").asLong() shouldBe 5L
+
+      val withoutLookups = payloads(1)
+      withoutLookups.has("delta_version_lookup_ms") shouldBe false
+      withoutLookups.has("delta_version_lookup_count") shouldBe false
+    }
+
     it("emits failed_before_end when completion is missing") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.fail_mv", "create")

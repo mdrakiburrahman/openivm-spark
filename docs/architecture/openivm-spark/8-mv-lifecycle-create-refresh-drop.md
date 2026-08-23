@@ -405,7 +405,7 @@ sequenceDiagram
         Cmd->>Spark: CREATE OR REPLACE VIEW v AS SELECT user columns WHERE HAVING
     end
     Cmd->>MvCat: upsert(MvMetadata(...))
-    Cmd->>Delta: history(1)
+    Cmd->>Delta: DeltaLog snapshot version (no Spark job)
     Cmd->>MvCat: advance(v, initialVersion)
     Cmd-->>Caller: empty result
 ```

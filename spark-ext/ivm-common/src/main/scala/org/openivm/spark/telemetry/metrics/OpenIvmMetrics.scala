@@ -364,6 +364,7 @@ object OpenIvmMetrics extends Logging {
       "refresh.sql_stmt.merge",
       "create.phase.create_mv_initial_load",
       "create.catalog_publication_admission.wait",
+      "catalog.delta_version.lookup",
       "compiler.compile"
     )
       .foreach(timer)

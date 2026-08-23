@@ -8,6 +8,7 @@ import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.apache.hadoop.fs.Path
+import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{
@@ -31,8 +32,9 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -491,6 +493,60 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         payload.path("hive_catalog_publication_ms").asLong() shouldBe
         payload.path("ctas_ms").asLong()
       assertBagEqual("mv_t1a_phases", "SELECT id, label FROM sales_t1a WHERE id >= 0")
+    }
+
+    it("publishes the catalog entry without submitting another Spark job") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_publish(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_publish VALUES (1, 'one'), (2, 'two')")
+
+      // Job submission timestamps, not listener delivery times, decide which
+      // side of the data-write boundary a job belongs to.
+      val jobSubmittedAtMs = new CopyOnWriteArrayList[java.lang.Long]()
+      val boundaryMs       = new AtomicLong(Long.MaxValue)
+      val listener = new SparkListener {
+        override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+          jobSubmittedAtMs.add(java.lang.Long.valueOf(jobStart.time))
+          ()
+        }
+      }
+      spark.sparkContext.addSparkListener(listener)
+
+      val payloads =
+        try
+          withLogCapture { appender =>
+            CommandConcurrencyInjection.withAfterCreateDataWrite({
+              Thread.sleep(50L)
+              boundaryMs.set(System.currentTimeMillis())
+            }) {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_publish AS " +
+                    "SELECT id, label FROM sales_t1a_publish"
+                )
+                .collect()
+            }
+            // Drain the asynchronous listener bus before reading the buffer.
+            Thread.sleep(1000L)
+            executionSpanPayloads(appender.messages, "mv_t1a_publish")
+          }
+        finally spark.sparkContext.removeSparkListener(listener)
+
+      val boundary = boundaryMs.get()
+      boundary should be < Long.MaxValue
+      val publicationJobs = jobSubmittedAtMs.asScala.count(_.longValue() >= boundary)
+      withClue("catalog publication must not submit Spark jobs that queue behind concurrent data writes: ") {
+        publicationJobs shouldBe 0
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("outcome").asText() shouldBe "create_executed"
+      payload.path("delta_version_lookup_count").asLong() shouldBe 1L
+      payload.has("delta_version_lookup_ms") shouldBe true
+      payload.path("catalog_publication_admission_width").asInt() shouldBe 32
+      payload.has("hive_catalog_publication_ms") shouldBe true
+      payload.has("metadata_publication_ms") shouldBe true
+      assertBagEqual("mv_t1a_publish", "SELECT id, label FROM sales_t1a_publish")
     }
 
     it("reuses a committed Delta path after failure before named registration") {

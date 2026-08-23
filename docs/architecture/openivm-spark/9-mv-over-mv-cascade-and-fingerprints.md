@@ -416,8 +416,7 @@ Citation: `MvCatalog.scala:485-503`.
 `postRefreshCleanup` calls that advance before marking consumed:
 
 ```scala
-val newVersion =
-  DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+val newVersion = DeltaTableVersion.requireLatest(spark, meta.location)
 MvCatalog.advance(spark, name, newVersion)
 ```
 

@@ -202,6 +202,19 @@ capacity. `ctas_data_write_ms` directly times the path-identifier Delta CTAS;
 `hive_catalog_publication_ms` directly times the subsequent named
 `CREATE TABLE ... USING DELTA LOCATION` registration. Their sum equals
 `ctas_ms`.
+
+`delta_version_lookup_ms` and `delta_version_lookup_count` report the time and
+number of latest-committed-Delta-version resolutions performed by the span
+(`org.openivm.spark.common.DeltaTableVersion`, metric
+`catalog.delta_version.lookup`). They are emitted only when the span performed
+at least one lookup, and they are deliberately kept out of `catalog_ms` so the
+publication tail can be attributed separately from MV-catalog writes. The
+lookup reads `DeltaLog.update().version` on the driver and submits no Spark
+job: a `DeltaTable.history(1)` read would submit one, and under a wide CREATE
+fan-out that job queues for a task slot behind the concurrent Delta data
+writes, inflating `metadata_publication_ms` for even a three-row output.
+`MaterializedViewCommandsSpec` guards this by asserting that a CREATE submits
+no Spark job after its data-write boundary.
 CREATE records the authoritative classification once it is known. REFRESH reads
 the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
 runs still emit the same three fields without recompiling. Legacy metadata rows

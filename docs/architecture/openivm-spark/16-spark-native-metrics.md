@@ -118,6 +118,7 @@ unit conventions; duration inputs are nanoseconds.
 | `openivm.catalog.mv_catalog.retry` | counter | retries | Delta MV catalog conflict retries. |
 | `openivm.catalog.cdf_watermark.<op>` | timer | ns | Delta CDF watermark commit latency by op. |
 | `openivm.catalog.cdf_watermark.retry` | counter | retries | Delta CDF watermark conflict retries. |
+| `openivm.catalog.delta_version.lookup` | timer | ns | Driver-side latest-committed-Delta-version resolution (`DeltaLog.update().version`); submits no Spark job. |
 | `openivm.ctas.queue_depth` | gauge | tasks | CTAS dispatcher queued tasks. |
 | `openivm.ctas.admission_width` | gauge | tasks | Current CTAS admission width. |
 | `openivm.ctas.active_threads` | gauge | threads | CTAS worker threads in flight. |

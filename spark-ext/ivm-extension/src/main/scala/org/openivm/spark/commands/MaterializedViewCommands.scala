@@ -4,7 +4,7 @@ import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   AttributeReference,
@@ -461,16 +461,27 @@ private[commands] object MvCommandHelper {
       requireExists: Boolean
   ): Unit = {
     val catalog = spark.sessionState.catalog
-    if (!catalog.tableExists(dataIdent)) {
-      if (requireExists)
-        throw new IllegalStateException(
-          s"Catalog registration did not create ${sqlIdent(dataIdent)}"
-        )
-      return
-    }
-
-    val metadata = catalog.getTableMetadata(dataIdent)
-    val hconf    = spark.sparkContext.hadoopConfiguration
+    // Every Hive metastore round-trip runs inside Spark's globally
+    // synchronized Hive client, so it is a serialized section shared by all
+    // concurrent commands. `getTableMetadata` already asserts that the
+    // database and the table exist, so probing with `tableExists` first only
+    // repeats that lookup. The probe is kept for the pre-registration call,
+    // where the table is normally absent and a single existence check is
+    // cheaper than a metadata read that has to fail.
+    val metadata =
+      if (requireExists) {
+        try catalog.getTableMetadata(dataIdent)
+        catch {
+          case _: NoSuchTableException | _: NoSuchDatabaseException =>
+            throw new IllegalStateException(
+              s"Catalog registration did not create ${sqlIdent(dataIdent)}"
+            )
+        }
+      } else {
+        if (!catalog.tableExists(dataIdent)) return
+        catalog.getTableMetadata(dataIdent)
+      }
+    val hconf = spark.sparkContext.hadoopConfiguration
     def qualified(path: Path): String =
       path.getFileSystem(hconf).makeQualified(path).toUri.normalize().toString.stripSuffix("/")
     val expectedProvider = metadata.provider.exists(_.equalsIgnoreCase("delta"))
@@ -1675,8 +1686,11 @@ case class CreateMaterializedViewCommand(
         // view) succeeded. A failed catalog write is safely retryable because
         // the retry detects the committed Delta path and repeats only the
         // idempotent named registration.
-        val version =
-          DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
+        //
+        // The committed version is read straight off the Delta log snapshot:
+        // a `DeltaTable.history` read would submit a Spark job that has to
+        // queue behind the concurrent Delta data writes for a task slot.
+        val version = DeltaTableVersion.requireLatest(spark, location)
         MvCatalog.upsert(spark, meta.copy(lastVersion = version))
       }
     }
@@ -1989,8 +2003,7 @@ case class RefreshMaterializedViewCommand(
       }
 
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
-        val dataVersion =
-          DeltaTable.forPath(spark, cleanupMeta.location).history(1).collect().head.getAs[Long]("version")
+        val dataVersion = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
         postRefreshCleanup(
           spark,
           name,
@@ -2533,8 +2546,7 @@ case class RefreshMaterializedViewCommand(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='runtime_empty_delta_skip' " +
                   "reason='all_source_delta_views_empty'"
               )
-              val unchangedVersion =
-                DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+              val unchangedVersion = DeltaTableVersion.requireLatest(spark, meta.location)
               consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
               return Seq.empty
@@ -2561,7 +2573,7 @@ case class RefreshMaterializedViewCommand(
             )
               Some(
                 profile.timeStep("pin_simple_aggregate_version", "source=delta_history") {
-                  DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+                  DeltaTableVersion.requireLatest(spark, meta.location)
                 }
               )
             else None
@@ -4542,7 +4554,7 @@ case class RefreshMaterializedViewCommand(
     import MvCommandHelper._
     val propagation = ChangePropagationFactory.forSession(spark)
     val newVersion = committedDataVersion.getOrElse {
-      DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+      DeltaTableVersion.requireLatest(spark, meta.location)
     }
     MvCatalog.advance(spark, name, newVersion)
 

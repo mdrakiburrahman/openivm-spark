@@ -37,6 +37,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var ctasDataWriteMs                  = Option.empty[Long]
   private var hiveCatalogPublishMs             = Option.empty[Long]
   private var metadataPublicationMs            = Option.empty[Long]
+  private var deltaVersionLookupMs             = Option.empty[Long]
+  private var deltaVersionLookupCount          = 0L
   private var rocksDbFlushMs                   = Option.empty[Long]
   private var rocksDbFlushCount                = 0L
   private var rocksDbFlushFailures             = 0L
@@ -133,6 +135,12 @@ final class OpenIvmExecutionSpan private[telemetry] (
   def recordMetadataPublication(durationMs: Long): Unit =
     recordBeforeComplete {
       metadataPublicationMs = addDuration(metadataPublicationMs, durationMs)
+    }
+
+  def recordDeltaVersionLookup(durationMs: Long): Unit =
+    recordBeforeComplete {
+      deltaVersionLookupMs = addDuration(deltaVersionLookupMs, durationMs)
+      deltaVersionLookupCount += 1L
     }
 
   def recordRocksDbFlush(durationMs: Long, failed: Boolean = false): Unit =
@@ -240,6 +248,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 ctasDataWriteMs = ctasDataWriteMs,
                 hiveCatalogPublicationMs = hiveCatalogPublishMs,
                 metadataPublicationMs = metadataPublicationMs,
+                deltaVersionLookupMs = deltaVersionLookupMs,
+                deltaVersionLookupCount = deltaVersionLookupCount,
                 rocksDbFlushMs = rocksDbFlushMs,
                 rocksDbFlushCount = rocksDbFlushCount,
                 rocksDbFlushFailures = rocksDbFlushFailures,
@@ -350,6 +360,10 @@ object OpenIvmExecutionSpan extends Logging {
   private val CompileFailedRefreshType = "COMPILE_FAILED"
   private val CompileFailedReason      = "compile_failed"
 
+  /** Mirrors `org.openivm.spark.common.DeltaTableVersion.LookupMetric`;
+    * duplicated to keep telemetry free of a common → telemetry dependency. */
+  private val DeltaVersionLookupMetric = "catalog.delta_version.lookup"
+
   val NoOp: OpenIvmExecutionSpan =
     new OpenIvmExecutionSpan("", "refresh", None, None, 0L, 0L, enabled = false)
 
@@ -441,6 +455,8 @@ object OpenIvmExecutionSpan extends Logging {
         withCurrentOrPending("refresh", durationMs)
       case "compiler.compile" =>
         Option(current.get()).foreach(_.recordCompiler(durationMs))
+      case DeltaVersionLookupMetric =>
+        Option(current.get()).foreach(_.recordDeltaVersionLookup(durationMs))
       case name if isCatalogMetric(name) =>
         Option(current.get()).foreach(_.recordCatalog(durationMs))
       case _ => ()
@@ -571,6 +587,8 @@ object OpenIvmExecutionSpan extends Logging {
       ctasDataWriteMs: Option[Long],
       hiveCatalogPublicationMs: Option[Long],
       metadataPublicationMs: Option[Long],
+      deltaVersionLookupMs: Option[Long],
+      deltaVersionLookupCount: Long,
       rocksDbFlushMs: Option[Long],
       rocksDbFlushCount: Long,
       rocksDbFlushFailures: Long,
@@ -609,6 +627,10 @@ object OpenIvmExecutionSpan extends Logging {
     ctasDataWriteMs.foreach(v => fields.put("ctas_data_write_ms", java.lang.Long.valueOf(v)))
     hiveCatalogPublicationMs.foreach(v => fields.put("hive_catalog_publication_ms", java.lang.Long.valueOf(v)))
     metadataPublicationMs.foreach(v => fields.put("metadata_publication_ms", java.lang.Long.valueOf(v)))
+    deltaVersionLookupMs.foreach(v => fields.put("delta_version_lookup_ms", java.lang.Long.valueOf(v)))
+    if (deltaVersionLookupCount > 0L) {
+      fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
+    }
     rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
     if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
     if (rocksDbFlushFailures > 0L) {
