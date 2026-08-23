@@ -56,6 +56,10 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   private val tsSchema: StructType      = StructType.fromDDL("id INT, ts TIMESTAMP")
   private val epochSchema: StructType   = StructType.fromDDL("id INT, epoch BIGINT")
   private val windowSchema: StructType  = StructType.fromDDL("id INT, grp INT, ts TIMESTAMP, name STRING")
+  private val intervalSchema: StructType =
+    StructType.fromDDL("dim_date_billing_usage_event_key STRING, dim_time_billing_usage_event_key INT")
+  private val billingJsonSchema: StructType =
+    StructType.fromDDL("usageuploadtime TIMESTAMP, azureresourceid STRING, additionalinfo STRING")
 
   "shim regexp_like(s, p)" should "compile and emit a non-FULL_REFRESH classification" in {
     val r = compileBody(
@@ -178,6 +182,55 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should include("date_format(")
     translated should not include "strftime"
   }
+
+  "shim make_interval(...)" should
+    "compile the status/billing canary shape, stay incremental, and restore Spark make_interval" in {
+      val r = compileBody(
+        viewName = "shim_make_interval_v1",
+        sources = Map("intervalsrc" -> intervalSchema),
+        body = "SELECT to_timestamp(dim_date_billing_usage_event_key, 'yyyyMMdd') + " +
+          "make_interval(0, 0, 0, 0, 0, 0, cast(dim_time_billing_usage_event_key AS int)) AS event_time " +
+          "FROM intervalsrc"
+      )
+      r.refreshTypeName should not equal "FULL_REFRESH"
+
+      r.initialLoadSql should include("make_interval(0, 0, 0, 0, 0, 0, dim_time_billing_usage_event_key)")
+      r.initialLoadSql should not include SparkFunctionShimSql.MakeIntervalMarker
+
+      val translated = LptsSparkDialect.translate(r.sql)
+      translated should include("make_interval(0, 0, 0, 0, 0, 0,")
+      translated should not include SparkFunctionShimSql.MakeIntervalMarker
+      translated should not include "__sparkfn_make_interval"
+    }
+
+  "shim get_json_object(json, path)" should
+    "compile the silver-billing canary shape, stay incremental, and restore Spark JSON extraction" in {
+      val r = compileBody(
+        viewName = "shim_get_json_object_v1",
+        sources = Map("billingsrc" -> billingJsonSchema),
+        body = """SELECT
+            |  usageuploadtime AS usage_upload_time,
+            |  LOWER(TRIM(azureresourceid)) AS azureresourceid,
+            |  COALESCE(
+            |    LOWER(GET_JSON_OBJECT(additionalinfo, '$.ArcMachineResourceUri')),
+            |    LOWER('NOT APPLICABLE')
+            |  ) AS container_resource_id,
+            |  TRY_CAST(GET_JSON_OBJECT(additionalinfo, '$.NumberOfCores') AS INT) AS billing_reported_cores
+            |FROM billingsrc""".stripMargin
+      )
+      r.refreshTypeName should not equal "FULL_REFRESH"
+
+      r.initialLoadSql should include("get_json_object(additionalinfo, '$.ArcMachineResourceUri')")
+      r.initialLoadSql should include("get_json_object(additionalinfo, '$.NumberOfCores')")
+      r.initialLoadSql should not include SparkFunctionShimSql.GetJsonObjectMarker
+
+      val translated = LptsSparkDialect.translate(r.sql)
+      translated should include("get_json_object(")
+      translated should include("$.ArcMachineResourceUri")
+      translated should include("$.NumberOfCores")
+      translated should not include SparkFunctionShimSql.GetJsonObjectMarker
+      translated should not include "__sparkfn_get_json_object"
+    }
 
   "shim last_value(expr, ignoreNulls)" should "compile, stay incremental, and emit Spark's ignore-null last_value at refresh time" in {
     val r = compileBody(
@@ -303,6 +356,10 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     )
     p should include("CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);")
+    p should include("CREATE OR REPLACE MACRO __sparkfn_make_interval")
+    p should include(SparkFunctionShimSql.MakeIntervalMarker)
+    p should include("CREATE OR REPLACE MACRO __sparkfn_get_json_object")
+    p should include(SparkFunctionShimSql.GetJsonObjectMarker)
     p should include("CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);")
     p should include("CREATE OR REPLACE MACRO __sparkfn_first_value(expr, ignore_nulls) AS first(expr);")
     p should include(

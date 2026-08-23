@@ -528,6 +528,30 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "date_format(ts, 'yyyyMMdd')"
     }
 
+    it("rewrites the exact refresh-time make_interval marker expansion from the local-openivm canary") {
+      val sql =
+        "COALESCE(to_seconds(TRY_CAST(concat('__openivm_spark_make_interval__', '0', '|', '0', '|', '0', '|', '0', '|', '0', '|', '0', '|', CAST(dim_time AS STRING)) AS DOUBLE)), (INTERVAL '0' SECOND + to_seconds(CAST(dim_time AS DOUBLE))))"
+
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "make_interval(0, 0, 0, 0, 0, 0, dim_time)"
+    }
+
+    it("rewrites the initial-load make_interval marker expansion with DuckDB VARCHAR casts") {
+      val sql =
+        "COALESCE(to_seconds(TRY_CAST(concat('__openivm_spark_make_interval__', CAST(0 AS VARCHAR), '|', CAST(0 AS VARCHAR), '|', CAST(0 AS VARCHAR), '|', CAST(0 AS VARCHAR), '|', CAST(0 AS VARCHAR), '|', CAST(0 AS VARCHAR), '|', CAST(dim_time AS VARCHAR)) AS DOUBLE)), (INTERVAL '0' SECOND + to_seconds(CAST(dim_time AS DOUBLE))))"
+
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "make_interval(0, 0, 0, 0, 0, 0, dim_time)"
+    }
+
+    it("rewrites get_json_object marker expansions without touching the JSONPath literals") {
+      val sql =
+        "LOWER(concat('__openivm_spark_get_json_object__', additionalinfo, '|', '$.ArcMachineResourceUri')), TRY_CAST(concat('__openivm_spark_get_json_object__', additionalinfo, '|', '$.NumberOfCores') AS INT)"
+
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
+        "LOWER(get_json_object(additionalinfo, '$.ArcMachineResourceUri')), TRY_CAST(get_json_object(additionalinfo, '$.NumberOfCores') AS INT)"
+    }
+
     it("rewrites last(expr) OVER (...) to last_value(expr) OVER (...)") {
       val sql = "last(name) OVER (PARTITION BY grp ORDER BY ts)"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
@@ -551,13 +575,15 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val sql =
         """SELECT 'strptime(raw, ''%Y-%m-%d %H:%M:%S'')' AS raw_txt,
           |       -- strftime(ts, 'yyyyMMdd')
-          |       strftime(ts, 'yyyyMMdd') AS fmt
-          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE) */""".stripMargin
+          |       strftime(ts, 'yyyyMMdd') AS fmt,
+          |       concat('__openivm_spark_get_json_object__', info, '|', '$.a') AS parsed
+          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE), concat('__openivm_spark_get_json_object__', x, '|', '$.x') */""".stripMargin
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe
         """SELECT 'strptime(raw, ''%Y-%m-%d %H:%M:%S'')' AS raw_txt,
           |       -- strftime(ts, 'yyyyMMdd')
-          |       date_format(ts, 'yyyyMMdd') AS fmt
-          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE) */""".stripMargin
+          |       date_format(ts, 'yyyyMMdd') AS fmt,
+          |       get_json_object(info, '$.a') AS parsed
+          |FROM src /* CAST(strptime(raw, '%Y-%m-%d') AS DATE), concat('__openivm_spark_get_json_object__', x, '|', '$.x') */""".stripMargin
     }
 
     it("does not rewrite the polymorphic CASE shim when the branch expressions differ") {

@@ -89,6 +89,24 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
         "SELECT id, __sparkfn_current_date() AS today, __sparkfn_current_timestamp() AS now_ts FROM src"
     }
 
+    it("rewrites the exact make_interval and get_json_object calls from the local-openivm canary") {
+      val sql =
+        """SELECT
+          |  to_timestamp(dim_date_billing_usage_event_key, 'yyyyMMdd') +
+          |    make_interval(0, 0, 0, 0, 0, 0, cast(dim_time_billing_usage_event_key AS int)) AS event_time,
+          |  LOWER(GET_JSON_OBJECT(additionalinfo, '$.ArcMachineResourceUri')) AS container_resource_id,
+          |  TRY_CAST(GET_JSON_OBJECT(additionalinfo, '$.NumberOfCores') AS INT) AS billing_reported_cores
+          |FROM src""".stripMargin
+
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        """SELECT
+          |  __sparkfn_to_timestamp(dim_date_billing_usage_event_key, 'yyyyMMdd') +
+          |    __sparkfn_make_interval(0, 0, 0, 0, 0, 0, cast(dim_time_billing_usage_event_key AS int)) AS event_time,
+          |  LOWER(__sparkfn_get_json_object(additionalinfo, '$.ArcMachineResourceUri')) AS container_resource_id,
+          |  TRY_CAST(__sparkfn_get_json_object(additionalinfo, '$.NumberOfCores') AS INT) AS billing_reported_cores
+          |FROM src""".stripMargin
+    }
+
     it("does not rewrite current_date/current_timestamp inside string literals or comments") {
       val sql =
         """SELECT 'current_date()' AS txt,

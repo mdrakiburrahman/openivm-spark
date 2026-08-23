@@ -12,6 +12,10 @@ import java.util.Locale
   */
 private[compiler] object SparkFunctionShimSql {
 
+  private[compiler] val MakeIntervalMarker: String  = "__openivm_spark_make_interval__"
+  private[compiler] val GetJsonObjectMarker: String = "__openivm_spark_get_json_object__"
+  private[compiler] val MarkerArgSeparator: String  = "|"
+
   private final case class FunctionCall(
       openParen: Int,
       closeParen: Int,
@@ -48,6 +52,16 @@ private[compiler] object SparkFunctionShimSql {
         1 -> "__sparkfn_date_format"
       )
     ),
+    "make_interval" -> RenameRule(
+      Map(
+        6 -> "__sparkfn_make_interval"
+      )
+    ),
+    "get_json_object" -> RenameRule(
+      Map(
+        1 -> "__sparkfn_get_json_object"
+      )
+    ),
     "last_value" -> RenameRule(
       Map(
         1 -> "__sparkfn_last_value"
@@ -82,6 +96,8 @@ private[compiler] object SparkFunctionShimSql {
     *   - 1-arg / 2-arg `to_date(...)`
     *   - 1-arg / 2-arg `to_timestamp(...)`
     *   - 2-arg `date_format(...)`
+    *   - 7-arg `make_interval(...)`
+    *   - 2-arg `get_json_object(...)`
     *   - 2-arg `last_value(expr, true|false)`
     *   - 2-arg `first_value(expr, true|false)`
     *   - 0-arg `current_date()`
@@ -115,6 +131,8 @@ private[compiler] object SparkFunctionShimSql {
     *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`                                               -> `to_timestamp(s)`
     *   - `strptime(s, fmt)`                                                               -> `to_timestamp(s, fmt)`
     *   - `strftime(d, fmt)`                                                               -> `date_format(d, fmt)`
+    *   - the `__sparkfn_make_interval` marker expansion                                    -> `make_interval(...)`
+    *   - the `__sparkfn_get_json_object` marker expansion                                  -> `get_json_object(...)`
     *   - `last_value(expr IGNORE NULLS) OVER (...)`                                      -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                                                          -> `last_value(expr) OVER (...)`
     *   - `first_value(expr IGNORE NULLS) OVER (...)`                                     -> `first_value(expr, true) OVER (...)`
@@ -132,7 +150,9 @@ private[compiler] object SparkFunctionShimSql {
     */
   def rewriteInlinedSparkShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
-      parseCastTemporalShim(sql, i)
+      parseMakeIntervalShim(sql, i)
+        .orElse(parseGetJsonObjectShim(sql, i))
+        .orElse(parseCastTemporalShim(sql, i))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "last_value"))
@@ -385,6 +405,127 @@ private[compiler] object SparkFunctionShimSql {
           else Some(call.closeParen + 1 -> s"$functionName(${rewriteInlinedSparkShimCalls(expr)}, true)")
         }
       }
+
+  private def parseMakeIntervalShim(sql: String, start: Int): Option[(Int, String)] =
+    parseFunctionCallAt(sql, start, "coalesce")
+      .filter(_.topLevelCommaCount == 1)
+      .flatMap { call =>
+        splitTopLevelArgs(sql, call).flatMap {
+          case Seq(markerRange, _) =>
+            parseMakeIntervalMarkerArgs(sql, markerRange).map { args =>
+              call.closeParen + 1 -> s"make_interval(${args.mkString(", ")})"
+            }
+          case _ => None
+        }
+      }
+
+  private def parseMakeIntervalMarkerArgs(sql: String, range: (Int, Int)): Option[Seq[String]] =
+    parseSingleFunctionCallInRange(sql, range, "to_seconds")
+      .filter(_.topLevelCommaCount == 0)
+      .flatMap { secondsCall =>
+        parseSingleFunctionCallInRange(
+          sql,
+          (secondsCall.openParen + 1, secondsCall.closeParen),
+          "try_cast"
+        )
+      }
+      .flatMap { tryCastCall =>
+        val bodyStart = tryCastCall.openParen + 1
+        val bodyEnd   = tryCastCall.closeParen
+        findTopLevelKeyword(sql, bodyStart, bodyEnd, "AS").flatMap { asStart =>
+          val typeStart = skipTriviaForward(sql, asStart + "AS".length, bodyEnd)
+          if (typeStart >= bodyEnd) None
+          else {
+            val typeEnd = readIdentifierEnd(sql, typeStart)
+            if (
+              !sql.substring(typeStart, typeEnd).equalsIgnoreCase("DOUBLE") ||
+              !isTriviaOnly(sql, typeEnd, bodyEnd)
+            ) None
+            else {
+              parseSingleFunctionCallInRange(sql, (bodyStart, asStart), "concat")
+                .filter(_.topLevelCommaCount == 13)
+                .flatMap(splitTopLevelArgs(sql, _))
+                .filter { args =>
+                  args.size == 14 &&
+                  argEqualsSingleQuotedLiteral(sql, args.head, s"'$MakeIntervalMarker'") &&
+                  (2 until 13 by 2).forall { idx =>
+                    argEqualsSingleQuotedLiteral(sql, args(idx), s"'$MarkerArgSeparator'")
+                  }
+                }
+                .map { args =>
+                  (1 until 14 by 2).map(idx => restoreMakeIntervalArg(sql, args(idx)))
+                }
+            }
+          }
+        }
+      }
+
+  private def parseGetJsonObjectShim(sql: String, start: Int): Option[(Int, String)] =
+    parseFunctionCallAt(sql, start, "concat")
+      .filter(_.topLevelCommaCount == 3)
+      .flatMap { call =>
+        splitTopLevelArgs(sql, call).flatMap {
+          case Seq(marker, jsonText, separator, path)
+              if argEqualsSingleQuotedLiteral(sql, marker, s"'$GetJsonObjectMarker'") &&
+                argEqualsSingleQuotedLiteral(sql, separator, s"'$MarkerArgSeparator'") =>
+            val jsonArg = restoreSerializedStringArg(sql, jsonText)
+            val pathArg = restoreSerializedStringArg(sql, path)
+            Some(call.closeParen + 1 -> s"get_json_object($jsonArg, $pathArg)")
+          case _ => None
+        }
+      }
+
+  private def parseSingleFunctionCallInRange(
+      sql: String,
+      range: (Int, Int),
+      functionName: String
+  ): Option[FunctionCall] = {
+    val (start, endExclusive) = range
+    val callStart             = skipTriviaForward(sql, start, endExclusive)
+    if (callStart >= endExclusive) None
+    else {
+      parseFunctionCallAt(sql, callStart, functionName)
+        .filter(call => call.closeParen < endExclusive && isTriviaOnly(sql, call.closeParen + 1, endExclusive))
+    }
+  }
+
+  private def restoreMakeIntervalArg(sql: String, range: (Int, Int)): String = {
+    val restored = restoreSerializedStringArg(sql, range)
+    if (
+      restored.length >= 2 &&
+      restored.head == '\'' &&
+      restored.last == '\'' &&
+      scala.util.Try(BigDecimal(restored.substring(1, restored.length - 1))).isSuccess
+    ) restored.substring(1, restored.length - 1)
+    else restored
+  }
+
+  private def restoreSerializedStringArg(sql: String, range: (Int, Int)): String = {
+    val (start, endExclusive) = range
+    val argStart              = skipTriviaForward(sql, start, endExclusive)
+    if (argStart >= endExclusive) ""
+    else {
+      parseFunctionCallAt(sql, argStart, "cast")
+        .filter(call => call.closeParen < endExclusive && isTriviaOnly(sql, call.closeParen + 1, endExclusive))
+        .flatMap { castCall =>
+          val bodyStart = castCall.openParen + 1
+          val bodyEnd   = castCall.closeParen
+          findTopLevelKeyword(sql, bodyStart, bodyEnd, "AS").flatMap { asStart =>
+            val typeStart = skipTriviaForward(sql, asStart + "AS".length, bodyEnd)
+            if (typeStart >= bodyEnd) None
+            else {
+              val typeEnd = readIdentifierEnd(sql, typeStart)
+              val isStringCast =
+                sql.substring(typeStart, typeEnd).equalsIgnoreCase("STRING") ||
+                  sql.substring(typeStart, typeEnd).equalsIgnoreCase("VARCHAR")
+              if (!isStringCast || !isTriviaOnly(sql, typeEnd, bodyEnd)) None
+              else Some(rewriteInlinedSparkShimCalls(sql.substring(bodyStart, asStart).trim))
+            }
+          }
+        }
+        .getOrElse(rewriteInlinedSparkShimCalls(sql.substring(argStart, endExclusive).trim))
+    }
+  }
 
   private def parseCastTemporalShim(sql: String, start: Int): Option[(Int, String)] =
     parseFunctionCallAt(sql, start, "cast").flatMap { castCall =>

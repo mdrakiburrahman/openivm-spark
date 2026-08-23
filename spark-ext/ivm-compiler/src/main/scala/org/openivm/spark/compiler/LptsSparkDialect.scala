@@ -186,6 +186,8 @@ object LptsSparkDialect {
     *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`       -> `to_timestamp(s)`
     *   - `strptime(s, fmt)`                       -> `to_timestamp(s, fmt)`
     *   - `strftime(d, fmt)`                       -> `date_format(d, fmt)`
+    *   - `__sparkfn_make_interval` marker body    -> `make_interval(...)`
+    *   - `__sparkfn_get_json_object` marker body  -> `get_json_object(...)`
     *   - `last_value(expr IGNORE NULLS) OVER (...)` -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                  -> `last_value(expr) OVER (...)`
     *

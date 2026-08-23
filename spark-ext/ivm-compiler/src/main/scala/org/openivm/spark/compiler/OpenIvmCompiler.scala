@@ -371,9 +371,10 @@ class OpenIvmCompiler private (
     *     FIRST, before any other pass scans for quoted regions, since every
     *     later pass assumes DuckDB-dialect literal syntax.
     *   - Spark 1-arg / 2-arg `to_date` / `to_timestamp` and 2-arg
-    *     `date_format` → collision-free `__sparkfn_*` names so DuckDB binds
-    *     our shim macro instead of its own incompatible built-in overloads /
-    *     arities.
+    *     `date_format`, 7-arg `make_interval`, and 2-arg `get_json_object` →
+    *     collision-free `__sparkfn_*` names so DuckDB binds our shim macro
+    *     instead of its own incompatible built-in overloads / arities (or,
+    *     for Spark-only functions, a missing DuckDB function).
     *   - Spark literal-boolean `last_value(expr, true|false)` /
     *     `first_value(expr, true|false)` → DuckDB's native window spelling
     *     (`last_value(expr IGNORE NULLS)` or `last_value(expr)`, and the
@@ -775,15 +776,16 @@ object OpenIvmCompiler {
     * must preserve enough structure for `LptsSparkDialect.translate` to
     * recover Spark's original spelling at refresh time.
     *
-    * Collision-prone or arity-incompatible Spark built-ins (1-arg / 2-arg
-    * `to_date`, 1-arg / 2-arg `to_timestamp`, 2-arg `date_format`, 0-arg
-    * `current_date`, 0-arg `current_timestamp`) are renamed to `__sparkfn_*`
-    * by [[renameSparkFunctionShimCalls]] before the SQL reaches DuckDB. The
+    * Collision-prone, arity-incompatible, or Spark-only built-ins (1-arg /
+    * 2-arg `to_date`, 1-arg / 2-arg `to_timestamp`, 2-arg `date_format`,
+    * 7-arg `make_interval`, 2-arg `get_json_object`, 0-arg `current_date`,
+    * 0-arg `current_timestamp`) are renamed to `__sparkfn_*` by
+    * [[renameSparkFunctionShimCalls]] before the SQL reaches DuckDB. The
     * 1-arg date/time spellings use dedicated `*_1arg` macro names because
-    * DuckDB macros do not overload by arity. The macros below define
-    * the corresponding DuckDB-side bodies that openivm will inline.
-    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses the date/time
-    * inlinings back to Spark's original functions in the emitted refresh SQL.
+    * DuckDB macros do not overload by arity. The macros below define the
+    * corresponding DuckDB-side bodies that openivm will inline.
+    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses the inlinings
+    * back to Spark's original functions in the emitted refresh SQL.
     *
     * Literal-boolean `last_value(expr, true|false)` / `first_value(expr,
     * true|false)` calls are normalized to DuckDB's native window syntax
@@ -813,6 +815,13 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      // The nonnumeric marker branch is always NULL, but keeps all seven
+      // arguments visible to LPTS for exact scanner-based recovery. The
+      // interval fallback keeps the DuckDB macro type- and value-correct.
+      s"CREATE OR REPLACE MACRO __sparkfn_make_interval(years, months, weeks, days, hours, mins, secs) AS COALESCE(to_seconds(TRY_CAST(concat('${SparkFunctionShimSql.MakeIntervalMarker}', years, '${SparkFunctionShimSql.MarkerArgSeparator}', months, '${SparkFunctionShimSql.MarkerArgSeparator}', weeks, '${SparkFunctionShimSql.MarkerArgSeparator}', days, '${SparkFunctionShimSql.MarkerArgSeparator}', hours, '${SparkFunctionShimSql.MarkerArgSeparator}', mins, '${SparkFunctionShimSql.MarkerArgSeparator}', secs) AS DOUBLE)), to_years(CAST(years AS BIGINT)) + to_months(CAST(months AS BIGINT)) + to_days(CAST(weeks AS BIGINT) * 7) + to_days(CAST(days AS BIGINT)) + to_hours(CAST(hours AS BIGINT)) + to_minutes(CAST(mins AS BIGINT)) + to_seconds(CAST(secs AS DOUBLE)));",
+      // The pinned DuckDB binary has no JSON extension. Encode both arguments
+      // in a collision-free VARCHAR marker, then restore Spark's exact call.
+      s"CREATE OR REPLACE MACRO __sparkfn_get_json_object(json_text, path) AS concat('${SparkFunctionShimSql.GetJsonObjectMarker}', json_text, '${SparkFunctionShimSql.MarkerArgSeparator}', path);",
       // Fallback for non-literal Spark `last_value(expr, ignoreNulls)` calls.
       // Literal boolean flags are handled in the pre-pass with DuckDB's native
       // `IGNORE NULLS` modifier; dynamic flags keep the legacy compile-time
