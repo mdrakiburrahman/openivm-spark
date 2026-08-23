@@ -10,16 +10,16 @@ import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
-class CreateMaterializationAdmissionSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
+class CreateCatalogPublicationAdmissionSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   private var spark: SparkSession = _
 
   override def beforeAll(): Unit = {
     spark = SparkSession
       .builder()
       .master("local[2]")
-      .appName("openivm-spark-CreateMaterializationAdmissionSpec")
+      .appName("openivm-spark-CreateCatalogPublicationAdmissionSpec")
       .config("spark.ui.enabled", "false")
-      .config(FeatureGate.CreateMaterializationMaxConcurrentKey, "2")
+      .config(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "2")
       .getOrCreate()
   }
 
@@ -30,8 +30,8 @@ class CreateMaterializationAdmissionSpec extends AnyFunSpec with Matchers with B
       SparkSession.clearDefaultSession()
     }
 
-  describe("CreateMaterializationAdmission") {
-    it("admits independent materializations concurrently while bounding the publication phase") {
+  describe("CreateCatalogPublicationAdmission") {
+    it("bounds only the named catalog-publication phase") {
       val pool       = Executors.newFixedThreadPool(6)
       val active     = new AtomicInteger(0)
       val maxActive  = new AtomicInteger(0)
@@ -48,7 +48,7 @@ class CreateMaterializationAdmissionSpec extends AnyFunSpec with Matchers with B
         implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
         val tasks = (1 to 6).map { _ =>
           Future {
-            CreateMaterializationAdmission.withPermit(spark) {
+            CreateCatalogPublicationAdmission.withPermit(spark) {
               val current = active.incrementAndGet()
               recordMax(current)
               firstTwo.countDown()
@@ -72,37 +72,13 @@ class CreateMaterializationAdmissionSpec extends AnyFunSpec with Matchers with B
       }
     }
 
-    it("releases a permit when a materialization fails") {
+    it("releases a permit when catalog publication fails") {
       intercept[IllegalStateException] {
-        CreateMaterializationAdmission.withPermit(spark) {
+        CreateCatalogPublicationAdmission.withPermit(spark) {
           throw new IllegalStateException("expected")
         }
       }
-      CreateMaterializationAdmission.withPermit(spark)(42) shouldBe 42
-    }
-  }
-
-  describe("CreateMaterializationTiming") {
-    it("splits a CTAS at the Delta commit boundary and clamps stale commit timestamps") {
-      CreateMaterializationTiming.fromDeltaCommit(
-        startedAtEpochMs = 1000L,
-        totalNanos = TimeUnit.SECONDS.toNanos(10L),
-        committedAtEpochMs = 7000L
-      ) shouldBe CreateMaterializationTiming(
-        totalMs = 10000L,
-        dataWriteMs = 6000L,
-        hiveCatalogPublicationMs = 4000L
-      )
-
-      CreateMaterializationTiming.fromDeltaCommit(
-        startedAtEpochMs = 1000L,
-        totalNanos = TimeUnit.SECONDS.toNanos(10L),
-        committedAtEpochMs = 500L
-      ) shouldBe CreateMaterializationTiming(
-        totalMs = 10000L,
-        dataWriteMs = 0L,
-        hiveCatalogPublicationMs = 10000L
-      )
+      CreateCatalogPublicationAdmission.withPermit(spark)(42) shouldBe 42
     }
   }
 }

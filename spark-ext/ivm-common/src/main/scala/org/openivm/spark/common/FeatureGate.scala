@@ -144,17 +144,15 @@ object FeatureGate {
     */
   val MetricsEnabledKey: String = "spark.openivm.metrics.enabled"
 
-  /** Bound only the eager Delta CTAS + external-catalog portion of concurrent
-    * CREATE MATERIALIZED VIEW commands. Analysis, compilation, watermark
-    * capture, and metadata publication remain concurrent.
-    *
-    * The default width of four is the measured throughput knee for the local
-    * 32-way CREATE workload. The minimum is two so this phase gate never
-    * becomes a process-global CREATE serializer.
+  /** Optional bound for the named external-catalog registration that follows
+    * an MV's path-based Delta CTAS. The default preserves 32-way request
+    * capacity; operators can reduce it explicitly, and execution spans expose
+    * both the configured width and any resulting wait.
     */
-  val CreateMaterializationMaxConcurrentKey: String =
-    "spark.openivm.create.maxConcurrentMaterializations"
-  val CreateMaterializationDefaultMaxConcurrent: Int = 4
+  val CreateCatalogPublicationMaxConcurrentKey: String =
+    "spark.openivm.create.maxConcurrentCatalogPublications"
+  val CreateCatalogPublicationDefaultMaxConcurrent: Int = 32
+  val CreateCatalogPublicationMaximum: Int              = 32
 
   /** Capture a Spark `EXPLAIN FORMATTED` physical plan per executed refresh
     * statement, recorded alongside the SQL in the query log. Default OFF so it
@@ -492,17 +490,20 @@ object FeatureGate {
   def metricsEnabled(spark: SparkSession): Boolean =
     metricsEnabled(spark.sparkContext.getConf)
 
-  def createMaterializationMaxConcurrent(conf: SparkConf): Int =
+  def createCatalogPublicationMaxConcurrent(conf: SparkConf): Int =
     math.max(
       2,
-      conf.getInt(
-        CreateMaterializationMaxConcurrentKey,
-        CreateMaterializationDefaultMaxConcurrent
+      math.min(
+        CreateCatalogPublicationMaximum,
+        conf.getInt(
+          CreateCatalogPublicationMaxConcurrentKey,
+          CreateCatalogPublicationDefaultMaxConcurrent
+        )
       )
     )
 
-  def createMaterializationMaxConcurrent(spark: SparkSession): Int =
-    createMaterializationMaxConcurrent(spark.sparkContext.getConf)
+  def createCatalogPublicationMaxConcurrent(spark: SparkSession): Int =
+    createCatalogPublicationMaxConcurrent(spark.sparkContext.getConf)
 
   def explainCaptureEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)

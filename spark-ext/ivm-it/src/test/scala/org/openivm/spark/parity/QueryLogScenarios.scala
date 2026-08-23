@@ -47,7 +47,7 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
     }
 
   describe("RefreshSqlLog — CREATE path") {
-    it("emits original_query and initial_load_ctas rows with mode=create") {
+    it("emits path CTAS and named registration rows in stable order") {
       clearLog()
       sql("CREATE TABLE qlog_t1 (k INT, v INT) USING DELTA")
       sql("INSERT INTO qlog_t1 VALUES (1, 10), (2, 20)")
@@ -63,6 +63,7 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
       val cats      = byRid(createRid).toSet
       cats should contain("original_query")
       cats should contain("initial_load_ctas")
+      cats should contain("catalog_registration")
 
       val createRows = rows.filter(_.getString(ColRefreshId) == createRid)
       createRows.foreach(_.getString(ColMode) shouldBe "create")
@@ -74,7 +75,40 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
 
       val initRow = createRows.find(_.getString(ColCategory) == "initial_load_ctas").get
       initRow.getInt(ColStmtOrder) shouldBe 0
-      initRow.getString(ColSqlText) should include("CREATE TABLE")
+      initRow.getString(ColSqlText) should include("CREATE TABLE delta.`")
+
+      val registrationRow = createRows.find(_.getString(ColCategory) == "catalog_registration").get
+      registrationRow.getInt(ColStmtOrder) shouldBe 1
+      registrationRow.getString(ColSqlText) should include("CREATE TABLE IF NOT EXISTS")
+      registrationRow.getString(ColSqlText) should include("USING DELTA LOCATION")
+      registrationRow.getString(ColSqlText) should not include " AS SELECT "
+    }
+
+    it("logs an optional backing user view after catalog registration") {
+      clearLog()
+      sql("CREATE TABLE qlog_t1_backing (k INT, v INT) USING DELTA")
+      sql("INSERT INTO qlog_t1_backing VALUES (1, 10), (1, 20), (2, 5)")
+      sql(
+        "CREATE MATERIALIZED VIEW qlog_mv1_backing AS " +
+          "SELECT k, SUM(v) AS s FROM qlog_t1_backing GROUP BY k HAVING SUM(v) > 10"
+      )
+
+      val rows      = showLog()
+      val createRid = categoriesByRefresh(rows).keys.find(_.contains("_create_mv_")).get
+      val createRows = rows
+        .filter(_.getString(ColRefreshId) == createRid)
+        .sortBy(_.getInt(ColStmtOrder))
+
+      createRows.map(_.getString(ColCategory)) should contain inOrderOnly (
+        "original_query",
+        "initial_load_ctas",
+        "catalog_registration",
+        "backing_user_view"
+      )
+      createRows
+        .find(_.getString(ColCategory) == "backing_user_view")
+        .get
+        .getInt(ColStmtOrder) shouldBe 2
     }
   }
 

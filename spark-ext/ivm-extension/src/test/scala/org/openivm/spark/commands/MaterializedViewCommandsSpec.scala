@@ -1,11 +1,13 @@
 package org.openivm.spark.commands
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import io.delta.tables.DeltaTable
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{
@@ -30,6 +32,7 @@ import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -249,6 +252,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
     }
 
+    describe("CREATE data and catalog SQL shape") {
+      it("uses a path CTAS followed by a named Delta registration") {
+        val dataSql = MvCommandHelper.createDataWriteSql(
+          location = "/warehouse/mv_shape",
+          clusterClause = "CLUSTER BY (`id`) ",
+          tablePropertiesClause = "TBLPROPERTIES ('delta.appendOnly' = 'false') ",
+          querySql = "SELECT id FROM source_shape"
+        )
+        val registrationSql = MvCommandHelper.createCatalogRegistrationSql(
+          TableIdentifier("mv_shape", Some("default")),
+          "/warehouse/mv_shape"
+        )
+
+        dataSql shouldBe
+          "CREATE TABLE delta.`/warehouse/mv_shape` USING DELTA " +
+          "CLUSTER BY (`id`) TBLPROPERTIES ('delta.appendOnly' = 'false') " +
+          "AS SELECT id FROM source_shape"
+        dataSql should not include "default.mv_shape"
+        registrationSql shouldBe
+          "CREATE TABLE IF NOT EXISTS `default`.`mv_shape` USING DELTA LOCATION '/warehouse/mv_shape'"
+        registrationSql should not include " AS SELECT "
+      }
+
+      it("rejects a named relation that points at a different backing table") {
+        spark.sql("CREATE TABLE mv_shape_conflict(id INT) USING DELTA")
+
+        an[AnalysisException] should be thrownBy {
+          MvCommandHelper.validateCatalogRegistration(
+            spark,
+            TableIdentifier("mv_shape_conflict"),
+            s"$warehouseDir/_ivm/views/mv_shape_conflict",
+            requireExists = false
+          )
+        }
+      }
+    }
+
     it("recognizes replacement CDF verdicts and explicit staging overwrites") {
       MvCommandHelper.hasReplacementBatch(Seq.empty, Seq(BatchVerdict.Replace)) shouldBe true
       MvCommandHelper.hasReplacementBatch(
@@ -441,7 +481,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       payload.path("outcome").asText() shouldBe "create_executed"
       payload.has("analysis_ms") shouldBe true
       payload.has("watermark_ms") shouldBe true
-      payload.has("ctas_admission_wait_ms") shouldBe true
+      payload.path("catalog_publication_admission_width").asInt() shouldBe 32
+      payload.has("catalog_publication_admission_wait_ms") shouldBe true
       payload.has("ctas_ms") shouldBe true
       payload.has("ctas_data_write_ms") shouldBe true
       payload.has("hive_catalog_publication_ms") shouldBe true
@@ -450,6 +491,88 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         payload.path("hive_catalog_publication_ms").asLong() shouldBe
         payload.path("ctas_ms").asLong()
       assertBagEqual("mv_t1a_phases", "SELECT id, label FROM sales_t1a WHERE id >= 0")
+    }
+
+    it("reuses a committed Delta path after failure before named registration") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_retry(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_retry VALUES (1, 'one'), (2, 'two'), (2, 'two')")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t1a_retry_keeper AS " +
+          "SELECT id, label FROM sales_t1a_retry"
+      )
+
+      val name     = "mv_t1a_retry"
+      val viewBody = "SELECT id, label FROM sales_t1a_retry WHERE id >= 0"
+      val location = MvCommandHelper.mvLocation(spark, TableIdentifier(name))
+      val injected = new AtomicBoolean(false)
+
+      val failure = intercept[IllegalStateException] {
+        CommandConcurrencyInjection.withAfterCreateDataWrite({
+          if (injected.compareAndSet(false, true))
+            throw new IllegalStateException("fail between data commit and catalog registration")
+        }) {
+          spark.sql(s"CREATE MATERIALIZED VIEW $name AS $viewBody").collect()
+        }
+      }
+      failure.getMessage should include("between data commit and catalog registration")
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+      spark.catalog.tableExists(name) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier(name)) shouldBe empty
+      val versionsAfterFailure = DeltaTable.forPath(spark, location).history().count()
+
+      spark.sql("INSERT INTO sales_t1a_retry VALUES (3, 'three')")
+      spark.sql(s"CREATE MATERIALIZED VIEW $name AS $viewBody").collect()
+
+      DeltaTable.forPath(spark, location).history().count() shouldBe versionsAfterFailure
+      MvCatalog.lookup(spark, TableIdentifier(name)).map(_.location) shouldBe Some(location)
+      val tableMetadata = spark.sessionState.catalog.getTableMetadata(TableIdentifier(name))
+      tableMetadata.provider shouldBe Some("delta")
+      new Path(tableMetadata.location).toUri shouldBe new Path(location).toUri
+      spark.table(name).filter("id = 3").count() shouldBe 0L
+      spark.sql(s"REFRESH MATERIALIZED VIEW $name").collect()
+      assertBagEqual(name, viewBody)
+    }
+
+    it("allows independent path CTAS phases to enter concurrently") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_1(id INT, label STRING) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_2(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_overlap_1 VALUES (1, 'one'), (2, 'two')")
+      spark.sql("INSERT INTO sales_t1a_overlap_2 VALUES (3, 'three'), (4, 'four')")
+
+      val bothEntered = new CountDownLatch(2)
+      val releaseBoth = new CountDownLatch(1)
+      CommandConcurrencyInjection.withBeforeCreateDataWrite({
+        bothEntered.countDown()
+        bothEntered.await(30L, TimeUnit.SECONDS) shouldBe true
+        releaseBoth.await(30L, TimeUnit.SECONDS) shouldBe true
+      }) {
+        withPool(2) { implicit ec =>
+          val first = Future {
+            spark
+              .sql(
+                "CREATE MATERIALIZED VIEW mv_t1a_overlap_1 AS " +
+                  "SELECT id, label FROM sales_t1a_overlap_1"
+              )
+              .collect()
+          }
+          val second = Future {
+            spark
+              .sql(
+                "CREATE MATERIALIZED VIEW mv_t1a_overlap_2 AS " +
+                  "SELECT id, label FROM sales_t1a_overlap_2"
+              )
+              .collect()
+          }
+          bothEntered.await(30L, TimeUnit.SECONDS) shouldBe true
+          first.isCompleted shouldBe false
+          second.isCompleted shouldBe false
+          releaseBoth.countDown()
+          awaitResult(Future.sequence(Seq(first, second)))
+        }
+      }
+
+      assertBagEqual("mv_t1a_overlap_1", "SELECT id, label FROM sales_t1a_overlap_1")
+      assertBagEqual("mv_t1a_overlap_2", "SELECT id, label FROM sales_t1a_overlap_2")
     }
   }
 

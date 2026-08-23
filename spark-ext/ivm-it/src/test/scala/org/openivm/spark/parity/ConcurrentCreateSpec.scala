@@ -28,7 +28,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
       .config("spark.sql.warehouse.dir", warehouseDir)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "4")
-      .config(FeatureGate.CreateMaterializationMaxConcurrentKey, "2")
+      .config(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "32")
       .config(FeatureGate.DriverAdmissionEnabledKey, "false")
       .config("spark.openivm.driverAdmission.maxConcurrentHeavyStatements", "1")
       .config("spark.openivm.driverAdmission.minHeapHeadroom", "512m")
@@ -40,7 +40,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
   }
 
   describe("concurrent CREATE MATERIALIZED VIEW against a fresh schema") {
-    it("queues eight independent leaf MVs through two publication lanes without changing results") {
+    it("creates eight independent leaf MVs at full configured capacity without changing results") {
       val schema = "cc_schema"
       sql(s"CREATE DATABASE IF NOT EXISTS $schema")
 

@@ -171,7 +171,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
     it("emits always-on CREATE phase timing without requiring profile rows") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.create_phases_mv", "create")
-        OpenIvmExecutionSpan.observeTimer("create.materialization_admission.wait", millis(19L))
+        OpenIvmExecutionSpan.recordActiveCatalogPublicationAdmission(7, millis(19L))
         span.recordProfileStep("create_analyze_query", "", 11L)
         span.recordProfileStep("create_capture_watermarks", "", 13L)
         span.recordProfileStep("create_ctas_total", "", 41L)
@@ -185,7 +185,8 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
 
       payloads should have size 1
       val payload = payloads.head
-      payload.get("ctas_admission_wait_ms").asLong() shouldBe 19L
+      payload.get("catalog_publication_admission_width").asInt() shouldBe 7
+      payload.get("catalog_publication_admission_wait_ms").asLong() shouldBe 19L
       payload.get("analysis_ms").asLong() shouldBe 11L
       payload.get("watermark_ms").asLong() shouldBe 13L
       payload.get("ctas_ms").asLong() shouldBe 41L

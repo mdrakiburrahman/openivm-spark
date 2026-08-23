@@ -30,12 +30,12 @@ object OpenIvmMetrics extends Logging {
   val CtasQueueDepth: AtomicInteger     = atomicIntegerGauge("ctas.queue_depth")
   val CtasAdmissionWidth: AtomicInteger = atomicIntegerGauge("ctas.admission_width")
   val CtasActiveThreads: AtomicInteger  = atomicIntegerGauge("ctas.active_threads")
-  val CreateMaterializationWidth: AtomicInteger =
-    atomicIntegerGauge("create.materialization_admission.width")
-  val CreateMaterializationQueued: AtomicInteger =
-    atomicIntegerGauge("create.materialization_admission.queued")
-  val CreateMaterializationInflight: AtomicInteger =
-    atomicIntegerGauge("create.materialization_admission.inflight")
+  val CreateCatalogPublicationWidth: AtomicInteger =
+    atomicIntegerGauge("create.catalog_publication_admission.width")
+  val CreateCatalogPublicationQueued: AtomicInteger =
+    atomicIntegerGauge("create.catalog_publication_admission.queued")
+  val CreateCatalogPublicationInflight: AtomicInteger =
+    atomicIntegerGauge("create.catalog_publication_admission.inflight")
   val DriverAdmissionWidth: AtomicInteger =
     atomicIntegerGauge("driver_admission.width")
   val DriverAdmissionQueued: AtomicInteger =
@@ -363,7 +363,7 @@ object OpenIvmMetrics extends Logging {
       "refresh.lock.wait",
       "refresh.sql_stmt.merge",
       "create.phase.create_mv_initial_load",
-      "create.materialization_admission.wait",
+      "create.catalog_publication_admission.wait",
       "compiler.compile"
     )
       .foreach(timer)

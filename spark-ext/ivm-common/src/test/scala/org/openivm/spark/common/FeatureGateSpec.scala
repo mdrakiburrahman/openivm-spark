@@ -134,15 +134,18 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  describe("FeatureGate.createMaterializationMaxConcurrent") {
-    it("defaults to four concurrent CTAS publications and never serializes globally") {
-      FeatureGate.createMaterializationMaxConcurrent(new SparkConf(false)) shouldBe 4
-      FeatureGate.createMaterializationMaxConcurrent(
-        new SparkConf(false).set(FeatureGate.CreateMaterializationMaxConcurrentKey, "7")
+  describe("FeatureGate.createCatalogPublicationMaxConcurrent") {
+    it("preserves 32-way capacity by default and clamps explicit bounds to 2 through 32") {
+      FeatureGate.createCatalogPublicationMaxConcurrent(new SparkConf(false)) shouldBe 32
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "7")
       ) shouldBe 7
-      FeatureGate.createMaterializationMaxConcurrent(
-        new SparkConf(false).set(FeatureGate.CreateMaterializationMaxConcurrentKey, "1")
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "1")
       ) shouldBe 2
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "64")
+      ) shouldBe 32
     }
   }
 

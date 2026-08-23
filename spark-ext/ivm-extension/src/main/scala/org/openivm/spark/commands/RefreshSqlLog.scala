@@ -46,7 +46,8 @@ final class RefreshSqlLog private (
     * inactive. NEVER throws — telemetry must not fail the refresh.
     *
     * @param category   stable enum tag (`original_query`, `initial_load_ctas`,
-    *                   `aggregate_having_view`, `register_source_delta`,
+    *                   `catalog_registration`, `backing_user_view`,
+    *                   `register_source_delta`,
     *                   `rewritten_stmt`, `count_monoid_cleanup`,
     *                   `post_cleanup_stage`, `drop_cleanup`,
     *                   `full_refresh_stmt`, `fused_view_delta_select`).

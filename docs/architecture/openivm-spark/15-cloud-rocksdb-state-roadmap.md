@@ -232,13 +232,24 @@ timestamps, queue delay, thread, outcome, and observed in-flight concurrency for
 an A/B trace view.
 
 Direct concurrent CREATE requests that do not arrive through a batch dispatcher
-still share one Spark driver and catalog. OpenIVM therefore admits only the eager
-Delta CTAS plus its synchronous post-commit external-catalog tail through four
-fair, application-scoped lanes by default. Analysis, compilation, watermark
-capture, optional backing-view creation, and OpenIVM metadata publication remain
-concurrent. This is not a global CREATE mutex.
-Override the width with `spark.openivm.create.maxConcurrentMaterializations`;
-values below two are coerced to two.
+still share one Spark driver and catalog. Each request first executes its Delta
+CTAS through a path identifier, so data planning, execution, and commit remain
+fully concurrent and do not publish a named Hive relation. After that commit,
+OpenIVM runs only
+`CREATE TABLE IF NOT EXISTS <name> USING DELTA LOCATION <path>` through an
+application-scoped catalog-publication gate. The default width is 32,
+preserving the benchmark's full request capacity; an explicit
+`spark.openivm.create.maxConcurrentCatalogPublications` value is clamped to
+2–32. Execution spans always expose the configured publication width and wait,
+including zero wait, so a reduced capacity cannot be hidden from benchmark
+guards. Analysis, compilation, watermark capture, optional backing-view
+creation, and OpenIVM metadata publication remain concurrent.
+
+The path CTAS persists its captured source watermarks as internal Delta table
+properties, marked by `_ivm_create_watermarks_v1`. If the driver fails after the
+Delta commit but before named registration or OpenIVM metadata publication, the
+retry reuses both the committed data and those original watermarks. It therefore
+does not add another data commit or skip changes that arrived between attempts.
 
 A clean deployed comparison used ten CTAS jobs over a one-million-row source:
 

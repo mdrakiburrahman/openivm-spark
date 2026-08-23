@@ -193,12 +193,15 @@ The JSON fields are stable and intentionally low-cardinality:
 `compile_refresh_type`, `effective_refresh_type`, and `refresh_reason`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
 `catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`. CREATE spans also
-include `ctas_admission_wait_ms`, `analysis_ms`, `watermark_ms`, `ctas_ms`,
-`ctas_data_write_ms`, `hive_catalog_publication_ms`, and
-`metadata_publication_ms`. `ctas_data_write_ms` ends at the Delta history commit
-timestamp; `hive_catalog_publication_ms` is the remaining synchronous CTAS
-command tail, including Delta post-commit hooks and external-catalog
-publication. Their sum equals `ctas_ms`.
+include `catalog_publication_admission_width`,
+`catalog_publication_admission_wait_ms`, `analysis_ms`, `watermark_ms`,
+`ctas_ms`, `ctas_data_write_ms`, `hive_catalog_publication_ms`, and
+`metadata_publication_ms`. The admission width and wait are emitted even when
+the wait is zero, so benchmark guards can see an explicitly reduced publication
+capacity. `ctas_data_write_ms` directly times the path-identifier Delta CTAS;
+`hive_catalog_publication_ms` directly times the subsequent named
+`CREATE TABLE ... USING DELTA LOCATION` registration. Their sum equals
+`ctas_ms`.
 CREATE records the authoritative classification once it is known. REFRESH reads
 the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
 runs still emit the same three fields without recompiling. Legacy metadata rows
@@ -207,6 +210,11 @@ set `compile_refresh_type` to that same value, and omit `refresh_reason`.
 `rocksdb_backup_ms` is best-effort only: async state backup may finish after the
 primary span is emitted, and that late completion does NOT trigger a duplicate
 `OPENIVM_EXECUTION_SPAN` line.
+
+When query logging is enabled, CREATE records the path CTAS as
+`category=initial_load_ctas, stmt_order=0`, the named registration as
+`category=catalog_registration, stmt_order=1`, and an optional backing user
+view as `category=backing_user_view, stmt_order=2`.
 
 The CREATE phase fields are collected even when
 `spark.openivm.profile.refresh=false` and

@@ -22,31 +22,32 @@ final class OpenIvmExecutionSpan private[telemetry] (
 
   private val lock = new Object
 
-  private var refreshClassification = OpenIvmExecutionSpan.RefreshClassification.empty
-  private var sameMvLockWaitMs      = Option.empty[Long]
-  private var driverAdmissionMs     = Option.empty[Long]
-  private var ctasAdmissionMs       = Option.empty[Long]
-  private var compilerMs            = Option.empty[Long]
-  private var catalogMs             = Option.empty[Long]
-  private var rocksDbWriteMs        = Option.empty[Long]
-  private var rocksDbWriteCount     = 0L
-  private var analysisMs            = Option.empty[Long]
-  private var watermarkMs           = Option.empty[Long]
-  private var ctasMs                = Option.empty[Long]
-  private var ctasDataWriteMs       = Option.empty[Long]
-  private var hiveCatalogPublishMs  = Option.empty[Long]
-  private var metadataPublicationMs = Option.empty[Long]
-  private var rocksDbFlushMs        = Option.empty[Long]
-  private var rocksDbFlushCount     = 0L
-  private var rocksDbFlushFailures  = 0L
-  private var rocksDbJvmLockWaitMs  = Option.empty[Long]
-  private var rocksDbExternalWaitMs = Option.empty[Long]
-  private var rocksDbBackupMs       = Option.empty[Long]
-  private var completedAtEpochMs    = Option.empty[Long]
-  private var completedAtNanos      = Option.empty[Long]
-  private var outcome               = Option.empty[String]
-  private var driverThread          = Option.empty[String]
-  private var emitted               = false
+  private var refreshClassification            = OpenIvmExecutionSpan.RefreshClassification.empty
+  private var sameMvLockWaitMs                 = Option.empty[Long]
+  private var driverAdmissionMs                = Option.empty[Long]
+  private var catalogPublicationAdmissionWidth = Option.empty[Int]
+  private var catalogPublicationAdmissionMs    = Option.empty[Long]
+  private var compilerMs                       = Option.empty[Long]
+  private var catalogMs                        = Option.empty[Long]
+  private var rocksDbWriteMs                   = Option.empty[Long]
+  private var rocksDbWriteCount                = 0L
+  private var analysisMs                       = Option.empty[Long]
+  private var watermarkMs                      = Option.empty[Long]
+  private var ctasMs                           = Option.empty[Long]
+  private var ctasDataWriteMs                  = Option.empty[Long]
+  private var hiveCatalogPublishMs             = Option.empty[Long]
+  private var metadataPublicationMs            = Option.empty[Long]
+  private var rocksDbFlushMs                   = Option.empty[Long]
+  private var rocksDbFlushCount                = 0L
+  private var rocksDbFlushFailures             = 0L
+  private var rocksDbJvmLockWaitMs             = Option.empty[Long]
+  private var rocksDbExternalWaitMs            = Option.empty[Long]
+  private var rocksDbBackupMs                  = Option.empty[Long]
+  private var completedAtEpochMs               = Option.empty[Long]
+  private var completedAtNanos                 = Option.empty[Long]
+  private var outcome                          = Option.empty[String]
+  private var driverThread                     = Option.empty[String]
+  private var emitted                          = false
 
   private[telemetry] def matchesCommand(expectedView: String, expectedOperation: String): Boolean =
     lock.synchronized {
@@ -82,9 +83,10 @@ final class OpenIvmExecutionSpan private[telemetry] (
       driverAdmissionMs = addDuration(driverAdmissionMs, durationMs)
     }
 
-  def recordCtasAdmissionWait(durationMs: Long): Unit =
+  def recordCatalogPublicationAdmission(width: Int, durationMs: Long): Unit =
     recordBeforeComplete {
-      ctasAdmissionMs = addDuration(ctasAdmissionMs, durationMs)
+      catalogPublicationAdmissionWidth = Some(width)
+      catalogPublicationAdmissionMs = addDuration(catalogPublicationAdmissionMs, durationMs)
     }
 
   def recordCompiler(durationMs: Long): Unit =
@@ -226,7 +228,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 refreshReason = refreshClassification.refreshReason,
                 sameMvLockWaitMs = sameMvLockWaitMs,
                 driverAdmissionWaitMs = driverAdmissionMs,
-                ctasAdmissionWaitMs = ctasAdmissionMs,
+                catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
+                catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
                 compilerMs = compilerMs,
                 catalogMs = catalogMs,
                 rocksDbWriteMs = rocksDbWriteMs,
@@ -404,6 +407,15 @@ object OpenIvmExecutionSpan extends Logging {
       )
     )
 
+  def recordActiveCatalogPublicationAdmission(width: Int, nanos: Long): Unit =
+    if (nanos >= 0L)
+      Option(current.get()).foreach(
+        _.recordCatalogPublicationAdmission(
+          width,
+          TimeUnit.NANOSECONDS.toMillis(nanos)
+        )
+      )
+
   def withCaptured[A](captured: Option[OpenIvmExecutionSpan])(body: => A): A = {
     val previous = Option(current.get())
     captured match {
@@ -427,8 +439,6 @@ object OpenIvmExecutionSpan extends Logging {
         withCurrentOrPending("create", durationMs)
       case "driver_admission.refresh.wait" =>
         withCurrentOrPending("refresh", durationMs)
-      case "create.materialization_admission.wait" =>
-        Option(current.get()).foreach(_.recordCtasAdmissionWait(durationMs))
       case "compiler.compile" =>
         Option(current.get()).foreach(_.recordCompiler(durationMs))
       case name if isCatalogMetric(name) =>
@@ -549,7 +559,8 @@ object OpenIvmExecutionSpan extends Logging {
       refreshReason: Option[String],
       sameMvLockWaitMs: Option[Long],
       driverAdmissionWaitMs: Option[Long],
-      ctasAdmissionWaitMs: Option[Long],
+      catalogPublicationAdmissionWidth: Option[Int],
+      catalogPublicationAdmissionWaitMs: Option[Long],
       compilerMs: Option[Long],
       catalogMs: Option[Long],
       rocksDbWriteMs: Option[Long],
@@ -582,7 +593,12 @@ object OpenIvmExecutionSpan extends Logging {
     refreshReason.foreach(fields.put("refresh_reason", _))
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
-    ctasAdmissionWaitMs.foreach(v => fields.put("ctas_admission_wait_ms", java.lang.Long.valueOf(v)))
+    catalogPublicationAdmissionWidth.foreach(v =>
+      fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
+    )
+    catalogPublicationAdmissionWaitMs.foreach(v =>
+      fields.put("catalog_publication_admission_wait_ms", java.lang.Long.valueOf(v))
+    )
     compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
     catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
     rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
