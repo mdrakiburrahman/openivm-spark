@@ -705,11 +705,16 @@ The create-time log field `emits_cascade_view_delta` is true only when both
 conditions hold:
 
 ```scala
-RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
   SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 ```
 
-Source: `MaterializedViewCommands.scala:626-628`.
+`mayEmitCascadeViewDelta` permits `FULL_REFRESH` in addition to the incremental
+types in `emitsCascadeViewDelta`; `hasRealDelta` over the compiled program is
+what decides, so a FULL_REFRESH without a verified companion still reports
+`false`.
+
+Source: `MaterializedViewCommands.scala` (`classifyEffectiveRefreshType`).
 
 The field is then written into the create-time decision log at
 `MaterializedViewCommands.scala:630-638`:

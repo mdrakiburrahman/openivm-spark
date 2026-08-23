@@ -271,13 +271,19 @@ CREATE computes whether this MV emits a downstream-consumable view delta.
 The condition is:
 
 ```scala
-RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
   SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 ```
 
-Source:
+`mayEmitCascadeViewDelta` is a permission set, never a verdict — it adds
+`FULL_REFRESH` on top of `emitsCascadeViewDelta` (which stays the fail-closed
+fallback for legacy metadata) because openivm's
+`refresh_sql.cpp build_split_safe_full_refresh_companion` emits an exact signed
+companion around every Spark-dialect FULL_REFRESH recompute. Capability is
+decided by `hasRealDelta` over the actual compiled program, not by the label.
 
-- `MaterializedViewCommands.scala:626-629`
+Source:
+- `MaterializedViewCommands.scala` (`classifyEffectiveRefreshType`)
 - `RefreshTypeCode.scala:20-76`
 - `SparkRefreshRewriter.scala:1868-1879`
   The classification log line includes `emits_cascade_view_delta='<boolean>'`. That boolean is true only when both conditions are true.
@@ -851,8 +857,8 @@ flowchart TD
     S --> AF[Advance lastVersion]
     AF --> AG[markConsumed input staging]
     AG --> AH[pruneFullyConsumed]
-    AH --> AI{non-cascade upstream has downstream?}
-    AI -- yes --> AJ[Record synthetic trigger row]
+    AH --> AI{upstream snapshot trigger needed?}
+    AI -- yes --> AJ[Record synthetic replacement trigger row]
     AI -- no --> AK[Return]
     AJ --> AK
 ```
