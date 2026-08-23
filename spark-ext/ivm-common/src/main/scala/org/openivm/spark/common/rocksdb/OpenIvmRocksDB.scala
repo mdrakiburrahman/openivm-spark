@@ -208,7 +208,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private def writePhysicalBatch(batch: WriteBatch, stats: BatchStats): Unit = {
     val started      = System.nanoTime()
     val localDb      = ensureLoaded()
-    val writeOptions = new WriteOptions().setSync(false).setDisableWAL(!conf.walEnabled)
+    val writeOptions = new WriteOptions().setSync(conf.walEnabled).setDisableWAL(!conf.walEnabled)
     var failed       = true
     try {
       localDb.write(writeOptions, batch)
@@ -241,11 +241,13 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
 
       val localDb = ensureLoaded()
-      // Persist the data and its undo records together before publishing the
-      // manifest. The post-manifest commit marker and undo cleanup are
-      // recoverable from that manifest; the next commit or close can coalesce
-      // them instead of forcing two more tiny SST flushes.
-      flushDirtyColumnFamilies(localDb)
+      // A synchronous WAL write makes the data and undo records durable
+      // without forcing a tiny SST for every catalog update. WAL-disabled
+      // deployments still require an atomic flush before publishing the
+      // logical commit manifest.
+      if (!conf.walEnabled) {
+        flushDirtyColumnFamilies(localDb)
+      }
       sstCount = sstFileCountInternal(localDb)
 
       val nextVersion = versionValue + 1L

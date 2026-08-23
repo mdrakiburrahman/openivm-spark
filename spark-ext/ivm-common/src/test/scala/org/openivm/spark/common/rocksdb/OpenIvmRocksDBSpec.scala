@@ -146,8 +146,9 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
     }
 
     it("flushes only the column families touched by the batch") {
-      val dir = newDbDir("flush-targets")
-      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta", "props"))
+      val dir  = newDbDir("flush-targets")
+      val conf = OpenIvmRocksDBConf.default.copy(walEnabled = false)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta", "props"))
 
       try {
         val flushed = ArrayBuffer.empty[Seq[String]]
@@ -167,8 +168,9 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
     }
 
     it("propagates a flush failure and rolls back the uncommitted batch") {
-      val dir = newDbDir("flush-failure")
-      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+      val dir  = newDbDir("flush-failure")
+      val conf = OpenIvmRocksDBConf.default.copy(walEnabled = false)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
 
       try {
         db.load()
@@ -212,7 +214,7 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
 
     it("streams oversized write batches into bounded commits") {
       val dir  = newDbDir("bounded-batch")
-      val conf = OpenIvmRocksDBConf.default.copy(maxWriteBatchBytes = 32L)
+      val conf = OpenIvmRocksDBConf.default.copy(walEnabled = false, maxWriteBatchBytes = 32L)
       val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
 
       try {
@@ -231,6 +233,27 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
         db.currentVersion shouldBe 1L
         flushed should have size 1
         flushed.head.toSet shouldBe Set("meta", OpenIvmRocksDB.InternalTxnColumnFamilyName)
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("uses synchronous WAL commits without flushing each batch") {
+      val dir = newDbDir("wal-commit")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+
+      try {
+        val flushed = ArrayBuffer.empty[Seq[String]]
+        db.setBeforeFlushHookForTesting(columnFamilies => flushed.synchronized { flushed += columnFamilies.sorted })
+        db.load()
+        db.withBatch { batch =>
+          db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+        }
+
+        db.get("meta", RocksDBCodec.utf8("k")).map(RocksDBCodec.fromUtf8) shouldBe Some("v")
+        db.currentVersion shouldBe 1L
+        flushed shouldBe empty
       } finally {
         closeQuietly(db)
         deleteRecursively(dir)
@@ -417,7 +440,8 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
     it("allows coalesced flushes for unrelated shards to overlap") {
       val dbCount   = 8
       val dirs      = (1 to dbCount).map(index => newDbDir(s"parallel-flush-$index"))
-      val dbs       = dirs.map(dir => new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta")))
+      val conf      = OpenIvmRocksDBConf.default.copy(walEnabled = false)
+      val dbs       = dirs.map(dir => new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta")))
       val ready     = new CountDownLatch(dbCount)
       val release   = new CountDownLatch(1)
       val active    = new AtomicInteger(0)
