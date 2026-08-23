@@ -2,13 +2,7 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{
-  ChangeFeedMode,
-  MvCatalog,
-  RefreshTypeCode,
-  StagingCatalog,
-  StagingDelta
-}
+import org.openivm.spark.common.{ChangeFeedMode, MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
 
 import java.util.UUID
 

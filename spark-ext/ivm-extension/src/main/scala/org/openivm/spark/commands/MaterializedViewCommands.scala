@@ -862,10 +862,19 @@ private[commands] object MvCommandHelper {
       refreshType: Int,
       refreshTypeName: String,
       reason: String,
-      emitsCascadeViewDelta: Boolean
+      emitsCascadeViewDelta: Boolean,
+      upstreamSnapshotTrigger: Option[String] = None
   ) {
+
+    /** True only for a genuine downgrade: a compiled INCREMENTAL type that ends
+      * up executing as a full rebuild. A view openivm itself compiled to
+      * FULL_REFRESH is not a demotion — including when it reports as
+      * [[RefreshTypeCode.CascadeRecomputeName]] because its verified signed
+      * companion still feeds dependents.
+      */
     def isDemotionToFullRefresh: Boolean =
-      refreshType == RefreshTypeCode.FullRefresh && compileRefreshTypeName != refreshTypeName
+      refreshTypeName == RefreshTypeCode.FullRefreshName &&
+        compileRefreshTypeName != RefreshTypeCode.FullRefreshName
   }
 
   def authoritativeFullRefreshClassification(
@@ -875,7 +884,7 @@ private[commands] object MvCommandHelper {
     EffectiveClassification(
       compileRefreshTypeName = compileRefreshTypeName,
       refreshType = RefreshTypeCode.FullRefresh,
-      refreshTypeName = "FULL_REFRESH",
+      refreshTypeName = RefreshTypeCode.FullRefreshName,
       reason = refreshReason,
       emitsCascadeViewDelta = false
     )
@@ -967,20 +976,29 @@ private[commands] object MvCommandHelper {
     }.toMap
   }
 
-  /** `Some(reason)` when any upstream MV cannot feed a downstream-consumable
-    * `openivm_delta_<view>`, else `None`. Drives the `non_cascade_upstream`
-    * demotion below.
+  /** `Some(detail)` when any upstream MV cannot feed a downstream-consumable
+    * `openivm_delta_<view>`, else `None`.
     *
     * The verdict is the upstream's PERSISTED per-MV capability
     * ([[MvMetadata.emitsCascadeViewDelta]]), never its refresh-type label: a
     * FULL_REFRESH upstream whose compiled program carries openivm's verified
     * split-safe signed companion feeds downstream MVs just like an incremental
-    * one, and must not demote its dependents.
+    * one.
+    *
+    * This is DIAGNOSTIC ONLY — it never demotes. An upstream that cannot
+    * cascade leaves an OVERWRITE snapshot trigger behind on every refresh
+    * (`postRefreshCleanup`), and [[MvCommandHelper.hasReplacementBatch]] routes
+    * exactly those batches through a recompute while the dependent keeps its
+    * own incremental refresh type for every other batch. Permanently demoting
+    * the dependent instead would recompute batches that need no recompute and,
+    * worse, propagate: the demoted MV became non-cascade itself and demoted ITS
+    * dependents, collapsing whole DAG branches (54 nodes off five staging views
+    * in the local-spark-openivm canary).
     */
-  def computeNonCascadeUpstreamReason(upstreamMvByQual: Map[String, MvMetadata]): Option[String] = {
-    val nonCascadeUpstreams: Seq[(String, String)] =
+  def computeUpstreamSnapshotTriggerDetail(upstreamMvByQual: Map[String, MvMetadata]): Option[String] = {
+    val triggerUpstreams: Seq[(String, String)] =
       upstreamMvByQual.toSeq.collect {
-        case (q, m) if !m.emitsCascadeViewDelta => q -> "non_cascade"
+        case (q, m) if !m.emitsCascadeViewDelta => q -> "snapshot_trigger"
         // Deliberately NOT demoting on `upstream is AGGREGATE_GROUP` or
         // `upstream MV count >= 2`: two historical guards
         // (`aggregate_group_into_simple_projection`, `multi_mv_simple_projection`)
@@ -990,14 +1008,14 @@ private[commands] object MvCommandHelper {
         // parity. Re-adding either guard silently regresses incrementalization; the
         // full rationale lives in git history at this line.
       }
-    if (nonCascadeUpstreams.isEmpty) None
+    if (triggerUpstreams.isEmpty) None
     else
       Some(
-        nonCascadeUpstreams
+        triggerUpstreams
           .groupBy(_._2)
           .toSeq
           .sortBy(_._1)
-          .map { case (reason, entries) => s"$reason:${entries.map(_._1).mkString(",")}" }
+          .map { case (reason, entries) => s"$reason:${entries.map(_._1).sorted.mkString(",")}" }
           .mkString(";")
       )
   }
@@ -1011,19 +1029,17 @@ private[commands] object MvCommandHelper {
       viewShortName: String,
       topKViewSpec: TopKViewSpec,
       simpleProjectionHasDataApply: Boolean,
-      nonCascadeUpstreamReason: Option[String],
+      upstreamSnapshotTriggerDetail: Option[String],
       rawHavingPred: Option[String],
       aggregateHavingDataColumns: Option[Set[String]],
       authoritativeClassification: Option[EffectiveClassification] = None
   ): EffectiveClassification =
     authoritativeClassification.getOrElse {
-      val (effectiveRefreshType, reason) = {
+      val (effectiveRefreshType, baseReason) = {
         if (topKViewSpec.detected && topKViewSpec.suffixSql.isEmpty)
           (RefreshTypeCode.FullRefresh, "top_k_unsupported")
         else if (!simpleProjectionHasDataApply)
           (RefreshTypeCode.FullRefresh, "simple_projection_no_apply")
-        else if (nonCascadeUpstreamReason.nonEmpty)
-          (RefreshTypeCode.FullRefresh, s"non_cascade_upstream:${nonCascadeUpstreamReason.get}")
         else if (compiled.refreshType == RefreshTypeCode.WindowPartition)
           (compiled.refreshType, "window_partition_kept")
         else if (compiled.refreshType == RefreshTypeCode.GroupRecompute)
@@ -1040,9 +1056,6 @@ private[commands] object MvCommandHelper {
         else if (topKViewSpec.detected) (compiled.refreshType, "top_k_kept")
         else (compiled.refreshType, "kept")
       }
-      val effectiveRefreshTypeName =
-        if (effectiveRefreshType == RefreshTypeCode.FullRefresh) "FULL_REFRESH"
-        else compiled.refreshTypeName
       // Cascade capability is a property of the compiled program, never of the
       // classification. FULL_REFRESH is cascade-capable ONLY when openivm's
       // split-safe signed companion is actually present in the emitted program
@@ -1053,12 +1066,33 @@ private[commands] object MvCommandHelper {
         !topKViewSpec.detected &&
           RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
           SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
+      // A view openivm ITSELF classified FULL_REFRESH (a `current_date()`
+      // predicate, an unsupported set operation, …) that carries the verified
+      // signed companion is not a degraded incremental refresh: it recomputes
+      // its own contents and still feeds every dependent an exact delta. Report
+      // it as its own strategy so it is never conflated with a view that fell
+      // back to a full rebuild. Strictly limited to `compiled.refreshType ==
+      // FullRefresh` — a genuine DEMOTION (`top_k_unsupported`,
+      // `having_pred_*`, `simple_projection_no_apply`, `no_real_delta`,
+      // `compile_failed`) keeps the FULL_REFRESH label even when it happens to
+      // carry a delta, because there the incremental path really was lost.
+      val cascadeRecompute =
+        baseReason == "kept" &&
+          compiled.refreshType == RefreshTypeCode.FullRefresh &&
+          effectiveRefreshType == RefreshTypeCode.FullRefresh &&
+          emitsCascadeViewDelta
+      val reason = if (cascadeRecompute) "cascade_recompute_verified_delta" else baseReason
+      val effectiveRefreshTypeName =
+        if (cascadeRecompute) RefreshTypeCode.CascadeRecomputeName
+        else if (effectiveRefreshType == RefreshTypeCode.FullRefresh) RefreshTypeCode.FullRefreshName
+        else compiled.refreshTypeName
       EffectiveClassification(
         compileRefreshTypeName = compiled.refreshTypeName,
         refreshType = effectiveRefreshType,
         refreshTypeName = effectiveRefreshTypeName,
         reason = reason,
-        emitsCascadeViewDelta = emitsCascadeViewDelta
+        emitsCascadeViewDelta = emitsCascadeViewDelta,
+        upstreamSnapshotTrigger = upstreamSnapshotTriggerDetail
       )
     }
 
@@ -1394,10 +1428,10 @@ case class CreateMaterializedViewCommand(
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
     val distinctUpstreamMvCount: Int =
       upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
-    // Non-cascade-upstream demotion reason (None when every upstream MV can feed
-    // a downstream-consumable view-delta). See computeNonCascadeUpstreamReason.
-    val nonCascadeUpstreamReason: Option[String] =
-      computeNonCascadeUpstreamReason(upstreamMvByQual)
+    // Upstream MVs that cannot feed a view-delta. DIAGNOSTIC ONLY — it never
+    // demotes; see computeUpstreamSnapshotTriggerDetail.
+    val upstreamSnapshotTriggerDetail: Option[String] =
+      computeUpstreamSnapshotTriggerDetail(upstreamMvByQual)
     // ── Effective refresh-type classification with structured logging ──────
     //
     // Every demotion of `compiled.refreshType` to FULL_REFRESH below is
@@ -1411,12 +1445,6 @@ case class CreateMaterializedViewCommand(
     //   - simple_projection_no_apply  compiler emitted a SIMPLE_PROJECTION delta
     //                                 feed but no data-table apply statement after
     //                                 rewrite, so REFRESH would be a no-op
-    //   - non_cascade_upstream        Upstream MV instance either does NOT emit a
-    //                                 persisted `openivm_delta_<view>` downstream can
-    //                                 consume incrementally. Specifically, an upstream MV
-    //                                 currently classified as FULL_REFRESH is the only
-    //                                 documented trigger today; the interpolated reason is
-    //                                 `non_cascade:<upstream>`.
     //   - window_partition_kept       compiler classified WINDOW_PARTITION; kept
     //                                 (primary refresh is still partition recompute,
     //                                 now with an auxiliary cascade view-delta)
@@ -1425,8 +1453,21 @@ case class CreateMaterializedViewCommand(
     //                                 cascade view-delta)
     //   - having_pred_empty           AggregateHaving with no extractable HAVING predicate
     //   - no_real_delta               openivm emitted only empty-placeholder delta
+    //   - cascade_recompute_verified_delta
+    //                                 openivm itself compiled FULL_REFRESH and the emitted
+    //                                 program carries the verified split-safe signed
+    //                                 companion, so the recompute still feeds every
+    //                                 dependent an exact delta — reported as
+    //                                 CASCADE_RECOMPUTE, not FULL_REFRESH
     //   - kept                        compiled type is preserved verbatim (incremental MV-over-MV
     //                                 case included — upstream is cascade-delta-capable)
+    //
+    // There is deliberately NO `non_cascade_upstream` key any more: an upstream
+    // that cannot cascade is handled per-batch by its OVERWRITE snapshot
+    // trigger (see `hasReplacementBatch`), never by permanently demoting the
+    // dependent — which used to propagate down entire DAG branches. The
+    // upstreams that will emit such triggers are logged as
+    // `upstream_snapshot_trigger=` beside the verdict.
     //
     // INFO-level for "kept" so the per-MV decision is always visible during
     // normal operation; ERROR-level for any demotion so even
@@ -1436,7 +1477,7 @@ case class CreateMaterializedViewCommand(
       viewShortName = name.table,
       topKViewSpec = topKViewSpec,
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
-      nonCascadeUpstreamReason = nonCascadeUpstreamReason,
+      upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
       rawHavingPred = rawHavingPred,
       aggregateHavingDataColumns = aggregateHavingDataColumns,
       authoritativeClassification = authoritativeClassification
@@ -1458,7 +1499,8 @@ case class CreateMaterializedViewCommand(
       val msg =
         s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
           s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
-          s"emits_cascade_view_delta='$emitsCascadeViewDelta'"
+          s"emits_cascade_view_delta='$emitsCascadeViewDelta'" +
+          classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
       if (classification.isDemotionToFullRefresh)
         logError(msg)
       else
@@ -2257,8 +2299,16 @@ case class RefreshMaterializedViewCommand(
       // semantics for THIS batch, so route it through a full recompute (the MV
       // stays incremental for subsequent append batches). Classifier consulted
       // once; conservative (failure => treat as Replace).
+      //
+      // Both propagation modes reach this the same way: a CDF `Replace` verdict
+      // and an intercepted OVERWRITE staging row are the same event seen
+      // through two transports. The intercepted form is what an upstream MV
+      // that cannot cascade leaves behind for its dependents
+      // (`postRefreshCleanup`), and honouring it here is what makes a dependent
+      // of a non-cascade upstream correct WITHOUT permanently demoting it to
+      // FULL_REFRESH at CREATE.
       lazy val replaceBatch: Boolean =
-        cdfBatchVerdicts.values.exists(_ == BatchVerdict.Replace)
+        hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
       if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
         if (meta.refreshType != RefreshTypeCode.FullRefresh)
           logInfo(

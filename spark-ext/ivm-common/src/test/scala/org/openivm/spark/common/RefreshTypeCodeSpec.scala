@@ -53,4 +53,18 @@ class RefreshTypeCodeSpec extends AnyFunSpec with Matchers {
       }
     }
   }
+
+  describe("reported strategy names") {
+    it("keeps the wire value the benchmark refresh-type guard treats as a lost incremental path") {
+      RefreshTypeCode.FullRefreshName shouldBe "FULL_REFRESH"
+    }
+
+    it("reports a verified full-refresh companion under a distinct, non-FULL strategy name") {
+      RefreshTypeCode.CascadeRecomputeName shouldBe "CASCADE_RECOMPUTE"
+      RefreshTypeCode.CascadeRecomputeName should not be RefreshTypeCode.FullRefreshName
+      // The guard normalizes only FULL/FULL_REFRESH to FULL; anything else
+      // passes through, so the cascade strategy must not alias either spelling.
+      Set("FULL", "FULL_REFRESH") should not contain RefreshTypeCode.CascadeRecomputeName
+    }
+  }
 }

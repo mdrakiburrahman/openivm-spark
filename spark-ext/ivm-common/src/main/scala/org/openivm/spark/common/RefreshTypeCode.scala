@@ -83,13 +83,31 @@ object RefreshTypeCode {
     * signed old×-1 / new×+1 companion around the recompute for the Spark
     * dialect whenever `CompileFacts::force_view_delta_cascade` is set (which
     * openivm-spark always sets). A FULL_REFRESH view whose compiled program
-    * carries that companion CAN feed downstream MVs, so its dependents must not
-    * be demoted at the `non_cascade_upstream` rule. A FULL_REFRESH view without
-    * it (compile failure, unsupported plan, empty-placeholder delta) fails
-    * closed exactly as before, because `hasRealDelta` is false.
+    * carries that companion CAN feed downstream MVs, so it is reported as
+    * CASCADE_RECOMPUTE and its dependents keep their own incremental refresh
+    * type. A FULL_REFRESH view without it (compile failure, unsupported plan,
+    * empty-placeholder delta) fails closed exactly as before, because
+    * `hasRealDelta` is false.
     */
   def mayEmitCascadeViewDelta(rt: Int): Boolean = rt match {
     case FullRefresh => true
     case other       => emitsCascadeViewDelta(other)
   }
+
+  /** Reported strategy name for a view executed as a full rebuild with no
+    * downstream-consumable delta. Wire value consumed by the benchmark's
+    * `refresh_type_guard`, which treats it (and the bare `FULL` alias) as a
+    * lost incremental path.
+    */
+  val FullRefreshName: String = "FULL_REFRESH"
+
+  /** Reported strategy name for a view openivm ITSELF compiled to FULL_REFRESH
+    * whose emitted program carries the verified split-safe signed companion
+    * (see [[mayEmitCascadeViewDelta]]). It recomputes its own contents and
+    * publishes an exact `old x -1 / new x +1` view delta, so every dependent
+    * stays incremental — materially different from a view that FELL BACK to a
+    * full rebuild and starves its dependents, and reported under its own name
+    * so the two are never conflated. A demoted view keeps [[FullRefreshName]].
+    */
+  val CascadeRecomputeName: String = "CASCADE_RECOMPUTE"
 }

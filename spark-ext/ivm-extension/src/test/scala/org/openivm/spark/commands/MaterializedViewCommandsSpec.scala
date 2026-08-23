@@ -378,7 +378,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = viewShortName,
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
@@ -390,7 +390,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       classification.isDemotionToFullRefresh shouldBe false
     }
 
-    it("surfaces the non_cascade_upstream detail in the final classification reason") {
+    it("records the upstream snapshot-trigger detail without demoting the dependent") {
       val upstream = MvMetadata(
         name = TableIdentifier("upstream_mv", Some("default")),
         querySql = "SELECT 1",
@@ -403,8 +403,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         createdAt = new Timestamp(0L),
         properties = Map(MvMetadata.EmitsCascadeViewDeltaKey -> "false")
       )
-      val reason =
-        MvCommandHelper.computeNonCascadeUpstreamReason(Map("default.upstream_mv" -> upstream))
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map("default.upstream_mv" -> upstream))
 
       val classification = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
@@ -416,14 +416,21 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = "mv_non_cascade",
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = reason,
+        upstreamSnapshotTriggerDetail = detail,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
 
-      reason shouldBe Some("non_cascade:default.upstream_mv")
-      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
-      classification.reason shouldBe "non_cascade_upstream:non_cascade:default.upstream_mv"
+      detail shouldBe Some("snapshot_trigger:default.upstream_mv")
+      // The dependent keeps its own incremental type: an upstream that cannot
+      // cascade leaves an OVERWRITE snapshot trigger, which `hasReplacementBatch`
+      // routes through a recompute for THAT batch only.
+      classification.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      classification.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.reason shouldBe "kept"
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.upstreamSnapshotTrigger shouldBe Some("snapshot_trigger:default.upstream_mv")
+      classification.reason.toUpperCase should not startWith "NON_CASCADE_UPSTREAM"
     }
 
     it("keeps compile_failed authoritative over the generic full-refresh fallback") {
@@ -439,7 +446,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = "mv_compile_failed",
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
@@ -448,7 +455,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = "mv_compile_failed",
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None,
         authoritativeClassification = Some(
@@ -468,7 +475,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       authoritative.emitsCascadeViewDelta shouldBe false
     }
 
-    it("keeps a FULL_REFRESH cascade-capable when openivm emits a verified signed companion") {
+    it("reports a verified FULL_REFRESH companion as CASCADE_RECOMPUTE, never as a full rebuild") {
       val viewShortName = "mv_full_refresh_cascade"
       val classification = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
@@ -480,16 +487,69 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = viewShortName,
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
 
+      // Execution stays a recompute (the code is unchanged) …
       classification.refreshType shouldBe RefreshTypeCode.FullRefresh
-      classification.refreshTypeName shouldBe "FULL_REFRESH"
-      classification.reason shouldBe "kept"
+      // … but the REPORTED strategy is its own, so it never normalizes to FULL.
+      classification.refreshTypeName shouldBe RefreshTypeCode.CascadeRecomputeName
+      classification.refreshTypeName should not be RefreshTypeCode.FullRefreshName
+      classification.reason shouldBe "cascade_recompute_verified_delta"
+      // The native compile type is preserved diagnostically.
+      classification.compileRefreshTypeName shouldBe "FULL_REFRESH"
       classification.isDemotionToFullRefresh shouldBe false
       classification.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("keeps a FULL_REFRESH with no verified companion reported as FULL_REFRESH") {
+      val viewShortName = "mv_full_refresh_placeholder_only"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = placeholderDeltaSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      classification.reason shouldBe "no_real_delta"
+      classification.emitsCascadeViewDelta shouldBe false
+    }
+
+    it("never launders a demoted incremental type into the cascade-recompute strategy") {
+      // A real signed delta is present, but the compiled type was INCREMENTAL and
+      // the view still lost its incremental path — that is a genuine degradation
+      // and must keep reporting FULL_REFRESH.
+      val viewShortName = "mv_demoted_with_delta"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.AggregateHaving,
+          refreshTypeName = "AGGREGATE_HAVING",
+          sql = realDeltaSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.reason shouldBe "having_pred_empty"
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      classification.isDemotionToFullRefresh shouldBe true
     }
 
     it("retains downstream incrementality over a verified FULL_REFRESH upstream") {
@@ -506,14 +566,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           viewShortName = upstreamShortName,
           topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
           simpleProjectionHasDataApply = true,
-          nonCascadeUpstreamReason = None,
+          upstreamSnapshotTriggerDetail = None,
           rawHavingPred = None,
           aggregateHavingDataColumns = None
         )
       )
 
-      val reason =
-        MvCommandHelper.computeNonCascadeUpstreamReason(Map(s"default.$upstreamShortName" -> upstream))
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map(s"default.$upstreamShortName" -> upstream))
       val downstream = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
           refreshType = RefreshTypeCode.WindowPartition,
@@ -524,20 +584,22 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = "mv_downstream_of_full_refresh",
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = reason,
+        upstreamSnapshotTriggerDetail = detail,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
 
       upstream.emitsCascadeViewDelta shouldBe true
-      reason shouldBe None
+      upstream.refreshTypeName shouldBe RefreshTypeCode.CascadeRecomputeName
+      detail shouldBe None
       downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
       downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
       downstream.reason shouldBe "window_partition_kept"
       downstream.isDemotionToFullRefresh shouldBe false
+      downstream.upstreamSnapshotTrigger shouldBe None
     }
 
-    it("still demotes downstream when the FULL_REFRESH upstream carries no real delta") {
+    it("does not demote downstream when the FULL_REFRESH upstream carries no real delta") {
       val upstreamShortName = "stg_full_refresh_placeholder"
       val upstreamClassification = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
@@ -549,14 +611,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = upstreamShortName,
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
       val upstream = upstreamMeta(upstreamShortName, upstreamClassification)
 
-      val reason =
-        MvCommandHelper.computeNonCascadeUpstreamReason(Map(s"default.$upstreamShortName" -> upstream))
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map(s"default.$upstreamShortName" -> upstream))
       val downstream = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
           refreshType = RefreshTypeCode.WindowPartition,
@@ -567,19 +629,26 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = "mv_downstream_of_placeholder",
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = reason,
+        upstreamSnapshotTriggerDetail = detail,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
 
+      // The upstream stays fail-closed: no verified companion, no cascade, and
+      // it keeps reporting FULL_REFRESH so the benchmark guard still sees it.
       upstreamClassification.reason shouldBe "no_real_delta"
+      upstreamClassification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
       upstreamClassification.emitsCascadeViewDelta shouldBe false
-      reason shouldBe Some(s"non_cascade:default.$upstreamShortName")
-      downstream.refreshType shouldBe RefreshTypeCode.FullRefresh
-      downstream.reason shouldBe s"non_cascade_upstream:non_cascade:default.$upstreamShortName"
-      // The demotion stops here: this view's own compiled program carries a real
-      // signed delta, so its recompute publishes one and ITS dependents stay
-      // incremental instead of inheriting the demotion transitively.
+      detail shouldBe Some(s"snapshot_trigger:default.$upstreamShortName")
+      // The dependent is NOT demoted — it recomputes only the batches carrying
+      // that upstream's OVERWRITE snapshot trigger, and stays incremental
+      // otherwise, so the old transitive `non_cascade_upstream` collapse of whole
+      // DAG branches cannot happen.
+      downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
+      downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
+      downstream.reason shouldBe "window_partition_kept"
+      downstream.isDemotionToFullRefresh shouldBe false
+      downstream.upstreamSnapshotTrigger shouldBe Some(s"snapshot_trigger:default.$upstreamShortName")
       downstream.emitsCascadeViewDelta shouldBe true
     }
 
@@ -595,20 +664,21 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         viewShortName = viewShortName,
         topKViewSpec = MvCommandHelper.TopKViewSpec(detected = true, suffixSql = None),
         simpleProjectionHasDataApply = true,
-        nonCascadeUpstreamReason = None,
+        upstreamSnapshotTriggerDetail = None,
         rawHavingPred = None,
         aggregateHavingDataColumns = None
       )
 
       classification.reason shouldBe "top_k_unsupported"
       classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
       classification.emitsCascadeViewDelta shouldBe false
     }
   }
 
   describe("full-refresh cascade view-delta") {
     def cascadeFixture(): (String, Long, Seq[String]) = {
-      val path = s"$warehouseDir/_ivm/test/full_refresh_cascade_${UUID.randomUUID().toString.take(8)}"
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_cascade_${UUID.randomUUID().toString.take(8)}"
       val previousBypass = IvmDmlInterceptorRule.bypass.get()
       IvmDmlInterceptorRule.bypass.set(true)
       try {
@@ -1130,10 +1200,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   // ---------------------------------------------------------------------------
-  // Test 11 — downstream demotion uses persisted cascade capability
+  // Test 11 — a non-cascade upstream drives snapshot triggers, not demotion
   // ---------------------------------------------------------------------------
-  describe("(11) MV-over-MV demotion uses the persisted cascade capability") {
-    it("demotes downstreams and synthesizes OVERWRITE triggers when an upstream opts out of cascade view-delta") {
+  describe("(11) MV-over-MV cascade capability drives snapshot triggers, not demotion") {
+    it(
+      "keeps downstreams incremental and recomputes only the trigger batch when an upstream opts out of cascade view-delta"
+    ) {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t11(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t11 VALUES ('east', 100), ('west', 200)")
       spark.sql("CREATE MATERIALIZED VIEW mv_t11_up AS SELECT region, amount FROM sales_t11")
@@ -1151,9 +1223,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           "SELECT region, COUNT(*) AS cnt FROM mv_t11_up GROUP BY region"
       )
 
+      // An upstream that cannot cascade no longer costs the dependent its
+      // incremental refresh type: the OVERWRITE trigger below routes the
+      // affected batch through a recompute, and every other batch stays
+      // incremental.
       val downstreamMeta = MvCatalog.lookup(spark, TableIdentifier("mv_t11_down")).get
-      downstreamMeta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      downstreamMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      downstreamMeta.refreshType should not be RefreshTypeCode.FullRefresh
+      downstreamMeta.refreshTypeName should not be RefreshTypeCode.FullRefreshName
 
       spark.sql("INSERT INTO sales_t11 VALUES ('east', 50), ('north', 300)")
       spark.sql("REFRESH MATERIALIZED VIEW mv_t11_up")
@@ -1177,6 +1253,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val mv = spark.table("mv_t11_down").select("region", "cnt")
       mv.exceptAll(expected).count() shouldBe 0L
       expected.exceptAll(mv).count() shouldBe 0L
+
+      // Still incremental after the trigger batch was absorbed.
+      MvCatalog
+        .lookup(spark, TableIdentifier("mv_t11_down"))
+        .get
+        .refreshType should not be RefreshTypeCode.FullRefresh
     }
   }
 

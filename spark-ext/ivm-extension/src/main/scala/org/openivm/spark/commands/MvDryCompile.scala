@@ -131,15 +131,15 @@ object MvDryCompile {
     val rawHavingPred =
       if (compiled.refreshType == RefreshTypeCode.AggregateHaving) extractHavingPredicateSql(analyzed)
       else None
-    val upstreamMvByQual         = computeUpstreamMvByQual(spark, qualNames)
-    val nonCascadeUpstreamReason = computeNonCascadeUpstreamReason(upstreamMvByQual)
+    val upstreamMvByQual              = computeUpstreamMvByQual(spark, qualNames)
+    val upstreamSnapshotTriggerDetail = computeUpstreamSnapshotTriggerDetail(upstreamMvByQual)
 
     val classification = classifyEffectiveRefreshType(
       compiled = compiled,
       viewShortName = name.table,
       topKViewSpec = topKViewSpec,
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
-      nonCascadeUpstreamReason = nonCascadeUpstreamReason,
+      upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
       rawHavingPred = rawHavingPred,
       aggregateHavingDataColumns = aggregateHavingDataColumns
     )
