@@ -103,6 +103,10 @@ unit conventions; duration inputs are nanoseconds.
 | `openivm.refresh.sql_stmt.<kind>.bytes_observed` | counter | bytes | Bytes observed in executed-plan SQL metrics. |
 | `openivm.create.inflight` | gauge | creates | CREATE MATERIALIZED VIEW commands executing. |
 | `openivm.create.phase.<phase>` | timer | ns | Per-CREATE phase latency, including analyze, compile, CTAS, metadata publish. |
+| `openivm.create.materialization_admission.queued` | gauge | creates | CREATE CTAS commands waiting for a publication lane. |
+| `openivm.create.materialization_admission.inflight` | gauge | creates | CREATE CTAS plus synchronous catalog publications in flight. |
+| `openivm.create.materialization_admission.width` | gauge | lanes | Configured application-scoped publication width. |
+| `openivm.create.materialization_admission.wait` | timer | ns | Wait for a CREATE publication lane. |
 | `openivm.compiler.cache.lock.wait` | timer | ns | Contention on the compiler singleton cache. |
 | `openivm.compiler.compile.count` | counter | compiles | DuckDB compile requests. |
 | `openivm.compiler.compile` | timer | ns | End-to-end compile latency. |

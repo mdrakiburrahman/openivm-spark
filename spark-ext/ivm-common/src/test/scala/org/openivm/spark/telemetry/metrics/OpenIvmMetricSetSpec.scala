@@ -21,6 +21,8 @@ class OpenIvmMetricSetSpec extends AnyFunSpec with Matchers {
       registry.getMetrics.get("openivm.create.inflight") should not be null
       registry.getMetrics.get("openivm.compiler.inflight") should not be null
       registry.getMetrics.get("openivm.ctas.queue_depth") should not be null
+      registry.getMetrics.get("openivm.create.materialization_admission.inflight") should not be null
+      registry.getMetrics.get("openivm.create.materialization_admission.wait") should not be null
     }
 
     it("updates RocksDB operation timers and counters") {

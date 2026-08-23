@@ -215,9 +215,10 @@ roughly twice the 10.07-second all-at-once result. No feedback controller can
 infer an unseen machine's optimum before receiving samples. The cold-start
 choice must therefore express the objective: optimize finite-batch makespan by
 starting wide, or protect interactive tail latency by starting conservatively.
-The dispatcher utility uses the former. OpenIVM-Spark itself owns one CREATE
-command at a time; the HTTP or benchmark ingress that owns the batch must call
-the utility. Benchmark reports must label cold and learned runs separately.
+The dispatcher utility uses the former. The HTTP or benchmark ingress that owns
+a finite batch should call the utility; OpenIVM's per-command publication gate
+is a separate tail-latency safeguard for requests arriving independently.
+Benchmark reports must label cold and learned runs separately.
 
 This does not require a Spark query cost model. The utility uses a small
 batch-boundary AIMD controller plus FAIR-pool assignment. Ordinary SQL failures
@@ -229,6 +230,15 @@ One capacity-constrained batch halves the next admission window. One successful
 recovery batch increases the window by one. Each task emits submitted/start/end
 timestamps, queue delay, thread, outcome, and observed in-flight concurrency for
 an A/B trace view.
+
+Direct concurrent CREATE requests that do not arrive through a batch dispatcher
+still share one Spark driver and catalog. OpenIVM therefore admits only the eager
+Delta CTAS plus its synchronous post-commit external-catalog tail through four
+fair, application-scoped lanes by default. Analysis, compilation, watermark
+capture, optional backing-view creation, and OpenIVM metadata publication remain
+concurrent. This is not a global CREATE mutex.
+Override the width with `spark.openivm.create.maxConcurrentMaterializations`;
+values below two are coerced to two.
 
 A clean deployed comparison used ten CTAS jobs over a one-million-row source:
 

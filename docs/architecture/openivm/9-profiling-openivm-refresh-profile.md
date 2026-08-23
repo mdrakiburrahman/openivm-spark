@@ -192,7 +192,13 @@ The JSON fields are stable and intentionally low-cardinality:
 `duration_ms`, `driver_thread`, `outcome`, optional
 `compile_refresh_type`, `effective_refresh_type`, and `refresh_reason`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
-`catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`.
+`catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`. CREATE spans also
+include `ctas_admission_wait_ms`, `analysis_ms`, `watermark_ms`, `ctas_ms`,
+`ctas_data_write_ms`, `hive_catalog_publication_ms`, and
+`metadata_publication_ms`. `ctas_data_write_ms` ends at the Delta history commit
+timestamp; `hive_catalog_publication_ms` is the remaining synchronous CTAS
+command tail, including Delta post-commit hooks and external-catalog
+publication. Their sum equals `ctas_ms`.
 CREATE records the authoritative classification once it is known. REFRESH reads
 the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
 runs still emit the same three fields without recompiling. Legacy metadata rows
@@ -201,6 +207,11 @@ set `compile_refresh_type` to that same value, and omit `refresh_reason`.
 `rocksdb_backup_ms` is best-effort only: async state backup may finish after the
 primary span is emitted, and that late completion does NOT trigger a duplicate
 `OPENIVM_EXECUTION_SPAN` line.
+
+The CREATE phase fields are collected even when
+`spark.openivm.profile.refresh=false` and
+`spark.openivm.metrics.enabled=false`; they therefore remain available in
+ordinary driver logs without enabling RocksDB profile persistence.
 
 The profile complements Spark event metrics. Use event metrics for records,
 files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.

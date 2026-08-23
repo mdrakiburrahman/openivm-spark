@@ -134,6 +134,18 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.createMaterializationMaxConcurrent") {
+    it("defaults to four concurrent CTAS publications and never serializes globally") {
+      FeatureGate.createMaterializationMaxConcurrent(new SparkConf(false)) shouldBe 4
+      FeatureGate.createMaterializationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateMaterializationMaxConcurrentKey, "7")
+      ) shouldBe 7
+      FeatureGate.createMaterializationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateMaterializationMaxConcurrentKey, "1")
+      ) shouldBe 2
+    }
+  }
+
   describe("FeatureGate.scd2RangeAccelEnabled") {
     it("defaults ON and honours an explicit OFF flag") {
       FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true

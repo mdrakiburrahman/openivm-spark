@@ -1,7 +1,7 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{CdfWatermarkCatalog, MvCatalog, StagingCatalog}
+import org.openivm.spark.common.{CdfWatermarkCatalog, FeatureGate, MvCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
 import java.util.concurrent.{Executors, TimeUnit}
@@ -28,6 +28,8 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
       .config("spark.sql.warehouse.dir", warehouseDir)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "4")
+      .config(FeatureGate.CreateMaterializationMaxConcurrentKey, "2")
+      .config(FeatureGate.DriverAdmissionEnabledKey, "false")
       .config("spark.openivm.driverAdmission.maxConcurrentHeavyStatements", "1")
       .config("spark.openivm.driverAdmission.minHeapHeadroom", "512m")
     extraConf.foreach { case (k, v) => builder.config(k, v) }
@@ -38,7 +40,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
   }
 
   describe("concurrent CREATE MATERIALIZED VIEW against a fresh schema") {
-    it("creates eight independent leaf MVs concurrently and each remains bag-equivalent") {
+    it("queues eight independent leaf MVs through two publication lanes without changing results") {
       val schema = "cc_schema"
       sql(s"CREATE DATABASE IF NOT EXISTS $schema")
 

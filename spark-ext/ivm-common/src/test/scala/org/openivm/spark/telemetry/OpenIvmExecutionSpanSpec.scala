@@ -168,6 +168,36 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("rocksdb_flush_failed_count").asLong() shouldBe 1L
     }
 
+    it("emits always-on CREATE phase timing without requiring profile rows") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.create_phases_mv", "create")
+        OpenIvmExecutionSpan.observeTimer("create.materialization_admission.wait", millis(19L))
+        span.recordProfileStep("create_analyze_query", "", 11L)
+        span.recordProfileStep("create_capture_watermarks", "", 13L)
+        span.recordProfileStep("create_ctas_total", "", 41L)
+        span.recordProfileStep("create_ctas_data_write", "", 29L)
+        span.recordProfileStep("create_hive_catalog_publication", "", 12L)
+        span.recordProfileStep("create_mv_publish_metadata", "", 17L)
+        span.complete("create_executed", "driver-create-phases")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.get("ctas_admission_wait_ms").asLong() shouldBe 19L
+      payload.get("analysis_ms").asLong() shouldBe 11L
+      payload.get("watermark_ms").asLong() shouldBe 13L
+      payload.get("ctas_ms").asLong() shouldBe 41L
+      payload.get("ctas_data_write_ms").asLong() shouldBe 29L
+      payload.get("hive_catalog_publication_ms").asLong() shouldBe 12L
+      payload.get("metadata_publication_ms").asLong() shouldBe 17L
+
+      OpenIvmExecutionSpan.needsProfileStepTiming("create_analyze_query") shouldBe true
+      OpenIvmExecutionSpan.needsProfileStepTiming("create_capture_watermarks") shouldBe true
+      OpenIvmExecutionSpan.needsProfileStepTiming("create_mv_publish_metadata") shouldBe true
+    }
+
     it("keeps compile_failed classification sticky against later generic fallbacks") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.sticky_mv", "create")

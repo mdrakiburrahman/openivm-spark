@@ -25,10 +25,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var refreshClassification = OpenIvmExecutionSpan.RefreshClassification.empty
   private var sameMvLockWaitMs      = Option.empty[Long]
   private var driverAdmissionMs     = Option.empty[Long]
+  private var ctasAdmissionMs       = Option.empty[Long]
   private var compilerMs            = Option.empty[Long]
   private var catalogMs             = Option.empty[Long]
   private var rocksDbWriteMs        = Option.empty[Long]
   private var rocksDbWriteCount     = 0L
+  private var analysisMs            = Option.empty[Long]
+  private var watermarkMs           = Option.empty[Long]
+  private var ctasMs                = Option.empty[Long]
+  private var ctasDataWriteMs       = Option.empty[Long]
+  private var hiveCatalogPublishMs  = Option.empty[Long]
+  private var metadataPublicationMs = Option.empty[Long]
   private var rocksDbFlushMs        = Option.empty[Long]
   private var rocksDbFlushCount     = 0L
   private var rocksDbFlushFailures  = 0L
@@ -75,6 +82,11 @@ final class OpenIvmExecutionSpan private[telemetry] (
       driverAdmissionMs = addDuration(driverAdmissionMs, durationMs)
     }
 
+  def recordCtasAdmissionWait(durationMs: Long): Unit =
+    recordBeforeComplete {
+      ctasAdmissionMs = addDuration(ctasAdmissionMs, durationMs)
+    }
+
   def recordCompiler(durationMs: Long): Unit =
     recordBeforeComplete {
       compilerMs = addDuration(compilerMs, durationMs)
@@ -89,6 +101,36 @@ final class OpenIvmExecutionSpan private[telemetry] (
     recordBeforeComplete {
       rocksDbWriteMs = addDuration(rocksDbWriteMs, durationMs)
       rocksDbWriteCount += 1L
+    }
+
+  def recordAnalysis(durationMs: Long): Unit =
+    recordBeforeComplete {
+      analysisMs = addDuration(analysisMs, durationMs)
+    }
+
+  def recordWatermark(durationMs: Long): Unit =
+    recordBeforeComplete {
+      watermarkMs = addDuration(watermarkMs, durationMs)
+    }
+
+  def recordCtas(durationMs: Long): Unit =
+    recordBeforeComplete {
+      ctasMs = addDuration(ctasMs, durationMs)
+    }
+
+  def recordCtasDataWrite(durationMs: Long): Unit =
+    recordBeforeComplete {
+      ctasDataWriteMs = addDuration(ctasDataWriteMs, durationMs)
+    }
+
+  def recordHiveCatalogPublication(durationMs: Long): Unit =
+    recordBeforeComplete {
+      hiveCatalogPublishMs = addDuration(hiveCatalogPublishMs, durationMs)
+    }
+
+  def recordMetadataPublication(durationMs: Long): Unit =
+    recordBeforeComplete {
+      metadataPublicationMs = addDuration(metadataPublicationMs, durationMs)
     }
 
   def recordRocksDbFlush(durationMs: Long, failed: Boolean = false): Unit =
@@ -130,9 +172,15 @@ final class OpenIvmExecutionSpan private[telemetry] (
     if (enabled) {
       if (detail eq null) ()
       stepName match {
-        case "acquire_locks"         => recordSameMvLockWait(durationMs)
-        case "create_catalog_lookup" => recordCatalog(durationMs)
-        case _                       => ()
+        case "acquire_locks"                   => recordSameMvLockWait(durationMs)
+        case "create_catalog_lookup"           => recordCatalog(durationMs)
+        case "create_analyze_query"            => recordAnalysis(durationMs)
+        case "create_capture_watermarks"       => recordWatermark(durationMs)
+        case "create_ctas_total"               => recordCtas(durationMs)
+        case "create_ctas_data_write"          => recordCtasDataWrite(durationMs)
+        case "create_hive_catalog_publication" => recordHiveCatalogPublication(durationMs)
+        case "create_mv_publish_metadata"      => recordMetadataPublication(durationMs)
+        case _                                 => ()
       }
     }
 
@@ -178,10 +226,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 refreshReason = refreshClassification.refreshReason,
                 sameMvLockWaitMs = sameMvLockWaitMs,
                 driverAdmissionWaitMs = driverAdmissionMs,
+                ctasAdmissionWaitMs = ctasAdmissionMs,
                 compilerMs = compilerMs,
                 catalogMs = catalogMs,
                 rocksDbWriteMs = rocksDbWriteMs,
                 rocksDbWriteCount = rocksDbWriteCount,
+                analysisMs = analysisMs,
+                watermarkMs = watermarkMs,
+                ctasMs = ctasMs,
+                ctasDataWriteMs = ctasDataWriteMs,
+                hiveCatalogPublicationMs = hiveCatalogPublishMs,
+                metadataPublicationMs = metadataPublicationMs,
                 rocksDbFlushMs = rocksDbFlushMs,
                 rocksDbFlushCount = rocksDbFlushCount,
                 rocksDbFlushFailures = rocksDbFlushFailures,
@@ -372,6 +427,8 @@ object OpenIvmExecutionSpan extends Logging {
         withCurrentOrPending("create", durationMs)
       case "driver_admission.refresh.wait" =>
         withCurrentOrPending("refresh", durationMs)
+      case "create.materialization_admission.wait" =>
+        Option(current.get()).foreach(_.recordCtasAdmissionWait(durationMs))
       case "compiler.compile" =>
         Option(current.get()).foreach(_.recordCompiler(durationMs))
       case name if isCatalogMetric(name) =>
@@ -400,7 +457,10 @@ object OpenIvmExecutionSpan extends Logging {
     if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbBackup(TimeUnit.NANOSECONDS.toMillis(nanos)))
 
   def needsProfileStepTiming(stepName: String): Boolean =
-    stepName == "create_catalog_lookup"
+    stepName == "create_catalog_lookup" ||
+      stepName == "create_analyze_query" ||
+      stepName == "create_capture_watermarks" ||
+      stepName == "create_mv_publish_metadata"
 
   private[spark] def clearCurrent(span: OpenIvmExecutionSpan): Unit =
     if (current.get() eq span) current.remove()
@@ -489,10 +549,17 @@ object OpenIvmExecutionSpan extends Logging {
       refreshReason: Option[String],
       sameMvLockWaitMs: Option[Long],
       driverAdmissionWaitMs: Option[Long],
+      ctasAdmissionWaitMs: Option[Long],
       compilerMs: Option[Long],
       catalogMs: Option[Long],
       rocksDbWriteMs: Option[Long],
       rocksDbWriteCount: Long,
+      analysisMs: Option[Long],
+      watermarkMs: Option[Long],
+      ctasMs: Option[Long],
+      ctasDataWriteMs: Option[Long],
+      hiveCatalogPublicationMs: Option[Long],
+      metadataPublicationMs: Option[Long],
       rocksDbFlushMs: Option[Long],
       rocksDbFlushCount: Long,
       rocksDbFlushFailures: Long,
@@ -515,10 +582,17 @@ object OpenIvmExecutionSpan extends Logging {
     refreshReason.foreach(fields.put("refresh_reason", _))
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
+    ctasAdmissionWaitMs.foreach(v => fields.put("ctas_admission_wait_ms", java.lang.Long.valueOf(v)))
     compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
     catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
     rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
     if (rocksDbWriteCount > 0L) fields.put("rocksdb_write_count", java.lang.Long.valueOf(rocksDbWriteCount))
+    analysisMs.foreach(v => fields.put("analysis_ms", java.lang.Long.valueOf(v)))
+    watermarkMs.foreach(v => fields.put("watermark_ms", java.lang.Long.valueOf(v)))
+    ctasMs.foreach(v => fields.put("ctas_ms", java.lang.Long.valueOf(v)))
+    ctasDataWriteMs.foreach(v => fields.put("ctas_data_write_ms", java.lang.Long.valueOf(v)))
+    hiveCatalogPublicationMs.foreach(v => fields.put("hive_catalog_publication_ms", java.lang.Long.valueOf(v)))
+    metadataPublicationMs.foreach(v => fields.put("metadata_publication_ms", java.lang.Long.valueOf(v)))
     rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
     if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
     if (rocksDbFlushFailures > 0L) {

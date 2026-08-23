@@ -11,6 +11,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{
   BatchVerdict,
   ChangeWatermark,
+  FeatureGate,
   MvCatalog,
   MvMetadata,
   RefreshTypeCode,
@@ -20,6 +21,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -402,6 +404,52 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
       // Catalog metadata must be present
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
+    }
+  }
+
+  describe("(1a) CREATE MATERIALIZED VIEW — always-on phase telemetry") {
+    it("splits CTAS data work from post-commit Hive publication with profiling and metrics off") {
+      FeatureGate.profileRefreshEnabled(spark) shouldBe false
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a VALUES (1, 'one'), (2, 'two')")
+
+      val metricsWereEnabled = OpenIvmMetrics.enabled
+      val payloads =
+        try {
+          OpenIvmMetrics.configure(enabled = false)
+          withLogCapture { appender =>
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-create-phases",
+              "openivm.node_id"    -> "model.create.phases"
+            ) {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_phases AS " +
+                    "SELECT id, label FROM sales_t1a WHERE id >= 0"
+                )
+                .collect()
+            }
+            executionSpanPayloads(appender.messages, "mv_t1a_phases")
+          }
+        } finally OpenIvmMetrics.configure(metricsWereEnabled)
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("request_id").asText() shouldBe "req-create-phases"
+      payload.path("dbt_node_id").asText() shouldBe "model.create.phases"
+      payload.path("operation").asText() shouldBe "create"
+      payload.path("outcome").asText() shouldBe "create_executed"
+      payload.has("analysis_ms") shouldBe true
+      payload.has("watermark_ms") shouldBe true
+      payload.has("ctas_admission_wait_ms") shouldBe true
+      payload.has("ctas_ms") shouldBe true
+      payload.has("ctas_data_write_ms") shouldBe true
+      payload.has("hive_catalog_publication_ms") shouldBe true
+      payload.has("metadata_publication_ms") shouldBe true
+      payload.path("ctas_data_write_ms").asLong() +
+        payload.path("hive_catalog_publication_ms").asLong() shouldBe
+        payload.path("ctas_ms").asLong()
+      assertBagEqual("mv_t1a_phases", "SELECT id, label FROM sales_t1a WHERE id >= 0")
     }
   }
 

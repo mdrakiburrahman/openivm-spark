@@ -1422,18 +1422,25 @@ case class CreateMaterializedViewCommand(
     profile.timeStep("create_cleanup_stale_location") {
       cleanupStaleMvLocation(spark, location)
     }
+    var successfulCtasTiming = Option.empty[(Long, Long)]
     CommandLocalState.withDmlBypass {
       profile.timeStep(
         "create_mv_initial_load",
         s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${initSql.length}"
       ) {
-        val t0      = System.nanoTime()
         var attempt = 0
         var done    = false
         while (!done) {
           val currentAttempt = attempt
+          val attemptT0      = System.nanoTime()
           try {
-            val df = spark.sql(initSql)
+            val df = CreateMaterializationAdmission.withPermit(spark) {
+              val startedAtEpochMs = System.currentTimeMillis()
+              val startedAtNanos   = System.nanoTime()
+              val result           = spark.sql(initSql)
+              successfulCtasTiming = Some(startedAtEpochMs -> (System.nanoTime() - startedAtNanos))
+              result
+            }
             recordPlanMetrics(df, RefreshPerf.classify(initSql, ""))
             done = true
           } catch {
@@ -1447,7 +1454,7 @@ case class CreateMaterializedViewCommand(
               }
             case t: Throwable => throw t
           } finally {
-            val ms = (System.nanoTime() - t0) / 1000000L
+            val ms = (System.nanoTime() - attemptT0) / 1000000L
             sqlLog.record(
               category = "initial_load_ctas",
               stmtOrder = 0,
@@ -1504,8 +1511,32 @@ case class CreateMaterializedViewCommand(
         // Publish complete metadata only after CTAS (and the optional HAVING
         // view) succeeded. A failed catalog write is safely retryable because
         // CREATE TABLE IF NOT EXISTS reuses the completed Delta table.
-        val version =
-          DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
+        val history =
+          DeltaTable
+            .forPath(spark, location)
+            .history(1)
+            .select("version", "timestamp")
+            .collect()
+            .head
+        val version = history.getAs[Long]("version")
+        successfulCtasTiming.foreach { case (startedAtEpochMs, totalNanos) =>
+          val committedAtEpochMs = history.getAs[Timestamp]("timestamp").getTime
+          val timing =
+            CreateMaterializationTiming.fromDeltaCommit(
+              startedAtEpochMs,
+              totalNanos,
+              committedAtEpochMs
+            )
+          val detail =
+            s"started_epoch_ms=$startedAtEpochMs;delta_commit_epoch_ms=$committedAtEpochMs"
+          profile.appendStep("create_ctas_total", detail, timing.totalMs)
+          profile.appendStep("create_ctas_data_write", detail, timing.dataWriteMs)
+          profile.appendStep(
+            "create_hive_catalog_publication",
+            detail,
+            timing.hiveCatalogPublicationMs
+          )
+        }
         MvCatalog.upsert(spark, meta.copy(lastVersion = version))
       }
     }
