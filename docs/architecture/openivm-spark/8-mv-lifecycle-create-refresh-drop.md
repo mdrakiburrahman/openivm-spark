@@ -116,7 +116,24 @@ The helper returns four values:
   Source:
 - `MaterializedViewCommands.scala:165-168`
 
-### 1.6 Additional analyzed-plan metadata
+### 1.5b Source constraint facts and metastore cost
+
+CREATE also discovers per-source constraint facts — foreign keys, unique keys, Delta `CHECK` constraints, and generated columns — through `WorkloadFactsRegistry.discover`. Those facts feed the refresh rewriter, so they are collected for every source of every MV.
+Source:
+
+- `MaterializedViewCommands.scala:1196`
+- `WorkloadFactsRegistry.scala:34-48`
+  Each fact source needs one `CatalogTable`: the Delta metadata is read from the resolved table location and the catalog properties come from the same object. `WorkloadFactsRegistry` therefore issues a single `SessionCatalog.getTableMetadata` per source and threads the result into both `deltaProperties` and `catalogProperties`.
+  Source:
+- `WorkloadFactsRegistry.scala:65-68`
+- `WorkloadFactsRegistry.scala:196-233`
+  This matters because every Hive metastore read runs inside Spark's globally synchronized Hive client (`HiveExternalCatalog.withClient`). A redundant `getTableMetadata` is not local work — it is a serialized section that every concurrent CREATE and REFRESH queues behind. `DeltaLog.forTable(spark, tableIdentifier)` resolves the identifier through `getTableMetadata` and then delegates to `DeltaLog.forTable(spark, catalogTable)`, so passing the already-resolved `CatalogTable` is the identical code path with the round-trip removed.
+  Source:
+- `DeltaLog.scala:770-781` (delta-spark 3.2.0)
+  `WorkloadFactsCatalogBudgetSpec` pins the budget against a real (Derby-backed) Hive metastore by counting `HiveMetaStore.audit` records: one warmed `discover` of a single Delta source must stay within 4 `get_table` and 2 `get_database` calls. Resolving the table twice costs 6 and 3.
+  Source:
+- `WorkloadFactsCatalogBudgetSpec.scala`
+
 
 CREATE analyzes the view body with Spark. It extracts group-by key names. It extracts a `COUNT(*)` alias when the query exposes one. It later extracts a HAVING predicate for `AGGREGATE_HAVING`.
 Source:
