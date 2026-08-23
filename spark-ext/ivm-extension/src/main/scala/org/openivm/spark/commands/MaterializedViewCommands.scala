@@ -459,7 +459,7 @@ private[commands] object MvCommandHelper {
       dataIdent: TableIdentifier,
       expectedLocation: String,
       requireExists: Boolean
-  ): Unit = {
+  ): Boolean = {
     val catalog = spark.sessionState.catalog
     // Every Hive metastore round-trip runs inside Spark's globally
     // synchronized Hive client, so it is a serialized section shared by all
@@ -478,7 +478,7 @@ private[commands] object MvCommandHelper {
             )
         }
       } else {
-        if (!catalog.tableExists(dataIdent)) return
+        if (!catalog.tableExists(dataIdent)) return false
         catalog.getTableMetadata(dataIdent)
       }
     val hconf = spark.sparkContext.hadoopConfiguration
@@ -491,6 +491,7 @@ private[commands] object MvCommandHelper {
         "TABLE_OR_VIEW_ALREADY_EXISTS",
         Map("relationName" -> sqlIdent(dataIdent))
       )
+    true
   }
 
   /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
@@ -562,6 +563,68 @@ private[commands] object MvCommandHelper {
     } catch {
       case _: Throwable => ()
     }
+  }
+
+  def cleanupFailedCreateArtifacts(
+      spark: SparkSession,
+      name: TableIdentifier,
+      dataIdent: TableIdentifier,
+      location: String
+  ): Unit = {
+    val catalog = spark.sessionState.catalog
+    val namedRegistrationPublished =
+      try catalog.tableExists(dataIdent)
+      catch {
+        case _: Throwable => true
+      }
+    val mvMetadataPublished =
+      try MvCatalog.lookup(spark, name).nonEmpty
+      catch {
+        case _: Throwable => true
+      }
+
+    if (namedRegistrationPublished || mvMetadataPublished) return
+
+    val mvQual      = metaName(name)
+    val mvShort     = name.identifier
+    val propagation = ChangePropagationFactory.forSession(spark)
+
+    try MvCatalog.remove(spark, name)
+    catch { case _: Throwable => () }
+
+    try propagation.removeForBaseTable(spark, mvQual)
+    catch { case _: Throwable => () }
+    if (mvShort != mvQual) {
+      try propagation.removeForBaseTable(spark, mvShort)
+      catch { case _: Throwable => () }
+    }
+
+    try CdfWatermarkCatalog.removeForView(spark, mvQual)
+    catch { case _: Throwable => () }
+    if (mvShort != mvQual) {
+      try CdfWatermarkCatalog.removeForView(spark, mvShort)
+      catch { case _: Throwable => () }
+    }
+    try CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
+    catch { case _: Throwable => () }
+    if (mvShort != mvQual) {
+      try CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
+      catch { case _: Throwable => () }
+    }
+
+    val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
+    val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
+    try {
+      val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
+      if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
+    } catch { case _: Throwable => () }
+
+    try {
+      val hadoopPath = new Path(location)
+      val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+      if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+    } catch { case _: Throwable => () }
   }
 
   def isCtasCleanupMissingTarget(error: Throwable, targetFragments: String*): Boolean =
@@ -1644,7 +1707,7 @@ case class CreateMaterializedViewCommand(
       createDataWriteSql(location, clusterClause, tblPropsClause, viewBodySql)
     val catalogRegistrationSql =
       createCatalogRegistrationSql(dataIdent, location)
-    profile.timeStep("create_validate_catalog_registration") {
+    val preexistingCatalogRegistration = profile.timeStep("create_validate_catalog_registration") {
       validateCatalogRegistration(spark, dataIdent, location, requireExists = false)
     }
     // Wipe stray files from a previous aborted CREATE so Delta's
@@ -1655,153 +1718,167 @@ case class CreateMaterializedViewCommand(
     profile.timeStep("create_cleanup_stale_location") {
       cleanupStaleMvLocation(spark, location)
     }
-    var dataWriteMs          = 0L
-    var catalogPublicationMs = 0L
-    var reusedDeltaPath      = false
-    CommandLocalState.withDmlBypass {
-      try {
-        profile.timeStep(
-          "create_mv_initial_load",
-          s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
-        ) {
-          reusedDeltaPath = DeltaTable.isDeltaTable(spark, location)
-          if (!reusedDeltaPath) {
-            var attempt = 0
-            var done    = false
-            while (!done) {
-              val currentAttempt = attempt
-              val attemptT0      = System.nanoTime()
+    val preexistingDeltaPath = profile.timeStep("create_probe_existing_delta_path") {
+      DeltaTable.isDeltaTable(spark, location)
+    }
+    val rollbackOwnedArtifactsOnFailure = !preexistingCatalogRegistration && !preexistingDeltaPath
+    var dataWriteMs                     = 0L
+    var catalogPublicationMs            = 0L
+    var reusedDeltaPath                 = false
+    var publicationCommitted            = false
+    try {
+      CommandLocalState.withDmlBypass {
+        try {
+          profile.timeStep(
+            "create_mv_initial_load",
+            s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
+          ) {
+            reusedDeltaPath = DeltaTable.isDeltaTable(spark, location)
+            if (!reusedDeltaPath) {
+              var attempt = 0
+              var done    = false
+              while (!done) {
+                val currentAttempt = attempt
+                val attemptT0      = System.nanoTime()
+                try {
+                  CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
+                  val dataWriteT0 = System.nanoTime()
+                  val df          = spark.sql(dataWriteSql)
+                  dataWriteMs = (System.nanoTime() - dataWriteT0) / 1000000L
+                  recordPlanMetrics(df, RefreshPerf.classify(dataWriteSql, ""))
+                  done = true
+                } catch {
+                  case t: Throwable
+                      if attempt < 3 &&
+                        isCtasCleanupMissingTarget(t, dataIdent.identifier, location) =>
+                    attempt += 1
+                    try Thread.sleep(100L * attempt)
+                    catch {
+                      case _: InterruptedException =>
+                        Thread.currentThread().interrupt()
+                        throw t
+                    }
+                  case t: Throwable => throw t
+                } finally {
+                  val ms = (System.nanoTime() - attemptT0) / 1000000L
+                  sqlLog.record(
+                    category = "initial_load_ctas",
+                    stmtOrder = 0,
+                    attemptIdx = currentAttempt,
+                    stmtKind = RefreshPerf.classify(dataWriteSql, ""),
+                    sql = dataWriteSql,
+                    durationMs = ms
+                  )
+                }
+              }
+            }
+          }
+        } finally {
+          profile.appendStep(
+            "create_ctas_data_write",
+            s"reused_delta_path=$reusedDeltaPath",
+            dataWriteMs
+          )
+        }
+
+        CommandConcurrencyInjection.maybePauseAfterCreateDataWrite()
+
+        try {
+          profile.timeStep(
+            "create_mv_catalog_registration",
+            s"data_table=${sqlIdent(dataIdent)}"
+          ) {
+            CreateCatalogPublicationAdmission.withPermit(spark) {
+              val publicationT0 = System.nanoTime()
               try {
-                CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
-                val dataWriteT0 = System.nanoTime()
-                val df          = spark.sql(dataWriteSql)
-                dataWriteMs = (System.nanoTime() - dataWriteT0) / 1000000L
-                recordPlanMetrics(df, RefreshPerf.classify(dataWriteSql, ""))
-                done = true
-              } catch {
-                case t: Throwable
-                    if attempt < 3 &&
-                      isCtasCleanupMissingTarget(t, dataIdent.identifier, location) =>
-                  attempt += 1
-                  try Thread.sleep(100L * attempt)
-                  catch {
-                    case _: InterruptedException =>
-                      Thread.currentThread().interrupt()
-                      throw t
-                  }
-                case t: Throwable => throw t
+                spark.sql(catalogRegistrationSql)
+                validateCatalogRegistration(spark, dataIdent, location, requireExists = true)
+                publicationCommitted = true
               } finally {
-                val ms = (System.nanoTime() - attemptT0) / 1000000L
+                catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
                 sqlLog.record(
-                  category = "initial_load_ctas",
-                  stmtOrder = 0,
-                  attemptIdx = currentAttempt,
-                  stmtKind = RefreshPerf.classify(dataWriteSql, ""),
-                  sql = dataWriteSql,
-                  durationMs = ms
+                  category = "catalog_registration",
+                  stmtOrder = 1,
+                  attemptIdx = 0,
+                  stmtKind = "ddl",
+                  sql = catalogRegistrationSql,
+                  durationMs = catalogPublicationMs
                 )
               }
             }
           }
+        } finally {
+          profile.appendStep(
+            "create_hive_catalog_publication",
+            s"data_table=${sqlIdent(dataIdent)}",
+            catalogPublicationMs
+          )
+          profile.appendStep(
+            "create_ctas_total",
+            s"reused_delta_path=$reusedDeltaPath",
+            dataWriteMs + catalogPublicationMs
+          )
         }
-      } finally {
-        profile.appendStep(
-          "create_ctas_data_write",
-          s"reused_delta_path=$reusedDeltaPath",
-          dataWriteMs
-        )
-      }
 
-      CommandConcurrencyInjection.maybePauseAfterCreateDataWrite()
-
-      try {
-        profile.timeStep(
-          "create_mv_catalog_registration",
-          s"data_table=${sqlIdent(dataIdent)}"
-        ) {
-          CreateCatalogPublicationAdmission.withPermit(spark) {
-            val publicationT0 = System.nanoTime()
+        // Backing-table layouts expose a Spark VIEW that hides OpenIVM bookkeeping
+        // columns and applies HAVING and/or Top-K only at read time.
+        if (usesBackingDataTable) {
+          profile.timeStep("create_mv_user_view", s"having=$isHavingViewIncremental;top_k=${topKViewSuffix.nonEmpty}") {
+            val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
+            val pred     = havingPred.getOrElse("TRUE")
+            if (!havingPredicateIsSafe(pred, dataCols)) {
+              throw new RuntimeException(
+                s"HAVING predicate '$pred' references columns not present on data table " +
+                  s"${sqlIdent(dataIdent)} (columns: ${dataCols.mkString(", ")}). " +
+                  "This indicates the HAVING clause uses an aggregate not in SELECT; " +
+                  "such views are not currently supported in the incremental AGGREGATE_HAVING " +
+                  "path — they will be retried as FULL_REFRESH on the next CREATE."
+              )
+            }
+            val colList = userOutputCols
+              .map(c => s"`${c.replace("`", "``")}`")
+              .mkString(", ")
+            val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
+            val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
+            val viewSql =
+              s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
+                s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
+            val t0 = System.nanoTime()
             try {
-              spark.sql(catalogRegistrationSql)
-              validateCatalogRegistration(spark, dataIdent, location, requireExists = true)
+              spark.sql(viewSql)
             } finally {
-              catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
+              val ms = (System.nanoTime() - t0) / 1000000L
               sqlLog.record(
-                category = "catalog_registration",
-                stmtOrder = 1,
+                category = "backing_user_view",
+                stmtOrder = 2,
                 attemptIdx = 0,
                 stmtKind = "ddl",
-                sql = catalogRegistrationSql,
-                durationMs = catalogPublicationMs
+                sql = viewSql,
+                durationMs = ms
               )
             }
           }
         }
-      } finally {
-        profile.appendStep(
-          "create_hive_catalog_publication",
-          s"data_table=${sqlIdent(dataIdent)}",
-          catalogPublicationMs
-        )
-        profile.appendStep(
-          "create_ctas_total",
-          s"reused_delta_path=$reusedDeltaPath",
-          dataWriteMs + catalogPublicationMs
-        )
-      }
 
-      // Backing-table layouts expose a Spark VIEW that hides OpenIVM bookkeeping
-      // columns and applies HAVING and/or Top-K only at read time.
-      if (usesBackingDataTable) {
-        profile.timeStep("create_mv_user_view", s"having=$isHavingViewIncremental;top_k=${topKViewSuffix.nonEmpty}") {
-          val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
-          val pred     = havingPred.getOrElse("TRUE")
-          if (!havingPredicateIsSafe(pred, dataCols)) {
-            throw new RuntimeException(
-              s"HAVING predicate '$pred' references columns not present on data table " +
-                s"${sqlIdent(dataIdent)} (columns: ${dataCols.mkString(", ")}). " +
-                "This indicates the HAVING clause uses an aggregate not in SELECT; " +
-                "such views are not currently supported in the incremental AGGREGATE_HAVING " +
-                "path — they will be retried as FULL_REFRESH on the next CREATE."
-            )
-          }
-          val colList = userOutputCols
-            .map(c => s"`${c.replace("`", "``")}`")
-            .mkString(", ")
-          val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
-          val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
-          val viewSql =
-            s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
-              s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
-          val t0 = System.nanoTime()
-          try {
-            spark.sql(viewSql)
-          } finally {
-            val ms = (System.nanoTime() - t0) / 1000000L
-            sqlLog.record(
-              category = "backing_user_view",
-              stmtOrder = 2,
-              attemptIdx = 0,
-              stmtKind = "ddl",
-              sql = viewSql,
-              durationMs = ms
-            )
-          }
+        profile.timeStep("create_mv_publish_metadata", s"sources=${meta.sourceTables.size}") {
+          // Publish complete metadata only after CTAS (and the optional HAVING
+          // view) succeeded. A failed catalog write is safely retryable because
+          // the retry detects the committed Delta path and repeats only the
+          // idempotent named registration.
+          //
+          // The committed version is read straight off the Delta log snapshot:
+          // a `DeltaTable.history` read would submit a Spark job that has to
+          // queue behind the concurrent Delta data writes for a task slot.
+          val version = DeltaTableVersion.requireLatest(spark, location)
+          MvCatalog.upsert(spark, meta.copy(lastVersion = version))
         }
       }
-
-      profile.timeStep("create_mv_publish_metadata", s"sources=${meta.sourceTables.size}") {
-        // Publish complete metadata only after CTAS (and the optional HAVING
-        // view) succeeded. A failed catalog write is safely retryable because
-        // the retry detects the committed Delta path and repeats only the
-        // idempotent named registration.
-        //
-        // The committed version is read straight off the Delta log snapshot:
-        // a `DeltaTable.history` read would submit a Spark job that has to
-        // queue behind the concurrent Delta data writes for a task slot.
-        val version = DeltaTableVersion.requireLatest(spark, location)
-        MvCatalog.upsert(spark, meta.copy(lastVersion = version))
-      }
+    } catch {
+      case t: Throwable =>
+        if (rollbackOwnedArtifactsOnFailure && !publicationCommitted) {
+          cleanupFailedCreateArtifacts(spark, name, dataIdent, location)
+        }
+        throw t
     }
 
     Seq.empty

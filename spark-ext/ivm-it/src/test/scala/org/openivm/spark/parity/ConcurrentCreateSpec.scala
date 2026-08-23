@@ -1,9 +1,14 @@
 package org.openivm.spark.parity
 
+import io.delta.tables.DeltaTable
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.commands.CommandConcurrencyInjection
 import org.openivm.spark.common.{CdfWatermarkCatalog, FeatureGate, MvCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.{Executors, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -12,6 +17,11 @@ class ConcurrentCreateSpec extends ConcurrentCreateScenarios with InterceptMode
 
 abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-create") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  private def pathExists(location: String): Boolean = {
+    val path = new Path(location)
+    path.getFileSystem(spark.sessionState.newHadoopConf()).exists(path)
+  }
 
   override protected def startSpark(extraConf: Map[String, String] = Map.empty): Unit = {
     val builder = SparkSession
@@ -73,6 +83,69 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
           s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
         )
       }
+    }
+
+    it("lets a queued IF NOT EXISTS CREATE rerun CTAS after the leader rolls back its unpublished path") {
+      val schema   = "cc_retry"
+      val mvTable  = "cc_retry_mv"
+      val mvName   = s"$schema.$mvTable"
+      val viewSql  = s"SELECT id, label FROM $schema.cc_retry_src WHERE id >= 0"
+      val location = s"${spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")}/_ivm/views/$schema/$mvTable"
+
+      sql(s"CREATE DATABASE IF NOT EXISTS $schema")
+      sql(s"CREATE TABLE IF NOT EXISTS $schema.cc_retry_src(id INT, label STRING) USING DELTA")
+      sql(s"INSERT INTO $schema.cc_retry_src VALUES (1, 'one'), (2, 'two')")
+
+      val createEntered     = new java.util.concurrent.CountDownLatch(1)
+      val releaseCreate     = new java.util.concurrent.CountDownLatch(1)
+      val injectedFailure   = new AtomicBoolean(false)
+      val dataWriteAttempts = new AtomicInteger(0)
+
+      CommandConcurrencyInjection.withBeforeCreateBody({
+        createEntered.countDown()
+        releaseCreate.await(30L, TimeUnit.SECONDS) shouldBe true
+      }) {
+        CommandConcurrencyInjection.withBeforeCreateDataWrite({
+          if (dataWriteAttempts.incrementAndGet() == 2) {
+            pathExists(location) shouldBe false
+            DeltaTable.isDeltaTable(spark, location) shouldBe false
+          }
+        }) {
+          CommandConcurrencyInjection.withAfterCreateDataWrite({
+            if (injectedFailure.compareAndSet(false, true))
+              throw new IllegalStateException("fail before catalog registration")
+          }) {
+            val pool = Executors.newFixedThreadPool(2)
+            try {
+              implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+              val firstCreate = Future {
+                intercept[IllegalStateException] {
+                  sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewSql").collect()
+                }
+              }
+              createEntered.await(30L, TimeUnit.SECONDS) shouldBe true
+              val queuedCreate = Future {
+                sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $mvName AS $viewSql").collect()
+              }
+              Thread.sleep(150L)
+              queuedCreate.isCompleted shouldBe false
+              releaseCreate.countDown()
+
+              Await.result(firstCreate, 180.seconds).getMessage should include("before catalog registration")
+              Await.result(queuedCreate, 180.seconds)
+            } finally {
+              pool.shutdown()
+              pool.awaitTermination(30, TimeUnit.SECONDS)
+            }
+          }
+        }
+      }
+
+      dataWriteAttempts.get() shouldBe 2
+      pathExists(location) shouldBe true
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+      MvCatalog.lookup(spark, TableIdentifier(mvTable, Some(schema))).map(_.location) shouldBe Some(location)
+      assertMvCorrect(mvName, viewSql)
     }
   }
 }

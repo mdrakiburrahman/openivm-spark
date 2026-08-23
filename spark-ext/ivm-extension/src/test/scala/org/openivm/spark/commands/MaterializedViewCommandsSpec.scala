@@ -107,6 +107,11 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     ()
   }
 
+  private def pathExists(location: String): Boolean = {
+    val path = new Path(location)
+    path.getFileSystem(spark.sessionState.newHadoopConf()).exists(path)
+  }
+
   private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A = {
     val pool = Executors.newFixedThreadPool(parallelism)
     try {
@@ -1036,7 +1041,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual("mv_t1a_publish", "SELECT id, label FROM sales_t1a_publish")
     }
 
-    it("reuses a committed Delta path after failure before named registration") {
+    it("rolls back a newly-created Delta path after failure before named registration") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_retry(id INT, label STRING) USING DELTA")
       spark.sql("INSERT INTO sales_t1a_retry VALUES (1, 'one'), (2, 'two'), (2, 'two')")
       spark.sql(
@@ -1058,22 +1063,58 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         }
       }
       failure.getMessage should include("between data commit and catalog registration")
-      DeltaTable.isDeltaTable(spark, location) shouldBe true
+      pathExists(location) shouldBe false
+      DeltaTable.isDeltaTable(spark, location) shouldBe false
       spark.catalog.tableExists(name) shouldBe false
       MvCatalog.lookup(spark, TableIdentifier(name)) shouldBe empty
-      val versionsAfterFailure = DeltaTable.forPath(spark, location).history().count()
 
       spark.sql("INSERT INTO sales_t1a_retry VALUES (3, 'three')")
       spark.sql(s"CREATE MATERIALIZED VIEW $name AS $viewBody").collect()
 
-      DeltaTable.forPath(spark, location).history().count() shouldBe versionsAfterFailure
       MvCatalog.lookup(spark, TableIdentifier(name)).map(_.location) shouldBe Some(location)
       val tableMetadata = spark.sessionState.catalog.getTableMetadata(TableIdentifier(name))
       tableMetadata.provider shouldBe Some("delta")
       new Path(tableMetadata.location).toUri shouldBe new Path(location).toUri
-      spark.table(name).filter("id = 3").count() shouldBe 0L
-      spark.sql(s"REFRESH MATERIALIZED VIEW $name").collect()
       assertBagEqual(name, viewBody)
+    }
+
+    it("does not delete a preexisting Delta path when an unpublished CREATE fails") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_existing(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_existing VALUES (1, 'one'), (2, 'two'), (2, 'two')")
+
+      val name     = TableIdentifier("mv_t1a_existing")
+      val viewBody = "SELECT id, label FROM sales_t1a_existing WHERE id >= 0"
+      val location = MvCommandHelper.mvLocation(spark, name)
+
+      spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+      val rowsAtLocation = DeltaTable.forPath(spark, location).toDF.count()
+      spark.sql(s"DROP TABLE IF EXISTS ${MvCommandHelper.sqlIdent(name)}")
+      MvCatalog.remove(spark, name)
+
+      spark.catalog.tableExists(name.table) shouldBe false
+      MvCatalog.lookup(spark, name) shouldBe empty
+      pathExists(location) shouldBe true
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+
+      val injected = new AtomicBoolean(false)
+      val failure = intercept[IllegalStateException] {
+        CommandConcurrencyInjection.withAfterCreateDataWrite({
+          if (injected.compareAndSet(false, true))
+            throw new IllegalStateException("fail before registering preexisting delta path")
+        }) {
+          spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+        }
+      }
+
+      failure.getMessage should include("preexisting delta path")
+      spark.catalog.tableExists(name.table) shouldBe false
+      MvCatalog.lookup(spark, name) shouldBe empty
+      pathExists(location) shouldBe true
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+      DeltaTable.forPath(spark, location).toDF.count() shouldBe rowsAtLocation
+
+      spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+      assertBagEqual(name.table, viewBody)
     }
 
     it("allows independent path CTAS phases to enter concurrently") {
