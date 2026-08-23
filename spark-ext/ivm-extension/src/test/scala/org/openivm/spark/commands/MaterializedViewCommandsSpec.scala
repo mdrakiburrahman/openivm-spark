@@ -14,8 +14,11 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.{ArrayType, IntegerType, MapType, StringType, StructField, StructType}
 import org.openivm.spark.common.{
   BatchVerdict,
+  CdfChangePropagation,
   ChangeWatermark,
+  DeltaTableVersion,
   FeatureGate,
+  InterceptChangePropagation,
   MvCatalog,
   MvMetadata,
   RefreshTypeCode,
@@ -215,6 +218,25 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
        |INSERT INTO openivm_data_$viewLogicalName (id) SELECT id FROM base;
        |INSERT INTO openivm_delta_$viewLogicalName (id, openivm_multiplicity)
        |SELECT id, 1 FROM openivm_data_$viewLogicalName;
+       |""".stripMargin
+
+  /** The FULL_REFRESH program shape openivm emits for a TERMINAL view: a
+    * one-row constant query with no source table, no upstream MV and no
+    * downstream consumer (`SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)`).
+    * `force_view_delta_cascade` forces `has_downstream = true` for FULL_REFRESH
+    * in `refresh_sql.cpp`, so the split-safe signed companion is emitted here
+    * too — there is no `FROM` in the recompute, but the retract/add pair is the
+    * same.
+    */
+  private def terminalConstantCompanionSql(viewLogicalName: String): String =
+    s"""DELETE FROM openivm_delta_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_delta_$viewLogicalName (ingested_at, openivm_multiplicity)
+       |SELECT ingested_at, -1 FROM openivm_data_$viewLogicalName;
+       |DELETE FROM openivm_data_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_data_$viewLogicalName (ingested_at)
+       |SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP);
+       |INSERT INTO openivm_delta_$viewLogicalName (ingested_at, openivm_multiplicity)
+       |SELECT ingested_at, 1 FROM openivm_data_$viewLogicalName;
        |""".stripMargin
 
   private def upstreamMeta(shortName: String, classification: MvCommandHelper.EffectiveClassification): MvMetadata =
@@ -475,7 +497,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       authoritative.emitsCascadeViewDelta shouldBe false
     }
 
-    it("reports a verified FULL_REFRESH companion as CASCADE_RECOMPUTE, never as a full rebuild") {
+    it("reports a verified FULL_REFRESH companion as SIGNED_DELTA_RECOMPUTE, never as a full rebuild") {
       val viewShortName = "mv_full_refresh_cascade"
       val classification = MvCommandHelper.classifyEffectiveRefreshType(
         compiled = CompiledRefresh(
@@ -495,13 +517,53 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       // Execution stays a recompute (the code is unchanged) …
       classification.refreshType shouldBe RefreshTypeCode.FullRefresh
       // … but the REPORTED strategy is its own, so it never normalizes to FULL.
-      classification.refreshTypeName shouldBe RefreshTypeCode.CascadeRecomputeName
+      classification.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
       classification.refreshTypeName should not be RefreshTypeCode.FullRefreshName
-      classification.reason shouldBe "cascade_recompute_verified_delta"
+      classification.reason shouldBe "signed_delta_recompute_verified"
       // The native compile type is preserved diagnostically.
       classification.compileRefreshTypeName shouldBe "FULL_REFRESH"
       classification.isDemotionToFullRefresh shouldBe false
       classification.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("reports the terminal current_timestamp view as a signed-delta recompute, not FULL") {
+      // `meta_ingestion` / `ingestion_metadata_mat_view` in the
+      // local-spark-openivm canary:
+      //     SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)
+      // No source table, no upstream MV, no downstream consumer — the archived
+      // canary logged it as compiled=FULL_REFRESH effective=FULL_REFRESH
+      // reason='kept', which the benchmark's refresh-type guard rejects even
+      // though openivm emitted a valid signed companion for it.
+      val viewShortName = "ingestion_metadata_mat_view"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = terminalConstantCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        // Terminal AND no upstream: nothing can supply a snapshot trigger.
+        upstreamSnapshotTriggerDetail = None,
+        simpleProjectionHasDataApply = true,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
+      classification.reason shouldBe "signed_delta_recompute_verified"
+      classification.compileRefreshTypeName shouldBe "FULL_REFRESH"
+      classification.emitsCascadeViewDelta shouldBe true
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.upstreamSnapshotTrigger shouldBe None
+      // The benchmark guard normalizes exactly FULL/FULL_REFRESH to FULL and
+      // fails the canary on it, plus any COMPILE_FAILED/NON_CASCADE_UPSTREAM
+      // reason prefix. This shape must clear all three.
+      Set("FULL", "FULL_REFRESH") should not contain classification.refreshTypeName
+      classification.reason.toUpperCase should not startWith "COMPILE_FAILED"
+      classification.reason.toUpperCase should not startWith "NON_CASCADE_UPSTREAM"
     }
 
     it("keeps a FULL_REFRESH with no verified companion reported as FULL_REFRESH") {
@@ -526,7 +588,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       classification.emitsCascadeViewDelta shouldBe false
     }
 
-    it("never launders a demoted incremental type into the cascade-recompute strategy") {
+    it("never launders a demoted incremental type into the signed-delta-recompute strategy") {
       // A real signed delta is present, but the compiled type was INCREMENTAL and
       // the view still lost its incremental path — that is a genuine degradation
       // and must keep reporting FULL_REFRESH.
@@ -590,7 +652,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
 
       upstream.emitsCascadeViewDelta shouldBe true
-      upstream.refreshTypeName shouldBe RefreshTypeCode.CascadeRecomputeName
+      upstream.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
       detail shouldBe None
       downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
       downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
@@ -687,8 +749,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
              |SELECT col1 AS k, col2 AS v FROM VALUES ('a', 1), ('b', 2), ('b', 2) AS t(col1, col2)
              |""".stripMargin
         )
-        val preVersion =
-          DeltaTable.forPath(spark, path).history(1).collect().head.getAs[Long]("version")
+        val preVersion = DeltaTableVersion.requireLatest(spark, path)
         spark.sql(
           s"""INSERT OVERWRITE TABLE delta.`$path`
              |SELECT col1 AS k, col2 AS v FROM VALUES ('b', 2), ('c', 3) AS t(col1, col2)
@@ -738,6 +799,98 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         ("b", 2, -1),
         ("b", 2, 1),
         ("c", 3, 1)
+      )
+    }
+
+    it("emits the signed old/new pair for a terminal one-row constant view") {
+      // `SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)`: no upstream, no
+      // consumer, one row that changes on every recompute. The delta is
+      // produced for the refreshed view ITSELF, which is what makes
+      // SIGNED_DELTA_RECOMPUTE an honest report rather than a label.
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_terminal_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      val (preVersion, schema) =
+        try {
+          spark.sql(
+            s"CREATE TABLE delta.`$path` USING DELTA AS SELECT TIMESTAMP'2024-01-01 00:00:00' AS ingested_at"
+          )
+          val v = DeltaTableVersion.requireLatest(spark, path)
+          spark.sql(
+            s"INSERT OVERWRITE TABLE delta.`$path` SELECT TIMESTAMP'2024-01-02 00:00:00' AS ingested_at"
+          )
+          (v, spark.read.format("delta").load(path).schema)
+        } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+
+      MvCommandHelper.supportsExactDiffCascade(schema) shouldBe true
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = schema.fieldNames.toSeq,
+        preRefreshVersion = preVersion,
+        exactDiff = true
+      )
+
+      val pairs = spark
+        .sql(sql)
+        .collect()
+        .map(r => (r.getAs[java.sql.Timestamp]("ingested_at").toString, r.getAs[Int]("openivm_multiplicity")))
+        .toSeq
+        .sorted
+      pairs shouldBe Seq(
+        ("2024-01-01 00:00:00.0", -1),
+        ("2024-01-02 00:00:00.0", 1)
+      )
+    }
+
+    it("records the same signed pair through the MV change feed under cdf mode") {
+      // The benchmark canary runs `spark.openivm.changeFeed.mode=cdf`, where
+      // the MV data table itself carries `delta.enableChangeDataFeed = true`
+      // (FeatureGate.buildMvDataTblProperties) and the explicit view-delta
+      // write is deliberately skipped: Delta records the recompute as the old
+      // snapshot deleted and the new snapshot inserted, which IS the signed
+      // `old x -1 / new x +1` pair. The two modes are complementary, so
+      // SIGNED_DELTA_RECOMPUTE is backed by a real signed record either way.
+      new InterceptChangePropagation().requiresDmlInterception shouldBe true
+      new InterceptChangePropagation().requiresMvCdf shouldBe false
+      new CdfChangePropagation().requiresDmlInterception shouldBe false
+      new CdfChangePropagation().requiresMvCdf shouldBe true
+
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_cdf_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      val preVersion =
+        try {
+          spark.sql(
+            s"CREATE TABLE delta.`$path` USING DELTA " +
+              s"TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true') " +
+              s"AS SELECT TIMESTAMP'2024-01-01 00:00:00' AS ingested_at"
+          )
+          val v = DeltaTableVersion.requireLatest(spark, path)
+          spark.sql(
+            s"INSERT OVERWRITE TABLE delta.`$path` SELECT TIMESTAMP'2024-01-02 00:00:00' AS ingested_at"
+          )
+          v
+        } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+
+      val signed = spark.read
+        .format("delta")
+        .option("readChangeFeed", "true")
+        .option("startingVersion", preVersion + 1)
+        .load(path)
+        .collect()
+        .map { r =>
+          val multiplicity = r.getAs[String]("_change_type") match {
+            case "insert" => 1
+            case "delete" => -1
+            case other    => fail(s"unexpected change type '$other'")
+          }
+          (r.getAs[java.sql.Timestamp]("ingested_at").toString, multiplicity)
+        }
+        .toSeq
+        .sorted
+      signed shouldBe Seq(
+        ("2024-01-01 00:00:00.0", -1),
+        ("2024-01-02 00:00:00.0", 1)
       )
     }
 

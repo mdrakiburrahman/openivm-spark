@@ -82,12 +82,14 @@ object RefreshTypeCode {
     * `refresh_sql.cpp build_split_safe_full_refresh_companion` emits an exact
     * signed old×-1 / new×+1 companion around the recompute for the Spark
     * dialect whenever `CompileFacts::force_view_delta_cascade` is set (which
-    * openivm-spark always sets). A FULL_REFRESH view whose compiled program
-    * carries that companion CAN feed downstream MVs, so it is reported as
-    * CASCADE_RECOMPUTE and its dependents keep their own incremental refresh
-    * type. A FULL_REFRESH view without it (compile failure, unsupported plan,
-    * empty-placeholder delta) fails closed exactly as before, because
-    * `hasRealDelta` is false.
+    * openivm-spark always sets, and which forces `has_downstream = true` for
+    * every FULL_REFRESH compile in `refresh_sql.cpp`, so the companion is
+    * emitted for terminal views with no consumer too). A FULL_REFRESH view
+    * whose compiled program carries that companion publishes an exact signed
+    * delta of its own contents, so it is reported as SIGNED_DELTA_RECOMPUTE and
+    * any dependents keep their own incremental refresh type. A FULL_REFRESH
+    * view without it (compile failure, unsupported plan, empty-placeholder
+    * delta) fails closed exactly as before, because `hasRealDelta` is false.
     */
   def mayEmitCascadeViewDelta(rt: Int): Boolean = rt match {
     case FullRefresh => true
@@ -104,10 +106,19 @@ object RefreshTypeCode {
   /** Reported strategy name for a view openivm ITSELF compiled to FULL_REFRESH
     * whose emitted program carries the verified split-safe signed companion
     * (see [[mayEmitCascadeViewDelta]]). It recomputes its own contents and
-    * publishes an exact `old x -1 / new x +1` view delta, so every dependent
-    * stays incremental — materially different from a view that FELL BACK to a
-    * full rebuild and starves its dependents, and reported under its own name
-    * so the two are never conflated. A demoted view keeps [[FullRefreshName]].
+    * publishes an exact `old x -1 / new x +1` delta of that recompute, so the
+    * refresh is auditable and any dependent stays incremental — materially
+    * different from a view that FELL BACK to a full rebuild and can only
+    * starve its consumers, and reported under its own name so the two are
+    * never conflated.
+    *
+    * Deliberately NOT named after cascading: the signed delta is produced for
+    * the refreshed view itself and is equally real for a terminal view with no
+    * upstream and no consumer (e.g. `SELECT CAST(CURRENT_TIMESTAMP() AS
+    * TIMESTAMP)`), which is exactly the shape that must not report FULL. Under
+    * `changeFeed.mode=cdf` that pair is recorded by the MV's own Delta change
+    * feed instead of a separate view-delta write; both modes keep the report
+    * honest. A demoted view keeps [[FullRefreshName]].
     */
-  val CascadeRecomputeName: String = "CASCADE_RECOMPUTE"
+  val SignedDeltaRecomputeName: String = "SIGNED_DELTA_RECOMPUTE"
 }

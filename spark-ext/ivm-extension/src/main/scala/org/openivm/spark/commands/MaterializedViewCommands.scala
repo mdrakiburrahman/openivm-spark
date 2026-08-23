@@ -869,7 +869,7 @@ private[commands] object MvCommandHelper {
     /** True only for a genuine downgrade: a compiled INCREMENTAL type that ends
       * up executing as a full rebuild. A view openivm itself compiled to
       * FULL_REFRESH is not a demotion — including when it reports as
-      * [[RefreshTypeCode.CascadeRecomputeName]] because its verified signed
+      * [[RefreshTypeCode.SignedDeltaRecomputeName]] because its verified signed
       * companion still feeds dependents.
       */
     def isDemotionToFullRefresh: Boolean =
@@ -1066,24 +1066,27 @@ private[commands] object MvCommandHelper {
         !topKViewSpec.detected &&
           RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
           SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
-      // A view openivm ITSELF classified FULL_REFRESH (a `current_date()`
-      // predicate, an unsupported set operation, …) that carries the verified
-      // signed companion is not a degraded incremental refresh: it recomputes
-      // its own contents and still feeds every dependent an exact delta. Report
-      // it as its own strategy so it is never conflated with a view that fell
-      // back to a full rebuild. Strictly limited to `compiled.refreshType ==
-      // FullRefresh` — a genuine DEMOTION (`top_k_unsupported`,
-      // `having_pred_*`, `simple_projection_no_apply`, `no_real_delta`,
-      // `compile_failed`) keeps the FULL_REFRESH label even when it happens to
-      // carry a delta, because there the incremental path really was lost.
-      val cascadeRecompute =
+      // A view openivm ITSELF classified FULL_REFRESH (a `current_date()` /
+      // `current_timestamp()` predicate, an unsupported set operation, …) that
+      // carries the verified signed companion is not a degraded incremental
+      // refresh: it recomputes its own contents and publishes an exact signed
+      // `old x -1 / new x +1` delta of that recompute. That delta is produced
+      // for THIS view — a terminal one-row constant view with no upstream and
+      // no consumer gets it too — so report it as its own strategy and never
+      // conflate it with a view that fell back to a full rebuild. Strictly
+      // limited to `compiled.refreshType == FullRefresh` — a genuine DEMOTION
+      // (`top_k_unsupported`, `having_pred_*`, `simple_projection_no_apply`,
+      // `no_real_delta`, `compile_failed`) keeps the FULL_REFRESH label even
+      // when it happens to carry a delta, because there the incremental path
+      // really was lost.
+      val signedDeltaRecompute =
         baseReason == "kept" &&
           compiled.refreshType == RefreshTypeCode.FullRefresh &&
           effectiveRefreshType == RefreshTypeCode.FullRefresh &&
           emitsCascadeViewDelta
-      val reason = if (cascadeRecompute) "cascade_recompute_verified_delta" else baseReason
+      val reason = if (signedDeltaRecompute) "signed_delta_recompute_verified" else baseReason
       val effectiveRefreshTypeName =
-        if (cascadeRecompute) RefreshTypeCode.CascadeRecomputeName
+        if (signedDeltaRecompute) RefreshTypeCode.SignedDeltaRecomputeName
         else if (effectiveRefreshType == RefreshTypeCode.FullRefresh) RefreshTypeCode.FullRefreshName
         else compiled.refreshTypeName
       EffectiveClassification(
@@ -1453,12 +1456,13 @@ case class CreateMaterializedViewCommand(
     //                                 cascade view-delta)
     //   - having_pred_empty           AggregateHaving with no extractable HAVING predicate
     //   - no_real_delta               openivm emitted only empty-placeholder delta
-    //   - cascade_recompute_verified_delta
+    //   - signed_delta_recompute_verified
     //                                 openivm itself compiled FULL_REFRESH and the emitted
     //                                 program carries the verified split-safe signed
-    //                                 companion, so the recompute still feeds every
-    //                                 dependent an exact delta — reported as
-    //                                 CASCADE_RECOMPUTE, not FULL_REFRESH
+    //                                 companion, so the recompute publishes an exact
+    //                                 `old x -1 / new x +1` delta of itself (terminal
+    //                                 views with no consumer included) — reported as
+    //                                 SIGNED_DELTA_RECOMPUTE, not FULL_REFRESH
     //   - kept                        compiled type is preserved verbatim (incremental MV-over-MV
     //                                 case included — upstream is cascade-delta-capable)
     //
@@ -2342,23 +2346,32 @@ case class RefreshMaterializedViewCommand(
         val assembled   = SparkMergeAssembler.assemble(input)
         var stmtCounter = 0
         try {
-          // MV-over-MV cascade for a recompute. Downstream MVs are kept
-          // incremental only when this MV advertises
-          // `_ivm_emits_cascade_view_delta` — verified at CREATE against
-          // openivm's split-safe FULL_REFRESH companion — so a recompute MUST
-          // publish the matching signed view-delta or the downstream would
-          // never observe this refresh. Pin the pre-refresh version BEFORE the
-          // recompute mutates the data table; the companion itself is written
-          // afterwards from Delta time travel.
+          // The signed view-delta of this recompute. Produced for THIS view,
+          // not merely for cascade propagation: a FULL_REFRESH MV that
+          // advertises `_ivm_emits_cascade_view_delta` — verified at CREATE
+          // against openivm's split-safe FULL_REFRESH companion — is reported
+          // as SIGNED_DELTA_RECOMPUTE, so the exact `old x -1 / new x +1` pair
+          // must actually be computed and persisted on every refresh, including
+          // for a terminal view with no upstream and no consumer (the
+          // `SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)` shape). Downstream
+          // MVs additionally get one `MV_VIEW_DELTA` staging row each, so they
+          // stay incremental. Pin the pre-refresh version BEFORE the recompute
+          // mutates the data table; the delta itself is written afterwards from
+          // Delta time travel.
           //
-          // Intercept mode only: under CDF the downstream discovers the
-          // recompute through this MV's own Delta change feed, and a recompute
-          // commit classifies as `Replace` there.
+          // Intercept mode only: under CDF the MV data table itself carries
+          // `delta.enableChangeDataFeed = true` (FeatureGate
+          // .buildMvDataTblProperties), so Delta already records the recompute
+          // as the old snapshot deleted and the new snapshot inserted — the
+          // same signed pair, durably, without a second write. Every consumer
+          // discovers the recompute through that change feed (a recompute
+          // commit classifies as `Replace` there).
+          val emitsSignedDelta: Boolean =
+            propagation.requiresDmlInterception && meta.emitsCascadeViewDelta
           val cascadeKeys: Set[String] =
-            if (propagation.requiresDmlInterception && meta.emitsCascadeViewDelta) downstreamSourceKeysForThisMv
-            else Set.empty
+            if (emitsSignedDelta) downstreamSourceKeysForThisMv else Set.empty
           val cascadePreRefreshVersion: Option[Long] =
-            if (cascadeKeys.isEmpty) None
+            if (!emitsSignedDelta) None
             else
               Some(profile.timeStep("pin_full_refresh_cascade_version", "source=delta_log_snapshot") {
                 DeltaTableVersion.requireLatest(spark, meta.location)
@@ -2395,10 +2408,12 @@ case class RefreshMaterializedViewCommand(
             }
           }
           // Strict ordering (mirrors the incremental path): the view-delta and
-          // its `MV_VIEW_DELTA` staging row are published BEFORE
+          // any `MV_VIEW_DELTA` staging rows are published BEFORE
           // markConsumed / MvCatalog.advance, so a crash in between leaves an
           // orphan delta the Phase-7 sweep collects — never a consumed source
-          // batch whose downstream feed was lost.
+          // batch whose downstream feed was lost. A terminal view records no
+          // staging row, so its delta is always swept; it is still written
+          // because it is the audit record of what this refresh changed.
           cascadePreRefreshVersion.foreach { preVersion =>
             val warehouse    = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
             val safeMvName   = metaName(name).replace(".", "_").replace(" ", "_")
@@ -2413,7 +2428,7 @@ case class RefreshMaterializedViewCommand(
             )
             profile.timeStep(
               "full_refresh_cascade_snapshot",
-              s"pre_version=$preVersion;exact_diff=$exactDiff;keys=${cascadeKeys.size}"
+              s"pre_version=$preVersion;exact_diff=$exactDiff;consumers=${cascadeKeys.size}"
             ) {
               val qOrder = qlogOrder.getAndIncrement()
               val t0     = System.nanoTime()
@@ -2430,7 +2445,7 @@ case class RefreshMaterializedViewCommand(
                   stmtOrder = qOrder,
                   attemptIdx = 0,
                   stmtKind = "insert_overwrite",
-                  sql = "-- synthetic representation of the full-refresh cascade view-delta write\n" +
+                  sql = "-- synthetic representation of the full-refresh signed view-delta write\n" +
                     s"INSERT OVERWRITE delta.`$cascadePath`\n$cascadeSelect",
                   durationMs = (System.nanoTime() - t0) / 1000000L
                 )
@@ -2453,8 +2468,9 @@ case class RefreshMaterializedViewCommand(
               }
             }
             logInfo(
-              s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='full_refresh_cascade_recorded' " +
-                s"exact_diff='$exactDiff' downstream_sources='${cascadeKeys.toSeq.sorted.mkString(",")}'"
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='signed_delta_recorded' " +
+                s"exact_diff='$exactDiff' consumers='${cascadeKeys.size}' " +
+                s"downstream_sources='${cascadeKeys.toSeq.sorted.mkString(",")}'"
             )
           }
           profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
@@ -2462,10 +2478,10 @@ case class RefreshMaterializedViewCommand(
               finalizeRefresh(meta)
             }
           }
-          emitEnd("full_refresh_executed", "FULL_REFRESH", changeBatches.size)
+          emitEnd("full_refresh_executed", meta.refreshTypeName, changeBatches.size)
         } catch {
           case t: Throwable =>
-            emitEnd("full_refresh_failed", "FULL_REFRESH", changeBatches.size)
+            emitEnd("full_refresh_failed", meta.refreshTypeName, changeBatches.size)
             val sqlSnippet = assembled.statements.mkString(";\n---\n")
             throw new RuntimeException(
               s"Full refresh of '${sqlIdent(name)}' failed: ${t.getMessage}\nAssembled SQL:\n$sqlSnippet",

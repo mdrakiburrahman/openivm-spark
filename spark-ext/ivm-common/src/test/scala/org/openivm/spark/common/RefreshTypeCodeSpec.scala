@@ -60,11 +60,11 @@ class RefreshTypeCodeSpec extends AnyFunSpec with Matchers {
     }
 
     it("reports a verified full-refresh companion under a distinct, non-FULL strategy name") {
-      RefreshTypeCode.CascadeRecomputeName shouldBe "CASCADE_RECOMPUTE"
-      RefreshTypeCode.CascadeRecomputeName should not be RefreshTypeCode.FullRefreshName
+      RefreshTypeCode.SignedDeltaRecomputeName shouldBe "SIGNED_DELTA_RECOMPUTE"
+      RefreshTypeCode.SignedDeltaRecomputeName should not be RefreshTypeCode.FullRefreshName
       // The guard normalizes only FULL/FULL_REFRESH to FULL; anything else
       // passes through, so the cascade strategy must not alias either spelling.
-      Set("FULL", "FULL_REFRESH") should not contain RefreshTypeCode.CascadeRecomputeName
+      Set("FULL", "FULL_REFRESH") should not contain RefreshTypeCode.SignedDeltaRecomputeName
     }
   }
 }
