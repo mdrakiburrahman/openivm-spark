@@ -11,6 +11,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.types.{ArrayType, IntegerType, MapType, StringType, StructField, StructType}
 import org.openivm.spark.common.{
   BatchVerdict,
   ChangeWatermark,
@@ -192,6 +193,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     s"""INSERT INTO openivm_delta_$viewLogicalName
        |SELECT 1 AS id, CAST(1 AS INTEGER) AS openivm_multiplicity
        |""".stripMargin
+
+  /** The empty-placeholder delta openivm emits when it cannot compute an
+    * incremental change for the view.
+    */
+  private def placeholderDeltaSql(viewLogicalName: String): String =
+    s"""INSERT INTO openivm_delta_$viewLogicalName
+       |SELECT CAST(NULL AS INTEGER) AS id, CAST(1 AS INTEGER) AS openivm_multiplicity WHERE false
+       |""".stripMargin
+
+  /** The FULL_REFRESH program shape openivm emits for the Spark dialect with
+    * `CompileFacts::force_view_delta_cascade`: `build_split_safe_full_refresh_companion`
+    * retracts the pre-refresh data table with `-1` before the recompute and adds
+    * the post-refresh data table with `+1` after it.
+    */
+  private def splitSafeFullRefreshCompanionSql(viewLogicalName: String): String =
+    s"""DELETE FROM openivm_delta_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_delta_$viewLogicalName (id, openivm_multiplicity)
+       |SELECT id, -1 FROM openivm_data_$viewLogicalName;
+       |DELETE FROM openivm_data_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_data_$viewLogicalName (id) SELECT id FROM base;
+       |INSERT INTO openivm_delta_$viewLogicalName (id, openivm_multiplicity)
+       |SELECT id, 1 FROM openivm_data_$viewLogicalName;
+       |""".stripMargin
+
+  private def upstreamMeta(shortName: String, classification: MvCommandHelper.EffectiveClassification): MvMetadata =
+    MvMetadata(
+      name = TableIdentifier(shortName, Some("default")),
+      querySql = "SELECT 1",
+      refreshType = classification.refreshType,
+      refreshTypeName = classification.refreshTypeName,
+      lastVersion = 0L,
+      sourceTables = Seq.empty,
+      sourceSchemaFingerprint = s"fp-$shortName",
+      location = s"target/$shortName",
+      createdAt = new Timestamp(0L),
+      properties = MvMetadata.cascadeViewDeltaProperties(classification.emitsCascadeViewDelta)
+    )
 
   /**
    * Create a staging Delta table that holds `rows` and register it in
@@ -426,6 +464,232 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       authoritative.refreshTypeName shouldBe "FULL_REFRESH"
       authoritative.reason shouldBe "compile_failed"
       authoritative.isDemotionToFullRefresh shouldBe true
+      generic.emitsCascadeViewDelta shouldBe false
+      authoritative.emitsCascadeViewDelta shouldBe false
+    }
+
+    it("keeps a FULL_REFRESH cascade-capable when openivm emits a verified signed companion") {
+      val viewShortName = "mv_full_refresh_cascade"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = splitSafeFullRefreshCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe "FULL_REFRESH"
+      classification.reason shouldBe "kept"
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("retains downstream incrementality over a verified FULL_REFRESH upstream") {
+      val upstreamShortName = "stg_full_refresh_upstream"
+      val upstream = upstreamMeta(
+        upstreamShortName,
+        MvCommandHelper.classifyEffectiveRefreshType(
+          compiled = CompiledRefresh(
+            refreshType = RefreshTypeCode.FullRefresh,
+            refreshTypeName = "FULL_REFRESH",
+            sql = splitSafeFullRefreshCompanionSql(upstreamShortName),
+            initialLoadSql = ""
+          ),
+          viewShortName = upstreamShortName,
+          topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+          simpleProjectionHasDataApply = true,
+          nonCascadeUpstreamReason = None,
+          rawHavingPred = None,
+          aggregateHavingDataColumns = None
+        )
+      )
+
+      val reason =
+        MvCommandHelper.computeNonCascadeUpstreamReason(Map(s"default.$upstreamShortName" -> upstream))
+      val downstream = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          sql = realDeltaSql("mv_downstream_of_full_refresh"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_downstream_of_full_refresh",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = reason,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      upstream.emitsCascadeViewDelta shouldBe true
+      reason shouldBe None
+      downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
+      downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
+      downstream.reason shouldBe "window_partition_kept"
+      downstream.isDemotionToFullRefresh shouldBe false
+    }
+
+    it("still demotes downstream when the FULL_REFRESH upstream carries no real delta") {
+      val upstreamShortName = "stg_full_refresh_placeholder"
+      val upstreamClassification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = placeholderDeltaSql(upstreamShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = upstreamShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+      val upstream = upstreamMeta(upstreamShortName, upstreamClassification)
+
+      val reason =
+        MvCommandHelper.computeNonCascadeUpstreamReason(Map(s"default.$upstreamShortName" -> upstream))
+      val downstream = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          sql = realDeltaSql("mv_downstream_of_placeholder"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_downstream_of_placeholder",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = reason,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      upstreamClassification.reason shouldBe "no_real_delta"
+      upstreamClassification.emitsCascadeViewDelta shouldBe false
+      reason shouldBe Some(s"non_cascade:default.$upstreamShortName")
+      downstream.refreshType shouldBe RefreshTypeCode.FullRefresh
+      downstream.reason shouldBe s"non_cascade_upstream:non_cascade:default.$upstreamShortName"
+      // The demotion stops here: this view's own compiled program carries a real
+      // signed delta, so its recompute publishes one and ITS dependents stay
+      // incremental instead of inheriting the demotion transitively.
+      downstream.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("keeps an unsupported Top-K FULL_REFRESH non-cascade even with a real compiled delta") {
+      val viewShortName = "mv_top_k_unsupported"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = splitSafeFullRefreshCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = true, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        nonCascadeUpstreamReason = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.reason shouldBe "top_k_unsupported"
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.emitsCascadeViewDelta shouldBe false
+    }
+  }
+
+  describe("full-refresh cascade view-delta") {
+    def cascadeFixture(): (String, Long, Seq[String]) = {
+      val path = s"$warehouseDir/_ivm/test/full_refresh_cascade_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      try {
+        spark.sql(
+          s"""CREATE TABLE delta.`$path` USING DELTA AS
+             |SELECT col1 AS k, col2 AS v FROM VALUES ('a', 1), ('b', 2), ('b', 2) AS t(col1, col2)
+             |""".stripMargin
+        )
+        val preVersion =
+          DeltaTable.forPath(spark, path).history(1).collect().head.getAs[Long]("version")
+        spark.sql(
+          s"""INSERT OVERWRITE TABLE delta.`$path`
+             |SELECT col1 AS k, col2 AS v FROM VALUES ('b', 2), ('c', 3) AS t(col1, col2)
+             |""".stripMargin
+        )
+        (path, preVersion, spark.read.format("delta").load(path).schema.fieldNames.toSeq)
+      } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+    }
+
+    def signedRows(sql: String): Seq[(String, Int, Int)] =
+      spark
+        .sql(sql)
+        .collect()
+        .map(r => (r.getAs[String]("k"), r.getAs[Int]("v"), r.getAs[Int]("openivm_multiplicity")))
+        .toSeq
+        .sorted
+
+    it("emits the exact signed multiset difference across the recompute") {
+      val (path, preVersion, columns) = cascadeFixture()
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = columns,
+        preRefreshVersion = preVersion,
+        exactDiff = true
+      )
+
+      sql should include(s"VERSION AS OF $preVersion")
+      sql should include("EXCEPT ALL")
+      // old = {a1, b2, b2}, new = {b2, c3}: one b2 cancels, the surplus retracts.
+      signedRows(sql) shouldBe Seq(("a", 1, -1), ("b", 2, -1), ("c", 3, 1))
+    }
+
+    it("falls back to the unconditional split-safe snapshot pair with the same net effect") {
+      val (path, preVersion, columns) = cascadeFixture()
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = columns,
+        preRefreshVersion = preVersion,
+        exactDiff = false
+      )
+
+      sql should include(s"VERSION AS OF $preVersion")
+      sql should not include "EXCEPT ALL"
+      signedRows(sql) shouldBe Seq(
+        ("a", 1, -1),
+        ("b", 2, -1),
+        ("b", 2, -1),
+        ("b", 2, 1),
+        ("c", 3, 1)
+      )
+    }
+
+    it("only reduces to the exact difference for set-operable schemas") {
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(Seq(StructField("k", StringType), StructField("v", IntegerType)))
+      ) shouldBe true
+
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(Seq(StructField("k", StringType), StructField("tags", MapType(StringType, StringType))))
+      ) shouldBe false
+
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(
+          Seq(
+            StructField(
+              "nested",
+              StructType(Seq(StructField("tags", ArrayType(MapType(StringType, StringType)))))
+            )
+          )
+        )
+      ) shouldBe false
     }
   }
 

@@ -84,9 +84,12 @@ final case class MvMetadata(
       .toMap
 
   /** Whether this persisted MV instance writes a downstream-consumable
-    * `openivm_delta_<view>` on REFRESH. Falls back to the coarse refresh-type
-    * capability for pre-property metadata rows created before
-    * `_ivm_emits_cascade_view_delta` existed.
+    * `openivm_delta_<view>` on REFRESH. The property is the per-MV verdict
+    * recorded at CREATE (compiled program verified by
+    * `SparkRefreshRewriter.hasRealDelta`). Missing property means legacy
+    * metadata written before `_ivm_emits_cascade_view_delta` existed, which
+    * falls back — fail-closed for FULL_REFRESH — to the coarse refresh-type
+    * capability.
     */
   def emitsCascadeViewDelta: Boolean =
     properties

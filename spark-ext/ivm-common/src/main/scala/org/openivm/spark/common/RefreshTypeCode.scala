@@ -52,9 +52,15 @@ object RefreshTypeCode {
     *
     * The remaining complement set — DISTINCT_INCREMENTAL,
     * SEMI_ANTI_RECOMPUTE, TOP_K, FULL_REFRESH — does NOT
-    * emit a cascade-usable view-delta. Downstream MVs over a
+    * emit a cascade-usable view-delta *by classification alone*. FULL_REFRESH
+    * is promoted to cascade-capable only after per-program verification; see
+    * [[mayEmitCascadeViewDelta]]. Downstream MVs over a
     * non-cascade-delta-capable upstream MUST be FullRefresh-demoted at CREATE
     * time.
+    *
+    * This is also the fail-closed fallback for legacy metadata rows written
+    * before `_ivm_emits_cascade_view_delta` existed, so FULL_REFRESH must stay
+    * `false` here.
     *
     * Matches the switch in `SparkRefreshRewriter.rewrite` (lines ~115-126)
     * combined with the Phase 2.1 demotion rule in
@@ -64,5 +70,26 @@ object RefreshTypeCode {
     case AggregateGroup | AggregateHaving | SimpleAggregate | SimpleProjection | WindowPartition | GroupRecompute =>
       true
     case _ => false
+  }
+
+  /** Refresh types ALLOWED to be cascade-capable once the actual compiled
+    * refresh program has been verified to carry a real signed view-delta
+    * (`SparkRefreshRewriter.hasRealDelta`). This is a permission set, never a
+    * verdict: a caller must AND it with that per-program verification.
+    *
+    * FULL_REFRESH is in this set — and only in this set, never in
+    * [[emitsCascadeViewDelta]] — because openivm's
+    * `refresh_sql.cpp build_split_safe_full_refresh_companion` emits an exact
+    * signed old×-1 / new×+1 companion around the recompute for the Spark
+    * dialect whenever `CompileFacts::force_view_delta_cascade` is set (which
+    * openivm-spark always sets). A FULL_REFRESH view whose compiled program
+    * carries that companion CAN feed downstream MVs, so its dependents must not
+    * be demoted at the `non_cascade_upstream` rule. A FULL_REFRESH view without
+    * it (compile failure, unsupported plan, empty-placeholder delta) fails
+    * closed exactly as before, because `hasRealDelta` is false.
+    */
+  def mayEmitCascadeViewDelta(rt: Int): Boolean = rt match {
+    case FullRefresh => true
+    case other       => emitsCascadeViewDelta(other)
   }
 }

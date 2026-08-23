@@ -2,7 +2,13 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
+import org.openivm.spark.common.{
+  ChangeFeedMode,
+  MvCatalog,
+  RefreshTypeCode,
+  StagingCatalog,
+  StagingDelta
+}
 
 import java.util.UUID
 
@@ -394,6 +400,84 @@ abstract class FullRefreshScenarios extends IvmParitySpecBase("full-refresh") {
         "SELECT region, amount FROM sales_fr8 WHERE amount > 50 " +
           "EXCEPT ALL " +
           "SELECT region, amount FROM sales_fr8 WHERE amount > 1000"
+      )
+    }
+  }
+
+  // ── Test 9: downstream MV over a FULL_REFRESH MV ──────────────────────────
+  // A FULL_REFRESH upstream still has to make its recompute visible to
+  // dependent MVs.  Two mechanisms exist, selected by the upstream's recorded
+  // cascade capability (`_ivm_emits_cascade_view_delta`, decided at CREATE by
+  // `SparkRefreshRewriter.hasRealDelta` over the compiled openivm program):
+  //
+  //   capability = true  → the recompute publishes a signed MV_VIEW_DELTA
+  //                        (old rows at -1, new rows at +1), and dependents
+  //                        stay on their own incremental refresh type.
+  //   capability = false → no view delta is emitted, so dependents were
+  //                        demoted to FULL_REFRESH at CREATE and the recompute
+  //                        only leaves an overwrite trigger behind.
+  //
+  // Either way the dependent must observe pending work after the upstream
+  // refresh and must end up bag-equal to its defining query.
+  describe("(9) MV over a FULL_REFRESH MV — the recompute stays visible downstream") {
+
+    it("propagates a FULL_REFRESH recompute to a dependent MV") {
+      sql("CREATE TABLE IF NOT EXISTS sales_fr9(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sales_fr9 VALUES ('east', 100), ('west', 50), ('north', 200)")
+      val upstreamSql =
+        "SELECT region, amount FROM sales_fr9 WHERE amount > 80 " +
+          "INTERSECT ALL " +
+          "SELECT region, amount FROM sales_fr9"
+      sql(s"CREATE MATERIALIZED VIEW mv_fr9_up AS $upstreamSql")
+
+      mvRefreshType("mv_fr9_up") shouldBe RefreshTypeCode.FullRefresh
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_fr9_down AS " +
+          "SELECT region, SUM(amount) AS total FROM mv_fr9_up GROUP BY region"
+      )
+
+      val upstreamMeta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_fr9_up"))
+        .getOrElse(fail("mv_fr9_up not found in catalog"))
+      val downstreamMeta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_fr9_down"))
+        .getOrElse(fail("mv_fr9_down not found in catalog"))
+
+      sql("INSERT INTO sales_fr9 VALUES ('south', 500)")
+      sql("DELETE FROM sales_fr9 WHERE region = 'west'")
+      refreshMv("mv_fr9_up")
+
+      if (changeFeedMode == ChangeFeedMode.Intercept) {
+        val downstreamName = downstreamMeta.name.database
+          .fold(downstreamMeta.name.table)(db => s"$db.${downstreamMeta.name.table}")
+        val pending = StagingCatalog.collectFor(
+          spark,
+          downstreamName,
+          downstreamMeta.sourceTables,
+          downstreamMeta.sourceWatermarks
+        )
+        withClue("upstream FULL_REFRESH left no pending work for the dependent MV: ") {
+          pending should not be empty
+        }
+        if (upstreamMeta.emitsCascadeViewDelta) {
+          val viewDelta = pending
+            .filter(_.opType == StagingDelta.OpTypes.MvViewDelta)
+            .lastOption
+            .getOrElse(fail("cascade-capable FULL_REFRESH published no MV_VIEW_DELTA row"))
+          spark.read
+            .format("delta")
+            .load(viewDelta.stagingPath)
+            .columns should contain("openivm_multiplicity")
+        }
+      }
+
+      refreshMv("mv_fr9_down")
+
+      assertMvCorrect("mv_fr9_up", upstreamSql)
+      assertMvCorrect(
+        "mv_fr9_down",
+        s"SELECT region, SUM(amount) AS total FROM ($upstreamSql) fr9 GROUP BY region"
       )
     }
   }

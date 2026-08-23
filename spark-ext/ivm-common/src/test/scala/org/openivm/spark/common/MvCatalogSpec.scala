@@ -249,6 +249,24 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
         )
         .emitsCascadeViewDelta shouldBe false
     }
+
+    it("honors a verified FULL_REFRESH cascade capability recorded at CREATE") {
+      sampleMeta("cascade_full_verified")
+        .copy(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          properties = MvMetadata.cascadeViewDeltaProperties(true)
+        )
+        .emitsCascadeViewDelta shouldBe true
+
+      sampleMeta("cascade_full_unverified")
+        .copy(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          properties = MvMetadata.cascadeViewDeltaProperties(false)
+        )
+        .emitsCascadeViewDelta shouldBe false
+    }
   }
 
   describe("MvMetadata.queryHasJoin") {
