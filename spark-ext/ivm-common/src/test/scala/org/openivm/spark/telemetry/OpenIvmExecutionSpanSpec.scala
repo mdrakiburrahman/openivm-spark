@@ -91,9 +91,13 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
         OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(7L))
         OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(13L))
         OpenIvmExecutionSpan.observeTimer("catalog.mv_catalog.upsert", millis(5L))
-        OpenIvmExecutionSpan.observeRocksDbCommit(millis(11L))
+        OpenIvmExecutionSpan.observeRocksDbWrite(millis(4L))
+        OpenIvmExecutionSpan.observeRocksDbWrite(millis(6L))
+        OpenIvmExecutionSpan.observeRocksDbFlush(millis(11L), failed = false)
+        OpenIvmExecutionSpan.observeRocksDbLockWait(millis(2L), millis(1L))
         span.complete("refresh_executed", "driver-1")
-        OpenIvmExecutionSpan.observeRocksDbCommit(millis(99L))
+        OpenIvmExecutionSpan.observeRocksDbWrite(millis(99L))
+        OpenIvmExecutionSpan.observeRocksDbFlush(millis(99L), failed = true)
         OpenIvmExecutionSpan.observeRocksDbBackup(millis(17L))
         span.emitIfNeeded("failed_before_end", "fallback-thread")
         spanPayloads(appender.messages)
@@ -114,7 +118,13 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("driver_admission_wait_ms").asLong() shouldBe 7L
       payload.get("compiler_ms").asLong() shouldBe 13L
       payload.get("catalog_ms").asLong() shouldBe 5L
+      payload.get("rocksdb_write_ms").asLong() shouldBe 10L
+      payload.get("rocksdb_write_count").asLong() shouldBe 2L
       payload.get("rocksdb_flush_ms").asLong() shouldBe 11L
+      payload.get("rocksdb_flush_count").asLong() shouldBe 1L
+      payload.has("rocksdb_flush_failed_count") shouldBe false
+      payload.get("rocksdb_jvm_lock_wait_ms").asLong() shouldBe 2L
+      payload.get("rocksdb_external_lock_wait_ms").asLong() shouldBe 1L
       payload.get("rocksdb_backup_ms").asLong() shouldBe 17L
       payload.get("duration_ms").asLong() should be >= 0L
       payload.get("engine_started_at").asText() should endWith("Z")
@@ -139,6 +149,23 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("outcome").asText() shouldBe "failed_before_end"
       payload.get("driver_admission_wait_ms").asLong() shouldBe 2L
       payload.has("compiler_ms") shouldBe false
+    }
+
+    it("reports failed flush attempts on the failed command span") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.flush_fail_mv", "refresh")
+        OpenIvmExecutionSpan.observeRocksDbFlush(millis(3L), failed = true)
+        span.complete("refresh_failed", "driver-flush-fail")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.get("outcome").asText() shouldBe "refresh_failed"
+      payload.get("rocksdb_flush_ms").asLong() shouldBe 3L
+      payload.get("rocksdb_flush_count").asLong() shouldBe 1L
+      payload.get("rocksdb_flush_failed_count").asLong() shouldBe 1L
     }
 
     it("keeps compile_failed classification sticky against later generic fallbacks") {

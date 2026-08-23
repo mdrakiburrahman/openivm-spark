@@ -64,7 +64,17 @@ unit conventions; duration inputs are nanoseconds.
 | `openivm.rocksdb.scope.<scope>.operation.<op>.native.close.count` | counter | closes | Whether multi-process mode is closing per operation. |
 | `openivm.rocksdb.scope.<scope>.operation.<op>.body` | timer | ns | Operation body time after locks/open. |
 | `openivm.rocksdb.scope.<scope>.operation.<op>.multi_process.count` | counter | operations | Which calls used multi-process mode. |
-| `openivm.rocksdb.scope.<scope>.commit_batch.latency` | timer | ns | Batch write + flush + manifest latency. |
+| `openivm.rocksdb.scope.<scope>.physical_write.count` | counter | RocksDB writes | How many bounded physical `WriteBatch` writes backed one logical commit? |
+| `openivm.rocksdb.scope.<scope>.physical_write.failed` | counter | failed writes | Did a native batch write fail? |
+| `openivm.rocksdb.scope.<scope>.physical_write.latency` | timer | ns | Native batch-write latency, excluding manual flush wait. |
+| `openivm.rocksdb.scope.<scope>.physical_write.bytes` | histogram | bytes | Approximate bytes per bounded physical write. |
+| `openivm.rocksdb.scope.<scope>.physical_write.keys` | histogram | keys | Keys per bounded physical write. |
+| `openivm.rocksdb.scope.<scope>.flush.count` | counter | manual flushes | How many coalesced durability flushes ran? |
+| `openivm.rocksdb.scope.<scope>.flush.failed` | counter | failed flushes | Did a manual flush fail? |
+| `openivm.rocksdb.scope.<scope>.flush.latency` | timer | ns | Actual native manual-flush wait, excluding lock acquisition and writes. |
+| `openivm.rocksdb.scope.<scope>.flush.column_families` | histogram | column families | How many touched column families were flushed together? |
+| `openivm.rocksdb.scope.<scope>.commit_batch.latency` | timer | ns | End-to-end logical commit latency. |
+| `openivm.rocksdb.scope.<scope>.commit_batch.failed` | counter | failed commits | Did the logical commit fail before publishing a version? |
 | `openivm.rocksdb.scope.<scope>.commit_batch.bytes` | histogram | bytes | Approximate key/value bytes per batch. |
 | `openivm.rocksdb.scope.<scope>.commit_batch.keys` | histogram | keys | Keys mutated per batch. |
 | `openivm.rocksdb.scope.<scope>.commit_batch.sst_files` | histogram | files | Live SST count after commit. |

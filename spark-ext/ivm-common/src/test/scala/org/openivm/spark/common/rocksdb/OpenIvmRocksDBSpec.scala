@@ -16,7 +16,8 @@ import scala.concurrent.{Await, Future}
 
 object OpenIvmRocksDBCrashWriter {
   def main(args: Array[String]): Unit = {
-    val db = new OpenIvmRocksDB(args(0), OpenIvmRocksDBConf.default, Seq("meta"))
+    val conf = OpenIvmRocksDBConf.default.copy(walEnabled = args.lift(1).forall(_.toBoolean))
+    val db   = new OpenIvmRocksDB(args(0), conf, Seq("meta"))
     db.load()
     db.withBatch { batch =>
       db.put(batch, "meta", RocksDBCodec.utf8("crash-key"), RocksDBCodec.utf8("crash-value"))
@@ -71,6 +72,42 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       case _: Throwable => ()
     }
 
+  private def runCrashWriter(dir: File, walEnabled: Boolean): Unit = {
+    val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val classpath = System.getProperty("java.class.path")
+    val logFile   = new File(dir, "crash-writer.log")
+    val process = new ProcessBuilder(
+      javaHome,
+      "-cp",
+      classpath,
+      "org.openivm.spark.common.rocksdb.OpenIvmRocksDBCrashWriter",
+      dir.getAbsolutePath,
+      walEnabled.toString
+    )
+      .redirectErrorStream(true)
+      .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+      .start()
+
+    process.waitFor(120, TimeUnit.SECONDS) shouldBe true
+    process.exitValue() shouldBe 0
+  }
+
+  private def assertCrashRecovery(walEnabled: Boolean): Unit = {
+    val dir      = newDbDir(s"crash-wal-$walEnabled")
+    val conf     = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled)
+    val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+    try {
+      runCrashWriter(dir, walEnabled)
+      reopened.load()
+      reopened.get("meta", RocksDBCodec.utf8("crash-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("crash-value")
+      reopened.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
+    } finally {
+      closeQuietly(reopened)
+      deleteRecursively(dir)
+    }
+  }
+
   describe("OpenIvmRocksDB") {
     it("opens and closes cleanly without leaving a stale lock") {
       val dir = newDbDir("open-close")
@@ -120,10 +157,34 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
           db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
         }
 
-        flushed should not be empty
+        flushed should have size 1
         flushed.exists(_.contains("props")) shouldBe false
         flushed.head.toSet shouldBe Set("meta", OpenIvmRocksDB.InternalTxnColumnFamilyName)
       } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
+    it("propagates a flush failure and rolls back the uncommitted batch") {
+      val dir = newDbDir("flush-failure")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+
+      try {
+        db.load()
+        db.setBeforeFlushHookForTesting(_ => throw new RuntimeException("flush boom"))
+
+        val thrown = intercept[RuntimeException] {
+          db.withBatch { batch =>
+            db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+          }
+        }
+
+        thrown.getMessage shouldBe "flush boom"
+        db.currentVersion shouldBe 0L
+        db.get("meta", RocksDBCodec.utf8("k")) shouldBe None
+      } finally {
+        db.setBeforeFlushHookForTesting(_ => ())
         closeQuietly(db)
         deleteRecursively(dir)
       }
@@ -155,6 +216,8 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
 
       try {
+        val flushed = ArrayBuffer.empty[Seq[String]]
+        db.setBeforeFlushHookForTesting(columnFamilies => flushed.synchronized { flushed += columnFamilies.sorted })
         db.load()
         db.withBatch { batch =>
           (1 to 5).foreach { idx =>
@@ -166,6 +229,8 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
           db.get("meta", RocksDBCodec.utf8(s"k$idx")).map(RocksDBCodec.fromUtf8) shouldBe Some("v" * 32)
         }
         db.currentVersion shouldBe 1L
+        flushed should have size 1
+        flushed.head.toSet shouldBe Set("meta", OpenIvmRocksDB.InternalTxnColumnFamilyName)
       } finally {
         closeQuietly(db)
         deleteRecursively(dir)
@@ -262,32 +327,11 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
     }
 
     it("recovers committed values after an unclean process exit") {
-      val dir       = newDbDir("crash")
-      val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString
-      val classpath = System.getProperty("java.class.path")
-      val logFile   = new File(dir, "crash-writer.log")
-      val process = new ProcessBuilder(
-        javaHome,
-        "-cp",
-        classpath,
-        "org.openivm.spark.common.rocksdb.OpenIvmRocksDBCrashWriter",
-        dir.getAbsolutePath
-      )
-        .redirectErrorStream(true)
-        .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
-        .start()
-      val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+      assertCrashRecovery(walEnabled = true)
+    }
 
-      try {
-        process.waitFor(120, TimeUnit.SECONDS) shouldBe true
-        process.exitValue() shouldBe 0
-
-        reopened.load()
-        reopened.get("meta", RocksDBCodec.utf8("crash-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("crash-value")
-      } finally {
-        closeQuietly(reopened)
-        deleteRecursively(dir)
-      }
+    it("recovers committed values without WAL after an unclean process exit") {
+      assertCrashRecovery(walEnabled = false)
     }
 
     it("retains only the configured recent manifests during cleanup") {
@@ -367,6 +411,54 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       } finally {
         closeQuietly(db)
         deleteRecursively(dir)
+      }
+    }
+
+    it("allows coalesced flushes for unrelated shards to overlap") {
+      val dbCount   = 8
+      val dirs      = (1 to dbCount).map(index => newDbDir(s"parallel-flush-$index"))
+      val dbs       = dirs.map(dir => new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta")))
+      val ready     = new CountDownLatch(dbCount)
+      val release   = new CountDownLatch(1)
+      val active    = new AtomicInteger(0)
+      val maxActive = new AtomicInteger(0)
+      val executor  = java.util.concurrent.Executors.newFixedThreadPool(dbCount)
+      val ec        = scala.concurrent.ExecutionContext.fromExecutorService(executor)
+
+      dbs.foreach { db =>
+        db.setBeforeFlushHookForTesting { _ =>
+          val current = active.incrementAndGet()
+          maxActive.updateAndGet(existing => math.max(existing, current))
+          ready.countDown()
+          try release.await(10, TimeUnit.SECONDS) shouldBe true
+          finally active.decrementAndGet()
+        }
+      }
+
+      try {
+        dbs.foreach(_.load())
+        val writes = dbs.zipWithIndex.map { case (db, index) =>
+          Future {
+            db.withBatch { batch =>
+              db.put(batch, "meta", RocksDBCodec.utf8(s"k$index"), RocksDBCodec.utf8(s"v$index"))
+            }
+          }(ec)
+        }
+
+        ready.await(10, TimeUnit.SECONDS) shouldBe true
+        maxActive.get() shouldBe dbCount
+        release.countDown()
+        writes.foreach(write => Await.result(write, 30.seconds))
+
+        dbs.zipWithIndex.foreach { case (db, index) =>
+          db.currentVersion shouldBe 1L
+          db.get("meta", RocksDBCodec.utf8(s"k$index")).map(RocksDBCodec.fromUtf8) shouldBe Some(s"v$index")
+        }
+      } finally {
+        release.countDown()
+        executor.shutdownNow()
+        dbs.foreach(closeQuietly)
+        dirs.foreach(deleteRecursively)
       }
     }
 

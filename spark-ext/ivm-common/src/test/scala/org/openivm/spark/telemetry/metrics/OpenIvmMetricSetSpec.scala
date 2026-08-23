@@ -45,6 +45,30 @@ class OpenIvmMetricSetSpec extends AnyFunSpec with Matchers {
       OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.native.open.count").getCount should be >= 1L
     }
 
+    it("separates physical writes, logical commits, and manual flush telemetry") {
+      OpenIvmMetrics.configure(enabled = true)
+      val scope = s"telemetry_${System.nanoTime()}"
+
+      OpenIvmMetrics.recordRocksDbWrite(scope, nanos = 10L, keys = 2L, bytes = 32L, failed = false)
+      OpenIvmMetrics.recordRocksDbFlush(scope, nanos = 20L, columnFamilyCount = 2, failed = false)
+      OpenIvmMetrics.recordRocksDbCommit(
+        scope,
+        nanos = 30L,
+        keys = 2L,
+        bytes = 32L,
+        sstCount = 1,
+        failed = false
+      )
+
+      OpenIvmMetrics.counter(s"rocksdb.scope.$scope.physical_write.count").getCount shouldBe 1L
+      OpenIvmMetrics.timer(s"rocksdb.scope.$scope.physical_write.latency").getCount shouldBe 1L
+      OpenIvmMetrics.counter(s"rocksdb.scope.$scope.flush.count").getCount shouldBe 1L
+      OpenIvmMetrics.timer(s"rocksdb.scope.$scope.flush.latency").getCount shouldBe 1L
+      OpenIvmMetrics.histogram(s"rocksdb.scope.$scope.flush.column_families").getCount shouldBe 1L
+      OpenIvmMetrics.timer(s"rocksdb.scope.$scope.commit_batch.latency").getCount shouldBe 1L
+      OpenIvmMetrics.counter(s"rocksdb.scope.$scope.commit_batch.version_bump").getCount shouldBe 1L
+    }
+
     it("registers metrics idempotently across multiple registries") {
       OpenIvmMetrics.clearRegistriesForTesting()
       OpenIvmMetrics.configure(enabled = true)

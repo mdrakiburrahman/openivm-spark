@@ -224,6 +224,34 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
+    it("restores a committed batch backed up before deferred transaction cleanup is flushed") {
+      val stateRoot  = newDir("state-sync-local")
+      val remoteRoot = newDir("state-sync-remote")
+      val spark = newSpark(
+        "state-sync-restore",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val dbDir  = new File(stateRoot, "_openivm/mvs/restore-test/rocksdb")
+      val dbPath = dbDir.getAbsolutePath
+      val db     = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+
+      db.withBatch { batch =>
+        db.put(batch, "meta", RocksDBCodec.utf8("delta-key"), RocksDBCodec.utf8("delta-value"))
+      }
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmRocksDBRegistry.close(dbPath)
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      OpenIvmStateSync.resetForTesting()
+
+      val restored = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      restored.currentVersion shouldBe 1L
+      restored.get("meta", RocksDBCodec.utf8("delta-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("delta-value")
+      restored.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
+    }
+
     it("coalesces in-flight requests into one follow-up pass and stays bounded while eventually becoming idle") {
       val spark = newSpark(
         "state-sync-coalesce",

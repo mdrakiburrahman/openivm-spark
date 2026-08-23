@@ -99,6 +99,7 @@ object OpenIvmMetrics extends Logging {
       nativeCloseNanos: Long,
       bodyNanos: Long
   ): Unit = {
+    OpenIvmExecutionSpan.observeRocksDbLockWait(jvmLockWaitNanos, externalLockWaitNanos)
     if (!enabled) return
     val prefix = s"rocksdb.scope.${sanitize(dbScope)}.operation.${sanitize(operation)}"
     increment(s"$prefix.count")
@@ -115,16 +116,56 @@ object OpenIvmMetrics extends Logging {
     if (multiProcess) increment(s"$prefix.multi_process.count")
   }
 
-  def recordRocksDbCommit(dbScope: String, nanos: Long, keys: Long, bytes: Long, sstCount: Int): Unit = {
+  def recordRocksDbWrite(
+      dbScope: String,
+      nanos: Long,
+      keys: Long,
+      bytes: Long,
+      failed: Boolean
+  ): Unit = {
     if (!enabled && !OpenIvmExecutionSpan.hasCurrentSpan) return
-    OpenIvmExecutionSpan.observeRocksDbCommit(nanos)
+    OpenIvmExecutionSpan.observeRocksDbWrite(nanos)
     if (!enabled) return
-    val prefix = s"rocksdb.scope.${sanitize(dbScope)}.commit_batch"
+    val prefix = s"rocksdb.scope.${sanitize(dbScope)}.physical_write"
+    increment(s"$prefix.count")
+    if (failed) increment(s"$prefix.failed")
     updateTimer(s"$prefix.latency", nanos)
     updateHistogram(s"$prefix.keys", keys)
     updateHistogram(s"$prefix.bytes", bytes)
+  }
+
+  def recordRocksDbFlush(
+      dbScope: String,
+      nanos: Long,
+      columnFamilyCount: Int,
+      failed: Boolean
+  ): Unit = {
+    if (!enabled && !OpenIvmExecutionSpan.hasCurrentSpan) return
+    OpenIvmExecutionSpan.observeRocksDbFlush(nanos, failed)
+    if (!enabled) return
+    val prefix = s"rocksdb.scope.${sanitize(dbScope)}.flush"
+    increment(s"$prefix.count")
+    if (failed) increment(s"$prefix.failed")
+    updateTimer(s"$prefix.latency", nanos)
+    updateHistogram(s"$prefix.column_families", columnFamilyCount.toLong)
+  }
+
+  def recordRocksDbCommit(
+      dbScope: String,
+      nanos: Long,
+      keys: Long,
+      bytes: Long,
+      sstCount: Int,
+      failed: Boolean
+  ): Unit = {
+    if (!enabled) return
+    val prefix = s"rocksdb.scope.${sanitize(dbScope)}.commit_batch"
+    updateTimer(s"$prefix.latency", nanos)
+    if (failed) increment(s"$prefix.failed")
+    updateHistogram(s"$prefix.keys", keys)
+    updateHistogram(s"$prefix.bytes", bytes)
     updateHistogram(s"$prefix.sst_files", sstCount.toLong)
-    increment(s"$prefix.version_bump")
+    if (!failed) increment(s"$prefix.version_bump")
   }
 
   def recordColumnFamilyRead(columnFamily: String, bytes: Long): Unit = {

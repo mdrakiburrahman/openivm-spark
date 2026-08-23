@@ -148,10 +148,19 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
     beforeFlushHookForTesting(targetColumnFamilies)
     val flushOptions = new FlushOptions().setWaitForFlush(true)
+    val started      = System.nanoTime()
+    var failed       = true
     try {
-      targetColumnFamilies.foreach(name => localDb.flush(flushOptions, cf(name)))
+      localDb.flush(flushOptions, targetColumnFamilies.map(cf).asJava)
+      failed = false
     } finally {
       flushOptions.close()
+      OpenIvmMetrics.recordRocksDbFlush(
+        OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
+        System.nanoTime() - started,
+        targetColumnFamilies.size,
+        failed
+      )
     }
     dirtySinceFlush = false
     dirtyColumnFamilies = Set.empty
@@ -196,54 +205,68 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def writePhysicalBatch(batch: WriteBatch, stats: BatchStats): Int = {
+  private def writePhysicalBatch(batch: WriteBatch, stats: BatchStats): Unit = {
     val started      = System.nanoTime()
     val localDb      = ensureLoaded()
     val writeOptions = new WriteOptions().setSync(false).setDisableWAL(!conf.walEnabled)
-    var sstCount     = 0
+    var failed       = true
     try {
-      try {
-        localDb.write(writeOptions, batch)
-        dirtySinceFlush = true
-        dirtyColumnFamilies = dirtyColumnFamilies ++ stats.activeColumnFamilies
-      } finally {
-        writeOptions.close()
-      }
-
-      flushColumnFamilies(localDb, stats.activeColumnFamilies)
-
-      sstCount = sstFileCountInternal(localDb)
-      sstCount
+      localDb.write(writeOptions, batch)
+      dirtySinceFlush = true
+      dirtyColumnFamilies = dirtyColumnFamilies ++ stats.activeColumnFamilies
+      failed = false
     } finally {
+      writeOptions.close()
       OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.logicalBytes)
       OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
-      OpenIvmMetrics.recordRocksDbCommit(
+      OpenIvmMetrics.recordRocksDbWrite(
         OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
         System.nanoTime() - started,
         stats.activeKeys,
         stats.activeBytes,
-        sstCount
+        failed
       )
     }
   }
 
   private def commitLogicalBatch(batch: WriteBatch, stats: BatchStats): Long = {
+    val started  = System.nanoTime()
     var sstCount = 0
-    if (stats.activeKeys > 0L) {
-      sstCount = writePhysicalBatch(batch, stats)
-      batch.clear()
-      stats.resetActive()
-    } else {
-      sstCount = sstFileCountInternal(ensureLoaded())
+    var failed   = true
+    try {
+      if (stats.activeKeys > 0L) {
+        writePhysicalBatch(batch, stats)
+        batch.clear()
+        stats.resetActive()
+      }
+
+      val localDb = ensureLoaded()
+      // Persist the data and its undo records together before publishing the
+      // manifest. The post-manifest commit marker and undo cleanup are
+      // recoverable from that manifest; the next commit or close can coalesce
+      // them instead of forcing two more tiny SST flushes.
+      flushDirtyColumnFamilies(localDb)
+      sstCount = sstFileCountInternal(localDb)
+
+      val nextVersion = versionValue + 1L
+      writeManifest(nextVersion, sstCount, stats.txnId)
+      stats.manifestWritten = true
+      versionValue = nextVersion
+      markTxnCommitted(stats.txnId)
+      cleanupTxn(stats.txnId)
+      failed = false
+      nextVersion
+    } finally {
+      OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.logicalBytes)
+      OpenIvmMetrics.recordRocksDbCommit(
+        OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
+        System.nanoTime() - started,
+        stats.logicalKeys,
+        stats.logicalBytes,
+        sstCount,
+        failed
+      )
     }
-    val nextVersion = versionValue + 1L
-    writeManifest(nextVersion, sstCount, stats.txnId)
-    stats.manifestWritten = true
-    versionValue = nextVersion
-    markTxnCommitted(stats.txnId)
-    cleanupTxn(stats.txnId)
-    OpenIvmMetrics.RocksDbCommitBatchLastBytes.set(stats.logicalBytes)
-    nextVersion
   }
 
   private def markTxnCommitted(txnId: String): Unit = {
@@ -625,8 +648,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     val descriptors = allColumnFamilies.map { name =>
       new ColumnFamilyDescriptor(RocksDBCodec.utf8(name), new ColumnFamilyOptions())
     }
-    val handles           = new java.util.ArrayList[ColumnFamilyHandle]()
-    val options           = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)
+    val handles = new java.util.ArrayList[ColumnFamilyHandle]()
+    val options = new DBOptions()
+      .setCreateIfMissing(true)
+      .setCreateMissingColumnFamilies(true)
+      .setAtomicFlush(true)
     var openedDb: RocksDB = null
     try {
       openedDb = RocksDB.open(options, normalizedDbPath, descriptors.asJava, handles)

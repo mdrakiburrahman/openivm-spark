@@ -27,7 +27,13 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var driverAdmissionMs     = Option.empty[Long]
   private var compilerMs            = Option.empty[Long]
   private var catalogMs             = Option.empty[Long]
+  private var rocksDbWriteMs        = Option.empty[Long]
+  private var rocksDbWriteCount     = 0L
   private var rocksDbFlushMs        = Option.empty[Long]
+  private var rocksDbFlushCount     = 0L
+  private var rocksDbFlushFailures  = 0L
+  private var rocksDbJvmLockWaitMs  = Option.empty[Long]
+  private var rocksDbExternalWaitMs = Option.empty[Long]
   private var rocksDbBackupMs       = Option.empty[Long]
   private var completedAtEpochMs    = Option.empty[Long]
   private var completedAtNanos      = Option.empty[Long]
@@ -79,9 +85,25 @@ final class OpenIvmExecutionSpan private[telemetry] (
       catalogMs = addDuration(catalogMs, durationMs)
     }
 
-  def recordRocksDbFlush(durationMs: Long): Unit =
+  def recordRocksDbWrite(durationMs: Long): Unit =
+    recordBeforeComplete {
+      rocksDbWriteMs = addDuration(rocksDbWriteMs, durationMs)
+      rocksDbWriteCount += 1L
+    }
+
+  def recordRocksDbFlush(durationMs: Long, failed: Boolean = false): Unit =
     recordBeforeComplete {
       rocksDbFlushMs = addDuration(rocksDbFlushMs, durationMs)
+      rocksDbFlushCount += 1L
+      if (failed) rocksDbFlushFailures += 1L
+    }
+
+  def recordRocksDbLockWait(jvmDurationMs: Long, externalDurationMs: Long): Unit =
+    recordBeforeComplete {
+      if (jvmDurationMs > 0L) rocksDbJvmLockWaitMs = addDuration(rocksDbJvmLockWaitMs, jvmDurationMs)
+      if (externalDurationMs > 0L) {
+        rocksDbExternalWaitMs = addDuration(rocksDbExternalWaitMs, externalDurationMs)
+      }
     }
 
   def recordRocksDbBackup(durationMs: Long): Unit =
@@ -158,7 +180,13 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 driverAdmissionWaitMs = driverAdmissionMs,
                 compilerMs = compilerMs,
                 catalogMs = catalogMs,
+                rocksDbWriteMs = rocksDbWriteMs,
+                rocksDbWriteCount = rocksDbWriteCount,
                 rocksDbFlushMs = rocksDbFlushMs,
+                rocksDbFlushCount = rocksDbFlushCount,
+                rocksDbFlushFailures = rocksDbFlushFailures,
+                rocksDbJvmLockWaitMs = rocksDbJvmLockWaitMs,
+                rocksDbExternalWaitMs = rocksDbExternalWaitMs,
                 rocksDbBackupMs = rocksDbBackupMs
               )
             )
@@ -352,8 +380,21 @@ object OpenIvmExecutionSpan extends Logging {
     }
   }
 
-  def observeRocksDbCommit(nanos: Long): Unit =
-    if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbFlush(TimeUnit.NANOSECONDS.toMillis(nanos)))
+  def observeRocksDbWrite(nanos: Long): Unit =
+    if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbWrite(TimeUnit.NANOSECONDS.toMillis(nanos)))
+
+  def observeRocksDbFlush(nanos: Long, failed: Boolean): Unit =
+    if (nanos >= 0L) {
+      Option(current.get()).foreach(_.recordRocksDbFlush(TimeUnit.NANOSECONDS.toMillis(nanos), failed))
+    }
+
+  def observeRocksDbLockWait(jvmNanos: Long, externalNanos: Long): Unit =
+    Option(current.get()).foreach(
+      _.recordRocksDbLockWait(
+        TimeUnit.NANOSECONDS.toMillis(math.max(0L, jvmNanos)),
+        TimeUnit.NANOSECONDS.toMillis(math.max(0L, externalNanos))
+      )
+    )
 
   def observeRocksDbBackup(nanos: Long): Unit =
     if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbBackup(TimeUnit.NANOSECONDS.toMillis(nanos)))
@@ -450,7 +491,13 @@ object OpenIvmExecutionSpan extends Logging {
       driverAdmissionWaitMs: Option[Long],
       compilerMs: Option[Long],
       catalogMs: Option[Long],
+      rocksDbWriteMs: Option[Long],
+      rocksDbWriteCount: Long,
       rocksDbFlushMs: Option[Long],
+      rocksDbFlushCount: Long,
+      rocksDbFlushFailures: Long,
+      rocksDbJvmLockWaitMs: Option[Long],
+      rocksDbExternalWaitMs: Option[Long],
       rocksDbBackupMs: Option[Long]
   ): String = {
     val fields = new LinkedHashMap[String, AnyRef]()
@@ -470,7 +517,15 @@ object OpenIvmExecutionSpan extends Logging {
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
     compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
     catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
+    rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
+    if (rocksDbWriteCount > 0L) fields.put("rocksdb_write_count", java.lang.Long.valueOf(rocksDbWriteCount))
     rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
+    if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
+    if (rocksDbFlushFailures > 0L) {
+      fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
+    }
+    rocksDbJvmLockWaitMs.foreach(v => fields.put("rocksdb_jvm_lock_wait_ms", java.lang.Long.valueOf(v)))
+    rocksDbExternalWaitMs.foreach(v => fields.put("rocksdb_external_lock_wait_ms", java.lang.Long.valueOf(v)))
     rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))
     Json.writeValueAsString(fields)
   }
