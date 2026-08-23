@@ -2310,8 +2310,8 @@ case class RefreshMaterializedViewCommand(
           val cascadePreRefreshVersion: Option[Long] =
             if (cascadeKeys.isEmpty) None
             else
-              Some(profile.timeStep("pin_full_refresh_cascade_version", "source=delta_history") {
-                DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+              Some(profile.timeStep("pin_full_refresh_cascade_version", "source=delta_log_snapshot") {
+                DeltaTableVersion.requireLatest(spark, meta.location)
               })
           CommandLocalState.withDmlBypass {
             assembled.statements.foreach { sql =>
