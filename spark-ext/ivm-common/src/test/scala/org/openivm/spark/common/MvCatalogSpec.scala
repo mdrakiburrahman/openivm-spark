@@ -3,6 +3,7 @@ package org.openivm.spark.common
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
+import org.openivm.spark.common.rocksdb.OpenIvmRocksDBRegistry
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
@@ -11,6 +12,7 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.nio.file.{Files, Paths}
 import java.sql.Timestamp
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CyclicBarrier
 import java.util.UUID
 import scala.concurrent.duration._
@@ -134,6 +136,38 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       allRows should have size 1
       allRows.head.lastVersion shouldBe 42L
       allRows.head.refreshTypeName shouldBe "AGGREGATE_GROUP"
+    }
+
+    it("syncs each touched RocksDB shard once while publishing metadata") {
+      val meta           = sampleMeta("wal_sync", sources = Seq("orders", "products", "customers"))
+      val serializedName = meta.name.database.fold(meta.name.identifier)(db => s"$db.${meta.name.identifier}")
+      val perMvDb = OpenIvmRocksDBRegistry.getOrOpen(
+        spark,
+        OpenIvmStatePaths.perMvDbPath(spark, serializedName),
+        OpenIvmStatePaths.PerMvColumnFamilies
+      )
+      val sourceDbs = meta.sourceTables.map(source =>
+        OpenIvmRocksDBRegistry.getOrOpen(
+          spark,
+          OpenIvmStatePaths.sourceDependencyDbPath(spark, source),
+          OpenIvmStatePaths.SourceDependencyColumnFamilies
+        )
+      )
+      val touchedDbs    = (perMvDb +: sourceDbs).distinct
+      val syncCountByDb = touchedDbs.map(_ -> new AtomicInteger(0)).toMap
+
+      try {
+        touchedDbs.foreach { db =>
+          db.setBeforeSyncWalHookForTesting(() => syncCountByDb(db).incrementAndGet())
+        }
+
+        MvCatalog.upsert(spark, meta)
+
+        MvCatalog.lookup(spark, meta.name) shouldBe Some(meta)
+        touchedDbs.foreach(db => syncCountByDb(db).get() shouldBe 1)
+      } finally {
+        touchedDbs.foreach(_.setBeforeSyncWalHookForTesting(() => ()))
+      }
     }
   }
 

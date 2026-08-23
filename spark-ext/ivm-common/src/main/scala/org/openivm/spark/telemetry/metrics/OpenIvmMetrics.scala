@@ -140,6 +140,20 @@ object OpenIvmMetrics extends Logging {
     updateHistogram(s"$prefix.bytes", bytes)
   }
 
+  def recordRocksDbWalSync(
+      dbScope: String,
+      nanos: Long,
+      failed: Boolean
+  ): Unit = {
+    if (!enabled && !OpenIvmExecutionSpan.hasCurrentSpan) return
+    OpenIvmExecutionSpan.observeRocksDbWalSync(nanos)
+    if (!enabled) return
+    val prefix = s"rocksdb.scope.${sanitize(dbScope)}.wal_sync"
+    increment(s"$prefix.count")
+    if (failed) increment(s"$prefix.failed")
+    updateTimer(s"$prefix.latency", nanos)
+  }
+
   def recordRocksDbFlush(
       dbScope: String,
       nanos: Long,

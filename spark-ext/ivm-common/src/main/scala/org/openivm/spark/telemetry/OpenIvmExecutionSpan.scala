@@ -107,6 +107,11 @@ final class OpenIvmExecutionSpan private[telemetry] (
       rocksDbWriteCount += 1L
     }
 
+  def recordRocksDbWriteLatency(durationMs: Long): Unit =
+    recordBeforeComplete {
+      rocksDbWriteMs = addDuration(rocksDbWriteMs, durationMs)
+    }
+
   def recordAnalysis(durationMs: Long): Unit =
     recordBeforeComplete {
       analysisMs = addDuration(analysisMs, durationMs)
@@ -465,6 +470,9 @@ object OpenIvmExecutionSpan extends Logging {
 
   def observeRocksDbWrite(nanos: Long): Unit =
     if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbWrite(TimeUnit.NANOSECONDS.toMillis(nanos)))
+
+  def observeRocksDbWalSync(nanos: Long): Unit =
+    if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbWriteLatency(TimeUnit.NANOSECONDS.toMillis(nanos)))
 
   def observeRocksDbFlush(nanos: Long, failed: Boolean): Unit =
     if (nanos >= 0L) {

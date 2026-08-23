@@ -102,6 +102,8 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private val compactCalls                                             = new AtomicLong(0L)
   @volatile private var beforeFlushHookForTesting: Seq[String] => Unit = (_: Seq[String]) => ()
+  @volatile private var beforeSyncWalHookForTesting: () => Unit        = () => ()
+  @volatile private var afterManifestHookForTesting: () => Unit        = () => ()
   @volatile private var beforeCloseHookForTesting: () => Unit          = () => ()
 
   private def cf(name: String): ColumnFamilyHandle =
@@ -205,11 +207,17 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def writePhysicalBatch(batch: WriteBatch, stats: BatchStats): Unit = {
-    val started      = System.nanoTime()
-    val localDb      = ensureLoaded()
-    val writeOptions = new WriteOptions().setSync(conf.walEnabled).setDisableWAL(!conf.walEnabled)
-    var failed       = true
+  private def writePhysicalBatch(
+      batch: WriteBatch,
+      stats: BatchStats,
+      syncWalWrite: Boolean = conf.walEnabled
+  ): Unit = {
+    val started = System.nanoTime()
+    val localDb = ensureLoaded()
+    val writeOptions = new WriteOptions()
+      .setSync(conf.walEnabled && syncWalWrite)
+      .setDisableWAL(!conf.walEnabled)
+    var failed = true
     try {
       localDb.write(writeOptions, batch)
       dirtySinceFlush = true
@@ -229,23 +237,42 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
+  private def syncWal(localDb: RocksDB): Unit = {
+    val started = System.nanoTime()
+    var failed  = true
+    try {
+      beforeSyncWalHookForTesting()
+      localDb.syncWal()
+      failed = false
+    } finally {
+      OpenIvmMetrics.recordRocksDbWalSync(
+        OpenIvmRocksDBTelemetry.scopeForPath(normalizedDbPath),
+        System.nanoTime() - started,
+        failed
+      )
+    }
+  }
+
   private def commitLogicalBatch(batch: WriteBatch, stats: BatchStats): Long = {
     val started  = System.nanoTime()
     var sstCount = 0
     var failed   = true
     try {
       if (stats.activeKeys > 0L) {
-        writePhysicalBatch(batch, stats)
+        writePhysicalBatch(batch, stats, syncWalWrite = false)
         batch.clear()
         stats.resetActive()
       }
 
       val localDb = ensureLoaded()
-      // A synchronous WAL write makes the data and undo records durable
-      // without forcing a tiny SST for every catalog update. WAL-disabled
-      // deployments still require an atomic flush before publishing the
-      // logical commit manifest.
-      if (!conf.walEnabled) {
+      // Keep every pre-manifest write in the WAL, then publish one durability
+      // barrier per logical commit. This avoids fsync amplification from
+      // syncing each internal bookkeeping batch independently while still
+      // guaranteeing the undo log and data mutations are durable before the
+      // manifest makes the new version visible.
+      if (conf.walEnabled) {
+        syncWal(localDb)
+      } else {
         flushDirtyColumnFamilies(localDb)
       }
       sstCount = sstFileCountInternal(localDb)
@@ -253,9 +280,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       val nextVersion = versionValue + 1L
       writeManifest(nextVersion, sstCount, stats.txnId)
       stats.manifestWritten = true
+      afterManifestHookForTesting()
       versionValue = nextVersion
-      markTxnCommitted(stats.txnId)
-      cleanupTxn(stats.txnId)
+      // Manifest publication is the durable commit marker. Cleanup can stay on
+      // the regular WAL/flush path because recovery replays or removes any
+      // leftover undo rows by consulting the manifest set on reopen.
+      cleanupTxn(stats.txnId, syncWalWrite = false)
       failed = false
       nextVersion
     } finally {
@@ -271,27 +301,14 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     }
   }
 
-  private def markTxnCommitted(txnId: String): Unit = {
-    val batch = new WriteBatch()
-    try {
-      batch.put(cf(InternalTxnColumnFamilyName), committedKey(txnId), Array.emptyByteArray)
-      val stats = new BatchStats
-      stats.touch(InternalTxnColumnFamilyName)
-      stats.addPhysical(committedKey(txnId).length.toLong)
-      writePhysicalBatch(batch, stats)
-    } finally {
-      batch.close()
-    }
-  }
-
-  private def cleanupTxn(txnId: String): Unit = {
+  private def cleanupTxn(txnId: String, syncWalWrite: Boolean = conf.walEnabled): Unit = {
     val batch = new WriteBatch()
     try {
       batch.deleteRange(cf(InternalTxnColumnFamilyName), txnPrefix(txnId), txnPrefixEnd(txnId))
       val stats = new BatchStats
       stats.touch(InternalTxnColumnFamilyName)
       stats.addPhysical(txnPrefix(txnId).length.toLong + txnPrefixEnd(txnId).length.toLong)
-      writePhysicalBatch(batch, stats)
+      writePhysicalBatch(batch, stats, syncWalWrite = syncWalWrite)
     } finally {
       batch.close()
     }
@@ -300,7 +317,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private def maybeWritePhysicalBatch(batch: WriteBatch, stats: BatchStats): Unit = {
     OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(stats.activeBytes)
     if (conf.maxWriteBatchBytes > 0L && stats.activeBytes >= conf.maxWriteBatchBytes) {
-      writePhysicalBatch(batch, stats)
+      writePhysicalBatch(batch, stats, syncWalWrite = false)
       batch.clear()
       stats.resetActive()
       OpenIvmMetrics.RocksDbCommitBatchActiveBytes.set(0L)
@@ -322,9 +339,6 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         key
       )
     )
-
-  private def committedKey(txnId: String): Array[Byte] =
-    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(txnId), RocksDBCodec.utf8("committed")))
 
   private def recordUndo(batch: WriteBatch, stats: BatchStats, columnFamily: String, key: Array[Byte]): Unit = {
     if (columnFamily == InternalTxnColumnFamilyName) return
@@ -501,10 +515,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
 
   private[rocksdb] def path: String = normalizedDbPath
 
-  private[rocksdb] def setBeforeFlushHookForTesting(hook: Seq[String] => Unit): Unit =
+  private[common] def setBeforeFlushHookForTesting(hook: Seq[String] => Unit): Unit =
     beforeFlushHookForTesting = hook
 
-  private[rocksdb] def setBeforeCloseHookForTesting(hook: () => Unit): Unit =
+  private[common] def setBeforeSyncWalHookForTesting(hook: () => Unit): Unit =
+    beforeSyncWalHookForTesting = hook
+
+  private[common] def setAfterManifestHookForTesting(hook: () => Unit): Unit =
+    afterManifestHookForTesting = hook
+
+  private[common] def setBeforeCloseHookForTesting(hook: () => Unit): Unit =
     beforeCloseHookForTesting = hook
 
   private[rocksdb] def markDirtyForTesting(columnFamilies: Seq[String]): Unit = withWriteLock {

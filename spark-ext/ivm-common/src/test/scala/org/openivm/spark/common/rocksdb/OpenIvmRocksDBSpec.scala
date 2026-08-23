@@ -26,6 +26,19 @@ object OpenIvmRocksDBCrashWriter {
   }
 }
 
+object OpenIvmRocksDBPostManifestCrashWriter {
+  def main(args: Array[String]): Unit = {
+    val conf = OpenIvmRocksDBConf.default.copy(walEnabled = args.lift(1).forall(_.toBoolean))
+    val db   = new OpenIvmRocksDB(args(0), conf, Seq("meta"))
+    db.setAfterManifestHookForTesting(() => Runtime.getRuntime.halt(0))
+    db.load()
+    db.withBatch { batch =>
+      db.put(batch, "meta", RocksDBCodec.utf8("manifest-key"), RocksDBCodec.utf8("manifest-value"))
+    }
+    Runtime.getRuntime.halt(1)
+  }
+}
+
 /** Stand-alone main used by the multi-process test below. Each invocation:
   *   1. opens the DB at `args(0)` in multi-process mode,
   *   2. writes `<args(1)> = <args(2)>` to the `meta` CF in one withBatch,
@@ -92,6 +105,26 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
     process.exitValue() shouldBe 0
   }
 
+  private def runPostManifestCrashWriter(dir: File, walEnabled: Boolean): Unit = {
+    val javaHome  = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val classpath = System.getProperty("java.class.path")
+    val logFile   = new File(dir, "post-manifest-crash-writer.log")
+    val process = new ProcessBuilder(
+      javaHome,
+      "-cp",
+      classpath,
+      "org.openivm.spark.common.rocksdb.OpenIvmRocksDBPostManifestCrashWriter",
+      dir.getAbsolutePath,
+      walEnabled.toString
+    )
+      .redirectErrorStream(true)
+      .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+      .start()
+
+    process.waitFor(120, TimeUnit.SECONDS) shouldBe true
+    process.exitValue() shouldBe 0
+  }
+
   private def assertCrashRecovery(walEnabled: Boolean): Unit = {
     val dir      = newDbDir(s"crash-wal-$walEnabled")
     val conf     = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled)
@@ -101,6 +134,22 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       runCrashWriter(dir, walEnabled)
       reopened.load()
       reopened.get("meta", RocksDBCodec.utf8("crash-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("crash-value")
+      reopened.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
+    } finally {
+      closeQuietly(reopened)
+      deleteRecursively(dir)
+    }
+  }
+
+  private def assertPostManifestCrashRecovery(walEnabled: Boolean): Unit = {
+    val dir      = newDbDir(s"post-manifest-crash-wal-$walEnabled")
+    val conf     = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled)
+    val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+    try {
+      runPostManifestCrashWriter(dir, walEnabled)
+      reopened.load()
+      reopened.get("meta", RocksDBCodec.utf8("manifest-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("manifest-value")
       reopened.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
     } finally {
       closeQuietly(reopened)
@@ -260,6 +309,32 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("syncs WAL once for a streamed logical commit") {
+      val dir  = newDbDir("wal-group-commit")
+      val conf = OpenIvmRocksDBConf.default.copy(maxWriteBatchBytes = 32L)
+      val db   = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
+
+      try {
+        val syncCount = new AtomicInteger(0)
+        db.setBeforeSyncWalHookForTesting(() => syncCount.incrementAndGet())
+        db.load()
+        db.withBatch { batch =>
+          (1 to 5).foreach { idx =>
+            db.put(batch, "meta", RocksDBCodec.utf8(s"k$idx"), RocksDBCodec.utf8("v" * 32))
+          }
+        }
+
+        (1 to 5).foreach { idx =>
+          db.get("meta", RocksDBCodec.utf8(s"k$idx")).map(RocksDBCodec.fromUtf8) shouldBe Some("v" * 32)
+        }
+        syncCount.get() shouldBe 1
+        db.currentVersion shouldBe 1L
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
     it("rolls back streamed writes that fail before the logical manifest") {
       val dir  = newDbDir("bounded-rollback")
       val conf = OpenIvmRocksDBConf.default.copy(maxWriteBatchBytes = 32L)
@@ -355,6 +430,14 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
 
     it("recovers committed values without WAL after an unclean process exit") {
       assertCrashRecovery(walEnabled = false)
+    }
+
+    it("recovers manifest-published values after a WAL crash before cleanup") {
+      assertPostManifestCrashRecovery(walEnabled = true)
+    }
+
+    it("recovers manifest-published values without WAL after a crash before cleanup") {
+      assertPostManifestCrashRecovery(walEnabled = false)
     }
 
     it("retains only the configured recent manifests during cleanup") {
