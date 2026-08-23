@@ -721,14 +721,49 @@ object FeatureGate {
   def changeFeedMode(conf: SparkConf): ChangeFeedMode =
     ChangeFeedMode.fromConf(conf)
 
-  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled. */
-  def buildMvDataTblProperties(spark: SparkSession): Seq[String] = {
+  /** Whether Delta can actually service auto-compaction for a table created with
+    * `clusterColumns` as its liquid-clustering key.
+    *
+    * Delta picks `OptimizeTableMode.CLUSTERING` for *any* clustered table with at
+    * least one clustering column (`OptimizeTableStrategy.getMode`), and
+    * `ClusteringStrategy.curve` is hard-coded to `"hilbert"`. Hilbert clustering
+    * asserts on more than one column:
+    *
+    * {{{
+    * // delta 3.2.0 skipping/MultiDimClustering.scala
+    * assert(cols.size > 1, "Cannot do Hilbert clustering by zero or one column!")
+    * }}}
+    *
+    * A clustered table with *exactly one* clustering column therefore throws
+    * `AssertionError` on every auto-compaction that finds work to do — clustering
+    * mode keeps single-file bins (`isMultiDimClustering`), so the hook fires on
+    * the very first commit. Delta logs the post-commit hook failure and keeps the
+    * commit, so the table is never compacted either way; the property only buys a
+    * wasted snapshot/bin-packing pass plus an ERROR per commit.
+    *
+    * Zero clustering columns falls to `CompactionStrategy` and two or more to a
+    * valid hilbert curve, so both remain eligible.
+    */
+  def autoCompactSupported(clusterColumns: Seq[String]): Boolean =
+    clusterColumns.size != 1
+
+  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled.
+    *
+    * `clusterColumns` is the liquid-clustering key the same DDL will emit as
+    * `CLUSTER BY (...)`; it gates `delta.autoOptimize.autoCompact` (see
+    * [[autoCompactSupported]]).
+    */
+  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] = {
     val props = scala.collection.mutable.ArrayBuffer.empty[String]
     if (deletionVectorsEnabled(spark)) props += "'delta.enableDeletionVectors' = 'true'"
     if (optimizeWriteEnabled(spark)) props += "'delta.autoOptimize.optimizeWrite' = 'true'"
-    if (autoCompactEnabled(spark)) props += "'delta.autoOptimize.autoCompact' = 'true'"
+    if (autoCompactEnabled(spark) && autoCompactSupported(clusterColumns))
+      props += "'delta.autoOptimize.autoCompact' = 'true'"
     if (ChangePropagationFactory.forSession(spark).requiresMvCdf)
       props += "'delta.enableChangeDataFeed' = 'true'"
     props.toSeq
   }
+
+  def buildMvDataTblProperties(spark: SparkSession): Seq[String] =
+    buildMvDataTblProperties(spark, Nil)
 }

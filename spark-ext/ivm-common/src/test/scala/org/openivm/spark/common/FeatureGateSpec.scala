@@ -209,4 +209,19 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm")
     }
   }
+
+  describe("FeatureGate.autoCompactSupported") {
+    it("rejects exactly one clustering column (Delta hilbert clustering asserts cols.size > 1)") {
+      FeatureGate.autoCompactSupported(Seq("region")) shouldBe false
+    }
+
+    it("allows an unclustered table — Delta falls back to CompactionStrategy") {
+      FeatureGate.autoCompactSupported(Nil) shouldBe true
+    }
+
+    it("allows two or more clustering columns — the hilbert curve is well defined") {
+      FeatureGate.autoCompactSupported(Seq("region", "day")) shouldBe true
+      FeatureGate.autoCompactSupported(Seq("region", "day", "sku")) shouldBe true
+    }
+  }
 }

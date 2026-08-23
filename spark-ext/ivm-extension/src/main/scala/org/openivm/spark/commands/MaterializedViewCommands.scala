@@ -1632,7 +1632,7 @@ case class CreateMaterializedViewCommand(
         .getOrElse("")
 
     val tblProps =
-      FeatureGate.buildMvDataTblProperties(spark) ++
+      FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
         createRecoveryTableProperties(watermarkProps)
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
