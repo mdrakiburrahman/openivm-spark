@@ -102,6 +102,26 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       assertMvCorrect("aio_mixed_rollup", viewBody)
       rewrittenSql("aio_mixed_rollup").size should be > 1
     }
+
+    itCdf("does not apply the direct MERGE to an aggregate over a join") {
+      sql("CREATE TABLE aio_join_facts (id INT, grp INT, value INT) USING DELTA")
+      sql("CREATE TABLE aio_join_labels (id INT, label STRING) USING DELTA")
+      sql("INSERT INTO aio_join_facts VALUES (1, 1, 10), (2, 2, 20)")
+      val viewBody =
+        "SELECT f.grp, SUM(f.value) AS total, COUNT(*) AS row_count " +
+          "FROM aio_join_facts f LEFT JOIN aio_join_labels l ON f.id = l.id GROUP BY f.grp"
+      sql(s"CREATE MATERIALIZED VIEW aio_join_rollup AS $viewBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql("INSERT INTO aio_join_labels VALUES (1, 'one')")
+      refreshMv("aio_join_rollup")
+      assertMvCorrect("aio_join_rollup", viewBody)
+
+      val statements = rewrittenSql("aio_join_rollup")
+      statements.size should be > 1
+      statements.mkString("\n") should not include "__openivm_direct_delta"
+    }
   }
 
   describe("downstream identity") {
