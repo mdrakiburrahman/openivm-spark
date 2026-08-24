@@ -113,6 +113,39 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // ---------------------------------------------------------------------------
   // Test 1 — CREATE happy path
   // ---------------------------------------------------------------------------
+  describe("downstream relation identity") {
+    it("distinguishes same-named relations in different schemas") {
+      spark.sql("CREATE DATABASE IF NOT EXISTS mv_identity_left")
+      spark.sql("CREATE DATABASE IF NOT EXISTS mv_identity_right")
+      spark.sql("CREATE TABLE mv_identity_left.rollup (grp INT) USING DELTA")
+      spark.sql("CREATE TABLE mv_identity_right.rollup (grp INT) USING DELTA")
+
+      def metadata(name: String, source: String): MvMetadata =
+        MvMetadata(
+          name = TableIdentifier(name),
+          querySql = s"SELECT * FROM $source",
+          refreshType = RefreshTypeCode.SimpleProjection,
+          refreshTypeName = "SIMPLE_PROJECTION",
+          lastVersion = 0L,
+          sourceTables = Seq(source),
+          sourceSchemaFingerprint = "unused",
+          location = s"$warehouseDir/$name",
+          createdAt = new Timestamp(0L),
+          properties = Map.empty
+        )
+
+      val consumers = Seq(
+        metadata("left_consumer", "mv_identity_left.rollup"),
+        metadata("right_consumer", "mv_identity_right.rollup")
+      )
+      MvCommandHelper.downstreamSourceKeys(
+        spark,
+        TableIdentifier("rollup", Some("mv_identity_left")),
+        consumers
+      ) shouldBe Set("mv_identity_left.rollup")
+    }
+  }
+
   describe("(1) CREATE MATERIALIZED VIEW — happy path") {
     it("creates the MV table, loads initial data, and registers catalog entry") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1(region STRING, amount INT) USING DELTA")

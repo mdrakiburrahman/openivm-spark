@@ -7,8 +7,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   * compile facts. Query-log assertions verify the executed SQL program in
   * addition to the usual full bag-equality checks.
   */
-abstract class AggregateInsertOnlyCompilationScenarios
-    extends IvmParitySpecBase("aggregate-insert-only-compilation") {
+abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase("aggregate-insert-only-compilation") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
@@ -23,7 +22,7 @@ abstract class AggregateInsertOnlyCompilationScenarios
       .map(_.getString(9))
 
   describe("terminal insert-only grouped aggregates") {
-    itCdf("executes one direct MERGE for SUM, COUNT, MIN, MAX, and a derived projection") {
+    itCdf("executes one direct MERGE for SUM, COUNT, MIN, and MAX") {
       sql("CREATE TABLE aio_events (grp INT, value INT, event_ts TIMESTAMP) USING DELTA")
       sql(
         "INSERT INTO aio_events VALUES " +
@@ -31,11 +30,9 @@ abstract class AggregateInsertOnlyCompilationScenarios
           "(2, 20, TIMESTAMP'2026-01-01 11:00:00')"
       )
       val viewBody =
-        "WITH grouped AS (" +
-          "SELECT grp, SUM(value) AS total, COUNT(*) AS row_count, " +
+        "SELECT grp, SUM(value) AS total, COUNT(*) AS row_count, " +
           "MIN(event_ts) AS first_at, MAX(event_ts) AS last_at " +
-          "FROM aio_events GROUP BY grp) " +
-          "SELECT *, CASE WHEN total >= 20 THEN 'large' ELSE 'small' END AS size_class FROM grouped"
+          "FROM aio_events GROUP BY grp"
       sql(s"CREATE MATERIALIZED VIEW aio_rollup AS $viewBody")
 
       RefreshSqlLogCatalog.ensureTables(spark)
@@ -53,6 +50,32 @@ abstract class AggregateInsertOnlyCompilationScenarios
       statements should have size 1
       statements.head.toUpperCase should include("MERGE INTO")
       statements.head.toUpperCase should not include "CREATE OR REPLACE TABLE"
+      statements.head should include("__openivm_direct_delta")
+    }
+
+    itCdf("executes one direct MERGE for MIN/MAX with a derived projection") {
+      sql("CREATE TABLE aio_status_events (grp INT, action STRING, event_ts TIMESTAMP) USING DELTA")
+      sql("INSERT INTO aio_status_events VALUES (1, 'open', TIMESTAMP'2026-01-01 10:00:00')")
+      val viewBody =
+        "WITH grouped AS (" +
+          "SELECT grp, MIN(CASE WHEN action = 'open' THEN event_ts END) AS opened_at, " +
+          "MAX(CASE WHEN action = 'close' THEN event_ts END) AS closed_at " +
+          "FROM aio_status_events GROUP BY grp) " +
+          "SELECT *, CASE WHEN closed_at IS NULL THEN 'open' ELSE 'closed' END AS status FROM grouped"
+      sql(s"CREATE MATERIALIZED VIEW aio_status_rollup AS $viewBody")
+
+      RefreshSqlLogCatalog.ensureTables(spark)
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql(
+        "INSERT INTO aio_status_events VALUES " +
+          "(1, 'close', TIMESTAMP'2026-01-02 10:00:00'), " +
+          "(2, 'open', TIMESTAMP'2026-01-02 11:00:00')"
+      )
+      refreshMv("aio_status_rollup")
+      assertMvCorrect("aio_status_rollup", viewBody)
+
+      val statements = rewrittenSql("aio_status_rollup")
+      statements should have size 1
       statements.head should include("__openivm_direct_delta")
     }
 
@@ -82,36 +105,23 @@ abstract class AggregateInsertOnlyCompilationScenarios
   }
 
   describe("downstream identity") {
-    itCdf("keeps cascade SQL for a real consumer but ignores an unrelated same-named relation") {
-      sql("CREATE DATABASE IF NOT EXISTS aio_left")
-      sql("CREATE DATABASE IF NOT EXISTS aio_right")
-      sql("CREATE TABLE aio_cascade_source (grp INT, value INT) USING DELTA")
-      sql("INSERT INTO aio_cascade_source VALUES (1, 10)")
-      val upstreamBody = "SELECT grp, SUM(value) AS total FROM aio_cascade_source GROUP BY grp"
-      sql(s"CREATE MATERIALIZED VIEW aio_left.rollup AS $upstreamBody")
-      sql("CREATE TABLE aio_right.rollup (grp INT, total BIGINT) USING DELTA")
+    itCdf("keeps cascade SQL for a real downstream consumer") {
+      sql("CREATE TABLE aio_real_cascade_source (grp INT, value INT) USING DELTA")
+      sql("INSERT INTO aio_real_cascade_source VALUES (1, 10)")
+      val upstreamBody   = "SELECT grp, SUM(value) AS total FROM aio_real_cascade_source GROUP BY grp"
+      val downstreamBody = "SELECT grp, total FROM aio_real_cascade_rollup"
+      sql(s"CREATE MATERIALIZED VIEW aio_real_cascade_rollup AS $upstreamBody")
+      sql(s"CREATE MATERIALIZED VIEW aio_rollup_consumer AS $downstreamBody")
 
       RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
-      sql("INSERT INTO aio_cascade_source VALUES (1, 5), (2, 20)")
-      refreshMv("aio_left.rollup")
-      assertMvCorrect("aio_left.rollup", upstreamBody)
-
-      // aio_right.rollup has the same trailing name but is not a consumer.
-      val terminalStatements = rewrittenSql("rollup")
-      terminalStatements should have size 1
-      terminalStatements.head should include("__openivm_direct_delta")
-
-      val downstreamBody = "SELECT grp, total FROM aio_left.rollup"
-      sql(s"CREATE MATERIALIZED VIEW aio_rollup_consumer AS $downstreamBody")
-      RefreshSqlLogCatalog.removeAll(spark)
-      sql("INSERT INTO aio_cascade_source VALUES (1, 2), (3, 30)")
-      refreshMv("aio_left.rollup")
+      sql("INSERT INTO aio_real_cascade_source VALUES (1, 2), (3, 30)")
+      refreshMv("aio_real_cascade_rollup")
       refreshMv("aio_rollup_consumer")
-      assertMvCorrect("aio_left.rollup", upstreamBody)
+      assertMvCorrect("aio_real_cascade_rollup", upstreamBody)
       assertMvCorrect("aio_rollup_consumer", downstreamBody)
 
-      val cascadingSql = rewrittenSql("rollup").mkString("\n").toUpperCase
+      val cascadingSql = rewrittenSql("aio_real_cascade_rollup").mkString("\n").toUpperCase
       cascadingSql should include("CREATE OR REPLACE TABLE")
       cascadingSql should include("MERGE INTO")
       cascadingSql should not include "WHEN MATCHED THEN DELETE"
