@@ -295,13 +295,13 @@ object SparkRefreshRewriter {
       targetSql: String
   ): Option[WindowDeleteMergeKeys] = {
     val stripped = stripExecutionMarker(sql).trim
-    val ident     = "(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
-    val aliasRe   = ("(?is)^\\s*(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
+    val ident    = "(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
+    val aliasRe  = ("(?is)^\\s*(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
     val headerRe = (
       "(?is)^MERGE\\s+INTO\\s+" + java.util.regex.Pattern.quote(targetSql) +
         "\\s+(?:AS\\s+)?(" + ident + ")\\s+USING\\s*"
     ).r
-    val header = headerRe.findPrefixMatchOf(stripped).getOrElse(return None)
+    val header      = headerRe.findPrefixMatchOf(stripped).getOrElse(return None)
     val targetAlias = header.group(1)
     val sourceStart = header.end
 
@@ -330,10 +330,10 @@ object SparkRefreshRewriter {
     def normalized(identifier: String): String =
       identifier.stripPrefix("`").stripSuffix("`").replace("``", "`")
 
-    val leftAlias  = normalized(matched.group(1))
-    val leftColumn = matched.group(2)
-    val rightAlias = normalized(matched.group(3))
-    val rightColumn = matched.group(4)
+    val leftAlias       = normalized(matched.group(1))
+    val leftColumn      = matched.group(2)
+    val rightAlias      = normalized(matched.group(3))
+    val rightColumn     = matched.group(4)
     val targetAliasName = normalized(targetAlias)
     val sourceAliasName = normalized(sourceAlias)
 
