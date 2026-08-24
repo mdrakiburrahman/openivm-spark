@@ -4368,7 +4368,7 @@ case class RefreshMaterializedViewCommand(
   private def parseWindowDeleteMerge(sql: String): Option[WindowDeleteMerge] = {
     val ident     = """(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"""
     val usingOpen = "(?is)\\bUSING\\s*\\(".r.findFirstMatchIn(sql)
-    val (sourceAlias, subquery, tail) = usingOpen match {
+    val (sourceAlias, subquery, directSource, tail) = usingOpen match {
       case Some(using) =>
         val openIdx  = using.end - 1
         val closeIdx = matchingCloseParen(sql, openIdx)
@@ -4376,12 +4376,12 @@ case class RefreshMaterializedViewCommand(
         val after   = sql.substring(closeIdx + 1)
         val aliasRe = ("(?is)^\\s+(?:AS\\s+)?(" + ident + ")\\s+ON\\s+").r
         val alias   = aliasRe.findFirstMatchIn(after).map(_.group(1)).getOrElse(return None)
-        (stripSqlIdent(alias), sql.substring(openIdx + 1, closeIdx).trim, after)
+        (stripSqlIdent(alias), sql.substring(openIdx + 1, closeIdx).trim, None, after)
       case None =>
         val directRe = ("(?is)\\bUSING\\s+(" + ident + ")\\s+(?:AS\\s+)?(" + ident + ")\\s+ON\\s+").r
         val direct   = directRe.findFirstMatchIn(sql).getOrElse(return None)
         val source   = direct.group(1)
-        (stripSqlIdent(direct.group(2)), s"SELECT * FROM $source", sql.substring(direct.start))
+        (stripSqlIdent(direct.group(2)), "", Some(source), sql.substring(direct.start))
     }
 
     val comparisonRe =
@@ -4390,11 +4390,14 @@ case class RefreshMaterializedViewCommand(
     comparisonRe.findFirstMatchIn(tail).flatMap { m =>
       val leftAlias  = stripSqlIdent(m.group(1))
       val rightAlias = stripSqlIdent(m.group(3))
-      if (leftAlias.equalsIgnoreCase(sourceAlias))
-        Some(WindowDeleteMerge(m.group(4).trim, m.group(2).trim, subquery))
-      else if (rightAlias.equalsIgnoreCase(sourceAlias))
-        Some(WindowDeleteMerge(m.group(2).trim, m.group(4).trim, subquery))
-      else None
+      val columns =
+        if (leftAlias.equalsIgnoreCase(sourceAlias)) Some(m.group(4).trim -> m.group(2).trim)
+        else if (rightAlias.equalsIgnoreCase(sourceAlias)) Some(m.group(2).trim -> m.group(4).trim)
+        else None
+      columns.map { case (targetCol, sourceCol) =>
+        val affectedSql = directSource.map(source => s"SELECT DISTINCT $sourceCol FROM $source").getOrElse(subquery)
+        WindowDeleteMerge(targetCol, sourceCol, affectedSql)
+      }
     }
   }
 
@@ -4771,7 +4774,7 @@ case class RefreshMaterializedViewCommand(
     val view  = targetId.table.toUpperCase(java.util.Locale.ROOT)
     upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS ") &&
     (upper.contains("OPENIVM_DELTA_") || upper.contains(s"OPENIVM_AFFECTED_$view")) &&
-    upper.contains("WHEN MATCHED THEN DELETE")
+    parseWindowDeleteMerge(sql).isDefined
   }
 
   private def isRawWindowSnapshotCtas(
