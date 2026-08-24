@@ -1720,4 +1720,53 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.isRecomputeInsertMerge(sql) shouldBe false
     }
   }
+
+  describe("windowDeleteMergeKeys") {
+    val target = "`silver`.`daily_market`"
+
+    it("extracts keys from the current OpenIVM named affected-key relation") {
+      val sql =
+        s"""MERGE INTO $target AS openivm_target
+           |USING openivm_affected_daily_market AS openivm_aff
+           |ON openivm_aff.dm_s_symb IS NOT DISTINCT FROM openivm_target.dm_s_symb
+           |WHEN MATCHED THEN DELETE""".stripMargin
+
+      SparkRefreshRewriter.windowDeleteMergeKeys(sql, target) shouldBe Some(
+        SparkRefreshRewriter.WindowDeleteMergeKeys(
+          "dm_s_symb",
+          "SELECT dm_s_symb FROM openivm_affected_daily_market"
+        )
+      )
+    }
+
+    it("extracts keys from the legacy parenthesised delete MERGE") {
+      val sql =
+        s"""MERGE INTO $target AS v
+           |USING (
+           |  SELECT DISTINCT symbol FROM openivm_delta_daily_market
+           |) AS d
+           |ON v.dm_s_symb <=> d.symbol
+           |WHEN MATCHED THEN DELETE""".stripMargin
+
+      SparkRefreshRewriter.windowDeleteMergeKeys(sql, target) shouldBe Some(
+        SparkRefreshRewriter.WindowDeleteMergeKeys(
+          "dm_s_symb",
+          "SELECT symbol FROM (SELECT DISTINCT symbol FROM openivm_delta_daily_market) " +
+            "AS __openivm_window_replace_source"
+        )
+      )
+    }
+
+    it("rejects a different target and non-delete MERGE") {
+      val deleteSql =
+        s"""MERGE INTO $target AS t
+           |USING affected AS s
+           |ON t.k <=> s.k
+           |WHEN MATCHED THEN DELETE""".stripMargin
+      val updateSql = deleteSql.replace("THEN DELETE", "THEN UPDATE SET t.k = s.k")
+
+      SparkRefreshRewriter.windowDeleteMergeKeys(deleteSql, "`silver`.`trades`") shouldBe None
+      SparkRefreshRewriter.windowDeleteMergeKeys(updateSql, target) shouldBe None
+    }
+  }
 }

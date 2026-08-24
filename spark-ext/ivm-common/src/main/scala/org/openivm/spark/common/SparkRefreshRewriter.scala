@@ -283,6 +283,70 @@ object SparkRefreshRewriter {
     }
   }
 
+  private[spark] case class WindowDeleteMergeKeys(targetColumn: String, sourceQuery: String)
+
+  /** Extract the affected partition-key query from a WINDOW_PARTITION delete
+    * MERGE. Supports both the legacy parenthesised USING query emitted by the
+    * Spark DELETE rewriter and the named affected-key relation emitted by
+    * current OpenIVM.
+    */
+  private[spark] def windowDeleteMergeKeys(
+      sql: String,
+      targetSql: String
+  ): Option[WindowDeleteMergeKeys] = {
+    val stripped = stripExecutionMarker(sql).trim
+    val ident     = "(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
+    val aliasRe   = ("(?is)^\\s*(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
+    val headerRe = (
+      "(?is)^MERGE\\s+INTO\\s+" + java.util.regex.Pattern.quote(targetSql) +
+        "\\s+(?:AS\\s+)?(" + ident + ")\\s+USING\\s*"
+    ).r
+    val header = headerRe.findPrefixMatchOf(stripped).getOrElse(return None)
+    val targetAlias = header.group(1)
+    val sourceStart = header.end
+
+    val (sourceSql, sourceAlias, tailStart) =
+      if (sourceStart < stripped.length && stripped.charAt(sourceStart) == '(') {
+        val close = findMatchingCloseParen(stripped, sourceStart)
+        if (close < 0) return None
+        val alias = aliasRe.findPrefixMatchOf(stripped.substring(close + 1)).getOrElse(return None)
+        val body  = stripped.substring(sourceStart + 1, close).trim
+        (s"($body) AS __openivm_window_replace_source", alias.group(1), close + 1 + alias.end)
+      } else {
+        val sourceRe = ("(?is)^(" + ident + "(?:\\s*\\.\\s*" + ident + ")*)\\s+" +
+          "(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
+        val source = sourceRe.findPrefixMatchOf(stripped.substring(sourceStart)).getOrElse(return None)
+        (source.group(1).trim, source.group(2), sourceStart + source.end)
+      }
+
+    val tail = stripped.substring(tailStart)
+    val matchRe = (
+      "(?is)^\\s*ON\\s+(" + ident + ")\\s*\\.\\s*(" + ident + ")\\s*" +
+        "(?:IS\\s+NOT\\s+DISTINCT\\s+FROM|<=>)\\s*(" + ident + ")\\s*\\.\\s*(" + ident + ")" +
+        "\\s+WHEN\\s+MATCHED\\s+THEN\\s+DELETE\\s*;?\\s*$"
+    ).r
+    val matched = matchRe.findPrefixMatchOf(tail).getOrElse(return None)
+
+    def normalized(identifier: String): String =
+      identifier.stripPrefix("`").stripSuffix("`").replace("``", "`")
+
+    val leftAlias  = normalized(matched.group(1))
+    val leftColumn = matched.group(2)
+    val rightAlias = normalized(matched.group(3))
+    val rightColumn = matched.group(4)
+    val targetAliasName = normalized(targetAlias)
+    val sourceAliasName = normalized(sourceAlias)
+
+    val (targetColumn, sourceColumn) =
+      if (leftAlias.equalsIgnoreCase(targetAliasName) && rightAlias.equalsIgnoreCase(sourceAliasName))
+        leftColumn -> rightColumn
+      else if (leftAlias.equalsIgnoreCase(sourceAliasName) && rightAlias.equalsIgnoreCase(targetAliasName))
+        rightColumn -> leftColumn
+      else return None
+
+    Some(WindowDeleteMergeKeys(targetColumn, s"SELECT $sourceColumn FROM $sourceSql"))
+  }
+
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse

@@ -3036,7 +3036,7 @@ case class RefreshMaterializedViewCommand(
     val deleteSqls = rewrittenStatements.take(insertIdx).filter(isWindowPartitionDeleteSql(_, targetId))
     if (deleteSqls.isEmpty) return None
 
-    val keySets = deleteSqls.flatMap(collectWindowReplaceKeySet(spark, _))
+    val keySets = deleteSqls.flatMap(collectWindowReplaceKeySet(spark, targetId, _))
     if (keySets.size != deleteSqls.size || keySets.isEmpty) return None
     if (keySets.forall(keys => keys.literals.isEmpty && !keys.hasNull)) return Some("")
 
@@ -3071,11 +3071,17 @@ case class RefreshMaterializedViewCommand(
     upper.contains(s"FROM OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}")
   }
 
-  private def collectWindowReplaceKeySet(spark: SparkSession, deleteMergeSql: String): Option[WindowReplaceKeySet] = {
-    val (targetCol, subquery) = parseWindowDeleteMerge(deleteMergeSql).getOrElse(return None)
+  private def collectWindowReplaceKeySet(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      deleteMergeSql: String
+  ): Option[WindowReplaceKeySet] = {
+    val keys = SparkRefreshRewriter
+      .windowDeleteMergeKeys(deleteMergeSql, MvCommandHelper.sqlIdent(targetId))
+      .getOrElse(return None)
     val probeSql =
       s"""SELECT DISTINCT * FROM (
-         |$subquery
+         |${keys.sourceQuery}
          |) __openivm_window_replace_keys
          |LIMIT ${WindowReplaceMaxLiteralKeys + 1}""".stripMargin
     val df = spark.sql(probeSql)
@@ -3093,48 +3099,7 @@ case class RefreshMaterializedViewCommand(
           case None      => return None
         }
     }
-    Some(WindowReplaceKeySet(targetCol, literals.distinct.toSeq, hasNull))
-  }
-
-  private def parseWindowDeleteMerge(sql: String): Option[(String, String)] = {
-    val usingIdx = "(?is)\\bUSING\\s*\\(".r.findFirstMatchIn(sql).map(_.end - 1).getOrElse(return None)
-    val closeIdx = matchingCloseParen(sql, usingIdx)
-    if (closeIdx < 0) return None
-    val subquery = sql.substring(usingIdx + 1, closeIdx).trim
-    val tail     = sql.substring(closeIdx + 1)
-    val ident    = """(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"""
-    val onRe =
-      ("""(?is)\bAS\s+d\s+ON\s+v\.\s*(""" + ident + """)\s+IS\s+NOT\s+DISTINCT\s+FROM\s+d\.\s*(""" +
-        ident + """)\s+WHEN\s+MATCHED\s+THEN\s+DELETE\b""").r
-    onRe.findFirstMatchIn(tail).map(m => m.group(1).trim -> subquery)
-  }
-
-  private def matchingCloseParen(sql: String, openIdx: Int): Int = {
-    var depth    = 0
-    var i        = openIdx
-    var inSingle = false
-    var inTick   = false
-    while (i < sql.length) {
-      val c = sql.charAt(i)
-      if (inSingle) {
-        if (c == '\'' && i + 1 < sql.length && sql.charAt(i + 1) == '\'') i += 1
-        else if (c == '\'') inSingle = false
-      } else if (inTick) {
-        if (c == '`') inTick = false
-      } else {
-        c match {
-          case '\'' => inSingle = true
-          case '`'  => inTick = true
-          case '('  => depth += 1
-          case ')' =>
-            depth -= 1
-            if (depth == 0) return i
-          case _ =>
-        }
-      }
-      i += 1
-    }
-    -1
+    Some(WindowReplaceKeySet(keys.targetColumn, literals.distinct.toSeq, hasNull))
   }
 
   private def literalSql(value: Any): Option[String] =
@@ -3478,11 +3443,7 @@ case class RefreshMaterializedViewCommand(
   }
 
   private def isWindowPartitionDeleteSql(sql: String, targetId: TableIdentifier): Boolean = {
-    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
-    upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS V") &&
-    upper.contains("SELECT DISTINCT") &&
-    upper.contains("OPENIVM_DELTA_") &&
-    upper.contains("WHEN MATCHED THEN DELETE")
+    SparkRefreshRewriter.windowDeleteMergeKeys(sql, MvCommandHelper.sqlIdent(targetId)).isDefined
   }
 
   private def isWindowPartitionInsertSql(sql: String, targetId: TableIdentifier): Boolean = {
