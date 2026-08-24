@@ -1974,6 +1974,139 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("user snapshot pins") {
+    val pinnedSource = """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM memory.main.accounts
+        |),
+        |t1_delta (t1_id, t1_value, t1_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+        |),
+        |t2_join (t2_id, t2_mul) AS (
+        |  SELECT t0_id, t1_mul FROM t0_scan INNER JOIN t1_delta ON t0_id = t1_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t2_join""".stripMargin
+
+    def rewriteWithPins(
+        sql: String,
+        pins: Map[String, String],
+        qualified: Map[String, String] = Map.empty,
+        snapshotVersions: Map[String, Long] = Map.empty
+    ): RewrittenRefresh =
+      SparkRefreshRewriter.rewrite(
+        compiledSql = sql,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("orders" -> "openivm_delta_orders"),
+        viewDeltaPath = viewDeltaPath,
+        sourceQualifiedNames = qualified,
+        sourceSnapshotPins = pins,
+        sourceSnapshotVersions = snapshotVersions
+      )
+
+    it("re-applies the user pin to a live source read") {
+      val rewritten = rewriteWithPins(pinnedSource, Map("accounts" -> "VERSION AS OF 366"))
+      rewritten.statements.head should include("FROM `accounts` VERSION AS OF 366")
+    }
+
+    it("re-applies the user pin to a qualified live source read") {
+      val rewritten = rewriteWithPins(
+        pinnedSource,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        qualified = Map("accounts" -> "db.accounts")
+      )
+      rewritten.statements.head should include("FROM `db`.`accounts` VERSION AS OF 366")
+    }
+
+    it("never pins the openivm delta temp view of an unpinned source") {
+      val rewritten = rewriteWithPins(pinnedSource, Map("accounts" -> "VERSION AS OF 366"))
+      rewritten.statements.head should include("FROM `openivm_delta_orders`")
+      rewritten.statements.head should not include "`openivm_delta_orders` VERSION AS OF"
+    }
+
+    it("leaves every source unpinned when no pins are registered") {
+      val rewritten = rewriteWithPins(pinnedSource, Map.empty)
+      rewritten.statements.head should include("FROM `accounts`")
+      rewritten.statements.head.toUpperCase should not include "VERSION AS OF"
+    }
+
+    it("keeps the user pin instead of the pre-refresh snapshot version") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        snapshotVersions = Map("accounts" -> 17L)
+      ).statements.head
+      rewritten should include("FROM `accounts` VERSION AS OF 366")
+      rewritten should not include "VERSION AS OF 17"
+    }
+
+    it("still collapses the old-state union for an unpinned source") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map.empty,
+        snapshotVersions = Map("accounts" -> 17L)
+      ).statements.head
+      rewritten should include("VERSION AS OF 17")
+    }
+  }
+
   describe("deduplicateCteColumnAliases") {
     it("renames duplicate CTE column aliases while leaving unique ones intact") {
       val sql =

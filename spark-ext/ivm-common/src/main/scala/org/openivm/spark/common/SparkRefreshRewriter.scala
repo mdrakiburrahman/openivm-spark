@@ -90,6 +90,25 @@ object SparkRefreshRewriter {
       override def initialValue(): Map[String, String] = Map.empty
     }
 
+  /** Per-rewrite map of short source-table name → the Spark `temporalClause`
+    * the user pinned that source to in the MV body (e.g. `VERSION AS OF 366`).
+    *
+    * openivm always emits a LIVE read of a source table; it has no notion of a
+    * Delta snapshot (the compile bridge registers row-less tables). A source
+    * the user pinned is a FROZEN relation, so every live-source read the
+    * compiled program performs — the `B` side of `ΔA ⋈ B` for a mixed
+    * pinned/live join, say — must be re-pinned to the user's version or the
+    * refresh would mix a pinned snapshot with live rows.
+    *
+    * Empty for every view without a snapshot pin, which is the overwhelming
+    * majority: an empty map makes [[rewriteMemoryMainPrefix]] behave exactly
+    * as before.
+    */
+  private val activeSnapshotPins: ThreadLocal[Map[String, String]] =
+    new ThreadLocal[Map[String, String]] {
+      override def initialValue(): Map[String, String] = Map.empty
+    }
+
   private[spark] val SimpleProjectionDeleteMergeMarker: String =
     "/*OPENIVM_SIMPLE_PROJECTION_DELETE_MERGE*/"
 
@@ -377,6 +396,14 @@ object SparkRefreshRewriter {
     *                         from `delta.\`<viewDeltaPath>\``.
     * @param postProcess      Final dialect translation applied to each
     *                         surviving statement (e.g. [[org.openivm.spark.compiler.LptsSparkDialect.translate]]).
+    * @param sourceQualifiedNames Map from short source-table name to its
+    *                         fully-qualified Spark name, used to expand
+    *                         `memory.main.<short>` references.
+    * @param sourceSnapshotPins Map from short source-table name to the Spark
+    *                         `temporalClause` the MV body pinned it to
+    *                         (`VERSION AS OF 366`). Re-applied to every
+    *                         live-source read openivm emits so a pinned source
+    *                         stays frozen at the user's version.
     * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
     *                         Required when pragma-gated recompute cascade emits an
     *                         `openivm_old_<view>` snapshot that must stay pinned to
@@ -392,6 +419,7 @@ object SparkRefreshRewriter {
       postProcess: String => String = identity,
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
+      sourceSnapshotPins: Map[String, String] = Map.empty,
       sourceSnapshotVersions: Map[String, Long] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
@@ -407,8 +435,10 @@ object SparkRefreshRewriter {
     // Make qualified-name remapping visible to every private rewriter below,
     // so `memory.main.<short>` becomes the correct `<db>.<table>` reference
     // in all six call sites instead of a current-schema-bound `<short>`.
-    val prior = activeQualifiedNames.get()
+    val prior     = activeQualifiedNames.get()
+    val priorPins = activeSnapshotPins.get()
     activeQualifiedNames.set(sourceQualifiedNames)
+    activeSnapshotPins.set(sourceSnapshotPins)
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
@@ -507,6 +537,7 @@ object SparkRefreshRewriter {
       RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
     } finally {
       activeQualifiedNames.set(prior)
+      activeSnapshotPins.set(priorPins)
     }
   }
 
@@ -857,9 +888,17 @@ object SparkRefreshRewriter {
     val ctes = parseLeadingCtes(sql)
     if (ctes.isEmpty) return sql
     val byName = ctes.map(c => c.name.toLowerCase -> c).toMap
-    val versionsByShort = sourceSnapshotVersions.map { case (table, version) =>
-      shortTableName(table).toLowerCase -> version
+    // A source the MV body pinned is frozen: its delta is empty by definition,
+    // so the `current UNION ALL negated-delta` form already equals the pinned
+    // snapshot. Replacing it with the refresh-time pre-refresh version would
+    // read a DIFFERENT (live) version, so user-pinned sources are skipped here
+    // and keep their pin via `rewriteMemoryMainPrefix`.
+    val pinnedShortNames = activeSnapshotPins.get().keySet.map(_.toLowerCase)
+    val versionsByShort = sourceSnapshotVersions.collect {
+      case (table, version) if !pinnedShortNames.contains(shortTableName(table).toLowerCase) =>
+        shortTableName(table).toLowerCase -> version
     }
+    if (versionsByShort.isEmpty) return sql
 
     def singleDependency(body: String): Option[String] = {
       val refs = "(?is)\\b(?:FROM|JOIN)\\s+`?([A-Za-z][A-Za-z0-9_]*)`?".r
@@ -1937,6 +1976,13 @@ object SparkRefreshRewriter {
     *   - `` `<identifier>` `` otherwise (the default openivm internal name
     *     e.g. `openivm_delta_<n>`, `openivm_data_<v>`).
     *
+    * A tracked source registered in [[activeSnapshotPins]] additionally keeps
+    * the user's Delta snapshot pin (`` `db`.`t` VERSION AS OF 366 ``): openivm
+    * emits a live read for every source, so without this the incremental
+    * program would read a frozen source's current rows. openivm only ever
+    * references a base source from a FROM/JOIN position, where Spark's
+    * `temporalClause` is grammatical.
+    *
     * openivm usually emits the DuckDB catalog prefix `memory.main.` when the
     * SPARK target dialect is selected, but some translated statements arrive
     * as the equivalent backticked multipart identifier
@@ -1949,26 +1995,36 @@ object SparkRefreshRewriter {
     */
   private[common] def rewriteMemoryMainPrefix(sql: String): String = {
     val qualifiedMap = activeQualifiedNames.get()
+    val pinMap       = activeSnapshotPins.get()
     val re =
       """(?i)(?:`?memory`?\s*+\.\s*+`?main`?\s*+\.\s*+`?([A-Za-z0-9_]++)`?)""".r
     re.replaceAllIn(
       sql,
       m => {
         val short = m.group(1)
-        qualifiedMap.get(short) match {
+        val relation = qualifiedMap.get(short) match {
           case Some(qual) if qual.contains(".") =>
             val parts = qual.split("\\.")
             // Wrap each segment in backticks so Spark resolves the table
             // against the specific database in the qualified name, not the
             // current session schema. `quoteReplacement` keeps regex meta-
             // characters (`$`, `\\`) in identifier strings inert.
-            java.util.regex.Matcher.quoteReplacement(parts.map(p => s"`$p`").mkString("."))
+            parts.map(p => s"`$p`").mkString(".")
           case _ =>
-            java.util.regex.Matcher.quoteReplacement(s"`$short`")
+            s"`$short`"
         }
+        val pinned = snapshotPinFor(short, pinMap).fold(relation)(clause => s"$relation $clause")
+        java.util.regex.Matcher.quoteReplacement(pinned)
       }
     )
   }
+
+  /** Case-insensitive lookup of the snapshot pin registered for a short source
+    * name, or `None` when the source is not pinned.
+    */
+  private def snapshotPinFor(short: String, pinMap: Map[String, String]): Option[String] =
+    if (pinMap.isEmpty) None
+    else pinMap.collectFirst { case (name, clause) if name.equalsIgnoreCase(short) => clause }
 
   /** Transform openivm's `WITH ... INSERT INTO openivm_delta_<view> (cols) SELECT * FROM <lastCte>`
     * tail into a Spark CTAS that materialises the view delta to a per-refresh

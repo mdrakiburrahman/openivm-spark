@@ -319,6 +319,85 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  // ── Test 7c: Snapshot-pinned sources (Spark/Delta time travel) ────────────
+  //
+  // DuckDB cannot represent a Delta snapshot, so a `VERSION AS OF` pin used to
+  // abort the compile (`Parser Error: syntax error at or near "as"`), demoting
+  // the whole view to COMPILE_FAILED -> FULL_REFRESH. The pin is a storage
+  // concern only: it is split out of the compile-bridge copy of the body and
+  // re-applied to every Spark-side source read.
+
+  it should "classify a view whose source is pinned with VERSION AS OF instead of failing to compile" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_agg",
+      viewSql = "SELECT region, SUM(amount) AS total FROM sales VERSION AS OF 366 GROUP BY region",
+      sources = Map("sales" -> salesSchema)
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+    result.sql should not be empty
+  }
+
+  it should "classify a view pinned with TIMESTAMP AS OF" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_ts",
+      viewSql = "SELECT region, SUM(amount) AS total FROM sales TIMESTAMP AS OF '2024-01-01' GROUP BY region",
+      sources = Map("sales" -> salesSchema)
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+  }
+
+  it should "classify a view that pins a qualified source" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_qual",
+      viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales VERSION AS OF 366 GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+  }
+
+  it should "classify a join whose sources are pinned to different versions" in {
+    val depts = StructType.fromDDL("dept_id INT, dept_name STRING")
+    val emps  = StructType.fromDDL("emp_id INT, dept_id INT, name STRING")
+    val req = CompileRequest(
+      viewName = "mv_pinned_join",
+      viewSql = "SELECT e.emp_id, d.dept_name FROM employees VERSION AS OF 2 e " +
+        "JOIN departments VERSION AS OF 5 d ON e.dept_id = d.dept_id",
+      sources = Map("employees" -> emps, "departments" -> depts)
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
+  it should "re-apply the snapshot pin to the Spark-side initial-load SQL" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_initial_load",
+      viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales VERSION AS OF 366 GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.initialLoadSql should not be empty
+    result.initialLoadSql should include("tpcdi.sales VERSION AS OF 366")
+    result.initialLoadSql should not include "memory.main."
+  }
+
+  it should "leave the initial-load SQL unpinned for an unpinned view" in {
+    val req = CompileRequest(
+      viewName = "mv_unpinned_initial_load",
+      viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.initialLoadSql should not be empty
+    result.initialLoadSql.toUpperCase should not include "VERSION AS OF"
+  }
+
   it should "emit RELY FK declarations for qualified compile facts when opted in" in {
     val req = CompileRequest(
       viewName = "mv_relyfk_script",

@@ -689,6 +689,18 @@ The compile bridge pre-normalizes function calls and semi/anti joins before
 DuckDB sees the SQL; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:236-262`.
 
+Delta snapshot pins (`FROM t VERSION AS OF 366`, `FROM t TIMESTAMP AS OF '…'`)
+used to land in the second row of that table: DuckDB fails with
+`Parser Error: syntax error at or near "as"`, and the view was demoted to
+`COMPILE_FAILED` → `FULL_REFRESH`. They are now split out of the compile-bridge
+copy of the body by
+`spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/SparkTimeTravelSql.scala`
+and re-applied to everything Spark executes; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7. If you see
+`reason='compile_failed'` on a pinned view, check that the pin shape is one the
+splitter recognises — an unrecognised shape is deliberately passed through
+unchanged so the failure stays loud.
+
 ### 5.2 Timeout and stderr caveat
 
 The bridge calls `process.waitFor(120, TimeUnit.SECONDS)` before collecting the

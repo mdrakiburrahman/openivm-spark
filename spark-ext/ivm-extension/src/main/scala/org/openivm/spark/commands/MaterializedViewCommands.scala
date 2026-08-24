@@ -32,7 +32,7 @@ import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler}
+import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
@@ -2105,6 +2105,17 @@ case class RefreshMaterializedViewCommand(
       val propagation      = ChangePropagationFactory.forSession(spark)
       val sourceWatermarks = meta.changeWatermarks
 
+      // A source the view body pinned to a snapshot (`… VERSION AS OF 366`) is a
+      // FROZEN relation: rows committed after the pinned version are not part of
+      // the view by definition, so their staged deltas must never be applied.
+      // `meta.querySql` is the user's SQL verbatim, so the pins are recomputed
+      // here rather than persisted as extra metadata.
+      val snapshotPinsByQualified: Map[String, String] =
+        if (SparkTimeTravelSql.hasSnapshotPin(meta.querySql))
+          SparkTimeTravelSql.pinsByQualifiedSource(meta.querySql, meta.sourceTables)
+        else Map.empty
+      val frozenSources: Set[String] = snapshotPinsByQualified.keySet.map(_.toLowerCase)
+
       // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
       // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
@@ -2126,7 +2137,7 @@ case class RefreshMaterializedViewCommand(
         return Seq.empty
       }
 
-      val changeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
+      val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
           propagation.collectChanges(
             spark,
@@ -2135,6 +2146,20 @@ case class RefreshMaterializedViewCommand(
             sourceWatermarks
           )
         }
+      }
+
+      // Deltas staged against a frozen (version-pinned) source are consumed
+      // without being applied: applying them would move the view off the pinned
+      // snapshot, and leaving them staged would grow staging without bound.
+      val (frozenChangeBatches, changeBatches) =
+        if (frozenSources.isEmpty) (Seq.empty[ChangeBatch], collectedChangeBatches)
+        else collectedChangeBatches.partition(b => frozenSources.contains(b.baseTable.toLowerCase))
+      if (frozenChangeBatches.nonEmpty) {
+        propagation.markConsumed(spark, viewNameStr, frozenChangeBatches)
+        logInfo(
+          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='frozen_source_deltas_skipped' " +
+            s"sources='${frozenSources.toSeq.sorted.mkString(",")}' batches='${frozenChangeBatches.size}'"
+        )
       }
       pendingDeltasForFailure = changeBatches.size
 
@@ -3009,6 +3034,13 @@ case class RefreshMaterializedViewCommand(
                 // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
                 // Spark would resolve `<short>` against the current_schema.
                 sourceQualifiedNames = shortToQual,
+                // Re-apply user snapshot pins to openivm's live-source reads: the
+                // compile bridge sees a de-pinned body (DuckDB cannot represent a
+                // Delta snapshot), so the emitted program would otherwise read a
+                // pinned source at its live version.
+                sourceSnapshotPins = snapshotPinsByQualified.map { case (qual, clause) =>
+                  qual.split("\\.").last -> clause
+                },
                 sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
                   case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
                 },

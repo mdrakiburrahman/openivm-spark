@@ -2,7 +2,7 @@ package org.openivm.spark.compiler
 
 import java.io.{BufferedReader, File, InputStreamReader}
 import java.nio.file.{Files, Path, Paths}
-import java.util.Comparator
+import java.util.{Comparator, Locale}
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
@@ -84,9 +84,16 @@ class OpenIvmCompiler private (
       val cols = schema.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       name -> s"CREATE TABLE $name ($cols)"
     }
+    // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
+    // DuckDB cannot parse and the bridge's row-less compile tables cannot
+    // model, so the pin is split out of the COMPILE COPY only. The pin is
+    // re-applied to every openivm-emitted source read (initial load here,
+    // refresh program in `SparkRefreshRewriter`), and `MvMetadata.querySql`
+    // keeps the user's pinned SQL verbatim.
+    val depinnedViewSql = SparkTimeTravelSql.stripSnapshotPins(req.viewSql)
     val normalizedViewSql =
       normalizeSparkSqlForDuckdb(
-        stripDbQualifiers(stripSparkBacktickIdentifiers(req.viewSql), req.sourceQualifiedNames)
+        stripDbQualifiers(stripSparkBacktickIdentifiers(depinnedViewSql), req.sourceQualifiedNames)
       )
 
     val tmpDir = Files.createTempDirectory("openivm_compiler_")
@@ -536,8 +543,17 @@ class OpenIvmCompiler private (
     // tables, so fall back to the original user-supplied view body instead.
     if ("""(?i)\browid\b""".r.findFirstIn(sql).isDefined) return ""
 
-    for ((short, qual) <- req.sourceQualifiedNames) {
-      sql = sql.replace(s"memory.main.$short", qual)
+    // openivm always emits a LIVE read of each source. When the user pinned a
+    // source to a Delta snapshot, re-attach that pin here — otherwise the CTAS
+    // at CREATE would load the current table instead of the version the view
+    // body asked for. Every `memory.main.<source>` reference openivm emits sits
+    // in a FROM position, where Spark's `temporalClause` is grammatical.
+    val pinBySource: Map[String, String] =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName -> pin.clause).toMap
+    for (short <- req.sourceQualifiedNames.keySet ++ pinBySource.keySet) {
+      val qualified = req.sourceQualifiedNames.getOrElse(short, short)
+      val pin       = pinBySource.get(short.toLowerCase(Locale.ROOT)).map(clause => s" $clause").getOrElse("")
+      if (qualified != short || pin.nonEmpty) sql = sql.replace(s"memory.main.$short", s"$qualified$pin")
     }
     sql = sql.replaceAll("memory\\.main\\.", "")
     LptsSparkDialect.translate(sql)

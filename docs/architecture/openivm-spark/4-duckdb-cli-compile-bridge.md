@@ -395,7 +395,61 @@ __sparkfn_to_timestamp
 
 ## This design lets the pre-pass choose the right macro from the observed arity. It also gives the post-pass enough structure to recover the original Spark function call.
 
-## 7. Process model and timeout behavior
+## 7. Snapshot pins (Delta time travel)
+
+A view body may pin a source to a Delta snapshot.
+Spark spells that pin `FROM t VERSION AS OF 366` or `FROM t TIMESTAMP AS OF '…'`
+(its `temporalClause`).
+DuckDB rejects that spelling at parse time:
+
+```text
+Parser Error: syntax error at or near "as"
+LINE 1: … FROM billing_meter_dim VERSION AS OF 366 GROUP BY region;
+                                         ^
+```
+
+DuckDB's own DuckLake spelling `AT (VERSION => 366)` parses but then fails to
+bind against the bridge's plain in-memory tables
+(`Binder Error: Catalog type does not support time travel`).
+Neither spelling can work on the DuckDB side, because
+[§5](#5-source-schema-synthesis) registers row-less, schema-only tables.
+A snapshot pin carries no information the classifier can use.
+Before the split, the pin therefore aborted the compile and demoted the whole
+view to `COMPILE_FAILED` → `FULL_REFRESH`, so every refresh — including a
+refresh with an empty delta — re-executed the entire body.
+
+`SparkTimeTravelSql.scala` splits the pin out of the compile-bridge COPY of the
+body only.
+The scanner is Spark-dialect and quote/comment aware.
+It does not re-implement a SQL parser.
+Every split is verified against Spark's own `CatalystSqlParser`: the de-pinned
+SQL must parse, must contain no residual `RelationTimeTravel` node, and must
+reference exactly the same relation identifiers as the original.
+If any check fails, the original SQL is passed through and the compile fails
+loudly as before.
+
+Nothing Spark executes loses the pin:
+
+| Spark-side artifact                              | Where the pin is re-applied                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------ |
+| `MvMetadata.querySql` (FULL_REFRESH body)         | never stripped — stored verbatim                                    |
+| initial-load CTAS at CREATE                       | `OpenIvmCompiler.parseInitialLoadSql`                               |
+| live source reads in the compiled refresh program | `SparkRefreshRewriter.rewriteMemoryMainPrefix` (`sourceSnapshotPins`) |
+
+A pinned source is a FROZEN relation.
+OpenIVM always emits a live read for every source, so the pin must be
+re-attached at each emitted `memory.main.<source>` reference.
+The refresh path in `MaterializedViewCommands` additionally consumes the staged
+deltas of a pinned source without applying them: post-pin DML is not part of the
+view, and leaving the rows staged would grow staging without bound.
+`rewriteRegularOldStateUnions` skips pinned sources so the user's pin is never
+replaced by the pre-refresh watermark version.
+
+If LPTS later grows a Spark-dialect front-end that accepts (and ignores)
+`temporalClause`, the split stays useful: it keeps the DuckDB-side body free of
+storage semantics that DuckDB cannot bind.
+
+## 8. Process model and timeout behavior
 
 Each `compile()` call creates a new process.
 The process is launched by `runCli()`.
@@ -435,7 +489,7 @@ CompiledRefresh(
 
 ## That demotion preserves correctness. The MV can still be refreshed by re-running the original Spark SQL with `INSERT OVERWRITE`. The trade-off is performance. The view is no longer incrementally maintained until the compile failure is fixed and the MV is recreated or recompiled. At refresh time, cached compiled SQL is normally reused. A legacy MV without cached SQL can invoke the compiler again. If that compile fails, the refresh path should treat it as a compile failure, not as partial incremental SQL. No partial SQL program is safe to execute after a timeout.
 
-## 8. JSON-lines output parser
+## 9. JSON-lines output parser
 
 DuckDB's `-jsonlines` mode makes parsing simple and robust enough for this
 bridge.
@@ -473,7 +527,7 @@ The decoder handles:
 
 ## That row is status information. It is not the compile result. The compile result row is the one with `refresh_type`.
 
-## 9. Sequence diagram
+## 10. Sequence diagram
 
 ```mermaid
 sequenceDiagram
@@ -512,7 +566,7 @@ sequenceDiagram
 
 ______________________________________________________________________
 
-## 10. Sample input and output
+## 11. Sample input and output
 
 This section shows a minimal aggregate MV.
 The source table has two columns.
@@ -750,7 +804,7 @@ The important details in this output are:
 
 ______________________________________________________________________
 
-## 11. Operational checklist
+## 12. Operational checklist
 
 When debugging the compile bridge, check these items in order.
 
@@ -773,7 +827,7 @@ When debugging the compile bridge, check these items in order.
 
 ______________________________________________________________________
 
-## 12. Key source references
+## 13. Key source references
 
 - `OpenIvmCompiler.scala:11-16` — `CompiledRefresh`.
 - `OpenIvmCompiler.scala:28-33` — `CompileRequest`.
@@ -787,6 +841,7 @@ ______________________________________________________________________
 - `OpenIvmCompiler.scala:445-467` — `build()` factory.
 - `OpenIvmCompiler.scala:490-523` — Spark function shim macros.
 - `SparkFunctionShimSql.scala:23-50` — arity-aware rename rules.
+- `SparkTimeTravelSql.scala` — snapshot-pin split and Spark-parser cross-check.
 - `Dependencies.scala:7-11` — DuckDB JDBC ABI pin and CLI note.
 - `pins.env:27-28` — DuckDB JDBC version pin.
 - `CompileRefreshSpec.scala:9-55` — parity spec for the compiler bridge.
