@@ -19,7 +19,7 @@ it through `spark-ext/dev/dev.sh`:
 ./spark-ext/dev/dev.sh test                             # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
 ./spark-ext/dev/dev.sh verify                           # lint + compile + Test/compile + assembly + test
-./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8 # cap forked-test concurrency
+./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8    # cap forked-test concurrency
 PRE_CLEAN=1 ./spark-ext/dev/dev.sh verify               # nuke every running container first, then verify
 ```
 

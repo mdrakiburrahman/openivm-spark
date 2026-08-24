@@ -961,8 +961,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
       statements should have size 2
       statements.foreach(_ should include("WHEN MATCHED THEN DELETE"))
-      statements.head should include("openivm_target.region <=> openivm_aff.region")
-      statements(1) should include("openivm_target.product <=> openivm_aff.product")
+      statements.head should include("ON v.region <=> d.region")
+      statements(1) should include("ON v.product <=> d.product")
       statements.foreach(_ should not startWith "DELETE FROM")
     }
   }
@@ -1153,7 +1153,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements(1) should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_recompute_mv_r AS")
       rewritten.statements(1) should include("FROM `sales`")
       rewritten.statements(1) should include(s"FROM delta.`$viewDeltaPath`")
-      rewritten.statements(2) should startWith("MERGE INTO `mydb`.`mv_r` AS openivm_tgt")
+      rewritten.statements(2) should startWith("MERGE INTO `mydb`.`mv_r` AS v")
       rewritten.statements(2) should include("WHEN MATCHED THEN DELETE")
       rewritten.statements(2) should not include "openivm_recompute_mv_r"
       rewritten.statements(3) shouldBe

@@ -558,17 +558,16 @@ private[compiler] object SparkFunctionShimSql {
       }
     }
 
-  /** Matches `CAST(get_current_timestamp() AS TIMESTAMP)` — the inlined body
-    * of the `__sparkfn_current_timestamp` macro registered by
-    * [[OpenIvmCompiler.sparkFunctionShimsPrologue]] — and restores Spark's
-    * `current_timestamp()` spelling.
+  /** Matches `CAST(get_current_timestamp() AS TIMESTAMP)` — or the newer
+    * native spelling `CAST(current_timestamp() AS TIMESTAMP)` emitted by some
+    * OpenIVM/LPTS pins — and restores Spark's `current_timestamp()` spelling.
     */
   private def parseCurrentTimestampShim(sql: String, exprStart: Int, exprEndExclusive: Int): Option[String] =
-    if (isGetCurrentTimestampCall(sql, exprStart, exprEndExclusive)) Some("current_timestamp()") else None
+    if (isCurrentTimestampLikeCall(sql, exprStart, exprEndExclusive)) Some("current_timestamp()") else None
 
-  /** Matches `CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)` — the
-    * inlined body of the `__sparkfn_current_date` macro — and restores
-    * Spark's `current_date()` spelling.
+  /** Matches `CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)` — or
+    * the newer native spelling with `current_timestamp()` already inlined —
+    * and restores Spark's `current_date()` spelling.
     *
     * The inner `CAST(get_current_timestamp() AS TIMESTAMP)` is itself a
     * [[parseCastTemporalShim]] match, so the cheap `CAST(` prefix guard below
@@ -586,8 +585,10 @@ private[compiler] object SparkFunctionShimSql {
     else None
   }
 
-  private def isGetCurrentTimestampCall(sql: String, start: Int, endExclusive: Int): Boolean =
-    sql.substring(start, endExclusive).trim.equalsIgnoreCase("get_current_timestamp()")
+  private def isCurrentTimestampLikeCall(sql: String, start: Int, endExclusive: Int): Boolean = {
+    val expr = sql.substring(start, endExclusive).trim
+    expr.equalsIgnoreCase("get_current_timestamp()") || expr.equalsIgnoreCase("current_timestamp()")
+  }
 
   private def rewriteCastTemporalBody(
       sql: String,

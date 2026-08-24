@@ -614,8 +614,18 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_timestamp()"
     }
 
+    it("rewrites the direct current_timestamp() cast form back to current_timestamp()") {
+      val sql = "CAST(current_timestamp() AS TIMESTAMP)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_timestamp()"
+    }
+
     it("rewrites the inlined current_date() shim body back to current_date()") {
       val sql = "CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE)"
+      LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_date()"
+    }
+
+    it("rewrites the direct current_timestamp()-nested date cast back to current_date()") {
+      val sql = "CAST(CAST(current_timestamp() AS TIMESTAMP) AS DATE)"
       LptsSparkDialect.rewriteSparkFunctionInlinings(sql) shouldBe "current_date()"
     }
 

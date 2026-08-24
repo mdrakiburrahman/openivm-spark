@@ -31,10 +31,10 @@ FROM ubuntu:24.04 AS openivm-builder
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
-ARG OPENIVM_BRANCH=openivm-spark
+ARG OPENIVM_BRANCH=dev/mdrrahman/add-months-ila
 ARG OPENIVM_COMMIT
 ARG LPTS_REPO
-ARG LPTS_BRANCH=openivm-spark
+ARG LPTS_BRANCH=dev/mdrrahman/spark-add-months
 ARG LPTS_COMMIT
 
 ENV DEBIAN_FRONTEND=noninteractive
