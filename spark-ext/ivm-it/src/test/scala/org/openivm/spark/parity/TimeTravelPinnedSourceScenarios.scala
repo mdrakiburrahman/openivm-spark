@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode}
+import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, TimeTravelPinStatus}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Regression coverage for materialized views whose sources are pinned to a
@@ -503,6 +503,95 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       refreshMv(mv)
       assertMvCorrect(mv, body)
       spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+    }
+  }
+
+  // ── §10: The pin-status telemetry contract ────────────────────────────────
+
+  /** Downstream consumers (the campaign/source integration's scratch historical
+    * MV probe and its hydrate guards) gate on `time_travel_pin_status`, so the
+    * status must be durable METADATA, not something re-derived from whatever
+    * SQL a refresh happens to execute: the generated delta program is free to
+    * carry no temporal clause at all. These cases hold the round trip —
+    * `APPLIED` at CREATE and at every later REFRESH of the same view,
+    * `NOT_APPLICABLE` only when the user wrote no pin, and `COMPILE_FAILED`
+    * for a pin OpenIVM refuses to maintain.
+    */
+  describe("(TTP-10) The pin-status telemetry contract") {
+    it("records APPLIED with the pin identity at CREATE and keeps it across refreshes") {
+      val (src, mv, pinned) = pinnedAggregateFixture("telemetry")
+      val created           = mvMeta(mv)
+      created.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      created.timeTravelPins should have size 1
+      created.timeTravelPins.head should endWith(s"=VERSION AS OF $pinned")
+      created.timeTravelPins.head.toLowerCase should include(src.toLowerCase)
+
+      // A frozen delta, then a refresh with nothing pending at all: neither may
+      // move the recorded status.
+      sql(s"INSERT INTO $src VALUES (8, 'b', 800)")
+      refreshMv(mv)
+      mvMeta(mv).timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      refreshMv(mv)
+      val refreshed = mvMeta(mv)
+      refreshed.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      refreshed.timeTravelPins shouldBe created.timeTravelPins
+      assertMvCorrect(mv, pinnedExpectation(src, pinned))
+
+      // The status must not be inferable from the compiled program: whatever
+      // openivm emitted and we cached carries no temporal clause of its own.
+      refreshed.properties.collect {
+        case (key, value) if key.startsWith("_ivm_compile_cache") => value
+      } foreach { cached =>
+        cached.toUpperCase should not include "VERSION AS OF"
+      }
+    }
+
+    it("records APPLIED through a dbt-shaped aliased pin") {
+      val (_, mv, pinned) = dbtPinnedFixture("telemetry")
+      val meta            = mvMeta(mv)
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      meta.timeTravelPins should have size 1
+      meta.timeTravelPins.head should endWith(s"=version as of $pinned")
+      refreshMv(mv)
+      mvMeta(mv).timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+    }
+
+    it("records NOT_APPLICABLE for a view the user did not pin") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_tel_live(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_tel_live VALUES (1, 'a', 10), (2, 'b', 20)")
+      sql(
+        "CREATE MATERIALIZED VIEW ttp_tel_mv_live AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          "FROM ttp_tel_live GROUP BY grp"
+      )
+      mvMeta("ttp_tel_mv_live").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+      mvMeta("ttp_tel_mv_live").timeTravelPins shouldBe empty
+
+      sql("INSERT INTO ttp_tel_live VALUES (3, 'a', 5)")
+      refreshMv("ttp_tel_mv_live")
+      mvMeta("ttp_tel_mv_live").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+    }
+
+    it("records COMPILE_FAILED for a pin OpenIVM refuses to maintain") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_tel_bad(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_tel_bad VALUES (1, 'a', 10), (2, 'b', 20)")
+      val vThen = latestVersion("ttp_tel_bad")
+      sql("INSERT INTO ttp_tel_bad VALUES (3, 'c', 30)")
+      val vNow = latestVersion("ttp_tel_bad")
+
+      val body =
+        s"""select a.id, a.val as val_then, b.val as val_now
+           |from ttp_tel_bad version as of $vThen as a
+           |inner join ttp_tel_bad version as of $vNow as b on a.id = b.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_tel_mv_bad AS $body")
+
+      val meta = mvMeta("ttp_tel_mv_bad")
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      meta.timeTravelPins shouldBe empty
+      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
+
+      refreshMv("ttp_tel_mv_bad")
+      mvMeta("ttp_tel_mv_bad").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      assertMvCorrect("ttp_tel_mv_bad", body)
     }
   }
 }

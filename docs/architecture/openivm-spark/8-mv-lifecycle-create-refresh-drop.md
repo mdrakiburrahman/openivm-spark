@@ -1258,7 +1258,7 @@ Source:
 A kept incremental aggregate view logs a classification line like:
 
 ```text
-[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true'
+[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Source:

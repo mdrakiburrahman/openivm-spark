@@ -1339,6 +1339,15 @@ case class CreateMaterializedViewCommand(
       propagation.validateSources(spark, qualNames)
     }
 
+    // Snapshot-pin telemetry contract.  Derived from the USER's body plus this
+    // view's tracked sources — never from compiled text, whose delta statements
+    // carry no temporal clause even when the sources are frozen exactly as
+    // pinned.  Recorded before the compile so a refused pin still reports its
+    // status on the CREATE span.
+    val timeTravelPinStatus = SparkTimeTravelSql.pinStatus(originalQueryText, qualNames)
+    val timeTravelPins      = SparkTimeTravelSql.pinIdentity(originalQueryText, qualNames)
+    OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(timeTravelPinStatus)
+
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
     val groupKeys      = extractGroupKeys(analyzed)
     val countStarAlias = extractCountStarAlias(analyzed)
@@ -1402,7 +1411,8 @@ case class CreateMaterializedViewCommand(
           // `[openivm-mv]` to enumerate all demotions for a run.
           logError(
             s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='COMPILE_FAILED' " +
-              s"effective_refresh_type='FULL_REFRESH' reason='compile_failed' cause=${e.getMessage}"
+              s"effective_refresh_type='FULL_REFRESH' reason='compile_failed' " +
+              s"time_travel_pin_status='$timeTravelPinStatus' cause=${e.getMessage}"
           )
           org.openivm.spark.compiler.CompiledRefresh(
             refreshType = RefreshTypeCode.FullRefresh,
@@ -1566,7 +1576,9 @@ case class CreateMaterializedViewCommand(
       val msg =
         s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
           s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
-          s"emits_cascade_view_delta='$emitsCascadeViewDelta'" +
+          s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
+          s"time_travel_pin_status='$timeTravelPinStatus'" +
+          (if (timeTravelPins.isEmpty) "" else s" time_travel_pins='${timeTravelPins.mkString(";")}'") +
           classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
       if (classification.isDemotionToFullRefresh)
         logError(msg)
@@ -1602,6 +1614,9 @@ case class CreateMaterializedViewCommand(
         compileRefreshTypeName = classification.compileRefreshTypeName,
         refreshReason = classifyReason
       )
+    // Persisted so a REFRESH reports the same pin status without re-deriving it
+    // from the generated delta statements, which never carry the clause.
+    val timeTravelPinProps = MvMetadata.timeTravelPinProperties(timeTravelPinStatus, timeTravelPins)
 
     // Fingerprint the current source schemas + every upstream MV's identity
     // hash. Captures schema drift AND upstream-body drift (DROP + recreate
@@ -1651,7 +1666,7 @@ case class CreateMaterializedViewCommand(
     val userProps = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ classificationProps ++ compiledProps ++ watermarkProps
+        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -2104,6 +2119,33 @@ case class RefreshMaterializedViewCommand(
       val viewNameStr      = metaName(name)
       val propagation      = ChangePropagationFactory.forSession(spark)
       val sourceWatermarks = meta.changeWatermarks
+
+      // Snapshot-pin telemetry contract.  The status recorded at CREATE is
+      // authoritative and is re-proved here against the user's body: a REFRESH
+      // must keep reporting `APPLIED` even though the generated delta program
+      // carries no temporal clause of its own.  A persisted status or pin
+      // identity that no longer matches the body means the frozen relations are
+      // not what the recorded status claims — fail closed rather than emit a
+      // status a hydrate guard would trust.
+      val derivedPinStatus = SparkTimeTravelSql.pinStatus(meta.querySql, meta.sourceTables)
+      val derivedPins      = SparkTimeTravelSql.pinIdentity(meta.querySql, meta.sourceTables)
+      meta.timeTravelPinStatus.foreach { persisted =>
+        val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPins
+        if (persisted != derivedPinStatus || !pinsAgree) {
+          throw new IllegalStateException(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' snapshot-pin metadata disagrees with the view body: " +
+              s"recorded status='$persisted' pins='${meta.timeTravelPins.mkString(";")}' but the body resolves to " +
+              s"status='$derivedPinStatus' pins='${derivedPins.mkString(";")}'. Recreate the view."
+          )
+        }
+      }
+      val timeTravelPinStatus = meta.timeTravelPinStatus.getOrElse(derivedPinStatus)
+      OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(timeTravelPinStatus)
+      logInfo(
+        s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+          s"time_travel_pin_status='$timeTravelPinStatus'" +
+          (if (derivedPins.isEmpty) "" else s" time_travel_pins='${derivedPins.mkString(";")}'")
+      )
 
       // A source the view body pinned to a snapshot (`… VERSION AS OF 366`) is a
       // FROZEN relation: rows committed after the pinned version are not part of

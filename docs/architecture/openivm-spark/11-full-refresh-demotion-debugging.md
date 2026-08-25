@@ -190,7 +190,7 @@ Expected metadata:
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='top_k_kept' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='top_k_kept' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Expected refresh SQL:
@@ -248,7 +248,7 @@ Expected metadata:
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_sp`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='simple_projection_no_apply' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_sp`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='simple_projection_no_apply' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Expected refresh SQL:
@@ -332,8 +332,8 @@ Expected metadata for a verified FULL_REFRESH upstream:
 Expected log lines:
 
 ```text
-[openivm-mv] view='`mv_recent`' compiled_refresh_type='FULL_REFRESH' effective_refresh_type='SIGNED_DELTA_RECOMPUTE' reason='signed_delta_recompute_verified' emits_cascade_view_delta='true'
-[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='kept' emits_cascade_view_delta='true'
+[openivm-mv] view='`mv_recent`' compiled_refresh_type='FULL_REFRESH' effective_refresh_type='SIGNED_DELTA_RECOMPUTE' reason='signed_delta_recompute_verified' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
+[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='kept' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Recovery when a dependent still recomputes:
@@ -460,7 +460,7 @@ and applies the demotion at
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_h2`' compiled_refresh_type='AGGREGATE_HAVING' effective_refresh_type='FULL_REFRESH' reason='having_pred_hidden_agg' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_h2`' compiled_refresh_type='AGGREGATE_HAVING' effective_refresh_type='FULL_REFRESH' reason='having_pred_hidden_agg' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Recovery:
@@ -501,7 +501,7 @@ not update the MV after source changes. The detector is
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_join`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='FULL_REFRESH' reason='no_real_delta' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_join`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='FULL_REFRESH' reason='no_real_delta' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Recovery:
@@ -712,6 +712,23 @@ tracked source (or to several) and a MOVING pin value such as
 on every refresh, so only literal values (`VERSION AS OF 4`,
 `TIMESTAMP AS OF '2026-08-24 00:00:00'`) stay incremental. Rewrite the body with
 a literal snapshot if you want incremental maintenance.
+
+Every CREATE and REFRESH classification line — and the matching
+`OPENIVM_EXECUTION_SPAN` JSON — also carries `time_travel_pin_status`
+(`APPLIED` / `NOT_APPLICABLE` / `COMPILE_FAILED`), so a pinned view that fell
+back can be told apart from an unpinned one without reading the body:
+
+```text
+[openivm-mv] view='`mv_pinned`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='false' time_travel_pin_status='APPLIED' time_travel_pins='db.dim=VERSION AS OF 366'
+[openivm-mv] refresh view='`mv_pinned`' refresh_type='AGGREGATE_GROUP' time_travel_pin_status='APPLIED' time_travel_pins='db.dim=VERSION AS OF 366'
+```
+
+`time_travel_pin_status='COMPILE_FAILED'` means the PIN was refused (§7.2 of the
+compile-bridge doc); a demotion for any other cause keeps the status the pin
+itself earned. The status is persisted in MV metadata
+(`_ivm_time_travel_pin_status`, `_ivm_time_travel_pins`), so REFRESH reports it
+even though the delta program it runs contains no temporal clause; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7.3.
 
 ### 5.2 Timeout and stderr caveat
 

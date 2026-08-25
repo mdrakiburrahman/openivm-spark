@@ -321,6 +321,41 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
     }
   }
 
+  describe("MvMetadata time-travel pin telemetry") {
+    it("round-trips the pin status and identity through the catalog") {
+      val pins = Seq(
+        "db.customer_address=VERSION AS OF 7",
+        "db.customer=VERSION AS OF 3"
+      )
+      val original = sampleMeta("pin_rt").copy(
+        properties = MvMetadata.timeTravelPinProperties(TimeTravelPinStatus.Applied, pins)
+      )
+      MvCatalog.upsert(spark, original)
+
+      val stored = MvCatalog.lookup(spark, original.name).get
+      stored.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      stored.timeTravelPins shouldBe Seq("db.customer=VERSION AS OF 3", "db.customer_address=VERSION AS OF 7")
+      stored.properties(MvMetadata.TimeTravelPinsKey) shouldBe
+        "db.customer=VERSION AS OF 3;db.customer_address=VERSION AS OF 7"
+    }
+
+    it("omits the pin list when the view has no resolved pin") {
+      val props = MvMetadata.timeTravelPinProperties(TimeTravelPinStatus.NotApplicable, Seq.empty)
+      props shouldBe Map(MvMetadata.TimeTravelPinStatusKey -> TimeTravelPinStatus.NotApplicable)
+      sampleMeta("pin_none").copy(properties = props).timeTravelPins shouldBe empty
+    }
+
+    it("treats a legacy or unrecognised status as absent rather than as NOT_APPLICABLE") {
+      sampleMeta("pin_legacy").copy(properties = Map.empty).timeTravelPinStatus shouldBe None
+      sampleMeta("pin_bogus")
+        .copy(properties = Map(MvMetadata.TimeTravelPinStatusKey -> "MAYBE"))
+        .timeTravelPinStatus shouldBe None
+      MvMetadata.timeTravelPinProperties("MAYBE", Seq("db.t=VERSION AS OF 1")) should not contain key(
+        MvMetadata.TimeTravelPinStatusKey
+      )
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Test 11: concurrent writers don't double-insert
   // ---------------------------------------------------------------------------

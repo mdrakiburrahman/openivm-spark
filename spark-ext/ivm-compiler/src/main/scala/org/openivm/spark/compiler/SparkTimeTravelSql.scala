@@ -6,6 +6,7 @@ import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedRel
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.openivm.spark.common.TimeTravelPinStatus
 
 /** Splits Spark/Delta snapshot pins (`… VERSION AS OF <v>` / `… TIMESTAMP AS OF
   * <ts>`, a.k.a. Spark's `temporalClause`) out of a materialized-view body.
@@ -286,6 +287,35 @@ object SparkTimeTravelSql {
   /** Pins in `sql` that do NOT resolve to exactly one of `qualifiedSources`. */
   def unresolvedPins(sql: String, qualifiedSources: Seq[String]): Seq[SnapshotPin] =
     unresolvedPins(split(sql).pins, qualifiedSources)
+
+  /** Telemetry status of the user-authored pins in `sql`, evaluated against the
+    * view's tracked sources.
+    *
+    * This is the ONLY sanctioned way to derive
+    * [[org.openivm.spark.common.TimeTravelPinStatus]]: it reads the user's body,
+    * never the compiled/generated program, whose delta statements carry no
+    * temporal clause even when the sources are frozen exactly as pinned.
+    *
+    *   - `COMPILE_FAILED` when a pin is present but un-maintainable
+    *     ([[unsupportedSnapshotPinReason]] — checked first, because those bodies
+    *     deliberately lift NO pin);
+    *   - `APPLIED` when every pin lifted and resolved to exactly one source, so
+    *     the engine freezes that source at the pinned snapshot;
+    *   - `NOT_APPLICABLE` when the body carries no pin at all.
+    */
+  def pinStatus(sql: String, qualifiedSources: Seq[String]): String =
+    if (unsupportedSnapshotPinReason(sql, qualifiedSources).isDefined) TimeTravelPinStatus.CompileFailed
+    else if (hasSnapshotPin(sql)) TimeTravelPinStatus.Applied
+    else TimeTravelPinStatus.NotApplicable
+
+  /** Identity of every resolved pin as `<qualified source>=<clause>`, sorted by
+    * source. Persisted at CREATE so REFRESH can prove the status it reports
+    * still describes the same frozen relations at the same frozen values.
+    * Sorted on the rendered entry so it matches the persisted property byte for
+    * byte.
+    */
+  def pinIdentity(sql: String, qualifiedSources: Seq[String]): Seq[String] =
+    pinsByQualifiedSource(sql, qualifiedSources).toSeq.map { case (source, clause) => s"$source=$clause" }.sorted
 
   private def unresolvedPins(pins: Seq[SnapshotPin], qualifiedSources: Seq[String]): Seq[SnapshotPin] = {
     val sources = qualifiedSources.distinct

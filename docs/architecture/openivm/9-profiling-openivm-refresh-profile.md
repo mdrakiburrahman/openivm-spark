@@ -190,7 +190,8 @@ The JSON fields are stable and intentionally low-cardinality:
 `dbt_node_id` (from `openivm.node_id`, else `spark.jobGroup.id`, including MDC),
 `materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
 `duration_ms`, `driver_thread`, `outcome`, optional
-`compile_refresh_type`, `effective_refresh_type`, and `refresh_reason`, plus optional
+`compile_refresh_type`, `effective_refresh_type`, `refresh_reason`, and
+`time_travel_pin_status`, plus optional
 `same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
 `catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`. CREATE spans also
 include `catalog_publication_admission_width`,
@@ -220,6 +221,15 @@ the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
 runs still emit the same three fields without recompiling. Legacy metadata rows
 that pre-date these properties fall back to `effective_refresh_type=refreshTypeName`,
 set `compile_refresh_type` to that same value, and omit `refresh_reason`.
+`time_travel_pin_status` reports whether a user-authored Delta snapshot pin
+(`FROM t VERSION AS OF 366`) was honored: `APPLIED` when every pin resolved and
+its source is frozen, `NOT_APPLICABLE` when the body carries no pin, and
+`COMPILE_FAILED` for a pin OpenIVM refuses to maintain. It is derived from the
+user's body and persisted at CREATE
+(`_ivm_time_travel_pin_status` / `_ivm_time_travel_pins`), never inferred from
+the compiled program, so a REFRESH whose delta statements carry no temporal
+clause still reports `APPLIED`; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7.3.
 `rocksdb_backup_ms` is best-effort only: async state backup may finish after the
 primary span is emitted, and that late completion does NOT trigger a duplicate
 `OPENIVM_EXECUTION_SPAN` line.

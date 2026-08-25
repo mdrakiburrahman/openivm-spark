@@ -134,6 +134,22 @@ final case class MvMetadata(
   /** Whether writes must target the sibling `<mv>__ivm_data` Delta table. */
   def usesBackingDataTable: Boolean =
     refreshType == RefreshTypeCode.AggregateHaving || backingViewSuffix.nonEmpty
+
+  /** CREATE-time [[TimeTravelPinStatus]] of this view's user-authored snapshot
+    * pins, or `None` for a view created before the status was persisted (the
+    * refresh path re-derives it from [[querySql]] in that case).
+    */
+  def timeTravelPinStatus: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinStatusKey).flatMap(TimeTravelPinStatus.normalize)
+
+  /** CREATE-time identity of every resolved pin, `<qualified source>=<clause>`,
+    * sorted by source. Empty when the view has no resolved pin.
+    */
+  def timeTravelPins: Seq[String] =
+    properties
+      .get(MvMetadata.TimeTravelPinsKey)
+      .map(_.split(MvMetadata.TimeTravelPinSeparator).iterator.map(_.trim).filter(_.nonEmpty).toVector)
+      .getOrElse(Vector.empty)
 }
 
 object MvMetadata {
@@ -185,6 +201,20 @@ object MvMetadata {
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
 
+  /** CREATE-time [[TimeTravelPinStatus]] of the view's user-authored snapshot
+    * pins. Persisted so a REFRESH still reports `APPLIED` even though the
+    * generated delta statements carry no temporal clause of their own.
+    */
+  val TimeTravelPinStatusKey: String = "_ivm_time_travel_pin_status"
+
+  /** CREATE-time pin identity, `<qualified source>=<clause>` entries joined by
+    * [[TimeTravelPinSeparator]] and sorted by source. Lets REFRESH prove the
+    * persisted status still describes the same frozen relations.
+    */
+  val TimeTravelPinsKey: String = "_ivm_time_travel_pins"
+
+  val TimeTravelPinSeparator: String = ";"
+
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
   private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
@@ -224,6 +254,20 @@ object MvMetadata {
     val compile = Option(compileRefreshTypeName).map(_.trim).filter(_.nonEmpty).map(CompileRefreshTypeKey -> _).toMap
     val reason  = Option(refreshReason).map(_.trim).filter(_.nonEmpty).map(RefreshReasonKey -> _).toMap
     compile ++ reason
+  }
+
+  /** Build the property entries recording the CREATE-time snapshot-pin
+    * telemetry contract. `pins` are `<qualified source>=<clause>` entries; they
+    * are stored sorted so the property is byte-stable, and omitted entirely
+    * when the view has no resolved pin.
+    */
+  def timeTravelPinProperties(status: String, pins: Seq[String]): Map[String, String] = {
+    val statusProp = TimeTravelPinStatus.normalize(status).map(TimeTravelPinStatusKey -> _).toMap
+    val pinList    = Option(pins).getOrElse(Seq.empty).map(_.trim).filter(_.nonEmpty).distinct.sorted
+    val pinsProp =
+      if (pinList.isEmpty) Map.empty[String, String]
+      else Map(TimeTravelPinsKey -> pinList.mkString(TimeTravelPinSeparator))
+    statusProp ++ pinsProp
   }
 
   /** Tier component for the compile cache key.  It includes only facts

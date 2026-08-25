@@ -545,8 +545,45 @@ Refusing in the bridge keeps the outcome loud and correct: `COMPILE_FAILED` →
 `FULL_REFRESH` re-executes `MvMetadata.querySql`, which still carries both pins,
 so Spark honors them on every refresh.
 
-## 8. Process model and timeout behavior
+### 7.3 `time_travel_pin_status` — the downstream telemetry contract
 
+Downstream consumers (the campaign/source integration's scratch historical MV
+probe and its hydrate guards) must be able to tell — without reading any SQL —
+whether the snapshot the user pinned was actually honored.
+Every CREATE and every REFRESH therefore reports a `time_travel_pin_status` in
+both the `[openivm-mv]` classification line and the
+`OPENIVM_EXECUTION_SPAN` JSON:
+
+| status           | meaning                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `APPLIED`        | the body carries at least one user pin, every pin resolved to exactly one tracked source, and that source is frozen at the pinned snapshot |
+| `NOT_APPLICABLE` | the body carries no user pin at all                                                          |
+| `COMPILE_FAILED` | the body carries a pin from [§7.2](#72-pin-shapes-openivm-refuses); the view is demoted to `FULL_REFRESH` |
+
+The values are `org.openivm.spark.common.TimeTravelPinStatus`; guards must
+compare against `APPLIED` exactly, never infer it from compiled text.
+
+Two properties make that contract safe:
+
+- **Derived from the USER's body.** `SparkTimeTravelSql.pinStatus(sql,
+  qualifiedSources)` reads `MvMetadata.querySql` plus the view's tracked
+  sources. It is never derived from the compiled program: openivm's delta
+  statements legitimately carry no temporal clause even though every source
+  read in them is re-pinned by `SparkRefreshRewriter`.
+- **Persisted, then re-proved.** CREATE writes
+  `_ivm_time_travel_pin_status` and `_ivm_time_travel_pins`
+  (`<qualified source>=<clause>`, sorted, `;`-joined) into the MV metadata, so
+  REFRESH reports `APPLIED` from metadata rather than from whatever SQL it is
+  about to execute. REFRESH still re-derives both from the body and fails
+  closed — `IllegalStateException`, no refresh — when the persisted status or
+  pin identity disagrees with it. A view created before this contract existed
+  has no persisted status; REFRESH then uses the derived value.
+
+`FULL_REFRESH` does not weaken `APPLIED`: a view demoted for an unrelated
+reason still re-executes `MvMetadata.querySql`, pin included. Only the refused
+pin shapes of [§7.2](#72-pin-shapes-openivm-refuses) report `COMPILE_FAILED`.
+
+## 8. Process model and timeout behavior
 Each `compile()` call creates a new process.
 The process is launched by `runCli()`.
 The command is:

@@ -24,7 +24,8 @@ import org.openivm.spark.common.{
   RefreshTypeCode,
   StagingCatalog,
   StagingChangeBatch,
-  StagingDelta
+  StagingDelta,
+  TimeTravelPinStatus
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
@@ -1319,6 +1320,154 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       payload.path("compile_refresh_type").asText() shouldBe meta.properties(MvMetadata.CompileRefreshTypeKey)
       payload.path("effective_refresh_type").asText() shouldBe meta.refreshTypeName
       payload.path("refresh_reason").asText() shouldBe meta.properties(MvMetadata.RefreshReasonKey)
+    }
+  }
+
+  describe("(5b) snapshot-pin telemetry contract") {
+    it("reports APPLIED on CREATE and on a later REFRESH whose delta program carries no clause") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b")
+      spark.sql("INSERT INTO sales_t5b VALUES ('west', 200)")
+
+      val createMessages = withLogCapture { appender =>
+        spark.sql(
+          s"CREATE MATERIALIZED VIEW mv_t5b_pin AS SELECT region, SUM(amount) AS total " +
+            s"FROM sales_t5b VERSION AS OF $pinnedVersion GROUP BY region"
+        )
+        appender.messages
+      }
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_pin")).get
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      meta.timeTravelPins should have size 1
+      meta.timeTravelPins.head should endWith(s"=VERSION AS OF $pinnedVersion")
+
+      val createSpan = executionSpanPayloads(createMessages, "mv_t5b_pin")
+      createSpan should have size 1
+      createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      val createClassification = createMessages.filter(m =>
+        m.contains("[openivm-mv] view='`mv_t5b_pin`'") && m.contains("compiled_refresh_type=")
+      )
+      createClassification should have size 1
+      createClassification.head should include(s"time_travel_pin_status='${TimeTravelPinStatus.Applied}'")
+      createClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+
+      // A delta arriving after the pinned version is consumed but never applied,
+      // and the generated refresh program carries no temporal clause — the
+      // status must still come back APPLIED, from metadata.
+      spark.sql("INSERT INTO sales_t5b VALUES ('south', 300)")
+      val refreshMessages = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_pin").collect()
+        appender.messages
+      }
+
+      val refreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_pin")
+      refreshSpan should have size 1
+      refreshSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      val refreshClassification = refreshMessages.filter(m =>
+        m.contains("[openivm-mv] refresh view='`mv_t5b_pin`'") && m.contains("time_travel_pin_status=")
+      )
+      refreshClassification should have size 1
+      refreshClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+
+      assertBagEqual(
+        "mv_t5b_pin",
+        s"SELECT region, SUM(amount) AS total FROM sales_t5b VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+    }
+
+    it("reports NOT_APPLICABLE for a view whose body carries no pin") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_nopin(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_nopin VALUES ('east', 100)")
+
+      val createMessages = withLogCapture { appender =>
+        spark.sql(
+          "CREATE MATERIALIZED VIEW mv_t5b_nopin AS " +
+            "SELECT region, SUM(amount) AS total FROM sales_t5b_nopin GROUP BY region"
+        )
+        appender.messages
+      }
+
+      executionSpanPayloads(createMessages, "mv_t5b_nopin").head
+        .path("time_travel_pin_status")
+        .asText() shouldBe TimeTravelPinStatus.NotApplicable
+      createMessages.filter(m =>
+        m.contains("[openivm-mv] view='`mv_t5b_nopin`'") && m.contains("compiled_refresh_type=")
+      ) foreach { line =>
+        line should include(s"time_travel_pin_status='${TimeTravelPinStatus.NotApplicable}'")
+        line should not include "time_travel_pins="
+      }
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_nopin")).get
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+      meta.timeTravelPins shouldBe empty
+
+      spark.sql("INSERT INTO sales_t5b_nopin VALUES ('west', 200)")
+      val refreshMessages = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_nopin").collect()
+        appender.messages
+      }
+      executionSpanPayloads(refreshMessages, "mv_t5b_nopin").head
+        .path("time_travel_pin_status")
+        .asText() shouldBe TimeTravelPinStatus.NotApplicable
+    }
+
+    it("reports COMPILE_FAILED for an unsupported pin instead of claiming it was applied") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_bad(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_bad VALUES ('east', 100)")
+      spark.sql("INSERT INTO sales_t5b_bad VALUES ('west', 200)")
+
+      val createMessages = withLogCapture { appender =>
+        spark.sql(
+          "CREATE MATERIALIZED VIEW mv_t5b_bad AS " +
+            "SELECT a.region, SUM(a.amount) AS total FROM sales_t5b_bad VERSION AS OF 0 a " +
+            "JOIN sales_t5b_bad VERSION AS OF 1 b ON a.region = b.region GROUP BY a.region"
+        )
+        appender.messages
+      }
+
+      val createSpan = executionSpanPayloads(createMessages, "mv_t5b_bad")
+      createSpan should have size 1
+      createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.CompileFailed
+      createSpan.head.path("compile_refresh_type").asText() shouldBe "COMPILE_FAILED"
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_bad")).get
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      meta.timeTravelPins shouldBe empty
+      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+
+      val refreshMessages = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_bad").collect()
+        appender.messages
+      }
+      executionSpanPayloads(refreshMessages, "mv_t5b_bad").head
+        .path("time_travel_pin_status")
+        .asText() shouldBe TimeTravelPinStatus.CompileFailed
+    }
+
+    it("fails closed when persisted pin metadata disagrees with the view body") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_drift(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_drift VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b_drift")
+      spark.sql(
+        s"CREATE MATERIALIZED VIEW mv_t5b_drift AS SELECT region, SUM(amount) AS total " +
+          s"FROM sales_t5b_drift VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_drift")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinStatusKey -> TimeTravelPinStatus.NotApplicable)
+      )
+
+      spark.sql("INSERT INTO sales_t5b_drift VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_drift").collect()
+      }
+      failure.getMessage should include("snapshot-pin metadata disagrees with the view body")
     }
   }
 

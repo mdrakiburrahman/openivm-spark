@@ -7,6 +7,7 @@ import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.slf4j.MDC
+import org.openivm.spark.common.TimeTravelPinStatus
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -253,6 +254,59 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("compile_refresh_type").asText() shouldBe "COMPILE_FAILED"
       payload.get("effective_refresh_type").asText() shouldBe "FULL_REFRESH"
       payload.get("refresh_reason").asText() shouldBe "compile_failed"
+    }
+
+    it("renders the recorded time-travel pin status on the span") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.pinned_mv", "refresh")
+        span.recordTimeTravelPinStatus(TimeTravelPinStatus.Applied)
+        span.complete("refreshed", "driver-pin")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.get("time_travel_pin_status").asText() shouldBe "APPLIED"
+    }
+
+    it("omits time_travel_pin_status when nothing recorded it") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.unrecorded_mv", "refresh")
+        span.complete("refreshed", "driver-pin")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.has("time_travel_pin_status") shouldBe false
+    }
+
+    it("keeps a refused pin status sticky and ignores unknown values") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.refused_mv", "create")
+        span.recordTimeTravelPinStatus(TimeTravelPinStatus.CompileFailed)
+        span.recordTimeTravelPinStatus(TimeTravelPinStatus.NotApplicable)
+        span.recordTimeTravelPinStatus("SOMETHING_ELSE")
+        span.recordTimeTravelPinStatus(null)
+        span.complete("created", "driver-pin")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.get("time_travel_pin_status").asText() shouldBe "COMPILE_FAILED"
+    }
+
+    it("records the pin status on the active span for the current thread") {
+      val payloads = withLogCapture { appender =>
+        OpenIvmExecutionSpan.start("default.active_pin_mv", "create")
+        OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(TimeTravelPinStatus.NotApplicable)
+        OpenIvmExecutionSpan.finishActive("created", "driver-active")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.get("time_travel_pin_status").asText() shouldBe "NOT_APPLICABLE"
     }
 
     it("reuses the same command span and does not re-emit for late async backup timing") {

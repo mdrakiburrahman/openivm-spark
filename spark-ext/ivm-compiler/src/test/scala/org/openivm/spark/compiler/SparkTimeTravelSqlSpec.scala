@@ -543,6 +543,51 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
     }
   }
 
+  describe("pinStatus / pinIdentity") {
+    it("reports APPLIED with a stable identity for a resolved pin") {
+      val sql = "SELECT id FROM arc_sql_db_bi.billing_meter_dim VERSION AS OF 366"
+      SparkTimeTravelSql.pinStatus(sql, Seq("arc_sql_db_bi.billing_meter_dim")) shouldBe "APPLIED"
+      SparkTimeTravelSql.pinIdentity(sql, Seq("arc_sql_db_bi.billing_meter_dim")) shouldBe
+        Seq("arc_sql_db_bi.billing_meter_dim=VERSION AS OF 366")
+    }
+
+    it("reports APPLIED through a dbt-style alias and keeps the user's clause case") {
+      val sql = "select p.id from `db`.`dim` version as of 2 as p"
+      SparkTimeTravelSql.pinStatus(sql, Seq("db.dim")) shouldBe "APPLIED"
+      SparkTimeTravelSql.pinIdentity(sql, Seq("db.dim")) shouldBe Seq("db.dim=version as of 2")
+    }
+
+    it("sorts a multi-source identity on the rendered entry") {
+      val sql =
+        "SELECT c.id FROM db.customer VERSION AS OF 3 c JOIN db.customer_address VERSION AS OF 7 a ON a.id = c.id"
+      SparkTimeTravelSql.pinIdentity(sql, Seq("db.customer_address", "db.customer")) shouldBe
+        Seq("db.customer=VERSION AS OF 3", "db.customer_address=VERSION AS OF 7")
+      SparkTimeTravelSql.pinStatus(sql, Seq("db.customer_address", "db.customer")) shouldBe "APPLIED"
+    }
+
+    it("reports NOT_APPLICABLE for an unpinned body") {
+      SparkTimeTravelSql.pinStatus("SELECT id FROM src", Seq("default.src")) shouldBe "NOT_APPLICABLE"
+      SparkTimeTravelSql.pinIdentity("SELECT id FROM src", Seq("default.src")) shouldBe empty
+    }
+
+    it("reports COMPILE_FAILED for a source read at two versions") {
+      val sql = "SELECT a.id FROM src VERSION AS OF 1 a JOIN src VERSION AS OF 2 b ON a.id = b.id"
+      SparkTimeTravelSql.pinStatus(sql, Seq("default.src")) shouldBe "COMPILE_FAILED"
+      SparkTimeTravelSql.pinIdentity(sql, Seq("default.src")) shouldBe empty
+    }
+
+    it("reports COMPILE_FAILED for a moving pin value") {
+      val sql = "SELECT id FROM src TIMESTAMP AS OF current_timestamp()"
+      SparkTimeTravelSql.pinStatus(sql, Seq("default.src")) shouldBe "COMPILE_FAILED"
+    }
+
+    it("reports COMPILE_FAILED for a pin that binds to no tracked source") {
+      val sql = "SELECT id FROM other_db.src VERSION AS OF 9"
+      SparkTimeTravelSql.pinStatus(sql, Seq("default.src")) shouldBe "COMPILE_FAILED"
+      SparkTimeTravelSql.pinIdentity(sql, Seq("default.src")) shouldBe empty
+    }
+  }
+
   describe("identifierSegments") {
     it("unquotes and lower-cases every segment") {
       SparkTimeTravelSql.identifierSegments("`Db`.`My Table`") shouldBe Seq("db", "my table")
