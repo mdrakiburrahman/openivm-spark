@@ -2513,23 +2513,41 @@ case class RefreshMaterializedViewCommand(
               meta.refreshType == RefreshTypeCode.WindowPartition
             ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
             else None
-          lazy val windowSinglePassReplaceSql: Option[String] =
-            if (
-              FeatureGate.windowSinglePassReplaceEnabled(spark) &&
+          val windowSinglePassReplaceEligible =
+            FeatureGate.windowSinglePassReplaceEnabled(spark) &&
               meta.refreshType == RefreshTypeCode.WindowPartition &&
               !windowSuffixSafe &&
               boundedRankInsertSql.isEmpty
-            )
-              buildWindowSinglePassReplaceSql(
+          var windowSinglePassReplacePlanned = false
+          var windowSinglePassReplaceSql     = Option.empty[String]
+
+          rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
+            val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+            val isWindowPartitionDelete =
+              (windowSinglePassReplaceEligible || windowSuffixSafe) &&
+                isWindowPartitionDeleteSql(sql, mergeTargetId)
+            if (
+              windowSinglePassReplaceEligible &&
+              !windowSinglePassReplacePlanned &&
+              isWindowPartitionDelete
+            ) {
+              // Current OpenIVM emits the delete source as a named affected-key
+              // view. Plan the replacement only after preceding statements have
+              // created that view; eager planning probes a missing relation.
+              windowSinglePassReplacePlanned = true
+              windowSinglePassReplaceSql = buildWindowSinglePassReplaceSql(
                 spark,
                 meta,
                 mergeTargetId,
                 rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
               )
-            else None
-
-          rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
-            val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+              if (
+                windowSinglePassReplaceSql.isDefined &&
+                FeatureGate.windowSnapshotCacheEnabled(spark)
+              ) {
+                executeSqlAt(s"CACHE TABLE `openivm_new_${mergeTargetId.table.replace("`", "``")}`", idx)
+              }
+            }
             val skipDeleteMerge =
               SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
             val skipWindowPartitionAux =
@@ -2546,13 +2564,9 @@ case class RefreshMaterializedViewCommand(
             val replaceWithBoundedRankInsert =
               boundedRankInsertSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
             val skipWindowSinglePassDelete =
-              windowSinglePassReplaceSql.isDefined && isWindowPartitionDeleteSql(sql, mergeTargetId)
+              windowSinglePassReplaceSql.isDefined && isWindowPartitionDelete
             val replaceWithWindowSinglePassInsert =
               windowSinglePassReplaceSql.isDefined && isWindowPartitionInsertSql(sql, mergeTargetId)
-            val cacheWindowSinglePassSnapshot =
-              windowSinglePassReplaceSql.isDefined &&
-                FeatureGate.windowSnapshotCacheEnabled(spark) &&
-                isWindowNewSnapshotCreateSql(sql, mergeTargetId)
 
             if (skipDeleteMerge) {
               logInfo(
@@ -2649,9 +2663,6 @@ case class RefreshMaterializedViewCommand(
                 }
               } else {
                 executeSqlAt(sql, idx)
-              }
-              if (cacheWindowSinglePassSnapshot) {
-                executeSqlAt(s"CACHE TABLE `openivm_new_${mergeTargetId.table.replace("`", "``")}`", idx)
               }
               // After any CTAS that wrote to the view-delta path, log a diagnostic
               // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8
@@ -3433,13 +3444,6 @@ case class RefreshMaterializedViewCommand(
     ((upper.startsWith("CREATE OR REPLACE TABLE DELTA.") || upper.startsWith("CREATE OR REPLACE TABLE DELTA.`")) &&
       upper.contains(s"FROM OPENIVM_OLD_$view") &&
       upper.contains(s"FROM OPENIVM_NEW_$view"))
-  }
-
-  private def isWindowNewSnapshotCreateSql(sql: String, targetId: TableIdentifier): Boolean = {
-    val upper = sql.trim.toUpperCase(java.util.Locale.ROOT)
-    upper.startsWith(
-      s"CREATE OR REPLACE TEMPORARY VIEW OPENIVM_NEW_${targetId.table.toUpperCase(java.util.Locale.ROOT)}"
-    )
   }
 
   private def isWindowPartitionDeleteSql(sql: String, targetId: TableIdentifier): Boolean = {
