@@ -701,7 +701,11 @@ and re-applied to everything Spark executes; see
 splitter recognises — an unrecognised shape is deliberately passed through
 unchanged so the failure stays loud. dbt bodies pin an ALIASED relation
 (`` from `db`.`model` version as of 366 as p ``); §7.1 covers that shape and the
-LPTS `66bf3ae` hold that goes with it.
+pin-bump policy that goes with it. A view that reads ONE source at two different
+versions (or pinned in one place and live in another) is refused by the bridge
+itself with `cause=View '<name>' pins a source to a Delta snapshot in a shape
+OpenIVM cannot maintain incrementally` — that demotion is deliberate and the
+rows stay correct, see §7.2.
 
 ### 5.2 Timeout and stderr caveat
 

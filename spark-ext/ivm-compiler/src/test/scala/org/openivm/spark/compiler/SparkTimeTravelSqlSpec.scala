@@ -283,6 +283,64 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("hasUnsupportedSnapshotPin") {
+    // OpenIVM re-applies a pin per SOURCE. Shapes it cannot honor were, until
+    // now, caught by accident: the un-split body still carried `VERSION AS OF`,
+    // so DuckDB's parser aborted the compile. An LPTS front-end that accepts
+    // Spark's `temporalClause` (the alias fix at `dbac36d`, which also covers
+    // two-version reads) removes that accident, so the bridge has to recognise
+    // them itself.
+    it("is true for a source read at two different versions") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(
+        "SELECT a.id FROM src VERSION AS OF 2 a JOIN src VERSION AS OF 5 b ON a.id = b.id"
+      ) shouldBe true
+    }
+
+    it("is true for an aliased dbt-shaped source read at two different versions") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(
+        "select a.id from `cat`.`sch`.`dim` version as of 2 as a " +
+          "inner join `cat`.`sch`.`dim` version as of 5 as b on a.id = b.id"
+      ) shouldBe true
+    }
+
+    it("is true for a source that is pinned in one place and read live in another") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(
+        "SELECT a.id FROM src VERSION AS OF 2 a JOIN src b ON a.id = b.id"
+      ) shouldBe true
+    }
+
+    it("is true when a CTE shadows the pinned source name") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(
+        "WITH src AS (SELECT 1 AS id) SELECT s.id FROM db.src VERSION AS OF 2 s JOIN src c ON s.id = c.id"
+      ) shouldBe true
+    }
+
+    it("is false for every shape the splitter handles") {
+      Seq(
+        "SELECT id FROM src VERSION AS OF 3",
+        "SELECT p.id FROM db.dim VERSION AS OF 2 AS p",
+        "select p.grp from `cat`.`sch`.`dim` version as of 2 as p",
+        "SELECT a.id FROM src VERSION AS OF 2 a JOIN src VERSION AS OF 2 b ON a.id = b.id",
+        "SELECT d.region FROM dim VERSION AS OF 2 d JOIN fact f ON f.dim_id = d.id",
+        "SELECT id FROM src TIMESTAMP AS OF '2024-01-01'"
+      ).foreach { sql =>
+        withClue(s"$sql: ") { SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe false }
+      }
+    }
+
+    it("is false for text that only mentions a temporal clause") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin("SELECT id FROM src WHERE n = 'VERSION AS OF 3'") shouldBe false
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin("SELECT id -- VERSION AS OF 3\nFROM src") shouldBe false
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin("SELECT version AS of FROM src") shouldBe false
+    }
+
+    it("is false for an unpinned body and for SQL that does not parse") {
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin("SELECT id FROM src") shouldBe false
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin("SELECT id FROM src VERSION AS OF") shouldBe false
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(null) shouldBe false
+    }
+  }
+
   describe("stripSnapshotPins") {
     it("is idempotent") {
       val once  = SparkTimeTravelSql.stripSnapshotPins("SELECT id FROM src VERSION AS OF 3")

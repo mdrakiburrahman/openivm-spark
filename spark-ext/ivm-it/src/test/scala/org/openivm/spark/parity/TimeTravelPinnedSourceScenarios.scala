@@ -268,4 +268,48 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       spark.table("ttp_dbt_mv_join").where("amount = 999").count() shouldBe 0L
     }
   }
+
+  // ── §6: Pin shapes OpenIVM refuses to maintain incrementally ──────────────
+
+  /** OpenIVM re-applies a pin per SOURCE, so a source read at two different
+    * versions (or pinned in one place and live in another) has no single
+    * version to freeze at. Those bodies used to be stopped by DuckDB's parser
+    * choking on `VERSION AS OF`; an LPTS front-end that accepts Spark's
+    * `temporalClause` — the alias fix at `dbac36d` also covers two-version
+    * reads — would let them compile with no pin registered and silently
+    * maintain a frozen relation from live rows.
+    *
+    * The compile bridge refuses them itself, so the demotion is a deliberate,
+    * loud FULL_REFRESH rather than an accident of the downstream parser, and
+    * the rows stay correct because FULL_REFRESH re-executes the pinned body
+    * verbatim — pins included.
+    */
+  describe("(TTP-6) A source read at two different versions") {
+    it("is demoted to FULL_REFRESH deliberately and still returns correct rows") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_tv_src(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_tv_src VALUES (1, 'a', 10), (2, 'b', 20)")
+      val vThen = latestVersion("ttp_tv_src")
+      sql("INSERT INTO ttp_tv_src VALUES (3, 'c', 30)")
+      val vNow = latestVersion("ttp_tv_src")
+
+      val body =
+        s"""select a.id, a.val as val_then, b.val as val_now
+           |from ttp_tv_src version as of $vThen as a
+           |inner join ttp_tv_src version as of $vNow as b on a.id = b.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_mv_two_versions AS $body")
+
+      val meta = mvMeta("ttp_mv_two_versions")
+      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
+      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+      assertMvCorrect("ttp_mv_two_versions", body)
+      spark.table("ttp_mv_two_versions").count() shouldBe 2L
+
+      // Spark honors both pins on every full refresh, so post-pin DML never
+      // reaches the view.
+      sql("INSERT INTO ttp_tv_src VALUES (4, 'd', 40)")
+      refreshMv("ttp_mv_two_versions")
+      assertMvCorrect("ttp_mv_two_versions", body)
+      spark.table("ttp_mv_two_versions").count() shouldBe 2L
+    }
+  }
 }

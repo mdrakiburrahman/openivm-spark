@@ -137,15 +137,44 @@ object SparkTimeTravelSql {
   def hasSnapshotPin(sql: String): Boolean =
     sql != null && sql.nonEmpty && TemporalClauseGuard.findFirstIn(sql).isDefined && split(sql).pins.nonEmpty
 
+  /** True when `sql` pins a source to a snapshot in a shape [[split]] refuses
+    * to lift out — the same source read at two different versions, or pinned in
+    * one place and read live in another (including through a CTE that shadows
+    * the pinned name).
+    *
+    * OpenIVM re-applies a pin per SOURCE, so it cannot honor those shapes:
+    * whichever single clause it picked would freeze or unfreeze the other read.
+    * Historically DuckDB's parser caught them for us — the un-split body still
+    * carried `VERSION AS OF`, so the compile aborted and the view fell back to
+    * FULL_REFRESH, which re-executes the user's pinned body verbatim and is
+    * therefore correct.
+    *
+    * An LPTS front-end that ACCEPTS Spark's `temporalClause` removes that
+    * accident: the compile would succeed, no pin would be registered, and the
+    * incremental program would silently read live rows for a frozen relation.
+    * The compile bridge refuses these bodies itself so the fallback does not
+    * depend on a downstream parser rejecting them.
+    *
+    * Bodies `CatalystSqlParser` cannot parse are NOT refused here: without a
+    * parse there is no evidence of a real pin, so they are passed through and
+    * DuckDB decides, exactly as before.
+    */
+  def hasUnsupportedSnapshotPin(sql: String): Boolean =
+    sql != null && sql.nonEmpty &&
+      TemporalClauseGuard.findFirstIn(sql).isDefined &&
+      split(sql).pins.isEmpty &&
+      parsePlan(sql).exists(plan => timeTravelCount(plan) > 0)
+
   /** Split every snapshot pin out of `sql`.
     *
     * Returns `Split(sql, Nil)` unchanged when there is no pin, when the scanner
     * cannot recognise the clause shape, when the same source is read at more
     * than one version (or both pinned and live), or when the parser cross-check
-    * rejects the rewrite. In every one of those cases the pin reaches DuckDB and
-    * the compile fails exactly as it does today — a loud `COMPILE_FAILED ->
-    * FULL_REFRESH` is correct, whereas re-applying one clause to every read of
-    * that source would silently produce wrong rows.
+    * rejects the rewrite. Those bodies are reported by
+    * [[hasUnsupportedSnapshotPin]] and refused by the compile bridge, because
+    * re-applying one clause to every read of that source would silently produce
+    * wrong rows; `COMPILE_FAILED -> FULL_REFRESH` re-executes the pinned body
+    * verbatim and stays correct.
     */
   def split(sql: String): Split = {
     if (sql == null || sql.isEmpty) return Split(sql, Nil)

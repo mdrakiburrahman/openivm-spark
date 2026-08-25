@@ -473,6 +473,51 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     """(?i)\bAS\s+p\s+VERSION\s+AS\s+OF""".r.findFirstIn(result.initialLoadSql) shouldBe None
   }
 
+  // ── Test 7e: Pin shapes OpenIVM refuses itself ────────────────────────────
+  //
+  // OpenIVM re-applies a pin per SOURCE, so it cannot maintain a source read at
+  // two versions, or pinned in one place and live in another. Those bodies used
+  // to be stopped by DuckDB's parser choking on `VERSION AS OF`; an LPTS
+  // front-end that accepts Spark's `temporalClause` would let them through with
+  // no pin registered, silently maintaining a frozen relation from live rows.
+  // The bridge refuses them itself, so the FULL_REFRESH fallback (which
+  // re-executes the pinned body verbatim) does not depend on a downstream parser.
+
+  it should "refuse a view that reads one source at two different versions" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_two_versions",
+      viewSql = "SELECT a.region, b.region AS region_then FROM tpcdi.sales VERSION AS OF 2 a " +
+        "JOIN tpcdi.sales VERSION AS OF 5 b ON a.region = b.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val thrown = the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req)
+    thrown.getMessage should include("mv_pinned_two_versions")
+    thrown.getMessage should include("two different versions")
+  }
+
+  it should "refuse a view that reads a source both pinned and live" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_and_live",
+      viewSql = "SELECT a.region FROM tpcdi.sales VERSION AS OF 2 a JOIN tpcdi.sales b ON a.region = b.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req)
+  }
+
+  it should "still compile a source pinned twice at the SAME version" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_same_version",
+      viewSql = "SELECT a.region FROM tpcdi.sales VERSION AS OF 2 a " +
+        "JOIN tpcdi.sales VERSION AS OF 2 b ON a.region = b.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+  }
+
   it should "emit RELY FK declarations for qualified compile facts when opted in" in {
     val req = CompileRequest(
       viewName = "mv_relyfk_script",

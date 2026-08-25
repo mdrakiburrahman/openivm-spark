@@ -466,13 +466,40 @@ split removes it and leaves `` from `analytics`.`billing_meter_dim` as p `` —
 and every Spark-side re-application inserts the clause immediately after the
 relation identifier, ahead of the alias.
 
-> **Dependency hold.** Do not pin `spark-ext/dev/pins.env` to LPTS `66bf3ae`
-> for this work. `LPTS_COMMIT` stays at `b3baf0bb`; the fix here needs no LPTS
-> change. The aliased-pin defect is tracked downstream by the
-> `split — aliased dbt-style relations` cases in `SparkTimeTravelSqlSpec`, test
-> 7d of `OpenIvmCompilerSpec` (compiled against a live DuckDB), the pin-ordering
-> cases in `SparkRefreshRewriterSpec`, and `(TTP-5)` in
+> **Pin bump policy.** `LPTS_COMMIT` stays at `b3baf0bb`; this work needs no
+> LPTS change. `66bf3ae` is not acceptable (aliased-pin defect above). The
+> alias + two-version fix on top of it is `dbac36d`, which is still a local
+> head and not fetchable from the remote, so it cannot be pinned yet — bump to
+> `dbac36d` or later once it is pushed. The coverage below is deliberately
+> pin-independent, so it doubles as the acceptance gate for that bump:
+> `split — aliased dbt-style relations` in `SparkTimeTravelSqlSpec`, tests 7d/7e
+> of `OpenIvmCompilerSpec` (compiled against a live DuckDB), the pin-ordering
+> cases in `SparkRefreshRewriterSpec`, and `(TTP-5)`/`(TTP-6)` in
 > `TimeTravelPinnedSourceScenarios`.
+
+### 7.2 Pin shapes OpenIVM refuses
+
+The pin is re-applied per SOURCE, so two shapes have no single version to
+freeze at:
+
+| shape                                             | example                                          |
+| ------------------------------------------------- | ------------------------------------------------ |
+| one source read at two different versions          | `t VERSION AS OF 2 a JOIN t VERSION AS OF 5 b`    |
+| one source pinned in one place and live in another | `t VERSION AS OF 2 a JOIN t b`                    |
+
+`split` returns the body unchanged for those, and
+`SparkTimeTravelSql.hasUnsupportedSnapshotPin` reports them so `compile()`
+rejects the body itself with an explicit message.
+
+That refusal is not redundant.
+Until now these bodies were stopped by accident: the un-split SQL still carried
+`VERSION AS OF`, so DuckDB's parser aborted the compile.
+An LPTS front-end that ACCEPTS Spark's `temporalClause` removes the accident —
+the compile would succeed, no pin would be registered, and the incremental
+program would maintain a frozen relation from live rows.
+Refusing in the bridge keeps the outcome loud and correct: `COMPILE_FAILED` →
+`FULL_REFRESH` re-executes `MvMetadata.querySql`, which still carries both pins,
+so Spark honors them on every refresh.
 
 ## 8. Process model and timeout behavior
 

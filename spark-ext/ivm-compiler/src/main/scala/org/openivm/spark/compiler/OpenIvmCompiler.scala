@@ -90,6 +90,20 @@ class OpenIvmCompiler private (
     // re-applied to every openivm-emitted source read (initial load here,
     // refresh program in `SparkRefreshRewriter`), and `MvMetadata.querySql`
     // keeps the user's pinned SQL verbatim.
+    //
+    // A pin OpenIVM cannot honor per-source is refused HERE rather than left to
+    // the downstream parser: an LPTS build that accepts Spark's `temporalClause`
+    // would otherwise compile the body, register no pin, and silently maintain a
+    // frozen relation from live rows. FULL_REFRESH re-executes the pinned body
+    // verbatim, so the fallback stays correct.
+    if (SparkTimeTravelSql.hasUnsupportedSnapshotPin(req.viewSql)) {
+      throw new OpenIvmCompileException(
+        s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
+          "incrementally: a source is read at two different versions, or pinned in one place and read " +
+          "live in another. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
+        null
+      )
+    }
     val depinnedViewSql = SparkTimeTravelSql.stripSnapshotPins(req.viewSql)
     val normalizedViewSql =
       normalizeSparkSqlForDuckdb(
