@@ -2111,9 +2111,19 @@ case class RefreshMaterializedViewCommand(
       // `meta.querySql` is the user's SQL verbatim, so the pins are recomputed
       // here rather than persisted as extra metadata.
       val snapshotPinsByQualified: Map[String, String] =
-        if (SparkTimeTravelSql.hasSnapshotPin(meta.querySql))
+        if (SparkTimeTravelSql.hasSnapshotPin(meta.querySql)) {
+          // Fail closed: a pin that does not bind to exactly one tracked source
+          // would leave that relation maintained from live rows while the user
+          // believes it is frozen.  Refuse the refresh instead.
+          val unresolved = SparkTimeTravelSql.unresolvedPins(meta.querySql, meta.sourceTables)
+          if (unresolved.nonEmpty) {
+            throw new IllegalStateException(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot maintain snapshot-pinned sources: " +
+                s"${unresolved.mkString("; ")}. Recreate the view with pins that name tracked sources."
+            )
+          }
           SparkTimeTravelSql.pinsByQualifiedSource(meta.querySql, meta.sourceTables)
-        else Map.empty
+        } else Map.empty
       val frozenSources: Set[String] = snapshotPinsByQualified.keySet.map(_.toLowerCase)
 
       // Phase D: memoize MvCatalog.list within this refresh.  The catalog is

@@ -2126,6 +2126,62 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stmt should include("FROM `db`.`accounts` VERSION AS OF 366 AS p")
       stmt should not include "AS p VERSION AS OF"
     }
+
+    // `customer` is a strict prefix of `customer_address`: an unbounded
+    // `sql.replace("memory.main.customer", …)` rewrites the FIRST source's name
+    // inside the SECOND one, injecting the clause mid-identifier
+    // (`customer VERSION AS OF 3_address`) or consuming the longer name so its
+    // own pin never lands.  Both directions must stay bounded.
+    val prefixCollisionSource = """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM memory.main.customer c
+        |),
+        |t1_scan (t1_id, t1_city) AS (
+        |  SELECT `id`, `city` FROM memory.main.customer_address AS ca
+        |),
+        |t2_delta (t2_id, t2_mul) AS (
+        |  SELECT `id`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+        |),
+        |t3_join (t3_id, t3_mul) AS (
+        |  SELECT t0_id, t2_mul FROM t0_scan INNER JOIN t1_scan ON t0_id = t1_id
+        |    INNER JOIN t2_delta ON t0_id = t2_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t3_join""".stripMargin
+
+    it("pins only the shorter prefix-colliding source") {
+      val stmt = rewriteWithPins(prefixCollisionSource, Map("customer" -> "VERSION AS OF 3")).statements.head
+      stmt should include("FROM `customer` VERSION AS OF 3 c")
+      stmt should include("FROM `customer_address` AS ca")
+      stmt should not include "customer VERSION AS OF 3_address"
+      stmt should not include "`customer_address` VERSION AS OF"
+    }
+
+    it("pins only the longer prefix-colliding source") {
+      val stmt = rewriteWithPins(prefixCollisionSource, Map("customer_address" -> "VERSION AS OF 9")).statements.head
+      stmt should include("FROM `customer_address` VERSION AS OF 9 AS ca")
+      stmt should include("FROM `customer` c")
+      stmt should not include "FROM `customer` VERSION AS OF"
+    }
+
+    it("pins both prefix-colliding sources at their own versions") {
+      val stmt = rewriteWithPins(
+        prefixCollisionSource,
+        pins = Map("customer" -> "VERSION AS OF 3", "customer_address" -> "VERSION AS OF 9"),
+        qualified = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+      ).statements.head
+      stmt should include("FROM `db`.`customer` VERSION AS OF 3 c")
+      stmt should include("FROM `db`.`customer_address` VERSION AS OF 9 AS ca")
+    }
+
+    it("qualifies both prefix-colliding sources when neither is pinned") {
+      val stmt = rewriteWithPins(
+        prefixCollisionSource,
+        pins = Map.empty,
+        qualified = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+      ).statements.head
+      stmt should include("FROM `db`.`customer` c")
+      stmt should include("FROM `db`.`customer_address` AS ca")
+    }
   }
 
   describe("deduplicateCteColumnAliases") {

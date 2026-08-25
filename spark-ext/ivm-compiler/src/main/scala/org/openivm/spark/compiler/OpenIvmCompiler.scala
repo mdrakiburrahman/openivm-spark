@@ -6,7 +6,7 @@ import java.util.{Comparator, Locale}
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
@@ -73,6 +73,31 @@ class OpenIvmCompiler private (
     */
   def compile(req: CompileRequest): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
+
+    // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
+    // DuckDB cannot parse and the bridge's row-less compile tables cannot
+    // model, so the pin is split out of the COMPILE COPY only. The pin is
+    // re-applied to every openivm-emitted source read (initial load below,
+    // refresh program in `SparkRefreshRewriter`), and `MvMetadata.querySql`
+    // keeps the user's pinned SQL verbatim.
+    //
+    // A pin OpenIVM cannot honor per-source is refused HERE rather than left to
+    // the downstream parser: an LPTS build that accepts Spark's `temporalClause`
+    // would otherwise compile the body, register no pin, and silently maintain a
+    // frozen relation from live rows. FULL_REFRESH re-executes the pinned body
+    // verbatim, so the fallback stays correct.
+    //
+    // The refusal runs BEFORE any metric bookkeeping: no compile is started, so
+    // the inflight gauge must not move (its decrement lives in the `finally`
+    // below, which an early throw would skip).
+    SparkTimeTravelSql.unsupportedSnapshotPinReason(req.viewSql, trackedSourceNames(req)).foreach { reason =>
+      throw new OpenIvmCompileException(
+        s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
+          s"incrementally: $reason. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
+        null
+      )
+    }
+
     OpenIvmMetrics.increment("compiler.compile.count")
     OpenIvmMetrics.CompilerInflight.incrementAndGet()
     val compileStarted = System.nanoTime()
@@ -83,26 +108,6 @@ class OpenIvmCompiler private (
     val tableDdls: Seq[(String, String)] = req.sources.toSeq.map { case (name, schema) =>
       val cols = schema.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       name -> s"CREATE TABLE $name ($cols)"
-    }
-    // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
-    // DuckDB cannot parse and the bridge's row-less compile tables cannot
-    // model, so the pin is split out of the COMPILE COPY only. The pin is
-    // re-applied to every openivm-emitted source read (initial load here,
-    // refresh program in `SparkRefreshRewriter`), and `MvMetadata.querySql`
-    // keeps the user's pinned SQL verbatim.
-    //
-    // A pin OpenIVM cannot honor per-source is refused HERE rather than left to
-    // the downstream parser: an LPTS build that accepts Spark's `temporalClause`
-    // would otherwise compile the body, register no pin, and silently maintain a
-    // frozen relation from live rows. FULL_REFRESH re-executes the pinned body
-    // verbatim, so the fallback stays correct.
-    if (SparkTimeTravelSql.hasUnsupportedSnapshotPin(req.viewSql)) {
-      throw new OpenIvmCompileException(
-        s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
-          "incrementally: a source is read at two different versions, or pinned in one place and read " +
-          "live in another. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
-        null
-      )
     }
     val depinnedViewSql = SparkTimeTravelSql.stripSnapshotPins(req.viewSql)
     val normalizedViewSql =
@@ -564,14 +569,28 @@ class OpenIvmCompiler private (
     // in a FROM position, where Spark's `temporalClause` is grammatical.
     val pinBySource: Map[String, String] =
       SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName -> pin.clause).toMap
-    for (short <- req.sourceQualifiedNames.keySet ++ pinBySource.keySet) {
-      val qualified = req.sourceQualifiedNames.getOrElse(short, short)
-      val pin       = pinBySource.get(short.toLowerCase(Locale.ROOT)).map(clause => s" $clause").getOrElse("")
-      if (qualified != short || pin.nonEmpty) sql = sql.replace(s"memory.main.$short", s"$qualified$pin")
+    val qualifiedByShort: Map[String, String] =
+      req.sourceQualifiedNames.map { case (short, qualified) => short.toLowerCase(Locale.ROOT) -> qualified }
+    // One identifier-bounded pass, NOT a `sql.replace("memory.main.<short>", …)`
+    // loop over a name set: with sources `customer` and `customer_address` the
+    // loop either injects the shorter name's pin into the middle of the longer
+    // identifier or rewrites its prefix first, so the longer name's own pin is
+    // never re-attached and its CTAS silently loads live rows. See
+    // `MemoryMainRefs`, which the refresh rewriter shares.
+    sql = MemoryMainRefs.rewrite(sql) { short =>
+      val key       = short.toLowerCase(Locale.ROOT)
+      val qualified = qualifiedByShort.getOrElse(key, short)
+      pinBySource.get(key).fold(qualified)(clause => s"$qualified $clause")
     }
-    sql = sql.replaceAll("memory\\.main\\.", "")
     LptsSparkDialect.translate(sql)
   }
+
+  /** Fully-qualified name of every source the request tracks, the key space a
+    * snapshot pin has to resolve against.
+    */
+  private def trackedSourceNames(req: CompileRequest): Seq[String] =
+    (req.sources.keySet ++ req.sourceQualifiedNames.keySet).toSeq
+      .map(short => req.sourceQualifiedNames.getOrElse(short, short))
 
   /** Parses a single `-jsonlines` row of the form
     * `{"refresh_type":N,"refresh_type_name":"...","sql":"..."}`.

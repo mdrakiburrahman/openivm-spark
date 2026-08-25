@@ -4,7 +4,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common._
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, LptsSparkDialect, OpenIvmCompileException}
+import org.openivm.spark.compiler.{
+  CompiledRefresh,
+  CompileRequest,
+  LptsSparkDialect,
+  OpenIvmCompileException,
+  SparkTimeTravelSql
+}
 
 /**
  * Session-scoped "cold DAG" registry for dry-run materialized views.
@@ -213,6 +219,13 @@ object MvDryCompile {
             qual.split("\\.").last -> schema.fieldNames.toSeq
           },
           sourceQualifiedNames = shortToQual,
+          // Diagnostics must mirror execution: REFRESH re-applies the user's
+          // snapshot pins to openivm's live-source reads, so the dry program
+          // has to show them too.
+          sourceSnapshotPins =
+            if (SparkTimeTravelSql.hasSnapshotPin(queryText))
+              SparkTimeTravelSql.pinsByShortSource(queryText, qualSchemas.keySet.toSeq ++ shortToQual.values.toSeq)
+            else Map.empty,
           semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
           fkTermPruneEnabled = FeatureGate.fkTermPruneEnabled(spark),
           uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark),

@@ -1992,31 +1992,27 @@ object SparkRefreshRewriter {
     * be expanded to `<db>.<table>` when the user's view body referenced a
     * Hive-qualified table — otherwise Spark resolves `<short>` against the
     * session's current_schema (typically `default`) and fails to find it.
+    *
+    * Matching is delegated to [[MemoryMainRefs]] so this and the compiler's
+    * initial-load reattach share one identifier-bounded pass — see there for
+    * why a per-name `String.replace` loop is unsafe.
     */
   private[common] def rewriteMemoryMainPrefix(sql: String): String = {
     val qualifiedMap = activeQualifiedNames.get()
     val pinMap       = activeSnapshotPins.get()
-    val re =
-      """(?i)(?:`?memory`?\s*+\.\s*+`?main`?\s*+\.\s*+`?([A-Za-z0-9_]++)`?)""".r
-    re.replaceAllIn(
-      sql,
-      m => {
-        val short = m.group(1)
-        val relation = qualifiedMap.get(short) match {
-          case Some(qual) if qual.contains(".") =>
-            val parts = qual.split("\\.")
-            // Wrap each segment in backticks so Spark resolves the table
-            // against the specific database in the qualified name, not the
-            // current session schema. `quoteReplacement` keeps regex meta-
-            // characters (`$`, `\\`) in identifier strings inert.
-            parts.map(p => s"`$p`").mkString(".")
-          case _ =>
-            s"`$short`"
-        }
-        val pinned = snapshotPinFor(short, pinMap).fold(relation)(clause => s"$relation $clause")
-        java.util.regex.Matcher.quoteReplacement(pinned)
+    MemoryMainRefs.rewrite(sql) { short =>
+      val relation = qualifiedMap.get(short) match {
+        case Some(qual) if qual.contains(".") =>
+          val parts = qual.split("\\.")
+          // Wrap each segment in backticks so Spark resolves the table
+          // against the specific database in the qualified name, not the
+          // current session schema.
+          parts.map(p => s"`$p`").mkString(".")
+        case _ =>
+          s"`$short`"
       }
-    )
+      snapshotPinFor(short, pinMap).fold(relation)(clause => s"$relation $clause")
+    }
   }
 
   /** Case-insensitive lookup of the snapshot pin registered for a short source

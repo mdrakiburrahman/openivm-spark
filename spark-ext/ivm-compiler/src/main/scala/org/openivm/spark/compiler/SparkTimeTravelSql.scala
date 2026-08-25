@@ -3,6 +3,7 @@ package org.openivm.spark.compiler
 import java.util.Locale
 
 import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 
@@ -44,13 +45,19 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
   * ## Correctness of the split
   *
   * The clause is located with a Spark-dialect, quote/comment-aware scanner —
-  * this object deliberately does NOT re-implement a SQL parser. Every split is
-  * then VERIFIED against Spark's own parser ([[CatalystSqlParser]]):
+  * this object deliberately does NOT re-implement a SQL parser. Spark's own
+  * parser ([[CatalystSqlParser]]) is the AUTHORITY on what was pinned; the
+  * scanner only supplies the text surgery. Every split must satisfy:
   *
   *   1. the de-pinned SQL must parse,
   *   2. it must contain no remaining `RelationTimeTravel` node,
   *   3. its multiset of relation identifiers must be identical to the original's
-  *      (source-table identity is preserved — nothing is renamed or dropped).
+  *      (source-table identity is preserved — nothing is renamed or dropped),
+  *   4. the lifted pins must correspond ONE FOR ONE to the original's
+  *      `RelationTimeTravel` nodes: same relation identifiers, same frozen
+  *      values, same count. A pin the scanner bound to the wrong token (a word
+  *      inside a comment, say) or a pin the scanner failed to see therefore
+  *      fails the split instead of silently resolving to no source.
   *
   * If any check fails the ORIGINAL SQL is returned unchanged, so the compile
   * bridge fails loudly exactly as it does today rather than silently compiling
@@ -76,12 +83,38 @@ object SparkTimeTravelSql {
     */
   final case class Split(sql: String, pins: Seq[SnapshotPin])
 
+  /** A pin as the scanner lifted it, plus the parsed clause KIND and VALUE.
+    * Those two are what binds the pin to the `RelationTimeTravel` node Spark's
+    * parser produced for the same relation — the clause TEXT is user-facing and
+    * deliberately not normalised beyond comment/whitespace cleanup.
+    */
+  private final case class PinnedRef(pin: SnapshotPin, kind: String, value: String) {
+    def identity: String = identityKey(pin.segments, kind, value)
+  }
+
+  private final case class Scanned(sql: String, refs: Seq[PinnedRef])
+
+  /** A temporal clause as located in the source text. */
+  private final case class ParsedClause(end: Int, text: String, kind: String, value: String)
+
+  private val VersionKind   = "version"
+  private val TimestampKind = "timestamp"
+
+  /** Relation + frozen value, the identity a lifted pin and a parsed
+    * `RelationTimeTravel` node must agree on.
+    */
+  private def identityKey(segments: Seq[String], kind: String, value: String): String =
+    s"${segments.mkString(".")}@$kind:$value"
+
   /** Cheap pre-filter so the scanner + parser round-trip only runs for bodies
     * that plausibly contain a temporal clause. Matches inside string literals
-    * too — that is fine, it only gates the precise pass below.
+    * too — that is fine, it only gates the precise pass below. Comments count
+    * as trivia between the keywords, exactly as they do for Spark's lexer.
     */
+  private val Trivia = """(?:\s|--[^\n\r]*+|/\*(?:[^*]|\*(?!/))*+\*/)"""
+
   private val TemporalClauseGuard =
-    """(?i)\b(?:SYSTEM_VERSION|VERSION|SYSTEM_TIME|TIMESTAMP)\s+AS\s+OF\b""".r
+    s"""(?i)\\b(?:SYSTEM_VERSION|VERSION|SYSTEM_TIME|TIMESTAMP)$Trivia++AS$Trivia++OF\\b""".r
 
   private val VersionKeywords   = Seq("SYSTEM_VERSION", "VERSION")
   private val TimestampKeywords = Seq("SYSTEM_TIME", "TIMESTAMP")
@@ -137,33 +170,61 @@ object SparkTimeTravelSql {
   def hasSnapshotPin(sql: String): Boolean =
     sql != null && sql.nonEmpty && TemporalClauseGuard.findFirstIn(sql).isDefined && split(sql).pins.nonEmpty
 
-  /** True when `sql` pins a source to a snapshot in a shape [[split]] refuses
-    * to lift out — the same source read at two different versions, or pinned in
-    * one place and read live in another (including through a CTE that shadows
-    * the pinned name).
+  /** True when `sql` pins a source to a snapshot in a shape the bridge refuses
+    * to lift out. See [[unsupportedSnapshotPinReason]], which also explains why
+    * this must not be left to a downstream parser.
+    */
+  def hasUnsupportedSnapshotPin(sql: String): Boolean = unsupportedSnapshotPinReason(sql, Nil).isDefined
+
+  /** Why `sql` carries a snapshot pin OpenIVM cannot maintain incrementally, or
+    * `None` when every pin (if any) is one it can honor.
     *
-    * OpenIVM re-applies a pin per SOURCE, so it cannot honor those shapes:
-    * whichever single clause it picked would freeze or unfreeze the other read.
-    * Historically DuckDB's parser caught them for us — the un-split body still
-    * carried `VERSION AS OF`, so the compile aborted and the view fell back to
-    * FULL_REFRESH, which re-executes the user's pinned body verbatim and is
-    * therefore correct.
+    * OpenIVM re-applies a pin per SOURCE, so it cannot honor:
     *
-    * An LPTS front-end that ACCEPTS Spark's `temporalClause` removes that
-    * accident: the compile would succeed, no pin would be registered, and the
-    * incremental program would silently read live rows for a frozen relation.
-    * The compile bridge refuses these bodies itself so the fallback does not
-    * depend on a downstream parser rejecting them.
+    *   - the same source read at two different versions, or pinned in one place
+    *     and read live in another (including through a CTE that shadows the
+    *     pinned name) — whichever single clause it picked would freeze or
+    *     unfreeze the other read;
+    *   - a MOVING pin value (`TIMESTAMP AS OF current_timestamp()`) — the
+    *     relation would be frozen at compile time and then maintained against a
+    *     different snapshot on every refresh;
+    *   - a pin the scanner and Spark's parser do not agree on;
+    *   - a pin that does not resolve to exactly one tracked source of the view
+    *     (`qualifiedSources`, empty to skip that check) — a pin that resolves to
+    *     none would silently maintain a frozen relation from live rows, and one
+    *     that resolves to several would freeze relations the user did not pin.
+    *
+    * Historically DuckDB's parser caught the un-liftable shapes for us — the
+    * un-split body still carried `VERSION AS OF`, so the compile aborted and the
+    * view fell back to FULL_REFRESH, which re-executes the user's pinned body
+    * verbatim and is therefore correct. An LPTS front-end that ACCEPTS Spark's
+    * `temporalClause` removes that accident: the compile would succeed, no pin
+    * would be registered, and the incremental program would silently read live
+    * rows for a frozen relation. The bridge refuses these bodies itself so the
+    * fallback does not depend on a downstream parser rejecting them.
     *
     * Bodies `CatalystSqlParser` cannot parse are NOT refused here: without a
     * parse there is no evidence of a real pin, so they are passed through and
     * DuckDB decides, exactly as before.
     */
-  def hasUnsupportedSnapshotPin(sql: String): Boolean =
-    sql != null && sql.nonEmpty &&
-      TemporalClauseGuard.findFirstIn(sql).isDefined &&
-      split(sql).pins.isEmpty &&
-      parsePlan(sql).exists(plan => timeTravelCount(plan) > 0)
+  def unsupportedSnapshotPinReason(sql: String, qualifiedSources: Seq[String]): Option[String] = {
+    if (sql == null || sql.isEmpty) return None
+    if (TemporalClauseGuard.findFirstIn(sql).isEmpty) return None
+    val pins = split(sql).pins
+    if (pins.isEmpty)
+      if (parsePlan(sql).exists(plan => timeTravelCount(plan) > 0))
+        Some(
+          "a source is read at two different versions, pinned in one place and read live in another, " +
+            "or pinned to a value that is not a stable literal"
+        )
+      else None
+    else if (qualifiedSources.isEmpty) None
+    else
+      unresolvedPins(pins, qualifiedSources).headOption.map { pin =>
+        s"the pin on '${pin.tableRef}' does not resolve to exactly one tracked source " +
+          s"(sources: ${qualifiedSources.distinct.sorted.mkString(", ")})"
+      }
+  }
 
   /** Split every snapshot pin out of `sql`.
     *
@@ -171,7 +232,7 @@ object SparkTimeTravelSql {
     * cannot recognise the clause shape, when the same source is read at more
     * than one version (or both pinned and live), or when the parser cross-check
     * rejects the rewrite. Those bodies are reported by
-    * [[hasUnsupportedSnapshotPin]] and refused by the compile bridge, because
+    * [[unsupportedSnapshotPinReason]] and refused by the compile bridge, because
     * re-applying one clause to every read of that source would silently produce
     * wrong rows; `COMPILE_FAILED -> FULL_REFRESH` re-executes the pinned body
     * verbatim and stays correct.
@@ -180,27 +241,35 @@ object SparkTimeTravelSql {
     if (sql == null || sql.isEmpty) return Split(sql, Nil)
     if (TemporalClauseGuard.findFirstIn(sql).isEmpty) return Split(sql, Nil)
     val scanned = scan(sql)
-    if (scanned.pins.isEmpty) return Split(sql, Nil)
-    if (!pinsAreUnambiguous(scanned.pins)) return Split(sql, Nil)
-    if (!verifiesAgainstSparkParser(sql, scanned.sql, scanned.pins)) Split(sql, Nil) else scanned
+    if (scanned.refs.isEmpty) return Split(sql, Nil)
+    if (!pinsAreUnambiguous(scanned.refs)) return Split(sql, Nil)
+    if (!verifiesAgainstSparkParser(sql, scanned.sql, scanned.refs)) Split(sql, Nil)
+    else Split(scanned.sql, scanned.refs.map(_.pin))
   }
 
   /** False when one source carries two different pins (a cross-version
     * self-join): the Spark side re-applies a pin per SOURCE, so there is no
-    * single version to freeze that relation at.
+    * single version to freeze that relation at. Two spellings of the SAME
+    * frozen value (`VERSION AS OF 2` / `version as of '2'`) are one pin.
     */
-  private def pinsAreUnambiguous(pins: Seq[SnapshotPin]): Boolean =
-    pins.groupBy(_.segments).forall { case (_, group) => group.map(_.clause).distinct.size == 1 }
+  private def pinsAreUnambiguous(refs: Seq[PinnedRef]): Boolean =
+    refs.groupBy(_.pin.segments).forall { case (_, group) => group.map(_.identity).distinct.size == 1 }
 
   /** De-pinned copy of `sql` for the DuckDB compile bridge. */
   def stripSnapshotPins(sql: String): String = split(sql).sql
 
   /** Resolve the pins in `sql` against a view's tracked source tables.
     *
-    * A pin written as a bare short name matches the qualified source with the
-    * same trailing segment (the `db.table` vs `table` sharp edge documented in
-    * `MaterializedViewCommands.postRefreshCleanup`); a pin written with a
-    * qualifier must match those trailing segments exactly.
+    * A pin and a source name identify the same relation when one's segment
+    * chain is a suffix of the other's: the tracker may hold a source as
+    * `db.table` while the body wrote a bare `table` (the sharp edge documented
+    * in `MaterializedViewCommands.postRefreshCleanup`), or the compile request
+    * may hold the bare name while the body qualified it. Disagreeing qualifiers
+    * (`other_db.src` vs `default.src`) never match.
+    *
+    * Callers that act on the result must first check [[unresolvedPins]]: a pin
+    * that matches no source (or several) silently drops out of this map, which
+    * on the refresh path means maintaining a frozen relation from live rows.
     *
     * @return qualified source table name → temporal clause text
     */
@@ -208,11 +277,24 @@ object SparkTimeTravelSql {
     val pins = split(sql).pins
     if (pins.isEmpty) return Map.empty
     qualifiedSources.flatMap { qualified =>
-      val qualSegments = identifierSegments(qualified)
       pins
-        .find(pin => qualSegments.endsWith(pin.segments))
+        .find(pin => referToSameRelation(pin, qualified))
         .map(pin => qualified -> pin.clause)
     }.toMap
+  }
+
+  /** Pins in `sql` that do NOT resolve to exactly one of `qualifiedSources`. */
+  def unresolvedPins(sql: String, qualifiedSources: Seq[String]): Seq[SnapshotPin] =
+    unresolvedPins(split(sql).pins, qualifiedSources)
+
+  private def unresolvedPins(pins: Seq[SnapshotPin], qualifiedSources: Seq[String]): Seq[SnapshotPin] = {
+    val sources = qualifiedSources.distinct
+    pins.filter(pin => sources.count(source => referToSameRelation(pin, source)) != 1)
+  }
+
+  private def referToSameRelation(pin: SnapshotPin, qualifiedSource: String): Boolean = {
+    val sourceSegments = identifierSegments(qualifiedSource)
+    sourceSegments.endsWith(pin.segments) || pin.segments.endsWith(sourceSegments)
   }
 
   /** Same as [[pinsByQualifiedSource]] but keyed by the short (last-segment)
@@ -252,36 +334,54 @@ object SparkTimeTravelSql {
   /** Locate and elide every temporal clause outside string literals, quoted
     * identifiers and comments. Pure text surgery — validated by [[split]].
     */
-  private def scan(sql: String): Split = {
+  private def scan(sql: String): Scanned = {
     val out  = new StringBuilder(sql.length)
-    val pins = scala.collection.mutable.ArrayBuffer.empty[SnapshotPin]
+    val refs = scala.collection.mutable.ArrayBuffer.empty[PinnedRef]
     var i    = 0
+    // Length of `out` up to and including the last emitted TOKEN character.
+    // Comments (and the whitespace after them) are trivia: Spark allows them
+    // between a relation and its temporal clause, so a word inside one
+    // (`FROM t -- freeze at load time\n VERSION AS OF 4`) must never be taken
+    // for the pinned relation.
+    var refEnd = 0
     while (i < sql.length) {
-      val protectedEnd = consumeProtectedRegion(sql, i)
-      if (protectedEnd > i) {
-        out.append(sql.substring(i, protectedEnd))
-        i = protectedEnd
+      val commentEnd = consumeComment(sql, i)
+      if (commentEnd > i) {
+        out.append(sql.substring(i, commentEnd))
+        i = commentEnd
       } else {
-        parseTemporalClause(sql, i) match {
-          case Some((clauseEnd, clause)) =>
-            // `out` holds everything already emitted, so the relation reference
-            // this clause pins is the trailing identifier chain of `out`.
-            trailingTableRef(out) match {
-              case Some(tableRef) =>
-                pins += SnapshotPin(tableRef, clause)
-                elideClause(out, sql, clauseEnd)
-                i = clauseEnd
-              case None =>
-                out.append(sql.charAt(i))
-                i += 1
-            }
-          case None =>
-            out.append(sql.charAt(i))
-            i += 1
+        val quotedEnd = consumeQuoted(sql, i)
+        if (quotedEnd > i) {
+          out.append(sql.substring(i, quotedEnd))
+          refEnd = out.length
+          i = quotedEnd
+        } else {
+          parseTemporalClause(sql, i) match {
+            case Some(clause) =>
+              trailingTableRef(out, refEnd) match {
+                case Some(tableRef) =>
+                  refs += PinnedRef(SnapshotPin(tableRef, clause.text), clause.kind, clause.value)
+                  elideClause(out, sql, clause.end)
+                  refEnd = math.min(refEnd, out.length)
+                  i = clause.end
+                case None =>
+                  refEnd = appendChar(out, sql.charAt(i), refEnd)
+                  i += 1
+              }
+            case None =>
+              refEnd = appendChar(out, sql.charAt(i), refEnd)
+              i += 1
+          }
         }
       }
     }
-    if (pins.isEmpty) Split(sql, Nil) else Split(out.toString, pins.toVector)
+    if (refs.isEmpty) Scanned(sql, Nil) else Scanned(out.toString, refs.toVector)
+  }
+
+  /** Append one character, returning the updated end-of-last-token marker. */
+  private def appendChar(out: StringBuilder, c: Char, refEnd: Int): Int = {
+    out.append(c)
+    if (c.isWhitespace) refEnd else out.length
   }
 
   /** Drop the elided clause together with the inline whitespace that preceded
@@ -299,13 +399,20 @@ object SparkTimeTravelSql {
 
   private def isInlineWhitespace(c: Char): Boolean = c.isWhitespace && c != '\n' && c != '\r'
 
-  /** End index (exclusive) of a string literal / quoted identifier / comment
-    * starting at `i`, or `i` itself when `i` does not start one.
+  /** End index (exclusive) of a string literal or quoted identifier starting at
+    * `i` — a real token — or `i` itself.
     */
-  private def consumeProtectedRegion(sql: String, i: Int): Int = sql.charAt(i) match {
+  private def consumeQuoted(sql: String, i: Int): Int = sql.charAt(i) match {
     case '\'' => SparkFunctionShimSql.consumeSparkSingleQuoted(sql, i)
     case '"'  => consumeSparkDoubleQuoted(sql, i)
     case '`'  => consumeBacktickQuoted(sql, i)
+    case _    => i
+  }
+
+  /** End index (exclusive) of a line or block comment starting at `i` — trivia,
+    * never part of a relation reference — or `i` itself.
+    */
+  private def consumeComment(sql: String, i: Int): Int = sql.charAt(i) match {
     case '-' if i + 1 < sql.length && sql.charAt(i + 1) == '-' =>
       var j = i + 2
       while (j < sql.length && sql.charAt(j) != '\n' && sql.charAt(j) != '\r') j += 1
@@ -348,10 +455,9 @@ object SparkTimeTravelSql {
     *   | FOR? (SYSTEM_TIME | TIMESTAMP)   AS OF timestamp=valueExpression
     * }}}
     *
-    * @return `(endExclusive, clauseText)` of the whole clause including a
-    *         leading `FOR`, or `None`.
+    * @return the clause, or `None` when `start` does not begin one.
     */
-  private def parseTemporalClause(sql: String, start: Int): Option[(Int, String)] = {
+  private def parseTemporalClause(sql: String, start: Int): Option[ParsedClause] = {
     if (!isIdentifierStart(sql.charAt(start)) || !hasLeftIdentifierBoundary(sql, start)) return None
 
     var pos = start
@@ -366,13 +472,71 @@ object SparkTimeTravelSql {
     if (!isKeywordAt(sql, pos, "AS")) return None
     pos = skipTrivia(sql, pos + "AS".length)
     if (!isKeywordAt(sql, pos, "OF")) return None
-    pos = skipTrivia(sql, pos + "OF".length)
+    val valueStart = skipTrivia(sql, pos + "OF".length)
 
+    val isVersion = VersionKeywords.contains(kindKeyword)
     val valueEnd =
-      if (VersionKeywords.contains(kindKeyword)) parseVersionValueEnd(sql, pos)
-      else parseTimestampValueEnd(sql, pos)
+      if (isVersion) parseVersionValueEnd(sql, valueStart) else parseTimestampValueEnd(sql, valueStart)
 
-    valueEnd.map(end => end -> sql.substring(start, end).trim.replaceAll("\\s+", " "))
+    valueEnd.map { end =>
+      ParsedClause(
+        end = end,
+        text = clauseText(sql, start, end),
+        kind = if (isVersion) VersionKind else TimestampKind,
+        value = unquoteLiteral(sql.substring(valueStart, end).trim)
+      )
+    }
+  }
+
+  /** The clause exactly as the user wrote it, minus comments and with runs of
+    * whitespace OUTSIDE string literals collapsed to one space. The result is
+    * re-emitted verbatim into the SQL Spark executes, so a line comment inside
+    * the clause (`VERSION -- pinned\n AS OF 4`) must not survive the collapse
+    * and comment the rest of the statement out.
+    */
+  private def clauseText(sql: String, start: Int, end: Int): String = {
+    val out = new StringBuilder(end - start)
+    var i   = start
+    while (i < end) {
+      val commentEnd = consumeComment(sql, i)
+      if (commentEnd > i) {
+        appendSeparator(out)
+        i = commentEnd
+      } else {
+        val quotedEnd = consumeQuoted(sql, i)
+        if (quotedEnd > i) {
+          out.append(sql.substring(i, math.min(quotedEnd, end)))
+          i = quotedEnd
+        } else if (sql.charAt(i).isWhitespace) {
+          appendSeparator(out)
+          i += 1
+        } else {
+          out.append(sql.charAt(i))
+          i += 1
+        }
+      }
+    }
+    out.toString.trim
+  }
+
+  private def appendSeparator(out: StringBuilder): Unit =
+    if (out.nonEmpty && out.charAt(out.length - 1) != ' ') out.append(' ')
+
+  /** Strip the quotes of a single-quoted literal and undo its escapes, so a
+    * scanned value can be compared with the one Spark's parser produced.
+    */
+  private def unquoteLiteral(text: String): String = {
+    if (text.length < 2 || text.charAt(0) != '\'' || text.charAt(text.length - 1) != '\'') return text
+    val out = new StringBuilder(text.length)
+    var i   = 1
+    val end = text.length - 1
+    while (i < end) {
+      val c = text.charAt(i)
+      if (c == '\\' && i + 1 < end) { out.append(text.charAt(i + 1)); i += 2 }
+      else if (c == '\'' && i + 1 < end && text.charAt(i + 1) == '\'') { out.append('\''); i += 2 }
+      else { out.append(c); i += 1 }
+    }
+    out.toString
   }
 
   /** `INTEGER_VALUE | STRING` — the only two forms Spark's grammar allows after
@@ -382,45 +546,46 @@ object SparkTimeTravelSql {
     if (start >= sql.length) return None
     val c = sql.charAt(start)
     if (c == '\'') Some(SparkFunctionShimSql.consumeSparkSingleQuoted(sql, start))
-    else if (c.isDigit || ((c == '+' || c == '-') && start + 1 < sql.length && sql.charAt(start + 1).isDigit)) {
+    else if (c.isDigit) {
       var i = start + 1
       while (i < sql.length && sql.charAt(i).isDigit) i += 1
       Some(i)
     } else None
   }
 
-  /** `valueExpression` after `TIMESTAMP AS OF`, restricted to the shapes a
-    * scanner can bound safely: a string literal, a number, or an identifier
-    * chain with an optional balanced argument list (`current_timestamp()`,
-    * `date_sub(current_date(), 1)`). Anything else yields `None`, which leaves
-    * the SQL untouched.
+  /** `valueExpression` after `TIMESTAMP AS OF`, restricted to the STABLE
+    * literal forms a frozen relation can be defined by: a string literal or a
+    * number.
+    *
+    * Anything else — `current_timestamp()`, `date_sub(current_date(), 1)`, an
+    * arithmetic expression — is a MOVING target. OpenIVM freezes a relation ONCE
+    * (the pin it re-applies is fixed text, and staged deltas for a frozen source
+    * are dropped), so a moving value would pick some snapshot at CREATE and then
+    * maintain the view against a different one at every refresh. Those bodies
+    * are deliberately not lifted: the bridge refuses them and the view falls
+    * back to FULL_REFRESH, which re-evaluates the user's expression each run.
     */
   private def parseTimestampValueEnd(sql: String, start: Int): Option[Int] = {
     if (start >= sql.length) return None
     val c = sql.charAt(start)
     if (c == '\'') return Some(SparkFunctionShimSql.consumeSparkSingleQuoted(sql, start))
-    if (c.isDigit) {
-      var i = start + 1
-      while (i < sql.length && (sql.charAt(i).isDigit || sql.charAt(i) == '.')) i += 1
-      return Some(i)
-    }
-    if (!isIdentifierStart(c)) return None
-    var i = start
-    while (i < sql.length && (isIdentifierChar(sql.charAt(i)) || sql.charAt(i) == '.')) i += 1
-    val word = sql.substring(start, i).toLowerCase(Locale.ROOT)
-    if (ValueStopKeywords.contains(word)) return None
-    val afterName = skipTrivia(sql, i)
-    if (afterName < sql.length && sql.charAt(afterName) == '(') findMatchingCloseParen(sql, afterName).map(_ + 1)
-    else Some(i)
+    if (!c.isDigit) return None
+    var i = start + 1
+    while (i < sql.length && (sql.charAt(i).isDigit || sql.charAt(i) == '.')) i += 1
+    Some(i)
   }
 
-  /** Trailing dot-separated identifier chain already emitted into `out` — the
+  /** Trailing dot-separated identifier chain already emitted into `out`, up to
+    * `limit` (the end of the last real token — comments are excluded) — the
     * relation the temporal clause pins. `None` when the preceding token is not
     * a plausible relation reference (e.g. a comma, an operator, or a SQL
     * keyword), which makes the caller leave the text untouched.
+    *
+    * This is a HINT, not the verdict: [[split]] only keeps the pin if Spark's
+    * own parser agrees the same relation carries the same clause.
     */
-  private def trailingTableRef(out: StringBuilder): Option[String] = {
-    var end = out.length
+  private def trailingTableRef(out: StringBuilder, limit: Int): Option[String] = {
+    var end = math.min(limit, out.length)
     while (end > 0 && out.charAt(end - 1).isWhitespace) end -= 1
     if (end == 0) return None
     var start = end
@@ -444,39 +609,13 @@ object SparkTimeTravelSql {
     Some(ref)
   }
 
-  private def findMatchingCloseParen(sql: String, openParen: Int): Option[Int] = {
-    var depth = 0
-    var i     = openParen
-    while (i < sql.length) {
-      val protectedEnd = consumeProtectedRegion(sql, i)
-      if (protectedEnd > i) i = protectedEnd
-      else {
-        sql.charAt(i) match {
-          case '(' => depth += 1; i += 1
-          case ')' =>
-            depth -= 1
-            if (depth == 0) return Some(i)
-            i += 1
-          case _ => i += 1
-        }
-      }
-    }
-    None
-  }
-
   private def skipTrivia(sql: String, start: Int): Int = {
     var i    = start
     var more = true
     while (more && i < sql.length) {
       if (sql.charAt(i).isWhitespace) i += 1
       else {
-        val end = i match {
-          case _ if sql.charAt(i) == '-' && i + 1 < sql.length && sql.charAt(i + 1) == '-' =>
-            consumeProtectedRegion(sql, i)
-          case _ if sql.charAt(i) == '/' && i + 1 < sql.length && sql.charAt(i + 1) == '*' =>
-            consumeProtectedRegion(sql, i)
-          case _ => i
-        }
+        val end = consumeComment(sql, i)
         if (end > i) i = end else more = false
       }
     }
@@ -501,20 +640,58 @@ object SparkTimeTravelSql {
 
   // ── Spark-parser cross-check ───────────────────────────────────────────────
 
-  /** The de-pinned SQL must parse, carry no residual time-travel node, and
-    * reference exactly the same relations as the original. A source that is
-    * pinned somewhere and read live elsewhere is rejected: the Spark side
-    * re-pins per source, which would freeze the live read too.
+  /** The de-pinned SQL must parse, carry no residual time-travel node,
+    * reference exactly the same relations as the original, and account for
+    * every pin Spark's parser saw. A source that is pinned somewhere and read
+    * live elsewhere is rejected: the Spark side re-pins per source, which would
+    * freeze the live read too.
     */
-  private def verifiesAgainstSparkParser(original: String, depinned: String, pins: Seq[SnapshotPin]): Boolean =
+  private def verifiesAgainstSparkParser(original: String, depinned: String, refs: Seq[PinnedRef]): Boolean =
     (parsePlan(original), parsePlan(depinned)) match {
       case (Some(before), Some(after)) =>
         timeTravelCount(before) > 0 &&
         timeTravelCount(after) == 0 &&
         relationIdentifiers(before) == relationIdentifiers(after) &&
-        !readsPinnedSourceLive(before, pins)
+        bindsExactlyToParsedPins(before, refs) &&
+        !readsPinnedSourceLive(before, refs.map(_.pin))
       case _ => false
     }
+
+  /** Spark's parser — not the scanner — decides WHICH relation a temporal
+    * clause pins and WHAT it is frozen at. The lifted pins must therefore be
+    * the same multiset of `(relation, kind, value)` as the `RelationTimeTravel`
+    * nodes of the parsed original.
+    *
+    * This is what stops a pin from silently binding to the wrong token (a word
+    * inside a comment that sits between the relation and its clause) or from
+    * going unnoticed (a clause shape the scanner does not lift, such as a
+    * moving `TIMESTAMP AS OF current_timestamp()`): either way the association
+    * is not exact, the split is refused, and the view falls back to a
+    * FULL_REFRESH of the user's pinned body.
+    */
+  private def bindsExactlyToParsedPins(plan: LogicalPlan, refs: Seq[PinnedRef]): Boolean =
+    parsedPinIdentities(plan).exists(_.sorted == refs.map(_.identity).sorted)
+
+  /** Identity of every `RelationTimeTravel` in `plan`, or `None` when any of
+    * them pins something other than a named relation or is frozen at anything
+    * other than a literal value (`current_timestamp()` and friends).
+    */
+  private def parsedPinIdentities(plan: LogicalPlan): Option[Seq[String]] = {
+    val identities = collectPlans(plan).collect { case tt: RelationTimeTravel => parsedPinIdentity(tt) }
+    if (identities.forall(_.isDefined)) Some(identities.map(_.get)) else None
+  }
+
+  private def parsedPinIdentity(travel: RelationTimeTravel): Option[String] = travel.relation match {
+    case relation: UnresolvedRelation =>
+      val segments = relation.multipartIdentifier.map(_.toLowerCase(Locale.ROOT))
+      (travel.version, travel.timestamp) match {
+        case (Some(version), None) => Some(identityKey(segments, VersionKind, unquoteLiteral(version)))
+        case (None, Some(literal: Literal)) if literal.value != null =>
+          Some(identityKey(segments, TimestampKind, literal.value.toString))
+        case _ => None
+      }
+    case _ => None
+  }
 
   /** True when a relation reference outside any `RelationTimeTravel` resolves
     * to one of the pinned sources. CTE names are compared too, so a CTE that

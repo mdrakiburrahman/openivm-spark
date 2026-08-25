@@ -505,11 +505,11 @@ for the statement-kind dispatch.
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | openivm-spark              | current repository checkout; benchmark image also pins `OPENIVM_SPARK_COMMIT=6dfe127dc03195bdcf4b1286ee612029ba10b23f` | benchmark Dockerfile ARG                                          | Spark extension jar must match the native compiler artifacts it expects.     |
 | OpenIVM                    | `2845bc4379172e0ad0377f3fb9126fa2837c7d7b`                                                                             | `spark-ext/dev/pins.env:5-7`                                      | Produces `openivm.duckdb_extension` and the matching DuckDB CLI.             |
-| LPTS                       | `b3baf0bbd974fc08161f1b7d9a540d60a9df96b8`                                                                             | `spark-ext/dev/pins.env:10-12`                                    | OpenIVM builds this LPTS commit as its serializer dependency.                |
-| DuckDB CLI / extension ABI | DuckDB 1.5.x, OpenIVM CI pin v1.5.2                                                                                    | OpenIVM build tree; `pins.env:27-28` documents the JDBC match     | `openivm.duckdb_extension` must be loaded by a CLI with the same native ABI. |
-| DuckDB JDBC                | `1.5.2.1`                                                                                                              | `spark-ext/dev/pins.env:27-28`, `project/Dependencies.scala:7-11` | Not the compile execution path, but kept aligned with the native DuckDB ABI. |
-| Spark                      | `3.5.1`                                                                                                                | `spark-ext/dev/pins.env:23`, `project/Dependencies.scala:4`       | Determines SQL dialect gaps and Catalyst/Delta behavior.                     |
-| Delta Lake                 | `3.2.0`                                                                                                                | `spark-ext/dev/pins.env:24`, `project/Dependencies.scala:5`       | Determines MERGE, UPDATE, Delta path, and warehouse behavior.                |
+| LPTS                       | `dbac36de2e7e00d22fcb48250662fd69c0c106cd`                                                                             | `spark-ext/dev/pins.env:25-27`                                    | OpenIVM builds this LPTS commit as its serializer dependency.                |
+| DuckDB CLI / extension ABI | DuckDB 1.5.x, OpenIVM CI pin v1.5.2                                                                                    | OpenIVM build tree; `pins.env:55-56` documents the JDBC match     | `openivm.duckdb_extension` must be loaded by a CLI with the same native ABI. |
+| DuckDB JDBC                | `1.5.2.1`                                                                                                              | `spark-ext/dev/pins.env:55-56`, `project/Dependencies.scala:7-11` | Not the compile execution path, but kept aligned with the native DuckDB ABI. |
+| Spark                      | `3.5.1`                                                                                                                | `spark-ext/dev/pins.env:52`, `project/Dependencies.scala:4`       | Determines SQL dialect gaps and Catalyst/Delta behavior.                     |
+| Delta Lake                 | `3.2.0`                                                                                                                | `spark-ext/dev/pins.env:53`, `project/Dependencies.scala:5`       | Determines MERGE, UPDATE, Delta path, and warehouse behavior.                |
 
 The key constraints are:
 
@@ -526,7 +526,7 @@ The key constraints are:
 flowchart LR
   OSS["openivm-spark\nSpark 3.5.1 / Delta 3.2.0\nScala 2.12.17"]
   OIVM["openivm\nOPENIVM_COMMIT\n2845bc4379172e0ad0377f3fb9126fa2837c7d7b"]
-  LPTS["LPTS\nLPTS_COMMIT\nb3baf0bbd974fc08161f1b7d9a540d60a9df96b8"]
+  LPTS["LPTS\nLPTS_COMMIT\ndbac36de2e7e00d22fcb48250662fd69c0c106cd"]
   Duck["DuckDB 1.5.x ABI\nCLI + extension binary\nJDBC 1.5.2.1"]
 
   OSS -->|"loads matching openivm.duckdb_extension via CLI"| OIVM
@@ -556,12 +556,12 @@ OPENIVM_COMMIT=2845bc4379172e0ad0377f3fb9126fa2837c7d7b
 
 LPTS_REPO=https://github.com/mdrakiburrahman/lpts.git
 LPTS_BRANCH=dev/mdrrahman/spark-add-months
-LPTS_COMMIT=b3baf0bbd974fc08161f1b7d9a540d60a9df96b8
+LPTS_COMMIT=dbac36de2e7e00d22fcb48250662fd69c0c106cd
 
 DUCKDB_JDBC_VERSION=1.5.2.1
 ```
 
-Source: `spark-ext/dev/pins.env:4-28`.
+Source: `spark-ext/dev/pins.env:4-56`.
 
 The development Dockerfile consumes those build args and overrides OpenIVM's
 `third_party/lpts` submodule URL/commit before building.
@@ -588,10 +588,14 @@ When synchronized, its defaults should match `pins.env`:
 
 ```text
 ARG OPENIVM_COMMIT=2845bc4379172e0ad0377f3fb9126fa2837c7d7b
-ARG LPTS_COMMIT=b3baf0bbd974fc08161f1b7d9a540d60a9df96b8
+ARG LPTS_COMMIT=dbac36de2e7e00d22fcb48250662fd69c0c106cd
 ```
 
 Source: `.temp/ivm-bench/src/containers/spark-openivm-build/Dockerfile:38-43`.
+
+> The ivm-bench Dockerfile still declares the previous `LPTS_COMMIT`
+> (`b3baf0bb…`); `dev.sh pins-sync` reports that as a non-fatal drift WARNING
+> until the benchmark repo is re-synced to `dbac36de…`.
 
 Pinning policy:
 

@@ -5,6 +5,7 @@ import java.util.concurrent.{CountDownLatch, Executors}
 
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -516,6 +517,129 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     )
     val result = sharedCompiler.compile(req)
     result.refreshType should be >= 0
+  }
+
+  // ── Test 7f: Prefix-colliding source names + gauge hygiene ────────────────
+  //
+  // openivm emits `memory.main.<source>` for every relation it reads and the
+  // bridge rewrites those back to Spark identifiers, re-attaching the user's
+  // pin. That rewrite has to be identifier-bounded: with sources `customer`
+  // and `customer_address`, a per-name `String.replace` either injects the
+  // shorter name's pin into the middle of the longer identifier or eats its
+  // prefix so the longer name keeps NO pin and silently loads live rows.
+
+  private val customerSchema: StructType        = StructType.fromDDL("id INT, name STRING")
+  private val customerAddressSchema: StructType = StructType.fromDDL("id INT, city STRING")
+
+  /** Runs the initial-load rewrite over a synthetic openivm compile output, so
+    * the assertion is about the rewrite and not about which plan openivm picks.
+    */
+  private def initialLoadSqlFor(req: CompileRequest, compiledQueries: String): String = {
+    val root = Files.createDirectories(java.nio.file.Paths.get("target", "openivm-initial-load"))
+    val dir  = Files.createTempDirectory(root, s"${req.viewName}-")
+    val file = dir.resolve(s"openivm_compiled_queries_${req.viewName}.sql")
+    try {
+      Files.write(file, compiledQueries.getBytes("UTF-8"))
+      sharedCompiler.parseInitialLoadSql(dir, req)
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
+  }
+
+  private val prefixCollisionRequest: CompileRequest = CompileRequest(
+    viewName = "mv_prefix_collision",
+    viewSql = "SELECT c.name, a.city FROM db.customer VERSION AS OF 3 AS c " +
+      "JOIN db.customer_address AS a ON a.id = c.id",
+    sources = Map("customer" -> customerSchema, "customer_address" -> customerAddressSchema),
+    sourceQualifiedNames = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+  )
+
+  private val prefixCollisionQueries: String =
+    "CREATE TABLE openivm_data_mv_prefix_collision AS SELECT c.name, a.city " +
+      "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;"
+
+  it should "not bleed a shorter source's pin into a longer source name in the initial load" in {
+    val sql = initialLoadSqlFor(prefixCollisionRequest, prefixCollisionQueries)
+    sql should include("db.customer VERSION AS OF 3 AS c")
+    sql should include("db.customer_address AS a")
+    sql should not include "memory.main."
+    sql should not include "3_address"
+    """(?i)customer_address\s+VERSION""".r.findFirstIn(sql) shouldBe None
+  }
+
+  it should "keep the LONGER source's pin when only it is pinned" in {
+    val req = prefixCollisionRequest.copy(
+      viewName = "mv_prefix_collision_long",
+      viewSql = "SELECT c.name, a.city FROM db.customer AS c " +
+        "JOIN db.customer_address VERSION AS OF 7 AS a ON a.id = c.id"
+    )
+    val sql = initialLoadSqlFor(
+      req,
+      prefixCollisionQueries.replace("mv_prefix_collision", "mv_prefix_collision_long")
+    )
+    sql should include("db.customer_address VERSION AS OF 7 AS a")
+    // The unpinned shorter source must stay live.
+    """(?i)db\.customer\s+VERSION""".r.findFirstIn(sql) shouldBe None
+  }
+
+  it should "re-attach both pins when a prefix pair is pinned to different versions" in {
+    val req = prefixCollisionRequest.copy(
+      viewName = "mv_prefix_collision_both",
+      viewSql = "SELECT c.name, a.city FROM db.customer VERSION AS OF 3 AS c " +
+        "JOIN db.customer_address VERSION AS OF 7 AS a ON a.id = c.id"
+    )
+    val sql = initialLoadSqlFor(
+      req,
+      prefixCollisionQueries.replace("mv_prefix_collision", "mv_prefix_collision_both")
+    )
+    sql should include("db.customer VERSION AS OF 3 AS c")
+    sql should include("db.customer_address VERSION AS OF 7 AS a")
+  }
+
+  it should "compile a view whose sources have colliding name prefixes" in {
+    val result = sharedCompiler.compile(prefixCollisionRequest)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+    result.sql.toUpperCase should not include "VERSION AS OF"
+  }
+
+  it should "refuse a pin that does not resolve to exactly one tracked source" in {
+    val req = CompileRequest(
+      viewName = "mv_pin_unresolved",
+      viewSql = "SELECT region, SUM(amount) AS total FROM other_db.sales VERSION AS OF 2 GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val thrown = the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req)
+    thrown.getMessage should include("other_db.sales")
+    thrown.getMessage should include("does not resolve")
+  }
+
+  it should "refuse a pin whose value moves with wall-clock time" in {
+    val req = CompileRequest(
+      viewName = "mv_pin_moving",
+      viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales TIMESTAMP AS OF current_timestamp() " +
+        "GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req)
+  }
+
+  it should "not leak the inflight compiler gauge when it refuses a pin" in {
+    val req = CompileRequest(
+      viewName = "mv_pin_gauge",
+      viewSql = "SELECT a.region FROM tpcdi.sales VERSION AS OF 2 a " +
+        "JOIN tpcdi.sales VERSION AS OF 5 b ON a.region = b.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val baseline = OpenIvmMetrics.CompilerInflight.get()
+    (1 to 3).foreach(_ => the[OpenIvmCompileException] thrownBy sharedCompiler.compile(req))
+    // The decrement lives in `compile`'s `finally`; a refusal thrown after the
+    // increment would strand the gauge one higher per refused view.
+    OpenIvmMetrics.CompilerInflight.get() shouldBe baseline
   }
 
   it should "emit RELY FK declarations for qualified compile facts when opted in" in {

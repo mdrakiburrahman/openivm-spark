@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import org.scalatest.OptionValues
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -10,7 +11,7 @@ import org.scalatest.matchers.should.Matchers
   * or mangled literal would silently compile a different view than the user
   * wrote.
   */
-class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
+class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues {
 
   private def normalized(sql: String): String = sql.replaceAll("\\s+", " ").trim
 
@@ -59,12 +60,6 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
       val split = SparkTimeTravelSql.split("SELECT id FROM src TIMESTAMP AS OF '2024-01-01 00:00:00'")
       normalized(split.sql) shouldBe "SELECT id FROM src"
       split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF '2024-01-01 00:00:00'")
-    }
-
-    it("accepts TIMESTAMP AS OF with a function-call expression") {
-      val split = SparkTimeTravelSql.split("SELECT id FROM src TIMESTAMP AS OF date_sub(current_date(), 1)")
-      normalized(split.sql) shouldBe "SELECT id FROM src"
-      split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF date_sub(current_date(), 1)")
     }
 
     it("removes pins from every relation of a join, preserving both") {
@@ -237,10 +232,11 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
       split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF '2024-01-01'")
     }
 
-    it("does not swallow the alias into a function-valued TIMESTAMP pin") {
-      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.dim TIMESTAMP AS OF current_timestamp() AS p")
-      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim AS p"
-      split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF current_timestamp()")
+    it("refuses a function-valued TIMESTAMP pin instead of swallowing the alias") {
+      val sql = "SELECT p.id FROM db.dim TIMESTAMP AS OF current_timestamp() AS p"
+      SparkTimeTravelSql.split(sql).sql shouldBe sql
+      SparkTimeTravelSql.split(sql).pins shouldBe empty
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe true
     }
 
     it("never emits a temporal clause after the alias") {
@@ -274,6 +270,165 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  /** A comment is TRIVIA: Spark allows one between a relation and its temporal
+    * clause, so `FROM t -- freeze at load time\n VERSION AS OF 4` pins `t`.
+    * Scanning backwards through the emitted text would bind the last word of
+    * the comment (`time`) as the relation instead, and a pin on a relation the
+    * view does not read resolves to NO source: the compile would succeed, the
+    * frozen relation would be maintained from live rows, and nothing would say
+    * so. Spark's parser is the authority on which relation carries the clause.
+    */
+  describe("split — comments around a pin") {
+    it("binds the pin to the relation, not to the last word of a line comment") {
+      val sql   = "SELECT id FROM t -- freeze at load time\n VERSION AS OF 4"
+      val split = SparkTimeTravelSql.split(sql)
+      split.pins.map(_.tableRef) shouldBe Seq("t")
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 4")
+      split.sql should include("-- freeze at load time")
+      split.sql.toUpperCase should not include "VERSION AS OF"
+      SparkTimeTravelSql.pinsByQualifiedSource(sql, Seq("db.t")) shouldBe Map("db.t" -> "VERSION AS OF 4")
+    }
+
+    it("does not bind a table named in a comment") {
+      val sql   = "SELECT id FROM db.t -- see also other_table\n VERSION AS OF 4"
+      val split = SparkTimeTravelSql.split(sql)
+      split.pins.map(_.tableRef) shouldBe Seq("db.t")
+      SparkTimeTravelSql.pinsByQualifiedSource(sql, Seq("db.other_table")) shouldBe empty
+      SparkTimeTravelSql.unresolvedPins(sql, Seq("db.other_table")) should have size 1
+    }
+
+    it("binds through a block comment between the relation and its clause") {
+      val sql   = "SELECT p.id FROM `cat`.`sch`.`dim` /* dbt: pinned ref */ VERSION AS OF 366 AS p"
+      val split = SparkTimeTravelSql.split(sql)
+      split.pins.map(_.shortName) shouldBe Seq("dim")
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 366")
+      normalized(split.sql) shouldBe "SELECT p.id FROM `cat`.`sch`.`dim` /* dbt: pinned ref */ AS p"
+    }
+
+    it("drops a block comment written between the clause keywords") {
+      val split = SparkTimeTravelSql.split("SELECT id FROM db.t VERSION /* pinned */ AS OF 4")
+      split.pins.map(_.tableRef) shouldBe Seq("db.t")
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 4")
+    }
+
+    it("never carries a line comment into the re-applied clause text") {
+      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.t VERSION -- pinned\n AS OF 4 AS p")
+      split.pins.map(_.tableRef) shouldBe Seq("db.t")
+      // A clause re-emitted as `VERSION -- pinned AS OF 4` would comment out the
+      // rest of the statement Spark executes.
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 4")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.t AS p"
+    }
+
+    it("binds a quoted, qualified relation inside a subquery") {
+      val sql =
+        "SELECT y.id FROM (SELECT x.id FROM `cat`.`sch`.`dim` /* pin */ VERSION AS OF 2 x) y"
+      val split = SparkTimeTravelSql.split(sql)
+      split.pins.map(_.segments) shouldBe Seq(Seq("cat", "sch", "dim"))
+      split.sql.toUpperCase should not include "VERSION AS OF"
+    }
+
+    it("leaves a comment-only lookalike untouched") {
+      val sql = "SELECT id FROM src /* VERSION AS OF 4 */ WHERE id > 1"
+      SparkTimeTravelSql.split(sql).sql shouldBe sql
+      SparkTimeTravelSql.split(sql).pins shouldBe empty
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe false
+    }
+  }
+
+  /** A pin OpenIVM honors is FROZEN once: the clause it re-applies is fixed
+    * text and staged deltas for the pinned source are dropped. A value that
+    * moves with wall-clock time would therefore be evaluated at CREATE and then
+    * maintained against a different snapshot on every refresh — silently wrong.
+    * Only stable literals are lifted; everything else must fall back to
+    * FULL_REFRESH, which re-evaluates the user's expression each run.
+    */
+  describe("split — moving pin values are refused") {
+    it("refuses every non-literal TIMESTAMP AS OF value") {
+      Seq(
+        "SELECT id FROM src TIMESTAMP AS OF current_timestamp()",
+        "SELECT id FROM src TIMESTAMP AS OF now()",
+        "SELECT id FROM src TIMESTAMP AS OF date_sub(current_date(), 1)",
+        "SELECT id FROM src TIMESTAMP AS OF date_add(current_date(), -1)",
+        "SELECT id FROM src SYSTEM_TIME AS OF current_timestamp()",
+        "SELECT id FROM src TIMESTAMP AS OF date '2024-01-01'"
+      ).foreach { sql =>
+        withClue(s"$sql: ") {
+          SparkTimeTravelSql.split(sql).sql shouldBe sql
+          SparkTimeTravelSql.split(sql).pins shouldBe empty
+          SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe true
+        }
+      }
+    }
+
+    it("leaves a pin Spark itself rejects to the downstream parser") {
+      // Spark refuses `current_date` here ("timestamp expression cannot refer to
+      // any columns"), so there is no parsed pin to refuse: the body is passed
+      // through unchanged and DuckDB aborts the compile, as it always did.
+      val sql = "SELECT id FROM src TIMESTAMP AS OF current_date"
+      SparkTimeTravelSql.split(sql).sql shouldBe sql
+      SparkTimeTravelSql.split(sql).pins shouldBe empty
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe false
+    }
+
+    it("refuses a moving pin even when another source is pinned to a literal") {
+      val sql = "SELECT d.region, f.amount FROM dim VERSION AS OF 2 d " +
+        "JOIN fact TIMESTAMP AS OF current_timestamp() f ON f.dim_id = d.id"
+      SparkTimeTravelSql.split(sql).pins shouldBe empty
+      SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe true
+    }
+
+    it("still accepts the stable literal forms") {
+      Seq(
+        "SELECT id FROM src TIMESTAMP AS OF '2024-01-01'",
+        "SELECT id FROM src SYSTEM_TIME AS OF '2024-01-01 12:30:00'",
+        "SELECT id FROM src VERSION AS OF 366",
+        "SELECT id FROM src VERSION AS OF '366'"
+      ).foreach { sql =>
+        withClue(s"$sql: ") {
+          SparkTimeTravelSql.split(sql).pins should have size 1
+          SparkTimeTravelSql.hasUnsupportedSnapshotPin(sql) shouldBe false
+        }
+      }
+    }
+  }
+
+  describe("unresolvedPins / unsupportedSnapshotPinReason") {
+    it("flags a pin that resolves to no tracked source") {
+      val sql = "SELECT id FROM other_db.src VERSION AS OF 9"
+      SparkTimeTravelSql.unresolvedPins(sql, Seq("default.src")).map(_.tableRef) shouldBe Seq("other_db.src")
+      SparkTimeTravelSql.unsupportedSnapshotPinReason(sql, Seq("default.src")).value should include("other_db.src")
+    }
+
+    it("flags a pin that resolves to several tracked sources") {
+      val sql = "SELECT id FROM t VERSION AS OF 2"
+      SparkTimeTravelSql.unresolvedPins(sql, Seq("db1.t", "db2.t")) should have size 1
+      SparkTimeTravelSql.unsupportedSnapshotPinReason(sql, Seq("db1.t", "db2.t")) shouldBe defined
+    }
+
+    it("accepts a pin that resolves to exactly one tracked source, qualified either way") {
+      SparkTimeTravelSql.unresolvedPins("SELECT id FROM sales VERSION AS OF 9", Seq("tpcdi.sales")) shouldBe empty
+      SparkTimeTravelSql.unresolvedPins("SELECT id FROM tpcdi.sales VERSION AS OF 9", Seq("sales")) shouldBe empty
+      SparkTimeTravelSql.unsupportedSnapshotPinReason(
+        "SELECT id FROM tpcdi.sales VERSION AS OF 9",
+        Seq("tpcdi.sales")
+      ) shouldBe None
+    }
+
+    it("skips the resolution check when no sources are supplied") {
+      SparkTimeTravelSql.unsupportedSnapshotPinReason("SELECT id FROM other_db.src VERSION AS OF 9", Nil) shouldBe None
+    }
+
+    it("reports the un-liftable shapes regardless of sources") {
+      SparkTimeTravelSql
+        .unsupportedSnapshotPinReason(
+          "SELECT a.id FROM src VERSION AS OF 2 a JOIN src VERSION AS OF 5 b ON a.id = b.id",
+          Seq("default.src")
+        )
+        .value should include("two different versions")
+    }
+  }
+
   describe("hasSnapshotPin") {
     it("is true only when a real pin is present") {
       SparkTimeTravelSql.hasSnapshotPin("SELECT id FROM src VERSION AS OF 3") shouldBe true
@@ -286,9 +441,9 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
   describe("hasUnsupportedSnapshotPin") {
     // OpenIVM re-applies a pin per SOURCE. Shapes it cannot honor were, until
     // now, caught by accident: the un-split body still carried `VERSION AS OF`,
-    // so DuckDB's parser aborted the compile. An LPTS front-end that accepts
-    // Spark's `temporalClause` (the alias fix at `dbac36d`, which also covers
-    // two-version reads) removes that accident, so the bridge has to recognise
+    // so DuckDB's parser aborted the compile. The pinned LPTS (`dbac36de`)
+    // accepts Spark's `temporalClause` — aliased and two-version reads
+    // included — which removes that accident, so the bridge has to recognise
     // them itself.
     it("is true for a source read at two different versions") {
       SparkTimeTravelSql.hasUnsupportedSnapshotPin(

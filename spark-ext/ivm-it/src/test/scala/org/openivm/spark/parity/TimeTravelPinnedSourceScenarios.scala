@@ -274,10 +274,10 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
   /** OpenIVM re-applies a pin per SOURCE, so a source read at two different
     * versions (or pinned in one place and live in another) has no single
     * version to freeze at. Those bodies used to be stopped by DuckDB's parser
-    * choking on `VERSION AS OF`; an LPTS front-end that accepts Spark's
-    * `temporalClause` — the alias fix at `dbac36d` also covers two-version
-    * reads — would let them compile with no pin registered and silently
-    * maintain a frozen relation from live rows.
+    * choking on `VERSION AS OF`; the pinned LPTS (`dbac36de`) accepts Spark's
+    * `temporalClause` — aliased and two-version reads included — so it would
+    * let them compile with no pin registered and silently maintain a frozen
+    * relation from live rows.
     *
     * The compile bridge refuses them itself, so the demotion is a deliberate,
     * loud FULL_REFRESH rather than an accident of the downstream parser, and
@@ -310,6 +310,199 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       refreshMv("ttp_mv_two_versions")
       assertMvCorrect("ttp_mv_two_versions", body)
       spark.table("ttp_mv_two_versions").count() shouldBe 2L
+    }
+  }
+
+  // ── §7: Source names where one is a prefix of another ─────────────────────
+
+  /** The pin is re-attached to openivm's `memory.main.<source>` reads by name.
+    * An unbounded string replace rewrites the shorter name INSIDE the longer
+    * one (`memory.main.customer` inside `memory.main.customer_address`), which
+    * either injects the clause mid-identifier or consumes the longer name so
+    * its own read is never pinned/qualified — a silent live read of a relation
+    * the user froze.
+    */
+  describe("(TTP-7) Sources whose names share a prefix") {
+    it("freezes the shorter-named source while the longer one stays live") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_cust(id INT, name STRING) USING DELTA")
+      sql("INSERT INTO ttp_cust VALUES (1, 'ann'), (2, 'bob')")
+      val pinned = latestVersion("ttp_cust")
+      sql("INSERT INTO ttp_cust VALUES (3, 'cyd')")
+
+      sql("CREATE TABLE IF NOT EXISTS ttp_cust_addr(id INT, city STRING) USING DELTA")
+      sql("INSERT INTO ttp_cust_addr VALUES (1, 'east'), (2, 'west'), (3, 'north')")
+
+      val body =
+        s"""select c.name, a.city
+           |from ttp_cust version as of $pinned as c
+           |inner join ttp_cust_addr as a on a.id = c.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_mv_prefix_short AS $body")
+      assertNotCompileFailed("ttp_mv_prefix_short")
+      assertMvCorrect("ttp_mv_prefix_short", body)
+      spark.table("ttp_mv_prefix_short").count() shouldBe 2L
+
+      sql("INSERT INTO ttp_cust VALUES (4, 'dee')")
+      sql("INSERT INTO ttp_cust_addr VALUES (4, 'south')")
+      refreshMv("ttp_mv_prefix_short")
+      assertMvCorrect("ttp_mv_prefix_short", body)
+      spark.table("ttp_mv_prefix_short").count() shouldBe 2L
+      assertNotCompileFailed("ttp_mv_prefix_short")
+    }
+
+    it("freezes the longer-named source while the shorter one stays live") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_pc(id INT, name STRING) USING DELTA")
+      sql("INSERT INTO ttp_pc VALUES (1, 'ann'), (2, 'bob')")
+
+      sql("CREATE TABLE IF NOT EXISTS ttp_pc_addr(id INT, city STRING) USING DELTA")
+      sql("INSERT INTO ttp_pc_addr VALUES (1, 'east'), (2, 'west')")
+      val pinned = latestVersion("ttp_pc_addr")
+      sql("INSERT INTO ttp_pc_addr VALUES (3, 'north')")
+
+      val body =
+        s"""select c.name, a.city
+           |from ttp_pc as c
+           |inner join ttp_pc_addr version as of $pinned as a on a.id = c.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_mv_prefix_long AS $body")
+      assertNotCompileFailed("ttp_mv_prefix_long")
+      assertMvCorrect("ttp_mv_prefix_long", body)
+      spark.table("ttp_mv_prefix_long").count() shouldBe 2L
+
+      sql("INSERT INTO ttp_pc VALUES (3, 'cyd')")
+      sql("INSERT INTO ttp_pc_addr VALUES (4, 'south')")
+      refreshMv("ttp_mv_prefix_long")
+      assertMvCorrect("ttp_mv_prefix_long", body)
+      spark.table("ttp_mv_prefix_long").count() shouldBe 2L
+      assertNotCompileFailed("ttp_mv_prefix_long")
+    }
+  }
+
+  // ── §8: Comments around a pin ─────────────────────────────────────────────
+
+  /** Scanning for the relation that a temporal clause belongs to must skip
+    * comment trivia rather than binding the comment's last word. `FROM t --
+    * freeze at load time\nVERSION AS OF n` used to bind `time`, which resolves
+    * to no tracked source: the split was accepted with no pin registered, so
+    * the relation the user froze was maintained from live rows.
+    */
+  describe("(TTP-8) A pin separated from its relation by a comment") {
+    it("binds the pin to the relation, not to a word inside a line comment") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_cmt_src(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_cmt_src VALUES (1, 'a', 10), (2, 'b', 20)")
+      val pinned = latestVersion("ttp_cmt_src")
+      sql("INSERT INTO ttp_cmt_src VALUES (3, 'a', 5)")
+
+      val body =
+        s"""select grp, sum(val) as total, count(*) as cnt
+           |from ttp_cmt_src -- freeze at load time
+           |version as of $pinned
+           |group by grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_mv_line_comment AS $body")
+      assertNotCompileFailed("ttp_mv_line_comment")
+      assertMvCorrect("ttp_mv_line_comment", body)
+      spark.table("ttp_mv_line_comment").selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+
+      sql("INSERT INTO ttp_cmt_src VALUES (4, 'b', 400)")
+      refreshMv("ttp_mv_line_comment")
+      assertMvCorrect("ttp_mv_line_comment", body)
+      spark.table("ttp_mv_line_comment").selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+    }
+
+    it("binds the pin across a block comment between the temporal keywords") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_cmt2_src(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_cmt2_src VALUES (1, 'a', 10), (2, 'b', 20)")
+      val pinned = latestVersion("ttp_cmt2_src")
+      sql("INSERT INTO ttp_cmt2_src VALUES (3, 'a', 5)")
+
+      val body =
+        s"""select grp, sum(val) as total, count(*) as cnt
+           |from ttp_cmt2_src /* dbt snapshot */ version /* keyword split */ as of $pinned as s
+           |group by grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_mv_block_comment AS $body")
+      assertNotCompileFailed("ttp_mv_block_comment")
+      assertMvCorrect("ttp_mv_block_comment", body)
+      spark.table("ttp_mv_block_comment").selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+
+      sql("INSERT INTO ttp_cmt2_src VALUES (4, 'b', 400)")
+      refreshMv("ttp_mv_block_comment")
+      assertMvCorrect("ttp_mv_block_comment", body)
+      spark.table("ttp_mv_block_comment").selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+    }
+  }
+
+  // ── §9: TIMESTAMP AS OF — frozen literals vs moving expressions ───────────
+
+  /** Backdate every Delta commit of `table` so a timestamp pin between the
+    * backdated commits and "now" resolves deterministically.
+    */
+  protected def backdateCommits(table: String, days: Int): Unit = {
+    val location = spark.sql(s"DESCRIBE DETAIL $table").select("location").head().getString(0)
+    val logDir   = new java.io.File(new java.io.File(new java.net.URI(location)), "_delta_log")
+    val target   = System.currentTimeMillis() - days * 24L * 60L * 60L * 1000L
+    Option(logDir.listFiles())
+      .getOrElse(Array.empty[java.io.File])
+      .filter(_.getName.endsWith(".json"))
+      .sortBy(_.getName)
+      .zipWithIndex
+      .foreach { case (file, i) => file.setLastModified(target + i * 1000L) }
+    org.apache.spark.sql.delta.DeltaLog.clearCache()
+  }
+
+  /** `<source>`, `<mv name>`. The source holds `(1,'a',10)`/`(2,'b',20)` in
+    * commits backdated three days, plus a post-pin `(3,'a',5)` committed now,
+    * so "yesterday" always resolves to the two-row snapshot.
+    */
+  protected def timestampPinnedFixture(suffix: String): (String, String) = {
+    val src = s"ttp_ts_src_$suffix"
+    sql(s"CREATE TABLE IF NOT EXISTS $src(id INT, grp STRING, val INT) USING DELTA")
+    sql(s"INSERT INTO $src VALUES (1, 'a', 10), (2, 'b', 20)")
+    backdateCommits(src, 3)
+    sql(s"INSERT INTO $src VALUES (3, 'a', 5)")
+    (src, s"ttp_ts_mv_$suffix")
+  }
+
+  describe("(TTP-9) A TIMESTAMP AS OF pin") {
+    it("stays incremental and frozen for a literal timestamp") {
+      val (_, mv)   = timestampPinnedFixture("lit")
+      val yesterday = java.time.LocalDate.now().minusDays(1).toString
+      val body =
+        s"""select grp, sum(val) as total, count(*) as cnt
+           |from ttp_ts_src_lit timestamp as of '$yesterday 00:00:00' as s
+           |group by grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW $mv AS $body")
+      assertNotCompileFailed(mv)
+      assertMvCorrect(mv, body)
+      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+
+      sql("INSERT INTO ttp_ts_src_lit VALUES (4, 'b', 400)")
+      refreshMv(mv)
+      assertMvCorrect(mv, body)
+      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+    }
+
+    /** A pin whose value is an expression re-evaluated on every refresh is not
+      * a frozen relation: the same body resolves to a different snapshot
+      * tomorrow, so no delta program can maintain it. The bridge refuses it
+      * loudly, and FULL_REFRESH re-executes the body — pin included — so the
+      * rows the user asked for stay correct.
+      */
+    it("is refused and demoted to FULL_REFRESH for a moving expression") {
+      val (src, mv) = timestampPinnedFixture("mov")
+      val body =
+        s"""select grp, sum(val) as total, count(*) as cnt
+           |from $src timestamp as of date_sub(current_date(), 1) as s
+           |group by grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW $mv AS $body")
+
+      val meta = mvMeta(mv)
+      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
+      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+      assertMvCorrect(mv, body)
+      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+
+      sql(s"INSERT INTO $src VALUES (4, 'b', 400)")
+      refreshMv(mv)
+      assertMvCorrect(mv, body)
+      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
     }
   }
 }

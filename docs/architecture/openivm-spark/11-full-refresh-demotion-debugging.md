@@ -705,7 +705,13 @@ pin-bump policy that goes with it. A view that reads ONE source at two different
 versions (or pinned in one place and live in another) is refused by the bridge
 itself with `cause=View '<name>' pins a source to a Delta snapshot in a shape
 OpenIVM cannot maintain incrementally` — that demotion is deliberate and the
-rows stay correct, see §7.2.
+rows stay correct, see §7.2. The same refusal covers a pin that resolves to no
+tracked source (or to several) and a MOVING pin value such as
+`TIMESTAMP AS OF current_timestamp()` or
+`TIMESTAMP AS OF date_sub(current_date(), 1)`: those name a different snapshot
+on every refresh, so only literal values (`VERSION AS OF 4`,
+`TIMESTAMP AS OF '2026-08-24 00:00:00'`) stay incremental. Rewrite the body with
+a literal snapshot if you want incremental maintenance.
 
 ### 5.2 Timeout and stderr caveat
 
