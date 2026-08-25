@@ -177,4 +177,95 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       )
     }
   }
+
+  // ── §5: dbt-shaped (aliased, backtick-qualified) pinned relations ─────────
+
+  /** `<db>.<dim>`, `<mv>`, pinned version. dbt renders every `ref()` as a
+    * backtick-qualified relation followed by an alias, so a pinned dbt model
+    * reads `` from `db`.`model` version as of N as p ``.
+    *
+    * That alias is the sharp edge: Spark's grammar is
+    * `identifierReference temporalClause? tableAlias`, so the clause sits
+    * BETWEEN the relation and its alias. A compiler front-end that forwards or
+    * re-emits the clause after the alias produces SQL that parses in neither
+    * dialect (the LPTS 66bf3ae aliased-pin defect). The bridge never lets the
+    * clause reach DuckDB, and re-attaches it ahead of the alias on the Spark
+    * side; these cases hold that end-to-end, in both dialect directions.
+    */
+  protected def dbtPinnedFixture(suffix: String): (String, String, Long) = {
+    val db  = "ttp_dbt_db"
+    val dim = s"$db.ttp_dbt_dim_$suffix"
+    val mv  = s"ttp_dbt_mv_$suffix"
+    sql(s"CREATE DATABASE IF NOT EXISTS $db")
+    sql(s"CREATE TABLE IF NOT EXISTS $dim(id INT, grp STRING, val INT) USING DELTA")
+    sql(s"INSERT INTO $dim VALUES (1, 'a', 10), (2, 'b', 20)")
+    val pinned = latestVersion(dim)
+    sql(s"INSERT INTO $dim VALUES (3, 'a', 5)")
+    sql(s"CREATE MATERIALIZED VIEW $mv AS ${dbtPinnedBody(suffix, pinned)}")
+    (dim, mv, pinned)
+  }
+
+  /** The body a dbt model compiles to: lower-cased, backtick-qualified,
+    * CTE-wrapped and aliased.
+    */
+  protected def dbtPinnedBody(suffix: String, pinned: Long): String =
+    s"""with source as (
+       |    select p.id, p.grp, p.val
+       |    from `ttp_dbt_db`.`ttp_dbt_dim_$suffix` version as of $pinned as p
+       |),
+       |final as (
+       |    select grp, sum(val) as total, count(*) as cnt
+       |    from source
+       |    group by grp
+       |)
+       |select grp, total, cnt from final""".stripMargin
+
+  describe("(TTP-5) A dbt-shaped model whose pinned relation carries an alias") {
+    it("classifies incrementally instead of recording COMPILE_FAILED") {
+      val (_, mv, pinned) = dbtPinnedFixture("cls")
+      assertNotCompileFailed(mv)
+      mvMeta(mv).querySql should include(s"version as of $pinned as p")
+    }
+
+    it("loads the pinned snapshot through the alias") {
+      val (_, mv, pinned) = dbtPinnedFixture("load")
+      assertMvCorrect(mv, dbtPinnedBody("load", pinned))
+      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+    }
+
+    it("keeps the aliased relation frozen across a refresh") {
+      val (dim, mv, pinned) = dbtPinnedFixture("frozen")
+      val before            = mvMeta(mv).lastVersion
+      sql(s"INSERT INTO $dim VALUES (4, 'b', 400), (5, 'c', 500)")
+      refreshMv(mv)
+      assertMvCorrect(mv, dbtPinnedBody("frozen", pinned))
+      assertNotCompileFailed(mv)
+      mvMeta(mv).lastVersion shouldBe before
+    }
+
+    it("maintains a live aliased fact against a frozen aliased dbt dimension") {
+      val db = "ttp_dbt_db"
+      sql(s"CREATE DATABASE IF NOT EXISTS $db")
+      sql(s"CREATE TABLE IF NOT EXISTS $db.ttp_dbt_jdim(dim_id INT, region STRING) USING DELTA")
+      sql(s"INSERT INTO $db.ttp_dbt_jdim VALUES (1, 'east'), (2, 'west')")
+      val pinned = latestVersion(s"$db.ttp_dbt_jdim")
+      sql(s"INSERT INTO $db.ttp_dbt_jdim VALUES (3, 'north')")
+
+      sql(s"CREATE TABLE IF NOT EXISTS $db.ttp_dbt_jfact(fact_id INT, dim_id INT, amount INT) USING DELTA")
+      sql(s"INSERT INTO $db.ttp_dbt_jfact VALUES (1, 1, 100), (2, 2, 200)")
+
+      val body =
+        s"""select d.region, f.amount
+           |from `ttp_dbt_db`.`ttp_dbt_jdim` version as of $pinned as d
+           |inner join `ttp_dbt_db`.`ttp_dbt_jfact` as f on f.dim_id = d.dim_id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW ttp_dbt_mv_join AS $body")
+      assertNotCompileFailed("ttp_dbt_mv_join")
+      assertMvCorrect("ttp_dbt_mv_join", body)
+
+      sql(s"INSERT INTO $db.ttp_dbt_jfact VALUES (3, 1, 50), (4, 3, 999)")
+      refreshMv("ttp_dbt_mv_join")
+      assertMvCorrect("ttp_dbt_mv_join", body)
+      spark.table("ttp_dbt_mv_join").where("amount = 999").count() shouldBe 0L
+    }
+  }
 }

@@ -699,7 +699,9 @@ and re-applied to everything Spark executes; see
 `docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7. If you see
 `reason='compile_failed'` on a pinned view, check that the pin shape is one the
 splitter recognises — an unrecognised shape is deliberately passed through
-unchanged so the failure stays loud.
+unchanged so the failure stays loud. dbt bodies pin an ALIASED relation
+(`` from `db`.`model` version as of 366 as p ``); §7.1 covers that shape and the
+LPTS `66bf3ae` hold that goes with it.
 
 ### 5.2 Timeout and stderr caveat
 

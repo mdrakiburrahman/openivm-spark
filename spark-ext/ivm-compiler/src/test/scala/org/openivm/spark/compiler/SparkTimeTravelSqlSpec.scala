@@ -162,6 +162,118 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  /** Aliased relations are the shape dbt emits for every `ref()`
+    * (`` from `cat`.`sch`.`model` as p ``), and they are also where a
+    * pin-aware LPTS front-end is easiest to get wrong: Spark's grammar is
+    * `identifierReference temporalClause? tableAlias`, so the clause sits
+    * BETWEEN the relation and its alias. Re-emitting it after the alias
+    * (`... p VERSION AS OF 2`) is invalid in both dialects.
+    *
+    * The bridge sidesteps that entirely — the clause never reaches DuckDB —
+    * but only if the split keeps the alias attached to the relation, and only
+    * if the alias is never mistaken for part of the version value or for the
+    * pinned relation itself. These cases lock that down.
+    */
+  describe("split — aliased dbt-style relations") {
+    it("keeps a bare alias attached to the relation and pins the relation, not the alias") {
+      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.dim VERSION AS OF 2 p WHERE p.id > 1")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim p WHERE p.id > 1"
+      split.pins.map(_.tableRef) shouldBe Seq("db.dim")
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 2")
+    }
+
+    it("keeps an AS alias attached to the relation") {
+      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.dim VERSION AS OF 2 AS p")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim AS p"
+      split.pins.map(_.tableRef) shouldBe Seq("db.dim")
+    }
+
+    it("keeps the alias of a backtick-qualified dbt relation") {
+      val sql =
+        "select p.grp, sum(p.val) as total " +
+          "from `spark_catalog`.`analytics`.`billing_meter_dim` version as of 366 as p " +
+          "group by p.grp"
+      val split = SparkTimeTravelSql.split(sql)
+      normalized(split.sql) shouldBe
+        "select p.grp, sum(p.val) as total from `spark_catalog`.`analytics`.`billing_meter_dim` as p group by p.grp"
+      split.pins.map(_.segments) shouldBe Seq(Seq("spark_catalog", "analytics", "billing_meter_dim"))
+      split.pins.map(_.shortName) shouldBe Seq("billing_meter_dim")
+    }
+
+    it("keeps the alias of a pinned relation inside a dbt CTE chain") {
+      val sql =
+        """with source as (
+          |  select id, grp, val from `cat`.`sch`.`dim` version as of 366 as d
+          |),
+          |renamed as (
+          |  select id as dim_id, grp, val from source
+          |)
+          |select grp, sum(val) as total from renamed group by grp""".stripMargin
+      val split = SparkTimeTravelSql.split(sql)
+      normalized(split.sql) should include("from `cat`.`sch`.`dim` as d")
+      split.pins.map(_.shortName) shouldBe Seq("dim")
+    }
+
+    it("keeps both aliases when only one side of a dbt-style join is pinned") {
+      val sql =
+        "select d.region, f.amount from `cat`.`sch`.`dim` version as of 2 as d " +
+          "inner join `cat`.`sch`.`fact` as f on f.dim_id = d.dim_id"
+      val split = SparkTimeTravelSql.split(sql)
+      normalized(split.sql) shouldBe
+        "select d.region, f.amount from `cat`.`sch`.`dim` as d " +
+        "inner join `cat`.`sch`.`fact` as f on f.dim_id = d.dim_id"
+      split.pins.map(_.shortName) shouldBe Seq("dim")
+    }
+
+    it("keeps an alias written on the next line") {
+      val split = SparkTimeTravelSql.split("SELECT p.id\nFROM db.dim VERSION AS OF 2\n  AS p")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim AS p"
+      split.pins.map(_.clause) shouldBe Seq("VERSION AS OF 2")
+    }
+
+    it("does not swallow the alias into a TIMESTAMP pin value") {
+      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.dim TIMESTAMP AS OF '2024-01-01' p")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim p"
+      split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF '2024-01-01'")
+    }
+
+    it("does not swallow the alias into a function-valued TIMESTAMP pin") {
+      val split = SparkTimeTravelSql.split("SELECT p.id FROM db.dim TIMESTAMP AS OF current_timestamp() AS p")
+      normalized(split.sql) shouldBe "SELECT p.id FROM db.dim AS p"
+      split.pins.map(_.clause) shouldBe Seq("TIMESTAMP AS OF current_timestamp()")
+    }
+
+    it("never emits a temporal clause after the alias") {
+      val bodies = Seq(
+        "SELECT p.id FROM db.dim VERSION AS OF 2 p",
+        "SELECT p.id FROM db.dim VERSION AS OF 2 AS p",
+        "select p.id from `cat`.`sch`.`dim` version as of 2 as p",
+        "SELECT p.id FROM db.dim TIMESTAMP AS OF '2024-01-01' p"
+      )
+      bodies.foreach { sql =>
+        val split = SparkTimeTravelSql.split(sql)
+        withClue(s"$sql -> ${split.sql}: ") {
+          split.pins should have size 1
+          split.sql.toUpperCase should not include "AS OF"
+          normalized(split.sql) should endWith("p")
+        }
+      }
+    }
+
+    it("leaves an aliased but unpinned dbt relation byte-identical") {
+      val sql = "select p.grp from `cat`.`sch`.`dim` as p"
+      SparkTimeTravelSql.split(sql).sql shouldBe sql
+      SparkTimeTravelSql.split(sql).pins shouldBe empty
+    }
+
+    it("resolves an aliased pin against the qualified source, ignoring the alias") {
+      val sql = "select p.grp from `cat`.`sch`.`dim` version as of 2 as p"
+      SparkTimeTravelSql.pinsByQualifiedSource(sql, Seq("cat.sch.dim")) shouldBe
+        Map("cat.sch.dim" -> "version as of 2")
+      SparkTimeTravelSql.pinsByQualifiedSource(sql, Seq("cat.sch.p")) shouldBe empty
+    }
+  }
+
   describe("hasSnapshotPin") {
     it("is true only when a real pin is present") {
       SparkTimeTravelSql.hasSnapshotPin("SELECT id FROM src VERSION AS OF 3") shouldBe true

@@ -2105,6 +2105,27 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       ).statements.head
       rewritten should include("VERSION AS OF 17")
     }
+
+    // Spark's grammar is `identifierReference temporalClause? tableAlias`, so a
+    // re-applied pin must land BETWEEN the relation and any alias openivm
+    // carried through. `... `accounts` p VERSION AS OF 366` would not parse.
+    it("re-applies the pin before a bare alias on the source read") {
+      val aliased = pinnedSource.replace("FROM memory.main.accounts", "FROM memory.main.accounts p")
+      val stmt    = rewriteWithPins(aliased, Map("accounts" -> "VERSION AS OF 366")).statements.head
+      stmt should include("FROM `accounts` VERSION AS OF 366 p")
+      stmt should not include "p VERSION AS OF"
+    }
+
+    it("re-applies the pin before an AS alias on a qualified source read") {
+      val aliased = pinnedSource.replace("FROM memory.main.accounts", "FROM memory.main.accounts AS p")
+      val stmt = rewriteWithPins(
+        aliased,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        qualified = Map("accounts" -> "db.accounts")
+      ).statements.head
+      stmt should include("FROM `db`.`accounts` VERSION AS OF 366 AS p")
+      stmt should not include "AS p VERSION AS OF"
+    }
   }
 
   describe("deduplicateCteColumnAliases") {

@@ -449,6 +449,31 @@ If LPTS later grows a Spark-dialect front-end that accepts (and ignores)
 `temporalClause`, the split stays useful: it keeps the DuckDB-side body free of
 storage semantics that DuckDB cannot bind.
 
+### 7.1 Aliased relations (the dbt shape)
+
+Spark's grammar is `identifierReference temporalClause? tableAlias`, so the pin
+sits BETWEEN the relation and its alias:
+
+```sql
+from `analytics`.`billing_meter_dim` version as of 366 as p
+```
+
+That is the shape dbt emits for every `ref()`, and it is the shape a pin-aware
+compiler front-end gets wrong: LPTS `66bf3ae` re-emits the clause after the
+alias, which is invalid in both dialects.
+The bridge is unaffected because the clause never reaches LPTS/DuckDB — the
+split removes it and leaves `` from `analytics`.`billing_meter_dim` as p `` —
+and every Spark-side re-application inserts the clause immediately after the
+relation identifier, ahead of the alias.
+
+> **Dependency hold.** Do not pin `spark-ext/dev/pins.env` to LPTS `66bf3ae`
+> for this work. `LPTS_COMMIT` stays at `b3baf0bb`; the fix here needs no LPTS
+> change. The aliased-pin defect is tracked downstream by the
+> `split — aliased dbt-style relations` cases in `SparkTimeTravelSqlSpec`, test
+> 7d of `OpenIvmCompilerSpec` (compiled against a live DuckDB), the pin-ordering
+> cases in `SparkRefreshRewriterSpec`, and `(TTP-5)` in
+> `TimeTravelPinnedSourceScenarios`.
+
 ## 8. Process model and timeout behavior
 
 Each `compile()` call creates a new process.

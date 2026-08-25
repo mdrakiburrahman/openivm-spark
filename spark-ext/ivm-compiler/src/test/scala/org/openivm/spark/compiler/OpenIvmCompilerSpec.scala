@@ -398,6 +398,81 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.initialLoadSql.toUpperCase should not include "VERSION AS OF"
   }
 
+  // ── Test 7d: Aliased (dbt-shaped) pinned relations ────────────────────────
+  //
+  // dbt renders every `ref()` as a backtick-qualified relation with an alias,
+  // and Spark puts the temporal clause BETWEEN the relation and its alias
+  // (`identifierReference temporalClause? tableAlias`). Splitting the clause
+  // out has to keep the alias attached to the relation, otherwise the SQL that
+  // reaches DuckDB is either invalid or silently refers to the wrong relation.
+  // These compile against a live DuckDB, so an invalid de-pinned body shows up
+  // as a COMPILE_FAILED classification rather than a string mismatch.
+
+  it should "classify a dbt-shaped view whose pinned relation carries a bare alias" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_alias_bare",
+      viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 p GROUP BY p.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+    result.sql should not be empty
+  }
+
+  it should "classify a dbt-shaped view whose pinned relation carries an AS alias" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_alias_as",
+      viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 AS p GROUP BY p.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+  }
+
+  it should "classify a dbt-shaped CTE model whose pinned relation carries an alias" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_alias_cte",
+      viewSql = "WITH source AS (SELECT p.region, p.amount FROM tpcdi.sales VERSION AS OF 366 AS p) " +
+        "SELECT region, SUM(amount) AS total FROM source GROUP BY region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshTypeName shouldBe "AGGREGATE_GROUP"
+  }
+
+  it should "classify an aliased join whose pinned side is dbt-shaped" in {
+    val depts = StructType.fromDDL("dept_id INT, dept_name STRING")
+    val emps  = StructType.fromDDL("emp_id INT, dept_id INT, name STRING")
+    val req = CompileRequest(
+      viewName = "mv_pinned_alias_join",
+      viewSql = "SELECT e.emp_id, d.dept_name FROM tpcdi.employees AS e " +
+        "JOIN tpcdi.departments VERSION AS OF 5 AS d ON e.dept_id = d.dept_id",
+      sources = Map("employees" -> emps, "departments" -> depts),
+      sourceQualifiedNames = Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments")
+    )
+    val result = sharedCompiler.compile(req)
+    result.refreshType should be >= 0
+    result.sql should not be empty
+  }
+
+  it should "re-apply the snapshot pin before the alias in the Spark-side initial-load SQL" in {
+    val req = CompileRequest(
+      viewName = "mv_pinned_alias_initial_load",
+      viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 AS p GROUP BY p.region",
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+    )
+    val result = sharedCompiler.compile(req)
+    result.initialLoadSql should not be empty
+    result.initialLoadSql should include("tpcdi.sales VERSION AS OF 366")
+    result.initialLoadSql should not include "memory.main."
+    // The pin must never trail the alias — that order parses in neither dialect.
+    """(?i)\bAS\s+p\s+VERSION\s+AS\s+OF""".r.findFirstIn(result.initialLoadSql) shouldBe None
+  }
+
   it should "emit RELY FK declarations for qualified compile facts when opted in" in {
     val req = CompileRequest(
       viewName = "mv_relyfk_script",
