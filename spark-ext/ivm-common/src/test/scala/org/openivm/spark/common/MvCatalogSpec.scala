@@ -322,37 +322,69 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
   }
 
   describe("MvMetadata time-travel pin telemetry") {
-    it("round-trips the pin status and identity through the catalog") {
+    it("round-trips the pin status, reason and identity through the catalog") {
       val pins = Seq(
         "db.customer_address=VERSION AS OF 7",
         "db.customer=VERSION AS OF 3"
       )
       val original = sampleMeta("pin_rt").copy(
-        properties = MvMetadata.timeTravelPinProperties(TimeTravelPinStatus.Applied, pins)
+        properties = MvMetadata.timeTravelPinProperties(
+          TimeTravelPinStatus.Applied,
+          pins,
+          TimeTravelPinReason.PinsResolved
+        )
       )
       MvCatalog.upsert(spark, original)
 
       val stored = MvCatalog.lookup(spark, original.name).get
       stored.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      stored.timeTravelPinReason shouldBe Some(TimeTravelPinReason.PinsResolved)
       stored.timeTravelPins shouldBe Seq("db.customer=VERSION AS OF 3", "db.customer_address=VERSION AS OF 7")
       stored.properties(MvMetadata.TimeTravelPinsKey) shouldBe
         "db.customer=VERSION AS OF 3;db.customer_address=VERSION AS OF 7"
     }
 
+    it("stores a quoted clause verbatim so REFRESH can compare it byte for byte") {
+      val pins = Seq("db.events=TIMESTAMP AS OF '2024-01-01'")
+      val props = MvMetadata.timeTravelPinProperties(
+        TimeTravelPinStatus.Applied,
+        pins,
+        TimeTravelPinReason.PinsResolved
+      )
+      val original = sampleMeta("pin_quoted").copy(properties = props)
+      MvCatalog.upsert(spark, original)
+
+      MvCatalog.lookup(spark, original.name).get.timeTravelPins shouldBe pins
+    }
+
     it("omits the pin list when the view has no resolved pin") {
-      val props = MvMetadata.timeTravelPinProperties(TimeTravelPinStatus.NotApplicable, Seq.empty)
-      props shouldBe Map(MvMetadata.TimeTravelPinStatusKey -> TimeTravelPinStatus.NotApplicable)
+      val props = MvMetadata.timeTravelPinProperties(
+        TimeTravelPinStatus.NotApplicable,
+        Seq.empty,
+        TimeTravelPinReason.NoUserPin
+      )
+      props shouldBe Map(
+        MvMetadata.TimeTravelPinStatusKey -> TimeTravelPinStatus.NotApplicable,
+        MvMetadata.TimeTravelPinReasonKey -> TimeTravelPinReason.NoUserPin
+      )
       sampleMeta("pin_none").copy(properties = props).timeTravelPins shouldBe empty
     }
 
-    it("treats a legacy or unrecognised status as absent rather than as NOT_APPLICABLE") {
+    it("treats a legacy status as absent but a corrupt one as refused") {
       sampleMeta("pin_legacy").copy(properties = Map.empty).timeTravelPinStatus shouldBe None
-      sampleMeta("pin_bogus")
+
+      // Fail-closed: a property outside the vocabulary must not read as
+      // "not persisted" (which silently re-derives) nor as NOT_APPLICABLE.
+      val corrupt = sampleMeta("pin_bogus")
         .copy(properties = Map(MvMetadata.TimeTravelPinStatusKey -> "MAYBE"))
-        .timeTravelPinStatus shouldBe None
-      MvMetadata.timeTravelPinProperties("MAYBE", Seq("db.t=VERSION AS OF 1")) should not contain key(
-        MvMetadata.TimeTravelPinStatusKey
-      )
+      corrupt.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      corrupt.timeTravelPinStatusRaw shouldBe Some("MAYBE")
+
+      MvMetadata.timeTravelPinProperties(
+        "MAYBE",
+        Seq("db.t=VERSION AS OF 1"),
+        "who_knows"
+      ) shouldBe Map(MvMetadata.TimeTravelPinsKey -> "db.t=VERSION AS OF 1")
     }
   }
 

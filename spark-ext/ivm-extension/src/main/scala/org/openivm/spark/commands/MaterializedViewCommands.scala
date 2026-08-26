@@ -33,7 +33,7 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
-import org.openivm.spark.telemetry.OpenIvmExecutionSpan
+import org.openivm.spark.telemetry.{KvLogValue, OpenIvmExecutionSpan}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -406,6 +406,24 @@ private[commands] object MvCommandHelper {
     val parts = id.catalog.toSeq ++ id.database.toSeq ++ Seq(id.table)
     parts.map(p => s"`${p.replace("`", "``")}`").mkString(".")
   }
+
+  /** Snapshot-pin fields for an `[openivm-mv]` classification line, in one
+    * place so CREATE and REFRESH report the contract identically.
+    *
+    * Every value goes through [[KvLogValue]]: a `TIMESTAMP AS OF '2024-01-01'`
+    * clause carries single quotes, and the line's own `key='value'` framing is
+    * scanned with `(\w+)='([^']*)'` — an unescaped quote would truncate
+    * `time_travel_pins` to its prefix, silently dropping the pinned value a pin
+    * audit exists to check. The MV metadata keeps the clause verbatim; only the
+    * log rendering is sanitized.
+    */
+  def pinTelemetryKv(status: String, reason: String, pins: Seq[String]): String =
+    KvLogValue.render("time_travel_pin_status", status) +
+      KvLogValue.renderIfPresent("time_travel_pin_reason", reason) +
+      KvLogValue.renderIfPresent(
+        "time_travel_pins",
+        Option(pins).getOrElse(Seq.empty).mkString(MvMetadata.TimeTravelPinSeparator)
+      )
 
   def createDataWriteSql(
       location: String,
@@ -1342,11 +1360,12 @@ case class CreateMaterializedViewCommand(
     // Snapshot-pin telemetry contract.  Derived from the USER's body plus this
     // view's tracked sources — never from compiled text, whose delta statements
     // carry no temporal clause even when the sources are frozen exactly as
-    // pinned.  Recorded before the compile so a refused pin still reports its
-    // status on the CREATE span.
-    val timeTravelPinStatus = SparkTimeTravelSql.pinStatus(originalQueryText, qualNames)
-    val timeTravelPins      = SparkTimeTravelSql.pinIdentity(originalQueryText, qualNames)
-    OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(timeTravelPinStatus)
+    // pinned.  `SparkTimeTravelSql.pinTelemetry` is the single derivation used
+    // by CREATE and REFRESH alike, so the status is operation-invariant.
+    // Recorded before the compile so a refused pin still reports its status on
+    // the CREATE span.
+    val pinTelemetry = SparkTimeTravelSql.pinTelemetry(originalQueryText, qualNames)
+    OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(pinTelemetry.status, pinTelemetry.reason)
 
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
     val groupKeys      = extractGroupKeys(analyzed)
@@ -1412,7 +1431,8 @@ case class CreateMaterializedViewCommand(
           logError(
             s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='COMPILE_FAILED' " +
               s"effective_refresh_type='FULL_REFRESH' reason='compile_failed' " +
-              s"time_travel_pin_status='$timeTravelPinStatus' cause=${e.getMessage}"
+              MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
+              s" cause=${e.getMessage}"
           )
           org.openivm.spark.compiler.CompiledRefresh(
             refreshType = RefreshTypeCode.FullRefresh,
@@ -1577,8 +1597,7 @@ case class CreateMaterializedViewCommand(
         s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
           s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
           s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
-          s"time_travel_pin_status='$timeTravelPinStatus'" +
-          (if (timeTravelPins.isEmpty) "" else s" time_travel_pins='${timeTravelPins.mkString(";")}'") +
+          MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
           classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
       if (classification.isDemotionToFullRefresh)
         logError(msg)
@@ -1616,7 +1635,8 @@ case class CreateMaterializedViewCommand(
       )
     // Persisted so a REFRESH reports the same pin status without re-deriving it
     // from the generated delta statements, which never carry the clause.
-    val timeTravelPinProps = MvMetadata.timeTravelPinProperties(timeTravelPinStatus, timeTravelPins)
+    val timeTravelPinProps =
+      MvMetadata.timeTravelPinProperties(pinTelemetry.status, pinTelemetry.pins, pinTelemetry.reason)
 
     // Fingerprint the current source schemas + every upstream MV's identity
     // hash. Captures schema drift AND upstream-body drift (DROP + recreate
@@ -2121,30 +2141,34 @@ case class RefreshMaterializedViewCommand(
       val sourceWatermarks = meta.changeWatermarks
 
       // Snapshot-pin telemetry contract.  The status recorded at CREATE is
-      // authoritative and is re-proved here against the user's body: a REFRESH
-      // must keep reporting `APPLIED` even though the generated delta program
-      // carries no temporal clause of its own.  A persisted status or pin
-      // identity that no longer matches the body means the frozen relations are
-      // not what the recorded status claims — fail closed rather than emit a
-      // status a hydrate guard would trust.
-      val derivedPinStatus = SparkTimeTravelSql.pinStatus(meta.querySql, meta.sourceTables)
-      val derivedPins      = SparkTimeTravelSql.pinIdentity(meta.querySql, meta.sourceTables)
+      // authoritative and is re-proved here against the user's body through the
+      // SAME `pinTelemetry` derivation CREATE used, so the value is
+      // operation-invariant: a REFRESH keeps reporting `APPLIED` even though the
+      // generated delta program carries no temporal clause of its own.  A
+      // persisted status or pin identity that no longer matches the body means
+      // the frozen relations are not what the recorded status claims — fail
+      // closed rather than emit a status a hydrate guard would trust.
+      val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables)
       meta.timeTravelPinStatus.foreach { persisted =>
-        val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPins
-        if (persisted != derivedPinStatus || !pinsAgree) {
+        val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
+        if (persisted != derivedPin.status || !pinsAgree) {
+          // A persisted value outside the contract vocabulary reads as
+          // COMPILE_FAILED (fail-closed), so corruption lands here too instead
+          // of being silently re-derived from the body.
+          val recorded = meta.timeTravelPinStatusRaw.getOrElse(persisted)
           throw new IllegalStateException(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' snapshot-pin metadata disagrees with the view body: " +
-              s"recorded status='$persisted' pins='${meta.timeTravelPins.mkString(";")}' but the body resolves to " +
-              s"status='$derivedPinStatus' pins='${derivedPins.mkString(";")}'. Recreate the view."
+              s"recorded status='$recorded' pins='${meta.timeTravelPins.mkString(MvMetadata.TimeTravelPinSeparator)}' " +
+              s"but the body resolves to status='${derivedPin.status}' " +
+              s"pins='${derivedPin.pins.mkString(MvMetadata.TimeTravelPinSeparator)}'. Recreate the view."
           )
         }
       }
-      val timeTravelPinStatus = meta.timeTravelPinStatus.getOrElse(derivedPinStatus)
-      OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(timeTravelPinStatus)
+      val timeTravelPinStatus = meta.timeTravelPinStatus.getOrElse(derivedPin.status)
+      OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(timeTravelPinStatus, derivedPin.reason)
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
-          s"time_travel_pin_status='$timeTravelPinStatus'" +
-          (if (derivedPins.isEmpty) "" else s" time_travel_pins='${derivedPins.mkString(";")}'")
+          MvCommandHelper.pinTelemetryKv(timeTravelPinStatus, derivedPin.reason, derivedPin.pins)
       )
 
       // A source the view body pinned to a snapshot (`… VERSION AS OF 366`) is a

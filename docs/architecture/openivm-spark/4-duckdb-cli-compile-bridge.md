@@ -565,13 +565,14 @@ compare against `APPLIED` exactly, never infer it from compiled text.
 
 Two properties make that contract safe:
 
-- **Derived from the USER's body.** `SparkTimeTravelSql.pinStatus(sql,
+- **Derived from the USER's body.** `SparkTimeTravelSql.pinTelemetry(sql,
   qualifiedSources)` reads `MvMetadata.querySql` plus the view's tracked
   sources. It is never derived from the compiled program: openivm's delta
   statements legitimately carry no temporal clause even though every source
   read in them is re-pinned by `SparkRefreshRewriter`.
 - **Persisted, then re-proved.** CREATE writes
-  `_ivm_time_travel_pin_status` and `_ivm_time_travel_pins`
+  `_ivm_time_travel_pin_status`, `_ivm_time_travel_pin_reason` and
+  `_ivm_time_travel_pins`
   (`<qualified source>=<clause>`, sorted, `;`-joined) into the MV metadata, so
   REFRESH reports `APPLIED` from metadata rather than from whatever SQL it is
   about to execute. REFRESH still re-derives both from the body and fails
@@ -583,7 +584,44 @@ Two properties make that contract safe:
 reason still re-executes `MvMetadata.querySql`, pin included. Only the refused
 pin shapes of [§7.2](#72-pin-shapes-openivm-refuses) report `COMPILE_FAILED`.
 
+#### `time_travel_pin_reason` — why the status is what it is
+
+The status alone cannot distinguish "the user wrote no pin" from "the pin was
+refused", so every emitter also reports a `time_travel_pin_reason` from
+`org.openivm.spark.common.TimeTravelPinReason`:
+
+| reason                            | paired status    | meaning                                                                   |
+| --------------------------------- | ---------------- | ------------------------------------------------------------------------- |
+| `pins_resolved`                   | `APPLIED`        | every user pin lifted and resolved to exactly one tracked source           |
+| `no_user_pin`                     | `NOT_APPLICABLE` | the body carries no temporal clause                                        |
+| `unsupported_pin_shape`           | `COMPILE_FAILED` | a refused shape from [§7.2](#72-pin-shapes-openivm-refuses)                |
+| `pin_not_resolved_to_single_source` | `COMPILE_FAILED` | a pin binds to zero or several tracked sources                           |
+| `no_tracked_sources`              | `COMPILE_FAILED` | the body pins a source but the view tracks none, so nothing can be frozen  |
+| `unknown_pin_status`              | `COMPILE_FAILED` | a status outside the vocabulary reached telemetry (see fail-closed, below) |
+
+Three further rules keep the pair trustworthy:
+
+- **Operation-invariant derivation.** `SparkTimeTravelSql.pinTelemetry(sql,
+  qualifiedSources)` is the only sanctioned way to produce the pair. CREATE
+  calls it with the user's body and the sources it collected; REFRESH calls it
+  with the SAME two values read back from `MvMetadata`, so one view cannot
+  report one status at CREATE and another at REFRESH.
+- **Fail closed on an unknown status.** A persisted or recorded status outside
+  the vocabulary reads as `COMPILE_FAILED`, never as absent and never as
+  `NOT_APPLICABLE`: softening it would let a corrupt property be silently
+  re-derived, and `NOT_APPLICABLE` is itself an assertion (that the user pinned
+  nothing) that corruption cannot support. A `COMPILE_FAILED` recorded on a
+  span is sticky.
+- **Quote-safe logging.** `[openivm-mv]` lines are `key='value'` text, not
+  JSON, and readers tokenize them with a `(\w+)='([^']*)'` scanner. A
+  `TIMESTAMP AS OF '2024-01-01'` clause therefore goes through
+  `org.openivm.spark.telemetry.KvLogValue` before it is logged (`'` → `"`,
+  control characters → space). The clause persisted in MV metadata is NOT
+  sanitized: the fail-closed CREATE-vs-REFRESH comparison must see exactly what
+  the user wrote.
+
 ## 8. Process model and timeout behavior
+
 Each `compile()` call creates a new process.
 The process is launched by `runCli()`.
 The command is:

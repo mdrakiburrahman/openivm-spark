@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
 import org.scalatest.OptionValues
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -585,6 +586,100 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
       val sql = "SELECT id FROM other_db.src VERSION AS OF 9"
       SparkTimeTravelSql.pinStatus(sql, Seq("default.src")) shouldBe "COMPILE_FAILED"
       SparkTimeTravelSql.pinIdentity(sql, Seq("default.src")) shouldBe empty
+    }
+  }
+
+  describe("pinTelemetry") {
+    it("is operation-invariant: the same body and sources yield the same telemetry") {
+      val sql     = "SELECT id FROM db.dim VERSION AS OF 366"
+      val sources = Seq("db.dim")
+
+      // CREATE derives from the user body + collected sources; REFRESH derives
+      // from the SAME two values read back from MvMetadata.
+      val atCreate  = SparkTimeTravelSql.pinTelemetry(sql, sources)
+      val atRefresh = SparkTimeTravelSql.pinTelemetry(sql, sources)
+
+      atRefresh shouldBe atCreate
+      atCreate.status shouldBe TimeTravelPinStatus.Applied
+      atCreate.reason shouldBe TimeTravelPinReason.PinsResolved
+      atCreate.pins shouldBe Seq("db.dim=VERSION AS OF 366")
+      atCreate.detail shouldBe None
+    }
+
+    it("reports NOT_APPLICABLE with no_user_pin for an unpinned body") {
+      val telemetry = SparkTimeTravelSql.pinTelemetry("SELECT id FROM db.src", Seq("db.src"))
+      telemetry.status shouldBe TimeTravelPinStatus.NotApplicable
+      telemetry.reason shouldBe TimeTravelPinReason.NoUserPin
+      telemetry.pins shouldBe empty
+    }
+
+    it("refuses a pinned body that tracks no source at all") {
+      val telemetry = SparkTimeTravelSql.pinTelemetry("SELECT id FROM db.src VERSION AS OF 3", Nil)
+      telemetry.status shouldBe TimeTravelPinStatus.CompileFailed
+      telemetry.reason shouldBe TimeTravelPinReason.NoTrackedSources
+      telemetry.pins shouldBe empty
+      telemetry.detail.value should include("tracks no source")
+    }
+
+    it("still reports NOT_APPLICABLE for an unpinned body with no tracked source") {
+      val telemetry = SparkTimeTravelSql.pinTelemetry("SELECT id FROM db.src", Nil)
+      telemetry.status shouldBe TimeTravelPinStatus.NotApplicable
+      telemetry.reason shouldBe TimeTravelPinReason.NoUserPin
+    }
+
+    it("lifts no pin identity for a refused body") {
+      val ambiguous =
+        SparkTimeTravelSql.pinTelemetry(
+          "SELECT a.id FROM db.src VERSION AS OF 1 a JOIN db.src VERSION AS OF 2 b ON a.id = b.id",
+          Seq("db.src")
+        )
+      ambiguous.status shouldBe TimeTravelPinStatus.CompileFailed
+      ambiguous.reason shouldBe TimeTravelPinReason.UnsupportedPinShape
+      ambiguous.pins shouldBe empty
+
+      val unresolved =
+        SparkTimeTravelSql.pinTelemetry("SELECT id FROM other_db.src VERSION AS OF 9", Seq("default.src"))
+      unresolved.status shouldBe TimeTravelPinStatus.CompileFailed
+      unresolved.reason shouldBe TimeTravelPinReason.PinNotResolvedToSingleSource
+      unresolved.pins shouldBe empty
+      unresolved.detail.value should include("other_db.src")
+    }
+
+    it("agrees with the compile bridge's own refusal check") {
+      val refused = Seq(
+        "SELECT a.id FROM db.src VERSION AS OF 1 a JOIN db.src VERSION AS OF 2 b ON a.id = b.id",
+        "SELECT id FROM other_db.src VERSION AS OF 9",
+        "SELECT id FROM db.src TIMESTAMP AS OF current_timestamp()"
+      )
+      refused.foreach { sql =>
+        withClue(s"$sql: ") {
+          SparkTimeTravelSql
+            .pinRefusal(sql, Seq("db.src"), requireTrackedSources = true)
+            .map(_.detail) shouldBe SparkTimeTravelSql.unsupportedSnapshotPinReason(
+            sql,
+            Seq("db.src"),
+            requireTrackedSources = true
+          )
+          SparkTimeTravelSql.pinTelemetry(sql, Seq("db.src")).status shouldBe TimeTravelPinStatus.CompileFailed
+        }
+      }
+    }
+
+    it("keeps every emitted reason inside the telemetry vocabulary") {
+      val bodies = Seq(
+        "SELECT id FROM db.src"                                                                  -> Seq("db.src"),
+        "SELECT id FROM db.src VERSION AS OF 3"                                                  -> Seq("db.src"),
+        "SELECT id FROM db.src VERSION AS OF 3"                                                  -> Nil,
+        "SELECT id FROM other_db.src VERSION AS OF 9"                                            -> Seq("db.src"),
+        "SELECT a.id FROM db.src VERSION AS OF 1 a JOIN db.src VERSION AS OF 2 b ON a.id = b.id" -> Seq("db.src")
+      )
+      bodies.foreach { case (sql, sources) =>
+        val telemetry = SparkTimeTravelSql.pinTelemetry(sql, sources)
+        withClue(s"$sql / $sources: ") {
+          TimeTravelPinStatus.All should contain(telemetry.status)
+          TimeTravelPinReason.All should contain(telemetry.reason)
+        }
+      }
     }
   }
 

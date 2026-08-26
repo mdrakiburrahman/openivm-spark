@@ -6,7 +6,7 @@ import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedRel
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.openivm.spark.common.TimeTravelPinStatus
+import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
 
 /** Splits Spark/Delta snapshot pins (`… VERSION AS OF <v>` / `… TIMESTAMP AS OF
   * <ts>`, a.k.a. Spark's `temporalClause`) out of a materialized-view body.
@@ -83,6 +83,27 @@ object SparkTimeTravelSql {
     * `pins` is empty exactly when `sql` is the untouched input.
     */
   final case class Split(sql: String, pins: Seq[SnapshotPin])
+
+  /** A refused pin shape: the stable
+    * [[org.openivm.spark.common.TimeTravelPinReason]] token consumers gate on,
+    * plus the operator-facing prose that names the offending relation.
+    */
+  final case class PinRefusal(reason: String, detail: String)
+
+  /** The snapshot-pin telemetry contract for one view body.
+    *
+    * @param status  [[org.openivm.spark.common.TimeTravelPinStatus]] value.
+    * @param pins    `<qualified source>=<clause>` identity of every frozen
+    *                relation, sorted; empty unless `status` is `APPLIED`.
+    * @param reason  [[org.openivm.spark.common.TimeTravelPinReason]] token.
+    * @param detail  operator-facing prose, present only for a refusal.
+    */
+  final case class PinTelemetry(
+      status: String,
+      pins: Seq[String],
+      reason: String,
+      detail: Option[String]
+  )
 
   /** A pin as the scanner lifted it, plus the parsed clause KIND and VALUE.
     * Those two are what binds the pin to the `RelationTimeTravel` node Spark's
@@ -178,7 +199,18 @@ object SparkTimeTravelSql {
   def hasUnsupportedSnapshotPin(sql: String): Boolean = unsupportedSnapshotPinReason(sql, Nil).isDefined
 
   /** Why `sql` carries a snapshot pin OpenIVM cannot maintain incrementally, or
-    * `None` when every pin (if any) is one it can honor.
+    * `None` when every pin (if any) is one it can honor. Prose form of
+    * [[pinRefusal]] — see there for the full rule set.
+    */
+  def unsupportedSnapshotPinReason(
+      sql: String,
+      qualifiedSources: Seq[String],
+      requireTrackedSources: Boolean = false
+  ): Option[String] =
+    pinRefusal(sql, qualifiedSources, requireTrackedSources).map(_.detail)
+
+  /** Structured refusal for `sql`, or `None` when every pin (if any) is one
+    * OpenIVM can honor.
     *
     * OpenIVM re-applies a pin per SOURCE, so it cannot honor:
     *
@@ -191,9 +223,13 @@ object SparkTimeTravelSql {
     *     different snapshot on every refresh;
     *   - a pin the scanner and Spark's parser do not agree on;
     *   - a pin that does not resolve to exactly one tracked source of the view
-    *     (`qualifiedSources`, empty to skip that check) — a pin that resolves to
-    *     none would silently maintain a frozen relation from live rows, and one
-    *     that resolves to several would freeze relations the user did not pin.
+    *     (`qualifiedSources`) — a pin that resolves to none would silently
+    *     maintain a frozen relation from live rows, and one that resolves to
+    *     several would freeze relations the user did not pin;
+    *   - with `requireTrackedSources`, a pinned body whose view tracks NO
+    *     source at all: nothing can be proven frozen, so reporting the pin as
+    *     honored would be an unbacked claim. Callers that only ask about the
+    *     pin SHAPE (no source list to check against) leave it `false`.
     *
     * Historically DuckDB's parser caught the un-liftable shapes for us — the
     * un-split body still carried `VERSION AS OF`, so the compile aborted and the
@@ -208,22 +244,41 @@ object SparkTimeTravelSql {
     * parse there is no evidence of a real pin, so they are passed through and
     * DuckDB decides, exactly as before.
     */
-  def unsupportedSnapshotPinReason(sql: String, qualifiedSources: Seq[String]): Option[String] = {
+  def pinRefusal(
+      sql: String,
+      qualifiedSources: Seq[String],
+      requireTrackedSources: Boolean = false
+  ): Option[PinRefusal] = {
     if (sql == null || sql.isEmpty) return None
     if (TemporalClauseGuard.findFirstIn(sql).isEmpty) return None
     val pins = split(sql).pins
     if (pins.isEmpty)
       if (parsePlan(sql).exists(plan => timeTravelCount(plan) > 0))
         Some(
-          "a source is read at two different versions, pinned in one place and read live in another, " +
-            "or pinned to a value that is not a stable literal"
+          PinRefusal(
+            TimeTravelPinReason.UnsupportedPinShape,
+            "a source is read at two different versions, pinned in one place and read live in another, " +
+              "or pinned to a value that is not a stable literal"
+          )
         )
       else None
-    else if (qualifiedSources.isEmpty) None
+    else if (qualifiedSources.isEmpty)
+      if (requireTrackedSources)
+        Some(
+          PinRefusal(
+            TimeTravelPinReason.NoTrackedSources,
+            "the view pins a source to a snapshot but tracks no source at all, so no relation can be " +
+              "proven frozen at the pinned snapshot"
+          )
+        )
+      else None
     else
       unresolvedPins(pins, qualifiedSources).headOption.map { pin =>
-        s"the pin on '${pin.tableRef}' does not resolve to exactly one tracked source " +
-          s"(sources: ${qualifiedSources.distinct.sorted.mkString(", ")})"
+        PinRefusal(
+          TimeTravelPinReason.PinNotResolvedToSingleSource,
+          s"the pin on '${pin.tableRef}' does not resolve to exactly one tracked source " +
+            s"(sources: ${qualifiedSources.distinct.sorted.mkString(", ")})"
+        )
       }
   }
 
@@ -288,25 +343,46 @@ object SparkTimeTravelSql {
   def unresolvedPins(sql: String, qualifiedSources: Seq[String]): Seq[SnapshotPin] =
     unresolvedPins(split(sql).pins, qualifiedSources)
 
-  /** Telemetry status of the user-authored pins in `sql`, evaluated against the
-    * view's tracked sources.
+  /** Telemetry of the user-authored pins in `sql`, evaluated against the view's
+    * tracked sources.
     *
     * This is the ONLY sanctioned way to derive
-    * [[org.openivm.spark.common.TimeTravelPinStatus]]: it reads the user's body,
-    * never the compiled/generated program, whose delta statements carry no
-    * temporal clause even when the sources are frozen exactly as pinned.
+    * [[org.openivm.spark.common.TimeTravelPinStatus]], and it is deliberately
+    * OPERATION-INVARIANT: CREATE and REFRESH call it with the same two inputs
+    * (the user's body — `MvMetadata.querySql` — and the view's tracked sources),
+    * so the same view cannot report one status at CREATE and another at
+    * REFRESH. It never reads compiled or generated SQL, whose delta statements
+    * carry no temporal clause even when every source read in them is re-pinned.
     *
     *   - `COMPILE_FAILED` when a pin is present but un-maintainable
-    *     ([[unsupportedSnapshotPinReason]] — checked first, because those bodies
-    *     deliberately lift NO pin);
+    *     ([[pinRefusal]] — checked first, because those bodies deliberately lift
+    *     NO pin, and with `requireTrackedSources` so a pinned body with no
+    *     tracked source can never be reported as honored);
     *   - `APPLIED` when every pin lifted and resolved to exactly one source, so
     *     the engine freezes that source at the pinned snapshot;
     *   - `NOT_APPLICABLE` when the body carries no pin at all.
+    *
+    * A refused body reports NO pin identity: nothing was frozen, so persisting
+    * `<source>=<clause>` entries for it would claim otherwise.
     */
+  def pinTelemetry(sql: String, qualifiedSources: Seq[String]): PinTelemetry =
+    pinRefusal(sql, qualifiedSources, requireTrackedSources = true) match {
+      case Some(refusal) =>
+        PinTelemetry(TimeTravelPinStatus.CompileFailed, Seq.empty, refusal.reason, Some(refusal.detail))
+      case None if hasSnapshotPin(sql) =>
+        PinTelemetry(
+          TimeTravelPinStatus.Applied,
+          pinIdentity(sql, qualifiedSources),
+          TimeTravelPinReason.PinsResolved,
+          None
+        )
+      case None =>
+        PinTelemetry(TimeTravelPinStatus.NotApplicable, Seq.empty, TimeTravelPinReason.NoUserPin, None)
+    }
+
+  /** Status component of [[pinTelemetry]]. */
   def pinStatus(sql: String, qualifiedSources: Seq[String]): String =
-    if (unsupportedSnapshotPinReason(sql, qualifiedSources).isDefined) TimeTravelPinStatus.CompileFailed
-    else if (hasSnapshotPin(sql)) TimeTravelPinStatus.Applied
-    else TimeTravelPinStatus.NotApplicable
+    pinTelemetry(sql, qualifiedSources).status
 
   /** Identity of every resolved pin as `<qualified source>=<clause>`, sorted by
     * source. Persisted at CREATE so REFRESH can prove the status it reports

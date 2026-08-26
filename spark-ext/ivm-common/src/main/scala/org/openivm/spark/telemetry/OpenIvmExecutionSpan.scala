@@ -3,7 +3,7 @@ package org.openivm.spark.telemetry
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.TimeTravelPinStatus
+import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
 import org.slf4j.MDC
 
 import java.time.Instant
@@ -25,6 +25,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
 
   private var refreshClassification            = OpenIvmExecutionSpan.RefreshClassification.empty
   private var timeTravelPinStatus              = Option.empty[String]
+  private var timeTravelPinReason              = Option.empty[String]
   private var sameMvLockWaitMs                 = Option.empty[Long]
   private var driverAdmissionMs                = Option.empty[Long]
   private var catalogPublicationAdmissionWidth = Option.empty[Int]
@@ -186,14 +187,26 @@ final class OpenIvmExecutionSpan private[telemetry] (
     }
 
   /** Record the [[org.openivm.spark.common.TimeTravelPinStatus]] of the view's
-    * user-authored snapshot pins. `COMPILE_FAILED` is authoritative once seen —
-    * a later, weaker value cannot mask a refused pin.
+    * user-authored snapshot pins, with the
+    * [[org.openivm.spark.common.TimeTravelPinReason]] that explains it.
+    *
+    * `COMPILE_FAILED` is authoritative once seen — a later, weaker value cannot
+    * mask a refused pin. A status that is not a contract value is recorded
+    * fail-closed as `COMPILE_FAILED`/`unknown_pin_status` rather than dropped,
+    * so a telemetry defect can never surface as a missing field that a
+    * coverage guard might read as "this engine does not classify pins".
     */
-  def recordTimeTravelPinStatus(status: String): Unit =
+  def recordTimeTravelPinStatus(status: String, reason: String = null): Unit =
     recordBeforeEmit {
-      TimeTravelPinStatus.normalize(status).foreach { incoming =>
+      TimeTravelPinStatus.normalizeOrRefuse(status).foreach { incoming =>
         val refused = timeTravelPinStatus.contains(TimeTravelPinStatus.CompileFailed)
-        if (!refused || incoming == TimeTravelPinStatus.CompileFailed) timeTravelPinStatus = Some(incoming)
+        val unknown = TimeTravelPinStatus.normalize(status).isEmpty
+        if (!refused || incoming == TimeTravelPinStatus.CompileFailed) {
+          timeTravelPinStatus = Some(incoming)
+          timeTravelPinReason =
+            if (unknown) Some(TimeTravelPinReason.UnknownPinStatus)
+            else TimeTravelPinReason.normalize(reason)
+        }
       }
     }
 
@@ -254,6 +267,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 effectiveRefreshType = refreshClassification.effectiveRefreshType,
                 refreshReason = refreshClassification.refreshReason,
                 timeTravelPinStatus = timeTravelPinStatus,
+                timeTravelPinReason = timeTravelPinReason,
                 sameMvLockWaitMs = sameMvLockWaitMs,
                 driverAdmissionWaitMs = driverAdmissionMs,
                 catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
@@ -441,8 +455,8 @@ object OpenIvmExecutionSpan extends Logging {
       )
     )
 
-  def recordActiveTimeTravelPinStatus(status: String): Unit =
-    Option(current.get()).foreach(_.recordTimeTravelPinStatus(status))
+  def recordActiveTimeTravelPinStatus(status: String, reason: String = null): Unit =
+    Option(current.get()).foreach(_.recordTimeTravelPinStatus(status, reason))
 
   def recordActiveCatalogPublicationAdmission(width: Int, nanos: Long): Unit =
     if (nanos >= 0L)
@@ -600,6 +614,7 @@ object OpenIvmExecutionSpan extends Logging {
       effectiveRefreshType: Option[String],
       refreshReason: Option[String],
       timeTravelPinStatus: Option[String],
+      timeTravelPinReason: Option[String],
       sameMvLockWaitMs: Option[Long],
       driverAdmissionWaitMs: Option[Long],
       catalogPublicationAdmissionWidth: Option[Int],
@@ -637,6 +652,7 @@ object OpenIvmExecutionSpan extends Logging {
     effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
     refreshReason.foreach(fields.put("refresh_reason", _))
     timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
+    timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
     catalogPublicationAdmissionWidth.foreach(v =>

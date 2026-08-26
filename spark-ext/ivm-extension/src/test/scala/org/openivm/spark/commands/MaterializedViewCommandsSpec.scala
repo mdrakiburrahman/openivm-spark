@@ -25,6 +25,7 @@ import org.openivm.spark.common.{
   StagingCatalog,
   StagingChangeBatch,
   StagingDelta,
+  TimeTravelPinReason,
   TimeTravelPinStatus
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
@@ -155,6 +156,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       appender.stop()
     }
   }
+
+  /** Parse an `[openivm-mv]` KV line the way a downstream telemetry reader
+    * does, so a test fails if a value ever closes its own field.
+    */
+  private val KvLogRe = """(\w+)='([^']*)'""".r
+
+  private def parseKv(line: String): Map[String, String] =
+    KvLogRe.findAllMatchIn(line).map(m => m.group(1) -> m.group(2)).toMap
 
   private def executionSpanPayloads(messages: Seq[String], materializedView: String): Seq[JsonNode] =
     messages
@@ -1346,12 +1355,15 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val createSpan = executionSpanPayloads(createMessages, "mv_t5b_pin")
       createSpan should have size 1
       createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      createSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.PinsResolved
       val createClassification = createMessages.filter(m =>
         m.contains("[openivm-mv] view='`mv_t5b_pin`'") && m.contains("compiled_refresh_type=")
       )
       createClassification should have size 1
       createClassification.head should include(s"time_travel_pin_status='${TimeTravelPinStatus.Applied}'")
+      createClassification.head should include(s"time_travel_pin_reason='${TimeTravelPinReason.PinsResolved}'")
       createClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+      parseKv(createClassification.head)("time_travel_pins") shouldBe meta.timeTravelPins.mkString(";")
 
       // A delta arriving after the pinned version is consumed but never applied,
       // and the generated refresh program carries no temporal clause — the
@@ -1365,11 +1377,22 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val refreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_pin")
       refreshSpan should have size 1
       refreshSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      refreshSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.PinsResolved
       val refreshClassification = refreshMessages.filter(m =>
         m.contains("[openivm-mv] refresh view='`mv_t5b_pin`'") && m.contains("time_travel_pin_status=")
       )
       refreshClassification should have size 1
+      refreshClassification.head should include(s"time_travel_pin_status='${TimeTravelPinStatus.Applied}'")
+      refreshClassification.head should include(s"time_travel_pin_reason='${TimeTravelPinReason.PinsResolved}'")
       refreshClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+
+      // Operation-invariance: CREATE and REFRESH must publish the identical
+      // status/reason/identity triple for the same view.
+      val createKv  = parseKv(createClassification.head)
+      val refreshKv = parseKv(refreshClassification.head)
+      Seq("time_travel_pin_status", "time_travel_pin_reason", "time_travel_pins").foreach { key =>
+        withClue(s"$key: ") { refreshKv.get(key) shouldBe createKv.get(key) }
+      }
 
       assertBagEqual(
         "mv_t5b_pin",
@@ -1389,18 +1412,20 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         appender.messages
       }
 
-      executionSpanPayloads(createMessages, "mv_t5b_nopin").head
-        .path("time_travel_pin_status")
-        .asText() shouldBe TimeTravelPinStatus.NotApplicable
+      val nopinCreateSpan = executionSpanPayloads(createMessages, "mv_t5b_nopin").head
+      nopinCreateSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.NotApplicable
+      nopinCreateSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.NoUserPin
       createMessages.filter(m =>
         m.contains("[openivm-mv] view='`mv_t5b_nopin`'") && m.contains("compiled_refresh_type=")
       ) foreach { line =>
         line should include(s"time_travel_pin_status='${TimeTravelPinStatus.NotApplicable}'")
+        line should include(s"time_travel_pin_reason='${TimeTravelPinReason.NoUserPin}'")
         line should not include "time_travel_pins="
       }
 
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_nopin")).get
       meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.NoUserPin)
       meta.timeTravelPins shouldBe empty
 
       spark.sql("INSERT INTO sales_t5b_nopin VALUES ('west', 200)")
@@ -1408,9 +1433,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_nopin").collect()
         appender.messages
       }
-      executionSpanPayloads(refreshMessages, "mv_t5b_nopin").head
-        .path("time_travel_pin_status")
-        .asText() shouldBe TimeTravelPinStatus.NotApplicable
+      val nopinRefreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_nopin").head
+      nopinRefreshSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.NotApplicable
+      nopinRefreshSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.NoUserPin
     }
 
     it("reports COMPILE_FAILED for an unsupported pin instead of claiming it was applied") {
@@ -1430,10 +1455,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val createSpan = executionSpanPayloads(createMessages, "mv_t5b_bad")
       createSpan should have size 1
       createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.CompileFailed
+      createSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.UnsupportedPinShape
       createSpan.head.path("compile_refresh_type").asText() shouldBe "COMPILE_FAILED"
 
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_bad")).get
       meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.UnsupportedPinShape)
       meta.timeTravelPins shouldBe empty
       meta.refreshType shouldBe RefreshTypeCode.FullRefresh
 
@@ -1441,9 +1468,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_bad").collect()
         appender.messages
       }
-      executionSpanPayloads(refreshMessages, "mv_t5b_bad").head
-        .path("time_travel_pin_status")
-        .asText() shouldBe TimeTravelPinStatus.CompileFailed
+      val badRefreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_bad").head
+      badRefreshSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.CompileFailed
+      badRefreshSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.UnsupportedPinShape
     }
 
     it("fails closed when persisted pin metadata disagrees with the view body") {
@@ -1468,6 +1495,78 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_drift").collect()
       }
       failure.getMessage should include("snapshot-pin metadata disagrees with the view body")
+    }
+
+    it("fails closed when the persisted pin identity no longer matches the body") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_pindrift(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_pindrift VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b_pindrift")
+      spark.sql(
+        s"CREATE MATERIALIZED VIEW mv_t5b_pindrift AS SELECT region, SUM(amount) AS total " +
+          s"FROM sales_t5b_pindrift VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_pindrift")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinsKey -> "default.sales_t5b_pindrift=VERSION AS OF 99")
+      )
+
+      spark.sql("INSERT INTO sales_t5b_pindrift VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_pindrift").collect()
+      }
+      failure.getMessage should include("snapshot-pin metadata disagrees with the view body")
+      failure.getMessage should include("VERSION AS OF 99")
+    }
+
+    it("fails closed on a persisted status outside the contract vocabulary") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_corrupt(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_corrupt VALUES ('east', 100)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t5b_corrupt AS SELECT region, SUM(amount) AS total " +
+          "FROM sales_t5b_corrupt GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_corrupt")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinStatusKey -> "MAYBE")
+      )
+
+      spark.sql("INSERT INTO sales_t5b_corrupt VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_corrupt").collect()
+      }
+      // The message must show what was on disk, not its fail-closed reading.
+      failure.getMessage should include("recorded status='MAYBE'")
+    }
+
+    it("renders a quoted pin clause so the classification line stays machine-readable") {
+      // `TIMESTAMP AS OF '2024-01-01'` carries the same single quote the
+      // `[openivm-mv]` KV format uses as its field delimiter; unsanitized it
+      // truncates `time_travel_pins` to its prefix and the pinned value is lost.
+      val kv = MvCommandHelper.pinTelemetryKv(
+        TimeTravelPinStatus.Applied,
+        TimeTravelPinReason.PinsResolved,
+        Seq("default.sales=TIMESTAMP AS OF '2024-01-01'", "default.dim=VERSION AS OF 7")
+      )
+      val line   = s"[openivm-mv] view='`mv_kv`' $kv upstream_snapshot_trigger='default.sales'"
+      val fields = parseKv(line)
+
+      fields("time_travel_pin_status") shouldBe TimeTravelPinStatus.Applied
+      fields("time_travel_pin_reason") shouldBe TimeTravelPinReason.PinsResolved
+      fields("time_travel_pins") shouldBe
+        """default.sales=TIMESTAMP AS OF "2024-01-01";default.dim=VERSION AS OF 7"""
+      fields("upstream_snapshot_trigger") shouldBe "default.sales"
+
+      MvCommandHelper.pinTelemetryKv(TimeTravelPinStatus.NotApplicable, TimeTravelPinReason.NoUserPin, Nil) shouldBe
+        s"time_travel_pin_status='${TimeTravelPinStatus.NotApplicable}' " +
+        s"time_travel_pin_reason='${TimeTravelPinReason.NoUserPin}'"
     }
   }
 

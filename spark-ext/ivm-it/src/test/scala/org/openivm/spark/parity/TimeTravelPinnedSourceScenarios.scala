@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, TimeTravelPinStatus}
+import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, TimeTravelPinReason, TimeTravelPinStatus}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Regression coverage for materialized views whose sources are pinned to a
@@ -522,6 +522,7 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       val (src, mv, pinned) = pinnedAggregateFixture("telemetry")
       val created           = mvMeta(mv)
       created.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      created.timeTravelPinReason shouldBe Some(TimeTravelPinReason.PinsResolved)
       created.timeTravelPins should have size 1
       created.timeTravelPins.head should endWith(s"=VERSION AS OF $pinned")
       created.timeTravelPins.head.toLowerCase should include(src.toLowerCase)
@@ -534,6 +535,7 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       refreshMv(mv)
       val refreshed = mvMeta(mv)
       refreshed.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      refreshed.timeTravelPinReason shouldBe Some(TimeTravelPinReason.PinsResolved)
       refreshed.timeTravelPins shouldBe created.timeTravelPins
       assertMvCorrect(mv, pinnedExpectation(src, pinned))
 
@@ -564,6 +566,7 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
           "FROM ttp_tel_live GROUP BY grp"
       )
       mvMeta("ttp_tel_mv_live").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+      mvMeta("ttp_tel_mv_live").timeTravelPinReason shouldBe Some(TimeTravelPinReason.NoUserPin)
       mvMeta("ttp_tel_mv_live").timeTravelPins shouldBe empty
 
       sql("INSERT INTO ttp_tel_live VALUES (3, 'a', 5)")
@@ -586,6 +589,7 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
 
       val meta = mvMeta("ttp_tel_mv_bad")
       meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
+      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.UnsupportedPinShape)
       meta.timeTravelPins shouldBe empty
       meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
 

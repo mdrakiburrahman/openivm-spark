@@ -138,9 +138,24 @@ final case class MvMetadata(
   /** CREATE-time [[TimeTravelPinStatus]] of this view's user-authored snapshot
     * pins, or `None` for a view created before the status was persisted (the
     * refresh path re-derives it from [[querySql]] in that case).
+    *
+    * Fail-closed: a property that is present but not a contract value reads as
+    * [[TimeTravelPinStatus.CompileFailed]], never as "absent" — otherwise a
+    * corrupt property would silently fall back to re-derivation and hide the
+    * corruption.
     */
   def timeTravelPinStatus: Option[String] =
-    properties.get(MvMetadata.TimeTravelPinStatusKey).flatMap(TimeTravelPinStatus.normalize)
+    properties.get(MvMetadata.TimeTravelPinStatusKey).flatMap(TimeTravelPinStatus.normalizeOrRefuse)
+
+  /** The persisted status exactly as stored, for error messages that must show
+    * what was actually on disk rather than its fail-closed interpretation.
+    */
+  def timeTravelPinStatusRaw: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinStatusKey).map(_.trim).filter(_.nonEmpty)
+
+  /** CREATE-time [[TimeTravelPinReason]] explaining the persisted status. */
+  def timeTravelPinReason: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinReasonKey).flatMap(TimeTravelPinReason.normalize)
 
   /** CREATE-time identity of every resolved pin, `<qualified source>=<clause>`,
     * sorted by source. Empty when the view has no resolved pin.
@@ -215,6 +230,9 @@ object MvMetadata {
 
   val TimeTravelPinSeparator: String = ";"
 
+  /** CREATE-time [[TimeTravelPinReason]] for the persisted status. */
+  val TimeTravelPinReasonKey: String = "_ivm_time_travel_pin_reason"
+
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
   private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
@@ -259,15 +277,17 @@ object MvMetadata {
   /** Build the property entries recording the CREATE-time snapshot-pin
     * telemetry contract. `pins` are `<qualified source>=<clause>` entries; they
     * are stored sorted so the property is byte-stable, and omitted entirely
-    * when the view has no resolved pin.
+    * when the view has no resolved pin. The clause is stored VERBATIM (never
+    * log-sanitized) so REFRESH can compare it byte for byte.
     */
-  def timeTravelPinProperties(status: String, pins: Seq[String]): Map[String, String] = {
+  def timeTravelPinProperties(status: String, pins: Seq[String], reason: String): Map[String, String] = {
     val statusProp = TimeTravelPinStatus.normalize(status).map(TimeTravelPinStatusKey -> _).toMap
+    val reasonProp = TimeTravelPinReason.normalize(reason).map(TimeTravelPinReasonKey -> _).toMap
     val pinList    = Option(pins).getOrElse(Seq.empty).map(_.trim).filter(_.nonEmpty).distinct.sorted
     val pinsProp =
       if (pinList.isEmpty) Map.empty[String, String]
       else Map(TimeTravelPinsKey -> pinList.mkString(TimeTravelPinSeparator))
-    statusProp ++ pinsProp
+    statusProp ++ reasonProp ++ pinsProp
   }
 
   /** Tier component for the compile cache key.  It includes only facts

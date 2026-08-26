@@ -90,13 +90,20 @@ class OpenIvmCompiler private (
     // The refusal runs BEFORE any metric bookkeeping: no compile is started, so
     // the inflight gauge must not move (its decrement lives in the `finally`
     // below, which an early throw would skip).
-    SparkTimeTravelSql.unsupportedSnapshotPinReason(req.viewSql, trackedSourceNames(req)).foreach { reason =>
-      throw new OpenIvmCompileException(
-        s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
-          s"incrementally: $reason. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
-        null
-      )
-    }
+    //
+    // `requireTrackedSources` keeps this refusal identical to the one
+    // `SparkTimeTravelSql.pinTelemetry` reports: a pinned body with no tracked
+    // source cannot be maintained from anything, so it must not compile into an
+    // incremental program that would claim a pin it cannot honor.
+    SparkTimeTravelSql
+      .unsupportedSnapshotPinReason(req.viewSql, trackedSourceNames(req), requireTrackedSources = true)
+      .foreach { reason =>
+        throw new OpenIvmCompileException(
+          s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
+            s"incrementally: $reason. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
+          null
+        )
+      }
 
     OpenIvmMetrics.increment("compiler.compile.count")
     OpenIvmMetrics.CompilerInflight.incrementAndGet()
