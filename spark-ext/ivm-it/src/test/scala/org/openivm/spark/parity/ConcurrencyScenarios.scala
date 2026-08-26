@@ -2,10 +2,9 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.commands.{CommandConcurrencyInjection, RefreshFailureInjection}
 import org.openivm.spark.parity.base.IvmParitySpecBase
-import org.openivm.spark.testkit.ParkedCommandBarrier
+import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.{Executors, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
@@ -75,27 +74,21 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
     }
 
   /** Run `tasks` on a fixed thread pool of size `parallelism`; wait `timeout`. */
-  protected def runAll(parallelism: Int, timeout: Duration)(tasks: Seq[() => Unit]): Unit = {
-    val pool = Executors.newFixedThreadPool(parallelism)
-    try {
-      implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
-      val futures                       = tasks.map(t => Future(t()))
+  protected def runAll(parallelism: Int, timeout: Duration)(tasks: Seq[() => Unit]): Unit =
+    TestPools.withPool(parallelism) { implicit ec: ExecutionContext =>
+      val futures = tasks.map(t => Future(t()))
       Await.result(Future.sequence(futures), timeout)
-    } finally {
-      pool.shutdown()
-      pool.awaitTermination(30, TimeUnit.SECONDS)
+      ()
     }
-  }
 
-  protected def withPool[A](parallelism: Int)(body: ExecutionContext => A): A = {
-    val pool = Executors.newFixedThreadPool(parallelism)
-    try {
-      body(ExecutionContext.fromExecutorService(pool))
-    } finally {
-      pool.shutdown()
-      pool.awaitTermination(30, TimeUnit.SECONDS)
-    }
-  }
+  /** Run `body` with an execution context backed by a fixed pool.  The pool is
+    * always drained — with an interrupt if a worker ignored the polite
+    * shutdown — so a failed assertion cannot leave a parked command holding
+    * the forked test JVM open.  Nest [[ParkedCommandBarrier.use]] INSIDE this
+    * scope so the parked command is released before the drain.
+    */
+  protected def withPool[A](parallelism: Int)(body: ExecutionContext => A): A =
+    TestPools.withPool(parallelism)(body)
 
   protected def runSqlEventually(sqlText: String, maxAttempts: Int = 10): Unit = {
     var attempt              = 0

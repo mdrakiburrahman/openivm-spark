@@ -31,7 +31,7 @@ import org.openivm.spark.common.{
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
-import org.openivm.spark.testkit.ParkedCommandBarrier
+import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -39,7 +39,7 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, Executors, TimeUnit}
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
@@ -115,15 +115,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     path.getFileSystem(spark.sessionState.newHadoopConf()).exists(path)
   }
 
-  private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A = {
-    val pool = Executors.newFixedThreadPool(parallelism)
-    try {
-      body(ExecutionContext.fromExecutorService(pool))
-    } finally {
-      pool.shutdown()
-      pool.awaitTermination(30, TimeUnit.SECONDS)
-    }
-  }
+  /** Nest [[ParkedCommandBarrier.use]] INSIDE this scope: the parked command
+    * must be released before the pool is drained, and the drain interrupts
+    * anything that ignored the polite shutdown.
+    */
+  private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A =
+    TestPools.withPool(parallelism)(body)
 
   private def awaitResult[A](future: Future[A], timeout: FiniteDuration = 600.seconds): A =
     Await.result(future, timeout)

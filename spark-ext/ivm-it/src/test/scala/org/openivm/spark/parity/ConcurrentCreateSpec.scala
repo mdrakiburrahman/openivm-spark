@@ -7,10 +7,9 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.commands.CommandConcurrencyInjection
 import org.openivm.spark.common.{CdfWatermarkCatalog, FeatureGate, MvCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
-import org.openivm.spark.testkit.ParkedCommandBarrier
+import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
-import java.util.concurrent.{Executors, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -61,9 +60,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
         sql(s"INSERT INTO $schema.cc_src_$idx VALUES $rows")
       }
 
-      val pool = Executors.newFixedThreadPool(8)
-      try {
-        implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+      TestPools.withPool(8) { implicit ec: ExecutionContext =>
         val futures = (1 to 8).map { idx =>
           Future {
             sql(
@@ -73,9 +70,6 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
           }
         }
         Await.result(Future.sequence(futures), 180.seconds)
-      } finally {
-        pool.shutdown()
-        pool.awaitTermination(30, TimeUnit.SECONDS)
       }
 
       (1 to 8).foreach { idx =>
@@ -112,10 +106,11 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
             if (injectedFailure.compareAndSet(false, true))
               throw new IllegalStateException("fail before catalog registration")
           }) {
-            val pool = Executors.newFixedThreadPool(2)
-            try
+            // `use` is nested INSIDE the pool scope so the parked CREATE is
+            // released before the pool is drained, including when an
+            // assertion below fails.
+            TestPools.withPool(2) { implicit ec: ExecutionContext =>
               createBarrier.use {
-                implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
                 val firstCreate = Future {
                   intercept[IllegalStateException] {
                     sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewSql").collect()
@@ -135,9 +130,6 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
                 Await.result(firstCreate, 180.seconds).getMessage should include("before catalog registration")
                 Await.result(queuedCreate, 180.seconds)
               }
-            finally {
-              pool.shutdown()
-              pool.awaitTermination(30, TimeUnit.SECONDS)
             }
           }
         }

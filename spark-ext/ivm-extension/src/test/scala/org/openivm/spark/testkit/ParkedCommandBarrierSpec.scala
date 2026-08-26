@@ -129,6 +129,78 @@ class ParkedCommandBarrierSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("the defect this replaces") {
+    // A scaled-down replica of the full-suite failure: the park budget is
+    // shorter than the observation, exactly as `30 s` was shorter than
+    // `300 s`.  Wall-clock ratios (2 s observation vs a 200 ms park budget)
+    // stand in for the real ones so the reproduction costs seconds, not
+    // minutes, and needs no artificial slow-down of a real REFRESH.
+    val ParkBudget       = 200.millis
+    val ObservationDelay = 2.seconds
+
+    it("reproduces the old latch handshake failing the command it was only supposed to observe") {
+      val release  = new CountDownLatch(1)
+      val entered  = new CountDownLatch(1)
+      val thrown   = new AtomicReference[Throwable](null)
+      val leftHook = new AtomicReference[java.lang.Long](null)
+      val finished = new CountDownLatch(1)
+
+      // The old hook body, verbatim in shape: a bounded await whose result is
+      // asserted ON THE PRODUCTION COMMAND THREAD.
+      val command = new Thread(
+        () => {
+          try {
+            entered.countDown()
+            release.await(ParkBudget.toMillis, TimeUnit.MILLISECONDS) shouldBe true
+          } catch { case t: Throwable => thrown.set(t) }
+          finally {
+            leftHook.set(System.nanoTime())
+            finished.countDown()
+          }
+        },
+        "old-style-parked-command"
+      )
+      command.setDaemon(true)
+      command.start()
+
+      entered.await(30, TimeUnit.SECONDS) shouldBe true
+      // The observed command legitimately outlives the park budget, which is
+      // all it takes: nothing here is locked.
+      Thread.sleep(ObservationDelay.toMillis)
+      finished.await(30, TimeUnit.SECONDS) shouldBe true
+      val releasedAt = System.nanoTime()
+      release.countDown()
+
+      // The observation aborted the command it was watching: it left the hook
+      // BEFORE the test released it, so the outer "is it still running?"
+      // check reports a locking verdict for a run in which nothing was
+      // locked.
+      thrown.get() should not be null
+      thrown.get().getMessage should include("was not equal to true")
+      leftHook.get().longValue() should be < releasedAt
+    }
+
+    it("keeps the same observation honest when the barrier owns the handshake") {
+      val barrier        = ParkedCommandBarrier.forObservation(30.seconds)
+      val (thrown, done) = parkOnThread(barrier)
+
+      barrier.awaitEntered() shouldBe true
+      // Same overrun that broke the old handshake ...
+      Thread.sleep(ObservationDelay.toMillis)
+
+      // ... the command is still parked, nothing was thrown into it, and the
+      // verdict stays falsifiable.
+      barrier.isParked shouldBe true
+      barrier.state shouldBe ParkedCommandBarrier.Parked
+      thrown.get() shouldBe null
+
+      barrier.release()
+      done.await(30, TimeUnit.SECONDS) shouldBe true
+      barrier.parkCount shouldBe 1
+      thrown.get() shouldBe null
+    }
+  }
+
   describe("release discipline") {
     it("releases the parked command even when the observation body fails") {
       val barrier        = ParkedCommandBarrier.forObservation(5.seconds)
