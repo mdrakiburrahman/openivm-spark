@@ -31,6 +31,7 @@ import org.openivm.spark.common.{
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
+import org.openivm.spark.testkit.ParkedCommandBarrier
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -38,11 +39,11 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.{CopyOnWriteArrayList, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
 /**
  * End-to-end integration tests for the three materialized-view DDL commands.
@@ -126,6 +127,34 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   private def awaitResult[A](future: Future[A], timeout: FiniteDuration = 600.seconds): A =
     Await.result(future, timeout)
+
+  /** Upper bound on a single command observed while another command is parked
+    * inside a concurrency-injection hook.  Generous because a full-suite run
+    * oversubscribes the box; exceeding it means the observed command is
+    * genuinely blocked, not merely slow.
+    */
+  private val CommandObservationBudget: FiniteDuration = 300.seconds
+
+  /** Fail with a self-describing message unless `barrier` still holds the
+    * command inside the injected hook.  Distinguishes "still parked" (the
+    * invariant under test) from "the park failsafe expired" and "the command
+    * left the hook and finished", neither of which says anything about
+    * locking.
+    */
+  private def assertStillParked(barrier: ParkedCommandBarrier, parkedCommand: Future[_]): Unit =
+    if (!barrier.isParked) {
+      val outcome = parkedCommand.value
+        .map {
+          case scala.util.Failure(t) => s"failed with ${t.getClass.getName}: ${t.getMessage}"
+          case scala.util.Success(_) => "completed successfully"
+        }
+        .getOrElse("still running")
+      fail(
+        s"the parked command left the injected hook before the observation finished " +
+          s"(${barrier.describe}); it $outcome. This observation is void — it does not " +
+          "prove or disprove anything about locking."
+      )
+    }
 
   private final class BufferingAppender(name: String)
       extends AbstractAppender(
@@ -1170,35 +1199,34 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("INSERT INTO sales_t1a_overlap_1 VALUES (1, 'one'), (2, 'two')")
       spark.sql("INSERT INTO sales_t1a_overlap_2 VALUES (3, 'three'), (4, 'four')")
 
-      val bothEntered = new CountDownLatch(2)
-      val releaseBoth = new CountDownLatch(1)
-      CommandConcurrencyInjection.withBeforeCreateDataWrite({
-        bothEntered.countDown()
-        bothEntered.await(30L, TimeUnit.SECONDS) shouldBe true
-        releaseBoth.await(30L, TimeUnit.SECONDS) shouldBe true
-      }) {
+      val barrier = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+      CommandConcurrencyInjection.withBeforeCreateDataWrite(barrier.park()) {
         withPool(2) { implicit ec =>
-          val first = Future {
-            spark
-              .sql(
-                "CREATE MATERIALIZED VIEW mv_t1a_overlap_1 AS " +
-                  "SELECT id, label FROM sales_t1a_overlap_1"
-              )
-              .collect()
+          barrier.use {
+            val first = Future {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_overlap_1 AS " +
+                    "SELECT id, label FROM sales_t1a_overlap_1"
+                )
+                .collect()
+            }
+            val second = Future {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_overlap_2 AS " +
+                    "SELECT id, label FROM sales_t1a_overlap_2"
+                )
+                .collect()
+            }
+            withClue(s"both CTAS phases must be inside the data-write hook together (${barrier.describe}): ") {
+              barrier.awaitParked(2) shouldBe true
+            }
+            first.isCompleted shouldBe false
+            second.isCompleted shouldBe false
+            barrier.release()
+            awaitResult(Future.sequence(Seq(first, second)))
           }
-          val second = Future {
-            spark
-              .sql(
-                "CREATE MATERIALIZED VIEW mv_t1a_overlap_2 AS " +
-                  "SELECT id, label FROM sales_t1a_overlap_2"
-              )
-              .collect()
-          }
-          bothEntered.await(30L, TimeUnit.SECONDS) shouldBe true
-          first.isCompleted shouldBe false
-          second.isCompleted shouldBe false
-          releaseBoth.countDown()
-          awaitResult(Future.sequence(Seq(first, second)))
         }
       }
 
@@ -1835,23 +1863,33 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_refresh AS $refreshSql")
       spark.sql("INSERT INTO sales_t14_refresh VALUES ('north', 11)")
 
-      val createEntered = new CountDownLatch(1)
-      val releaseCreate = new CountDownLatch(1)
+      val barrier = ParkedCommandBarrier.forObservation(CommandObservationBudget)
 
-      CommandConcurrencyInjection.withBeforeCreateBody({
-        createEntered.countDown()
-        releaseCreate.await(30, TimeUnit.SECONDS) shouldBe true
-      }) {
+      CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
         withPool(2) { implicit ec =>
-          val createFuture =
-            Future { spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_create AS $createSql").collect() }
-          createEntered.await(30, TimeUnit.SECONDS) shouldBe true
-          val refreshFuture =
-            Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t14_refresh").collect() }
-          awaitResult(refreshFuture, 300.seconds)
-          createFuture.isCompleted shouldBe false
-          releaseCreate.countDown()
-          awaitResult(createFuture, 600.seconds)
+          barrier.use {
+            val createFuture =
+              Future { spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_create AS $createSql").collect() }
+            withClue(s"CREATE never reached the before-create hook (${barrier.describe}): ") {
+              barrier.awaitEntered() shouldBe true
+            }
+            val refreshFuture =
+              Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t14_refresh").collect() }
+            try awaitResult(refreshFuture, CommandObservationBudget)
+            catch {
+              case _: TimeoutException =>
+                fail(
+                  s"REFRESH on mv_t14_refresh did not complete within $CommandObservationBudget while " +
+                    s"CREATE of mv_t14_create was parked before its body — CREATE is holding a lock " +
+                    s"that is not scoped to its own view (${barrier.describe})"
+                )
+            }
+            assertStillParked(barrier, createFuture)
+            createFuture.isCompleted shouldBe false
+            barrier.release()
+            awaitResult(createFuture)
+            barrier.parkCount shouldBe 1
+          }
         }
       }
 
@@ -1865,38 +1903,39 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t14a_create(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t14a_create VALUES ('east', 10), ('west', 20)")
 
-      val createSql     = "SELECT region, SUM(amount) AS total FROM sales_t14a_create GROUP BY region"
-      val createEntered = new CountDownLatch(1)
-      val releaseCreate = new CountDownLatch(1)
+      val createSql = "SELECT region, SUM(amount) AS total FROM sales_t14a_create GROUP BY region"
+      val barrier   = ParkedCommandBarrier.forObservation(CommandObservationBudget)
 
       val payloads = withLogCapture { appender =>
-        CommandConcurrencyInjection.withBeforeCreateBody({
-          createEntered.countDown()
-          releaseCreate.await(30, TimeUnit.SECONDS) shouldBe true
-        }) {
+        CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
           withPool(2) { implicit ec =>
-            val create1 = Future {
-              withSparkLocalProperties(
-                "openivm.request_id" -> "req-create-1",
-                "openivm.node_id"    -> "model.create.one"
-              ) {
-                spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+            barrier.use {
+              val create1 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-create-1",
+                  "openivm.node_id"    -> "model.create.one"
+                ) {
+                  spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+                }
               }
-            }
-            createEntered.await(30, TimeUnit.SECONDS) shouldBe true
-            val create2 = Future {
-              withSparkLocalProperties(
-                "openivm.request_id" -> "req-create-2",
-                "openivm.node_id"    -> "model.create.two"
-              ) {
-                spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+              withClue(s"first CREATE never reached the before-create hook (${barrier.describe}): ") {
+                barrier.awaitEntered() shouldBe true
               }
+              val create2 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-create-2",
+                  "openivm.node_id"    -> "model.create.two"
+                ) {
+                  spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+                }
+              }
+              Thread.sleep(150L)
+              create2.isCompleted shouldBe false
+              assertStillParked(barrier, create1)
+              barrier.release()
+              awaitResult(create1)
+              awaitResult(create2)
             }
-            Thread.sleep(150L)
-            create2.isCompleted shouldBe false
-            releaseCreate.countDown()
-            awaitResult(create1, 600.seconds)
-            awaitResult(create2, 600.seconds)
           }
         }
         executionSpanPayloads(appender.messages, "mv_t14a_create_span")

@@ -7,6 +7,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.commands.CommandConcurrencyInjection
 import org.openivm.spark.common.{CdfWatermarkCatalog, FeatureGate, MvCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
+import org.openivm.spark.testkit.ParkedCommandBarrier
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.{Executors, TimeUnit}
@@ -96,15 +97,11 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
       sql(s"CREATE TABLE IF NOT EXISTS $schema.cc_retry_src(id INT, label STRING) USING DELTA")
       sql(s"INSERT INTO $schema.cc_retry_src VALUES (1, 'one'), (2, 'two')")
 
-      val createEntered     = new java.util.concurrent.CountDownLatch(1)
-      val releaseCreate     = new java.util.concurrent.CountDownLatch(1)
+      val createBarrier     = ParkedCommandBarrier.forObservation(180.seconds)
       val injectedFailure   = new AtomicBoolean(false)
       val dataWriteAttempts = new AtomicInteger(0)
 
-      CommandConcurrencyInjection.withBeforeCreateBody({
-        createEntered.countDown()
-        releaseCreate.await(30L, TimeUnit.SECONDS) shouldBe true
-      }) {
+      CommandConcurrencyInjection.withBeforeCreateBody(createBarrier.park()) {
         CommandConcurrencyInjection.withBeforeCreateDataWrite({
           if (dataWriteAttempts.incrementAndGet() == 2) {
             pathExists(location) shouldBe false
@@ -116,24 +113,29 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
               throw new IllegalStateException("fail before catalog registration")
           }) {
             val pool = Executors.newFixedThreadPool(2)
-            try {
-              implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
-              val firstCreate = Future {
-                intercept[IllegalStateException] {
-                  sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewSql").collect()
+            try
+              createBarrier.use {
+                implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+                val firstCreate = Future {
+                  intercept[IllegalStateException] {
+                    sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewSql").collect()
+                  }
                 }
-              }
-              createEntered.await(30L, TimeUnit.SECONDS) shouldBe true
-              val queuedCreate = Future {
-                sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $mvName AS $viewSql").collect()
-              }
-              Thread.sleep(150L)
-              queuedCreate.isCompleted shouldBe false
-              releaseCreate.countDown()
+                withClue(s"first CREATE never reached the before-create hook (${createBarrier.describe}): ") {
+                  createBarrier.awaitEntered() shouldBe true
+                }
+                val queuedCreate = Future {
+                  sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $mvName AS $viewSql").collect()
+                }
+                Thread.sleep(150L)
+                queuedCreate.isCompleted shouldBe false
+                createBarrier.isParked shouldBe true
+                createBarrier.release()
 
-              Await.result(firstCreate, 180.seconds).getMessage should include("before catalog registration")
-              Await.result(queuedCreate, 180.seconds)
-            } finally {
+                Await.result(firstCreate, 180.seconds).getMessage should include("before catalog registration")
+                Await.result(queuedCreate, 180.seconds)
+              }
+            finally {
               pool.shutdown()
               pool.awaitTermination(30, TimeUnit.SECONDS)
             }

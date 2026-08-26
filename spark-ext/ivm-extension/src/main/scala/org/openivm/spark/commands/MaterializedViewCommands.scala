@@ -186,6 +186,15 @@ private[spark] object RefreshFailureInjection {
     }
 }
 
+/** Test-only pause points in the CREATE command path.
+  *
+  * A hook body runs ON the production command thread: whatever it throws
+  * aborts the command, and whatever it blocks on holds the command inside the
+  * state it has reached.  A test that parks a command here must therefore
+  * release it from a `finally` and must never bound the park by a budget
+  * shorter than the observation it is running meanwhile — use
+  * `org.openivm.spark.testkit.ParkedCommandBarrier`, which enforces both.
+  */
 private[spark] object CommandConcurrencyInjection {
 
   @volatile private var beforeCreateBody: () => Unit      = null

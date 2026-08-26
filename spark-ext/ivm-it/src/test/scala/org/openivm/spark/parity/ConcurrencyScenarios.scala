@@ -2,11 +2,12 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.commands.{CommandConcurrencyInjection, RefreshFailureInjection}
 import org.openivm.spark.parity.base.IvmParitySpecBase
+import org.openivm.spark.testkit.ParkedCommandBarrier
 
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.{Executors, TimeUnit}
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
 /** Parity port of `openivm/test/sql/concurrency.test`.
   *
@@ -43,6 +44,13 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   *   - We use a JDK `ExecutorService` (fixed thread pool) and `Future`s.
   *     Each test bounds total wall time with `Await.result(... , timeout)`
   *     so a deadlock would fail-fast rather than hang the suite.
+  *
+  *   - Where a scenario must hold one command still while another runs, the
+  *     command is parked inside a `CommandConcurrencyInjection` hook through
+  *     [[org.openivm.spark.testkit.ParkedCommandBarrier]].  Never park with an
+  *     ad-hoc latch budget: the parked command is released only after the
+  *     observation completes, so a park budget shorter than the observation
+  *     budget turns a merely slow observation into a phantom locking verdict.
   *
   *   - We do NOT assert that REFRESHes from different threads never fail —
   *     OCC may legitimately surface a transient error.  We DO assert that,
@@ -118,6 +126,40 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
     }
   }
 
+  /** Upper bound on a single unrelated command observed while another command
+    * is parked.  Generous because a full-suite run oversubscribes the box
+    * (32 forked JVMs × `local[4]`); exceeding it means the observed command is
+    * genuinely blocked, not merely slow.
+    */
+  protected val RefreshObservationBudget: FiniteDuration = 300.seconds
+
+  /** Upper bound on the parked command finishing once it has been released. */
+  protected val CreateCompletionBudget: FiniteDuration = 600.seconds
+
+  /** Fail with a self-describing message unless `barrier` still holds the
+    * command inside the injected hook.  Distinguishes "still parked" (the
+    * invariant we assert) from "the park failsafe expired" and from "the
+    * command left the hook and finished", neither of which says anything
+    * about locking.
+    */
+  protected def assertStillParked(
+      barrier: ParkedCommandBarrier,
+      parkedCommand: Future[_]
+  ): Unit =
+    if (!barrier.isParked) {
+      val outcome = parkedCommand.value
+        .map {
+          case scala.util.Failure(t) => s"failed with ${t.getClass.getName}: ${t.getMessage}"
+          case scala.util.Success(_) => "completed successfully"
+        }
+        .getOrElse("still running")
+      fail(
+        s"the parked command left the injected hook before the observation finished " +
+          s"(${barrier.describe}); it $outcome. This observation is void — it does not " +
+          "prove or disprove anything about locking."
+      )
+    }
+
   // ============================================================================
   // (0) CREATE on one MV must not block REFRESH on another MV
   // ============================================================================
@@ -133,21 +175,41 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
       sql(s"CREATE MATERIALIZED VIEW mv_refresh_c0 AS $refreshSql")
       sql("INSERT INTO refresh_c0 VALUES ('north', 3)")
 
-      val createEntered = new CountDownLatch(1)
-      val releaseCreate = new CountDownLatch(1)
+      // The parked CREATE is released only after the REFRESH has been
+      // observed, so the barrier's park failsafe must dominate the REFRESH
+      // budget — `forObservation` enforces that ordering at construction.
+      val barrier = ParkedCommandBarrier.forObservation(RefreshObservationBudget)
 
-      CommandConcurrencyInjection.withBeforeCreateBody({
-        createEntered.countDown()
-        releaseCreate.await(30, TimeUnit.SECONDS) shouldBe true
-      }) {
+      CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
         withPool(2) { implicit ec =>
-          val createFuture = Future(sql(s"CREATE MATERIALIZED VIEW mv_create_c0 AS $createSql").collect())
-          createEntered.await(30, TimeUnit.SECONDS) shouldBe true
-          val refreshFuture = Future(refreshMv("mv_refresh_c0"))
-          Await.result(refreshFuture, 300.seconds)
-          createFuture.isCompleted shouldBe false
-          releaseCreate.countDown()
-          Await.result(createFuture, 600.seconds)
+          // `use` releases the parked CREATE before the pool is shut down,
+          // including when an assertion below fails.
+          barrier.use {
+            val createFuture = Future(sql(s"CREATE MATERIALIZED VIEW mv_create_c0 AS $createSql").collect())
+            withClue(s"CREATE never reached the before-create hook within $RefreshObservationBudget: ") {
+              barrier.awaitEntered() shouldBe true
+            }
+
+            val refreshFuture = Future(refreshMv("mv_refresh_c0"))
+            try Await.result(refreshFuture, RefreshObservationBudget)
+            catch {
+              case _: TimeoutException =>
+                fail(
+                  s"REFRESH on mv_refresh_c0 did not complete within $RefreshObservationBudget while " +
+                    s"CREATE of mv_create_c0 was parked before its body — CREATE is holding a lock that " +
+                    s"is not scoped to its own view (${barrier.describe})"
+                )
+            }
+
+            // The parked CREATE can only leave the hook when this test
+            // releases it, so these are state assertions, not timing races.
+            assertStillParked(barrier, createFuture)
+            createFuture.isCompleted shouldBe false
+
+            barrier.release()
+            Await.result(createFuture, CreateCompletionBudget)
+            barrier.parkCount shouldBe 1
+          }
         }
       }
 
