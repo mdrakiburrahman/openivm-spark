@@ -37,9 +37,18 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       refreshMv("wspr_mv")
 
       assertMvCorrect("wspr_mv", viewSql)
-      val refreshSql = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
-      refreshSql should include("REPLACE WHERE")
-      refreshSql should not include "WHEN MATCHED THEN DELETE"
+      val refreshStatements = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).toSeq
+      val cascadeIdx = refreshStatements.indexWhere { statement =>
+        statement.contains("CREATE OR REPLACE TABLE delta.") && statement.contains("/_ivm/view_deltas/")
+      }
+      val replacementIdx = refreshStatements.indexWhere(_.contains("REPLACE WHERE"))
+
+      cascadeIdx should be >= 0
+      replacementIdx should be > cascadeIdx
+      refreshStatements(replacementIdx) should include("/_ivm/view_deltas/")
+      refreshStatements(replacementIdx) should include("WHERE `openivm_multiplicity` > 0")
+      refreshStatements(replacementIdx) should not include "openivm_new_wspr_mv"
+      refreshStatements.mkString("\n") should not include "WHEN MATCHED THEN DELETE"
     }
   }
 }
