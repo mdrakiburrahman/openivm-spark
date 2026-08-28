@@ -97,6 +97,29 @@ final case class MvMetadata(
         case "false" => false
       }
       .getOrElse(RefreshTypeCode.emitsCascadeViewDelta(refreshType))
+
+  /** User-supplied `CLUSTER BY` columns (declaration order), or empty when the
+    * MV was created without an explicit `CLUSTER BY` clause.
+    */
+  def clusterColumns: Seq[String] =
+    properties
+      .get(MvMetadata.ClusterColumnsKey)
+      .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toSeq)
+      .getOrElse(Seq.empty)
+
+  /** Whether the analyzed CREATE query contains a logical join. Missing or
+    * malformed metadata is treated conservatively as joined so legacy views
+    * cannot opt into insert-only aggregate shortcuts accidentally.
+    */
+  def queryHasJoin: Boolean =
+    properties
+      .get(MvMetadata.QueryHasJoinKey)
+      .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+      .collect {
+        case "true"  => true
+        case "false" => false
+      }
+      .getOrElse(true)
 }
 
 object MvMetadata {
@@ -112,6 +135,9 @@ object MvMetadata {
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
 
+  /** Property recording whether Spark's analyzed CREATE plan contains a join. */
+  val QueryHasJoinKey: String = "_ivm_query_has_join"
+
   /** Compiled initial-load SQL persisted at CREATE.  The FULL_REFRESH path
     * reads it to reproduce the hidden bookkeeping columns (e.g.
     * `openivm_count_star`) that the raw user query omits, independent of the
@@ -119,8 +145,17 @@ object MvMetadata {
     */
   val CompiledInitialLoadSqlKey: String = "_ivm_compiled_initial_load_sql"
 
+  /** Property key recording the user-supplied `CLUSTER BY` columns from
+    * `CREATE MATERIALIZED VIEW ... CLUSTER BY (...)`. Comma-separated, in
+    * declaration order. Empty/absent when the MV has no explicit clustering.
+    */
+  val ClusterColumnsKey: String = "_ivm_cluster_cols"
+
   /** Last observable compile-time cost-model hint captured during REFRESH. */
   val LastCostModelHintKey: String = "_ivm_last_cost_model_hint"
+
+  def queryShapeProperties(hasJoin: Boolean): Map[String, String] =
+    Map(QueryHasJoinKey -> hasJoin.toString)
 
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
@@ -146,6 +181,13 @@ object MvMetadata {
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
+
+  /** Build the property entry recording the user-supplied `CLUSTER BY` columns.
+    * Returns an empty map when there are no clustering columns.
+    */
+  def clusterColumnsProperties(cols: Seq[String]): Map[String, String] =
+    if (cols.isEmpty) Map.empty
+    else Map(ClusterColumnsKey -> cols.mkString(","))
 
   /** Tier component for the compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative

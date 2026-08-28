@@ -283,70 +283,6 @@ object SparkRefreshRewriter {
     }
   }
 
-  private[spark] case class WindowDeleteMergeKeys(targetColumn: String, sourceQuery: String)
-
-  /** Extract the affected partition-key query from a WINDOW_PARTITION delete
-    * MERGE. Supports both the legacy parenthesised USING query emitted by the
-    * Spark DELETE rewriter and the named affected-key relation emitted by
-    * current OpenIVM.
-    */
-  private[spark] def windowDeleteMergeKeys(
-      sql: String,
-      targetSql: String
-  ): Option[WindowDeleteMergeKeys] = {
-    val stripped = stripExecutionMarker(sql).trim
-    val ident    = "(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
-    val aliasRe  = ("(?is)^\\s*(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
-    val headerRe = (
-      "(?is)^MERGE\\s+INTO\\s+" + java.util.regex.Pattern.quote(targetSql) +
-        "\\s+(?:AS\\s+)?(" + ident + ")\\s+USING\\s*"
-    ).r
-    val header      = headerRe.findPrefixMatchOf(stripped).getOrElse(return None)
-    val targetAlias = header.group(1)
-    val sourceStart = header.end
-
-    val (sourceSql, sourceAlias, tailStart) =
-      if (sourceStart < stripped.length && stripped.charAt(sourceStart) == '(') {
-        val close = findMatchingCloseParen(stripped, sourceStart)
-        if (close < 0) return None
-        val alias = aliasRe.findPrefixMatchOf(stripped.substring(close + 1)).getOrElse(return None)
-        val body  = stripped.substring(sourceStart + 1, close).trim
-        (s"($body) AS __openivm_window_replace_source", alias.group(1), close + 1 + alias.end)
-      } else {
-        val sourceRe = ("(?is)^(" + ident + "(?:\\s*\\.\\s*" + ident + ")*)\\s+" +
-          "(?:AS\\s+)?(" + ident + ")(?=\\s|$)").r
-        val source = sourceRe.findPrefixMatchOf(stripped.substring(sourceStart)).getOrElse(return None)
-        (source.group(1).trim, source.group(2), sourceStart + source.end)
-      }
-
-    val tail = stripped.substring(tailStart)
-    val matchRe = (
-      "(?is)^\\s*ON\\s+(" + ident + ")\\s*\\.\\s*(" + ident + ")\\s*" +
-        "(?:IS\\s+NOT\\s+DISTINCT\\s+FROM|<=>)\\s*(" + ident + ")\\s*\\.\\s*(" + ident + ")" +
-        "\\s+WHEN\\s+MATCHED\\s+THEN\\s+DELETE\\s*;?\\s*$"
-    ).r
-    val matched = matchRe.findPrefixMatchOf(tail).getOrElse(return None)
-
-    def normalized(identifier: String): String =
-      identifier.stripPrefix("`").stripSuffix("`").replace("``", "`")
-
-    val leftAlias       = normalized(matched.group(1))
-    val leftColumn      = matched.group(2)
-    val rightAlias      = normalized(matched.group(3))
-    val rightColumn     = matched.group(4)
-    val targetAliasName = normalized(targetAlias)
-    val sourceAliasName = normalized(sourceAlias)
-
-    val (targetColumn, sourceColumn) =
-      if (leftAlias.equalsIgnoreCase(targetAliasName) && rightAlias.equalsIgnoreCase(sourceAliasName))
-        leftColumn -> rightColumn
-      else if (leftAlias.equalsIgnoreCase(sourceAliasName) && rightAlias.equalsIgnoreCase(targetAliasName))
-        rightColumn -> leftColumn
-      else return None
-
-    Some(WindowDeleteMergeKeys(targetColumn, s"SELECT $sourceColumn FROM $sourceSql"))
-  }
-
   /** Match `CREATE OR REPLACE TABLE delta.`<viewDeltaPath>` USING DELTA AS`
     * (whitespace-tolerant, case-insensitive on keywords) and return the SELECT
     * body that follows the `AS` keyword. Used by the SimpleProjection fuse
@@ -384,22 +320,14 @@ object SparkRefreshRewriter {
     val refPattern    = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(literalRef))
     val refMatcher    = refPattern.matcher(strippedMerge)
     var refCount      = 0
-    var refEnd        = -1
-    while (refMatcher.find()) {
-      refCount += 1
-      refEnd = refMatcher.end()
-    }
+    while (refMatcher.find()) refCount += 1
 
     if (!isMerge || refCount != 1) None
     else
       extractViewDeltaCtasBody(ctas, viewDeltaPath).map { body =>
         val subquery = body.stripSuffix(";").trim
-        val existingAlias =
-          "(?is)^\\s+AS\\s+(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*\\b)".r
-            .findFirstIn(strippedMerge.substring(refEnd))
-            .isDefined
         val replacement = java.util.regex.Matcher.quoteReplacement(
-          if (existingAlias) s"($subquery)" else s"($subquery) AS __openivm_direct_delta"
+          s"($subquery) AS __openivm_direct_delta"
         )
         refPattern.matcher(strippedMerge).replaceFirst(replacement)
       }
@@ -464,6 +392,7 @@ object SparkRefreshRewriter {
       postProcess: String => String = identity,
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
+      sourceSnapshotVersions: Map[String, Long] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
       fkTermPruneEnabled: Boolean = false,
@@ -483,23 +412,30 @@ object SparkRefreshRewriter {
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
+      var viewDeltaMaterialized = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
-            Seq(
-              rewriteViewDeltaInsert(
-                stmt,
-                viewLogicalName,
-                viewDeltaPath,
-                deltaShape,
-                semiJoinPruneEnabled,
-                fkTermPruneEnabled,
-                fkRelations,
-                uniqueKeys,
-                uniqueJoinSimplifyEnabled
-              )
-            )
+            val rewritten =
+              if (!viewDeltaMaterialized) {
+                viewDeltaMaterialized = true
+                rewriteViewDeltaInsert(
+                  stmt,
+                  viewLogicalName,
+                  viewDeltaPath,
+                  deltaShape,
+                  semiJoinPruneEnabled,
+                  fkTermPruneEnabled,
+                  fkRelations,
+                  uniqueKeys,
+                  uniqueJoinSimplifyEnabled,
+                  sourceSnapshotVersions
+                )
+              } else {
+                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
+              }
+            Seq(rewritten)
           case StatementKind.ViewDeltaCompanion =>
             Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.MvMerge =>
@@ -535,6 +471,12 @@ object SparkRefreshRewriter {
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
             Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+          case StatementKind.GroupRecomputeRowsCreate =>
+            Seq(rewriteGroupRecomputeRowsCreate(stmt, viewLogicalName, viewDeltaPath))
+          case StatementKind.GroupRecomputeRowsInsert =>
+            Seq(rewriteGroupRecomputeRowsInsert(stmt, viewLogicalName, mvName))
+          case StatementKind.GroupRecomputeRowsDrop =>
+            Seq(rewriteGroupRecomputeRowsDrop(viewLogicalName))
           case StatementKind.CurrentSnapshotCreate =>
             Seq(rewriteCurrentSnapshotCreate(stmt))
           case StatementKind.OldSnapshotCreate =>
@@ -629,6 +571,16 @@ object SparkRefreshRewriter {
       * `DROP TABLE IF EXISTS openivm_affected_<view>` → `DROP VIEW IF EXISTS …`. */
     case object GroupRecomputeAffectedDrop extends StatementKind
 
+    /** DuckDB's indexed GROUP_RECOMPUTE path materialises surviving affected
+      * rows, conditionally deletes stale rows, and applies `INSERT OR REPLACE`.
+      * Spark has no corresponding DuckDB unique-index restriction, so it
+      * rewrites the program to delete every affected group and insert this
+      * materialised recompute result.
+      */
+    case object GroupRecomputeRowsCreate extends StatementKind
+    case object GroupRecomputeRowsInsert extends StatementKind
+    case object GroupRecomputeRowsDrop   extends StatementKind
+
     /** Current-diff recompute snapshot of the full post-refresh query result.
       *
       * OpenIVM emits `openivm_current_<view>` before `openivm_affected_<view>`
@@ -704,6 +656,7 @@ object SparkRefreshRewriter {
   private def classify(stmt: String, viewLogicalName: String): StatementKind = {
     val upper             = stmt.toUpperCase.trim
     val affectedKeysName  = s"OPENIVM_AFFECTED_${viewLogicalName.toUpperCase}"
+    val recomputeRowsName = s"OPENIVM_RECOMPUTE_${viewLogicalName.toUpperCase}"
     val currentName       = s"OPENIVM_CURRENT_${viewLogicalName.toUpperCase}"
     val oldSnapshotName   = s"OPENIVM_OLD_${viewLogicalName.toUpperCase}"
     val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
@@ -730,6 +683,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement B: TEMP TABLE materialising affected group keys.
       StatementKind.GroupRecomputeAffectedCreate
+    } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $recomputeRowsName")) {
+      StatementKind.GroupRecomputeRowsCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $currentName")) {
       StatementKind.CurrentSnapshotCreate
     } else if (upper.startsWith(s"CREATE OR REPLACE TEMP TABLE $oldSnapshotName")) {
@@ -741,6 +696,8 @@ object SparkRefreshRewriter {
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $affectedKeysName")) {
       // GROUP_RECOMPUTE Statement E: cleanup of the affected-keys scratch object.
       StatementKind.GroupRecomputeAffectedDrop
+    } else if (upper.startsWith(s"DROP TABLE IF EXISTS $recomputeRowsName")) {
+      StatementKind.GroupRecomputeRowsDrop
     } else if (upper.startsWith(s"DROP TABLE IF EXISTS $currentName")) {
       StatementKind.CurrentSnapshotDrop
     } else if (
@@ -779,6 +736,11 @@ object SparkRefreshRewriter {
       else StatementKind.ViewDeltaInsert
     } else if (upper.contains(s"MERGE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}")) {
       StatementKind.MvMerge
+    } else if (
+      upper.contains(s"INSERT OR REPLACE INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
+      upper.contains(recomputeRowsName)
+    ) {
+      StatementKind.GroupRecomputeRowsInsert
     } else if (
       upper.startsWith(s"DELETE FROM OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
       containsInSubquery(upper)
@@ -847,7 +809,8 @@ object SparkRefreshRewriter {
       fkTermPruneEnabled: Boolean,
       fkRelations: Seq[ForeignKeyRelation],
       uniqueKeys: Seq[UniqueKey],
-      uniqueJoinSimplifyEnabled: Boolean
+      uniqueJoinSimplifyEnabled: Boolean,
+      sourceSnapshotVersions: Map[String, Long]
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
@@ -856,10 +819,314 @@ object SparkRefreshRewriter {
     s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
+    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
     s
+  }
+
+  private case class ParsedCte(name: String, columns: String, bodyStart: Int, bodyEnd: Int, body: String)
+
+  final case class RegularNtermKeyRequest(sourceShortName: String, outputColumn: String, castType: Option[String])
+
+  private case class RegularNtermSource(shortName: String, isDelta: Boolean)
+
+  private case class RegularNtermPruneSite(
+      cteName: String,
+      targetExpression: String,
+      request: RegularNtermKeyRequest
+  )
+
+  /** Replace OpenIVM's regular N-term old-state reconstruction
+    *
+    *   current rows with weight +1 UNION ALL source delta with negated weight
+    *
+    * with a direct read of the source's pre-refresh Delta snapshot. The pass
+    * deliberately recognizes only the canonical CTE graph emitted by
+    * `CreateRegularOldNode`: a current scan followed by a literal-one
+    * projection, paired with a single-source negated delta chain. Unknown or
+    * projection-wrapped shapes are left untouched.
+    */
+  private[common] def rewriteRegularOldStateUnions(
+      sql: String,
+      sourceSnapshotVersions: Map[String, Long]
+  ): String = {
+    if (sourceSnapshotVersions.isEmpty) return sql
+
+    val ctes = parseLeadingCtes(sql)
+    if (ctes.isEmpty) return sql
+    val byName = ctes.map(c => c.name.toLowerCase -> c).toMap
+    val versionsByShort = sourceSnapshotVersions.map { case (table, version) =>
+      shortTableName(table).toLowerCase -> version
+    }
+
+    def singleDependency(body: String): Option[String] = {
+      val refs = "(?is)\\b(?:FROM|JOIN)\\s+`?([A-Za-z][A-Za-z0-9_]*)`?".r
+        .findAllMatchIn(body)
+        .map(_.group(1).toLowerCase)
+        .filter(byName.contains)
+        .toVector
+        .distinct
+      if (refs.size == 1) refs.headOption else None
+    }
+
+    def terminalScan(cteName: String, seen: Set[String] = Set.empty): Option[(String, String)] = {
+      if (seen(cteName)) return None
+      byName.get(cteName).flatMap { cte =>
+        val scan =
+          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+        cte.body match {
+          case scan(columns, table) => Some(table -> columns.trim)
+          case _                    => singleDependency(cte.body).flatMap(terminalScan(_, seen + cteName))
+        }
+      }
+    }
+
+    def directSourceScan(cte: ParsedCte): Option[(String, String)] =
+      singleDependency(cte.body).flatMap { dependency =>
+        byName.get(dependency).flatMap { scanCte =>
+          val scan =
+            "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+          scanCte.body match {
+            case scan(columns, table) => Some(table -> columns.trim)
+            case _                    => None
+          }
+        }
+      }
+
+    val union =
+      "(?is)^\\s*SELECT\\s+\\*\\s+FROM\\s+`?([A-Za-z][A-Za-z0-9_]*)`?\\s+UNION\\s+ALL\\s+SELECT\\s+\\*\\s+FROM\\s+`?([A-Za-z][A-Za-z0-9_]*)`?\\s*$".r
+    val replacements = ctes.flatMap { cte =>
+      cte.body match {
+        case union(currentProjectionName, negatedDeltaName) =>
+          val currentProjection = byName.get(currentProjectionName.toLowerCase)
+          val negatedDelta      = byName.get(negatedDeltaName.toLowerCase)
+          val literalOne = currentProjection.exists(c =>
+            "(?is)^\\s*SELECT\\s+.+,\\s*(?:CAST\\s*\\(\\s*)?1(?:\\s+AS\\s+INTEGER\\s*\\))?\\s+FROM\\s+.+$".r
+              .findFirstIn(c.body)
+              .nonEmpty
+          )
+          val negatesMultiplicity = negatedDelta.exists(_.body.matches("(?is).*\\(\\s*-1\\s*\\*.+"))
+          val currentScan         = currentProjection.flatMap(directSourceScan)
+          val deltaScan           = terminalScan(negatedDeltaName.toLowerCase)
+
+          (literalOne, negatesMultiplicity, currentScan, deltaScan) match {
+            case (true, true, Some((source, columns)), Some((deltaSource, _)))
+                if deltaSource.equalsIgnoreCase(s"openivm_delta_$source") =>
+              versionsByShort.get(source.toLowerCase).map { version =>
+                val qualified = activeQualifiedNames
+                  .get()
+                  .collectFirst { case (short, name) if short.equalsIgnoreCase(source) => name }
+                  .getOrElse(source)
+                  .split("\\.")
+                  .map(part => s"`${part.replace("`", "``")}`")
+                  .mkString(".")
+                val body = s"SELECT $columns, CAST(1 AS INT) FROM $qualified VERSION AS OF $version"
+                (cte.bodyStart, cte.bodyEnd, body)
+              }
+            case _ => None
+          }
+        case _ => None
+      }
+    }
+
+    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
+      rewritten.substring(0, start) + body + rewritten.substring(end)
+    }
+  }
+
+  private def parseLeadingCtes(sql: String): Seq[ParsedCte] = {
+    val withStart = findTopLevelSqlKeyword(sql, 0, sql.length, "WITH").getOrElse(return Seq.empty)
+    val parsed    = scala.collection.mutable.ArrayBuffer.empty[ParsedCte]
+    var pos       = withStart + "WITH".length
+    var more      = true
+    while (more) {
+      pos = skipWhitespace(sql, pos)
+      val nameEnd = scanBareToken(sql, pos)
+      if (nameEnd <= pos) return parsed.toVector
+      val name = sql.substring(pos, nameEnd).replace("`", "")
+      pos = skipWhitespace(sql, nameEnd)
+      if (pos >= sql.length || sql.charAt(pos) != '(') return parsed.toVector
+      val columnsEnd = findMatchingCloseParen(sql, pos)
+      if (columnsEnd < 0) return parsed.toVector
+      val columns = sql.substring(pos + 1, columnsEnd)
+      pos = skipWhitespace(sql, columnsEnd + 1)
+      if (!isKeywordAt(sql, pos, "AS")) return parsed.toVector
+      pos = skipWhitespace(sql, pos + 2)
+      if (pos >= sql.length || sql.charAt(pos) != '(') return parsed.toVector
+      val bodyEnd = findMatchingCloseParen(sql, pos)
+      if (bodyEnd < 0) return parsed.toVector
+      parsed += ParsedCte(name, columns, pos + 1, bodyEnd, sql.substring(pos + 1, bodyEnd))
+      pos = skipWhitespace(sql, bodyEnd + 1)
+      if (pos < sql.length && sql.charAt(pos) == ',') pos += 1 else more = false
+    }
+    parsed.toVector
+  }
+
+  /** Return the bounded delta-key sets that can prune direct base-table sides
+    * of regular N-term joins. Each request is derived from an equality inside
+    * one generated term, so callers may safely collect the requested delta
+    * column and feed it to [[pruneRegularNtermWithLiteralKeys]].
+    */
+  def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
+    regularNtermPruneSites(sql).map(_.request).distinct
+
+  /** Add literal IN predicates to the direct base-table side of a regular
+    * N-term equality join. Missing requests are left untouched; callers use
+    * that fail-closed behaviour when a key set is too large or cannot be
+    * rendered as portable Spark SQL literals.
+    */
+  def pruneRegularNtermWithLiteralKeys(
+      sql: String,
+      literalsByRequest: Map[RegularNtermKeyRequest, Seq[String]]
+  ): String = {
+    if (literalsByRequest.isEmpty) return sql
+    val ctes  = parseLeadingCtes(sql)
+    val sites = regularNtermPruneSites(sql).groupBy(_.cteName.toLowerCase)
+    val replacements = ctes.flatMap { cte =>
+      val predicates = sites
+        .getOrElse(cte.name.toLowerCase, Seq.empty)
+        .flatMap { site =>
+          literalsByRequest.get(site.request).map { literals =>
+            if (literals.isEmpty) "FALSE"
+            else s"${site.targetExpression} IN (${literals.mkString(", ")})"
+          }
+        }
+        .distinct
+      if (predicates.isEmpty) None
+      else {
+        val body = predicates.foldLeft(cte.body)(addTopLevelWhereConjunct)
+        Some((cte.bodyStart, cte.bodyEnd, body))
+      }
+    }
+    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
+      rewritten.substring(0, start) + body + rewritten.substring(end)
+    }
+  }
+
+  private def regularNtermPruneSites(sql: String): Seq[RegularNtermPruneSite] = {
+    if (!"(?is)\\bVERSION\\s+AS\\s+OF\\b".r.findFirstIn(sql).isDefined) return Seq.empty
+    val ctes   = parseLeadingCtes(sql)
+    val byName = ctes.map(cte => cte.name.toLowerCase -> cte).toMap
+    if (byName.isEmpty) return Seq.empty
+
+    val origins = scala.collection.mutable.Map.empty[String, Option[RegularNtermSource]]
+    def origin(cteName: String, seen: Set[String] = Set.empty): Option[RegularNtermSource] = {
+      val normalized = cteName.toLowerCase
+      if (seen(normalized)) None
+      else
+        origins.getOrElseUpdate(
+          normalized,
+          byName.get(normalized).flatMap { cte =>
+            val refs = collectScd2RelationRefs(cte.body)
+            val resolved = refs.flatMap { ref =>
+              byName.get(ref.shortName.toLowerCase) match {
+                case Some(_) => origin(ref.shortName, seen + normalized)
+                case None =>
+                  ref.deltaSourceShortName
+                    .map(short => RegularNtermSource(short.toLowerCase, isDelta = true))
+                    .orElse(Some(RegularNtermSource(ref.shortName.toLowerCase, isDelta = false)))
+              }
+            }.distinct
+            if (resolved.size == 1) resolved.headOption else None
+          }
+        )
+    }
+
+    val operand =
+      "((?:(?i:CAST)\\s*\\(\\s*)?(?:(`?[A-Za-z][A-Za-z0-9_]*`?)\\s*\\.\\s*)?(`?[A-Za-z][A-Za-z0-9_]*`?)(?:\\s+(?i:AS)\\s+([A-Za-z][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)\\s*\\))?)"
+    val equality = ("(?s)" + operand + "\\s*=\\s*" + operand).r
+
+    ctes.flatMap { cte =>
+      val refs = collectScd2RelationRefs(cte.body).filter(ref => byName.contains(ref.shortName.toLowerCase))
+      if (refs.size < 2 || !"(?is)\\bINNER\\s+JOIN\\b".r.findFirstIn(cte.body).isDefined) Seq.empty
+      else {
+        def relationFor(alias: String, column: String): Option[Scd2RelationRef] = {
+          val normalizedAlias = stripBackticks(Option(alias).getOrElse(""))
+          val normalizedCol   = stripBackticks(column)
+          val candidates =
+            if (normalizedAlias.nonEmpty)
+              refs.filter(ref =>
+                stripBackticks(ref.alias).equalsIgnoreCase(normalizedAlias) ||
+                  ref.shortName.equalsIgnoreCase(normalizedAlias)
+              )
+            else
+              refs.filter { ref =>
+                byName
+                  .get(ref.shortName.toLowerCase)
+                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(normalizedCol)))
+              }
+          candidates.distinct match {
+            case Seq(single) => Some(single)
+            case _           => None
+          }
+        }
+
+        equality
+          .findAllMatchIn(cte.body)
+          .flatMap { m =>
+            val leftRef  = relationFor(m.group(2), m.group(3))
+            val rightRef = relationFor(m.group(6), m.group(7))
+            for {
+              left        <- leftRef
+              right       <- rightRef
+              leftOrigin  <- origin(left.shortName)
+              rightOrigin <- origin(right.shortName)
+              site <- (leftOrigin, rightOrigin) match {
+                case (base, delta) if !base.isDelta && delta.isDelta =>
+                  Some(
+                    RegularNtermPruneSite(
+                      cte.name,
+                      m.group(1).trim,
+                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(7)), Option(m.group(8)))
+                    )
+                  )
+                case (delta, base) if delta.isDelta && !base.isDelta =>
+                  Some(
+                    RegularNtermPruneSite(
+                      cte.name,
+                      m.group(5).trim,
+                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(3)), Option(m.group(4)))
+                    )
+                  )
+                case _ => None
+              }
+            } yield site
+          }
+          .toVector
+      }
+    }.distinct
+  }
+
+  private def parsedCteColumns(cte: ParsedCte): Seq[String] =
+    splitTopLevelCsv(cte.columns).map(value => stripBackticks(value.trim))
+
+  private def splitTopLevelCsv(value: String): Seq[String] = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    var start = 0
+    var i     = 0
+    var depth = 0
+    while (i < value.length) {
+      value.charAt(i) match {
+        case '\'' => i = skipSingleQuoted(value, i)
+        case '"'  => i = skipDelimited(value, i, '"')
+        case '`'  => i = skipDelimited(value, i, '`')
+        case '(' =>
+          depth += 1
+          i += 1
+        case ')' =>
+          depth = math.max(0, depth - 1)
+          i += 1
+        case ',' if depth == 0 =>
+          parts += value.substring(start, i).trim
+          i += 1
+          start = i
+        case _ => i += 1
+      }
+    }
+    parts += value.substring(start).trim
+    parts.filter(_.nonEmpty).toVector
   }
 
   /** Drop inclusion-exclusion UNION ALL arms that select a source delta proven
@@ -1095,13 +1362,12 @@ object SparkRefreshRewriter {
             val aliasEnd   = scanBareToken(sql, aliasStart)
             val normalized = normalizeSqlIdentifier(ref)
             val short      = normalized.split("\\.").lastOption.getOrElse(normalized)
-            val alias =
+            val parsedAlias =
               if (aliasEnd > aliasStart) sql.substring(aliasStart, aliasEnd)
               else short
-            if (!stop(alias.toUpperCase)) {
-              val deltaShort = deltaSourceShortName(short)
-              refs += Scd2RelationRef(ref, short, alias, deltaShort)
-            }
+            val alias      = if (stop(parsedAlias.toUpperCase)) short else parsedAlias
+            val deltaShort = deltaSourceShortName(short)
+            refs += Scd2RelationRef(ref, short, alias, deltaShort)
           }
         }
       }
@@ -1554,7 +1820,7 @@ object SparkRefreshRewriter {
     sql.length
   }
 
-  /** Strip `openivm_timestamp [op] '<ts>'::TIMESTAMP` predicates that openivm
+  /** Strip `openivm_timestamp [op] <refresh horizon>` predicates that openivm
     * emits at the source-scan level.  The Spark-side staging catalog already
     * controls which staging Delta paths are visible, so the inner timestamp
     * filter is redundant (and references a value that's only tracked by
@@ -1575,11 +1841,17 @@ object SparkRefreshRewriter {
     // emitted by openivm when `force_view_delta_cascade=true`).
     val qcol      = "(?:`?\\w+`?\\.)?`?openivm_timestamp`?"
     val tsLiteral = "(?:'[^']*'::\\s*TIMESTAMP|CAST\\s*\\(\\s*'[^']*'\\s+AS\\s+TIMESTAMP\\s*\\))"
-    val cmp       = "\\s*(?:>=|>|<=|<|=)\\s*"
+    val metadataTable =
+      "(?:(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?openivm_delta_tables`?)"
+    val metadataHorizon =
+      "\\(\\s*SELECT\\s+last_update\\s+FROM\\s+" + metadataTable + "\\s+WHERE\\s+" +
+        "view_name\\s*=\\s*'[^']*'\\s+AND\\s+table_name\\s*=\\s*'[^']*'\\s*\\)"
+    val refreshHorizon = "(?:" + tsLiteral + "|" + metadataHorizon + ")"
+    val cmp            = "\\s*(?:>=|>|<=|<|=)\\s*"
     // LPTS rewrites parenthesises each WHERE conjunct
     // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
     // wrapped in a balanced paren pair or bare (pre-merge single-line form).
-    val tsPred = "(?:\\(\\s*" + qcol + cmp + tsLiteral + "\\s*\\)|" + qcol + cmp + tsLiteral + ")"
+    val tsPred = "(?:\\(\\s*" + qcol + cmp + refreshHorizon + "\\s*\\)|" + qcol + cmp + refreshHorizon + ")"
     // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
     // Case 2: trailing `AND [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
@@ -1594,6 +1866,66 @@ object SparkRefreshRewriter {
       ),
       ""
     )
+  }
+
+  /** Rewrite an additional data-bearing INSERT into the already-materialized
+    * per-refresh view-delta table. OpenIVM can emit these after the primary
+    * delta for LEFT JOIN match-state transitions; replacing the table here
+    * would silently discard the primary delta rows.
+    */
+  private def rewriteAdditionalViewDeltaInsert(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    var s           = rewriteLeftJoinSecondaryLateral(stripTimestampPredicate(stmt))
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val insertTargetRe = ("(?i)INSERT\\s+INTO\\s+`?openivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "`?").r
+    s = insertTargetRe.replaceAllIn(
+      s,
+      java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
+    )
+    rewriteMemoryMainPrefix(s)
+  }
+
+  /** Spark cannot resolve an outer key through the nested scalar subqueries in
+    * OpenIVM's DuckDB-optimized LEFT JOIN correction shape. Flatten those
+    * scalar aggregates into directly correlated LATERAL aggregates, preserving
+    * the same one-row COUNT/COALESCE(SUM) semantics.
+    */
+  private def rewriteLeftJoinSecondaryLateral(sql: String): String = {
+    val newCount = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+ib\\s+" +
+        "WHERE\\s+(.+?)\\)\\s+AS\\s+__newc\\s*\\)\\s+__n"
+    ).r
+    val withNewCount = newCount.replaceAllIn(
+      sql,
+      m =>
+        java.util.regex.Matcher.quoteReplacement(
+          s"LATERAL (SELECT COUNT(*) AS __newc FROM ${m.group(1)} ib WHERE ${m.group(2)}) __n"
+        )
+    )
+
+    val oldPresence = (
+      "(?is)LATERAL\\s*\\(\\s*SELECT\\s*\\(\\s*SELECT\\s+COUNT\\(\\*\\)\\s+FROM\\s+(.+?)\\s+pb\\s+" +
+        "WHERE\\s+(.+?)\\)\\s*-\\s*COALESCE\\s*\\(\\s*\\(\\s*SELECT\\s+SUM\\(__m\\)\\s+FROM\\s+" +
+        "(.+?)\\s+__pd\\s+WHERE\\s+(.+?)\\)\\s*,\\s*0\\s*\\)\\s+AS\\s+__old_pres_count\\s*\\)\\s+__op"
+    ).r
+    if (oldPresence.findFirstIn(withNewCount).isEmpty) withNewCount
+    else {
+      oldPresence
+        .replaceAllIn(
+          withNewCount,
+          m =>
+            java.util.regex.Matcher.quoteReplacement(
+              s"LATERAL (SELECT COUNT(*) AS __pres_count FROM ${m.group(1)} pb WHERE ${m.group(2)}) __pc,\n" +
+                s"LATERAL (SELECT COALESCE(SUM(__m), 0) AS __pres_delta FROM ${m.group(3)} __pd " +
+                s"WHERE ${m.group(4)}) __pdelta"
+            )
+        )
+        .replace("__old_pres_count", "(__pres_count - __pres_delta)")
+    }
   }
 
   /** Replace `memory.main.<identifier>` (bare or backticked) → either
@@ -2204,6 +2536,8 @@ object SparkRefreshRewriter {
     if (usingRewritten != s) return Seq(usingRewritten)
     val inRewritten = rewriteDeleteInAsMerge(s, mvRef)
     if (inRewritten.nonEmpty) return inRewritten
+    val existsRewritten = rewriteDeleteExistsDisjunctionAsMerges(s, mvRef)
+    if (existsRewritten.nonEmpty) return existsRewritten
     Seq(rewriteDeleteExistsAsMerge(s, mvRef))
   }
 
@@ -2338,6 +2672,10 @@ object SparkRefreshRewriter {
     var i     = start
     while (i < endExclusive) {
       sql.charAt(i) match {
+        case '-' if i + 1 < endExclusive && sql.charAt(i + 1) == '-' =>
+          i = consumeSqlLineComment(sql, i).min(endExclusive)
+        case '/' if i + 1 < endExclusive && sql.charAt(i + 1) == '*' =>
+          i = consumeSqlBlockComment(sql, i).min(endExclusive)
         case '\'' => i = consumeSqlSingleQuoted(sql, i).min(endExclusive)
         case '"'  => i = consumeSqlDoubleQuoted(sql, i).min(endExclusive)
         case '('  => depth += 1; i += 1
@@ -2367,6 +2705,27 @@ object SparkRefreshRewriter {
       else i += 1
     }
     sql.length
+  }
+
+  private def consumeSqlLineComment(sql: String, start: Int): Int = {
+    var i = start + 2
+    while (i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i += 1
+    i
+  }
+
+  private def consumeSqlBlockComment(sql: String, start: Int): Int = {
+    var depth = 1
+    var i     = start + 2
+    while (i < sql.length && depth > 0) {
+      if (i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*') {
+        depth += 1
+        i += 2
+      } else if (i + 1 < sql.length && sql.charAt(i) == '*' && sql.charAt(i + 1) == '/') {
+        depth -= 1
+        i += 2
+      } else i += 1
+    }
+    i
   }
 
   private def consumeSqlDoubleQuoted(sql: String, start: Int): Int = {
@@ -2516,11 +2875,17 @@ object SparkRefreshRewriter {
         if (existsClose < 0) return stmt
         val existsBody = stmt.substring(existsOpen + 1, existsClose).trim
         val trailing   = stmt.substring(existsClose + 1).trim
-        // The trailing text past the EXISTS must be just a terminator (`)` or
-        // empty) — anything else means the surrounding context is more complex
-        // than the inline affected-keys form and we bail out rather than
-        // mangle the SQL.
-        if (trailing.nonEmpty && trailing != ";") return stmt
+        // DuckDB's indexed GROUP_RECOMPUTE path retains target rows that also
+        // occur in openivm_recompute_<view>, then applies INSERT OR REPLACE.
+        // Delta has no matching unique-index restriction, and Spark rewrites
+        // that later upsert to a plain INSERT. Delete every affected group here
+        // so the pair remains equivalent without nesting EXISTS in Delta DELETE.
+        val indexedGroupRecomputeGuard =
+          trailing.toUpperCase.startsWith("AND") && trailing.toUpperCase.contains("NOT EXISTS") &&
+            trailing.toUpperCase.contains("OPENIVM_RECOMPUTE_")
+        // Other trailing predicates mean the surrounding context is more
+        // complex than a supported affected-key form.
+        if (trailing.nonEmpty && trailing != ";" && !indexedGroupRecomputeGuard) return stmt
 
         // EXISTS body forms (from refresh_helpers.cpp:195-218):
         //   (a) inline subquery — `SELECT 1 FROM (<sub>) AS <aff> WHERE <cond>`
@@ -2538,11 +2903,11 @@ object SparkRefreshRewriter {
               .findFirstMatchIn(tail)
               .map { t =>
                 val affAlias = t.group(1)
-                val onCond   = t.group(2)
-                s"""|MERGE INTO $mvRef AS $tgtAlias
+                val onCond   = normalizeDeleteExistsMatchAliases(t.group(2), tgtAlias, affAlias)
+                s"""|MERGE INTO $mvRef AS v
                   |USING (
                   |$subBody
-                  |) AS $affAlias
+                  |) AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -2554,9 +2919,9 @@ object SparkRefreshRewriter {
               .map { t =>
                 val src      = t.group(1)
                 val affAlias = t.group(2)
-                val onCond   = t.group(3)
-                s"""|MERGE INTO $mvRef AS $tgtAlias
-                  |USING $src AS $affAlias
+                val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                s"""|MERGE INTO $mvRef AS v
+                  |USING $src AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -2564,6 +2929,35 @@ object SparkRefreshRewriter {
         }
     }
   }
+
+  /** Rewrites the composite WINDOW_PARTITION delete emitted as one EXISTS per
+    * partition column, joined by top-level OR, into independent Delta MERGEs.
+    * Sequential deletes preserve the original disjunction semantics while
+    * avoiding Delta's unsupported DELETE subqueries.
+    */
+  private def rewriteDeleteExistsDisjunctionAsMerges(stmt: String, mvRef: String): Seq[String] = {
+    val deleteRe = ("(?is)^\\s*DELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
+      "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+(.+?)\\s*;?\\s*$").r
+    deleteRe.findFirstMatchIn(stmt).toSeq.flatMap { m =>
+      val tgtAlias = Option(m.group(1)).getOrElse("v")
+      val clauses  = splitTopLevelOr(m.group(2).trim)
+      if (clauses.size < 2 || clauses.exists(c => !c.trim.toUpperCase.startsWith("EXISTS"))) Seq.empty
+      else {
+        val rewritten = clauses.map { clause =>
+          val one = s"DELETE FROM $mvRef AS $tgtAlias WHERE ${clause.trim}"
+          rewriteDeleteExistsAsMerge(one, mvRef)
+        }
+        if (rewritten.exists(_.trim.toUpperCase.startsWith("DELETE FROM"))) Seq.empty else rewritten
+      }
+    }
+  }
+
+  private def normalizeDeleteExistsMatchAliases(
+      onCond: String,
+      targetAlias: String,
+      affectedAlias: String
+  ): String =
+    qualifyAlias(qualifyAlias(onCond, targetAlias, "v"), affectedAlias, "d")
 
   // ── WINDOW_PARTITION (RefreshType 5) statement rewrites ───────────────────
 
@@ -3099,6 +3493,44 @@ object SparkRefreshRewriter {
     val affectedName = s"openivm_affected_$viewLogicalName"
     s"DROP VIEW IF EXISTS `$affectedName`"
   }
+
+  /** Materialises the current rows for affected GROUP_RECOMPUTE keys as a
+    * Spark temporary view. The native compiler uses a DuckDB TEMP TABLE here
+    * because it subsequently performs INSERT OR REPLACE; Spark only needs a
+    * stable relation shared by the delete and insert statements.
+    */
+  private def rewriteGroupRecomputeRowsCreate(
+      stmt: String,
+      viewLogicalName: String,
+      viewDeltaPath: String
+  ): String = {
+    val escapedPath = viewDeltaPath.replace("`", "``")
+    val deltaViewRe = ("(?i)\\bopenivm_delta_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
+    s = rewriteMemoryMainPrefix(s)
+    s = stripTimestampPredicate(s)
+    s = rewriteExcludeAsExcept(s)
+    s = deltaViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(s"delta.`$escapedPath`"))
+    s
+  }
+
+  /** Replaces DuckDB's `INSERT OR REPLACE` half of indexed GROUP_RECOMPUTE
+    * with a plain append. The preceding Spark MERGE deletes every affected
+    * group, so no target row can conflict with the recomputed survivors.
+    */
+  private def rewriteGroupRecomputeRowsInsert(
+      stmt: String,
+      viewLogicalName: String,
+      mvName: TableIdentifier
+  ): String = {
+    val targetRe = ("(?is)\\bINSERT\\s+OR\\s+REPLACE\\s+INTO\\s+openivm_data_" +
+      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    targetRe.replaceFirstIn(stmt, java.util.regex.Matcher.quoteReplacement(s"INSERT INTO ${backtickMvName(mvName)}"))
+  }
+
+  private def rewriteGroupRecomputeRowsDrop(viewLogicalName: String): String =
+    s"DROP VIEW IF EXISTS `openivm_recompute_$viewLogicalName`"
 
   /** Rewrites `SELECT * EXCLUDE (col1, col2)` (DuckDB) by stripping the
     * `EXCLUDE (...)` clause entirely.

@@ -8,7 +8,9 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.Origin
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
+import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowQueryLogCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
@@ -31,17 +33,28 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
 
   override def visitCreateMaterializedView(
       ctx: IvmSqlBaseParser.CreateMaterializedViewContext
+  ): AnyRef = buildCreateCommand(ctx)
+
+  override def visitExplainCreateMaterializedView(
+      ctx: IvmSqlBaseParser.ExplainCreateMaterializedViewContext
   ): AnyRef = {
-    val name        = toTableIdentifier(ctx.multipartIdentifier(0))
-    val ifNotExists = ctx.IF() != null
-    val provider =
-      if (ctx.USING() != null) Some(identifierText(ctx.tableProvider)) else None
-    val properties =
-      if (ctx.tableProperties() != null) buildProperties(ctx.tableProperties())
-      else Map.empty[String, String]
-    val queryText = extractQueryBody(ctx.queryBody())
-    val queryPlan = session.sessionState.sqlParser.parsePlan(queryText)
-    CreateMaterializedViewCommand(name, queryPlan, properties, ifNotExists, provider, queryText)
+    val create = ctx.createMaterializedView()
+    ExplainCreateMaterializedViewCommand(
+      toTableIdentifier(create.multipartIdentifier()),
+      extractQueryBody(create.queryBody()),
+      clusterColumns(create)
+    )
+  }
+
+  override def visitShowRefreshSql(
+      ctx: IvmSqlBaseParser.ShowRefreshSqlContext
+  ): AnyRef = {
+    val create = ctx.createMaterializedView()
+    ShowMaterializedViewRefreshSqlCommand(
+      toTableIdentifier(create.multipartIdentifier()),
+      extractQueryBody(create.queryBody()),
+      clusterColumns(create)
+    )
   }
 
   override def visitRefreshMaterializedView(
@@ -70,6 +83,50 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
+
+  /** Build a [[CreateMaterializedViewCommand]] from a create-MV parse context.
+    * Shared by the plain CREATE visitor and the EXPLAIN / SHOW REFRESH SQL
+    * visitors that wrap the same `createMaterializedView` production.
+    */
+  private def buildCreateCommand(
+      ctx: IvmSqlBaseParser.CreateMaterializedViewContext
+  ): CreateMaterializedViewCommand = {
+    val name        = toTableIdentifier(ctx.multipartIdentifier())
+    val ifNotExists = ctx.IF() != null
+    val provider =
+      if (ctx.USING() != null) Some(identifierText(ctx.tableProvider)) else None
+    val properties =
+      if (ctx.tableProperties() != null) buildProperties(ctx.tableProperties())
+      else Map.empty[String, String]
+    val queryText = extractQueryBody(ctx.queryBody())
+    val queryPlan = session.sessionState.sqlParser.parsePlan(queryText)
+    CreateMaterializedViewCommand(
+      name,
+      queryPlan,
+      properties,
+      ifNotExists,
+      provider,
+      queryText,
+      clusterColumns(ctx)
+    )
+  }
+
+  /** Extract the `CLUSTER BY (...)` column names (declaration order), or empty
+    * when the DDL had no `CLUSTER BY` clause.
+    */
+  private def clusterColumns(
+      ctx: IvmSqlBaseParser.CreateMaterializedViewContext
+  ): Seq[String] = {
+    val clause = ctx.clusterByClause()
+    if (clause == null) Seq.empty
+    else clause.multipartIdentifier().asScala.map(multipartColumnName).toList
+  }
+
+  /** Reconstruct a (possibly dotted) column reference from a multipart id. */
+  private def multipartColumnName(
+      ctx: IvmSqlBaseParser.MultipartIdentifierContext
+  ): String =
+    ctx.identifier().asScala.map(identifierText).mkString(".")
 
   /** Convert a multipart identifier context into a Spark [[TableIdentifier]]. */
   private def toTableIdentifier(

@@ -224,6 +224,24 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
     }
   }
 
+  describe("MvMetadata.queryHasJoin") {
+    it("fails closed for legacy or malformed metadata") {
+      sampleMeta("join_shape_legacy").copy(properties = Map.empty).queryHasJoin shouldBe true
+      sampleMeta("join_shape_malformed")
+        .copy(properties = Map(MvMetadata.QueryHasJoinKey -> "unknown"))
+        .queryHasJoin shouldBe true
+    }
+
+    it("uses the analyzed-plan fact persisted at CREATE") {
+      sampleMeta("join_shape_false")
+        .copy(properties = MvMetadata.queryShapeProperties(hasJoin = false))
+        .queryHasJoin shouldBe false
+      sampleMeta("join_shape_true")
+        .copy(properties = MvMetadata.queryShapeProperties(hasJoin = true))
+        .queryHasJoin shouldBe true
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Test 11: concurrent writers don't double-insert
   // ---------------------------------------------------------------------------

@@ -2,7 +2,16 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, StagingCatalog, StagingDelta}
+import org.openivm.spark.common.{
+  BatchVerdict,
+  ChangeWatermark,
+  MvCatalog,
+  MvMetadata,
+  RefreshTypeCode,
+  StagingCatalog,
+  StagingChangeBatch,
+  StagingDelta
+}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -113,36 +122,37 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // ---------------------------------------------------------------------------
   // Test 1 — CREATE happy path
   // ---------------------------------------------------------------------------
-  describe("downstream relation identity") {
-    it("distinguishes same-named relations in different schemas") {
-      spark.sql("CREATE DATABASE IF NOT EXISTS mv_identity_left")
-      spark.sql("CREATE DATABASE IF NOT EXISTS mv_identity_right")
-      spark.sql("CREATE TABLE mv_identity_left.rollup (grp INT) USING DELTA")
-      spark.sql("CREATE TABLE mv_identity_right.rollup (grp INT) USING DELTA")
+  describe("replacement-batch detection") {
+    val timestamp = new Timestamp(0L)
 
-      def metadata(name: String, source: String): MvMetadata =
-        MvMetadata(
-          name = TableIdentifier(name),
-          querySql = s"SELECT * FROM $source",
-          refreshType = RefreshTypeCode.SimpleProjection,
-          refreshTypeName = "SIMPLE_PROJECTION",
-          lastVersion = 0L,
-          sourceTables = Seq(source),
-          sourceSchemaFingerprint = "unused",
-          location = s"$warehouseDir/$name",
-          createdAt = new Timestamp(0L),
-          properties = Map.empty
-        )
-
-      val consumers = Seq(
-        metadata("left_consumer", "mv_identity_left.rollup"),
-        metadata("right_consumer", "mv_identity_right.rollup")
+    def stagingBatch(opType: String): StagingChangeBatch = {
+      val delta = StagingDelta(
+        baseTable = "default.source",
+        opType = opType,
+        stagingPath = "/tmp/openivm-test-delta",
+        txnTs = timestamp,
+        consumedBy = Seq.empty
       )
-      MvCommandHelper.downstreamSourceKeys(
-        spark,
-        TableIdentifier("rollup", Some("mv_identity_left")),
-        consumers
-      ) shouldBe Set("mv_identity_left.rollup")
+      StagingChangeBatch(
+        baseTable = delta.baseTable,
+        deltas = Seq(delta),
+        endWatermark = ChangeWatermark.TxnTs(timestamp)
+      )
+    }
+
+    it("recognizes replacement CDF verdicts and explicit staging overwrites") {
+      MvCommandHelper.hasReplacementBatch(Seq.empty, Seq(BatchVerdict.Replace)) shouldBe true
+      MvCommandHelper.hasReplacementBatch(
+        Seq(stagingBatch(StagingDelta.OpTypes.Overwrite)),
+        Seq.empty
+      ) shouldBe true
+    }
+
+    it("keeps signed cascade view deltas eligible for incremental fast paths") {
+      MvCommandHelper.hasReplacementBatch(
+        Seq(stagingBatch(StagingDelta.OpTypes.MvViewDelta)),
+        Seq.empty
+      ) shouldBe false
     }
   }
 

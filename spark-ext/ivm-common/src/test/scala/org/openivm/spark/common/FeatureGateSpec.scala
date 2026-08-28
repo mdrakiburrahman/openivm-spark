@@ -75,6 +75,15 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.regularNtermLiteralPruneEnabled") {
+    it("defaults ON and honours an explicit OFF flag") {
+      FeatureGate.regularNtermLiteralPruneEnabled(new SparkConf(false)) shouldBe true
+      FeatureGate.regularNtermLiteralPruneEnabled(
+        new SparkConf(false).set(FeatureGate.RegularNtermLiteralPruneEnabledKey, "false")
+      ) shouldBe false
+    }
+  }
+
   describe("FeatureGate.skewFanoutEnabled") {
     it("defaults OFF and honours explicit strategy thresholds") {
       val base = new SparkConf(false)

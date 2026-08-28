@@ -10,6 +10,8 @@ class WindowPartitionSingleDeleteMergeSpec
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowPartitionSingleDeleteMergeEnabledKey -> "true",
+      FeatureGate.WindowSinglePassReplaceEnabledKey          -> "false",
+      FeatureGate.WindowCascadeMergeEnabledKey               -> "false",
       FeatureGate.QueryLogEnabledKey                         -> "true"
     )
 

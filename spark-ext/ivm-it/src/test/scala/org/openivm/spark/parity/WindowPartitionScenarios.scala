@@ -31,11 +31,13 @@ import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
   * CompileFacts payload), WINDOW_PARTITION now ALSO
   * emits an `INSERT INTO openivm_delta_<view>` companion: openivm snapshots
   * the affected pre-refresh rows into `openivm_old_<view>`, the recomputed
-  * post-refresh rows into `openivm_new_<view>`, refreshes
-  * `openivm_data_<view>` via the existing partition-scoped DELETE+INSERT, and
-  * then appends `-1/+1` rows into `openivm_delta_<view>`. The primary local
-  * refresh is still the DELETE+INSERT program; the auxiliary view-delta exists
-  * so downstream MV-over-MV chains can stay incremental.
+  * post-refresh rows into `openivm_new_<view>`, and emits `-1/+1` rows into
+  * `openivm_delta_<view>`. For a bounded affected-key set and this raw signed
+  * snapshot shape, Spark materializes the affected-key set once, persists the
+  * cascade, and applies its positive rows. Small literal key sets use one
+  * partition-scoped `REPLACE WHERE`; larger sets use the materialized keys for
+  * DELETE and the cascade for INSERT. The signed view delta also keeps
+  * downstream MV-over-MV chains incremental.
   *
   * == Observed `refreshType` per test ==
   *

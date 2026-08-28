@@ -761,6 +761,52 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       stripped.head should not include "openivm_timestamp"
       stripped.head should not include "::TIMESTAMP"
     }
+
+    it("appends additional LEFT JOIN correction deltas and strips metadata-backed refresh horizons") {
+      val input =
+        s"""INSERT INTO openivm_delta_mv_r (region, total, openivm_count_star, openivm_multiplicity)
+           |SELECT CAST(NULL AS STRING), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT), CAST(NULL AS INTEGER)
+           |WHERE false;
+           |INSERT INTO openivm_delta_mv_r (region, total, openivm_count_star, openivm_multiplicity)
+           |SELECT X.region, 0, 1, -1
+           |FROM (
+           |  SELECT customer_id AS __k, SUM(openivm_multiplicity) AS dsum
+           |  FROM `openivm_delta_orders`
+           |  WHERE openivm_timestamp >= (
+           |    SELECT last_update FROM memory.main.openivm_delta_tables
+           |    WHERE view_name = 'mv_r' AND table_name = 'openivm_delta_orders'
+           |  )
+           |  GROUP BY customer_id
+           |) d
+           |JOIN memory.main.customers X ON X.customer_id = d.__k,
+           |LATERAL (SELECT (SELECT COUNT(*) FROM memory.main.orders ib WHERE ib.customer_id = d.__k) AS __newc) __n,
+           |LATERAL (SELECT (SELECT COUNT(*) FROM memory.main.customers pb WHERE pb.customer_id = d.__k) -
+           |  COALESCE((SELECT SUM(__m) FROM (SELECT customer_id AS __k, openivm_multiplicity AS __m
+           |    FROM `openivm_delta_customers`) __pd WHERE __pd.__k = d.__k), 0) AS __old_pres_count) __op
+           |WHERE __newc > 0 AND __old_pres_count > 0;""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("orders" -> "openivm_delta_orders"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 2
+      rewritten.statements.head should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`")
+      rewritten.statements(1) should startWith(s"INSERT INTO delta.`$viewDeltaPath`")
+      rewritten.statements(1) should include("FROM `openivm_delta_orders`")
+      rewritten.statements(1) should include("JOIN `customers` X")
+      rewritten.statements(1) should include("LATERAL (SELECT COUNT(*) AS __newc FROM `orders` ib")
+      rewritten.statements(1) should include("LATERAL (SELECT COUNT(*) AS __pres_count FROM `customers` pb")
+      rewritten.statements(1) should include("COALESCE(SUM(__m), 0) AS __pres_delta")
+      rewritten.statements(1) should include("(__pres_count - __pres_delta) > 0")
+      rewritten.statements(1) should not include "SELECT (SELECT COUNT(*)"
+      rewritten.statements(1) should not include "openivm_timestamp"
+      rewritten.statements(1) should not include "openivm_delta_tables"
+    }
   }
 
   // ── 7. INSERT INTO openivm_delta_<v> becomes CREATE OR REPLACE TABLE CTAS ─
@@ -882,6 +928,35 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       deleteMerges.head should include("SELECT th_t_id AS trade_id")
       deleteMerges.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
       deleteMerges.head should not include "openivm_timestamp"
+    }
+
+    it("splits composite-partition OR EXISTS deletes into Delta-compatible MERGEs") {
+      val input =
+        """DELETE FROM openivm_data_mv_r AS openivm_target
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_sales) openivm_aff
+          |  WHERE openivm_target.region <=> openivm_aff.region
+          |) OR EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT product FROM openivm_delta_sales) openivm_aff
+          |  WHERE openivm_target.product <=> openivm_aff.product
+          |);""".stripMargin
+
+      val statements = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+        .statements
+
+      statements should have size 2
+      statements.foreach(_ should include("WHEN MATCHED THEN DELETE"))
+      statements.head should include("openivm_target.region <=> openivm_aff.region")
+      statements(1) should include("openivm_target.product <=> openivm_aff.product")
+      statements.foreach(_ should not startWith "DELETE FROM")
     }
   }
 
@@ -1030,6 +1105,56 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("indexed GROUP_RECOMPUTE rewrites") {
+    it("materializes recomputed rows and replaces DuckDB's guarded upsert with delete plus insert") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |SELECT region, amount, openivm_multiplicity FROM memory.main.openivm_delta_sales;
+          |CREATE OR REPLACE TEMP TABLE openivm_recompute_mv_r AS
+          |SELECT * FROM (SELECT region, MAX(amount) AS total FROM memory.main.sales GROUP BY region) openivm_recompute
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_mv_r) AS openivm_aff
+          |  WHERE openivm_aff.region IS NOT DISTINCT FROM openivm_recompute.region
+          |);
+          |DELETE FROM openivm_data_mv_r AS openivm_tgt
+          |WHERE EXISTS (
+          |  SELECT 1 FROM (SELECT DISTINCT region FROM openivm_delta_mv_r) AS openivm_aff
+          |  WHERE openivm_aff.region IS NOT DISTINCT FROM openivm_tgt.region
+          |)
+          |  AND ((openivm_tgt.region IS NULL)
+          |    OR NOT EXISTS (
+          |      SELECT 1 FROM openivm_recompute_mv_r AS openivm_keep
+          |      WHERE openivm_keep.region IS NOT DISTINCT FROM openivm_tgt.region
+          |    ));
+          |INSERT OR REPLACE INTO openivm_data_mv_r
+          |SELECT * FROM openivm_recompute_mv_r;
+          |DROP TABLE IF EXISTS openivm_recompute_mv_r;
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("sales" -> "openivm_delta_sales"),
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 5
+      rewritten.statements(1) should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_recompute_mv_r AS")
+      rewritten.statements(1) should include("FROM `sales`")
+      rewritten.statements(1) should include(s"FROM delta.`$viewDeltaPath`")
+      rewritten.statements(2) should startWith("MERGE INTO `mydb`.`mv_r` AS openivm_tgt")
+      rewritten.statements(2) should include("WHEN MATCHED THEN DELETE")
+      rewritten.statements(2) should not include "openivm_recompute_mv_r"
+      rewritten.statements(3) shouldBe
+        "INSERT INTO `mydb`.`mv_r`\nSELECT * FROM openivm_recompute_mv_r"
+      rewritten.statements(4) shouldBe "DROP VIEW IF EXISTS `openivm_recompute_mv_r`"
+    }
+  }
+
   // ── 9. postProcess is applied to each surviving statement ────────────────
   describe("postProcess hook") {
     it("invokes the supplied postProcess function on every kept statement") {
@@ -1138,6 +1263,34 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
+    it("canonicalizes NULL-safe materialized window keys for cascade reuse") {
+      val input =
+        """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
+          |DELETE FROM openivm_data_mv_r AS openivm_target
+          |WHERE EXISTS (
+          |  SELECT 1 FROM openivm_affected_mv_r AS openivm_aff
+          |  WHERE openivm_aff.region <=> openivm_target.region
+          |);
+          |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_r';
+          |""".stripMargin
+
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+
+      rewritten.statements should have size 1
+      val deleteMerge = rewritten.statements.head
+      deleteMerge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      deleteMerge should include("USING openivm_affected_mv_r AS d")
+      deleteMerge should include("ON d.region <=> v.region")
+      deleteMerge should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("keeps the pre-refresh snapshot pinned via Delta time travel and aliases bare delta metadata cols") {
       val windowCascadeInput =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1605,6 +1758,10 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     it("recognizes a CTE-prefixed MERGE without matching string literals") {
       SparkRefreshRewriter.isMergeStatement(merge) shouldBe true
       SparkRefreshRewriter.isMergeStatement("SELECT 'MERGE INTO not_a_statement'") shouldBe false
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 -- MERGE INTO not_a_statement") shouldBe false
+      SparkRefreshRewriter.isMergeStatement("SELECT 1 /* MERGE INTO not_a_statement */") shouldBe false
+      SparkRefreshRewriter.isMergeStatement(s"-- MERGE INTO fake\n$merge") shouldBe true
+      SparkRefreshRewriter.isMergeStatement(s"/* MERGE INTO fake */\n$merge") shouldBe true
     }
 
     it("rejects a non-MERGE consumer") {
@@ -1616,16 +1773,6 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     it("rejects a MERGE that scans the scratch more than once") {
       val twice = merge + s"\n-- second reference delta.`$path`"
       SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(ctas, twice, path) shouldBe None
-    }
-
-    it("preserves an explicit alias on the generated scratch scan") {
-      val aliased = merge.replace(s"delta.`$path`", s"delta.`$path` AS source_delta")
-      val result = SparkRefreshRewriter
-        .inlineViewDeltaCtasIntoMerge(ctas, aliased, path)
-        .getOrElse(fail("eligible aliased aggregate merge was not inlined"))
-
-      result should include("FROM (SELECT k, v, openivm_multiplicity FROM source_delta) AS source_delta")
-      result should not include "AS __openivm_direct_delta AS source_delta"
     }
   }
 
@@ -1721,52 +1868,102 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
-  describe("windowDeleteMergeKeys") {
-    val target = "`silver`.`daily_market`"
+  describe("regular N-term old-state snapshots") {
+    val canonical =
+      """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+        |),
+        |t1_projection (t1_id, t1_value, t1_mul) AS (
+        |  SELECT t0_id, t0_value, 1 FROM t0_scan
+        |),
+        |t2_scan (t2_id, t2_value, t2_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+        |),
+        |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+        |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+        |),
+        |t4_filter (t4_id, t4_value, t4_mul) AS (
+        |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+        |),
+        |t5_projection (t5_id, t5_value, t5_mul) AS (
+        |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+        |),
+        |t6_projection (t6_id, t6_value, t6_mul) AS (
+        |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+        |),
+        |t7_union (t7_id, t7_value, t7_mul) AS (
+        |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+        |)
+        |INSERT INTO openivm_delta_v SELECT * FROM t7_union""".stripMargin
 
-    it("extracts keys from the current OpenIVM named affected-key relation") {
-      val sql =
-        s"""MERGE INTO $target AS openivm_target
-           |USING openivm_affected_daily_market AS openivm_aff
-           |ON openivm_aff.dm_s_symb IS NOT DISTINCT FROM openivm_target.dm_s_symb
-           |WHEN MATCHED THEN DELETE""".stripMargin
+    it("replaces the canonical current-minus-delta arm with a pinned Delta snapshot") {
+      val rewritten = SparkRefreshRewriter.rewriteRegularOldStateUnions(canonical, Map("db.accounts" -> 17L))
 
-      SparkRefreshRewriter.windowDeleteMergeKeys(sql, target) shouldBe Some(
-        SparkRefreshRewriter.WindowDeleteMergeKeys(
-          "dm_s_symb",
-          "SELECT dm_s_symb FROM openivm_affected_daily_market"
-        )
-      )
+      rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
+      rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
     }
 
-    it("extracts keys from the legacy parenthesised delete MERGE") {
-      val sql =
-        s"""MERGE INTO $target AS v
-           |USING (
-           |  SELECT DISTINCT symbol FROM openivm_delta_daily_market
-           |) AS d
-           |ON v.dm_s_symb <=> d.symbol
-           |WHEN MATCHED THEN DELETE""".stripMargin
-
-      SparkRefreshRewriter.windowDeleteMergeKeys(sql, target) shouldBe Some(
-        SparkRefreshRewriter.WindowDeleteMergeKeys(
-          "dm_s_symb",
-          "SELECT symbol FROM (SELECT DISTINCT symbol FROM openivm_delta_daily_market) " +
-            "AS __openivm_window_replace_source"
+    it("leaves non-canonical projection-wrapped source arms unchanged") {
+      val wrapped = canonical
+        .replace(
+          "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0_id, t0_value, 1 FROM t0_scan",
+          "t0_filter (t0f_id, t0f_value) AS (SELECT t0_id, t0_value FROM t0_scan WHERE t0_value > 0),\n" +
+            "t1_projection (t1_id, t1_value, t1_mul) AS (\n  SELECT t0f_id, t0f_value, 1 FROM t0_filter"
         )
-      )
+
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(wrapped, Map("accounts" -> 17L)) shouldBe wrapped
     }
 
-    it("rejects a different target and non-delete MERGE") {
-      val deleteSql =
-        s"""MERGE INTO $target AS t
-           |USING affected AS s
-           |ON t.k <=> s.k
-           |WHEN MATCHED THEN DELETE""".stripMargin
-      val updateSql = deleteSql.replace("THEN DELETE", "THEN UPDATE SET t.k = s.k")
+    it("prunes only the direct base side with bounded delta-key literals") {
+      val sql =
+        """CREATE OR REPLACE TABLE delta.`/tmp/openivm_delta_v`
+          |USING DELTA AS
+          |WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_projection (t1_account_id, t1_mul) AS (
+          |  SELECT t0_account_id, t0_mul FROM t0_delta
+          |),
+          |t2_snapshot (t2_account_id, t2_name, t2_mul) AS (
+          |  SELECT `account_id`, `name`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t3_join (t3_name, t3_mul) AS (
+          |  SELECT t2_name, t1_mul * t2_mul
+          |  FROM t1_projection
+          |  INNER JOIN t2_snapshot ON CAST(t1_account_id AS BIGINT) = t2_account_id
+          |)
+          |INSERT INTO openivm_delta_v SELECT * FROM t3_join""".stripMargin
+      val request = SparkRefreshRewriter.RegularNtermKeyRequest("orders", "t1_account_id", Some("BIGINT"))
 
-      SparkRefreshRewriter.windowDeleteMergeKeys(deleteSql, "`silver`.`trades`") shouldBe None
-      SparkRefreshRewriter.windowDeleteMergeKeys(updateSql, target) shouldBe None
+      SparkRefreshRewriter.regularNtermKeyRequests(sql) shouldBe Seq(request)
+      val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(sql, Map(request -> Seq("10", "20")))
+      rewritten should include("WHERE t2_account_id IN (10, 20)")
+      rewritten should include("FROM t1_projection")
+      rewritten should include("FROM `accounts` VERSION AS OF 17")
+    }
+
+    it("leaves the N-term SQL unchanged when no bounded key set is available") {
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(canonical, Map.empty) shouldBe canonical
+    }
+
+    it("does not derive literal-pruning requests from outer joins") {
+      val outerJoin =
+        """WITH
+          |t0_delta (t0_account_id, t0_mul) AS (
+          |  SELECT `account_id`, `openivm_multiplicity` FROM `openivm_delta_orders`
+          |),
+          |t1_snapshot (t1_account_id, t1_mul) AS (
+          |  SELECT `account_id`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17
+          |),
+          |t2_join (t2_account_id, t2_mul) AS (
+          |  SELECT t1_account_id, t0_mul * t1_mul
+          |  FROM t0_delta LEFT JOIN t1_snapshot ON t0_account_id = t1_account_id
+          |)
+          |SELECT * FROM t2_join""".stripMargin
+
+      SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
     }
   }
 }

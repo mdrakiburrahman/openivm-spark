@@ -1,21 +1,25 @@
 /*
  * Top-of-grammar ANTLR4 file for the OpenIVM Spark extension.
  *
- * Adds four productions to Spark's surface SQL:
+ * Adds these productions to Spark's surface SQL:
  *
  *   CREATE MATERIALIZED VIEW <multipart_identifier>
- *     [USING <provider>] [<table_clauses>] AS <query>
+ *     [USING <provider>] [<table_clauses>] [CLUSTER BY (<cols>)] AS <query>
  *
  *   REFRESH MATERIALIZED VIEW <multipart_identifier>
  *
  *   DROP MATERIALIZED VIEW [IF EXISTS] <multipart_identifier>
+ *
+ *   EXPLAIN CREATE MATERIALIZED VIEW ... AS <query>       (dry-run verdict)
+ *
+ *   SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW ... AS <query>  (dry-run SQL)
  *
  *   SHOW OPENIVM REFRESH PROFILE
  *
  *   SHOW OPENIVM QUERY LOG
  *
  * The grammar is invoked only when `IvmParser.parsePlan` sees a statement
- * whose head matches one of the four forms above; otherwise the input is
+ * whose head matches one of the forms above; otherwise the input is
  * delegated to Spark's own parser unchanged.
  *
  * Notes:
@@ -37,7 +41,9 @@
 grammar IvmSqlBase;
 
 ivmStatement
-    : createMaterializedView
+    : explainCreateMaterializedView
+    | showRefreshSql
+    | createMaterializedView
     | refreshMaterializedView
     | dropMaterializedView
     | showOpenivmRefreshProfile
@@ -48,8 +54,25 @@ createMaterializedView
     : CREATE MATERIALIZED VIEW (IF NOT EXISTS)? multipartIdentifier
       (USING tableProvider=identifier)?
       (TBLPROPERTIES tableProperties)?
-      (PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')')?
+      partitionedClause?
+      clusterByClause?
       AS queryBody
+    ;
+
+partitionedClause
+    : PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    ;
+
+clusterByClause
+    : CLUSTER BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    ;
+
+explainCreateMaterializedView
+    : EXPLAIN createMaterializedView
+    ;
+
+showRefreshSql
+    : SHOW REFRESH SQL FOR createMaterializedView
     ;
 
 refreshMaterializedView
@@ -105,7 +128,7 @@ identifier
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
-    | QUERY | LOG
+    | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -126,6 +149,10 @@ OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
 PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
 QUERY         : [Qq][Uu][Ee][Rr][Yy];
 LOG           : [Ll][Oo][Gg];
+EXPLAIN       : [Ee][Xx][Pp][Ll][Aa][Ii][Nn];
+CLUSTER       : [Cc][Ll][Uu][Ss][Tt][Ee][Rr];
+SQL           : [Ss][Qq][Ll];
+FOR           : [Ff][Oo][Rr];
 
 EQ            : '=' | '==';
 

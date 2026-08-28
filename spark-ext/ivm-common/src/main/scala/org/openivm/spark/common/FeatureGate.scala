@@ -214,6 +214,13 @@ object FeatureGate {
     */
   val SemiJoinPruneEnabledKey: String = "spark.openivm.refresh.semiJoinPrune.enabled"
 
+  /** Collect bounded equality-key sets from regular N-term delta leaves and
+    * inject them as literal predicates on the directly joined base side. This
+    * enables native Delta data skipping without persistent helper state.
+    * Default ON; unsupported or oversized key domains fail closed.
+    */
+  val RegularNtermLiteralPruneEnabledKey: String = "spark.openivm.refresh.regularNtermLiteralPrune.enabled"
+
   /** Enable skew-aware delta fanout join hints. Default OFF: when opted in, the
     * refresh planner inspects per-refresh delta stats against source column
     * stats and broadcasts only the narrow/small source-delta side of
@@ -308,14 +315,24 @@ object FeatureGate {
 
   /** Replace WINDOW_PARTITION delete+insert recompute pairs with one Delta
     * `INSERT ... REPLACE WHERE` when the affected partition literal list is
-    * small enough to collect safely. Default ON; flip OFF to restore the legacy
-    * MERGE-delete plus INSERT execution path byte-for-byte.
+    * small enough to collect safely. Default ON; flip OFF to disable only the
+    * literal-key `REPLACE WHERE` path. The separately gated materialized-key
+    * cascade path may still optimize the compiler's DELETE+INSERT program.
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
+  /** Reuse a materialized affected-partition key set plus the persisted signed
+    * WINDOW_PARTITION cascade for target DELETE+INSERT when the literal-key
+    * `REPLACE WHERE` path is unavailable. Default ON; flip OFF to disable key
+    * materialization/cascade reuse. The independently gated small literal-key
+    * `REPLACE WHERE` path may remain active.
+    */
+  val WindowCascadeMergeEnabledKey: String = "spark.openivm.refresh.windowCascadeMerge.enabled"
+
   /** Cache WINDOW_PARTITION's post-refresh snapshot when the single-pass
-    * `REPLACE WHERE` path will consume it twice (cascade view-delta plus MV
-    * data write). Default OFF: flag-off execution remains byte-identical.
+    * `REPLACE WHERE` fallback will consume it twice. Default OFF: eligible raw
+    * signed-cascade programs instead materialize the cascade first and reuse
+    * its positive rows for the target write.
     */
   val WindowSnapshotCacheEnabledKey: String = "spark.openivm.refresh.windowSnapshotCache.enabled"
 
@@ -434,6 +451,12 @@ object FeatureGate {
   def semiJoinPruneEnabled(spark: SparkSession): Boolean =
     semiJoinPruneEnabled(spark.sparkContext.getConf)
 
+  def regularNtermLiteralPruneEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, RegularNtermLiteralPruneEnabledKey, default = true)
+
+  def regularNtermLiteralPruneEnabled(spark: SparkSession): Boolean =
+    regularNtermLiteralPruneEnabled(spark.sparkContext.getConf)
+
   def skewFanoutEnabled(conf: SparkConf): Boolean =
     boolConf(conf, SkewFanoutEnabledKey, default = false)
 
@@ -530,6 +553,12 @@ object FeatureGate {
 
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
+
+  def windowCascadeMergeEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, WindowCascadeMergeEnabledKey, default = true)
+
+  def windowCascadeMergeEnabled(spark: SparkSession): Boolean =
+    windowCascadeMergeEnabled(spark.sparkContext.getConf)
 
   def windowSnapshotCacheEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowSnapshotCacheEnabledKey, default = false)

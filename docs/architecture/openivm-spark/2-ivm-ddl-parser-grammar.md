@@ -13,8 +13,11 @@ Primary source files:
 - `spark-ext/project/Settings.scala`
 - `spark-ext/project/Dependencies.scala`
   The key design point is narrowness: OpenIVM does not fork Spark's SQL grammar.
-  It adds only `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, and
-  `DROP MATERIALIZED VIEW`. Everything else remains Spark SQL.
+  It adds `CREATE MATERIALIZED VIEW` (with optional `CLUSTER BY`),
+  `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, the dry-run
+  introspection verbs `EXPLAIN CREATE MATERIALIZED VIEW` and
+  `SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW`, plus the `SHOW OPENIVM …`
+  telemetry views. Everything else remains Spark SQL.
 
 ______________________________________________________________________
 
@@ -27,17 +30,25 @@ OpenIVM DDL wrapper, not a full `SELECT` grammar.
 /*
  * Top-of-grammar ANTLR4 file for the OpenIVM Spark extension.
  *
- * Adds three productions to Spark's surface SQL:
+ * Adds these productions to Spark's surface SQL:
  *
  *   CREATE MATERIALIZED VIEW <multipart_identifier>
- *     [USING <provider>] [<table_clauses>] AS <query>
+ *     [USING <provider>] [<table_clauses>] [CLUSTER BY (<cols>)] AS <query>
  *
  *   REFRESH MATERIALIZED VIEW <multipart_identifier>
  *
  *   DROP MATERIALIZED VIEW [IF EXISTS] <multipart_identifier>
  *
+ *   EXPLAIN CREATE MATERIALIZED VIEW ... AS <query>       (dry-run verdict)
+ *
+ *   SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW ... AS <query>  (dry-run SQL)
+ *
+ *   SHOW OPENIVM REFRESH PROFILE
+ *
+ *   SHOW OPENIVM QUERY LOG
+ *
  * The grammar is invoked only when `IvmParser.parsePlan` sees a statement
- * whose head matches one of the three forms above; otherwise the input is
+ * whose head matches one of the forms above; otherwise the input is
  * delegated to Spark's own parser unchanged.
  *
  * Notes:
@@ -59,17 +70,38 @@ OpenIVM DDL wrapper, not a full `SELECT` grammar.
 grammar IvmSqlBase;
 
 ivmStatement
-    : createMaterializedView
+    : explainCreateMaterializedView
+    | showRefreshSql
+    | createMaterializedView
     | refreshMaterializedView
     | dropMaterializedView
+    | showOpenivmRefreshProfile
+    | showOpenivmQueryLog
     ;
 
 createMaterializedView
     : CREATE MATERIALIZED VIEW (IF NOT EXISTS)? multipartIdentifier
       (USING tableProvider=identifier)?
       (TBLPROPERTIES tableProperties)?
-      (PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')')?
+      partitionedClause?
+      clusterByClause?
       AS queryBody
+    ;
+
+partitionedClause
+    : PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    ;
+
+clusterByClause
+    : CLUSTER BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    ;
+
+explainCreateMaterializedView
+    : EXPLAIN createMaterializedView
+    ;
+
+showRefreshSql
+    : SHOW REFRESH SQL FOR createMaterializedView
     ;
 
 refreshMaterializedView
@@ -78,6 +110,14 @@ refreshMaterializedView
 
 dropMaterializedView
     : DROP MATERIALIZED VIEW (IF EXISTS)? multipartIdentifier
+    ;
+
+showOpenivmRefreshProfile
+    : SHOW OPENIVM REFRESH PROFILE
+    ;
+
+showOpenivmQueryLog
+    : SHOW OPENIVM QUERY LOG
     ;
 
 queryBody
@@ -116,7 +156,8 @@ identifier
 
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
-    | AS  | BY  | DROP   | REFRESH
+    | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
+    | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -132,6 +173,15 @@ AS            : [Aa][Ss];
 BY            : [Bb][Yy];
 PARTITIONED   : [Pp][Aa][Rr][Tt][Ii][Tt][Ii][Oo][Nn][Ee][Dd];
 TBLPROPERTIES : [Tt][Bb][Ll][Pp][Rr][Oo][Pp][Ee][Rr][Tt][Ii][Ee][Ss];
+SHOW          : [Ss][Hh][Oo][Ww];
+OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
+PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
+QUERY         : [Qq][Uu][Ee][Rr][Yy];
+LOG           : [Ll][Oo][Gg];
+EXPLAIN       : [Ee][Xx][Pp][Ll][Aa][Ii][Nn];
+CLUSTER       : [Cc][Ll][Uu][Ss][Tt][Ee][Rr];
+SQL           : [Ss][Qq][Ll];
+FOR           : [Ff][Oo][Rr];
 
 EQ            : '=' | '==';
 
@@ -207,11 +257,17 @@ val LeadingJunk: Pattern = Pattern.compile(
 )
 ```
 
-It then looks for exactly the supported MV DDL heads:
+It then looks for exactly the supported IVM statement heads:
 
 ```scala
 val IvmKeyword: Pattern = Pattern.compile(
-  "\\A(?:create|refresh|drop)\\s+materialized\\s+view\\b",
+  "\\A(?:" +
+    "explain\\s+create\\s+materialized\\s+view|" +
+    "show\\s+refresh\\s+sql\\s+for\\s+create\\s+materialized\\s+view|" +
+    "(?:create|refresh|drop)\\s+materialized\\s+view|" +
+    "show\\s+openivm\\s+refresh\\s+profile|" +
+    "show\\s+openivm\\s+query\\s+log" +
+    ")\\b",
   Pattern.CASE_INSENSITIVE
 )
 ```
@@ -230,15 +286,22 @@ So these are intercepted:
 
 ```sql
 CREATE MATERIALIZED VIEW mv AS SELECT 1
+CREATE MATERIALIZED VIEW mv CLUSTER BY (region) AS SELECT region FROM t
 refresh materialized view mv
 /* comment */ DROP MATERIALIZED VIEW IF EXISTS mv
+EXPLAIN CREATE MATERIALIZED VIEW mv AS SELECT 1
+SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW mv AS SELECT 1
 ```
 
-But typoed or unrelated SQL is delegated to Spark:
+But typoed or unrelated SQL is delegated to Spark — note that a bare
+`EXPLAIN <query>` and `OPTIMIZE <table>` are deliberately **not** matched, so
+they fall through to Spark's / Delta's own planner:
 
 ```sql
 CREATE MATERIALIZD VIEW mv AS SELECT 1
 ALTER MATERIALIZED VIEW mv RENAME TO mv2
+EXPLAIN SELECT 1
+OPTIMIZE mv
 SELECT 1
 ```
 
@@ -316,8 +379,12 @@ Then the create visitor reparses the body with Spark:
 ```scala
 override def visitCreateMaterializedView(
     ctx: IvmSqlBaseParser.CreateMaterializedViewContext
-): AnyRef = {
-  val name        = toTableIdentifier(ctx.multipartIdentifier(0))
+): AnyRef = buildCreateCommand(ctx)
+
+private def buildCreateCommand(
+    ctx: IvmSqlBaseParser.CreateMaterializedViewContext
+): CreateMaterializedViewCommand = {
+  val name        = toTableIdentifier(ctx.multipartIdentifier())
   val ifNotExists = ctx.IF() != null
   val provider =
     if (ctx.USING() != null) Some(identifierText(ctx.tableProvider)) else None
@@ -326,9 +393,18 @@ override def visitCreateMaterializedView(
     else Map.empty[String, String]
   val queryText = extractQueryBody(ctx.queryBody())
   val queryPlan = session.sessionState.sqlParser.parsePlan(queryText)
-  CreateMaterializedViewCommand(name, queryPlan, properties, ifNotExists, provider, queryText)
+  CreateMaterializedViewCommand(
+    name, queryPlan, properties, ifNotExists, provider, queryText,
+    clusterColumns(ctx) // CLUSTER BY (...) column names, or empty
+  )
 }
 ```
+
+`buildCreateCommand` is shared: the plain `CREATE` visitor calls it directly,
+while `visitExplainCreateMaterializedView` and `visitShowRefreshSql` unwrap the
+same `createMaterializedView` production and build an
+`ExplainCreateMaterializedViewCommand` / `ShowMaterializedViewRefreshSqlCommand`
+respectively (both dry-run — no MV is created).
 
 The critical line is:
 
@@ -457,8 +533,8 @@ Not supported:
 ALTER MATERIALIZED VIEW mv RENAME TO mv2
 ```
 
-The head is not one of the three intercepted prefixes, so it is delegated to
-Spark and rejected there.
+The head is not one of the intercepted IVM statement prefixes, so it is
+delegated to Spark and rejected there.
 
 ### MV with column list
 
@@ -469,7 +545,7 @@ CREATE MATERIALIZED VIEW mv(a, b) AS SELECT a, b FROM t
 ```
 
 The grammar expects the MV name followed by optional `USING`, `TBLPROPERTIES`,
-`PARTITIONED BY`, and then `AS`; it has no column-list production.
+`PARTITIONED BY`, `CLUSTER BY`, and then `AS`; it has no column-list production.
 
 ### Table-valued function MV bodies
 
@@ -583,6 +659,45 @@ DROP MATERIALIZED VIEW IF EXISTS mv_sales
 ```
 
 Result: `DropMaterializedViewCommand` with `ifExists = true`.
+
+### Create with `CLUSTER BY` (#24)
+
+```sql
+CREATE MATERIALIZED VIEW mv_clustered CLUSTER BY (region, day)
+AS SELECT region, day, sum(amount) AS sum_amount FROM sales GROUP BY region, day
+```
+
+Result: `CreateMaterializedViewCommand` with `clusterColumns = Seq("region",
+"day")`. The columns are threaded into the MV's Delta `CLUSTER BY (...)` CTAS
+(user `CLUSTER BY` overrides the window-prune clustering) and persisted in
+`MvMetadata` under `_ivm_cluster_cols`. `OPTIMIZE mv_clustered` is **not**
+intercepted — it falls through to Delta and runs liquid clustering on the MV's
+real table.
+
+### Explain (dry-run verdict, #4)
+
+```sql
+EXPLAIN CREATE MATERIALIZED VIEW mv_sales
+AS SELECT region, sum(amount) AS sum_amount FROM sales GROUP BY region
+```
+
+Result: `ExplainCreateMaterializedViewCommand`. **No MV is created.** It emits a
+single `explain STRING` column containing one JSON row —
+`{view, eligible, refresh_type, refresh_type_name, reason, source_tables,
+emits_cascade_view_delta}` — where `eligible` is `refresh_type != FULL_REFRESH`.
+
+### Show refresh SQL (dry-run rewrite, #25)
+
+```sql
+SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW mv_sales
+AS SELECT region, sum(amount) AS sum_amount FROM sales GROUP BY region
+```
+
+Result: `ShowMaterializedViewRefreshSqlCommand`. **No MV is created.** It emits a
+single `refresh_sql STRING` column containing the incrementally-rewritten,
+Spark-executable refresh program (multi-statement, `;`-separated). Both dry-run
+verbs register the MV's empty schema-only output in the session so downstream
+statements in the same dbt DAG resolve it (cold-DAG resolution).
 
 ______________________________________________________________________
 

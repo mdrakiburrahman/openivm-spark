@@ -156,7 +156,6 @@ The emit sites found by `grep -rn "logInfo.*refresh" spark-ext/` and related `lo
 | refresh has pending deltas             | `refresh_type`, `pending_deltas`, `source_tables`                                                                | INFO          | `MaterializedViewCommands.scala:824-827`                                                                   |
 | compile cache backfill failure         | exception class and message                                                                                      | WARN          | `MaterializedViewCommands.scala:920-939`                                                                   |
 | rewritten statement text               | `stmt[i]=<Spark SQL preview>`                                                                                    | INFO          | `MaterializedViewCommands.scala:1017-1026`                                                                 |
-| simple projection fallback             | `outcome='simple_projection_full_refresh' reason='conflicting_signed_rows'`                                      | INFO          | `MaterializedViewCommands.scala:1030-1042`                                                                 |
 | skipped simple projection delete merge | `outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'`                                        | INFO          | `MaterializedViewCommands.scala:1061-1070`, `1077-1086`                                                    |
 
 The assemblers under `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/*Assembler.scala` do not currently emit log lines themselves.
@@ -512,7 +511,7 @@ Suggested insertion points are direct and low-risk.
 | rewrite           | around `SparkRefreshRewriter.rewrite(...)` in `runUnderLock`                                                          |
 | execute statement | inside the `executeSql` wrapper at `MaterializedViewCommands.scala:1027-1028`                                         |
 | mark consumed     | around `postRefreshCleanup(...)` and `StagingCatalog.markConsumed(...)` at `MaterializedViewCommands.scala:1273-1274` |
-| cascade delta     | immediately after `cleanupMeta.emitsCascadeViewDelta` is evaluated at `MaterializedViewCommands.scala:1132-1155`      |
+| cascade delta     | immediately after `meta.emitsCascadeViewDelta` is evaluated in `MaterializedViewCommands.scala`                       |
 
 Until that instrumentation exists, treat Spark logs as control-plane evidence and Spark SQL metrics as runtime evidence.
 For DuckDB standalone refresh runtime, use `openivm_refresh_profile` directly.

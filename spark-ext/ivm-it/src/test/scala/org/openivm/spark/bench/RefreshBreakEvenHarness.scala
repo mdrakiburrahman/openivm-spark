@@ -9,6 +9,95 @@ object MicroBenchmarkTag extends Tag("org.openivm.spark.tags.MicroBenchmark")
 
 class RefreshBreakEvenHarness extends RefreshBreakEvenScenarios with InterceptMode
 
+class WindowNoopWriteHarness extends WindowNoopWriteScenarios with InterceptMode
+
+abstract class WindowNoopWriteScenarios extends IvmParitySpecBase("window-noop-write-benchmark") {
+  self: IvmParityMode =>
+
+  describe("window net-zero write micro-bench") {
+    it("proves the probe beats the previous target writes", MicroBenchmarkTag) {
+      val rows     = 20000
+      val target   = "rbe_window_noop_target"
+      val expected = "rbe_window_noop_expected"
+      val cascade  = "rbe_window_noop_cascade"
+
+      sql(
+        s"""|CREATE TABLE $target USING DELTA AS
+            |SELECT id,
+            |       CAST(id % 1001 AS INT) AS part,
+            |       CAST(id * 17 AS BIGINT) AS payload,
+            |       ROW_NUMBER() OVER (PARTITION BY id % 1001 ORDER BY id) AS row_num
+            |FROM range($rows)""".stripMargin
+      )
+      sql(s"CREATE TABLE $expected USING DELTA AS SELECT * FROM $target")
+      sql(
+        s"""|CREATE TABLE $cascade USING DELTA AS
+            |SELECT id, part, payload, row_num, CAST(-1 AS INT) AS openivm_multiplicity FROM $target
+            |UNION ALL
+            |SELECT id, part, payload, row_num, CAST(1 AS INT) AS openivm_multiplicity FROM $target""".stripMargin
+      )
+
+      val probeSql =
+        s"""|SELECT 1
+            |FROM $cascade
+            |GROUP BY id, part, payload, row_num
+            |HAVING SUM(CAST(openivm_multiplicity AS BIGINT)) <> 0
+            |LIMIT 1""".stripMargin
+      val deleteSql =
+        s"""|MERGE INTO $target AS target
+            |USING (SELECT DISTINCT part FROM $cascade) AS affected
+            |ON target.part <=> affected.part
+            |WHEN MATCHED THEN DELETE""".stripMargin
+      val insertSql =
+        s"""|INSERT INTO $target
+            |SELECT id, part, payload, row_num
+            |FROM $cascade
+            |WHERE openivm_multiplicity > 0""".stripMargin
+
+      def version(table: String): Long =
+        sql(s"DESCRIBE HISTORY $table").selectExpr("MAX(version)").head().getLong(0)
+      def timeMs(body: => Unit): Long = {
+        val start = System.nanoTime()
+        body
+        math.max(1L, (System.nanoTime() - start) / 1000000L)
+      }
+      def median(samples: Seq[Long]): Long = samples.sorted.apply(samples.size / 2)
+
+      sql(probeSql).collect() shouldBe empty
+      val beforeProbeVersion = version(target)
+      val probeMs            = median(Seq.fill(5)(timeMs(sql(probeSql).collect())))
+      version(target) shouldBe beforeProbeVersion
+
+      val beforePreviousVersion = version(target)
+      val previousMs = median(
+        Seq.fill(3) {
+          timeMs {
+            sql(deleteSql).collect()
+            sql(insertSql).collect()
+          }
+        }
+      )
+      version(target) shouldBe (beforePreviousVersion + 6L)
+      assertBagEqual(s"SELECT * FROM $target", s"SELECT * FROM $expected")
+
+      println(
+        s"Window net-zero A/B: rows=$rows probe_median_ms=$probeMs " +
+          s"previous_delete_insert_median_ms=$previousMs"
+      )
+      withClue(s"probe_median_ms=$probeMs previous_delete_insert_median_ms=$previousMs") {
+        probeMs should be < previousMs
+      }
+    }
+  }
+
+  private def assertBagEqual(leftSql: String, rightSql: String): Unit = {
+    sql(s"SELECT * FROM ($leftSql) openivm_left EXCEPT ALL SELECT * FROM ($rightSql) openivm_right")
+      .count() shouldBe 0L
+    sql(s"SELECT * FROM ($rightSql) openivm_right EXCEPT ALL SELECT * FROM ($leftSql) openivm_left")
+      .count() shouldBe 0L
+  }
+}
+
 private final case class BenchShape(
     name: String,
     shortName: String,
@@ -39,6 +128,7 @@ abstract class RefreshBreakEvenScenarios extends IvmParitySpecBase("refresh-brea
         printTable(shape.name, results)
       }
     }
+
   }
 
   private def runOne(shape: BenchShape, fraction: Double, index: Int): BenchResult = {

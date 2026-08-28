@@ -115,11 +115,22 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
     }
 
     it("keeps an insert-only MERGE conservative when the writer omits row metrics") {
-      val mergeInfo = CommitInfo
-        .empty(None)
-        .copy(operation = "MERGE", operationParameters = Map.empty, operationMetrics = None)
+      val table = createTable("merge_insert_only")
+      val view  = uniqueTable("merge_insert_only_src")
+      spark.sql(s"INSERT INTO $table VALUES (1, 'a')")
+      spark.sql(s"CREATE OR REPLACE TEMP VIEW $view AS SELECT 2 AS id, 'b' AS name")
+      val before = latest(table)
 
-      DeltaCommitClassifier.classifyCommit(Seq(mergeInfo)) shouldBe Mutating
+      spark.sql(
+        s"""
+           |MERGE INTO $table t
+           |USING $view s
+           |ON t.id = s.id
+           |WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)
+           |""".stripMargin
+      )
+
+      classify(table, before) shouldBe Mutating
     }
 
     it("uses MERGE row metrics when the writer records a complete insert-only proof") {
