@@ -1622,7 +1622,10 @@ case class CreateMaterializedViewCommand(
     val isHavingViewIncremental = effectiveRefreshType == RefreshTypeCode.AggregateHaving
     val topKViewSuffix =
       if (effectiveRefreshType != RefreshTypeCode.FullRefresh) topKViewSpec.suffixSql else None
-    val usesBackingDataTable = isHavingViewIncremental || topKViewSuffix.nonEmpty
+    val requiresCasePreservingView =
+      analyzed.output.exists(column => column.name != column.name.toLowerCase(java.util.Locale.ROOT))
+    val usesBackingDataTable =
+      isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresCasePreservingView
     val dataIdent: TableIdentifier =
       if (usesBackingDataTable) dataTableId(name) else name
     val havingPred: Option[String] = if (isHavingViewIncremental) rawHavingPred else None
@@ -1634,7 +1637,8 @@ case class CreateMaterializedViewCommand(
     val countProp  = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp = havingPred.map(p => "_ivm_having_pred" -> p).toMap
     val backingViewProp =
-      topKViewSuffix.map(MvMetadata.BackingViewSuffixKey -> _).toMap
+      topKViewSuffix.map(MvMetadata.BackingViewSuffixKey -> _).toMap ++
+        (if (usesBackingDataTable) Map(MvMetadata.BackingDataTableKey -> "true") else Map.empty)
     val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
     val classificationProps =
@@ -1872,12 +1876,13 @@ case class CreateMaterializedViewCommand(
           )
         }
 
-        // Backing-table layouts expose a Spark VIEW that hides OpenIVM bookkeeping
-        // columns and applies HAVING and/or Top-K only at read time.
+        // Backing-table layouts expose a Spark VIEW that hides OpenIVM bookkeeping,
+        // preserves user-authored output case, and applies HAVING/Top-K at read time.
         if (usesBackingDataTable) {
           profile.timeStep("create_mv_user_view", s"having=$isHavingViewIncremental;top_k=${topKViewSuffix.nonEmpty}") {
-            val dataCols = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSet
-            val pred     = havingPred.getOrElse("TRUE")
+            val dataFields = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSeq
+            val dataCols   = dataFields.toSet
+            val pred       = havingPred.getOrElse("TRUE")
             if (!havingPredicateIsSafe(pred, dataCols)) {
               throw new RuntimeException(
                 s"HAVING predicate '$pred' references columns not present on data table " +
@@ -1888,7 +1893,18 @@ case class CreateMaterializedViewCommand(
               )
             }
             val colList = userOutputCols
-              .map(c => s"`${c.replace("`", "``")}`")
+              .map { userColumn =>
+                val matches = dataFields.filter(_.equalsIgnoreCase(userColumn))
+                if (matches.size != 1) {
+                  throw new RuntimeException(
+                    s"User column '$userColumn' did not resolve uniquely on backing table " +
+                      s"${sqlIdent(dataIdent)} (matches: ${matches.mkString(", ")})"
+                  )
+                }
+                val physical = matches.head.replace("`", "``")
+                val logical  = userColumn.replace("`", "``")
+                s"`$physical` AS `$logical`"
+              }
               .mkString(", ")
             val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
             val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")

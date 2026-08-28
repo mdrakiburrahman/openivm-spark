@@ -133,7 +133,9 @@ final case class MvMetadata(
 
   /** Whether writes must target the sibling `<mv>__ivm_data` Delta table. */
   def usesBackingDataTable: Boolean =
-    refreshType == RefreshTypeCode.AggregateHaving || backingViewSuffix.nonEmpty
+    refreshType == RefreshTypeCode.AggregateHaving ||
+      backingViewSuffix.nonEmpty ||
+      properties.get(MvMetadata.BackingDataTableKey).contains("true")
 
   /** CREATE-time [[TimeTravelPinStatus]] of this view's user-authored snapshot
     * pins, or `None` for a view created before the status was persisted (the
@@ -184,6 +186,9 @@ object MvMetadata {
     * user-facing VIEW over an unlimited incremental backing table.
     */
   val BackingViewSuffixKey: String = "_ivm_backing_view_suffix"
+
+  /** Property recording a user-facing view over the physical state table. */
+  val BackingDataTableKey: String = "_ivm_uses_backing_data_table"
 
   /** Property recording whether Spark's analyzed CREATE plan contains a join. */
   val QueryHasJoinKey: String = "_ivm_query_has_join"
