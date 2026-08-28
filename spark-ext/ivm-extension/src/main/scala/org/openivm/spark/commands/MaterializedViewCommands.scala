@@ -10,6 +10,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeReference,
   Expression,
   NamedExpression,
+  RowOrdering,
   SubqueryExpression
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
@@ -2112,6 +2113,7 @@ case class RefreshMaterializedViewCommand(
         FeatureGate.fuseScratchEnabled(spark) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
           rewritten.statements.nonEmpty
+      var cascadeProducedChanges = true
 
       try {
         lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
@@ -2157,7 +2159,7 @@ case class RefreshMaterializedViewCommand(
             done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
           }
         }
-        def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+        def executeSqlRowsAt(sql: String, stmtIdx: Int): Array[Row] = {
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
           val sqlBytes = sql.length
@@ -2199,6 +2201,10 @@ case class RefreshMaterializedViewCommand(
               }
             }
           }
+        }
+        def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+          executeSqlRowsAt(sql, stmtIdx)
+          ()
         }
         def executeSql(sql: String): Unit = {
           val idx = stmtCounter.getAndIncrement()
@@ -2516,6 +2522,7 @@ case class RefreshMaterializedViewCommand(
           val windowSinglePassReplaceEligible =
             FeatureGate.windowSinglePassReplaceEnabled(spark) &&
               meta.refreshType == RefreshTypeCode.WindowPartition &&
+              !FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark) &&
               !windowSuffixSafe &&
               boundedRankInsertSql.isEmpty
           val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
@@ -2686,13 +2693,30 @@ case class RefreshMaterializedViewCommand(
               }
               if (isViewDeltaCtas && idx == windowCascadeCtasIdx) {
                 deferredWindowTargetSql.foreach { case (targetIdx, targetSql) =>
-                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_first_replace'")
-                  logInfo(
-                    s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                      "outcome='window_cascade_first_replace' reason='reuse_materialized_cascade_snapshot'"
-                  )
-                  withPlanTimeBroadcastDisabled {
-                    executeSqlAt(targetSql, targetIdx)
+                  val plan = windowSinglePassReplacePlan.get
+                  val hasNetChanges = plan.netChangeProbeSql.forall { probeSql =>
+                    withPlanTimeBroadcastDisabled {
+                      val probeIdx = stmtCounter.getAndIncrement()
+                      executeSqlRowsAt(probeSql, probeIdx).nonEmpty
+                    }
+                  }
+                  if (hasNetChanges) {
+                    RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_first_replace'")
+                    logInfo(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                        "outcome='window_cascade_first_replace' reason='reuse_materialized_cascade_snapshot'"
+                    )
+                    withPlanTimeBroadcastDisabled {
+                      executeSqlAt(targetSql, targetIdx)
+                    }
+                  } else {
+                    cascadeProducedChanges = false
+                    logSkippedWindowStmt(targetIdx, "window_replace_noop_skipped")
+                    RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_noop'")
+                    logInfo(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                        "outcome='window_cascade_noop' reason='old_new_bags_equal'"
+                    )
                   }
                 }
                 deferredWindowTargetSql = None
@@ -2785,7 +2809,7 @@ case class RefreshMaterializedViewCommand(
         // Only matters for the intercept mode: under CDF the downstream MV
         // discovers our update via the MV data table's own change feed, so
         // there is no need to write an MV_VIEW_DELTA staging row.
-        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta) {
+        if (propagation.requiresDmlInterception && cleanupMeta.emitsCascadeViewDelta && cascadeProducedChanges) {
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
@@ -3056,7 +3080,11 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowReplaceKeySet(targetCol: String, literals: Seq[String], hasNull: Boolean)
 
-  private case class WindowSinglePassReplacePlan(directSql: String, cascadeSql: String)
+  private case class WindowSinglePassReplacePlan(
+      directSql: String,
+      cascadeSql: String,
+      netChangeProbeSql: Option[String]
+  )
 
   private case class BoundedRankShape(
       sourceShort: String,
@@ -3086,7 +3114,7 @@ case class RefreshMaterializedViewCommand(
     val keySets = deleteSqls.flatMap(collectWindowReplaceKeySet(spark, targetId, _))
     if (keySets.size != deleteSqls.size || keySets.isEmpty) return None
     if (keySets.forall(keys => keys.literals.isEmpty && !keys.hasNull))
-      return Some(WindowSinglePassReplacePlan("", ""))
+      return Some(WindowSinglePassReplacePlan("", "", None))
 
     val predicates = keySets.flatMap { keys =>
       val inPred =
@@ -3099,7 +3127,7 @@ case class RefreshMaterializedViewCommand(
         case many     => Some(many.mkString("(", " OR ", ")"))
       }
     }
-    if (predicates.isEmpty) return Some(WindowSinglePassReplacePlan("", ""))
+    if (predicates.isEmpty) return Some(WindowSinglePassReplacePlan("", "", None))
 
     val predicate = predicates.mkString("(", " OR ", ")")
     if (predicate.length > WindowReplaceMaxPredicateBytes) return None
@@ -3107,7 +3135,8 @@ case class RefreshMaterializedViewCommand(
     val escapedLocation = meta.location.replace("`", "``")
     val view            = targetId.table.replace("`", "``")
     val targetRef       = MvCommandHelper.sqlIdent(targetId)
-    val targetColumns   = spark.table(targetRef).columns.toSeq.map(quoteCol).mkString(", ")
+    val targetSchema    = spark.table(targetRef).schema
+    val targetColumns   = targetSchema.fieldNames.toSeq.map(quoteCol).mkString(", ")
     val directSql =
       s"""|INSERT INTO delta.`$escapedLocation`
           |REPLACE WHERE $predicate
@@ -3119,8 +3148,18 @@ case class RefreshMaterializedViewCommand(
           |SELECT $targetColumns
           |FROM delta.`$escapedDeltaPath`
           |WHERE `openivm_multiplicity` > 0""".stripMargin
+    val netChangeProbeSql =
+      if (targetSchema.forall(field => RowOrdering.isOrderable(field.dataType)))
+        Some(
+          s"""|SELECT 1
+              |FROM delta.`$escapedDeltaPath`
+              |GROUP BY $targetColumns
+              |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) <> 0
+              |LIMIT 1""".stripMargin
+        )
+      else None
     Some(
-      WindowSinglePassReplacePlan(directSql, cascadeSql)
+      WindowSinglePassReplacePlan(directSql, cascadeSql, netChangeProbeSql)
     )
   }
 
