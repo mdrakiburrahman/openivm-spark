@@ -29,15 +29,6 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
     MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType
   }
 
-  private def mvDataVersion(name: String): Long = {
-    val id   = spark.sessionState.sqlParser.parseTableIdentifier(name)
-    val meta = MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog"))
-    sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`")
-      .selectExpr("MAX(version)")
-      .head()
-      .getLong(0)
-  }
-
   private def rewrittenRows(viewName: String): Seq[Row] =
     sql("SHOW OPENIVM QUERY LOG")
       .collect()

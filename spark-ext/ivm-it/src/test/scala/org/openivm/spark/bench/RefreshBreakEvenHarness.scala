@@ -9,10 +9,7 @@ object MicroBenchmarkTag extends Tag("org.openivm.spark.tags.MicroBenchmark")
 
 class RefreshBreakEvenHarness extends RefreshBreakEvenScenarios with InterceptMode
 
-class WindowNoopWriteHarness extends WindowNoopWriteScenarios with InterceptMode
-
-abstract class WindowNoopWriteScenarios extends IvmParitySpecBase("window-noop-write-benchmark") {
-  self: IvmParityMode =>
+class WindowNoopWriteHarness extends IvmParitySpecBase("window-noop-write-benchmark") with InterceptMode {
 
   describe("window net-zero write micro-bench") {
     it("proves the probe beats the previous target writes", MicroBenchmarkTag) {
@@ -78,7 +75,7 @@ abstract class WindowNoopWriteScenarios extends IvmParitySpecBase("window-noop-w
         }
       )
       version(target) shouldBe (beforePreviousVersion + 6L)
-      assertBagEqual(s"SELECT * FROM $target", s"SELECT * FROM $expected")
+      assertMvCorrect(target, s"SELECT * FROM $expected")
 
       println(
         s"Window net-zero A/B: rows=$rows probe_median_ms=$probeMs " +
@@ -88,13 +85,6 @@ abstract class WindowNoopWriteScenarios extends IvmParitySpecBase("window-noop-w
         probeMs should be < previousMs
       }
     }
-  }
-
-  private def assertBagEqual(leftSql: String, rightSql: String): Unit = {
-    sql(s"SELECT * FROM ($leftSql) openivm_left EXCEPT ALL SELECT * FROM ($rightSql) openivm_right")
-      .count() shouldBe 0L
-    sql(s"SELECT * FROM ($rightSql) openivm_right EXCEPT ALL SELECT * FROM ($leftSql) openivm_left")
-      .count() shouldBe 0L
   }
 }
 
@@ -128,7 +118,6 @@ abstract class RefreshBreakEvenScenarios extends IvmParitySpecBase("refresh-brea
         printTable(shape.name, results)
       }
     }
-
   }
 
   private def runOne(shape: BenchShape, fraction: Double, index: Int): BenchResult = {

@@ -35,7 +35,6 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
           "FROM aio_events GROUP BY grp"
       sql(s"CREATE MATERIALIZED VIEW aio_rollup AS $viewBody")
 
-      RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
       sql(
         "INSERT INTO aio_events VALUES " +
@@ -64,7 +63,6 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
           "SELECT *, CASE WHEN closed_at IS NULL THEN 'open' ELSE 'closed' END AS status FROM grouped"
       sql(s"CREATE MATERIALIZED VIEW aio_status_rollup AS $viewBody")
 
-      RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
       sql(
         "INSERT INTO aio_status_events VALUES " +
@@ -92,7 +90,6 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
           "FROM aio_mixed_events GROUP BY grp"
       sql(s"CREATE MATERIALIZED VIEW aio_mixed_rollup AS $viewBody")
 
-      RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
       sql("INSERT INTO aio_mixed_events VALUES (3, 3, 40, TIMESTAMP'2026-02-01 10:00:00')")
       sql("UPDATE aio_mixed_events SET value = 11 WHERE id = 1")
@@ -112,7 +109,6 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
           "FROM aio_join_facts f LEFT JOIN aio_join_labels l ON f.id = l.id GROUP BY f.grp"
       sql(s"CREATE MATERIALIZED VIEW aio_join_rollup AS $viewBody")
 
-      RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
       sql("INSERT INTO aio_join_labels VALUES (1, 'one')")
       refreshMv("aio_join_rollup")
@@ -133,7 +129,6 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       sql(s"CREATE MATERIALIZED VIEW aio_real_cascade_rollup AS $upstreamBody")
       sql(s"CREATE MATERIALIZED VIEW aio_rollup_consumer AS $downstreamBody")
 
-      RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
       sql("INSERT INTO aio_real_cascade_source VALUES (1, 2), (3, 30)")
       refreshMv("aio_real_cascade_rollup")

@@ -64,18 +64,8 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       val downstreamSql = "SELECT id, region, amount, rn FROM wspr_noop_mv"
       sql(s"CREATE MATERIALIZED VIEW wspr_noop_downstream AS $downstreamSql")
 
-      def dataVersion(viewName: String): Long = {
-        val id   = spark.sessionState.sqlParser.parseTableIdentifier(viewName)
-        val meta = MvCatalog.lookup(spark, id).getOrElse(fail(s"missing $viewName metadata"))
-        spark
-          .sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`")
-          .selectExpr("MAX(version)")
-          .head()
-          .getLong(0)
-      }
-
-      val upstreamVersion   = dataVersion("wspr_noop_mv")
-      val downstreamVersion = dataVersion("wspr_noop_downstream")
+      val upstreamVersion   = mvDataVersion("wspr_noop_mv")
+      val downstreamVersion = mvDataVersion("wspr_noop_downstream")
 
       // Exercise several conflicting operations before one refresh while
       // restoring the exact source bag.
@@ -88,11 +78,11 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
 
       refreshMv("wspr_noop_mv")
       assertMvCorrect("wspr_noop_mv", viewSql)
-      dataVersion("wspr_noop_mv") shouldBe upstreamVersion
+      mvDataVersion("wspr_noop_mv") shouldBe upstreamVersion
 
       refreshMv("wspr_noop_downstream")
       assertMvCorrect("wspr_noop_downstream", downstreamSql)
-      dataVersion("wspr_noop_downstream") shouldBe downstreamVersion
+      mvDataVersion("wspr_noop_downstream") shouldBe downstreamVersion
     }
   }
 }
