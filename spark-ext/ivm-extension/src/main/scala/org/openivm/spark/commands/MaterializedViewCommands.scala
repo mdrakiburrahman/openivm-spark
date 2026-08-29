@@ -10,6 +10,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeReference,
   Expression,
   NamedExpression,
+  RowOrdering,
   SubqueryExpression
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
@@ -1932,6 +1933,7 @@ case class RefreshMaterializedViewCommand(
     var fusedScratchView: Option[String]               = None
     var fusedScratchRecordedForCascade: Boolean        = false
     var materializedWindowAffectedView: Option[String] = None
+    var cascadeProducedChanges: Boolean                = true
 
     IvmDmlInterceptorRule.bypass.set(true)
     try {
@@ -2293,7 +2295,7 @@ case class RefreshMaterializedViewCommand(
             done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
           }
         }
-        def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+        def executeSqlRowsAt(sql: String, stmtIdx: Int): Array[Row] = {
           advanceStmtCounterPast(stmtIdx)
           val kind     = RefreshPerf.classify(sql, viewDeltaPath)
           val sqlBytes = sql.length
@@ -2335,6 +2337,10 @@ case class RefreshMaterializedViewCommand(
               }
             }
           }
+        }
+        def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
+          executeSqlRowsAt(sql, stmtIdx)
+          ()
         }
         def executeSql(sql: String): Unit = {
           val idx = stmtCounter.getAndIncrement()
@@ -2807,53 +2813,78 @@ case class RefreshMaterializedViewCommand(
                 executeSqlAt(sql, idx)
               }
               if (isViewDeltaCtas && idx == windowCascadeCtasIdx) {
-                windowCascadeMergePlan.foreach { plan =>
-                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_merge'")
-                  logInfo(
-                    s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                      "outcome='window_cascade_merge' reason='reuse_materialized_cascade'"
-                  )
-                  try {
-                    withPlanTimeBroadcastDisabled {
-                      executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
-                    }
-                    RefreshFailureInjection.maybeFailWindowCascadeInsert(spark)
-                    withPlanTimeBroadcastDisabled {
-                      executeSqlAt(plan.insertSql, plan.insertStmtIdx)
-                    }
-                  } catch {
-                    case targetError: Throwable =>
-                      try {
-                        withPlanTimeBroadcastDisabled {
-                          executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
-                          executeSqlAt(plan.restoreSql, plan.insertStmtIdx)
-                        }
-                        logInfo(
-                          s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                            "outcome='window_cascade_compensated' reason='target_write_failed'"
-                        )
-                      } catch {
-                        case compensationError: Throwable =>
-                          preserveViewDeltaOnFailure = true
-                          targetError.addSuppressed(compensationError)
-                          logError(
-                            s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                              s"outcome='window_cascade_compensation_failed' cascade_path='$viewDeltaPath'",
-                            compensationError
-                          )
+                val targetWritePending = windowCascadeMergePlan.nonEmpty || deferredWindowTargetSql.nonEmpty
+                val hasNetChanges =
+                  !targetWritePending || buildWindowNetChangeProbeSql(spark, mergeTargetId, viewDeltaPath).forall {
+                    probeSql =>
+                      withPlanTimeBroadcastDisabled {
+                        val probeIdx = stmtCounter.getAndIncrement()
+                        executeSqlRowsAt(probeSql, probeIdx).nonEmpty
                       }
-                      throw targetError
                   }
-                }
-                deferredWindowTargetSql.foreach { case (targetIdx, targetSql) =>
-                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_first_replace'")
+                if (hasNetChanges) {
+                  windowCascadeMergePlan.foreach { plan =>
+                    RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_merge'")
+                    logInfo(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                        "outcome='window_cascade_merge' reason='reuse_materialized_cascade'"
+                    )
+                    try {
+                      withPlanTimeBroadcastDisabled {
+                        executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
+                      }
+                      RefreshFailureInjection.maybeFailWindowCascadeInsert(spark)
+                      withPlanTimeBroadcastDisabled {
+                        executeSqlAt(plan.insertSql, plan.insertStmtIdx)
+                      }
+                    } catch {
+                      case targetError: Throwable =>
+                        try {
+                          withPlanTimeBroadcastDisabled {
+                            executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
+                            executeSqlAt(plan.restoreSql, plan.insertStmtIdx)
+                          }
+                          logInfo(
+                            s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                              "outcome='window_cascade_compensated' reason='target_write_failed'"
+                          )
+                        } catch {
+                          case compensationError: Throwable =>
+                            preserveViewDeltaOnFailure = true
+                            targetError.addSuppressed(compensationError)
+                            logError(
+                              s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                                s"outcome='window_cascade_compensation_failed' cascade_path='$viewDeltaPath'",
+                              compensationError
+                            )
+                        }
+                        throw targetError
+                    }
+                  }
+                  deferredWindowTargetSql.foreach { case (targetIdx, targetSql) =>
+                    RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_first_replace'")
+                    logInfo(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                        "outcome='window_cascade_first_replace' reason='reuse_materialized_cascade_snapshot'"
+                    )
+                    withPlanTimeBroadcastDisabled {
+                      executeSqlAt(targetSql, targetIdx)
+                    }
+                  }
+                } else {
+                  cascadeProducedChanges = false
+                  windowCascadeMergePlan.foreach { plan =>
+                    logSkippedWindowStmt(plan.deleteStmtIdx, "window_cascade_noop_skipped")
+                    logSkippedWindowStmt(plan.insertStmtIdx, "window_cascade_noop_skipped")
+                  }
+                  deferredWindowTargetSql.foreach { case (targetIdx, _) =>
+                    logSkippedWindowStmt(targetIdx, "window_replace_noop_skipped")
+                  }
+                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_noop'")
                   logInfo(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                      "outcome='window_cascade_first_replace' reason='reuse_materialized_cascade_snapshot'"
+                      "outcome='window_cascade_noop' reason='old_new_bags_equal'"
                   )
-                  withPlanTimeBroadcastDisabled {
-                    executeSqlAt(targetSql, targetIdx)
-                  }
                 }
                 deferredWindowTargetSql = None
                 materializedWindowAffectedView.foreach { affectedView =>
@@ -2955,7 +2986,7 @@ case class RefreshMaterializedViewCommand(
         // Only matters for the intercept mode: under CDF the downstream MV
         // discovers our update via the MV data table's own change feed, so
         // there is no need to write an MV_VIEW_DELTA staging row.
-        if (propagation.requiresDmlInterception && meta.emitsCascadeViewDelta) {
+        if (propagation.requiresDmlInterception && meta.emitsCascadeViewDelta && cascadeProducedChanges) {
           profile.timeStep("metadata_post_sql", "phase=record_cascade") {
             RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
               val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
@@ -3226,6 +3257,26 @@ case class RefreshMaterializedViewCommand(
   private val WindowReplaceMaxLiteralKeys    = 1000
   private val RegularNtermMaxLiteralKeys     = 10000
   private val WindowReplaceMaxPredicateBytes = 1024 * 1024
+
+  private def buildWindowNetChangeProbeSql(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      viewDeltaPath: String
+  ): Option[String] = {
+    val targetSchema = spark.table(MvCommandHelper.sqlIdent(targetId)).schema
+    if (targetSchema.isEmpty || !targetSchema.forall(field => RowOrdering.isOrderable(field.dataType))) None
+    else {
+      val targetColumns    = targetSchema.fieldNames.toSeq.map(quoteCol).mkString(", ")
+      val escapedDeltaPath = viewDeltaPath.replace("`", "``")
+      Some(
+        s"""|SELECT 1
+            |FROM delta.`$escapedDeltaPath`
+            |GROUP BY $targetColumns
+            |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) <> 0
+            |LIMIT 1""".stripMargin
+      )
+    }
+  }
 
   private def collectRegularNtermLiteralKeys(
       spark: SparkSession,
