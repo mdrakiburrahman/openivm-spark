@@ -1154,6 +1154,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements(1) should include("FROM `sales`")
       rewritten.statements(1) should include(s"FROM delta.`$viewDeltaPath`")
       rewritten.statements(2) should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      rewritten.statements(2) should include("ON d.region IS NOT DISTINCT FROM v.region")
       rewritten.statements(2) should include("WHEN MATCHED THEN DELETE")
       rewritten.statements(2) should not include "openivm_recompute_mv_r"
       rewritten.statements(3) shouldBe

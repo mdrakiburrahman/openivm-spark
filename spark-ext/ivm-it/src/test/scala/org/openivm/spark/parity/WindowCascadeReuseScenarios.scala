@@ -224,6 +224,42 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertMvCorrect("wcm_mv", viewSql)
       assertMvCorrect("wcm_downstream", downstreamSql)
       assertCascadeMergeTargetWrite("wcm_mv")
+
+      val upstreamVersion   = mvDataVersion("wcm_mv")
+      val downstreamVersion = mvDataVersion("wcm_downstream")
+
+      // Affect more than the literal-key threshold with conflicting inserts,
+      // updates, and deletes, but restore the exact source bag before one refresh.
+      sql(
+        "INSERT INTO wcm_events " +
+          "SELECT id, 3 AS seq, id + 300000 AS payload FROM range(1001) " +
+          "UNION ALL SELECT CAST(NULL AS BIGINT), 3, -3"
+      )
+      sql("UPDATE wcm_events SET payload = payload + 1 WHERE seq IN (2, 3)")
+      sql("DELETE FROM wcm_events WHERE seq = 3")
+      sql("UPDATE wcm_events SET payload = payload - 1 WHERE seq = 2")
+
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wcm_mv")
+      assertMvCorrect("wcm_mv", viewSql)
+      mvDataVersion("wcm_mv") shouldBe upstreamVersion
+
+      val noOpRows = rewrittenRows("wcm_mv")
+      withClue(noOpRows.map(_.getString(ColSqlText)).mkString("\n---\n")) {
+        noOpRows.exists { row =>
+          val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("SELECT 1") &&
+          upper.contains("HAVING SUM(CAST(`OPENIVM_MULTIPLICITY` AS BIGINT)) <> 0")
+        } shouldBe true
+        noOpRows.exists { row =>
+          val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("MERGE INTO") && upper.contains("WHEN MATCHED THEN DELETE")
+        } shouldBe false
+      }
+
+      refreshMv("wcm_downstream")
+      assertMvCorrect("wcm_downstream", downstreamSql)
+      mvDataVersion("wcm_downstream") shouldBe downstreamVersion
     }
   }
 }

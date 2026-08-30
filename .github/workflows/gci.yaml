@@ -70,6 +70,12 @@ jobs:
       - name: dev.sh verify (lint + compile + assembly + all suites)
         run: ./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=${OPENIVM_TEST_FORKS}
 
+      - name: Window net-zero probe A/B
+        run: >-
+          ./spark-ext/dev/dev.sh test
+          'ivmIt/testOnly org.openivm.spark.bench.WindowNoopWriteHarness --
+          -n org.openivm.spark.tags.MicroBenchmark'
+
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
