@@ -1,7 +1,7 @@
 package org.openivm.spark.parity.base
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.openivm.spark.common.{CdfWatermarkCatalog, MvCatalog, StagingCatalog}
+import org.openivm.spark.common.{CdfWatermarkCatalog, DeltaCommitClassifier, MvCatalog, StagingCatalog}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -154,6 +154,12 @@ abstract class IvmParitySpecBase(val specSlug: String) extends AnyFunSpec with M
 
   protected def refreshMv(name: String): Unit =
     spark.sql(s"REFRESH MATERIALIZED VIEW $name").collect()
+
+  protected def mvDataVersion(name: String): Long = {
+    val id   = spark.sessionState.sqlParser.parseTableIdentifier(name)
+    val meta = MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog"))
+    DeltaCommitClassifier.latestVersion(spark, meta.location)
+  }
 
   /** Register a test case that only makes sense under intercept mode (e.g.
     * one that asserts directly on `StagingCatalog` contents or simulates a
