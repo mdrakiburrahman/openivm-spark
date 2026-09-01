@@ -1992,7 +1992,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         sql: String,
         pins: Map[String, String],
         qualified: Map[String, String] = Map.empty,
-        snapshotVersions: Map[String, Long] = Map.empty
+        snapshotVersions: Map[String, Long] = Map.empty,
+        advanceOldVersions: Map[String, Long] = Map.empty
     ): RewrittenRefresh =
       SparkRefreshRewriter.rewrite(
         compiledSql = sql,
@@ -2003,7 +2004,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         viewDeltaPath = viewDeltaPath,
         sourceQualifiedNames = qualified,
         sourceSnapshotPins = pins,
-        sourceSnapshotVersions = snapshotVersions
+        sourceSnapshotVersions = snapshotVersions,
+        sourceSnapshotAdvanceOldVersions = advanceOldVersions
       )
 
     it("re-applies the user pin to a live source read") {
@@ -2068,6 +2070,44 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       ).statements.head
       rewritten should include("FROM `accounts` VERSION AS OF 366")
       rewritten should not include "VERSION AS OF 17"
+    }
+
+    it("uses the target pin for live reads and the old pin for source advancement old-state terms") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map("accounts" -> "VERSION AS OF 18"),
+        advanceOldVersions = Map("accounts" -> 17L)
+      ).statements.head
+      rewritten should include("FROM `accounts` VERSION AS OF 18")
+      rewritten should include("FROM `accounts` VERSION AS OF 17")
     }
 
     it("still collapses the old-state union for an unpinned source") {

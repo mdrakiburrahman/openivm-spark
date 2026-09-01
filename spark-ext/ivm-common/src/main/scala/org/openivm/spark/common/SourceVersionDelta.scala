@@ -3,6 +3,7 @@ package org.openivm.spark.common
 import org.apache.spark.sql.functions.{col, lit, when}
 import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, MapType, StructType, TimestampType}
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.storage.StorageLevel
 import org.slf4j.LoggerFactory
 
 import scala.util.control.NonFatal
@@ -59,10 +60,11 @@ object SourceVersionDelta {
       try registerCdfView(spark, batch, sourceSchema)
       catch {
         case NonFatal(cdfError) if supportsBagDiff(sourceSchema) =>
-          log.warn(
+          val detail = Option(cdfError.getMessage).getOrElse("").replace('\n', ' ').replace('\r', ' ')
+          log.info(
             s"[openivm-mv] bounded CDF read failed for '${batch.baseTable}' " +
-              s"${batch.startVersionInclusive}->${batch.endVersionInclusive}; using exact EXCEPT ALL bag diff",
-            cdfError
+              s"${batch.startVersionInclusive}->${batch.endVersionInclusive}; using exact EXCEPT ALL bag diff " +
+              s"(${cdfError.getClass.getSimpleName}: $detail)"
           )
           registerBagDiffView(spark, batch, sourceSchema)
         case NonFatal(cdfError) =>
@@ -137,8 +139,21 @@ object SourceVersionDelta {
         .cast(IntegerType)
         .as("openivm_multiplicity")
     )
-    raw.select(outputColumns: _*).createOrReplaceTempView(StagingDeltaView.deltaViewName(batch.baseTable))
-    s"/* bounded Delta CDF ${batch.baseTable} versions $from..${batch.endVersionInclusive} */"
+    val viewName = StagingDeltaView.deltaViewName(batch.baseTable)
+    raw.select(outputColumns: _*).createOrReplaceTempView(viewName)
+    try {
+      spark.catalog.cacheTable(viewName, StorageLevel.DISK_ONLY)
+      val rows = spark.table(viewName).count()
+      s"/* materialized bounded Delta CDF ${batch.baseTable} versions " +
+        s"$from..${batch.endVersionInclusive}, rows=$rows */"
+    } catch {
+      case NonFatal(error) =>
+        try spark.catalog.uncacheTable(viewName)
+        catch { case _: Throwable => () }
+        try spark.catalog.dropTempView(viewName)
+        catch { case _: Throwable => () }
+        throw error
+    }
   }
 
   private def registerBagDiffView(

@@ -2478,6 +2478,14 @@ case class RefreshMaterializedViewCommand(
           SparkTimeTravelSql.pinsByQualifiedSource(meta.querySql, meta.sourceTables)
         } else Map.empty
       val frozenSources: Set[String] = snapshotPinsByQualified.keySet.map(_.toLowerCase)
+      val executionSnapshotPinsByQualified: Map[String, String] =
+        preparedSourceAdvance
+          .map(_.repin.targetVersions.map { case (source, version) => source -> s"VERSION AS OF $version" })
+          .getOrElse(snapshotPinsByQualified)
+      val sourceSnapshotAdvanceOldVersions: Map[String, Long] =
+        preparedSourceAdvance
+          .map(_.changeBatches.map(batch => batch.baseTable -> batch.startVersionInclusive).toMap)
+          .getOrElse(Map.empty)
 
       // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
       // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
@@ -3469,16 +3477,17 @@ case class RefreshMaterializedViewCommand(
                 // Live-source refs would otherwise hit DELTA_TABLE_NOT_FOUND because
                 // Spark would resolve `<short>` against the current_schema.
                 sourceQualifiedNames = shortToQual,
-                // Re-apply user snapshot pins to openivm's live-source reads: the
-                // compile bridge sees a de-pinned body (DuckDB cannot represent a
-                // Delta snapshot), so the emitted program would otherwise read a
-                // pinned source at its live version.
-                sourceSnapshotPins = snapshotPinsByQualified.map { case (qual, clause) =>
+                // Re-apply snapshot pins to openivm's live-source reads. A normal
+                // refresh uses the persisted user pin; source advancement uses
+                // the supplied target pin and passes the old version separately
+                // for old-state CTE reconstruction.
+                sourceSnapshotPins = executionSnapshotPinsByQualified.map { case (qual, clause) =>
                   qual.split("\\.").last -> clause
                 },
                 sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
                   case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
                 },
+                sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion)
               )
             }
@@ -4455,6 +4464,8 @@ case class RefreshMaterializedViewCommand(
           tempViewShortNames.foreach { n =>
             val dropSql = StagingDeltaView.dropSourceDeltaViewSql(n)
             val t0      = System.nanoTime()
+            try spark.catalog.uncacheTable(s"openivm_delta_$n")
+            catch { case _: Throwable => () }
             try {
               spark.sql(dropSql)
             } catch { case _: Throwable => () }

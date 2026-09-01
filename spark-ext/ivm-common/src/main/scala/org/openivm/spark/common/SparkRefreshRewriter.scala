@@ -404,6 +404,9 @@ object SparkRefreshRewriter {
     *                         (`VERSION AS OF 366`). Re-applied to every
     *                         live-source read openivm emits so a pinned source
     *                         stays frozen at the user's version.
+    * @param sourceSnapshotAdvanceOldVersions Pre-advance snapshot versions for
+    *                         pinned sources whose live reads are intentionally
+    *                         moved to a caller-supplied target pin.
     * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
     *                         Required when pragma-gated recompute cascade emits an
     *                         `openivm_old_<view>` snapshot that must stay pinned to
@@ -421,6 +424,7 @@ object SparkRefreshRewriter {
       sourceQualifiedNames: Map[String, String] = Map.empty,
       sourceSnapshotPins: Map[String, String] = Map.empty,
       sourceSnapshotVersions: Map[String, Long] = Map.empty,
+      sourceSnapshotAdvanceOldVersions: Map[String, Long] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
       semiJoinPruneEnabled: Boolean = false,
       fkTermPruneEnabled: Boolean = false,
@@ -460,7 +464,8 @@ object SparkRefreshRewriter {
                   fkRelations,
                   uniqueKeys,
                   uniqueJoinSimplifyEnabled,
-                  sourceSnapshotVersions
+                  sourceSnapshotVersions ++ sourceSnapshotAdvanceOldVersions,
+                  sourceSnapshotAdvanceOldVersions.keySet
                 )
               } else {
                 rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
@@ -841,7 +846,8 @@ object SparkRefreshRewriter {
       fkRelations: Seq[ForeignKeyRelation],
       uniqueKeys: Seq[UniqueKey],
       uniqueJoinSimplifyEnabled: Boolean,
-      sourceSnapshotVersions: Map[String, Long]
+      sourceSnapshotVersions: Map[String, Long],
+      advancingPinnedSources: Set[String]
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
@@ -850,7 +856,7 @@ object SparkRefreshRewriter {
     s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
-    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions)
+    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions, advancingPinnedSources)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
@@ -881,21 +887,24 @@ object SparkRefreshRewriter {
     */
   private[common] def rewriteRegularOldStateUnions(
       sql: String,
-      sourceSnapshotVersions: Map[String, Long]
+      sourceSnapshotVersions: Map[String, Long],
+      advancingPinnedSources: Set[String] = Set.empty
   ): String = {
     if (sourceSnapshotVersions.isEmpty) return sql
 
     val ctes = parseLeadingCtes(sql)
     if (ctes.isEmpty) return sql
     val byName = ctes.map(c => c.name.toLowerCase -> c).toMap
-    // A source the MV body pinned is frozen: its delta is empty by definition,
-    // so the `current UNION ALL negated-delta` form already equals the pinned
-    // snapshot. Replacing it with the refresh-time pre-refresh version would
-    // read a DIFFERENT (live) version, so user-pinned sources are skipped here
-    // and keep their pin via `rewriteMemoryMainPrefix`.
-    val pinnedShortNames = activeSnapshotPins.get().keySet.map(_.toLowerCase)
+    // A normally pinned source is frozen and keeps its pin via
+    // rewriteMemoryMainPrefix. An explicit source-version advancement is the
+    // exception: live reads use the target pin, while this old-state rewrite
+    // must read the supplied pre-advance version.
+    val pinnedShortNames    = activeSnapshotPins.get().keySet.map(_.toLowerCase)
+    val advancingShortNames = advancingPinnedSources.map(shortTableName).map(_.toLowerCase)
     val versionsByShort = sourceSnapshotVersions.collect {
-      case (table, version) if !pinnedShortNames.contains(shortTableName(table).toLowerCase) =>
+      case (table, version)
+          if !pinnedShortNames.contains(shortTableName(table).toLowerCase) ||
+            advancingShortNames.contains(shortTableName(table).toLowerCase) =>
         shortTableName(table).toLowerCase -> version
     }
     if (versionsByShort.isEmpty) return sql
