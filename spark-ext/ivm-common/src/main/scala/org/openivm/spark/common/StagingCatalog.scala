@@ -292,6 +292,40 @@ object StagingCatalog {
     }
   }
 
+  /** Remove every staging and per-MV consumption record for one exact staging
+    * path. Used by source-version advancement rollback before the operation is
+    * published as committed metadata.
+    */
+  def removeStagingPathEverywhere(spark: SparkSession, stagingPath: String): Unit = {
+    OpenIvmStatePaths.existingBaseTableDbPaths(spark).foreach { dbPath =>
+      val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+      val victims = baseDb
+        .prefixScan(StagingCf, Array.emptyByteArray)
+        .flatMap { case (key, _) =>
+          if (decodeStagingKey(key)._2 == stagingPath) Iterator.single(key.clone()) else Iterator.empty
+        }
+        .toList
+      if (victims.nonEmpty)
+        baseDb.withBatch { batch =>
+          victims.foreach(key => OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key))
+        }
+    }
+
+    val consumedKey = RocksDBCodec.utf8(stagingPath)
+    OpenIvmStatePaths.existingMvDbPaths(spark).foreach { dbPath =>
+      val mvDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, MvDbColumnFamilies)
+      if (mvDb.get(ConsumedCf, consumedKey).nonEmpty)
+        mvDb.withBatch(batch => OpenIvmRocksDBBatchOps.delete(mvDb, batch, ConsumedCf, consumedKey))
+    }
+
+    StagingDeltaView.CachedViewDeltaRef.decode(stagingPath).foreach { globalView =>
+      try spark.catalog.uncacheTable(s"global_temp.$globalView")
+      catch { case _: Throwable => () }
+      try spark.catalog.dropGlobalTempView(globalView)
+      catch { case _: Throwable => () }
+    }
+  }
+
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
     val dbPath = baseTableDbPath(spark, baseTable)
     if (OpenIvmStatePaths.isExistingDb(dbPath)) {

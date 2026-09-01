@@ -1,5 +1,6 @@
 package org.openivm.spark.parity
 
+import org.openivm.spark.commands.RefreshFailureInjection
 import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, TimeTravelPinReason, TimeTravelPinStatus}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
@@ -596,6 +597,123 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       refreshMv("ttp_tel_mv_bad")
       mvMeta("ttp_tel_mv_bad").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
       assertMvCorrect("ttp_tel_mv_bad", body)
+    }
+  }
+
+  describe("(TTP-11) Atomic immutable source-version advancement") {
+    it("applies an exact duplicate-sensitive source delta and is idempotent on retry") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_adv_src(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_adv_src VALUES (1, 'a', 10), (2, 'a', 10), (3, 'b', 20)")
+      val oldVersion = latestVersion("ttp_adv_src")
+      sql(
+        s"CREATE MATERIALIZED VIEW ttp_adv_mv AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          s"FROM ttp_adv_src VERSION AS OF $oldVersion GROUP BY grp"
+      )
+
+      sql("INSERT INTO ttp_adv_src VALUES (4, 'a', 10), (5, 'c', 30)")
+      sql("DELETE FROM ttp_adv_src WHERE id = 3")
+      val targetVersion = latestVersion("ttp_adv_src")
+
+      sql(
+        s"ALTER MATERIALIZED VIEW ttp_adv_mv ADVANCE SOURCE VERSIONS " +
+          s"(ttp_adv_src = $targetVersion)"
+      )
+      assertMvCorrect(
+        "ttp_adv_mv",
+        s"SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          s"FROM ttp_adv_src VERSION AS OF $targetVersion GROUP BY grp"
+      )
+      val advanced = mvMeta("ttp_adv_mv")
+      advanced.querySql should include(s"VERSION AS OF $targetVersion")
+      advanced.timeTravelPins.exists(_.endsWith(s"ttp_adv_src=VERSION AS OF $targetVersion")) shouldBe true
+      advanced.changeWatermarks.collectFirst {
+        case (source, watermark) if source.endsWith("ttp_adv_src") => watermark.encode
+      } shouldBe Some(s"v:$targetVersion")
+
+      val mvVersion = advanced.lastVersion
+      sql(
+        s"ALTER MATERIALIZED VIEW ttp_adv_mv ADVANCE SOURCE VERSIONS " +
+          s"(ttp_adv_src = $targetVersion)"
+      )
+      mvMeta("ttp_adv_mv").lastVersion shouldBe mvVersion
+    }
+
+    it("advances a multi-source map and publishes one signed cascade to a downstream MV") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_adv_left(id INT, grp STRING) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS ttp_adv_right(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO ttp_adv_left VALUES (1, 'a'), (2, 'b')")
+      sql("INSERT INTO ttp_adv_right VALUES (1, 10), (2, 20)")
+      val leftOld  = latestVersion("ttp_adv_left")
+      val rightOld = latestVersion("ttp_adv_right")
+
+      sql(
+        s"""CREATE MATERIALIZED VIEW ttp_adv_upstream AS
+           |SELECT l.grp, r.amount
+           |FROM ttp_adv_left VERSION AS OF $leftOld l
+           |JOIN ttp_adv_right VERSION AS OF $rightOld r ON l.id = r.id""".stripMargin
+      )
+      sql(
+        "CREATE MATERIALIZED VIEW ttp_adv_downstream AS " +
+          "SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM ttp_adv_upstream GROUP BY grp"
+      )
+
+      sql("INSERT INTO ttp_adv_left VALUES (3, 'a')")
+      sql("INSERT INTO ttp_adv_right VALUES (3, 30)")
+      sql("UPDATE ttp_adv_right SET amount = 25 WHERE id = 2")
+      val leftTarget  = latestVersion("ttp_adv_left")
+      val rightTarget = latestVersion("ttp_adv_right")
+
+      sql(
+        s"ALTER MATERIALIZED VIEW ttp_adv_upstream ADVANCE SOURCE VERSIONS " +
+          s"(ttp_adv_left = $leftTarget, ttp_adv_right = $rightTarget)"
+      )
+      assertMvCorrect(
+        "ttp_adv_upstream",
+        s"""SELECT l.grp, r.amount
+           |FROM ttp_adv_left VERSION AS OF $leftTarget l
+           |JOIN ttp_adv_right VERSION AS OF $rightTarget r ON l.id = r.id""".stripMargin
+      )
+      refreshMv("ttp_adv_downstream")
+      assertMvCorrect(
+        "ttp_adv_downstream",
+        "SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM ttp_adv_upstream GROUP BY grp"
+      )
+    }
+
+    it("restores the prior pinned state after a pre-commit failure and retries cleanly") {
+      sql("CREATE TABLE IF NOT EXISTS ttp_adv_retry_src(id INT, grp STRING, val INT) USING DELTA")
+      sql("INSERT INTO ttp_adv_retry_src VALUES (1, 'a', 10), (2, 'b', 20)")
+      val oldVersion = latestVersion("ttp_adv_retry_src")
+      sql(
+        s"CREATE MATERIALIZED VIEW ttp_adv_retry_mv AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          s"FROM ttp_adv_retry_src VERSION AS OF $oldVersion GROUP BY grp"
+      )
+      sql("INSERT INTO ttp_adv_retry_src VALUES (3, 'a', 5)")
+      val targetVersion = latestVersion("ttp_adv_retry_src")
+
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[RuntimeException] should be thrownBy {
+        sql(
+          s"ALTER MATERIALIZED VIEW ttp_adv_retry_mv ADVANCE SOURCE VERSIONS " +
+            s"(ttp_adv_retry_src = $targetVersion)"
+        )
+      }
+      assertMvCorrect(
+        "ttp_adv_retry_mv",
+        s"SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          s"FROM ttp_adv_retry_src VERSION AS OF $oldVersion GROUP BY grp"
+      )
+      mvMeta("ttp_adv_retry_mv").querySql should include(s"VERSION AS OF $oldVersion")
+
+      sql(
+        s"ALTER MATERIALIZED VIEW ttp_adv_retry_mv ADVANCE SOURCE VERSIONS " +
+          s"(ttp_adv_retry_src = $targetVersion)"
+      )
+      assertMvCorrect(
+        "ttp_adv_retry_mv",
+        s"SELECT grp, SUM(val) AS total, COUNT(*) AS cnt " +
+          s"FROM ttp_adv_retry_src VERSION AS OF $targetVersion GROUP BY grp"
+      )
     }
   }
 }

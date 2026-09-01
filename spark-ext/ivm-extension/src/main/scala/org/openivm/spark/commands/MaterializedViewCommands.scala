@@ -170,11 +170,25 @@ private[commands] object RefreshMutex {
       body
     }
   }
+
+  /** Acquire several MV locks in canonical order. Re-entrant acquisition of a
+    * lock already held by the current command is safe under JVM monitors.
+    */
+  def withLocks[A](mvKeys: Seq[String])(body: => A): A = {
+    val ordered = mvKeys.distinct.sorted
+    def acquire(remaining: List[String]): A = remaining match {
+      case head :: tail => withLock(head)(acquire(tail))
+      case Nil          => body
+    }
+    acquire(ordered.toList)
+  }
 }
 
 private[spark] object RefreshFailureInjection {
 
   private val FailWindowCascadeInsertKey = "spark.openivm.test.failWindowCascadeInsert"
+  private val FailSourceVersionAdvanceBeforeCommitKey =
+    "spark.openivm.test.failSourceVersionAdvanceBeforeCommit"
 
   def failNextWindowCascadeInsert(spark: SparkSession): Unit =
     spark.sparkContext.setLocalProperty(FailWindowCascadeInsertKey, "true")
@@ -183,6 +197,15 @@ private[spark] object RefreshFailureInjection {
     if (spark.sparkContext.getLocalProperty(FailWindowCascadeInsertKey) == "true") {
       spark.sparkContext.setLocalProperty(FailWindowCascadeInsertKey, null)
       throw new RuntimeException("injected failure after WINDOW_PARTITION target delete")
+    }
+
+  def failNextSourceVersionAdvanceBeforeCommit(spark: SparkSession): Unit =
+    spark.sparkContext.setLocalProperty(FailSourceVersionAdvanceBeforeCommitKey, "true")
+
+  private[commands] def maybeFailSourceVersionAdvanceBeforeCommit(spark: SparkSession): Unit =
+    if (spark.sparkContext.getLocalProperty(FailSourceVersionAdvanceBeforeCommitKey) == "true") {
+      spark.sparkContext.setLocalProperty(FailSourceVersionAdvanceBeforeCommitKey, null)
+      throw new RuntimeException("injected failure before source-version advancement metadata commit")
     }
 }
 
@@ -390,7 +413,8 @@ private[commands] object MvCommandHelper {
       changeBatches.exists {
         case batch: StagingChangeBatch =>
           batch.deltas.exists(_.opType == StagingDelta.OpTypes.Overwrite)
-        case _: CdfChangeBatch => false
+        case _: CdfChangeBatch           => false
+        case _: SourceVersionChangeBatch => false
       }
 
   def recordPlanMetrics(df: DataFrame, stmtKind: String): Unit =
@@ -1957,8 +1981,20 @@ case class CreateMaterializedViewCommand(
 // RefreshMaterializedViewCommand
 // ---------------------------------------------------------------------------
 
+case class AdvanceMaterializedViewSourceVersionsCommand(
+    name: TableIdentifier,
+    versionsBySource: Map[String, Long]
+) extends LeafRunnableCommand {
+
+  override def run(spark: SparkSession): Seq[Row] =
+    RefreshMaterializedViewCommand(name, Some(SourceVersionAdvanceRequest(versionsBySource))).run(spark)
+}
+
+final case class SourceVersionAdvanceRequest(versionsBySource: Map[String, Long])
+
 case class RefreshMaterializedViewCommand(
-    name: TableIdentifier
+    name: TableIdentifier,
+    sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None
 ) extends LeafRunnableCommand {
 
   override def run(spark: SparkSession): Seq[Row] = {
@@ -1972,7 +2008,20 @@ case class RefreshMaterializedViewCommand(
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0 = System.nanoTime()
     try {
-      val rows = RefreshMutex.withLock(viewMeta) {
+      val lockKeys =
+        if (sourceVersionAdvance.isEmpty) Seq(viewMeta)
+        else {
+          val downstream =
+            try
+              MvCatalog
+                .list(spark)
+                .filter(meta => metaName(meta.name) != viewMeta)
+                .filter(_.sourceTables.exists(_.split("\\.").last == name.identifier))
+                .map(meta => metaName(meta.name))
+            catch { case _: Throwable => Seq.empty[String] }
+          viewMeta +: downstream
+        }
+      val rows = RefreshMutex.withLocks(lockKeys) {
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         OpenIvmMetrics.RefreshInflight.incrementAndGet()
         try {
@@ -1991,6 +2040,205 @@ case class RefreshMaterializedViewCommand(
       try RefreshProfile.flushActive()
       finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
     }
+  }
+
+  private final class PreparedSourceVersionAdvance(
+      val originalMeta: MvMetadata,
+      val repin: SparkTimeTravelSql.VersionRepin,
+      val preRefreshMvVersion: Long
+  ) {
+    private val paths                = scala.collection.mutable.LinkedHashSet.empty[String]
+    private var frozenStagingBatches = Vector.empty[StagingChangeBatch]
+    @volatile private var committed  = false
+
+    val requestedBatches: Seq[SourceVersionChangeBatch] =
+      repin.currentVersions.toSeq
+        .map { case (source, current) =>
+          SourceVersionChangeBatch(source, current, repin.targetVersions(source))
+        }
+        .sortBy(_.baseTable)
+
+    val changeBatches: Seq[SourceVersionChangeBatch] =
+      requestedBatches.filter(batch => batch.endVersionInclusive > batch.startVersionInclusive)
+
+    def batchFor(source: String): Option[SourceVersionChangeBatch] =
+      requestedBatches.find(_.baseTable == source)
+
+    def trackPath(path: String): Unit = paths.synchronized(paths += path)
+
+    def begin(spark: SparkSession, baseMeta: MvMetadata): Unit = {
+      val cascadePath = paths.synchronized(paths.headOption).getOrElse {
+        throw new IllegalStateException("source-version advancement has no rollback path")
+      }
+      val journalProperties = baseMeta.properties ++ Map(
+        MvMetadata.SourceVersionAdvancePreMvVersionKey -> preRefreshMvVersion.toString,
+        MvMetadata.SourceVersionAdvanceCascadePathKey  -> cascadePath
+      )
+      MvCatalog.upsert(spark, baseMeta.copy(properties = journalProperties))
+    }
+
+    def retainFrozenStaging(batches: Seq[ChangeBatch]): Unit =
+      frozenStagingBatches = batches.collect { case batch: StagingChangeBatch => batch }.toVector
+
+    def consumedBatches: Seq[ChangeBatch] = changeBatches ++ frozenStagingBatches
+
+    def updatedMeta(baseMeta: MvMetadata, dataVersion: Long): MvMetadata = {
+      val pinPropertyKeys = Set(
+        MvMetadata.TimeTravelPinStatusKey,
+        MvMetadata.TimeTravelPinsKey,
+        MvMetadata.TimeTravelPinReasonKey,
+        MvMetadata.SourceVersionAdvancePreMvVersionKey,
+        MvMetadata.SourceVersionAdvanceCascadePathKey
+      )
+      val watermarkKeys = repin.targetVersions.keySet.map(source => s"${MvMetadata.WatermarkKeyPrefix}$source")
+      val retained = baseMeta.properties.filterNot { case (key, _) =>
+        pinPropertyKeys.contains(key) || watermarkKeys.contains(key)
+      }
+      val stableIdentity = originalMeta.properties
+        .get(MvMetadata.DefinitionIdentityKey)
+        .filter(_.nonEmpty)
+        .getOrElse(MvCatalog.mvIdentity(originalMeta))
+      val properties = retained ++
+        Map(MvMetadata.DefinitionIdentityKey -> stableIdentity) ++
+        MvMetadata.timeTravelPinProperties(
+          TimeTravelPinStatus.Applied,
+          repin.pins,
+          TimeTravelPinReason.PinsResolved
+        ) ++
+        MvMetadata.changeWatermarkProperties(
+          repin.targetVersions.map { case (source, version) =>
+            source -> ChangeWatermark.DeltaVersion(version)
+          }
+        )
+      baseMeta.copy(querySql = repin.querySql, lastVersion = dataVersion, properties = properties)
+    }
+
+    def markCommitted(): Unit = committed = true
+
+    def isCommitted: Boolean = committed
+
+    def rollback(spark: SparkSession, originalError: Throwable): Unit = {
+      paths.synchronized(paths.toVector).foreach { path =>
+        try StagingCatalog.removeStagingPathEverywhere(spark, path)
+        catch { case cleanupError: Throwable => originalError.addSuppressed(cleanupError) }
+        try {
+          val hadoopPath = new Path(path)
+          val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+          if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+        } catch { case cleanupError: Throwable => originalError.addSuppressed(cleanupError) }
+      }
+
+      var rollbackVersion = originalMeta.lastVersion
+      try {
+        DeltaTableVersion.latestOption(spark, originalMeta.location).foreach { currentVersion =>
+          if (currentVersion != preRefreshMvVersion) {
+            val escaped = originalMeta.location.replace("`", "``")
+            CommandLocalState.withDmlBypass {
+              spark
+                .sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $preRefreshMvVersion")
+                .collect()
+            }
+            rollbackVersion = DeltaTableVersion.requireLatest(spark, originalMeta.location)
+          }
+        }
+      } catch { case restoreError: Throwable => originalError.addSuppressed(restoreError) }
+
+      try MvCatalog.upsert(spark, originalMeta.copy(lastVersion = rollbackVersion))
+      catch { case metadataError: Throwable => originalError.addSuppressed(metadataError) }
+    }
+  }
+
+  private def prepareSourceVersionAdvance(
+      spark: SparkSession,
+      meta: MvMetadata,
+      request: SourceVersionAdvanceRequest
+  ): PreparedSourceVersionAdvance = {
+    if (meta.refreshType == RefreshTypeCode.FullRefresh)
+      throw new AnalysisException(
+        "_LEGACY_ERROR_TEMP_2273",
+        Map(
+          "message" -> (
+            s"ALTER MATERIALIZED VIEW ${MvCommandHelper.sqlIdent(name)} ADVANCE SOURCE VERSIONS " +
+              "requires an incrementally maintained materialized view; FULL_REFRESH is not supported"
+          )
+        )
+      )
+    if (!meta.emitsCascadeViewDelta && meta.usesBackingDataTable)
+      throw new AnalysisException(
+        "_LEGACY_ERROR_TEMP_2273",
+        Map(
+          "message" -> (
+            s"ALTER MATERIALIZED VIEW ${MvCommandHelper.sqlIdent(name)} ADVANCE SOURCE VERSIONS " +
+              "cannot synthesize a downstream signed cascade for this filtered backing-table shape"
+          )
+        )
+      )
+
+    val repin = SparkTimeTravelSql
+      .repinVersions(meta.querySql, meta.sourceTables, request.versionsBySource)
+      .fold(
+        detail =>
+          throw new AnalysisException(
+            "_LEGACY_ERROR_TEMP_2273",
+            Map(
+              "message" ->
+                s"Cannot advance source versions for ${MvCommandHelper.sqlIdent(name)}: $detail"
+            )
+          ),
+        identity
+      )
+    val preRefreshMvVersion = DeltaTableVersion.requireLatest(spark, meta.location)
+    if (preRefreshMvVersion != meta.lastVersion)
+      throw new IllegalStateException(
+        s"Cannot advance source versions for ${MvCommandHelper.sqlIdent(name)}: " +
+          s"materialized-view metadata records Delta version ${meta.lastVersion}, " +
+          s"but the backing table is at version $preRefreshMvVersion"
+      )
+    new PreparedSourceVersionAdvance(meta, repin, preRefreshMvVersion)
+  }
+
+  private def recoverInterruptedSourceVersionAdvance(spark: SparkSession, meta: MvMetadata): MvMetadata = {
+    val preVersionRaw = meta.properties.get(MvMetadata.SourceVersionAdvancePreMvVersionKey)
+    val cascadePath   = meta.properties.get(MvMetadata.SourceVersionAdvanceCascadePathKey)
+    if (preVersionRaw.isEmpty && cascadePath.isEmpty) return meta
+    if (preVersionRaw.isEmpty || cascadePath.isEmpty)
+      throw new IllegalStateException(
+        s"Materialized view ${MvCommandHelper.sqlIdent(name)} has an incomplete source-version advancement journal"
+      )
+
+    val preVersion = scala.util.Try(preVersionRaw.get.toLong).toOption.filter(_ >= 0L).getOrElse {
+      throw new IllegalStateException(
+        s"Materialized view ${MvCommandHelper.sqlIdent(name)} has an invalid source-version advancement journal"
+      )
+    }
+    val path = cascadePath.get
+    StagingCatalog.removeStagingPathEverywhere(spark, path)
+    val hadoopPath = new Path(path)
+    val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+    if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+
+    DeltaTableVersion.latestOption(spark, meta.location).foreach { currentVersion =>
+      if (currentVersion != preVersion) {
+        val escaped = meta.location.replace("`", "``")
+        CommandLocalState.withDmlBypass {
+          spark.sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $preVersion").collect()
+        }
+      }
+    }
+    val restoredVersion = DeltaTableVersion.requireLatest(spark, meta.location)
+    val recovered = meta.copy(
+      lastVersion = restoredVersion,
+      properties = meta.properties -- Seq(
+        MvMetadata.SourceVersionAdvancePreMvVersionKey,
+        MvMetadata.SourceVersionAdvanceCascadePathKey
+      )
+    )
+    MvCatalog.upsert(spark, recovered)
+    logWarning(
+      s"[openivm-mv] advance_source_versions view='${MvCommandHelper.sqlIdent(name)}' " +
+        s"outcome='recovered_interrupted_apply' restored_version='$preVersion'"
+    )
+    recovered
   }
 
   private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
@@ -2114,9 +2362,10 @@ case class RefreshMaterializedViewCommand(
     val qlogOrder = new java.util.concurrent.atomic.AtomicInteger(0)
     profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
     RefreshPerf.emit(refreshId, viewLabel, "start", s"thread='$threadName'")
-    var endEmitted              = false
-    var refreshTypeForFailure   = "UNKNOWN"
-    var pendingDeltasForFailure = 0
+    var endEmitted                                                  = false
+    var refreshTypeForFailure                                       = "UNKNOWN"
+    var pendingDeltasForFailure                                     = 0
+    var preparedSourceAdvance: Option[PreparedSourceVersionAdvance] = None
 
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
       if (!endEmitted) {
@@ -2141,7 +2390,7 @@ case class RefreshMaterializedViewCommand(
     }
 
     try {
-      val meta = MvCatalog
+      val loadedMeta = MvCatalog
         .lookup(spark, name)
         .getOrElse {
           emitEnd("metadata_not_found", "UNKNOWN", 0)
@@ -2150,7 +2399,19 @@ case class RefreshMaterializedViewCommand(
             Map("relationName" -> sqlIdent(name))
           )
         }
+      val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
       refreshTypeForFailure = meta.refreshTypeName
+      preparedSourceAdvance = sourceVersionAdvance.map(prepareSourceVersionAdvance(spark, meta, _))
+      preparedSourceAdvance.foreach { advance =>
+        if (advance.changeBatches.isEmpty) {
+          logInfo(
+            s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
+              s"versions='${advance.repin.targetVersions.toSeq.sorted.mkString(",")}'"
+          )
+          emitEnd("source_versions_already_applied", meta.refreshTypeName, 0)
+          return Seq.empty
+        }
+      }
       OpenIvmExecutionSpan.recordActiveRefreshClassification(
         compileRefreshType = meta.properties
           .get(MvMetadata.CompileRefreshTypeKey)
@@ -2227,6 +2488,7 @@ case class RefreshMaterializedViewCommand(
         catch { case _: Throwable => Seq.empty[MvMetadata] }
 
       if (
+        preparedSourceAdvance.isEmpty &&
         meta.refreshType != RefreshTypeCode.FullRefresh &&
         !propagation.hasPendingChanges(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
       ) {
@@ -2240,12 +2502,33 @@ case class RefreshMaterializedViewCommand(
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
-          propagation.collectChanges(
-            spark,
-            viewNameStr,
-            meta.sourceTables,
-            sourceWatermarks
-          )
+          preparedSourceAdvance match {
+            case Some(advance) =>
+              val pendingRegular = propagation.collectChanges(
+                spark,
+                viewNameStr,
+                meta.sourceTables,
+                sourceWatermarks
+              )
+              val pinnedSources = advance.repin.currentVersions.keySet.map(_.toLowerCase)
+              val unpinnedPending =
+                pendingRegular.filterNot(batch => pinnedSources.contains(batch.baseTable.toLowerCase))
+              if (unpinnedPending.nonEmpty)
+                throw new IllegalStateException(
+                  s"Cannot advance source versions for ${sqlIdent(name)} while unpinned sources have pending " +
+                    s"changes (${unpinnedPending.map(_.baseTable).distinct.sorted.mkString(", ")}); " +
+                    "run REFRESH MATERIALIZED VIEW first"
+                )
+              advance.retainFrozenStaging(pendingRegular)
+              advance.changeBatches
+            case None =>
+              propagation.collectChanges(
+                spark,
+                viewNameStr,
+                meta.sourceTables,
+                sourceWatermarks
+              )
+          }
         }
       }
 
@@ -2254,7 +2537,11 @@ case class RefreshMaterializedViewCommand(
       // snapshot, and leaving them staged would grow staging without bound.
       val (frozenChangeBatches, changeBatches) =
         if (frozenSources.isEmpty) (Seq.empty[ChangeBatch], collectedChangeBatches)
-        else collectedChangeBatches.partition(b => frozenSources.contains(b.baseTable.toLowerCase))
+        else
+          collectedChangeBatches.partition {
+            case _: SourceVersionChangeBatch => false
+            case batch                       => frozenSources.contains(batch.baseTable.toLowerCase)
+          }
       if (frozenChangeBatches.nonEmpty) {
         propagation.markConsumed(spark, viewNameStr, frozenChangeBatches)
         logInfo(
@@ -2323,17 +2610,22 @@ case class RefreshMaterializedViewCommand(
       }
 
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
-        val dataVersion = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        val dataVersion     = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
+        val consumedBatches = preparedSourceAdvance.map(_.consumedBatches).getOrElse(changeBatches)
         postRefreshCleanup(
           spark,
           name,
           cleanupMeta,
-          changeBatches,
+          consumedBatches,
           viewNameStr,
           sqlLog,
           qlogOrder,
-          Some(dataVersion)
+          Some(dataVersion),
+          replacementMeta,
+          suppressNonCascadeTrigger = preparedSourceAdvance.nonEmpty
         )
+        preparedSourceAdvance.foreach(_.markCommitted())
       }
 
       // Once we know we'll be doing real work, record the user-supplied CREATE-MV
@@ -2372,7 +2664,16 @@ case class RefreshMaterializedViewCommand(
       val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
         profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
           RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
-            val schemas = meta.sourceTables.map(t => t -> spark.table(t).schema).toMap
+            val schemas = meta.sourceTables.map { source =>
+              val schema = preparedSourceAdvance
+                .flatMap(_.batchFor(source))
+                .map { batch =>
+                  val expected = SourceVersionDelta.schemaAt(spark, source, batch.startVersionInclusive)
+                  SourceVersionDelta.validate(spark, batch, expected)
+                }
+                .getOrElse(spark.table(source).schema)
+              source -> schema
+            }.toMap
             val identityMap: Map[String, String] = {
               val all                             = allMvsCached
               val byMeta: Map[String, MvMetadata] = all.map(m => metaName(m.name) -> m).toMap
@@ -2431,7 +2732,12 @@ case class RefreshMaterializedViewCommand(
           }
 
       lazy val sourceDeltaShape: Map[String, DeltaShape] =
-        if (cdfChangeBatches.nonEmpty) {
+        if (preparedSourceAdvance.nonEmpty) {
+          val changed = changeBatches.collect { case batch: SourceVersionChangeBatch => batch.baseTable }.toSet
+          meta.sourceTables.map { source =>
+            source -> (if (changed.contains(source)) DeltaShape.General else DeltaShape.Unchanged)
+          }.toMap
+        } else if (cdfChangeBatches.nonEmpty) {
           meta.sourceTables.map { source =>
             source -> verdictForSource(source).map(DeltaCommitClassifier.shapeOf).getOrElse(DeltaShape.Unchanged)
           }.toMap
@@ -2820,6 +3126,15 @@ case class RefreshMaterializedViewCommand(
           }
         }
       }
+      if (
+        preparedSourceAdvance.nonEmpty &&
+        (compiled.refreshType == RefreshTypeCode.FullRefresh ||
+          !SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table))
+      )
+        throw new IllegalStateException(
+          s"Cannot advance source versions for ${sqlIdent(name)}: the current compile does not expose an " +
+            "incremental signed-delta program; refusing to recompute the materialized-view output"
+        )
 
       // Per-refresh view-delta path under a STABLE per-MV namespace
       // (`<warehouse>/_ivm/view_deltas/<safe-qualified-mv-name>/<txn-ts-uuid>`).
@@ -2833,6 +3148,7 @@ case class RefreshMaterializedViewCommand(
       val warehouse     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
       val safeMvName    = metaName(name).replace(".", "_").replace(" ", "_")
       val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
+      preparedSourceAdvance.foreach(_.trackPath(viewDeltaPath))
 
       val byTable                                        = changeBatches.groupBy(_.baseTable)
       val tempViewShortNames                             = scala.collection.mutable.ArrayBuffer[String]()
@@ -2849,12 +3165,18 @@ case class RefreshMaterializedViewCommand(
           profile.timeStep("metadata_pre_sql", "phase=register_views") {
             RefreshPerf.timePhase(refreshId, viewLabel, "register_views") {
               for (qualTable <- meta.sourceTables) {
-                val schema       = freshSchemas(qualTable)
-                val tableBatches = byTable.getOrElse(qualTable, Seq.empty)
-                val t0           = System.nanoTime()
+                val schema             = freshSchemas(qualTable)
+                val tableBatches       = byTable.getOrElse(qualTable, Seq.empty)
+                val t0                 = System.nanoTime()
+                val sourceVersionBatch = tableBatches.collectFirst { case batch: SourceVersionChangeBatch => batch }
+                val diagnosticSql = sourceVersionBatch
+                  .map(SourceVersionDelta.buildBagDiffSql(_, schema))
+                  .getOrElse(propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches))
                 val viewSql =
                   try {
-                    propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                    sourceVersionBatch
+                      .map(SourceVersionDelta.registerSourceDeltaView(spark, _, schema))
+                      .getOrElse(propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches))
                   } finally {
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record(
@@ -2862,7 +3184,7 @@ case class RefreshMaterializedViewCommand(
                       stmtOrder = qlogOrder.getAndIncrement(),
                       attemptIdx = 0,
                       stmtKind = "temp_view",
-                      sql = propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches),
+                      sql = diagnosticSql,
                       durationMs = ms
                     )
                   }
@@ -2971,7 +3293,17 @@ case class RefreshMaterializedViewCommand(
                   "reason='all_source_delta_views_empty'"
               )
               val unchangedVersion = DeltaTableVersion.requireLatest(spark, meta.location)
-              consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
+              preparedSourceAdvance match {
+                case Some(advance) =>
+                  MvCatalog.upsert(
+                    spark,
+                    advance.updatedMeta(meta.copy(properties = refreshProperties), unchangedVersion)
+                  )
+                  consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, advance.consumedBatches)
+                  advance.markCommitted()
+                case None =>
+                  consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
+              }
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
               return Seq.empty
             }
@@ -3175,9 +3507,12 @@ case class RefreshMaterializedViewCommand(
               if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
             } catch { case _: Throwable => () }
 
+          preparedSourceAdvance.foreach(_.begin(spark, meta.copy(properties = refreshProperties)))
+
           val fuseEligible =
             FeatureGate.fuseScratchEnabled(spark) &&
               meta.refreshType == RefreshTypeCode.SimpleProjection &&
+              preparedSourceAdvance.isEmpty &&
               rewritten.statements.nonEmpty
 
           try {
@@ -3919,7 +4254,11 @@ case class RefreshMaterializedViewCommand(
             // Only matters for the intercept mode: under CDF the downstream MV
             // discovers our update via the MV data table's own change feed, so
             // there is no need to write an MV_VIEW_DELTA staging row.
-            if (propagation.requiresDmlInterception && meta.emitsCascadeViewDelta) {
+            if (
+              propagation.requiresDmlInterception &&
+              meta.emitsCascadeViewDelta &&
+              (preparedSourceAdvance.isEmpty || meta.usesBackingDataTable)
+            ) {
               profile.timeStep("metadata_post_sql", "phase=record_cascade") {
                 RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
                   val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
@@ -3965,6 +4304,46 @@ case class RefreshMaterializedViewCommand(
                 }
               }
             }
+
+            preparedSourceAdvance.foreach { advance =>
+              if (propagation.requiresDmlInterception && !meta.usesBackingDataTable) {
+                val triggerKeys = downstreamSourceKeysForThisMv
+                if (triggerKeys.nonEmpty) {
+                  val userSchema = spark.table(sqlIdent(name)).schema
+                  val exactDiff  = supportsExactDiffCascade(userSchema)
+                  val cascadeSelect = buildFullRefreshCascadeSql(
+                    dataPath = meta.location,
+                    targetColumns = userSchema.fieldNames.toSeq,
+                    preRefreshVersion = advance.preRefreshMvVersion,
+                    exactDiff = exactDiff
+                  )
+                  profile.timeStep(
+                    "source_version_advance_cascade",
+                    s"pre_version=${advance.preRefreshMvVersion};exact_diff=$exactDiff;consumers=${triggerKeys.size}"
+                  ) {
+                    spark
+                      .sql(cascadeSelect)
+                      .write
+                      .format("delta")
+                      .mode("overwrite")
+                      .save(viewDeltaPath)
+                  }
+                  val txnTs = new Timestamp(System.currentTimeMillis())
+                  triggerKeys.foreach { triggerKey =>
+                    StagingCatalog.record(
+                      spark,
+                      StagingDelta(
+                        baseTable = triggerKey,
+                        opType = StagingDelta.OpTypes.MvViewDelta,
+                        stagingPath = viewDeltaPath,
+                        txnTs = txnTs,
+                        consumedBy = Seq.empty
+                      )
+                    )
+                  }
+                }
+              }
+            }
           } catch {
             case t: Throwable =>
               // Best-effort cleanup of any partial view-delta on failure. Phase 7
@@ -3985,9 +4364,15 @@ case class RefreshMaterializedViewCommand(
               )
           }
 
+          if (preparedSourceAdvance.nonEmpty)
+            RefreshFailureInjection.maybeFailSourceVersionAdvanceBeforeCommit(spark)
+
           profile.timeStep("metadata_post_sql", "phase=post_cleanup") {
             RefreshPerf.timePhase(refreshId, viewLabel, "post_cleanup") {
-              finalizeRefresh(meta)
+              val cleanupMeta =
+                if (preparedSourceAdvance.nonEmpty) meta.copy(properties = refreshProperties)
+                else meta
+              finalizeRefresh(cleanupMeta)
             }
           }
           emitEnd(
@@ -4045,8 +4430,22 @@ case class RefreshMaterializedViewCommand(
       Seq.empty
     } catch {
       case t: Throwable =>
-        emitEnd("refresh_failed", refreshTypeForFailure, pendingDeltasForFailure)
-        throw t
+        preparedSourceAdvance match {
+          case Some(advance) if advance.isCommitted =>
+            emitEnd("committed_with_cleanup_warning", refreshTypeForFailure, pendingDeltasForFailure)
+            logWarning(
+              s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' " +
+                s"outcome='committed_with_cleanup_warning': ${t.getClass.getName}: ${t.getMessage}"
+            )
+            Seq.empty
+          case Some(advance) =>
+            advance.rollback(spark, t)
+            emitEnd("refresh_failed", refreshTypeForFailure, pendingDeltasForFailure)
+            throw t
+          case None =>
+            emitEnd("refresh_failed", refreshTypeForFailure, pendingDeltasForFailure)
+            throw t
+        }
     }
   }
 
@@ -4985,14 +5384,19 @@ case class RefreshMaterializedViewCommand(
       viewNameStr: String,
       sqlLog: RefreshSqlLog = RefreshSqlLog.NoOp,
       qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0),
-      committedDataVersion: Option[Long] = None
+      committedDataVersion: Option[Long] = None,
+      replacementMeta: Option[MvMetadata] = None,
+      suppressNonCascadeTrigger: Boolean = false
   ): Unit = {
     import MvCommandHelper._
     val propagation = ChangePropagationFactory.forSession(spark)
     val newVersion = committedDataVersion.getOrElse {
       DeltaTableVersion.requireLatest(spark, meta.location)
     }
-    MvCatalog.advance(spark, name, newVersion)
+    replacementMeta match {
+      case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
+      case None          => MvCatalog.advance(spark, name, newVersion)
+    }
 
     propagation.markConsumed(spark, viewNameStr, changeBatches)
 
@@ -5007,7 +5411,7 @@ case class RefreshMaterializedViewCommand(
         .map { case (t, pairs) => t -> pairs.map(_._2) }
       propagation.pruneConsumed(spark, viewsByTable)
 
-      if (!meta.emitsCascadeViewDelta) {
+      if (!meta.emitsCascadeViewDelta && !suppressNonCascadeTrigger) {
         val upstreamShortName = name.identifier
         val downstreamSourceKeys = allMvs
           .filterNot(m => metaName(m.name) == viewNameStr)

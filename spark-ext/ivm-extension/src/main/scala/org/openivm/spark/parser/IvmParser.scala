@@ -30,6 +30,7 @@ import org.openivm.spark.parser.gen.IvmSqlBaseParser
  *    `EXPLAIN CREATE MATERIALIZED VIEW`,
  *    `SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW`,
  *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`,
+ *    `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`,
  *    `DROP MATERIALIZED VIEW`, `SHOW OPENIVM REFRESH PROFILE`, or
  *    `SHOW OPENIVM QUERY LOG`
  *    (case-insensitive) → parsed by [[IvmSqlBaseParser]] / [[IvmAstBuilder]].
@@ -155,7 +156,7 @@ private object IvmParser {
     "\\A(?:" +
       "explain\\s+create\\s+materialized\\s+view|" +
       "show\\s+refresh\\s+sql\\s+for\\s+create\\s+materialized\\s+view|" +
-      "(?:create|refresh|drop)\\s+materialized\\s+view|" +
+      "(?:create|refresh|alter|drop)\\s+materialized\\s+view|" +
       "show\\s+openivm\\s+refresh\\s+profile|" +
       "show\\s+openivm\\s+query\\s+log" +
       ")\\b",

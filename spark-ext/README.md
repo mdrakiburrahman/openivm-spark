@@ -156,9 +156,20 @@ CREATE MATERIALIZED VIEW sales_summary AS
 -- Refresh after DML on base tables
 REFRESH MATERIALIZED VIEW sales_summary;
 
+-- Atomically advance every immutable VERSION AS OF source pin
+ALTER MATERIALIZED VIEW historical_sales
+  ADVANCE SOURCE VERSIONS (sales = 43, regions = 17);
+
 -- Drop
 DROP MATERIALIZED VIEW IF EXISTS sales_summary;
 ```
+
+`ADVANCE SOURCE VERSIONS` requires an exact map covering all and only pinned
+sources. It never resolves "latest": each supplied Delta version is validated,
+the old/new snapshot delta is applied through the existing incremental program,
+and the query pins, pin telemetry, source watermarks, and MV version are
+published together only after the data apply succeeds. Repeating the same map is
+a no-op.
 
 DML on a tracked base table (INSERT / DELETE / UPDATE / MERGE) is intercepted
 by `IvmDmlInterceptorRule`, which tees the change set to a per-base-table Delta

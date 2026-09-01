@@ -690,4 +690,81 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
       SparkTimeTravelSql.identifierSegments("t") shouldBe Seq("t")
     }
   }
+
+  describe("repinVersions") {
+    it("rewrites an exact multi-source VERSION map and preserves the pin contract") {
+      val sql =
+        """SELECT a.id, b.name
+          |FROM db.a VERSION AS OF 4 a
+          |JOIN `db`.`b` FOR SYSTEM_VERSION AS OF '9' b ON a.id = b.id""".stripMargin
+
+      val repin = SparkTimeTravelSql
+        .repinVersions(sql, Seq("db.a", "db.b"), Map("a" -> 5L, "db.b" -> 12L))
+        .right
+        .toOption
+        .value
+
+      repin.currentVersions shouldBe Map("db.a" -> 4L, "db.b" -> 9L)
+      repin.targetVersions shouldBe Map("db.a" -> 5L, "db.b" -> 12L)
+      normalized(repin.querySql) shouldBe
+        "SELECT a.id, b.name FROM db.a VERSION AS OF 5 a JOIN `db`.`b` VERSION AS OF 12 b ON a.id = b.id"
+      repin.pins shouldBe Seq("db.a=VERSION AS OF 5", "db.b=VERSION AS OF 12")
+    }
+
+    it("accepts an identical map for idempotent retry") {
+      val repin = SparkTimeTravelSql
+        .repinVersions(
+          "SELECT id FROM db.src VERSION AS OF 7",
+          Seq("db.src"),
+          Map("db.src" -> 7L)
+        )
+        .right
+        .toOption
+        .value
+
+      repin.querySql shouldBe "SELECT id FROM db.src VERSION AS OF 7"
+      repin.currentVersions shouldBe repin.targetVersions
+    }
+
+    it("rejects partial, duplicate-resolved, backward, and timestamp maps") {
+      val multi =
+        "SELECT a.id FROM db.a VERSION AS OF 4 a JOIN db.b VERSION AS OF 9 b ON a.id = b.id"
+
+      SparkTimeTravelSql
+        .repinVersions(multi, Seq("db.a", "db.b"), Map("db.a" -> 5L))
+        .left
+        .toOption
+        .value should include("missing: db.b")
+
+      SparkTimeTravelSql
+        .repinVersions(
+          "SELECT id FROM db.src VERSION AS OF 4",
+          Seq("db.src"),
+          Map("src" -> 5L, "db.src" -> 5L)
+        )
+        .left
+        .toOption
+        .value should include("more than once")
+
+      SparkTimeTravelSql
+        .repinVersions(
+          "SELECT id FROM db.src VERSION AS OF 4",
+          Seq("db.src"),
+          Map("db.src" -> 3L)
+        )
+        .left
+        .toOption
+        .value should include("moves backwards")
+
+      SparkTimeTravelSql
+        .repinVersions(
+          "SELECT id FROM db.src TIMESTAMP AS OF '2026-01-01'",
+          Seq("db.src"),
+          Map("db.src" -> 5L)
+        )
+        .left
+        .toOption
+        .value should include("only VERSION AS OF")
+    }
+  }
 }

@@ -9,6 +9,7 @@ import org.apache.spark.sql.catalyst.trees.Origin
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
 import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
+import org.openivm.spark.commands.AdvanceMaterializedViewSourceVersionsCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowQueryLogCommand
@@ -61,6 +62,33 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       ctx: IvmSqlBaseParser.RefreshMaterializedViewContext
   ): AnyRef =
     RefreshMaterializedViewCommand(toTableIdentifier(ctx.multipartIdentifier()))
+
+  override def visitAdvanceMaterializedViewSourceVersions(
+      ctx: IvmSqlBaseParser.AdvanceMaterializedViewSourceVersionsContext
+  ): AnyRef = {
+    val entries = ctx
+      .sourceVersionEntry()
+      .asScala
+      .map { entry =>
+        multipartColumnName(entry.multipartIdentifier()) -> entry.INTEGER_VALUE().getText.toLong
+      }
+      .toVector
+    val duplicate = entries
+      .groupBy(_._1.toLowerCase(java.util.Locale.ROOT))
+      .collectFirst { case (_, values) if values.size > 1 => values.head._1 }
+    duplicate.foreach { source =>
+      throw new ParseException(
+        Some(ctx.getText),
+        s"Source version map names '$source' more than once",
+        Origin(),
+        Origin()
+      )
+    }
+    AdvanceMaterializedViewSourceVersionsCommand(
+      toTableIdentifier(ctx.multipartIdentifier()),
+      entries.toMap
+    )
+  }
 
   override def visitDropMaterializedView(
       ctx: IvmSqlBaseParser.DropMaterializedViewContext

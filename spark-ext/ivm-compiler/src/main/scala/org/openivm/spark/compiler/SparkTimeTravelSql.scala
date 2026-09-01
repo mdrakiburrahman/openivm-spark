@@ -105,19 +105,33 @@ object SparkTimeTravelSql {
       detail: Option[String]
   )
 
+  /** Validated replacement of every immutable VERSION pin in a view body. */
+  final case class VersionRepin(
+      querySql: String,
+      currentVersions: Map[String, Long],
+      targetVersions: Map[String, Long],
+      pins: Seq[String]
+  )
+
   /** A pin as the scanner lifted it, plus the parsed clause KIND and VALUE.
     * Those two are what binds the pin to the `RelationTimeTravel` node Spark's
     * parser produced for the same relation — the clause TEXT is user-facing and
     * deliberately not normalised beyond comment/whitespace cleanup.
     */
-  private final case class PinnedRef(pin: SnapshotPin, kind: String, value: String) {
+  private final case class PinnedRef(
+      pin: SnapshotPin,
+      kind: String,
+      value: String,
+      clauseStart: Int,
+      clauseEnd: Int
+  ) {
     def identity: String = identityKey(pin.segments, kind, value)
   }
 
   private final case class Scanned(sql: String, refs: Seq[PinnedRef])
 
   /** A temporal clause as located in the source text. */
-  private final case class ParsedClause(end: Int, text: String, kind: String, value: String)
+  private final case class ParsedClause(start: Int, end: Int, text: String, kind: String, value: String)
 
   private val VersionKind   = "version"
   private val TimestampKind = "timestamp"
@@ -393,6 +407,114 @@ object SparkTimeTravelSql {
   def pinIdentity(sql: String, qualifiedSources: Seq[String]): Seq[String] =
     pinsByQualifiedSource(sql, qualifiedSources).toSeq.map { case (source, clause) => s"$source=$clause" }.sorted
 
+  /** Replace every resolved immutable VERSION pin with the caller's exact
+    * source-version map.
+    *
+    * The map must resolve one-to-one to all and only pinned sources. Targets
+    * may equal their current value so retrying a successful command is a
+    * no-op, but they may never move backwards. TIMESTAMP pins are deliberately
+    * rejected: their source snapshot cannot be advanced by a numeric Delta
+    * version without changing the user's pin kind.
+    */
+  def repinVersions(
+      sql: String,
+      qualifiedSources: Seq[String],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] = {
+    val validatedSplit = split(sql)
+    if (validatedSplit.pins.isEmpty)
+      return Left("the materialized-view query has no supported immutable VERSION AS OF source pins")
+
+    val scanned = scan(sql)
+    if (
+      scanned.refs.isEmpty ||
+      !pinsAreUnambiguous(scanned.refs) ||
+      !verifiesAgainstSparkParser(sql, scanned.sql, scanned.refs)
+    )
+      return Left("the materialized-view query contains an unsupported or ambiguous source pin shape")
+
+    if (scanned.refs.exists(_.kind != VersionKind))
+      return Left("only VERSION AS OF pins can be advanced; TIMESTAMP AS OF pins are not supported")
+
+    val resolvedRefs = scanned.refs.map { ref =>
+      val matches = qualifiedSources.distinct.filter(source => referToSameRelation(ref.pin, source))
+      if (matches.size != 1)
+        return Left(
+          s"the pin on '${ref.pin.tableRef}' resolves to ${matches.size} tracked sources; expected exactly one"
+        )
+      val version =
+        scala.util.Try(ref.value.toLong).toOption.filter(_ >= 0L).getOrElse {
+          return Left(s"the VERSION AS OF value '${ref.value}' on '${ref.pin.tableRef}' is not a non-negative integer")
+        }
+      (ref, matches.head, version)
+    }
+
+    val currentVersions = resolvedRefs
+      .groupBy(_._2)
+      .map { case (source, refs) =>
+        val values = refs.map(_._3).distinct
+        if (values.size != 1)
+          return Left(s"the tracked source '$source' is read at multiple VERSION AS OF values")
+        source -> values.head
+      }
+
+    val resolvedRequested = requestedVersions.toSeq.map { case (requestedSource, version) =>
+      if (version < 0L)
+        return Left(s"the requested version for '$requestedSource' must be non-negative")
+      val requestedSegments = identifierSegments(requestedSource)
+      val matches = qualifiedSources.distinct.filter { source =>
+        val sourceSegments = identifierSegments(source)
+        sourceSegments.endsWith(requestedSegments) || requestedSegments.endsWith(sourceSegments)
+      }
+      if (matches.size != 1)
+        return Left(
+          s"the requested source '$requestedSource' resolves to ${matches.size} tracked sources; expected exactly one"
+        )
+      matches.head -> version
+    }
+    val duplicateRequested = resolvedRequested.groupBy(_._1).collectFirst {
+      case (source, entries) if entries.size > 1 =>
+        source
+    }
+    duplicateRequested.foreach(source => return Left(s"the requested version map names '$source' more than once"))
+    val targetVersions = resolvedRequested.toMap
+
+    val missing = currentVersions.keySet -- targetVersions.keySet
+    val extra   = targetVersions.keySet -- currentVersions.keySet
+    if (missing.nonEmpty || extra.nonEmpty)
+      return Left(
+        s"the requested version map must cover all and only pinned sources " +
+          s"(missing: ${missing.toSeq.sorted.mkString(", ")}; extra: ${extra.toSeq.sorted.mkString(", ")})"
+      )
+
+    currentVersions.toSeq.sortBy(_._1).foreach { case (source, current) =>
+      val target = targetVersions(source)
+      if (target < current)
+        return Left(s"the requested version for '$source' moves backwards from $current to $target")
+    }
+
+    val rewritten = new StringBuilder(sql)
+    resolvedRefs.sortBy(_._1.clauseStart).reverse.foreach { case (ref, source, _) =>
+      rewritten.replace(ref.clauseStart, ref.clauseEnd, s"VERSION AS OF ${targetVersions(source)}")
+    }
+    val querySql  = rewritten.toString
+    val telemetry = pinTelemetry(querySql, qualifiedSources)
+    if (telemetry.status != TimeTravelPinStatus.Applied)
+      Left(
+        s"the rewritten query did not preserve a valid source-pin contract: " +
+          telemetry.detail.getOrElse(telemetry.reason)
+      )
+    else
+      Right(
+        VersionRepin(
+          querySql = querySql,
+          currentVersions = currentVersions,
+          targetVersions = targetVersions,
+          pins = telemetry.pins
+        )
+      )
+  }
+
   private def unresolvedPins(pins: Seq[SnapshotPin], qualifiedSources: Seq[String]): Seq[SnapshotPin] = {
     val sources = qualifiedSources.distinct
     pins.filter(pin => sources.count(source => referToSameRelation(pin, source)) != 1)
@@ -466,7 +588,13 @@ object SparkTimeTravelSql {
             case Some(clause) =>
               trailingTableRef(out, refEnd) match {
                 case Some(tableRef) =>
-                  refs += PinnedRef(SnapshotPin(tableRef, clause.text), clause.kind, clause.value)
+                  refs += PinnedRef(
+                    SnapshotPin(tableRef, clause.text),
+                    clause.kind,
+                    clause.value,
+                    clause.start,
+                    clause.end
+                  )
                   elideClause(out, sql, clause.end)
                   refEnd = math.min(refEnd, out.length)
                   i = clause.end
@@ -586,6 +714,7 @@ object SparkTimeTravelSql {
 
     valueEnd.map { end =>
       ParsedClause(
+        start = start,
         end = end,
         text = clauseText(sql, start, end),
         kind = if (isVersion) VersionKind else TimestampKind,

@@ -238,6 +238,19 @@ object MvMetadata {
   /** CREATE-time [[TimeTravelPinReason]] for the persisted status. */
   val TimeTravelPinReasonKey: String = "_ivm_time_travel_pin_reason"
 
+  /** Stable identity used by downstream schema fingerprints. Source-version
+    * advancement seeds this with the pre-advance identity so changing only an
+    * immutable VERSION pin does not masquerade as a DROP/CREATE definition
+    * change to downstream materialized views.
+    */
+  val DefinitionIdentityKey: String = "_ivm_definition_identity"
+
+  /** Crash-recovery journal for an in-flight source-version advancement. The
+    * user query/pin/watermark fields remain unchanged while these keys exist.
+    */
+  val SourceVersionAdvancePreMvVersionKey: String = "_ivm_source_version_advance_pre_mv_version"
+  val SourceVersionAdvanceCascadePathKey: String  = "_ivm_source_version_advance_cascade_path"
+
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
   private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
@@ -765,6 +778,20 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
    * of the same MV name with a different body is detected as drift.
    */
   def mvIdentity(meta: MvMetadata): String = {
+    if (
+      meta.properties.contains(MvMetadata.SourceVersionAdvancePreMvVersionKey) ||
+      meta.properties.contains(MvMetadata.SourceVersionAdvanceCascadePathKey)
+    )
+      throw new IllegalStateException(
+        s"Materialized view '${serializeName(meta.name)}' has an in-flight source-version advancement; " +
+          "refresh or retry that view before refreshing a dependent materialized view"
+      )
+    meta.properties.get(MvMetadata.DefinitionIdentityKey).filter(_.nonEmpty).getOrElse {
+      legacyMvIdentity(meta)
+    }
+  }
+
+  private def legacyMvIdentity(meta: MvMetadata): String = {
     val serialized = serializeName(meta.name)
     val content    = s"$serialized|${meta.location}|${meta.querySql}"
     val digest     = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
