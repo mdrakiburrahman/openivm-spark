@@ -440,6 +440,41 @@ private[commands] object MvCommandHelper {
   def metaName(id: TableIdentifier): String =
     id.database.fold(id.table)(db => s"$db.${id.table}")
 
+  def telemetrySourceVersions(
+      spark: SparkSession,
+      sources: Seq[String],
+      knownVersions: Map[String, Long]
+  ): Seq[OpenIvmTelemetryContract.SourceVersion] = {
+    val knownByCanonical = knownVersions.map { case (source, version) =>
+      OpenIvmTelemetryContract.canonicalRelationKey(source) -> version
+    }
+    val mvVersionsByCanonical =
+      try
+        MvCatalog
+          .list(spark)
+          .flatMap { meta =>
+            Seq(metaName(meta.name), meta.name.table).map { source =>
+              OpenIvmTelemetryContract.canonicalRelationKey(source) -> meta.lastVersion
+            }
+          }
+          .toMap
+      catch { case _: Throwable => Map.empty[String, Long] }
+    sources.map { source =>
+      val key = OpenIvmTelemetryContract.canonicalRelationKey(source)
+      val version = knownByCanonical
+        .get(key)
+        .orElse(DeltaTableVersion.latestOption(spark, source))
+        .orElse(mvVersionsByCanonical.get(key))
+        .filter(_ >= 0L)
+        .getOrElse(
+          throw new IllegalStateException(
+            s"OpenIVM telemetry could not resolve a committed version for source relation '$source'"
+          )
+        )
+      OpenIvmTelemetryContract.SourceVersion(source, version, version)
+    }
+  }
+
   /** Backtick-quoted SQL identifier, including optional catalog and database. */
   def sqlIdent(id: TableIdentifier): String = {
     val parts = id.catalog.toSeq ++ id.database.toSeq ++ Seq(id.table)
@@ -1388,7 +1423,7 @@ case class CreateMaterializedViewCommand(
     } match {
       case Some(meta) if ifNotExists =>
         if (OpenIvmExecutionSpan.hasActiveExport) {
-          recordExistingCreateTelemetry(meta)
+          recordExistingCreateTelemetry(spark, meta)
           OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
           return "create_already_exists"
         }
@@ -1753,16 +1788,13 @@ case class CreateMaterializedViewCommand(
       }
     }
     OpenIvmExecutionSpan.recordActiveSourceVersions(
-      watermarkProps.toSeq.flatMap { case (key, value) =>
-        ChangeWatermark
-          .decodeDeltaVersion(value)
-          .map(version =>
-            OpenIvmTelemetryContract.SourceVersion(
-              key.stripPrefix(MvMetadata.WatermarkKeyPrefix),
-              version.version,
-              version.version
-            )
-          )
+      {
+        val watermarksBySource = watermarkProps.toSeq.flatMap { case (key, value) =>
+          ChangeWatermark
+            .decodeDeltaVersion(value)
+            .map(version => key.stripPrefix(MvMetadata.WatermarkKeyPrefix) -> version.version)
+        }.toMap
+        telemetrySourceVersions(spark, qualNames, watermarksBySource)
       }
     )
     val userProps = properties - MvMetadata.BackingViewSuffixKey
@@ -2021,7 +2053,7 @@ case class CreateMaterializedViewCommand(
     "create_executed"
   }
 
-  private def recordExistingCreateTelemetry(meta: MvMetadata): Unit = {
+  private def recordExistingCreateTelemetry(spark: SparkSession, meta: MvMetadata): Unit = {
     import MvCommandHelper._
 
     val compileRefreshType = meta.properties
@@ -2059,8 +2091,11 @@ case class CreateMaterializedViewCommand(
     val pinStatus = meta.timeTravelPinStatus.getOrElse(derivedPin.status)
     OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(pinStatus, derivedPin.reason)
     OpenIvmExecutionSpan.recordActiveSourceVersions(
-      meta.changeWatermarks.toSeq.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-        OpenIvmTelemetryContract.SourceVersion(source, version, version)
+      {
+        val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+          source -> version
+        }
+        telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
       }
     )
     OpenIvmExecutionSpan.recordActivePendingDeltaCount(0L)
@@ -2528,8 +2563,11 @@ case class RefreshMaterializedViewCommand(
       val propagation      = ChangePropagationFactory.forSession(spark)
       val sourceWatermarks = meta.changeWatermarks
       OpenIvmExecutionSpan.recordActiveSourceVersions(
-        sourceWatermarks.toSeq.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-          OpenIvmTelemetryContract.SourceVersion(source, version, version)
+        {
+          val watermarksBySource = sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+            source -> version
+          }
+          telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
         }
       )
 

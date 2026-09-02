@@ -144,6 +144,9 @@ short-circuit outcome. The schema's
 `x-openivm-w6-required-success-fields` annotation is the ingestion-required
 field set for every accepted outcome. `create_already_exists` is valid only
 when `operation=create`; the schema's operation/outcome map is authoritative.
+Reusable successes require a nonempty `source_versions` array that is unique
+and ascending by lower-cased canonical relation key. The internal duration may
+differ from the timestamp interval by at most 5 ms.
 
 ### JVM module-opens block (JDK 17)
 

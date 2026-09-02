@@ -290,7 +290,7 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     if (
       !payload.path("source_versions").isArray ||
       (OpenIvmTelemetryContract.OutcomesRequiringSourceVersions.contains(outcome) &&
-        payload.path("source_versions").isEmpty)
+        payload.path("source_versions").size() == 0)
     )
       throw invalidReusable(path)
     sourceEndVersions(payload, path)
@@ -329,10 +329,16 @@ private[telemetry] final class OpenIvmTelemetryExporter(
         if (start < 0L || end < start) throw invalidReusable(path)
         val validated =
           OpenIvmTelemetryContract.SourceVersion(relation, start, end).validated
-        validated.relation -> validated.endVersion
+        OpenIvmTelemetryContract.canonicalRelationKey(validated.relation) -> validated.endVersion
       }
       .toSeq
-    if (versions.map(_._1).distinct.size != versions.size) throw invalidReusable(path)
+    val relationKeys = versions.map(_._1)
+    if (
+      relationKeys.isEmpty ||
+      relationKeys.distinct.size != relationKeys.size ||
+      relationKeys != relationKeys.sorted
+    )
+      throw invalidReusable(path)
     versions.toMap
   }
 

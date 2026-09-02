@@ -179,16 +179,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
     if (configuredExport.nonEmpty) {
       recordBeforeEmit {
         OpenIvmTelemetryContract.validatedSourceVersions(values).foreach { value =>
-          val merged = sourceVersions.get(value.relation) match {
+          val relationKey = OpenIvmTelemetryContract.canonicalRelationKey(value.relation)
+          val merged = sourceVersions.get(relationKey) match {
             case Some(existing) =>
               OpenIvmTelemetryContract.SourceVersion(
-                value.relation,
+                existing.relation,
                 math.min(existing.startVersion, value.startVersion),
                 math.max(existing.endVersion, value.endVersion)
               )
             case None => value
           }
-          sourceVersions = sourceVersions.updated(value.relation, merged)
+          sourceVersions = sourceVersions.updated(relationKey, merged)
         }
       }
     }

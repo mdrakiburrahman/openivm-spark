@@ -41,9 +41,19 @@
     ]
   },
   "x-openivm-outcomes-requiring-source-versions": [
-    "source_versions_already_applied"
+    "create_executed",
+    "create_already_exists",
+    "source_versions_already_applied",
+    "no_pending_deltas",
+    "noop_fast_exit",
+    "full_refresh_executed",
+    "runtime_empty_delta_skip",
+    "incremental_executed",
+    "committed_with_cleanup_warning"
   ],
-  "x-openivm-duration-timestamp-tolerance-ms": 5000,
+  "x-openivm-source-version-order": "canonical_relation_ascending",
+  "x-openivm-source-version-uniqueness": "canonical_relation",
+  "x-openivm-duration-timestamp-tolerance-ms": 5,
   "x-openivm-duplicate-fields": "reject",
   "type": "object",
   "additionalProperties": false,

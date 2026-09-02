@@ -54,7 +54,7 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
   private def completeSuccessPayload(
       value: OpenIvmTelemetryContract.ExecutionIdentity,
       outcome: String,
-      sourceVersions: String = "[]"
+      sourceVersions: String = """[{"relation":"benchmark.source","start_version":7,"end_version":7}]"""
   ): String =
     s"""{
        |"schema_id":"${OpenIvmTelemetryContract.SchemaId}",
@@ -255,6 +255,46 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
         )
       }
       changedError.getMessage should include("not a complete matching accepted success")
+
+      val sortedRefresh = identity("sorted-refresh")
+      val acceptedSorted =
+        """[{"relation":"benchmark.Alpha","start_version":6,"end_version":7},""" +
+          """{"relation":"benchmark.beta","start_version":8,"end_version":9}]"""
+      val replaySorted =
+        """[{"relation":"benchmark.Alpha","start_version":7,"end_version":7},""" +
+          """{"relation":"benchmark.beta","start_version":9,"end_version":9}]"""
+      exporter.publish(
+        sortedRefresh,
+        completeSuccessPayload(sortedRefresh, "incremental_executed", acceptedSorted)
+      )
+      exporter.reuseCompleted(
+        sortedRefresh,
+        completeSuccessPayload(sortedRefresh, "source_versions_already_applied", replaySorted)
+      ) shouldBe true
+    }
+
+    it("accepts a 5 ms duration discrepancy and rejects 6 ms") {
+      val root     = newRoot()
+      val exporter = new OpenIvmTelemetryExporter(root.toURI.toString, new Configuration())
+
+      val fiveMs = identity("duration-five").copy(operation = "create", phase = "full")
+      exporter.publish(
+        fiveMs,
+        completeSuccessPayload(fiveMs, "create_executed")
+          .replace(""""duration_ms":1000""", """"duration_ms":1005""")
+      )
+      exporter.reuseCompleted(fiveMs, completeSuccessPayload(fiveMs, "create_already_exists")) shouldBe true
+
+      val sixMs = identity("duration-six").copy(operation = "create", phase = "full")
+      exporter.publish(
+        sixMs,
+        completeSuccessPayload(sixMs, "create_executed")
+          .replace(""""duration_ms":1000""", """"duration_ms":1006""")
+      )
+      val error = intercept[OpenIvmTelemetryExportException] {
+        exporter.reuseCompleted(sixMs, completeSuccessPayload(sixMs, "create_already_exists"))
+      }
+      error.getMessage should include("not a complete matching accepted success")
     }
 
     it("rejects every schema-invalid or operation-invalid completed object during reuse") {
@@ -344,11 +384,56 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
         )
       )
 
-      val refresh = identity("empty-source-versions")
+      val createEmpty = identity("empty-create").copy(operation = "create", phase = "full")
       rejects(
-        "source-version advancement has no source versions",
-        refresh,
-        completeSuccessPayload(refresh, "source_versions_already_applied")
+        "CREATE success has no source versions",
+        createEmpty,
+        completeSuccessPayload(createEmpty, "create_executed", "[]")
+      )
+
+      val noPendingEmpty = identity("empty-no-pending")
+      rejects(
+        "no-pending REFRESH success has no source versions",
+        noPendingEmpty,
+        completeSuccessPayload(noPendingEmpty, "no_pending_deltas", "[]")
+      )
+
+      val refreshEmpty = identity("empty-refresh")
+      rejects(
+        "incremental REFRESH success has no source versions",
+        refreshEmpty,
+        completeSuccessPayload(refreshEmpty, "incremental_executed", "[]")
+      )
+
+      val sourceAdvanceEmpty = identity("empty-source-advance")
+      rejects(
+        "already-applied REFRESH success has no source versions",
+        sourceAdvanceEmpty,
+        completeSuccessPayload(sourceAdvanceEmpty, "source_versions_already_applied", "[]")
+      )
+
+      val duplicate = identity("duplicate-source")
+      rejects(
+        "source versions repeat a canonical relation",
+        duplicate,
+        completeSuccessPayload(
+          duplicate,
+          "incremental_executed",
+          """[{"relation":"benchmark.Source","start_version":6,"end_version":7},""" +
+            """{"relation":"benchmark.source","start_version":7,"end_version":7}]"""
+        )
+      )
+
+      val unsorted = identity("unsorted-source")
+      rejects(
+        "source versions are not canonical-relation sorted",
+        unsorted,
+        completeSuccessPayload(
+          unsorted,
+          "incremental_executed",
+          """[{"relation":"benchmark.zeta","start_version":6,"end_version":7},""" +
+            """{"relation":"benchmark.alpha","start_version":8,"end_version":9}]"""
+        )
       )
     }
 

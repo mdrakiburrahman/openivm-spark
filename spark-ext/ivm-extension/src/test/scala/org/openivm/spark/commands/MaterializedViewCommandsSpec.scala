@@ -275,6 +275,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     payload.path("duration_ms").asLong() should be >= 0L
     payload.path("pending_delta_count").asLong() should be >= 0L
     payload.path("source_versions").isArray shouldBe true
+    payload.path("source_versions").size() should be > 0
   }
 
   private def assertBagEqual(tableName: String, expectedSql: String): Unit = {

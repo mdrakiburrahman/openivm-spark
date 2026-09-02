@@ -72,9 +72,9 @@ object OpenIvmTelemetryContract {
 
   val ReusableSuccessOutcomes: Set[String] = CreateSuccessOutcomes ++ RefreshSuccessOutcomes
 
-  val OutcomesRequiringSourceVersions: Set[String] = Set("source_versions_already_applied")
+  val OutcomesRequiringSourceVersions: Set[String] = ReusableSuccessOutcomes
 
-  val DurationTimestampToleranceMs: Long = 5000L
+  val DurationTimestampToleranceMs: Long = 5L
 
   private[telemetry] val SourceVersionFields: Set[String] =
     Set("relation", "start_version", "end_version")
@@ -198,14 +198,18 @@ object OpenIvmTelemetryContract {
     Option(values)
       .getOrElse(Seq.empty)
       .map(_.validated)
-      .groupBy(_.relation)
+      .groupBy(value => canonicalRelationKey(value.relation))
       .toSeq
       .sortBy(_._1)
-      .map { case (relation, versions) =>
-        val starts = versions.map(_.startVersion)
-        val ends   = versions.map(_.endVersion)
+      .map { case (_, versions) =>
+        val starts   = versions.map(_.startVersion)
+        val ends     = versions.map(_.endVersion)
+        val relation = versions.map(_.relation).min
         SourceVersion(relation, starts.min, ends.max).validated
       }
+
+  def canonicalRelationKey(relation: String): String =
+    safeIdentity("source relation identity", relation).toLowerCase(java.util.Locale.ROOT)
 
   private def safeOperation(value: String): String =
     safeIdentity("operation identity", value).toLowerCase(java.util.Locale.ROOT) match {

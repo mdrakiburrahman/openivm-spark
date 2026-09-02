@@ -269,6 +269,16 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
         .asScala
         .map(_.asText())
         .toSet shouldBe OpenIvmTelemetryContract.RefreshSuccessOutcomes
+      schema.path("x-openivm-duration-timestamp-tolerance-ms").asLong() shouldBe
+        OpenIvmTelemetryContract.DurationTimestampToleranceMs
+      schema
+        .path("x-openivm-outcomes-requiring-source-versions")
+        .elements()
+        .asScala
+        .map(_.asText())
+        .toSet shouldBe OpenIvmTelemetryContract.OutcomesRequiringSourceVersions
+      schema.path("x-openivm-source-version-order").asText() shouldBe "canonical_relation_ascending"
+      schema.path("x-openivm-source-version-uniqueness").asText() shouldBe "canonical_relation"
     }
 
     it("does not evaluate export-only source fields when telemetry is disabled") {
