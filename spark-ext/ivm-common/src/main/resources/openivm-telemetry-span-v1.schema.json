@@ -15,6 +15,7 @@
     "engine_started_at",
     "engine_completed_at",
     "duration_ms",
+    "driver_thread",
     "outcome",
     "compile_refresh_type",
     "effective_refresh_type",
@@ -24,6 +25,26 @@
     "source_versions",
     "pending_delta_count"
   ],
+  "x-openivm-operation-success-outcomes": {
+    "create": [
+      "create_executed",
+      "create_already_exists"
+    ],
+    "refresh": [
+      "source_versions_already_applied",
+      "no_pending_deltas",
+      "noop_fast_exit",
+      "full_refresh_executed",
+      "runtime_empty_delta_skip",
+      "incremental_executed",
+      "committed_with_cleanup_warning"
+    ]
+  },
+  "x-openivm-outcomes-requiring-source-versions": [
+    "source_versions_already_applied"
+  ],
+  "x-openivm-duration-timestamp-tolerance-ms": 5000,
+  "x-openivm-duplicate-fields": "reject",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -100,25 +121,32 @@
       "minimum": 0
     },
     "driver_thread": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "outcome": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "compile_refresh_type": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "effective_refresh_type": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "refresh_reason": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "time_travel_pin_status": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "time_travel_pin_reason": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "source_versions": {
       "type": "array",

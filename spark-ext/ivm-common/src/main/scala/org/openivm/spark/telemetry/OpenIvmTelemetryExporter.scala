@@ -1,5 +1,6 @@
 package org.openivm.spark.telemetry
 
+import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -9,9 +10,10 @@ import org.slf4j.MDC
 
 import java.net.URI
 import java.nio.charset.StandardCharsets
-import java.time.Instant
+import java.time.{Duration, Instant}
 import java.util.Arrays
 import java.util.UUID
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.collection.JavaConverters._
 
 final class OpenIvmTelemetryExportException(message: String) extends IllegalStateException(message)
@@ -27,6 +29,22 @@ private[telemetry] final case class ConfiguredTelemetryExport(
     publisher: CompletedSpanPublisher
 )
 
+private[spark] object OpenIvmTelemetryPublicationInjection {
+  private final case class OneShotHook(requestId: String, fired: AtomicBoolean, beforeRename: () => Unit)
+
+  private val hook = new AtomicReference[OneShotHook]()
+
+  def installBeforeRenameOnce(requestId: String)(beforeRename: => Unit): Unit =
+    hook.set(OneShotHook(requestId, new AtomicBoolean(false), () => beforeRename))
+
+  def clear(): Unit = hook.set(null)
+
+  private[telemetry] def beforeRename(identity: OpenIvmTelemetryContract.ExecutionIdentity): Unit =
+    Option(hook.get()).filter(_.requestId == identity.requestId).foreach { installed =>
+      if (installed.fired.compareAndSet(false, true)) installed.beforeRename()
+    }
+}
+
 /** Atomic completed-object publisher for Hadoop-compatible filesystems,
   * including OneLake's ABFS implementation.
   */
@@ -40,7 +58,8 @@ private[telemetry] final class OpenIvmTelemetryExporter(
   def this(rootUri: String, hadoopConf: Configuration) =
     this(rootUri, hadoopConf, None, () => UUID.randomUUID().toString)
 
-  private val Json            = new ObjectMapper()
+  private val Json = new ObjectMapper()
+    .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
   private val MaxPayloadBytes = 4 * 1024 * 1024
 
   private def rootPath: Path = new Path(rootUri)
@@ -114,6 +133,8 @@ private[telemetry] final class OpenIvmTelemetryExporter(
         syncIfSupported(output.hsync())
       } finally output.close()
 
+      OpenIvmTelemetryPublicationInjection.beforeRename(validatedIdentity)
+
       if (fs.exists(finalPath)) {
         requireMatchingContent(fs, finalPath, bytes)
         return finalPath
@@ -182,6 +203,11 @@ private[telemetry] final class OpenIvmTelemetryExporter(
       identity: OpenIvmTelemetryContract.ExecutionIdentity,
       replayPayload: String
   ): Unit = {
+    if (
+      !OpenIvmTelemetryContract.isCompletedPath(path) ||
+      path.getName != OpenIvmTelemetryContract.completedFileName(identity)
+    )
+      throw invalidReusable(path)
     val existing =
       try Json.readTree(readExisting(fs, path))
       catch {
@@ -217,11 +243,34 @@ private[telemetry] final class OpenIvmTelemetryExporter(
       identity: OpenIvmTelemetryContract.ExecutionIdentity,
       path: Path
   ): Unit = {
+    if (payload == null || !payload.isObject) throw invalidReusable(path)
+    val fieldNames = payload.fieldNames().asScala.toSeq
+    if (fieldNames.exists(field => !OpenIvmTelemetryContract.AllowedFields.contains(field)))
+      throw invalidReusable(path)
+    OpenIvmTelemetryContract.SchemaRequiredFields.foreach { field =>
+      if (!payload.hasNonNull(field)) throw invalidReusable(path)
+    }
     OpenIvmTelemetryContract.W6RequiredSuccessFields.foreach { field =>
       if (!payload.hasNonNull(field)) throw invalidReusable(path)
     }
+    OpenIvmTelemetryContract.TextFields.foreach { field =>
+      if (payload.has(field) && (!payload.path(field).isTextual || payload.path(field).asText().isEmpty))
+        throw invalidReusable(path)
+    }
+    OpenIvmTelemetryContract.IntegralFields.foreach { field =>
+      if (
+        payload.has(field) &&
+        (!payload.path(field).isIntegralNumber ||
+          !payload.path(field).canConvertToLong ||
+          payload.path(field).longValue() < 0L)
+      )
+        throw invalidReusable(path)
+    }
     requireText(payload, "schema_id", OpenIvmTelemetryContract.SchemaId, path)
-    if (payload.path("schema_version").asInt(-1) != OpenIvmTelemetryContract.SchemaVersion)
+    if (
+      !payload.path("schema_version").isIntegralNumber ||
+      payload.path("schema_version").longValue() != OpenIvmTelemetryContract.SchemaVersion.toLong
+    )
       throw invalidReusable(path)
     requireText(payload, "campaign_id", identity.campaignId, path)
     requireText(payload, "request_id", identity.requestId, path)
@@ -230,22 +279,28 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     requireText(payload, "materialized_view", identity.materializedView, path)
     requireText(payload, "operation", identity.operation, path)
     requireText(payload, "phase", identity.phase, path)
-    if (!OpenIvmTelemetryContract.ReusableSuccessOutcomes.contains(payload.path("outcome").asText()))
+    val outcome = payload.path("outcome").asText()
+    val allowedOutcomes = identity.operation match {
+      case "create"  => OpenIvmTelemetryContract.CreateSuccessOutcomes
+      case "refresh" => OpenIvmTelemetryContract.RefreshSuccessOutcomes
+      case _         => Set.empty[String]
+    }
+    if (!allowedOutcomes.contains(outcome))
       throw invalidReusable(path)
     if (
-      payload.path("compile_refresh_type").asText().isEmpty ||
-      payload.path("effective_refresh_type").asText().isEmpty ||
-      payload.path("refresh_reason").asText().isEmpty ||
-      payload.path("time_travel_pin_status").asText().isEmpty ||
-      payload.path("time_travel_pin_reason").asText().isEmpty ||
       !payload.path("source_versions").isArray ||
-      payload.path("duration_ms").asLong(-1L) < 0L ||
-      payload.path("pending_delta_count").asLong(-1L) < 0L
+      (OpenIvmTelemetryContract.OutcomesRequiringSourceVersions.contains(outcome) &&
+        payload.path("source_versions").isEmpty)
     )
       throw invalidReusable(path)
+    sourceEndVersions(payload, path)
     val started   = parseInstant(payload, "engine_started_at", path)
     val completed = parseInstant(payload, "engine_completed_at", path)
     if (completed.isBefore(started)) throw invalidReusable(path)
+    val wallDurationMs = Duration.between(started, completed).toMillis
+    val durationMs     = payload.path("duration_ms").longValue()
+    if (math.abs(wallDurationMs - durationMs) > OpenIvmTelemetryContract.DurationTimestampToleranceMs)
+      throw invalidReusable(path)
   }
 
   private def sourceEndVersions(payload: JsonNode, path: Path): Map[String, Long] = {
@@ -254,11 +309,27 @@ private[telemetry] final class OpenIvmTelemetryExporter(
       .elements()
       .asScala
       .map { version =>
-        val relation = version.path("relation").asText()
-        val start    = version.path("start_version").asLong(-1L)
-        val end      = version.path("end_version").asLong(-1L)
-        if (relation.isEmpty || start < 0L || end < start) throw invalidReusable(path)
-        relation -> end
+        if (!version.isObject) throw invalidReusable(path)
+        val fields = version.fieldNames().asScala.toSet
+        if (fields != OpenIvmTelemetryContract.SourceVersionFields) throw invalidReusable(path)
+        val relation  = version.path("relation").asText()
+        val startNode = version.path("start_version")
+        val endNode   = version.path("end_version")
+        if (
+          !version.path("relation").isTextual ||
+          relation.isEmpty ||
+          !startNode.isIntegralNumber ||
+          !startNode.canConvertToLong ||
+          !endNode.isIntegralNumber ||
+          !endNode.canConvertToLong
+        )
+          throw invalidReusable(path)
+        val start = startNode.longValue()
+        val end   = endNode.longValue()
+        if (start < 0L || end < start) throw invalidReusable(path)
+        val validated =
+          OpenIvmTelemetryContract.SourceVersion(relation, start, end).validated
+        validated.relation -> validated.endVersion
       }
       .toSeq
     if (versions.map(_._1).distinct.size != versions.size) throw invalidReusable(path)

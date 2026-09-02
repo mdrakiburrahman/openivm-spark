@@ -28,7 +28,7 @@ object OpenIvmTelemetryContract {
   val CompletedFileSuffix: String  = ".json"
   val PartialFileSuffix: String    = ".partial"
 
-  val W6RequiredSuccessFields: Seq[String] = Seq(
+  val SchemaRequiredFields: Seq[String] = Seq(
     "schema_id",
     "schema_version",
     "campaign_id",
@@ -41,19 +41,26 @@ object OpenIvmTelemetryContract {
     "engine_started_at",
     "engine_completed_at",
     "duration_ms",
+    "driver_thread",
     "outcome",
-    "compile_refresh_type",
-    "effective_refresh_type",
-    "refresh_reason",
-    "time_travel_pin_status",
-    "time_travel_pin_reason",
     "source_versions",
     "pending_delta_count"
   )
 
-  val ReusableSuccessOutcomes: Set[String] = Set(
-    "create_executed",
-    "create_already_exists",
+  val W6RequiredSuccessFields: Seq[String] = Seq(
+    SchemaRequiredFields,
+    Seq(
+      "compile_refresh_type",
+      "effective_refresh_type",
+      "refresh_reason",
+      "time_travel_pin_status",
+      "time_travel_pin_reason"
+    )
+  ).flatten.distinct
+
+  val CreateSuccessOutcomes: Set[String] = Set("create_executed", "create_already_exists")
+
+  val RefreshSuccessOutcomes: Set[String] = Set(
     "source_versions_already_applied",
     "no_pending_deltas",
     "noop_fast_exit",
@@ -62,6 +69,66 @@ object OpenIvmTelemetryContract {
     "incremental_executed",
     "committed_with_cleanup_warning"
   )
+
+  val ReusableSuccessOutcomes: Set[String] = CreateSuccessOutcomes ++ RefreshSuccessOutcomes
+
+  val OutcomesRequiringSourceVersions: Set[String] = Set("source_versions_already_applied")
+
+  val DurationTimestampToleranceMs: Long = 5000L
+
+  private[telemetry] val SourceVersionFields: Set[String] =
+    Set("relation", "start_version", "end_version")
+
+  private[telemetry] val TextFields: Set[String] = Set(
+    "schema_id",
+    "campaign_id",
+    "request_id",
+    "correlation_id",
+    "dbt_node_id",
+    "materialized_view",
+    "operation",
+    "phase",
+    "engine_started_at",
+    "engine_completed_at",
+    "driver_thread",
+    "outcome",
+    "compile_refresh_type",
+    "effective_refresh_type",
+    "refresh_reason",
+    "time_travel_pin_status",
+    "time_travel_pin_reason"
+  )
+
+  private[telemetry] val IntegralFields: Set[String] = Set(
+    "schema_version",
+    "duration_ms",
+    "pending_delta_count",
+    "same_mv_lock_wait_ms",
+    "driver_admission_wait_ms",
+    "catalog_publication_admission_width",
+    "catalog_publication_admission_wait_ms",
+    "compiler_ms",
+    "catalog_ms",
+    "analysis_ms",
+    "watermark_ms",
+    "ctas_ms",
+    "ctas_data_write_ms",
+    "hive_catalog_publication_ms",
+    "metadata_publication_ms",
+    "delta_version_lookup_ms",
+    "delta_version_lookup_count",
+    "rocksdb_write_ms",
+    "rocksdb_write_count",
+    "rocksdb_flush_ms",
+    "rocksdb_flush_count",
+    "rocksdb_flush_failed_count",
+    "rocksdb_jvm_lock_wait_ms",
+    "rocksdb_external_lock_wait_ms",
+    "rocksdb_backup_ms"
+  )
+
+  private[telemetry] val AllowedFields: Set[String] =
+    TextFields ++ IntegralFields + "source_versions"
 
   final case class ExecutionIdentity(
       campaignId: String,

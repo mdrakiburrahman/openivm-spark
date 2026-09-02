@@ -251,7 +251,24 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
         .elements()
         .asScala
         .map(_.asText())
-        .toSeq shouldBe OpenIvmTelemetryContract.W6RequiredSuccessFields
+        .toSet shouldBe OpenIvmTelemetryContract.W6RequiredSuccessFields.toSet
+      schema.path("required").elements().asScala.map(_.asText()).toSeq shouldBe
+        OpenIvmTelemetryContract.SchemaRequiredFields
+      schema.path("properties").fieldNames().asScala.toSet shouldBe OpenIvmTelemetryContract.AllowedFields
+      schema
+        .path("x-openivm-operation-success-outcomes")
+        .path("create")
+        .elements()
+        .asScala
+        .map(_.asText())
+        .toSet shouldBe OpenIvmTelemetryContract.CreateSuccessOutcomes
+      schema
+        .path("x-openivm-operation-success-outcomes")
+        .path("refresh")
+        .elements()
+        .asScala
+        .map(_.asText())
+        .toSet shouldBe OpenIvmTelemetryContract.RefreshSuccessOutcomes
     }
 
     it("does not evaluate export-only source fields when telemetry is disabled") {

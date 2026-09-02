@@ -1305,7 +1305,20 @@ case class CreateMaterializedViewCommand(
     )
     val sqlLog =
       RefreshSqlLog.start(spark, profile.refreshId, commandName, RefreshSqlLog.ModeCreate)
-    var createOutcome = "create_failed"
+    var createOutcome               = "create_failed"
+    var createFinalizationAttempted = false
+    val finalizeUnderLock           = OpenIvmExecutionSpan.hasActiveExport
+
+    def finalizeCreate(): Unit =
+      if (!createFinalizationAttempted) {
+        createFinalizationAttempted = true
+        val totalMs = (System.nanoTime() - createT0) / 1000000L
+        profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
+        profile.completeSpan(createOutcome, Thread.currentThread().getName)
+        profile.flush()
+        sqlLog.flush()
+      }
+
     // Record the user-supplied CREATE-MV body up front. Not executed by us
     // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
     // because it's the verbatim user query.
@@ -1320,30 +1333,37 @@ case class CreateMaterializedViewCommand(
     try {
       val lockWaitT0 = System.nanoTime()
       val outcome = RefreshMutex.withLock(commandName) {
-        val threadName = Thread.currentThread().getName
-        val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
-        profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-          OpenIvmMetrics.CreateInflight.incrementAndGet()
-          try {
-            CommandConcurrencyInjection.maybePauseBeforeCreate()
-            DriverHeavyOperationAdmission.withPermit(spark, "create") {
-              runCreate(isolated, profile, sqlLog)
+        try {
+          val threadName = Thread.currentThread().getName
+          val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+          profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
+          val outcome =
+            org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+              OpenIvmMetrics.CreateInflight.incrementAndGet()
+              try {
+                CommandConcurrencyInjection.maybePauseBeforeCreate()
+                DriverHeavyOperationAdmission.withPermit(spark, "create") {
+                  runCreate(isolated, profile, sqlLog)
+                }
+              } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
-          } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+          if (finalizeUnderLock) {
+            OpenIvmStateSync.backupAsync(spark)
+            createOutcome = outcome
+          }
+          outcome
+        } finally {
+          if (finalizeUnderLock) finalizeCreate()
         }
       }
-      OpenIvmStateSync.backupAsync(spark)
-      createOutcome = outcome
+      if (!finalizeUnderLock) {
+        OpenIvmStateSync.backupAsync(spark)
+        createOutcome = outcome
+      }
       Seq.empty
     } finally {
-      try {
-        val totalMs = (System.nanoTime() - createT0) / 1000000L
-        profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
-        profile.completeSpan(createOutcome, Thread.currentThread().getName)
-        profile.flush()
-        sqlLog.flush()
-      } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+      try finalizeCreate()
+      finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
     }
   }
 

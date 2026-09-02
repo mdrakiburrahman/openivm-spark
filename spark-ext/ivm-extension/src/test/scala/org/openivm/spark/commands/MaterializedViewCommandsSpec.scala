@@ -30,7 +30,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
-import org.openivm.spark.telemetry.OpenIvmTelemetryContract
+import org.openivm.spark.telemetry.{OpenIvmTelemetryContract, OpenIvmTelemetryPublicationInjection}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
@@ -41,7 +41,7 @@ import java.io.File
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
@@ -1528,6 +1528,70 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       byRequest.values.foreach(assertW6SuccessFields)
       byRequest("request-t5ab-original").path("outcome").asText() shouldBe "create_executed"
       byRequest("request-t5ab-new").path("outcome").asText() shouldBe "create_already_exists"
+    }
+
+    it("keeps the actual CREATE as publication winner when a retry arrives before its rename") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ab-concurrent").toURI)
+      val enteredRename = new CountDownLatch(1)
+      val releaseRename = new CountDownLatch(1)
+      val retryStarted  = new CountDownLatch(1)
+      val requestId     = "request-t5ab-concurrent"
+      val createSql =
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t5ab_concurrent AS " +
+          "SELECT id, SUM(amount) AS total FROM src_t5ab_concurrent GROUP BY id"
+
+      def create(): Unit =
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ab_concurrent"
+        ) {
+          spark.sql(createSql).collect()
+        }
+
+      OpenIvmTelemetryPublicationInjection.installBeforeRenameOnce(requestId) {
+        enteredRename.countDown()
+        if (!releaseRename.await(30L, TimeUnit.SECONDS))
+          throw new IllegalStateException("timed out waiting to release the original telemetry rename")
+      }
+      try {
+        withSparkConfs(
+          FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+          FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+          FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ab-concurrent",
+          FeatureGate.TelemetryPhaseKey         -> "full"
+        ) {
+          spark.sql("CREATE TABLE IF NOT EXISTS src_t5ab_concurrent(id INT, amount INT) USING DELTA")
+          spark.sql("INSERT INTO src_t5ab_concurrent VALUES (1, 10)")
+
+          withPool(2) { implicit ec =>
+            val original = Future(create())
+            enteredRename.await(30L, TimeUnit.SECONDS) shouldBe true
+            val retry = Future {
+              retryStarted.countDown()
+              create()
+            }
+            retryStarted.await(30L, TimeUnit.SECONDS) shouldBe true
+            try {
+              Thread.sleep(500L)
+              retry.isCompleted shouldBe false
+              completedTelemetryPayloads(telemetryRoot) shouldBe empty
+            } finally {
+              releaseRename.countDown()
+            }
+            awaitResult(original)
+            awaitResult(retry)
+          }
+        }
+      } finally {
+        releaseRename.countDown()
+        OpenIvmTelemetryPublicationInjection.clear()
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 1
+      payloads.head.path("request_id").asText() shouldBe requestId
+      payloads.head.path("outcome").asText() shouldBe "create_executed"
+      assertW6SuccessFields(payloads.head)
     }
   }
 

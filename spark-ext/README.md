@@ -142,7 +142,8 @@ already-applied `ADVANCE SOURCE VERSIONS` reuse only a complete, identity-matche
 accepted object; a new request identity publishes a complete explicit
 short-circuit outcome. The schema's
 `x-openivm-w6-required-success-fields` annotation is the ingestion-required
-field set for every accepted outcome.
+field set for every accepted outcome. `create_already_exists` is valid only
+when `operation=create`; the schema's operation/outcome map is authoritative.
 
 ### JVM module-opens block (JDK 17)
 

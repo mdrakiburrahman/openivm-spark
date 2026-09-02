@@ -53,7 +53,8 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
 
   private def completeSuccessPayload(
       value: OpenIvmTelemetryContract.ExecutionIdentity,
-      outcome: String
+      outcome: String,
+      sourceVersions: String = "[]"
   ): String =
     s"""{
        |"schema_id":"${OpenIvmTelemetryContract.SchemaId}",
@@ -75,7 +76,7 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
        |"refresh_reason":"kept",
        |"time_travel_pin_status":"NOT_APPLICABLE",
        |"time_travel_pin_reason":"no_user_pin",
-       |"source_versions":[],
+       |"source_versions":$sourceVersions,
        |"pending_delta_count":0
        |}""".stripMargin
 
@@ -211,12 +212,20 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
       exporter.publish(reusable, reusablePayload)
       exporter.reuseCompleted(reusable, completeSuccessPayload(reusable, "create_already_exists")) shouldBe true
 
-      val reusableRefresh        = identity("reusable-refresh")
-      val reusableRefreshPayload = completeSuccessPayload(reusableRefresh, "incremental_executed")
+      val reusableRefresh = identity("reusable-refresh")
+      val reusableRefreshPayload = completeSuccessPayload(
+        reusableRefresh,
+        "incremental_executed",
+        """[{"relation":"benchmark.source","start_version":6,"end_version":7}]"""
+      )
       exporter.publish(reusableRefresh, reusableRefreshPayload)
       exporter.reuseCompleted(
         reusableRefresh,
-        completeSuccessPayload(reusableRefresh, "source_versions_already_applied")
+        completeSuccessPayload(
+          reusableRefresh,
+          "source_versions_already_applied",
+          """[{"relation":"benchmark.source","start_version":7,"end_version":7}]"""
+        )
       ) shouldBe true
 
       val incomplete = identity("incomplete-create").copy(operation = "create", phase = "full")
@@ -246,6 +255,101 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
         )
       }
       changedError.getMessage should include("not a complete matching accepted success")
+    }
+
+    it("rejects every schema-invalid or operation-invalid completed object during reuse") {
+      val root     = newRoot()
+      val exporter = new OpenIvmTelemetryExporter(root.toURI.toString, new Configuration())
+
+      def rejects(label: String, identity: OpenIvmTelemetryContract.ExecutionIdentity, existing: String): Unit = {
+        exporter.publish(identity, existing)
+        val replay =
+          completeSuccessPayload(
+            identity,
+            if (identity.operation == "create") "create_already_exists" else "no_pending_deltas"
+          )
+        withClue(s"$label: ") {
+          intercept[OpenIvmTelemetryExportException] {
+            exporter.reuseCompleted(identity, replay)
+          }.getMessage should include("not a complete matching accepted success")
+        }
+      }
+
+      val createBase = identity("invalid-base").copy(operation = "create", phase = "full")
+      rejects(
+        "missing schema-required driver_thread",
+        createBase.copy(requestId = "request-missing-driver"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-missing-driver"),
+          "create_executed"
+        ).replace(""""driver_thread":"driver",""", "")
+      )
+      rejects(
+        "duration encoded as a string",
+        createBase.copy(requestId = "request-string-duration"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-string-duration"),
+          "create_executed"
+        ).replace(""""duration_ms":1000""", """"duration_ms":"1000"""")
+      )
+      rejects(
+        "classification encoded as a number",
+        createBase.copy(requestId = "request-number-classification"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-number-classification"),
+          "create_executed"
+        ).replace(""""compile_refresh_type":"AGGREGATE_GROUP"""", """"compile_refresh_type":7""")
+      )
+      rejects(
+        "unknown root field",
+        createBase.copy(requestId = "request-unknown-field"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-unknown-field"),
+          "create_executed"
+        ).replace("\n}", """,\n"unknown_field":"unexpected"\n}""")
+      )
+      rejects(
+        "duplicate root field",
+        createBase.copy(requestId = "request-duplicate-field"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-duplicate-field"),
+          "create_executed"
+        ).replace(
+          """"phase":"full",""",
+          """"phase":"full","phase":"full","""
+        )
+      )
+      rejects(
+        "empty driver thread",
+        createBase.copy(requestId = "request-empty-driver"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-empty-driver"),
+          "create_executed"
+        ).replace(""""driver_thread":"driver"""", """"driver_thread":"""")
+      )
+      rejects(
+        "duration disagrees with timestamps",
+        createBase.copy(requestId = "request-duration-mismatch"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-duration-mismatch"),
+          "create_executed"
+        ).replace(""""duration_ms":1000""", """"duration_ms":60000""")
+      )
+      rejects(
+        "CREATE carries a REFRESH-only success outcome",
+        createBase.copy(requestId = "request-create-refresh-outcome"),
+        completeSuccessPayload(
+          createBase.copy(requestId = "request-create-refresh-outcome"),
+          "incremental_executed"
+        )
+      )
+
+      val refresh = identity("empty-source-versions")
+      rejects(
+        "source-version advancement has no source versions",
+        refresh,
+        completeSuccessPayload(refresh, "source_versions_already_applied")
+      )
     }
 
     it("redacts URI user-info, query, fragment, and path details from failures") {
