@@ -49,6 +49,22 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Optional campaign-scoped Hadoop filesystem URI for completed execution
+    * span objects. Unset preserves the historical log-only behavior.
+    */
+  val TelemetryUriKey: String = "spark.openivm.telemetry.uri"
+
+  /** Nonsecret campaign identity required when [[TelemetryUriKey]] is set. */
+  val TelemetryCampaignIdKey: String = "spark.openivm.telemetry.campaignId"
+
+  /** Nonsecret request correlation identity used when no request-scoped local
+    * property is present.
+    */
+  val TelemetryCorrelationIdKey: String = "spark.openivm.telemetry.correlationId"
+
+  /** Campaign phase required when [[TelemetryUriKey]] is set. */
+  val TelemetryPhaseKey: String = "spark.openivm.telemetry.phase"
+
   /** Authoritative MV catalog backend. `rocksdb` preserves the local
     * compatibility layout; `delta` stores shared metadata in a Delta table and
     * is the production setting for multi-driver/object-store deployments.
@@ -429,6 +445,13 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def telemetryUri(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(TelemetryUriKey)
+      .orElse(spark.sparkContext.getConf.getOption(TelemetryUriKey))
+      .map(_.trim)
+      .filter(_.nonEmpty)
 
   def catalogBackend(spark: SparkSession): String = {
     val backend = spark.conf.getOption(CatalogBackendKey).getOrElse("rocksdb").trim.toLowerCase(java.util.Locale.ROOT)

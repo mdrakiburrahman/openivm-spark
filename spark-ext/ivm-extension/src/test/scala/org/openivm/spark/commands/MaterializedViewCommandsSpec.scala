@@ -30,6 +30,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.telemetry.OpenIvmTelemetryContract
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
@@ -38,6 +39,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.sql.Timestamp
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
@@ -207,6 +209,37 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       previous.foreach { case (key, value) =>
         spark.sparkContext.setLocalProperty(key, value)
       }
+  }
+
+  private def withSparkConfs[A](entries: (String, String)*)(body: => A): A = {
+    val previous = entries.map { case (key, _) => key -> spark.conf.getOption(key) }
+    entries.foreach { case (key, value) => spark.conf.set(key, value) }
+    try body
+    finally
+      previous.foreach {
+        case (key, Some(value)) => spark.conf.set(key, value)
+        case (key, None)        => spark.conf.unset(key)
+      }
+  }
+
+  private def completedTelemetryPayloads(root: Path): Seq[JsonNode] = {
+    val completed =
+      new Path(
+        new Path(root, OpenIvmTelemetryContract.CompletedDirectory),
+        OpenIvmTelemetryContract.VersionDirectory
+      )
+    val fs = completed.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(completed)) Seq.empty
+    else
+      fs.listStatus(completed)
+        .filter(status => status.isFile && OpenIvmTelemetryContract.isCompletedPath(status.getPath))
+        .sortBy(_.getPath.getName)
+        .map { status =>
+          val input = fs.open(status.getPath)
+          try Json.readTree(input)
+          finally input.close()
+        }
+        .toSeq
   }
 
   private def assertBagEqual(tableName: String, expectedSql: String): Unit = {
@@ -1354,6 +1387,67 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       payload.path("compile_refresh_type").asText() shouldBe meta.properties(MvMetadata.CompileRefreshTypeKey)
       payload.path("effective_refresh_type").asText() shouldBe meta.refreshTypeName
       payload.path("refresh_reason").asText() shouldBe meta.properties(MvMetadata.RefreshReasonKey)
+    }
+  }
+
+  describe("(5aa) campaign-scoped completed telemetry export") {
+    it("writes one bound completed object for CREATE and one for REFRESH") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5aa").toURI)
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5aa",
+        FeatureGate.TelemetryPhaseKey         -> "full"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5aa_export(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5aa_export VALUES (1, 10)")
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5aa-create",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5aa_export"
+        ) {
+          spark
+            .sql(
+              "CREATE MATERIALIZED VIEW mv_t5aa_export AS " +
+                "SELECT id, SUM(amount) AS total FROM src_t5aa_export GROUP BY id"
+            )
+            .collect()
+        }
+
+        spark.conf.set(FeatureGate.TelemetryPhaseKey, "refresh")
+        spark.sql("INSERT INTO src_t5aa_export VALUES (1, 5)")
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5aa-refresh",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5aa_export"
+        ) {
+          spark.sql("REFRESH MATERIALIZED VIEW mv_t5aa_export").collect()
+        }
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 2
+      val byOperation = payloads.map(payload => payload.path("operation").asText() -> payload).toMap
+
+      val create = byOperation("create")
+      create.path("schema_version").asInt() shouldBe OpenIvmTelemetryContract.SchemaVersion
+      create.path("campaign_id").asText() shouldBe "central-frozen-fast"
+      create.path("request_id").asText() shouldBe "request-t5aa-create"
+      create.path("phase").asText() shouldBe "full"
+      create.path("pending_delta_count").asLong() shouldBe 0L
+      create.path("compile_refresh_type").asText() should not be empty
+      create.path("effective_refresh_type").asText() should not be empty
+      create.path("refresh_reason").asText() should not be empty
+
+      val refresh = byOperation("refresh")
+      refresh.path("request_id").asText() shouldBe "request-t5aa-refresh"
+      refresh.path("phase").asText() shouldBe "refresh"
+      refresh.path("pending_delta_count").asLong() should be > 0L
+      refresh.path("compile_refresh_type").asText() shouldBe create.path("compile_refresh_type").asText()
+      refresh.path("effective_refresh_type").asText() shouldBe create.path("effective_refresh_type").asText()
+      refresh.path("refresh_reason").asText() shouldBe create.path("refresh_reason").asText()
+      Instant.parse(refresh.path("engine_completed_at").asText()) should be >=
+        Instant.parse(refresh.path("engine_started_at").asText())
+
+      assertBagEqual("mv_t5aa_export", "SELECT id, SUM(amount) AS total FROM src_t5aa_export GROUP BY id")
     }
   }
 

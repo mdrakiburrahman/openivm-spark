@@ -34,7 +34,12 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
-import org.openivm.spark.telemetry.{KvLogValue, OpenIvmExecutionSpan}
+import org.openivm.spark.telemetry.{
+  KvLogValue,
+  OpenIvmExecutionSpan,
+  OpenIvmTelemetryContract,
+  OpenIvmTelemetryExportException
+}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -1721,6 +1726,19 @@ case class CreateMaterializedViewCommand(
         )
       }
     }
+    OpenIvmExecutionSpan.recordActiveSourceVersions(
+      watermarkProps.toSeq.flatMap { case (key, value) =>
+        ChangeWatermark
+          .decodeDeltaVersion(value)
+          .map(version =>
+            OpenIvmTelemetryContract.SourceVersion(
+              key.stripPrefix(MvMetadata.WatermarkKeyPrefix),
+              version.version,
+              version.version
+            )
+          )
+      }
+    )
     val userProps = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
@@ -2371,6 +2389,7 @@ case class RefreshMaterializedViewCommand(
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
       if (!endEmitted) {
         endEmitted = true
+        OpenIvmExecutionSpan.recordActivePendingDeltaCount(pendingDeltas.toLong)
         val totalMs = (System.nanoTime() - refreshT0) / 1000000L
         RefreshPerf.emit(
           refreshId,
@@ -2404,6 +2423,15 @@ case class RefreshMaterializedViewCommand(
       refreshTypeForFailure = meta.refreshTypeName
       preparedSourceAdvance = sourceVersionAdvance.map(prepareSourceVersionAdvance(spark, meta, _))
       preparedSourceAdvance.foreach { advance =>
+        OpenIvmExecutionSpan.recordActiveSourceVersions(
+          advance.requestedBatches.map(batch =>
+            OpenIvmTelemetryContract.SourceVersion(
+              batch.baseTable,
+              batch.startVersionInclusive,
+              batch.endVersionInclusive
+            )
+          )
+        )
         if (advance.changeBatches.isEmpty) {
           logInfo(
             s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
@@ -2426,6 +2454,11 @@ case class RefreshMaterializedViewCommand(
       val viewNameStr      = metaName(name)
       val propagation      = ChangePropagationFactory.forSession(spark)
       val sourceWatermarks = meta.changeWatermarks
+      OpenIvmExecutionSpan.recordActiveSourceVersions(
+        sourceWatermarks.toSeq.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+          OpenIvmTelemetryContract.SourceVersion(source, version, version)
+        }
+      )
 
       // Snapshot-pin telemetry contract.  The status recorded at CREATE is
       // authoritative and is re-proved here against the user's body through the
@@ -2559,6 +2592,30 @@ case class RefreshMaterializedViewCommand(
         )
       }
       pendingDeltasForFailure = changeBatches.size
+      OpenIvmExecutionSpan.recordActiveSourceVersions {
+        val versionBatchesBySource =
+          changeBatches.groupBy(_.baseTable.toLowerCase(java.util.Locale.ROOT))
+        meta.sourceTables.flatMap { source =>
+          val versionBatches =
+            versionBatchesBySource.getOrElse(source.toLowerCase(java.util.Locale.ROOT), Seq.empty)
+          val starts = versionBatches.flatMap {
+            case batch: CdfChangeBatch           => Some(batch.startVersionExclusive)
+            case batch: SourceVersionChangeBatch => Some(batch.startVersionInclusive)
+            case _                               => None
+          }
+          val ends = versionBatches.flatMap {
+            case batch: CdfChangeBatch           => Some(batch.endVersionInclusive)
+            case batch: SourceVersionChangeBatch => Some(batch.endVersionInclusive)
+            case _                               => None
+          }
+          if (starts.nonEmpty && ends.nonEmpty)
+            Some(OpenIvmTelemetryContract.SourceVersion(source, starts.min, ends.max))
+          else
+            sourceWatermarks.get(source).collect { case ChangeWatermark.DeltaVersion(version) =>
+              OpenIvmTelemetryContract.SourceVersion(source, version, version)
+            }
+        }
+      }
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
@@ -4511,6 +4568,8 @@ case class RefreshMaterializedViewCommand(
 
       Seq.empty
     } catch {
+      case t: OpenIvmTelemetryExportException =>
+        throw t
       case t: Throwable =>
         preparedSourceAdvance match {
           case Some(advance) if advance.isCommitted =>

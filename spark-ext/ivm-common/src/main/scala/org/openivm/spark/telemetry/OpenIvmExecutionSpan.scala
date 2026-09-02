@@ -18,7 +18,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private val dbtNodeId: Option[String],
     private val startedAtEpochMs: Long,
     private val startedAtNanos: Long,
-    private val enabled: Boolean
+    private val enabled: Boolean,
+    private val configuredExport: Option[ConfiguredTelemetryExport]
 ) {
 
   private val lock = new Object
@@ -48,6 +49,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var rocksDbJvmLockWaitMs             = Option.empty[Long]
   private var rocksDbExternalWaitMs            = Option.empty[Long]
   private var rocksDbBackupMs                  = Option.empty[Long]
+  private var sourceVersions                   = Map.empty[String, OpenIvmTelemetryContract.SourceVersion]
+  private var pendingDeltaCount                = 0L
   private var completedAtEpochMs               = Option.empty[Long]
   private var completedAtNanos                 = Option.empty[Long]
   private var outcome                          = Option.empty[String]
@@ -171,6 +174,33 @@ final class OpenIvmExecutionSpan private[telemetry] (
       rocksDbBackupMs = addDuration(rocksDbBackupMs, durationMs)
     }
 
+  def recordSourceVersions(values: => Seq[OpenIvmTelemetryContract.SourceVersion]): Unit =
+    if (configuredExport.nonEmpty) {
+      recordBeforeEmit {
+        OpenIvmTelemetryContract.validatedSourceVersions(values).foreach { value =>
+          val merged = sourceVersions.get(value.relation) match {
+            case Some(existing) =>
+              OpenIvmTelemetryContract.SourceVersion(
+                value.relation,
+                math.min(existing.startVersion, value.startVersion),
+                math.max(existing.endVersion, value.endVersion)
+              )
+            case None => value
+          }
+          sourceVersions = sourceVersions.updated(value.relation, merged)
+        }
+      }
+    }
+
+  def recordPendingDeltaCount(count: Long): Unit =
+    if (configuredExport.nonEmpty) {
+      recordBeforeEmit {
+        if (count < 0L)
+          throw new OpenIvmTelemetryExportException("OpenIVM telemetry pending delta count must be non-negative")
+        pendingDeltaCount = count
+      }
+    }
+
   def recordRefreshClassification(
       compileRefreshType: Option[String] = None,
       effectiveRefreshType: Option[String] = None,
@@ -230,8 +260,9 @@ final class OpenIvmExecutionSpan private[telemetry] (
     if (enabled) {
       lock.synchronized {
         if (completedAtNanos.isEmpty) {
+          val endNanos = System.nanoTime()
           completedAtEpochMs = Some(System.currentTimeMillis())
-          completedAtNanos = Some(System.nanoTime())
+          completedAtNanos = Some(endNanos)
           outcome = Some(OpenIvmExecutionSpan.normalizeString(finalOutcome))
           driverThread = Some(OpenIvmExecutionSpan.normalizeString(finalDriverThread))
         }
@@ -246,23 +277,69 @@ final class OpenIvmExecutionSpan private[telemetry] (
           if (emitted) None
           else {
             if (completedAtNanos.isEmpty) {
+              val endNanos = System.nanoTime()
               completedAtEpochMs = Some(System.currentTimeMillis())
-              completedAtNanos = Some(System.nanoTime())
+              completedAtNanos = Some(endNanos)
               outcome = Some(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
               driverThread = Some(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
             }
             emitted = true
-            Some(
-              OpenIvmExecutionSpan.renderJson(
+            val completedEpochMs = completedAtEpochMs.getOrElse(startedAtEpochMs)
+            val durationMs =
+              TimeUnit.NANOSECONDS.toMillis(completedAtNanos.getOrElse(startedAtNanos) - startedAtNanos)
+            val finalDriverThread =
+              driverThread.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
+            val finalOutcome = outcome.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
+            val logPayload = OpenIvmExecutionSpan.renderJson(
+              requestId = requestId,
+              dbtNodeId = dbtNodeId,
+              materializedView = materializedView,
+              operation = operation,
+              startedAtEpochMs = startedAtEpochMs,
+              completedAtEpochMs = math.max(startedAtEpochMs, completedEpochMs),
+              durationMs = math.max(0L, durationMs),
+              driverThread = finalDriverThread,
+              outcome = finalOutcome,
+              compileRefreshType = refreshClassification.compileRefreshType,
+              effectiveRefreshType = refreshClassification.effectiveRefreshType,
+              refreshReason = refreshClassification.refreshReason,
+              timeTravelPinStatus = timeTravelPinStatus,
+              timeTravelPinReason = timeTravelPinReason,
+              sameMvLockWaitMs = sameMvLockWaitMs,
+              driverAdmissionWaitMs = driverAdmissionMs,
+              catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
+              catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
+              compilerMs = compilerMs,
+              catalogMs = catalogMs,
+              rocksDbWriteMs = rocksDbWriteMs,
+              rocksDbWriteCount = rocksDbWriteCount,
+              analysisMs = analysisMs,
+              watermarkMs = watermarkMs,
+              ctasMs = ctasMs,
+              ctasDataWriteMs = ctasDataWriteMs,
+              hiveCatalogPublicationMs = hiveCatalogPublishMs,
+              metadataPublicationMs = metadataPublicationMs,
+              deltaVersionLookupMs = deltaVersionLookupMs,
+              deltaVersionLookupCount = deltaVersionLookupCount,
+              rocksDbFlushMs = rocksDbFlushMs,
+              rocksDbFlushCount = rocksDbFlushCount,
+              rocksDbFlushFailures = rocksDbFlushFailures,
+              rocksDbJvmLockWaitMs = rocksDbJvmLockWaitMs,
+              rocksDbExternalWaitMs = rocksDbExternalWaitMs,
+              rocksDbBackupMs = rocksDbBackupMs
+            )
+            val exportPayload = configuredExport.map { export =>
+              export -> OpenIvmExecutionSpan.renderExportJson(
+                identity = export.identity,
                 requestId = requestId,
                 dbtNodeId = dbtNodeId,
                 materializedView = materializedView,
                 operation = operation,
                 startedAtEpochMs = startedAtEpochMs,
-                completedAtEpochMs = completedAtEpochMs.getOrElse(startedAtEpochMs),
-                durationMs = TimeUnit.NANOSECONDS.toMillis(completedAtNanos.getOrElse(startedAtNanos) - startedAtNanos),
-                driverThread = driverThread.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultDriverThread)),
-                outcome = outcome.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultOutcome)),
+                completedAtEpochMs = completedEpochMs,
+                durationMs = durationMs,
+                driverThread = finalDriverThread,
+                outcome = finalOutcome,
                 compileRefreshType = refreshClassification.compileRefreshType,
                 effectiveRefreshType = refreshClassification.effectiveRefreshType,
                 refreshReason = refreshClassification.refreshReason,
@@ -289,18 +366,31 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 rocksDbFlushFailures = rocksDbFlushFailures,
                 rocksDbJvmLockWaitMs = rocksDbJvmLockWaitMs,
                 rocksDbExternalWaitMs = rocksDbExternalWaitMs,
-                rocksDbBackupMs = rocksDbBackupMs
+                rocksDbBackupMs = rocksDbBackupMs,
+                sourceVersions = sourceVersions.values.toSeq,
+                pendingDeltaCount = pendingDeltaCount
               )
-            )
+            }
+            Some(OpenIvmExecutionSpan.RenderedPayload(logPayload, exportPayload))
           }
         }
       }
 
-    payload.foreach(OpenIvmExecutionSpan.logSpan)
+    payload.foreach { rendered =>
+      rendered.exportPayload.foreach { case (export, exportJson) =>
+        export.publisher.publish(export.identity, exportJson)
+      }
+      OpenIvmExecutionSpan.logSpan(rendered.logPayload)
+    }
   }
 }
 
 object OpenIvmExecutionSpan extends Logging {
+
+  private final case class RenderedPayload(
+      logPayload: String,
+      exportPayload: Option[(ConfiguredTelemetryExport, String)]
+  )
 
   private final case class PendingDuration(durationMs: Long, observedAtNanos: Long)
   private final case class RefreshClassification(
@@ -399,19 +489,56 @@ object OpenIvmExecutionSpan extends Logging {
   private val DeltaVersionLookupMetric = "catalog.delta_version.lookup"
 
   val NoOp: OpenIvmExecutionSpan =
-    new OpenIvmExecutionSpan("", "refresh", None, None, 0L, 0L, enabled = false)
+    new OpenIvmExecutionSpan("", "refresh", None, None, 0L, 0L, enabled = false, configuredExport = None)
 
-  def start(spark: SparkSession, materializedView: String, operation: String): OpenIvmExecutionSpan =
+  def start(spark: SparkSession, materializedView: String, operation: String): OpenIvmExecutionSpan = {
+    Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
+      return existing
+    }
     correlationIdsFromSpark(spark) match {
       case (requestId, dbtNodeId) =>
-        start(materializedView, operation, requestId, dbtNodeId)
+        startInternal(
+          materializedView = materializedView,
+          operation = operation,
+          requestId = requestId,
+          dbtNodeId = dbtNodeId,
+          configuredExport = OpenIvmTelemetryExporter.configuredForSpark(
+            spark,
+            materializedView,
+            operation,
+            requestId,
+            dbtNodeId
+          )
+        )
     }
+  }
 
   def start(
       materializedView: String,
       operation: String,
       requestId: Option[String] = None,
       dbtNodeId: Option[String] = None
+  ): OpenIvmExecutionSpan =
+    startInternal(materializedView, operation, requestId, dbtNodeId, configuredExport = None)
+
+  private[telemetry] def startForTesting(
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      publisher: CompletedSpanPublisher
+  ): OpenIvmExecutionSpan =
+    startInternal(
+      materializedView = identity.materializedView,
+      operation = identity.operation,
+      requestId = Some(identity.requestId),
+      dbtNodeId = Some(identity.dbtNodeId),
+      configuredExport = Some(ConfiguredTelemetryExport(identity.validated, publisher))
+    )
+
+  private def startInternal(
+      materializedView: String,
+      operation: String,
+      requestId: Option[String],
+      dbtNodeId: Option[String],
+      configuredExport: Option[ConfiguredTelemetryExport]
   ): OpenIvmExecutionSpan = {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
@@ -425,7 +552,8 @@ object OpenIvmExecutionSpan extends Logging {
       dbtNodeId = dbtNodeId.map(normalizeString).filter(_.nonEmpty),
       startedAtEpochMs = nowEpochMs,
       startedAtNanos = nowNanos,
-      enabled = true
+      enabled = true,
+      configuredExport = configuredExport
     )
     consumePending(span, nowNanos)
     current.set(span)
@@ -457,6 +585,12 @@ object OpenIvmExecutionSpan extends Logging {
 
   def recordActiveTimeTravelPinStatus(status: String, reason: String = null): Unit =
     Option(current.get()).foreach(_.recordTimeTravelPinStatus(status, reason))
+
+  def recordActiveSourceVersions(values: => Seq[OpenIvmTelemetryContract.SourceVersion]): Unit =
+    Option(current.get()).foreach(_.recordSourceVersions(values))
+
+  def recordActivePendingDeltaCount(count: Long): Unit =
+    Option(current.get()).foreach(_.recordPendingDeltaCount(count))
 
   def recordActiveCatalogPublicationAdmission(width: Int, nanos: Long): Unit =
     if (nanos >= 0L)
@@ -675,6 +809,113 @@ object OpenIvmExecutionSpan extends Logging {
     if (deltaVersionLookupCount > 0L) {
       fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
     }
+    rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
+    if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
+    if (rocksDbFlushFailures > 0L) {
+      fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
+    }
+    rocksDbJvmLockWaitMs.foreach(v => fields.put("rocksdb_jvm_lock_wait_ms", java.lang.Long.valueOf(v)))
+    rocksDbExternalWaitMs.foreach(v => fields.put("rocksdb_external_lock_wait_ms", java.lang.Long.valueOf(v)))
+    rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))
+    Json.writeValueAsString(fields)
+  }
+
+  private def renderExportJson(
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      requestId: Option[String],
+      dbtNodeId: Option[String],
+      materializedView: String,
+      operation: String,
+      startedAtEpochMs: Long,
+      completedAtEpochMs: Long,
+      durationMs: Long,
+      driverThread: String,
+      outcome: String,
+      compileRefreshType: Option[String],
+      effectiveRefreshType: Option[String],
+      refreshReason: Option[String],
+      timeTravelPinStatus: Option[String],
+      timeTravelPinReason: Option[String],
+      sameMvLockWaitMs: Option[Long],
+      driverAdmissionWaitMs: Option[Long],
+      catalogPublicationAdmissionWidth: Option[Int],
+      catalogPublicationAdmissionWaitMs: Option[Long],
+      compilerMs: Option[Long],
+      catalogMs: Option[Long],
+      rocksDbWriteMs: Option[Long],
+      rocksDbWriteCount: Long,
+      analysisMs: Option[Long],
+      watermarkMs: Option[Long],
+      ctasMs: Option[Long],
+      ctasDataWriteMs: Option[Long],
+      hiveCatalogPublicationMs: Option[Long],
+      metadataPublicationMs: Option[Long],
+      deltaVersionLookupMs: Option[Long],
+      deltaVersionLookupCount: Long,
+      rocksDbFlushMs: Option[Long],
+      rocksDbFlushCount: Long,
+      rocksDbFlushFailures: Long,
+      rocksDbJvmLockWaitMs: Option[Long],
+      rocksDbExternalWaitMs: Option[Long],
+      rocksDbBackupMs: Option[Long],
+      sourceVersions: Seq[OpenIvmTelemetryContract.SourceVersion],
+      pendingDeltaCount: Long
+  ): String = {
+    val validatedIdentity = identity.validated
+    val fields            = new LinkedHashMap[String, AnyRef]()
+    fields.put("schema_id", OpenIvmTelemetryContract.SchemaId)
+    fields.put("schema_version", java.lang.Integer.valueOf(OpenIvmTelemetryContract.SchemaVersion))
+    fields.put("campaign_id", validatedIdentity.campaignId)
+    fields.put("request_id", requestId.getOrElse(validatedIdentity.requestId))
+    fields.put("correlation_id", validatedIdentity.correlationId)
+    fields.put("dbt_node_id", dbtNodeId.getOrElse(validatedIdentity.dbtNodeId))
+    fields.put("materialized_view", materializedView)
+    fields.put("operation", operation)
+    fields.put("phase", validatedIdentity.phase)
+    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
+    fields.put("engine_completed_at", Instant.ofEpochMilli(completedAtEpochMs).toString)
+    fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
+    fields.put("driver_thread", driverThread)
+    fields.put("outcome", outcome)
+    compileRefreshType.foreach(fields.put("compile_refresh_type", _))
+    effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
+    refreshReason.foreach(fields.put("refresh_reason", _))
+    timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
+    timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
+
+    val versionArray = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+    OpenIvmTelemetryContract.validatedSourceVersions(sourceVersions).foreach { version =>
+      val item = new LinkedHashMap[String, AnyRef]()
+      item.put("relation", version.relation)
+      item.put("start_version", java.lang.Long.valueOf(version.startVersion))
+      item.put("end_version", java.lang.Long.valueOf(version.endVersion))
+      versionArray.add(item)
+    }
+    fields.put("source_versions", versionArray)
+    fields.put("pending_delta_count", java.lang.Long.valueOf(math.max(0L, pendingDeltaCount)))
+
+    sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
+    driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
+    catalogPublicationAdmissionWidth.foreach(v =>
+      fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
+    )
+    catalogPublicationAdmissionWaitMs.foreach(v =>
+      fields.put("catalog_publication_admission_wait_ms", java.lang.Long.valueOf(v))
+    )
+    compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
+    catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
+    analysisMs.foreach(v => fields.put("analysis_ms", java.lang.Long.valueOf(v)))
+    watermarkMs.foreach(v => fields.put("watermark_ms", java.lang.Long.valueOf(v)))
+    ctasMs.foreach(v => fields.put("ctas_ms", java.lang.Long.valueOf(v)))
+    ctasDataWriteMs.foreach(v => fields.put("ctas_data_write_ms", java.lang.Long.valueOf(v)))
+    hiveCatalogPublicationMs.foreach(v => fields.put("hive_catalog_publication_ms", java.lang.Long.valueOf(v)))
+    metadataPublicationMs.foreach(v => fields.put("metadata_publication_ms", java.lang.Long.valueOf(v)))
+    deltaVersionLookupMs.foreach(v => fields.put("delta_version_lookup_ms", java.lang.Long.valueOf(v)))
+    if (deltaVersionLookupCount > 0L) {
+      fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
+    }
+    rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
+    if (rocksDbWriteCount > 0L) fields.put("rocksdb_write_count", java.lang.Long.valueOf(rocksDbWriteCount))
     rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
     if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
     if (rocksDbFlushFailures > 0L) {

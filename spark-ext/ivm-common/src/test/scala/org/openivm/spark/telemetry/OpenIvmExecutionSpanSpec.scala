@@ -12,6 +12,7 @@ import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeUnit}
 import scala.collection.mutable.ArrayBuffer
@@ -67,6 +68,26 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
     }
 
   private def millis(value: Long): Long = TimeUnit.MILLISECONDS.toNanos(value)
+
+  private final class CapturingPublisher(delayMs: Long = 0L, failure: Option[Throwable] = None)
+      extends CompletedSpanPublisher {
+    private val captured = ArrayBuffer.empty[(OpenIvmTelemetryContract.ExecutionIdentity, String)]
+    @volatile var publishStartedAtEpochMs: Long = 0L
+
+    override def publish(
+        identity: OpenIvmTelemetryContract.ExecutionIdentity,
+        payload: String
+    ): org.apache.hadoop.fs.Path = {
+      publishStartedAtEpochMs = System.currentTimeMillis()
+      captured.synchronized(captured += identity -> payload)
+      if (delayMs > 0L) Thread.sleep(delayMs)
+      failure.foreach(throw _)
+      new org.apache.hadoop.fs.Path("file:/captured/completed.json")
+    }
+
+    def payloads: Seq[JsonNode] =
+      captured.synchronized(captured.toVector.map { case (_, payload) => Json.readTree(payload) })
+  }
 
   private def withMdc[A](entries: (String, String)*)(body: => A): A = {
     entries.foreach { case (key, value) => MDC.put(key, value) }
@@ -130,6 +151,165 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("duration_ms").asLong() should be >= 0L
       payload.get("engine_started_at").asText() should endWith("Z")
       payload.get("engine_completed_at").asText() should endWith("Z")
+      payload.has("schema_version") shouldBe false
+      payload.has("campaign_id") shouldBe false
+      payload.has("source_versions") shouldBe false
+      payload.has("pending_delta_count") shouldBe false
+    }
+
+    it("exports the complete versioned schema with refresh classification and source versions") {
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "central-frozen-fast",
+        requestId = "request-123",
+        correlationId = "correlation-123",
+        dbtNodeId = "model.benchmark.sales",
+        materializedView = "benchmark.sales",
+        operation = "refresh",
+        phase = "refresh"
+      )
+      val publisher = new CapturingPublisher()
+      val span      = OpenIvmExecutionSpan.startForTesting(identity, publisher)
+
+      span.recordRefreshClassification(
+        compileRefreshType = Some("AGGREGATE_GROUP"),
+        effectiveRefreshType = Some("AGGREGATE_GROUP"),
+        refreshReason = Some("kept")
+      )
+      span.recordTimeTravelPinStatus(TimeTravelPinStatus.Applied, TimeTravelPinReason.PinsResolved)
+      span.recordSourceVersions(
+        Seq(
+          OpenIvmTelemetryContract.SourceVersion("benchmark.orders", 41L, 42L),
+          OpenIvmTelemetryContract.SourceVersion("benchmark.customers", 17L, 17L)
+        )
+      )
+      span.recordPendingDeltaCount(2L)
+      span.recordProfileStep("acquire_locks", "", 3L)
+      span.recordProfileStep("create_analyze_query", "", 5L)
+      span.recordProfileStep("create_capture_watermarks", "", 7L)
+      span.recordProfileStep("create_ctas_total", "", 11L)
+      span.recordProfileStep("create_ctas_data_write", "", 9L)
+      span.recordProfileStep("create_hive_catalog_publication", "", 2L)
+      span.recordProfileStep("create_mv_publish_metadata", "", 4L)
+      span.recordDriverAdmissionWait(6L)
+      span.recordCompiler(8L)
+      span.recordCatalog(10L)
+      span.recordRocksDbWrite(12L)
+      span.recordRocksDbFlush(14L)
+      span.recordRocksDbLockWait(16L, 18L)
+      span.complete("refresh_executed", "driver-schema")
+      span.emitIfNeeded("failed_before_end", "unused")
+
+      publisher.payloads should have size 1
+      val payload = publisher.payloads.head
+      payload.path("schema_id").asText() shouldBe OpenIvmTelemetryContract.SchemaId
+      payload.path("schema_version").asInt() shouldBe OpenIvmTelemetryContract.SchemaVersion
+      payload.path("campaign_id").asText() shouldBe identity.campaignId
+      payload.path("request_id").asText() shouldBe identity.requestId
+      payload.path("correlation_id").asText() shouldBe identity.correlationId
+      payload.path("dbt_node_id").asText() shouldBe identity.dbtNodeId
+      payload.path("materialized_view").asText() shouldBe identity.materializedView
+      payload.path("operation").asText() shouldBe identity.operation
+      payload.path("phase").asText() shouldBe identity.phase
+      payload.path("compile_refresh_type").asText() shouldBe "AGGREGATE_GROUP"
+      payload.path("effective_refresh_type").asText() shouldBe "AGGREGATE_GROUP"
+      payload.path("refresh_reason").asText() shouldBe "kept"
+      payload.path("time_travel_pin_status").asText() shouldBe "APPLIED"
+      payload.path("time_travel_pin_reason").asText() shouldBe "pins_resolved"
+      payload.path("pending_delta_count").asLong() shouldBe 2L
+      payload.path("analysis_ms").asLong() shouldBe 5L
+      payload.path("ctas_ms").asLong() shouldBe 11L
+      payload.path("ctas_data_write_ms").asLong() shouldBe 9L
+      payload.path("hive_catalog_publication_ms").asLong() shouldBe 2L
+      payload.path("metadata_publication_ms").asLong() shouldBe 4L
+      payload.path("compiler_ms").asLong() shouldBe 8L
+      payload.path("catalog_ms").asLong() shouldBe 10L
+      payload.path("rocksdb_write_ms").asLong() shouldBe 12L
+      payload.path("rocksdb_flush_ms").asLong() shouldBe 14L
+      payload.path("rocksdb_jvm_lock_wait_ms").asLong() shouldBe 16L
+      payload.path("rocksdb_external_lock_wait_ms").asLong() shouldBe 18L
+
+      val versions = payload.path("source_versions")
+      versions.size() shouldBe 2
+      versions.get(0).path("relation").asText() shouldBe "benchmark.customers"
+      versions.get(0).path("start_version").asLong() shouldBe 17L
+      versions.get(0).path("end_version").asLong() shouldBe 17L
+      versions.get(1).path("relation").asText() shouldBe "benchmark.orders"
+      versions.get(1).path("start_version").asLong() shouldBe 41L
+      versions.get(1).path("end_version").asLong() shouldBe 42L
+
+      val schemaStream = Option(getClass.getResourceAsStream(OpenIvmTelemetryContract.SchemaResource))
+      schemaStream should not be empty
+      val schema =
+        try Json.readTree(schemaStream.get)
+        finally schemaStream.get.close()
+      schema.path("$id").asText() shouldBe OpenIvmTelemetryContract.SchemaId
+      schema.path("properties").path("schema_version").path("const").asInt() shouldBe
+        OpenIvmTelemetryContract.SchemaVersion
+    }
+
+    it("does not evaluate export-only source fields when telemetry is disabled") {
+      var evaluated = false
+      val span      = OpenIvmExecutionSpan.start("default.disabled_export_mv", "refresh")
+      span.recordSourceVersions {
+        evaluated = true
+        throw new IllegalStateException("disabled telemetry evaluated export-only data")
+      }
+      span.recordPendingDeltaCount(-1L)
+      span.complete("no_pending_deltas", "driver-disabled")
+      span.emitIfNeeded("failed_before_end", "unused")
+
+      evaluated shouldBe false
+    }
+
+    it("captures the internal end before serialization and excludes export delay from duration") {
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "central-frozen-fast",
+        requestId = "request-delay",
+        correlationId = "correlation-delay",
+        dbtNodeId = "model.benchmark.delay",
+        materializedView = "benchmark.delay",
+        operation = "refresh",
+        phase = "refresh"
+      )
+      val publisher = new CapturingPublisher(delayMs = 150L)
+      val wallStart = System.nanoTime()
+      val span      = OpenIvmExecutionSpan.startForTesting(identity, publisher)
+      Thread.sleep(10L)
+      span.complete("refresh_executed", "driver-delay")
+      span.emitIfNeeded("failed_before_end", "unused")
+      val wallDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - wallStart)
+
+      val payload        = publisher.payloads.head
+      val startedAt      = Instant.parse(payload.path("engine_started_at").asText())
+      val completedAt    = Instant.parse(payload.path("engine_completed_at").asText())
+      val engineDuration = payload.path("duration_ms").asLong()
+
+      completedAt should be >= startedAt
+      completedAt.toEpochMilli should be <= publisher.publishStartedAtEpochMs
+      wallDurationMs should be >= 140L
+      engineDuration should be < (wallDurationMs - 100L)
+    }
+
+    it("surfaces exporter failures to the command path") {
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "central-frozen-fast",
+        requestId = "request-failure",
+        correlationId = "correlation-failure",
+        dbtNodeId = "model.benchmark.failure",
+        materializedView = "benchmark.failure",
+        operation = "create",
+        phase = "full"
+      )
+      val publisher =
+        new CapturingPublisher(failure = Some(new OpenIvmTelemetryExportException("explicit export failure")))
+      val span = OpenIvmExecutionSpan.startForTesting(identity, publisher)
+      span.complete("create_executed", "driver-failure")
+
+      val error = intercept[OpenIvmTelemetryExportException] {
+        span.emitIfNeeded("failed_before_end", "unused")
+      }
+      error.getMessage shouldBe "explicit export failure"
+      publisher.payloads should have size 1
     }
 
     it("keeps delta version lookups out of catalog_ms") {
