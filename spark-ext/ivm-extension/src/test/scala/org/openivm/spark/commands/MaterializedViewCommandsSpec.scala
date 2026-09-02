@@ -242,6 +242,41 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         .toSeq
   }
 
+  private def assertW6SuccessFields(payload: JsonNode): Unit = {
+    Seq(
+      "schema_id",
+      "schema_version",
+      "campaign_id",
+      "request_id",
+      "correlation_id",
+      "dbt_node_id",
+      "materialized_view",
+      "operation",
+      "phase",
+      "engine_started_at",
+      "engine_completed_at",
+      "duration_ms",
+      "outcome",
+      "compile_refresh_type",
+      "effective_refresh_type",
+      "refresh_reason",
+      "time_travel_pin_status",
+      "time_travel_pin_reason",
+      "source_versions",
+      "pending_delta_count"
+    ).foreach(field => withClue(s"missing W6 success field '$field': ") { payload.hasNonNull(field) shouldBe true })
+    payload.path("compile_refresh_type").asText() should not be empty
+    payload.path("effective_refresh_type").asText() should not be empty
+    payload.path("refresh_reason").asText() should not be empty
+    payload.path("time_travel_pin_status").asText() should not be empty
+    payload.path("time_travel_pin_reason").asText() should not be empty
+    Instant.parse(payload.path("engine_completed_at").asText()) should be >=
+      Instant.parse(payload.path("engine_started_at").asText())
+    payload.path("duration_ms").asLong() should be >= 0L
+    payload.path("pending_delta_count").asLong() should be >= 0L
+    payload.path("source_versions").isArray shouldBe true
+  }
+
   private def assertBagEqual(tableName: String, expectedSql: String): Unit = {
     val expected = spark.sql(expectedSql)
     val cols     = expected.columns.toSeq
@@ -1448,6 +1483,133 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         Instant.parse(refresh.path("engine_started_at").asText())
 
       assertBagEqual("mv_t5aa_export", "SELECT id, SUM(amount) AS total FROM src_t5aa_export GROUP BY id")
+    }
+  }
+
+  describe("(5ab) idempotent CREATE telemetry replay") {
+    it("reuses the completed object for the same request and emits a complete object for a new request") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ab").toURI)
+      val createSql =
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t5ab_replay AS " +
+          "SELECT id, SUM(amount) AS total FROM src_t5ab_replay GROUP BY id"
+
+      def create(requestId: String): Unit =
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ab_replay"
+        ) {
+          spark.sql(createSql).collect()
+        }
+
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ab",
+        FeatureGate.TelemetryPhaseKey         -> "full"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5ab_replay(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5ab_replay VALUES (1, 10)")
+
+        create("request-t5ab-original")
+        val original = completedTelemetryPayloads(telemetryRoot)
+        original should have size 1
+        assertW6SuccessFields(original.head)
+
+        create("request-t5ab-original")
+        completedTelemetryPayloads(telemetryRoot) shouldBe original
+
+        create("request-t5ab-new")
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 2
+      val byRequest = payloads.map(payload => payload.path("request_id").asText() -> payload).toMap
+      byRequest.keySet shouldBe Set("request-t5ab-original", "request-t5ab-new")
+      byRequest.values.foreach(assertW6SuccessFields)
+      byRequest("request-t5ab-original").path("outcome").asText() shouldBe "create_executed"
+      byRequest("request-t5ab-new").path("outcome").asText() shouldBe "create_already_exists"
+    }
+  }
+
+  describe("(5ac) already-applied source-version telemetry") {
+    it("records complete classification, pin, version, delta, and timing fields before publishing") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ac").toURI)
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-advance-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ac",
+        FeatureGate.TelemetryPhaseKey         -> "source_refresh_staging"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5ac_advance(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5ac_advance VALUES (1, 10)")
+        val oldVersion = DeltaTableVersion.requireLatest(spark, "src_t5ac_advance")
+
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5ac-create",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+        ) {
+          spark
+            .sql(
+              s"CREATE MATERIALIZED VIEW mv_t5ac_advance AS " +
+                s"SELECT id, SUM(amount) AS total FROM src_t5ac_advance VERSION AS OF $oldVersion GROUP BY id"
+            )
+            .collect()
+        }
+
+        spark.sql("INSERT INTO src_t5ac_advance VALUES (1, 5)")
+        val targetVersion = DeltaTableVersion.requireLatest(spark, "src_t5ac_advance")
+
+        def advance(requestId: String): Unit =
+          withSparkLocalProperties(
+            OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+            OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+          ) {
+            spark
+              .sql(
+                s"ALTER MATERIALIZED VIEW mv_t5ac_advance ADVANCE SOURCE VERSIONS " +
+                  s"(src_t5ac_advance = $targetVersion)"
+              )
+              .collect()
+          }
+
+        advance("request-t5ac-advance")
+        val accepted = completedTelemetryPayloads(telemetryRoot)
+          .find(_.path("request_id").asText() == "request-t5ac-advance")
+          .getOrElse(fail("missing accepted source-version advancement telemetry"))
+        accepted.path("outcome").asText() shouldBe "incremental_executed"
+        assertW6SuccessFields(accepted)
+
+        advance("request-t5ac-advance")
+        completedTelemetryPayloads(telemetryRoot)
+          .find(_.path("request_id").asText() == "request-t5ac-advance") shouldBe Some(accepted)
+
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5ac-already-applied",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+        ) {
+          spark
+            .sql(
+              s"ALTER MATERIALIZED VIEW mv_t5ac_advance ADVANCE SOURCE VERSIONS " +
+                s"(src_t5ac_advance = $targetVersion)"
+            )
+            .collect()
+        }
+      }
+
+      val advance = completedTelemetryPayloads(telemetryRoot)
+        .find(_.path("request_id").asText() == "request-t5ac-already-applied")
+        .getOrElse(fail("missing already-applied advancement telemetry"))
+      assertW6SuccessFields(advance)
+      advance.path("outcome").asText() shouldBe "source_versions_already_applied"
+      advance.path("operation").asText() shouldBe "refresh"
+      advance.path("pending_delta_count").asLong() shouldBe 0L
+      advance.path("time_travel_pin_status").asText() shouldBe "APPLIED"
+      advance.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      advance.path("delta_version_lookup_count").asLong() should be > 0L
+      val versions = advance.path("source_versions").elements().asScala.toSeq
+      versions should have size 1
+      versions.head.path("relation").asText() should endWith("src_t5ac_advance")
+      versions.head.path("start_version").asLong() shouldBe versions.head.path("end_version").asLong()
     }
   }
 

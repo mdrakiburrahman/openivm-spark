@@ -1319,7 +1319,7 @@ case class CreateMaterializedViewCommand(
     )
     try {
       val lockWaitT0 = System.nanoTime()
-      val rows = RefreshMutex.withLock(commandName) {
+      val outcome = RefreshMutex.withLock(commandName) {
         val threadName = Thread.currentThread().getName
         val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
         profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
@@ -1334,8 +1334,8 @@ case class CreateMaterializedViewCommand(
         }
       }
       OpenIvmStateSync.backupAsync(spark)
-      createOutcome = "create_executed"
-      rows
+      createOutcome = outcome
+      Seq.empty
     } finally {
       try {
         val totalMs = (System.nanoTime() - createT0) / 1000000L
@@ -1351,7 +1351,7 @@ case class CreateMaterializedViewCommand(
       spark: SparkSession,
       profile: RefreshProfile,
       sqlLog: RefreshSqlLog
-  ): Seq[Row] = {
+  ): String = {
     import MvCommandHelper._
 
     val propagation = ChangePropagationFactory.forSession(spark)
@@ -1366,7 +1366,13 @@ case class CreateMaterializedViewCommand(
     profile.timeStep("create_catalog_lookup") {
       MvCatalog.lookup(spark, name)
     } match {
-      case Some(_) if ifNotExists => return Seq.empty
+      case Some(meta) if ifNotExists =>
+        if (OpenIvmExecutionSpan.hasActiveExport) {
+          recordExistingCreateTelemetry(meta)
+          OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
+          return "create_already_exists"
+        }
+        return "create_executed"
       case Some(_) =>
         throw new AnalysisException(
           "TABLE_OR_VIEW_ALREADY_EXISTS",
@@ -1992,7 +1998,52 @@ case class CreateMaterializedViewCommand(
         throw t
     }
 
-    Seq.empty
+    "create_executed"
+  }
+
+  private def recordExistingCreateTelemetry(meta: MvMetadata): Unit = {
+    import MvCommandHelper._
+
+    val compileRefreshType = meta.properties
+      .get(MvMetadata.CompileRefreshTypeKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .getOrElse(
+        throw new IllegalStateException(
+          s"Materialized view ${sqlIdent(name)} lacks CREATE-time compile classification metadata"
+        )
+      )
+    val refreshReason = meta.properties
+      .get(MvMetadata.RefreshReasonKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .getOrElse(
+        throw new IllegalStateException(
+          s"Materialized view ${sqlIdent(name)} lacks CREATE-time refresh-reason metadata"
+        )
+      )
+    OpenIvmExecutionSpan.recordActiveRefreshClassification(
+      compileRefreshType = Some(compileRefreshType),
+      effectiveRefreshType = Some(meta.refreshTypeName),
+      refreshReason = Some(refreshReason)
+    )
+
+    val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables)
+    meta.timeTravelPinStatus.foreach { persisted =>
+      val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
+      if (persisted != derivedPin.status || !pinsAgree)
+        throw new IllegalStateException(
+          s"Materialized view ${sqlIdent(name)} has snapshot-pin metadata that disagrees with its stored definition"
+        )
+    }
+    val pinStatus = meta.timeTravelPinStatus.getOrElse(derivedPin.status)
+    OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(pinStatus, derivedPin.reason)
+    OpenIvmExecutionSpan.recordActiveSourceVersions(
+      meta.changeWatermarks.toSeq.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+        OpenIvmTelemetryContract.SourceVersion(source, version, version)
+      }
+    )
+    OpenIvmExecutionSpan.recordActivePendingDeltaCount(0L)
   }
 }
 
@@ -2422,6 +2473,8 @@ case class RefreshMaterializedViewCommand(
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
       refreshTypeForFailure = meta.refreshTypeName
       preparedSourceAdvance = sourceVersionAdvance.map(prepareSourceVersionAdvance(spark, meta, _))
+      val sourceVersionsAlreadyApplied =
+        preparedSourceAdvance.exists(_.changeBatches.isEmpty)
       preparedSourceAdvance.foreach { advance =>
         OpenIvmExecutionSpan.recordActiveSourceVersions(
           advance.requestedBatches.map(batch =>
@@ -2432,7 +2485,7 @@ case class RefreshMaterializedViewCommand(
             )
           )
         )
-        if (advance.changeBatches.isEmpty) {
+        if (advance.changeBatches.isEmpty && !OpenIvmExecutionSpan.hasActiveExport) {
           logInfo(
             s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
               s"versions='${advance.repin.targetVersions.toSeq.sorted.mkString(",")}'"
@@ -2490,6 +2543,16 @@ case class RefreshMaterializedViewCommand(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
           MvCommandHelper.pinTelemetryKv(timeTravelPinStatus, derivedPin.reason, derivedPin.pins)
       )
+
+      if (sourceVersionsAlreadyApplied) {
+        logInfo(
+          s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
+            s"versions='${preparedSourceAdvance.get.repin.targetVersions.toSeq.sorted.mkString(",")}'"
+        )
+        OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
+        emitEnd("source_versions_already_applied", meta.refreshTypeName, 0)
+        return Seq.empty
+      }
 
       // A source the view body pinned to a snapshot (`… VERSION AS OF 366`) is a
       // FROZEN relation: rows committed after the pinned version are not part of

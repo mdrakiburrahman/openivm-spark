@@ -55,6 +55,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var completedAtNanos                 = Option.empty[Long]
   private var outcome                          = Option.empty[String]
   private var driverThread                     = Option.empty[String]
+  private var completedExportReuseAllowed      = false
   private var emitted                          = false
 
   private[telemetry] def matchesCommand(expectedView: String, expectedOperation: String): Boolean =
@@ -198,6 +199,13 @@ final class OpenIvmExecutionSpan private[telemetry] (
         if (count < 0L)
           throw new OpenIvmTelemetryExportException("OpenIVM telemetry pending delta count must be non-negative")
         pendingDeltaCount = count
+      }
+    }
+
+  def allowCompletedExportReuse(): Unit =
+    if (configuredExport.nonEmpty) {
+      recordBeforeEmit {
+        completedExportReuseAllowed = true
       }
     }
 
@@ -371,14 +379,23 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 pendingDeltaCount = pendingDeltaCount
               )
             }
-            Some(OpenIvmExecutionSpan.RenderedPayload(logPayload, exportPayload))
+            Some(
+              OpenIvmExecutionSpan.RenderedPayload(
+                logPayload,
+                exportPayload,
+                completedExportReuseAllowed
+              )
+            )
           }
         }
       }
 
     payload.foreach { rendered =>
       rendered.exportPayload.foreach { case (export, exportJson) =>
-        export.publisher.publish(export.identity, exportJson)
+        val reused =
+          rendered.completedExportReuseAllowed &&
+            export.publisher.reuseCompleted(export.identity, exportJson)
+        if (!reused) export.publisher.publish(export.identity, exportJson)
       }
       OpenIvmExecutionSpan.logSpan(rendered.logPayload)
     }
@@ -389,7 +406,8 @@ object OpenIvmExecutionSpan extends Logging {
 
   private final case class RenderedPayload(
       logPayload: String,
-      exportPayload: Option[(ConfiguredTelemetryExport, String)]
+      exportPayload: Option[(ConfiguredTelemetryExport, String)],
+      completedExportReuseAllowed: Boolean
   )
 
   private final case class PendingDuration(durationMs: Long, observedAtNanos: Long)
@@ -568,6 +586,9 @@ object OpenIvmExecutionSpan extends Logging {
 
   def hasCurrentSpan: Boolean = current.get() != null
 
+  def hasActiveExport: Boolean =
+    Option(current.get()).exists(_.configuredExport.nonEmpty)
+
   def captureCurrent(): Option[OpenIvmExecutionSpan] = Option(current.get())
 
   def recordActiveRefreshClassification(
@@ -591,6 +612,9 @@ object OpenIvmExecutionSpan extends Logging {
 
   def recordActivePendingDeltaCount(count: Long): Unit =
     Option(current.get()).foreach(_.recordPendingDeltaCount(count))
+
+  def allowActiveCompletedExportReuse(): Unit =
+    Option(current.get()).foreach(_.allowCompletedExportReuse())
 
   def recordActiveCatalogPublicationAdmission(width: Int, nanos: Long): Unit =
     if (nanos >= 0L)

@@ -28,6 +28,41 @@ object OpenIvmTelemetryContract {
   val CompletedFileSuffix: String  = ".json"
   val PartialFileSuffix: String    = ".partial"
 
+  val W6RequiredSuccessFields: Seq[String] = Seq(
+    "schema_id",
+    "schema_version",
+    "campaign_id",
+    "request_id",
+    "correlation_id",
+    "dbt_node_id",
+    "materialized_view",
+    "operation",
+    "phase",
+    "engine_started_at",
+    "engine_completed_at",
+    "duration_ms",
+    "outcome",
+    "compile_refresh_type",
+    "effective_refresh_type",
+    "refresh_reason",
+    "time_travel_pin_status",
+    "time_travel_pin_reason",
+    "source_versions",
+    "pending_delta_count"
+  )
+
+  val ReusableSuccessOutcomes: Set[String] = Set(
+    "create_executed",
+    "create_already_exists",
+    "source_versions_already_applied",
+    "no_pending_deltas",
+    "noop_fast_exit",
+    "full_refresh_executed",
+    "runtime_empty_delta_skip",
+    "incremental_executed",
+    "committed_with_cleanup_warning"
+  )
+
   final case class ExecutionIdentity(
       campaignId: String,
       requestId: String,

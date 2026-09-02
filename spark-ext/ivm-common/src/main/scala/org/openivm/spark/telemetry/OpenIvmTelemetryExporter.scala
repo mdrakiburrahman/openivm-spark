@@ -1,5 +1,6 @@
 package org.openivm.spark.telemetry
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
@@ -8,13 +9,17 @@ import org.slf4j.MDC
 
 import java.net.URI
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.Arrays
 import java.util.UUID
+import scala.collection.JavaConverters._
 
 final class OpenIvmTelemetryExportException(message: String) extends IllegalStateException(message)
 
 private[telemetry] trait CompletedSpanPublisher {
   def publish(identity: OpenIvmTelemetryContract.ExecutionIdentity, payload: String): Path
+
+  def reuseCompleted(identity: OpenIvmTelemetryContract.ExecutionIdentity, replayPayload: String): Boolean = false
 }
 
 private[telemetry] final case class ConfiguredTelemetryExport(
@@ -35,6 +40,7 @@ private[telemetry] final class OpenIvmTelemetryExporter(
   def this(rootUri: String, hadoopConf: Configuration) =
     this(rootUri, hadoopConf, None, () => UUID.randomUUID().toString)
 
+  private val Json            = new ObjectMapper()
   private val MaxPayloadBytes = 4 * 1024 * 1024
 
   private def rootPath: Path = new Path(rootUri)
@@ -50,6 +56,29 @@ private[telemetry] final class OpenIvmTelemetryExporter(
 
   private def fileSystem(path: Path): FileSystem =
     fileSystemOverride.fold(path.getFileSystem(hadoopConf))(factory => factory(path))
+
+  override def reuseCompleted(
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      replayPayload: String
+  ): Boolean = {
+    val validatedIdentity = identity.validated
+    try {
+      val finalPath = completedPath(validatedIdentity)
+      val fs        = fileSystem(finalPath)
+      if (!fs.exists(finalPath)) false
+      else {
+        validateReusableSuccess(fs, finalPath, validatedIdentity, replayPayload)
+        true
+      }
+    } catch {
+      case e: OpenIvmTelemetryExportException => throw e
+      case t: Throwable =>
+        throw new OpenIvmTelemetryExportException(
+          s"OpenIVM telemetry completed-object reuse at ${OpenIvmTelemetryExporter.redactUri(rootUri)} failed " +
+            s"(${t.getClass.getSimpleName})"
+        )
+    }
+  }
 
   override def publish(identity: OpenIvmTelemetryContract.ExecutionIdentity, payload: String): Path = {
     val validatedIdentity = identity.validated
@@ -146,6 +175,117 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     finally input.close()
     if (!Arrays.equals(existing, expected)) throw differentContent(path)
   }
+
+  private def validateReusableSuccess(
+      fs: FileSystem,
+      path: Path,
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      replayPayload: String
+  ): Unit = {
+    val existing =
+      try Json.readTree(readExisting(fs, path))
+      catch {
+        case _: Throwable => throw invalidReusable(path)
+      }
+    val replay =
+      try Json.readTree(replayPayload)
+      catch {
+        case _: Throwable => throw invalidReusable(path)
+      }
+    validateSuccessPayload(existing, identity, path)
+    validateSuccessPayload(replay, identity, path)
+    Seq(
+      "compile_refresh_type",
+      "effective_refresh_type",
+      "refresh_reason",
+      "time_travel_pin_status",
+      "time_travel_pin_reason"
+    ).foreach { field =>
+      if (existing.path(field).asText() != replay.path(field).asText()) throw invalidReusable(path)
+    }
+    if (sourceEndVersions(existing, path) != sourceEndVersions(replay, path)) throw invalidReusable(path)
+    if (
+      identity.operation == "create" &&
+      (existing.path("source_versions") != replay.path("source_versions") ||
+        existing.path("pending_delta_count").asLong() != replay.path("pending_delta_count").asLong())
+    )
+      throw invalidReusable(path)
+  }
+
+  private def validateSuccessPayload(
+      payload: JsonNode,
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      path: Path
+  ): Unit = {
+    OpenIvmTelemetryContract.W6RequiredSuccessFields.foreach { field =>
+      if (!payload.hasNonNull(field)) throw invalidReusable(path)
+    }
+    requireText(payload, "schema_id", OpenIvmTelemetryContract.SchemaId, path)
+    if (payload.path("schema_version").asInt(-1) != OpenIvmTelemetryContract.SchemaVersion)
+      throw invalidReusable(path)
+    requireText(payload, "campaign_id", identity.campaignId, path)
+    requireText(payload, "request_id", identity.requestId, path)
+    requireText(payload, "correlation_id", identity.correlationId, path)
+    requireText(payload, "dbt_node_id", identity.dbtNodeId, path)
+    requireText(payload, "materialized_view", identity.materializedView, path)
+    requireText(payload, "operation", identity.operation, path)
+    requireText(payload, "phase", identity.phase, path)
+    if (!OpenIvmTelemetryContract.ReusableSuccessOutcomes.contains(payload.path("outcome").asText()))
+      throw invalidReusable(path)
+    if (
+      payload.path("compile_refresh_type").asText().isEmpty ||
+      payload.path("effective_refresh_type").asText().isEmpty ||
+      payload.path("refresh_reason").asText().isEmpty ||
+      payload.path("time_travel_pin_status").asText().isEmpty ||
+      payload.path("time_travel_pin_reason").asText().isEmpty ||
+      !payload.path("source_versions").isArray ||
+      payload.path("duration_ms").asLong(-1L) < 0L ||
+      payload.path("pending_delta_count").asLong(-1L) < 0L
+    )
+      throw invalidReusable(path)
+    val started   = parseInstant(payload, "engine_started_at", path)
+    val completed = parseInstant(payload, "engine_completed_at", path)
+    if (completed.isBefore(started)) throw invalidReusable(path)
+  }
+
+  private def sourceEndVersions(payload: JsonNode, path: Path): Map[String, Long] = {
+    val versions = payload
+      .path("source_versions")
+      .elements()
+      .asScala
+      .map { version =>
+        val relation = version.path("relation").asText()
+        val start    = version.path("start_version").asLong(-1L)
+        val end      = version.path("end_version").asLong(-1L)
+        if (relation.isEmpty || start < 0L || end < start) throw invalidReusable(path)
+        relation -> end
+      }
+      .toSeq
+    if (versions.map(_._1).distinct.size != versions.size) throw invalidReusable(path)
+    versions.toMap
+  }
+
+  private def readExisting(fs: FileSystem, path: Path): Array[Byte] = {
+    val length = fs.getFileStatus(path).getLen
+    if (length < 0L || length > MaxPayloadBytes) throw invalidReusable(path)
+    val bytes = new Array[Byte](length.toInt)
+    val input = fs.open(path)
+    try input.readFully(bytes)
+    finally input.close()
+    bytes
+  }
+
+  private def requireText(payload: JsonNode, field: String, expected: String, path: Path): Unit =
+    if (payload.path(field).asText() != expected) throw invalidReusable(path)
+
+  private def parseInstant(payload: JsonNode, field: String, path: Path): Instant =
+    try Instant.parse(payload.path(field).asText())
+    catch { case _: Throwable => throw invalidReusable(path) }
+
+  private def invalidReusable(path: Path): OpenIvmTelemetryExportException =
+    new OpenIvmTelemetryExportException(
+      s"OpenIVM telemetry completed object ${path.getName} is not a complete matching accepted success"
+    )
 
   private def differentContent(path: Path): OpenIvmTelemetryExportException =
     new OpenIvmTelemetryExportException(

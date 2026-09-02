@@ -137,6 +137,12 @@ content for the same identity fails. The public constants live in
 `OpenIvmTelemetryContract`, and the packaged schema is
 `openivm-telemetry-span-v1.schema.json`. Export failures fail the SQL operation;
 when the URI is unset, the existing log-only span behavior is unchanged.
+Same-request retries of `CREATE MATERIALIZED VIEW IF NOT EXISTS` and
+already-applied `ADVANCE SOURCE VERSIONS` reuse only a complete, identity-matched
+accepted object; a new request identity publishes a complete explicit
+short-circuit outcome. The schema's
+`x-openivm-w6-required-success-fields` annotation is the ingestion-required
+field set for every accepted outcome.
 
 ### JVM module-opens block (JDK 17)
 

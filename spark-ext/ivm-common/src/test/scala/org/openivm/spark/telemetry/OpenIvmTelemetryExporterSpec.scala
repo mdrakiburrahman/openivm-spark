@@ -51,6 +51,34 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
     override def rename(src: Path, dst: Path): Boolean = false
   }
 
+  private def completeSuccessPayload(
+      value: OpenIvmTelemetryContract.ExecutionIdentity,
+      outcome: String
+  ): String =
+    s"""{
+       |"schema_id":"${OpenIvmTelemetryContract.SchemaId}",
+       |"schema_version":${OpenIvmTelemetryContract.SchemaVersion},
+       |"campaign_id":"${value.campaignId}",
+       |"request_id":"${value.requestId}",
+       |"correlation_id":"${value.correlationId}",
+       |"dbt_node_id":"${value.dbtNodeId}",
+       |"materialized_view":"${value.materializedView}",
+       |"operation":"${value.operation}",
+       |"phase":"${value.phase}",
+       |"engine_started_at":"2026-09-02T00:00:00Z",
+       |"engine_completed_at":"2026-09-02T00:00:01Z",
+       |"duration_ms":1000,
+       |"driver_thread":"driver",
+       |"outcome":"$outcome",
+       |"compile_refresh_type":"AGGREGATE_GROUP",
+       |"effective_refresh_type":"AGGREGATE_GROUP",
+       |"refresh_reason":"kept",
+       |"time_travel_pin_status":"NOT_APPLICABLE",
+       |"time_travel_pin_reason":"no_user_pin",
+       |"source_versions":[],
+       |"pending_delta_count":0
+       |}""".stripMargin
+
   describe("OpenIvmTelemetryExporter") {
     it("does nothing when the telemetry URI is unset") {
       val configured = OpenIvmTelemetryExporter.resolveConfigured(
@@ -173,6 +201,51 @@ class OpenIvmTelemetryExporterSpec extends AnyFunSpec with Matchers with BeforeA
       mismatch.getMessage should include("different content")
       val fs = first.getFileSystem(new Configuration())
       new String(readAll(fs, first), StandardCharsets.UTF_8) should include(""""duration_ms":7""")
+    }
+
+    it("reuses only complete matching accepted success objects") {
+      val root            = newRoot()
+      val exporter        = new OpenIvmTelemetryExporter(root.toURI.toString, new Configuration())
+      val reusable        = identity("reusable-create").copy(operation = "create", phase = "full")
+      val reusablePayload = completeSuccessPayload(reusable, "create_executed")
+      exporter.publish(reusable, reusablePayload)
+      exporter.reuseCompleted(reusable, completeSuccessPayload(reusable, "create_already_exists")) shouldBe true
+
+      val reusableRefresh        = identity("reusable-refresh")
+      val reusableRefreshPayload = completeSuccessPayload(reusableRefresh, "incremental_executed")
+      exporter.publish(reusableRefresh, reusableRefreshPayload)
+      exporter.reuseCompleted(
+        reusableRefresh,
+        completeSuccessPayload(reusableRefresh, "source_versions_already_applied")
+      ) shouldBe true
+
+      val incomplete = identity("incomplete-create").copy(operation = "create", phase = "full")
+      exporter.publish(incomplete, """{"schema_id":"openivm.execution-span","schema_version":1}""")
+      val incompleteError = intercept[OpenIvmTelemetryExportException] {
+        exporter.reuseCompleted(incomplete, completeSuccessPayload(incomplete, "create_already_exists"))
+      }
+      incompleteError.getMessage should include("not a complete matching accepted success")
+
+      val mismatched = identity("mismatched-create").copy(operation = "create", phase = "full")
+      val wrong      = mismatched.copy(requestId = "another-request")
+      exporter.publish(mismatched, completeSuccessPayload(wrong, "create_executed"))
+      val mismatchError = intercept[OpenIvmTelemetryExportException] {
+        exporter.reuseCompleted(mismatched, completeSuccessPayload(mismatched, "create_already_exists"))
+      }
+      mismatchError.getMessage should include("not a complete matching accepted success")
+
+      val changed = identity("changed-classification").copy(operation = "create", phase = "full")
+      exporter.publish(changed, completeSuccessPayload(changed, "create_executed"))
+      val changedError = intercept[OpenIvmTelemetryExportException] {
+        exporter.reuseCompleted(
+          changed,
+          completeSuccessPayload(changed, "create_already_exists").replace(
+            """"refresh_reason":"kept"""",
+            """"refresh_reason":"changed""""
+          )
+        )
+      }
+      changedError.getMessage should include("not a complete matching accepted success")
     }
 
     it("redacts URI user-info, query, fragment, and path details from failures") {

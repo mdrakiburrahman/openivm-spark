@@ -15,6 +15,7 @@ import org.scalatest.matchers.should.Matchers
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeUnit}
+import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
 class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAfterEach {
@@ -245,6 +246,12 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       schema.path("$id").asText() shouldBe OpenIvmTelemetryContract.SchemaId
       schema.path("properties").path("schema_version").path("const").asInt() shouldBe
         OpenIvmTelemetryContract.SchemaVersion
+      schema
+        .path("x-openivm-w6-required-success-fields")
+        .elements()
+        .asScala
+        .map(_.asText())
+        .toSeq shouldBe OpenIvmTelemetryContract.W6RequiredSuccessFields
     }
 
     it("does not evaluate export-only source fields when telemetry is disabled") {
