@@ -552,38 +552,72 @@ private[commands] object MvCommandHelper {
       expectedLocation: String,
       requireExists: Boolean
   ): Boolean = {
-    val catalog = spark.sessionState.catalog
-    // Every Hive metastore round-trip runs inside Spark's globally
-    // synchronized Hive client, so it is a serialized section shared by all
-    // concurrent commands. `getTableMetadata` already asserts that the
-    // database and the table exist, so probing with `tableExists` first only
-    // repeats that lookup. The probe is kept for the pre-registration call,
-    // where the table is normally absent and a single existence check is
-    // cheaper than a metadata read that has to fail.
-    val metadata =
-      if (requireExists) {
-        try catalog.getTableMetadata(dataIdent)
-        catch {
-          case _: NoSuchTableException | _: NoSuchDatabaseException =>
-            throw new IllegalStateException(
-              s"Catalog registration did not create ${sqlIdent(dataIdent)}"
-            )
-        }
-      } else {
-        if (!catalog.tableExists(dataIdent)) return false
-        catalog.getTableMetadata(dataIdent)
-      }
-    val hconf = spark.sparkContext.hadoopConfiguration
-    def qualified(path: Path): String =
+    // The registered data table's (provider, physical location), or None when
+    // it does not exist. The primary probe is the job-free V1 SessionCatalog
+    // metastore read used against a local Hive metastore — it must not submit a
+    // Spark job (catalog publication runs inside a serialized admission window).
+    //
+    // A managed Fabric Spark lakehouse routes that V1 probe through its OneLake
+    // external catalog, which rejects a bare `schema.table` identifier as a
+    // single-part namespace ("Missing namespace parts in non-system context").
+    // When (and only when) the V1 probe fails that way, fall back to Delta's
+    // `DESCRIBE DETAIL`, which resolves through the analyzer / current-catalog
+    // path — identical to the `CREATE TABLE ... USING DELTA LOCATION` that
+    // registers the table — so it works on the Fabric lakehouse too.
+    val ident = sqlIdent(dataIdent)
+
+    def qualified(path: Path): String = {
+      val hconf = spark.sparkContext.hadoopConfiguration
       path.getFileSystem(hconf).makeQualified(path).toUri.normalize().toString.stripSuffix("/")
-    val expectedProvider = metadata.provider.exists(_.equalsIgnoreCase("delta"))
-    val expectedPath     = qualified(new Path(metadata.location)) == qualified(new Path(expectedLocation))
-    if (!expectedProvider || !expectedPath)
-      throw new AnalysisException(
-        "TABLE_OR_VIEW_ALREADY_EXISTS",
-        Map("relationName" -> sqlIdent(dataIdent))
-      )
-    true
+    }
+
+    // Outer None => the V1 probe is unusable here (Fabric); fall back.
+    // Inner None => the V1 probe ran and the table does not exist.
+    def viaSessionCatalog: Option[Option[(Option[String], Path)]] =
+      try {
+        val catalog = spark.sessionState.catalog
+        if (requireExists) {
+          val m = catalog.getTableMetadata(dataIdent)
+          Some(Some((m.provider, new Path(m.location))))
+        } else if (!catalog.tableExists(dataIdent)) {
+          Some(None)
+        } else {
+          val m = catalog.getTableMetadata(dataIdent)
+          Some(Some((m.provider, new Path(m.location))))
+        }
+      } catch {
+        case _: NoSuchTableException | _: NoSuchDatabaseException => Some(None)
+        case NonFatal(_)                                          => None
+      }
+
+    def viaDescribeDetail: Option[(Option[String], Path)] = {
+      val rows =
+        try spark.sql(s"DESCRIBE DETAIL $ident").select("format", "location").take(1)
+        catch { case _: AnalysisException => Array.empty[Row] }
+      rows.headOption.map { r =>
+        (Option(r.getString(0)), new Path(Option(r.getString(1)).getOrElse("")))
+      }
+    }
+
+    val found: Option[(Option[String], Path)] = viaSessionCatalog.getOrElse(viaDescribeDetail)
+
+    found match {
+      case None =>
+        if (requireExists)
+          throw new IllegalStateException(
+            s"Catalog registration did not create $ident"
+          )
+        false
+      case Some((provider, actualLocation)) =>
+        val expectedProvider = provider.exists(_.equalsIgnoreCase("delta"))
+        val expectedPath     = qualified(actualLocation) == qualified(new Path(expectedLocation))
+        if (!expectedProvider || !expectedPath)
+          throw new AnalysisException(
+            "TABLE_OR_VIEW_ALREADY_EXISTS",
+            Map("relationName" -> ident)
+          )
+        true
+    }
   }
 
   /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
