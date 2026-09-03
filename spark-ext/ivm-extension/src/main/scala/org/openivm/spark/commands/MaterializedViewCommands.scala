@@ -620,11 +620,29 @@ private[commands] object MvCommandHelper {
     }
   }
 
-  /** Physical path for the MV's Delta table inside `<warehouse>/_ivm/views/`. */
+  /** Physical path for the MV's Delta table.
+    *
+    * By default this is `<warehouse>/_ivm/views/<db>/<table>`, an openivm-owned
+    * area that keeps MV data out of the user table namespace on a Hive
+    * metastore. A managed Fabric Spark lakehouse, however, forces every catalog
+    * table into its managed `Tables/<schema>/<name>` area and silently ignores a
+    * `LOCATION` that points elsewhere — so an MV registered against
+    * `_ivm/views/...` ends up with its catalog entry at `Tables/...` and its
+    * data written to `_ivm/views/...`, which never reconcile. When
+    * `spark.openivm.managedTablesRoot` is set (to the lakehouse `Tables` ABFSS
+    * root) the MV's Delta path IS its managed catalog location, so the path
+    * write, the named registration and the catalog probe all agree. */
   def mvLocation(spark: SparkSession, id: TableIdentifier): String = {
-    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val segment   = id.database.fold(id.table)(db => s"$db/${id.table}")
-    s"$warehouse/_ivm/views/$segment"
+    val segment = id.database.fold(id.table)(db => s"$db/${id.table}")
+    spark.conf
+      .getOption("spark.openivm.managedTablesRoot")
+      .map(_.trim)
+      .filter(_.nonEmpty) match {
+      case Some(root) => s"${root.stripSuffix("/")}/$segment"
+      case None =>
+        val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        s"$warehouse/_ivm/views/$segment"
+    }
   }
 
   /** Resolved simple-column window partition key for liquid-clustering
