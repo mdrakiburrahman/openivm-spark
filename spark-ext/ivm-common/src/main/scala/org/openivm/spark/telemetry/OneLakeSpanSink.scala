@@ -8,6 +8,13 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.internal.Logging
 
+/** A destination for completed `OPENIVM_EXECUTION_SPAN` lines. Abstracted so the
+  * single emit call site can be tested against an always-throwing sink and prove
+  * a delivery failure never fails the (already-committed) model. */
+private[telemetry] trait SpanSink {
+  def write(key: String, line: String): Unit
+}
+
 /** Mirrors each completed `OPENIVM_EXECUTION_SPAN` line to its own object under
   * a Hadoop-filesystem directory (an OneLake `Files/...` path on managed Fabric
   * Spark).
@@ -33,7 +40,7 @@ import org.apache.spark.internal.Logging
   *    silent: it increments the dropped counter and is visible to the harness,
   *    which fails loudly if a required classification is genuinely missing.
   */
-final class OneLakeSpanSink private (dir: Path, hadoopConf: Configuration) extends Logging {
+final class OneLakeSpanSink private (dir: Path, hadoopConf: Configuration) extends SpanSink with Logging {
 
   import OneLakeSpanSink._
 
@@ -125,6 +132,12 @@ object OneLakeSpanSink {
     droppedCount.incrementAndGet()
     lastDropError = Option(error).map(e => s"${e.getClass.getName}: ${e.getMessage}")
   }
+
+  /** Record a span-mirror delivery failure observed at the emit call site (a
+    * throw that escaped `write`, e.g. a non-delivery bug). Kept public so the
+    * single emission point can log-loud-and-continue while still surfacing the
+    * drop in the retrievable health signal. */
+  def recordCallSiteFailure(error: Throwable): Unit = recordDropped(error)
 
   def forDir(dir: String, hadoopConf: Configuration): OneLakeSpanSink =
     new OneLakeSpanSink(new Path(dir), hadoopConf)

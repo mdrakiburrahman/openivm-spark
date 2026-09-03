@@ -346,6 +346,33 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       publisher.payloads should have size 1
     }
 
+    it("swallows a OneLake sink delivery failure without failing the emitted span") {
+      OneLakeSpanSink.resetHealth()
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "sink-failure",
+        requestId = "request-sink",
+        correlationId = "correlation-sink",
+        dbtNodeId = "model.benchmark.sink",
+        materializedView = "benchmark.sink",
+        operation = "create",
+        phase = "full"
+      )
+      val publisher = new CapturingPublisher()
+      val throwingSink = new SpanSink {
+        override def write(key: String, line: String): Unit =
+          throw new RuntimeException("sink delivery boom")
+      }
+      val span = OpenIvmExecutionSpan.startForTesting(identity, publisher, throwingSink)
+      span.complete("create_executed", "driver-sink")
+
+      // The model has committed by the time emitIfNeeded runs; an always-throwing
+      // sink must NOT fail the span nor mask anything. The authoritative export
+      // still succeeds and the drop is recorded in the retrievable health signal.
+      noException should be thrownBy span.emitIfNeeded("failed_before_end", "unused")
+      publisher.payloads should have size 1
+      OneLakeSpanSink.health.dropped should be >= 1L
+    }
+
     it("keeps delta version lookups out of catalog_ms") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.version_mv", "create")

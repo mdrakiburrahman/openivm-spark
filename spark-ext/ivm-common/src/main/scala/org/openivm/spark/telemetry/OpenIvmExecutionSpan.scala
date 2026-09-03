@@ -9,6 +9,7 @@ import org.slf4j.MDC
 import java.time.Instant
 import java.util.LinkedHashMap
 import java.util.concurrent.TimeUnit
+import scala.util.control.NonFatal
 
 /** Structured one-line execution-span contract for CREATE / REFRESH MV work. */
 final class OpenIvmExecutionSpan private[telemetry] (
@@ -20,7 +21,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private val startedAtNanos: Long,
     private val enabled: Boolean,
     private val configuredExport: Option[ConfiguredTelemetryExport],
-    private val oneLakeSink: Option[OneLakeSpanSink] = None
+    private val oneLakeSink: Option[SpanSink] = None
 ) {
 
   private val lock = new Object
@@ -401,10 +402,22 @@ final class OpenIvmExecutionSpan private[telemetry] (
       }
       OpenIvmExecutionSpan.logSpan(rendered.logPayload)
       oneLakeSink.foreach { sink =>
-        sink.write(
-          requestId.orElse(dbtNodeId).getOrElse(materializedView),
-          OpenIvmExecutionSpan.LogPrefix + rendered.logPayload
-        )
+        try {
+          sink.write(
+            requestId.orElse(dbtNodeId).getOrElse(materializedView),
+            OpenIvmExecutionSpan.LogPrefix + rendered.logPayload
+          )
+        } catch {
+          // emitIfNeeded runs from finishActive in the CREATE/REFRESH `finally`,
+          // AFTER the model's SQL has committed. The span is a pure telemetry
+          // mirror of an already-decided classification, so a sink throw here
+          // must never fail the committed model nor mask its original exception.
+          // Record it loudly + in the retrievable health signal, then swallow —
+          // delivery failure only (fatal VM errors still propagate).
+          case NonFatal(sinkError) =>
+            OneLakeSpanSink.recordCallSiteFailure(sinkError)
+            OpenIvmExecutionSpan.logSinkDropAtEmit(materializedView, sinkError)
+        }
       }
     }
   }
@@ -562,13 +575,27 @@ object OpenIvmExecutionSpan extends Logging {
       configuredExport = Some(ConfiguredTelemetryExport(identity.validated, publisher))
     )
 
+  private[telemetry] def startForTesting(
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      publisher: CompletedSpanPublisher,
+      oneLakeSink: SpanSink
+  ): OpenIvmExecutionSpan =
+    startInternal(
+      materializedView = identity.materializedView,
+      operation = identity.operation,
+      requestId = Some(identity.requestId),
+      dbtNodeId = Some(identity.dbtNodeId),
+      configuredExport = Some(ConfiguredTelemetryExport(identity.validated, publisher)),
+      oneLakeSink = Some(oneLakeSink)
+    )
+
   private def startInternal(
       materializedView: String,
       operation: String,
       requestId: Option[String],
       dbtNodeId: Option[String],
       configuredExport: Option[ConfiguredTelemetryExport],
-      oneLakeSink: Option[OneLakeSpanSink] = None
+      oneLakeSink: Option[SpanSink] = None
   ): OpenIvmExecutionSpan = {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
@@ -966,4 +993,14 @@ object OpenIvmExecutionSpan extends Logging {
 
   private def logSpan(payload: String): Unit =
     logInfo(LogPrefix + payload)
+
+  /** Stable-marker ERROR for a span-mirror delivery failure observed at the
+    * emit call site. Greppable on `[openivm-telemetry-sink]`; the model itself
+    * is unaffected (the span mirrors an already-committed classification). */
+  private[telemetry] def logSinkDropAtEmit(model: String, error: Throwable): Unit =
+    logError(
+      s"[openivm-telemetry-sink] DROPPED span mirror at emit call site " +
+        s"(model=$model); telemetry only, model unaffected",
+      error
+    )
 }

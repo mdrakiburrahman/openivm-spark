@@ -1299,6 +1299,57 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual("mv_t1a_overlap_1", "SELECT id, label FROM sales_t1a_overlap_1")
       assertBagEqual("mv_t1a_overlap_2", "SELECT id, label FROM sales_t1a_overlap_2")
     }
+
+    it("releases resources so a same-process retry succeeds after an injected create failure") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_create_retry(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_create_retry VALUES (1, 'one'), (2, 'two')")
+      val body = "SELECT id, label FROM sales_create_retry"
+
+      // First attempt fails inside the initial data write (the per-MV RocksDB
+      // watermark handle is opened around CREATE). A failed CREATE must release
+      // its per-MV RocksDB lock and roll back its partial catalog artifacts.
+      intercept[Exception] {
+        CommandConcurrencyInjection.withBeforeCreateDataWrite(
+          throw new RuntimeException("injected create failure")
+        ) {
+          spark.sql("CREATE MATERIALIZED VIEW mv_create_retry AS " + body).collect()
+        }
+      }
+
+      // Same-session retry with the hook cleared: must succeed — no leaked
+      // "lock hold by current process", no stale half-registered MV.
+      noException should be thrownBy {
+        spark.sql("CREATE MATERIALIZED VIEW mv_create_retry AS " + body).collect()
+      }
+      assertBagEqual("mv_create_retry", body)
+    }
+
+    it("concurrent DROP+CREATE of MVs sharing one source stays lock-safe (bounded fan-out)") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_fanout(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_fanout VALUES ('north', 10), ('south', 20)")
+      val n    = 8
+      val body = (i: Int) => s"SELECT region, SUM(amount) AS total_$i FROM sales_fanout GROUP BY region"
+      (0 until n).foreach(i => spark.sql(s"CREATE MATERIALIZED VIEW mv_fanout_$i AS ${body(i)}").collect())
+
+      // All MVs share `sales_fanout`, so each DROP exercises removeForBaseTable
+      // fan-out (now bounded by the reverse index) and closeAndDelete of the
+      // per-MV RocksDB while other workers concurrently CREATE against the same
+      // source. Before the lifecycle fix this raced into
+      // "lock hold by current process".
+      withPool(n) { implicit ec =>
+        val futures = (0 until n).map { i =>
+          Future {
+            (0 until 2).foreach { _ =>
+              spark.sql(s"DROP MATERIALIZED VIEW mv_fanout_$i").collect()
+              spark.sql(s"CREATE MATERIALIZED VIEW mv_fanout_$i AS ${body(i)}").collect()
+            }
+          }
+        }
+        awaitResult(Future.sequence(futures))
+      }
+
+      (0 until n).foreach(i => assertBagEqual(s"mv_fanout_$i", body(i)))
+    }
   }
 
   // ---------------------------------------------------------------------------
