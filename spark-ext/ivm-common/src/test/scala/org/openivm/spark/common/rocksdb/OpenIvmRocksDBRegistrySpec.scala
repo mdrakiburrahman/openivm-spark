@@ -322,6 +322,18 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       // TABLE cleanups do). Before the retire-on-prune fix a pruned slot could
       // be re-populated into an orphan, and the next open of that path failed
       // with `RocksDBException: lock hold by current process`.
+      //
+      // `close(path)` invalidates the shared registry handle for ALL current
+      // holders. A concurrent close racing another thread's getOrOpen+write
+      // therefore produces IllegalStateException("already closed") — a
+      // test-induced shared-handle use-after-close that is tolerated here as
+      // distinct from an orphaned-lock failure. RocksDBException "lock hold by
+      // current process" / "No locks available" and all other exceptions are
+      // real failures and are surfaced unconditionally.
+      //
+      // After the stress: closeAll() drains remaining handles, the registry must
+      // quiesce to HandleSnapshot(0,0,0), and a fresh getOrOpen of every path
+      // must succeed — positively proving no native LOCK file is orphaned.
       val spark      = newSpark("registry-concurrent-cleanup")
       val paths      = (0 until 4).map(i => newDir(s"concurrent-$i").getAbsolutePath)
       val errors     = new java.util.concurrent.ConcurrentLinkedQueue[Throwable]()
@@ -340,7 +352,12 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
               db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8(s"k$w"), RocksDBCodec.utf8("v")))
               if ((i + w) % 3 == 0) OpenIvmRocksDBRegistry.close(p)
             } catch {
-              case t: Throwable => errors.add(t)
+              case e: IllegalStateException if Option(e.getMessage).exists(_.contains("already closed")) =>
+                // A concurrent close invalidated the shared handle between
+                // getOrOpen and withBatch: tolerated, not an orphaned-lock signal.
+                ()
+              case t: Throwable =>
+                errors.add(t)
             }
             i += 1
           }
@@ -351,8 +368,20 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       futures.foreach(f => Await.result(f, 60.seconds))
 
       val errList = errors.asScala.toList
-      withClue(errList.map(_.toString).mkString("\n")) {
+      withClue(errList.map(e => s"${e.getClass.getName}: ${e.getMessage}").mkString("\n")) {
         errList shouldBe empty
+      }
+
+      // Drain any live handles; registry must reach full quiescence.
+      OpenIvmRocksDBRegistry.closeAll()
+      OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe NoLiveOrReachableRocksDbHandles
+
+      // Positive orphan-lock probe: every path must reopen cleanly. An orphaned
+      // native LOCK would cause RocksDBException("lock hold by current process")
+      // or RocksDBException("No locks available") on the native open below.
+      paths.foreach { p =>
+        val db = OpenIvmRocksDBRegistry.getOrOpen(spark, p, Seq("meta"))
+        noException should be thrownBy db.currentVersion
       }
     }
 
