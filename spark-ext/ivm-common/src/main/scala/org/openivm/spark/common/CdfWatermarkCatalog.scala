@@ -2,8 +2,10 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
+import scala.util.control.NonFatal
 
 /**
  * Per-MV RocksDB catalog of last-consumed Delta versions.
@@ -14,6 +16,8 @@ import java.nio.file.Files
  * from the former shared index DB.
  */
 private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
+
+  private val log = LoggerFactory.getLogger(getClass)
 
   private val Cf: String       = IndexDbColumnFamilies.CdfWatermarks
   private val LegacyCf: String = IndexDbColumnFamilies.CdfWatermarks
@@ -74,14 +78,64 @@ private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
   }
 
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
-    val key = sourceKey(baseTable)
-    OpenIvmStatePaths.existingMvDbPaths(spark).foreach { path =>
-      val db = OpenIvmRocksDBRegistry.getOrOpen(spark, path, OpenIvmStatePaths.PerMvColumnFamilies)
-      if (db.get(Cf, key).nonEmpty) {
-        db.withBatch(batch => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, key))
+    // Guard: only proceed with per-MV cleanup when the reverse dependency index
+    // DB exists. If it does not exist, no MV has been registered with baseTable
+    // as a source (MvCatalog.upsert creates the DB on first registration), so
+    // there is nothing to clean up. Without this guard, MvCatalog.viewsForSource
+    // would fall back to scanning all per-MV DBs via MvCatalog.list — the exact
+    // open-all fanout that this reverse-index path eliminates.
+    val depDbPath = OpenIvmStatePaths.sourceDependencyDbPath(spark, baseTable)
+    if (OpenIvmStatePaths.isExistingDb(depDbPath)) {
+      // Use the authoritative reverse dependency index instead of enumerating
+      // existingMvDbPaths and opening every per-MV RocksDB. Under concurrent
+      // source-sharing DROP+CREATE the old open-all fanout raced with sibling
+      // MvCatalog.remove close+delete cycles, opening DBs mid-deletion and
+      // amplifying the registry orphan race. viewsForSource validates each
+      // reverse-index entry against authoritative per-MV metadata, so stale
+      // entries (a dropped MV whose index row was not yet pruned) are silently
+      // skipped rather than opening a being-deleted or absent DB.
+      val key = sourceKey(baseTable)
+      MvCatalog.viewsForSource(spark, baseTable).foreach { meta =>
+        val serializedName = meta.name.database.fold(meta.name.identifier)(db => s"$db.${meta.name.identifier}")
+        val path           = OpenIvmStatePaths.perMvDbPath(spark, serializedName)
+        // A concurrent DROP may delete this DB between viewsForSource's metadata
+        // read and the open below. Guard with isExistingDb first; the NonFatal
+        // catch is then narrowed to that benign concurrent-deletion window only.
+        if (OpenIvmStatePaths.isExistingDb(path)) {
+          try {
+            val db = openMvDb(spark, serializedName)
+            if (db.get(Cf, key).nonEmpty) {
+              db.withBatch(batch => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, key))
+            }
+          } catch {
+            case NonFatal(e) =>
+              // The catch is benign ONLY when the DB genuinely disappeared under
+              // us (the concurrent-DROP race). Re-check the path: if the DB is
+              // still present the failure is a real watermark write error /
+              // corruption / lock regression and MUST surface — never swallow it.
+              if (OpenIvmStatePaths.isExistingDb(path)) {
+                log.error(
+                  s"openivm-cdf-watermark removeForBaseTable: cleanup of view '$serializedName' failed " +
+                    s"while its RocksDB is still present; surfacing (not a concurrent-deletion race)",
+                  e
+                )
+                throw e
+              } else {
+                log.warn(
+                  s"openivm-cdf-watermark removeForBaseTable: skipped view '$serializedName' " +
+                    s"(RocksDB concurrently deleted): ${e.getMessage}"
+                )
+              }
+          }
+        }
       }
     }
 
+    // Legacy shared-index cleanup. The shared index stores (viewName, source)
+    // composite keys and must be scanned by source value; it predates per-MV
+    // sharding and cannot use the reverse-dependency index. Exercised only on
+    // pre-sharding installations where the legacy DB exists on disk; new installs
+    // never write to it, so the scan is a no-op.
     openLegacyIndexDb(spark).foreach { db =>
       val baseBytes = RocksDBCodec.utf8(baseTable)
       val victims = db

@@ -728,8 +728,14 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     val candidatePath  = perMvDbPath(spark, serializedName)
     val sourceTables   = readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
 
-    OpenIvmRocksDBRegistry.close(candidatePath)
-    deleteRecursively(Paths.get(candidatePath))
+    // Close and delete as one atomic lifecycle step. Separating Registry.close
+    // from deleteRecursively left a window where a concurrent getOrOpen (e.g.
+    // from removeForBaseTable) could reopen the DB against a being-deleted
+    // directory. closeAndDelete holds the per-path slot lock across both the
+    // close and the filesystem removal, so a racing open blocks and then retries
+    // into a fresh DB instead of a "lock held by current process" / "already
+    // closed" failure.
+    OpenIvmRocksDBRegistry.closeAndDelete(candidatePath)(canonical => deleteRecursively(Paths.get(canonical)))
 
     sourceTables.toSeq.sorted.foreach { sourceTable =>
       val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)

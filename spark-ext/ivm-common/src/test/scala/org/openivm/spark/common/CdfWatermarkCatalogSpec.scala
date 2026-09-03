@@ -1,6 +1,8 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.types._
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -8,6 +10,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.nio.file.{Files, Paths}
+import java.sql.Timestamp
 import java.util.UUID
 
 class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
@@ -43,6 +46,22 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
     ()
   }
 
+  private def sampleMvMeta(name: String, sources: Seq[String]): MvMetadata =
+    MvMetadata(
+      name = CatalystSqlParser.parseTableIdentifier(name),
+      querySql = s"SELECT count(*) FROM ${sources.head}",
+      refreshType = 0,
+      refreshTypeName = "SIMPLE_PROJECTION",
+      lastVersion = 0L,
+      sourceTables = sources,
+      sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
+        sources.map(_ -> StructType(Seq(StructField("id", LongType)))).toMap
+      ),
+      location = s"$warehouseDir/$name",
+      createdAt = new Timestamp(1700000000000L),
+      properties = Map.empty
+    )
+
   describe("CdfWatermarkCatalog sharding") {
     it("stores independent view watermarks without creating the shared index DB") {
       CdfWatermarkCatalog.putAll(spark, "mv_a", Map("orders" -> 3L, "lineitem" -> 7L))
@@ -54,7 +73,15 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       Files.exists(Paths.get(OpenIvmStatePaths.indexDbPath(spark), "CURRENT")) shouldBe false
     }
 
-    it("removes one base-table watermark from every MV shard") {
+    it("removes one base-table watermark from every registered dependent MV shard") {
+      // removeForBaseTable now uses MvCatalog.viewsForSource (reverse dependency
+      // index) instead of scanning every per-MV path. MVs must be registered in
+      // the catalog for cleanup to reach their shards.
+      val mvCMeta = sampleMvMeta("mv_c", Seq("orders", "customer"))
+      val mvDMeta = sampleMvMeta("mv_d", Seq("orders"))
+      MvCatalog.upsert(spark, mvCMeta)
+      MvCatalog.upsert(spark, mvDMeta)
+
       CdfWatermarkCatalog.putAll(spark, "mv_c", Map("orders" -> 13L, "customer" -> 17L))
       CdfWatermarkCatalog.put(spark, "mv_d", "orders", 19L)
 
@@ -62,7 +89,36 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
 
       CdfWatermarkCatalog.get(spark, "mv_c", "orders") shouldBe None
       CdfWatermarkCatalog.get(spark, "mv_d", "orders") shouldBe None
+      // Non-target source watermark is preserved
       CdfWatermarkCatalog.get(spark, "mv_c", "customer") shouldBe Some(17L)
+
+      MvCatalog.remove(spark, mvCMeta.name)
+      MvCatalog.remove(spark, mvDMeta.name)
+    }
+
+    it("does not open DBs of MVs unrelated to the base table") {
+      // Register mv_x (depends on "orders") and mv_y (depends on "lineitem" only).
+      // Cleaning up "orders" must not open mv_y's shard.
+      val mvXMeta = sampleMvMeta("mv_x_unrelated", Seq("orders"))
+      val mvYMeta = sampleMvMeta("mv_y_unrelated", Seq("lineitem"))
+      MvCatalog.upsert(spark, mvXMeta)
+      MvCatalog.upsert(spark, mvYMeta)
+
+      CdfWatermarkCatalog.put(spark, "mv_x_unrelated", "orders", 5L)
+      CdfWatermarkCatalog.put(spark, "mv_y_unrelated", "lineitem", 7L)
+
+      // Force mv_y_unrelated's per-MV DB to exist on disk so an open-all scan
+      // would find it, then verify it is untouched after the cleanup.
+      CdfWatermarkCatalog.get(spark, "mv_y_unrelated", "lineitem") shouldBe Some(7L)
+
+      CdfWatermarkCatalog.removeForBaseTable(spark, "orders")
+
+      // orders watermark on mv_x is gone; lineitem watermark on mv_y is untouched
+      CdfWatermarkCatalog.get(spark, "mv_x_unrelated", "orders") shouldBe None
+      CdfWatermarkCatalog.get(spark, "mv_y_unrelated", "lineitem") shouldBe Some(7L)
+
+      MvCatalog.remove(spark, mvXMeta.name)
+      MvCatalog.remove(spark, mvYMeta.name)
     }
 
     it("lazily migrates a legacy shared watermark into the owning MV shard") {

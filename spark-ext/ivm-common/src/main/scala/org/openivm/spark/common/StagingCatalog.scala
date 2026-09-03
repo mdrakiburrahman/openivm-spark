@@ -329,8 +329,9 @@ object StagingCatalog {
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
     val dbPath = baseTableDbPath(spark, baseTable)
     if (OpenIvmStatePaths.isExistingDb(dbPath)) {
-      OpenIvmRocksDBRegistry.close(dbPath)
-      deleteRecursively(Paths.get(dbPath))
+      // Close and filesystem removal form one atomic lifecycle step; see
+      // OpenIvmRocksDBRegistry.closeAndDelete for the per-path exclusion contract.
+      OpenIvmRocksDBRegistry.closeAndDelete(dbPath)(canonical => deleteRecursively(Paths.get(canonical)))
     }
   }
 }
