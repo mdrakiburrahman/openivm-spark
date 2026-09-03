@@ -3,7 +3,7 @@ package org.openivm.spark.telemetry
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
+import org.openivm.spark.common.{FeatureGate, TimeTravelPinReason, TimeTravelPinStatus}
 import org.slf4j.MDC
 
 import java.time.Instant
@@ -19,7 +19,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private val startedAtEpochMs: Long,
     private val startedAtNanos: Long,
     private val enabled: Boolean,
-    private val configuredExport: Option[ConfiguredTelemetryExport]
+    private val configuredExport: Option[ConfiguredTelemetryExport],
+    private val oneLakeSink: Option[OneLakeSpanSink] = None
 ) {
 
   private val lock = new Object
@@ -399,6 +400,12 @@ final class OpenIvmExecutionSpan private[telemetry] (
         if (!reused) export.publisher.publish(export.identity, exportJson)
       }
       OpenIvmExecutionSpan.logSpan(rendered.logPayload)
+      oneLakeSink.foreach { sink =>
+        sink.write(
+          requestId.orElse(dbtNodeId).getOrElse(materializedView),
+          OpenIvmExecutionSpan.LogPrefix + rendered.logPayload
+        )
+      }
     }
   }
 }
@@ -527,7 +534,10 @@ object OpenIvmExecutionSpan extends Logging {
             operation,
             requestId,
             dbtNodeId
-          )
+          ),
+          oneLakeSink = FeatureGate
+            .oneLakeTelemetryDir(spark)
+            .map(dir => OneLakeSpanSink.forDir(dir, spark.sessionState.newHadoopConf()))
         )
     }
   }
@@ -557,7 +567,8 @@ object OpenIvmExecutionSpan extends Logging {
       operation: String,
       requestId: Option[String],
       dbtNodeId: Option[String],
-      configuredExport: Option[ConfiguredTelemetryExport]
+      configuredExport: Option[ConfiguredTelemetryExport],
+      oneLakeSink: Option[OneLakeSpanSink] = None
   ): OpenIvmExecutionSpan = {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
@@ -572,7 +583,8 @@ object OpenIvmExecutionSpan extends Logging {
       startedAtEpochMs = nowEpochMs,
       startedAtNanos = nowNanos,
       enabled = true,
-      configuredExport = configuredExport
+      configuredExport = configuredExport,
+      oneLakeSink = oneLakeSink
     )
     consumePending(span, nowNanos)
     current.set(span)

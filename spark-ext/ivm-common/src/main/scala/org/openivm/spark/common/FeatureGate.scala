@@ -54,6 +54,16 @@ object FeatureGate {
     */
   val TelemetryUriKey: String = "spark.openivm.telemetry.uri"
 
+  /** Optional Hadoop-filesystem directory into which each completed
+    * `OPENIVM_EXECUTION_SPAN` line is also mirrored, one object per span. It
+    * exists for managed Fabric Spark, whose driver log4j is only reachable
+    * through a browser-authenticated Spark UI: the benchmark harness cannot
+    * scrape the driver log there, so without this mirror the classification
+    * spans never reach dbt-server. Unset preserves the historical log-only
+    * behavior; when set, a failed write is fatal (never a silent gap).
+    */
+  val OneLakeTelemetryDirKey: String = "spark.openivm.telemetry.oneLakeDir"
+
   /** Nonsecret campaign identity required when [[TelemetryUriKey]] is set. */
   val TelemetryCampaignIdKey: String = "spark.openivm.telemetry.campaignId"
 
@@ -450,6 +460,13 @@ object FeatureGate {
     spark.conf
       .getOption(TelemetryUriKey)
       .orElse(spark.sparkContext.getConf.getOption(TelemetryUriKey))
+      .map(_.trim)
+      .filter(_.nonEmpty)
+
+  def oneLakeTelemetryDir(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(OneLakeTelemetryDirKey)
+      .orElse(spark.sparkContext.getConf.getOption(OneLakeTelemetryDirKey))
       .map(_.trim)
       .filter(_.nonEmpty)
 
