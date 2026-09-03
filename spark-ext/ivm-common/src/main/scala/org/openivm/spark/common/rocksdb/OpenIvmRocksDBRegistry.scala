@@ -15,6 +15,15 @@ import scala.util.control.NonFatal
 object OpenIvmRocksDBRegistry {
   private val log = LoggerFactory.getLogger(getClass)
 
+  /** Invariant snapshot used by deterministic tests to assert the registry has
+    * quiesced: no live native handles, no map-reachable entries, no slots.
+    */
+  private[rocksdb] final case class HandleSnapshot(
+      liveHandleCount: Int,
+      reachableHandleCount: Int,
+      slotCount: Int
+  )
+
   private final case class Entry(
       db: OpenIvmRocksDB,
       columnFamilies: Set[String],
@@ -136,12 +145,73 @@ object OpenIvmRocksDBRegistry {
         lock.unlock()
       }
     }
+
+    def isRetired: Boolean = {
+      lock.lock()
+      try retired
+      finally lock.unlock()
+    }
+
+    def hasEntry: Boolean = {
+      lock.lock()
+      try entry != null
+      finally lock.unlock()
+    }
+
+    def currentDbForTesting: Option[OpenIvmRocksDB] = {
+      lock.lock()
+      try Option(entry).map(_.db)
+      finally lock.unlock()
+    }
+
+    /** Close any live entry, then run `afterClose` (a caller-supplied filesystem
+      * delete) — all while holding `lock`, so no concurrent [[getOrOpen]] can
+      * install a handle on this path between the close and the delete (the
+      * classic close/delete TOCTOU). The slot is marked `retired` before the
+      * lock is released, so an opener that fetched this slot earlier observes
+      * the retirement (via `SlotRetiredSignal`) and retries against a fresh
+      * slot rather than reopening half-deleted state. Returns false WITHOUT
+      * running `afterClose` when the slot was already retired, telling the
+      * caller to retry with a fresh slot.
+      *
+      * `retired` is set in a `finally` so it holds even when `afterClose`
+      * throws: the handle is already closed and the dead slot must still be
+      * evicted, so lifecycle state stays safe and retryable while the delete
+      * failure propagates to the caller instead of being silently swallowed.
+      */
+    def closeAndRun(afterClose: () => Unit): Boolean = {
+      lock.lock()
+      try {
+        if (retired) {
+          false
+        } else {
+          if (entry != null) {
+            closeEntry(canonicalPath, entry)
+            entry = null
+            publishOpenEntryCount(openEntryCount.decrementAndGet())
+          }
+          try {
+            afterClose()
+          } finally {
+            retired = true
+          }
+          true
+        }
+      } finally {
+        lock.unlock()
+      }
+    }
   }
 
   private val entries               = new ConcurrentHashMap[String, Slot]()
   private val listenerAppIds        = ConcurrentHashMap.newKeySet[String]()
   private val openEntryCount        = new AtomicInteger(0)
   private val shutdownHookInstalled = new AtomicBoolean(false)
+
+  // Test-only park point, invoked after `slotFor` selects a slot but before the
+  // slot lock is acquired. Lets a deterministic test force the exact
+  // select-then-retire-then-open interleaving. A volatile no-op in production.
+  @volatile private var afterSlotSelectionHookForTesting: String => Unit = (_: String) => ()
 
   // Internal control signal: a `getOrOpen` reached a slot that was retired by a
   // concurrent prune. The caller re-fetches the current slot and retries. Never
@@ -168,10 +238,16 @@ object OpenIvmRocksDBRegistry {
     registerSparkListenerIfNeeded(spark, appId)
     var attempts = 0
     while (true) {
+      val slot = slotFor(canonicalPath)
+      afterSlotSelectionHookForTesting(canonicalPath)
       try {
-        return slotFor(canonicalPath).getOrOpen(spark, appId, requestedColumnFamilies)
+        return slot.getOrOpen(spark, appId, requestedColumnFamilies)
       } catch {
         case SlotRetiredSignal =>
+          // The slot was retired by a concurrent prune or closeAndDelete. Help
+          // evict the exact dead slot (identity- and retired-checked, so a fresh
+          // concurrent slot is never dropped), then retry against a live slot.
+          evictIfRetired(canonicalPath, slot)
           attempts += 1
           if (attempts >= MaxSlotRetries) {
             throw new IllegalStateException(
@@ -192,6 +268,35 @@ object OpenIvmRocksDBRegistry {
     if (slot != null) {
       slot.closeNow()
       pruneSlotIfEmpty(canonicalPath)
+    }
+    OpenIvmMaintenanceCoordinator.shutdownIfIdle()
+  }
+
+  /** Close the RocksDB at `dbPath` (if open) and run `delete` under the SAME
+    * per-path slot lock, so no concurrent [[getOrOpen]] can reopen the path
+    * between the close and the delete (the classic close/delete TOCTOU). The
+    * native `<dbPath>/LOCK` is released by the close before `delete` runs; the
+    * slot is then retired and removed so an opener that raced in retries into a
+    * fresh slot (a brand-new DB) instead of observing half-deleted state.
+    *
+    * `delete` receives the canonical local path and MUST be idempotent: a lost
+    * close/delete race can run it again on an already-removed directory. If
+    * `delete` throws, the handle is already closed and the dead slot is still
+    * retired and evicted, but the exception is propagated — a cleanup failure
+    * is never silently swallowed, and the path stays reopenable. Exclusion is
+    * per-slot; other paths are never blocked.
+    */
+  def closeAndDelete(dbPath: String)(delete: String => Unit): Unit = {
+    val canonicalPath = canonicalLocalPath(dbPath)
+    var completed     = false
+    while (!completed) {
+      val slot = slotFor(canonicalPath)
+      afterSlotSelectionHookForTesting(canonicalPath)
+      try {
+        completed = slot.closeAndRun(() => delete(canonicalPath))
+      } finally {
+        evictIfRetired(canonicalPath, slot)
+      }
     }
     OpenIvmMaintenanceCoordinator.shutdownIfIdle()
   }
@@ -234,6 +339,21 @@ object OpenIvmRocksDBRegistry {
       }
     )
 
+  // Remove a slot from the map only if it is the exact slot we looked up AND it
+  // is retired. Identity-checked so a fresh slot installed by a concurrent
+  // open+retry is never evicted. Runs under the map bin lock, then the slot lock
+  // (via `isRetired`) — the same map -> slot order as `pruneSlotIfEmpty`, and no
+  // thread ever holds a slot lock while touching the map, so there is no lock
+  // inversion or deadlock.
+  private def evictIfRetired(canonicalPath: String, expected: Slot): Unit =
+    entries.computeIfPresent(
+      canonicalPath,
+      new java.util.function.BiFunction[String, Slot, Slot] {
+        override def apply(path: String, slot: Slot): Slot =
+          if ((slot eq expected) && slot.isRetired) null else slot
+      }
+    )
+
   private def canonicalLocalPath(path: String): String =
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
@@ -244,6 +364,29 @@ object OpenIvmRocksDBRegistry {
     )
     slot.overrideAppIds(appIds)
   }
+
+  private[rocksdb] def setAfterSlotSelectionHookForTesting(hook: String => Unit): Unit =
+    afterSlotSelectionHookForTesting = hook
+
+  private[rocksdb] def clearAfterSlotSelectionHookForTesting(): Unit =
+    afterSlotSelectionHookForTesting = (_: String) => ()
+
+  /** Invariant probe: the live, map-reachable RocksDB handle for `dbPath`, if
+    * any. Proves an opened handle is reachable (not orphaned in an evicted slot).
+    */
+  private[rocksdb] def liveHandleForTesting(dbPath: String): Option[OpenIvmRocksDB] =
+    Option(entries.get(canonicalLocalPath(dbPath))).flatMap(_.currentDbForTesting)
+
+  private[rocksdb] def mappedSlotCountForTesting: Int = entries.size
+
+  private[rocksdb] def openEntryCountForTesting: Int = openEntryCount.get()
+
+  private[rocksdb] def handleSnapshotForTesting: HandleSnapshot =
+    HandleSnapshot(
+      liveHandleCount = openEntryCount.get(),
+      reachableHandleCount = entries.values().asScala.count(_.hasEntry),
+      slotCount = entries.size()
+    )
 
   private def installShutdownHookIfNeeded(): Unit =
     if (shutdownHookInstalled.compareAndSet(false, true)) {

@@ -1,30 +1,38 @@
 package org.openivm.spark.common.rocksdb
 
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, OpenIvmStatePaths}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
+import java.sql.Timestamp
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import java.util.UUID
 
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with Matchers {
-  private val TestStateSyncKey = "spark.openivm.test.stateSync.key"
+  private val TestStateSyncKey                = "spark.openivm.test.stateSync.key"
+  private val RegistryRaceTimeout             = 30.seconds
+  private val SourceSharingAdmissionWidth     = 18
+  private val SourceSharingSource             = "source_sharing_base"
+  private val NoLiveOrReachableRocksDbHandles = OpenIvmRocksDBRegistry.HandleSnapshot(0, 0, 0)
 
   private val sparks = ArrayBuffer.empty[SparkSession]
   private val dirs   = ArrayBuffer.empty[File]
 
   override def afterEach(): Unit = {
+    OpenIvmRocksDBRegistry.clearAfterSlotSelectionHookForTesting()
     OpenIvmRocksDBRegistry.closeAll()
     sparks.reverse.foreach { spark =>
       try spark.stop()
@@ -98,6 +106,57 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
           OpenIvmStateSync.BackupStateSnapshot(running = false, requested = false)
         )
     }
+
+  private def awaitLatch(latch: CountDownLatch, description: String): Unit =
+    withClue(s"$description within $RegistryRaceTimeout: ") {
+      latch.await(RegistryRaceTimeout.toMillis, TimeUnit.MILLISECONDS) shouldBe true
+    }
+
+  private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A = {
+    val pool = Executors.newFixedThreadPool(parallelism)
+    try body(ExecutionContext.fromExecutorService(pool))
+    finally {
+      pool.shutdownNow()
+      pool.awaitTermination(RegistryRaceTimeout.toMillis, TimeUnit.MILLISECONDS)
+      ()
+    }
+  }
+
+  private def withParkedSlotSelections[A](dbPaths: Set[String], expectedSelections: Int = -1)(
+      body: (CountDownLatch, CountDownLatch) => A
+  ): A = {
+    val selected = new CountDownLatch(if (expectedSelections < 0) dbPaths.size else expectedSelections)
+    val release  = new CountDownLatch(1)
+    OpenIvmRocksDBRegistry.setAfterSlotSelectionHookForTesting { selectedPath =>
+      if (dbPaths.contains(selectedPath)) {
+        selected.countDown()
+        if (!release.await(RegistryRaceTimeout.toMillis, TimeUnit.MILLISECONDS)) {
+          throw new AssertionError(s"slot selection was not released for $selectedPath")
+        }
+      }
+    }
+    try body(selected, release)
+    finally {
+      release.countDown()
+      OpenIvmRocksDBRegistry.clearAfterSlotSelectionHookForTesting()
+    }
+  }
+
+  private def sourceSharingMeta(index: Int, generation: String): MvMetadata =
+    MvMetadata(
+      name = TableIdentifier(s"source_sharing_mv_$index", Some("registry_source_sharing")),
+      querySql = s"SELECT id FROM $SourceSharingSource WHERE generation = '$generation'",
+      refreshType = 0,
+      refreshTypeName = "SIMPLE_PROJECTION",
+      lastVersion = 0L,
+      sourceTables = Seq(SourceSharingSource),
+      sourceSchemaFingerprint = MvCatalog.schemaFingerprint(
+        Map(SourceSharingSource -> StructType(Seq(StructField("id", StringType))))
+      ),
+      location = s"source-sharing-$generation-$index",
+      createdAt = new Timestamp(1700000000000L),
+      properties = Map("generation" -> generation)
+    )
 
   describe("OpenIvmRocksDBRegistry") {
     it("returns the same instance for repeated opens of the same path") {
@@ -278,17 +337,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
             val p = paths((i + w) % paths.size)
             try {
               val db = OpenIvmRocksDBRegistry.getOrOpen(spark, p, Seq("meta"))
-              try {
-                db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8(s"k$w"), RocksDBCodec.utf8("v")))
-              } catch {
-                // A concurrent close() of this shared path can close the handle
-                // mid-write; that "already closed" race is expected here and is
-                // NOT the orphaned-lock defect under test. Any other failure
-                // (notably `RocksDBException: lock hold by current process`) is
-                // recorded below.
-                case e: IllegalStateException if Option(e.getMessage).exists(_.contains("already closed")) =>
-                  ()
-              }
+              db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8(s"k$w"), RocksDBCodec.utf8("v")))
               if ((i + w) % 3 == 0) OpenIvmRocksDBRegistry.close(p)
             } catch {
               case t: Throwable => errors.add(t)
@@ -301,13 +350,239 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       start.countDown()
       futures.foreach(f => Await.result(f, 60.seconds))
 
-      // The orphaned-slot defect surfaces as a RocksDB lock-acquire failure on a
-      // path whose lock is still held by an orphaned handle. Assert none such (and
-      // no slot-retry exhaustion) occurred.
       val errList = errors.asScala.toList
       withClue(errList.map(_.toString).mkString("\n")) {
         errList shouldBe empty
       }
+    }
+
+    it("does not orphan a live handle when a slot is retired between selection and open") {
+      val spark = newSpark("registry-toctou-orphan")
+      val dbDir = newDir("toctou-orphan-db")
+      val path  = dbDir.getAbsolutePath
+      val canon = new File(path).getCanonicalPath
+
+      // Force the exact defect interleaving: an opener installs a fresh (empty)
+      // slot via slotFor and parks BEFORE acquiring the slot lock; concurrently
+      // close() retires and evicts that very slot; then the opener is released.
+      val parked      = new CountDownLatch(1)
+      val releaseOpen = new CountDownLatch(1)
+      val armed       = new AtomicBoolean(true)
+      OpenIvmRocksDBRegistry.setAfterSlotSelectionHookForTesting { hookedPath =>
+        if (hookedPath == canon && armed.compareAndSet(true, false)) {
+          parked.countDown()
+          releaseOpen.await(10, TimeUnit.SECONDS)
+          ()
+        }
+      }
+
+      val openFuture = Future {
+        OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      }
+
+      // The opener has published an empty slot and parked before opening it.
+      parked.await(10, TimeUnit.SECONDS) shouldBe true
+      OpenIvmRocksDBRegistry.liveHandleForTesting(path) shouldBe None
+
+      // Concurrent close retires and evicts the empty slot the opener is holding.
+      OpenIvmRocksDBRegistry.close(path)
+      OpenIvmRocksDBRegistry.mappedSlotCountForTesting shouldBe 0
+
+      // Release the opener: it must detect the slot was retired and retry into a
+      // fresh, reachable slot instead of stranding a native handle.
+      releaseOpen.countDown()
+      val opened = Await.result(openFuture, 10.seconds)
+
+      // The opened handle is live, reachable and unique — no orphan holding LOCK.
+      opened.isClosed shouldBe false
+      OpenIvmRocksDBRegistry.liveHandleForTesting(path) shouldBe Some(opened)
+      OpenIvmRocksDBRegistry.mappedSlotCountForTesting shouldBe 1
+      OpenIvmRocksDBRegistry.openEntryCountForTesting shouldBe 1
+
+      // Same-process reuse hits the reachable slot (no second native open, so no
+      // "lock hold by current process"): it is the very same instance.
+      OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta")) should be theSameInstanceAs opened
+
+      // Closing releases the LOCK; a subsequent fresh native open of the SAME
+      // path then succeeds, proving nothing still holds <path>/LOCK.
+      OpenIvmRocksDBRegistry.close(path)
+      OpenIvmRocksDBRegistry.mappedSlotCountForTesting shouldBe 0
+      OpenIvmRocksDBRegistry.openEntryCountForTesting shouldBe 0
+      opened.isClosed shouldBe true
+
+      val reopened = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      reopened should not be theSameInstanceAs(opened)
+      noException should be thrownBy reopened.currentVersion
+    }
+
+    it("holds per-path exclusion across close and a caller-supplied delete") {
+      val spark = newSpark("registry-close-and-delete")
+      val dbDir = newDir("close-and-delete-db")
+      val path  = dbDir.getAbsolutePath
+
+      val original = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      original.withBatch { batch =>
+        original.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+      }
+
+      val deleteEntered         = new CountDownLatch(1)
+      val releaseDelete         = new CountDownLatch(1)
+      val deleteRan             = new AtomicBoolean(false)
+      val closedDuringDelete    = new AtomicBoolean(false)
+      val reachableDuringDelete = new AtomicBoolean(true)
+
+      val deleteFuture = Future {
+        OpenIvmRocksDBRegistry.closeAndDelete(path) { canonical =>
+          deleteRan.set(true)
+          // The handle is closed (LOCK released) and unreachable before delete runs.
+          closedDuringDelete.set(original.isClosed)
+          reachableDuringDelete.set(OpenIvmRocksDBRegistry.liveHandleForTesting(path).isDefined)
+          deleteEntered.countDown()
+          releaseDelete.await(10, TimeUnit.SECONDS)
+          deleteRecursively(new File(canonical))
+        }
+      }
+
+      deleteEntered.await(10, TimeUnit.SECONDS) shouldBe true
+
+      // Exclusion: a concurrent open must NOT proceed while the delete is in-flight.
+      val reopenObserved = new AtomicBoolean(false)
+      val reopenFuture = Future {
+        val db = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+        reopenObserved.set(true)
+        db
+      }
+      Thread.sleep(200L)
+      reopenObserved.get() shouldBe false
+
+      releaseDelete.countDown()
+      Await.result(deleteFuture, 10.seconds)
+      val reopened = Await.result(reopenFuture, 10.seconds)
+
+      deleteRan.get() shouldBe true
+      closedDuringDelete.get() shouldBe true
+      reachableDuringDelete.get() shouldBe false
+      original.isClosed shouldBe true
+
+      // The reopen produced a distinct, working handle over a freshly recreated DB.
+      reopened should not be theSameInstanceAs(original)
+      reopened.currentVersion shouldBe 0L
+      OpenIvmRocksDBRegistry.liveHandleForTesting(path) shouldBe Some(reopened)
+    }
+
+    it("surfaces a caller delete failure while keeping the handle closed and the path retryable") {
+      val spark = newSpark("registry-close-and-delete-failure")
+      val dbDir = newDir("close-and-delete-failure-db")
+      val path  = dbDir.getAbsolutePath
+
+      val original = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      original.withBatch { batch =>
+        original.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+      }
+
+      // The DB directory is still present when the caller-supplied delete fails.
+      val boom = new RuntimeException("delete failed while DB present")
+      val thrown = intercept[RuntimeException] {
+        OpenIvmRocksDBRegistry.closeAndDelete(path)(_ => throw boom)
+      }
+      thrown should be theSameInstanceAs boom
+
+      // No silent partial success: the handle is closed (LOCK released) and the
+      // dead slot is evicted, so nothing is orphaned even though delete failed.
+      original.isClosed shouldBe true
+      OpenIvmRocksDBRegistry.liveHandleForTesting(path) shouldBe None
+      OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe NoLiveOrReachableRocksDbHandles
+      OpenIvmStatePaths.isExistingDb(new File(path).getCanonicalPath) shouldBe true
+
+      // The path stays retryable: a fresh getOrOpen reopens the still-present DB
+      // as a new, working handle (no "lock hold by current process").
+      val reopened = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      reopened should not be theSameInstanceAs(original)
+      noException should be thrownBy reopened.currentVersion
+    }
+
+    it("keeps the first open reachable when DROP cleanup retires its selected empty slot") {
+      val spark  = newSpark("registry-drop-open-race")
+      val dbPath = newDir("drop-open-race-db").getCanonicalPath
+
+      withParkedSlotSelections(Set(dbPath)) { (selected, release) =>
+        val opening = Future {
+          OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+        }
+        awaitLatch(selected, "opener never selected its registry slot")
+
+        OpenIvmRocksDBRegistry.close(dbPath)
+        release.countDown()
+
+        val opened = Await.result(opening, RegistryRaceTimeout)
+        val retry  = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+        retry should be theSameInstanceAs opened
+
+        OpenIvmRocksDBRegistry.close(dbPath)
+        OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe NoLiveOrReachableRocksDbHandles
+      }
+    }
+
+    it("retries in the same process after closeAll races the first open and quiesces cleanly") {
+      val spark  = newSpark("registry-close-all-open-race")
+      val dbPath = newDir("close-all-open-race-db").getCanonicalPath
+
+      withParkedSlotSelections(Set(dbPath)) { (selected, release) =>
+        val opening = Future {
+          OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+        }
+        awaitLatch(selected, "opener never selected its registry slot")
+
+        OpenIvmRocksDBRegistry.closeAll()
+        release.countDown()
+
+        val opened = Await.result(opening, RegistryRaceTimeout)
+        val retry  = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+        retry should be theSameInstanceAs opened
+
+        OpenIvmRocksDBRegistry.closeAll()
+        OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe NoLiveOrReachableRocksDbHandles
+      }
+    }
+
+    it("keeps 18 source-sharing DROP and CREATE replacements lock-free and consistent") {
+      val spark          = newSpark("registry-source-sharing-fanout")
+      val originalMvs    = (1 to SourceSharingAdmissionWidth).map(sourceSharingMeta(_, "before"))
+      val replacementMvs = (1 to SourceSharingAdmissionWidth).map(sourceSharingMeta(_, "after"))
+      MvCatalog.ensureTables(spark)
+      originalMvs.foreach(MvCatalog.upsert(spark, _))
+      val sharedSourceDbPath = new File(
+        OpenIvmStatePaths.sourceDependencyDbPath(spark, SourceSharingSource)
+      ).getCanonicalPath
+      OpenIvmRocksDBRegistry.closeAll()
+
+      withParkedSlotSelections(Set(sharedSourceDbPath), SourceSharingAdmissionWidth) { (selected, release) =>
+        withPool(SourceSharingAdmissionWidth) { implicit ec =>
+          val drops = originalMvs.map { meta =>
+            Future {
+              MvCatalog.remove(spark, meta.name)
+            }(ec)
+          }
+          awaitLatch(selected, s"not all $SourceSharingAdmissionWidth DROP cleanups selected the shared source slot")
+
+          OpenIvmRocksDBRegistry.close(sharedSourceDbPath)
+          release.countDown()
+          drops.foreach(drop => Await.result(drop, RegistryRaceTimeout))
+          OpenIvmRocksDBRegistry.clearAfterSlotSelectionHookForTesting()
+
+          val creates = replacementMvs.map { meta =>
+            Future {
+              MvCatalog.upsert(spark, meta)
+            }(ec)
+          }
+          creates.foreach(create => Await.result(create, RegistryRaceTimeout))
+        }
+      }
+
+      MvCatalog.viewsForSource(spark, SourceSharingSource).map(_.name).toSet shouldBe replacementMvs.map(_.name).toSet
+      MvCatalog.list(spark).map(_.properties("generation")).toSet shouldBe Set("after")
+      OpenIvmRocksDBRegistry.closeAll()
+      OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe NoLiveOrReachableRocksDbHandles
     }
   }
 
