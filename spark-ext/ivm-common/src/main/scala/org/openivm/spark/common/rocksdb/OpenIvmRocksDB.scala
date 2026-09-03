@@ -105,6 +105,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   @volatile private var beforeSyncWalHookForTesting: () => Unit        = () => ()
   @volatile private var afterManifestHookForTesting: () => Unit        = () => ()
   @volatile private var beforeCloseHookForTesting: () => Unit          = () => ()
+  @volatile private var afterRawOpenHookForTesting: () => Unit         = () => ()
 
   private def cf(name: String): ColumnFamilyHandle =
     columnFamilyHandles.getOrElse(
@@ -527,6 +528,9 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private[common] def setBeforeCloseHookForTesting(hook: () => Unit): Unit =
     beforeCloseHookForTesting = hook
 
+  private[common] def setAfterRawOpenHookForTesting(hook: () => Unit): Unit =
+    afterRawOpenHookForTesting = hook
+
   private[rocksdb] def markDirtyForTesting(columnFamilies: Seq[String]): Unit = withWriteLock {
     dirtySinceFlush = true
     dirtyColumnFamilies = dirtyColumnFamilies ++ columnFamilies
@@ -682,12 +686,34 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       columnFamilyHandles = allColumnFamilies.zip(handles.asScala).toMap
       dirtySinceFlush = false
       dirtyColumnFamilies = Set.empty
+      // Injection point: simulate a post-`RocksDB.open` failure (e.g. a
+      // `recoverLogicalTransactions`/`readCurrentVersion` throw) that occurs
+      // AFTER the native `<dbPath>/LOCK` is held, to prove the catch below
+      // releases the lock and resets state for a clean retry.
+      afterRawOpenHookForTesting()
       recoverLogicalTransactions()
       versionValue = readCurrentVersion()
     } catch {
       case t: Throwable =>
+        // A failed open must leave NO trace of a half-initialised handle. The
+        // native `RocksDB.open` above acquires `<dbPath>/LOCK`; if a later step
+        // (`recoverLogicalTransactions`, `readCurrentVersion`) throws we have
+        // already assigned `dbHandle`/`columnFamilyHandles`. Closing `openedDb`
+        // releases the native LOCK, but unless we also reset these fields the
+        // object is left with a stale, non-null handle pointing at a closed DB.
+        // `withNativeHandle` keys "already open?" on `dbHandle != null`, so a
+        // stale handle makes the next operation run against a dead DB (or, if
+        // the process still owns the file lock, makes the retrying open fail
+        // with "lock hold by current process"). Reset every field so a failed
+        // open is indistinguishable from "never opened": LOCK released, clean
+        // fresh open on retry.
         handles.asScala.foreach(closeQuietly)
         closeQuietly(openedDb)
+        dbHandle = null
+        columnFamilyHandles = Map.empty
+        dirtySinceFlush = false
+        dirtyColumnFamilies = Set.empty
+        versionValue = 0L
         throw t
     } finally {
       descriptors.foreach(descriptor => closeQuietly(descriptor.getOptions))

@@ -175,6 +175,42 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("resets state and releases the native lock when an open fails after the lock is acquired") {
+      val dir = newDbDir("open-failure-retry")
+      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+
+      try {
+        // Simulate a post-`RocksDB.open` failure (as `recoverLogicalTransactions`
+        // / `readCurrentVersion` can throw) that happens AFTER `<dbPath>/LOCK` is
+        // already held.
+        db.setAfterRawOpenHookForTesting(() => throw new RuntimeException("open boom"))
+        intercept[RuntimeException](db.load()).getMessage shouldBe "open boom"
+
+        // The failed open must leave NO stale handle and NO held lock: the very
+        // next operation in the SAME process must re-open cleanly. A stale closed
+        // handle would run against a dead DB; a leaked lock would fail the reopen
+        // with "lock hold by current process".
+        db.setAfterRawOpenHookForTesting(() => ())
+        db.withBatch { batch =>
+          db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v"))
+        }
+        db.get("meta", RocksDBCodec.utf8("k")).map(RocksDBCodec.fromUtf8) shouldBe Some("v")
+        db.close()
+
+        // A brand-new instance on the same path also opens, proving the failed
+        // open leaked no OS-level RocksDB lock.
+        val reopened = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
+        try {
+          reopened.load()
+          reopened.get("meta", RocksDBCodec.utf8("k")).map(RocksDBCodec.fromUtf8) shouldBe Some("v")
+        } finally closeQuietly(reopened)
+      } finally {
+        db.setAfterRawOpenHookForTesting(() => ())
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
     it("round-trips puts and gets across multiple column families") {
       val dir = newDbDir("round-trip")
       val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta", "props"))
