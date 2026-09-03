@@ -73,6 +73,7 @@ class WindowSuffixSkipCdfSpec extends IvmParitySpecBase("window-suffix-skip") wi
       withClue("captured [openivm-perf] lines:\n" + perfLines.mkString("\n") + "\n") {
         perfLines.exists(_.contains("stmt_kind='window_suffix_aux_skipped'")) shouldBe true
         perfLines.exists(_.contains("stmt_kind='window_suffix_delete_skipped'")) shouldBe true
+        perfLines.exists(_.contains("phase='cdf_window_net_change_probe'")) shouldBe false
       }
       assertMvCorrect("wss_mv_suffix", viewSql)
     }
@@ -98,6 +99,7 @@ class WindowSuffixSkipCdfSpec extends IvmParitySpecBase("window-suffix-skip") wi
 
       withClue("captured [openivm-perf] lines:\n" + perfLines.mkString("\n") + "\n") {
         perfLines.exists(_.contains("outcome='window_suffix_skip'")) shouldBe false
+        perfLines.exists(_.contains("phase='cdf_window_net_change_probe'")) shouldBe false
       }
       assertMvCorrect("wss_mv_fallback", viewSql)
     }
