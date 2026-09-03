@@ -24,10 +24,19 @@ object OpenIvmRocksDBRegistry {
   private final class Slot(canonicalPath: String) {
     private val lock         = new ReentrantLock()
     private var entry: Entry = null
+    // Set (under `lock`) at the instant this slot is pruned from `entries`.
+    // A thread that fetched this slot from the map BEFORE the prune can still
+    // call `getOrOpen`; without this flag it would re-populate a slot that is
+    // no longer the map's canonical slot for the path, leaving an ORPHANED live
+    // RocksDB whose `<dbPath>/LOCK` a fresh slot then fails to acquire
+    // ("lock hold by current process"). A retired slot refuses `getOrOpen` so
+    // the registry re-fetches the current slot instead.
+    private var retired: Boolean = false
 
     def getOrOpen(spark: SparkSession, appId: String, requestedColumnFamilies: Set[String]): OpenIvmRocksDB = {
       lock.lock()
       try {
+        if (retired) throw SlotRetiredSignal
         val current = entry
         if (current != null) {
           OpenIvmMetrics.increment("rocksdb.registry.get_or_open.hit")
@@ -107,10 +116,22 @@ object OpenIvmRocksDBRegistry {
       }
     }
 
-    def isEmpty: Boolean = {
+    /** Atomically retire-and-report for pruning: if the slot holds no open
+      * entry it is marked retired (so no later `getOrOpen` reuses it) and `true`
+      * is returned, telling the caller it is safe to remove from `entries`. A
+      * slot that still has an entry is left untouched. Called inside the map's
+      * `computeIfPresent` so the retire + map removal are atomic with respect to
+      * a concurrent `getOrOpen` that has already fetched this slot.
+      */
+    def retireIfEmpty(): Boolean = {
       lock.lock()
       try {
-        entry == null
+        if (entry == null) {
+          retired = true
+          true
+        } else {
+          false
+        }
       } finally {
         lock.unlock()
       }
@@ -121,6 +142,17 @@ object OpenIvmRocksDBRegistry {
   private val listenerAppIds        = ConcurrentHashMap.newKeySet[String]()
   private val openEntryCount        = new AtomicInteger(0)
   private val shutdownHookInstalled = new AtomicBoolean(false)
+
+  // Internal control signal: a `getOrOpen` reached a slot that was retired by a
+  // concurrent prune. The caller re-fetches the current slot and retries. Never
+  // escapes the registry; carries no stack trace (hot path, not an error).
+  private object SlotRetiredSignal extends RuntimeException("openivm-rocksdb slot retired") {
+    override def fillInStackTrace(): Throwable = this
+  }
+  // A retired slot is removed from the map in the same `computeIfPresent` that
+  // retires it, so the retry converges within a couple of spins; the bound only
+  // guards against an unforeseen livelock.
+  private val MaxSlotRetries = 1024
 
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
@@ -134,7 +166,24 @@ object OpenIvmRocksDBRegistry {
       ))
 
     registerSparkListenerIfNeeded(spark, appId)
-    slotFor(canonicalPath).getOrOpen(spark, appId, requestedColumnFamilies)
+    var attempts = 0
+    while (true) {
+      try {
+        return slotFor(canonicalPath).getOrOpen(spark, appId, requestedColumnFamilies)
+      } catch {
+        case SlotRetiredSignal =>
+          attempts += 1
+          if (attempts >= MaxSlotRetries) {
+            throw new IllegalStateException(
+              s"openivm-rocksdb registry could not obtain a live slot for $canonicalPath " +
+                s"after $MaxSlotRetries retries (persistent prune/get race)"
+            )
+          }
+          OpenIvmMetrics.increment("rocksdb.registry.get_or_open.slot_retired_retry")
+      }
+    }
+    // Unreachable: the loop only exits via `return` or `throw`.
+    throw new IllegalStateException("unreachable")
   }
 
   def close(dbPath: String): Unit = {
@@ -178,7 +227,10 @@ object OpenIvmRocksDBRegistry {
       canonicalPath,
       new java.util.function.BiFunction[String, Slot, Slot] {
         override def apply(path: String, slot: Slot): Slot =
-          if (slot.isEmpty) null else slot
+          // Retire + report atomically: `computeIfPresent` holds the map bin so
+          // the retire (under the slot lock) and the removal (returning null)
+          // are one step relative to a concurrent `getOrOpen` on this slot.
+          if (slot.retireIfEmpty()) null else slot
       }
     )
 

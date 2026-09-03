@@ -13,6 +13,7 @@ import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.UUID
 
 import scala.collection.mutable.ArrayBuffer
+import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
@@ -220,6 +221,93 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
 
       OpenIvmMaintenanceCoordinator.isRunning shouldBe true
       noException should be thrownBy survivor.currentVersion
+    }
+
+    it("keeps one canonical slot when a getOrOpen races a concurrent close+prune") {
+      val spark = newSpark("registry-orphan-race")
+      val dbDir = newDir("orphan-race-db")
+      val db1   = OpenIvmRocksDBRegistry.getOrOpen(spark, dbDir.getAbsolutePath, Seq("meta"))
+
+      val closeEntered = new CountDownLatch(1)
+      val releaseClose = new CountDownLatch(1)
+      db1.setBeforeCloseHookForTesting(() => {
+        closeEntered.countDown()
+        releaseClose.await(5, TimeUnit.SECONDS) shouldBe true
+      })
+
+      // Close pauses mid-flight while a concurrent getOrOpen fetches the slot
+      // that is about to be pruned and blocks on the slot lock.
+      val closeFuture = Future(OpenIvmRocksDBRegistry.close(dbDir.getAbsolutePath))
+      closeEntered.await(5, TimeUnit.SECONDS) shouldBe true
+      val reopenFuture =
+        Future(OpenIvmRocksDBRegistry.getOrOpen(spark, dbDir.getAbsolutePath, Seq("meta")))
+      Thread.sleep(100L)
+
+      releaseClose.countDown()
+      Await.result(closeFuture, 10.seconds)
+      val reopenedDb = Await.result(reopenFuture, 10.seconds)
+
+      // A later getOrOpen must return the SAME instance as the raced reopen:
+      // the retired slot was never re-populated into an orphan holding the
+      // native LOCK (which a fresh slot would then fail to acquire with
+      // "lock hold by current process").
+      val afterDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbDir.getAbsolutePath, Seq("meta"))
+      afterDb should be theSameInstanceAs reopenedDb
+      reopenedDb should not be theSameInstanceAs(db1)
+      noException should be thrownBy afterDb.currentVersion
+    }
+
+    it("never orphans a per-path RocksDB lock under concurrent getOrOpen + close") {
+      // Reproduces the DROP-cleanup race: many threads open + write + close the
+      // same small set of paths (as concurrent DROP MATERIALIZED VIEW / DROP
+      // TABLE cleanups do). Before the retire-on-prune fix a pruned slot could
+      // be re-populated into an orphan, and the next open of that path failed
+      // with `RocksDBException: lock hold by current process`.
+      val spark      = newSpark("registry-concurrent-cleanup")
+      val paths      = (0 until 4).map(i => newDir(s"concurrent-$i").getAbsolutePath)
+      val errors     = new java.util.concurrent.ConcurrentLinkedQueue[Throwable]()
+      val iterations = 300
+      val workers    = 8
+      val start      = new CountDownLatch(1)
+
+      val futures = (0 until workers).map { w =>
+        Future {
+          start.await(5, TimeUnit.SECONDS)
+          var i = 0
+          while (i < iterations) {
+            val p = paths((i + w) % paths.size)
+            try {
+              val db = OpenIvmRocksDBRegistry.getOrOpen(spark, p, Seq("meta"))
+              try {
+                db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8(s"k$w"), RocksDBCodec.utf8("v")))
+              } catch {
+                // A concurrent close() of this shared path can close the handle
+                // mid-write; that "already closed" race is expected here and is
+                // NOT the orphaned-lock defect under test. Any other failure
+                // (notably `RocksDBException: lock hold by current process`) is
+                // recorded below.
+                case e: IllegalStateException if Option(e.getMessage).exists(_.contains("already closed")) =>
+                  ()
+              }
+              if ((i + w) % 3 == 0) OpenIvmRocksDBRegistry.close(p)
+            } catch {
+              case t: Throwable => errors.add(t)
+            }
+            i += 1
+          }
+        }
+      }
+
+      start.countDown()
+      futures.foreach(f => Await.result(f, 60.seconds))
+
+      // The orphaned-slot defect surfaces as a RocksDB lock-acquire failure on a
+      // path whose lock is still held by an orphaned handle. Assert none such (and
+      // no slot-retry exhaustion) occurred.
+      val errList = errors.asScala.toList
+      withClue(errList.map(_.toString).mkString("\n")) {
+        errList shouldBe empty
+      }
     }
   }
 
