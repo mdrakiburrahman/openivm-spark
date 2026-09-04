@@ -2,11 +2,14 @@ package org.openivm.spark.compiler
 
 import java.util.Locale
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
+
+import scala.util.control.NonFatal
 
 /** Splits Spark/Delta snapshot pins (`… VERSION AS OF <v>` / `… TIMESTAMP AS OF
   * <ts>`, a.k.a. Spark's `temporalClause`) out of a materialized-view body.
@@ -114,7 +117,7 @@ object SparkTimeTravelSql {
   )
 
   /** Test-only pin-resolution contract; production callers do not yet use it. */
-  private[compiler] final case class SourceIdentity(
+  private[spark] final case class SourceIdentity(
       alias: String,
       deltaLogDataPath: String,
       deltaTableMetadataId: String
@@ -122,7 +125,7 @@ object SparkTimeTravelSql {
     def matchesAlias(candidate: String): Boolean = alias == candidate
   }
 
-  private[compiler] final case class ResolvedSnapshotPin(
+  private[spark] final case class ResolvedSnapshotPin(
       pin: SnapshotPin,
       sqlVisibleSource: SourceIdentity,
       operationalSource: SourceIdentity
@@ -130,9 +133,9 @@ object SparkTimeTravelSql {
     def emitsResolved: String = operationalSource.alias
   }
 
-  private[compiler] sealed trait PinIdentityOperation
+  private[spark] sealed trait PinIdentityOperation
 
-  private[compiler] object PinIdentityOperation {
+  private[spark] object PinIdentityOperation {
     case object Create           extends PinIdentityOperation
     case object IdempotentCreate extends PinIdentityOperation
     case object Refresh          extends PinIdentityOperation
@@ -141,9 +144,15 @@ object SparkTimeTravelSql {
     case object DryRewrite       extends PinIdentityOperation
   }
 
-  private[compiler] sealed trait PinBindingCheckpoint
+  /** A pinned relation the caller could not resolve to a unique physical Delta
+    * identity (resolution exception, cross-version conflict, etc.). Carried in
+    * the binding so validation hard-fails before any compile/CTAS. */
+  private[spark] final case class PinResolutionFailure(pin: SnapshotPin, detail: String)
 
-  private[compiler] object PinBindingCheckpoint {
+  /** Where a TOCTOU identity re-check runs relative to the writes it guards. */
+  private[spark] sealed trait PinBindingCheckpoint
+
+  private[spark] object PinBindingCheckpoint {
     case object CreateBeforeWrite              extends PinBindingCheckpoint
     case object CreateAfterWrite               extends PinBindingCheckpoint
     case object RefreshBeforeApply             extends PinBindingCheckpoint
@@ -151,7 +160,10 @@ object SparkTimeTravelSql {
     case object RefreshAfterApply              extends PinBindingCheckpoint
   }
 
-  private[compiler] final case class PinBindingCheckpointFailure(
+  /** The outcome contract of a failed checkpoint: what the caller must have done
+    * (or guaranteed unchanged) so the rebind is compensated without partial
+    * publish or marker drift. */
+  private[spark] final case class PinBindingCheckpointFailure(
       detail: String,
       createArtifactsCleaned: Boolean,
       refreshRestored: Boolean,
@@ -163,22 +175,25 @@ object SparkTimeTravelSql {
       refreshMarkersUnchanged: Boolean
   )
 
-  private[compiler] sealed trait PinRewriteSurface
+  /** An emit surface whose pinned reads must be path-bound before execution. */
+  private[spark] sealed trait PinRewriteSurface
 
-  private[compiler] object PinRewriteSurface {
+  private[spark] object PinRewriteSurface {
     case object UserFullQuery               extends PinRewriteSurface
     case object CompilerInitialLoad         extends PinRewriteSurface
     case object SparkRefreshRewriterEmitted extends PinRewriteSurface
   }
 
-  private[compiler] final case class PathBoundRewrite(
-      sql: String,
-      pinnedOccurrenceCount: Int
-  )
+  private[spark] final case class PathBoundRewrite(sql: String, pinnedOccurrenceCount: Int)
 
-  private[compiler] sealed trait BindingSite
+  /** The compiler and pin consumers a single resolved binding must reach, so
+    * coverage is enumerable rather than per-site. `bindingFor` returns the one
+    * binding unchanged at every site — the type exists to make "one binding,
+    * every consumer" a checkable contract.
+    */
+  private[spark] sealed trait BindingSite
 
-  private[compiler] object BindingSite {
+  private[spark] object BindingSite {
     case object CreateCompileRequest               extends BindingSite
     case object DryCompileCompileRequest           extends BindingSite
     case object CreateInitialLoad                  extends BindingSite
@@ -213,18 +228,25 @@ object SparkTimeTravelSql {
     )
   }
 
-  /** Test-only pin-binding contract; production callers do not yet use it. */
-  private[compiler] final case class PinResolutionFailure(
-      pin: SnapshotPin,
-      detail: String
-  )
-
-  private[compiler] final case class ResolvedSnapshotPinBindings(
+  /** One command's resolved snapshot-pin binding: the view's tracked source
+    * names, their physical identities, and the resolved pins. Threaded to every
+    * [[BindingSite]] via [[bindingFor]].
+    */
+  private[spark] final case class ResolvedSnapshotPinBindings(
       sourceTables: Seq[String],
       sourceIdentities: Seq[SourceIdentity],
       pins: Seq[ResolvedSnapshotPin],
       resolutionFailures: Seq[PinResolutionFailure] = Seq.empty
   )
+
+  /** The single binding, returned unchanged for every consumer site. */
+  private[spark] def bindingFor(
+      bindings: ResolvedSnapshotPinBindings,
+      site: BindingSite
+  ): ResolvedSnapshotPinBindings = {
+    val _ = site
+    bindings
+  }
 
   /** A pin as the scanner lifted it, plus the parsed clause KIND and VALUE.
     * Those two are what binds the pin to the `RelationTimeTravel` node Spark's
@@ -254,6 +276,21 @@ object SparkTimeTravelSql {
     */
   private def identityKey(segments: Seq[String], kind: String, value: String): String =
     s"${segments.mkString(".")}@$kind:$value"
+
+  private val AnyVersionClause   = """(?i)^(?:FOR\s+)?(?:SYSTEM_)?VERSION\s+AS\s+OF\s+'?(\d+)'?$""".r
+  private val AnyTimestampClause = """(?i)^(?:FOR\s+)?(?:SYSTEM_)?TIMESTAMP\s+AS\s+OF\s+(.+?)$""".r
+
+  /** Canonical (kind, value) of a pin clause, independent of the spelling the
+    * user wrote: `VERSION AS OF 2`, `version as of '2'` and `FOR VERSION AS OF 2`
+    * canonicalize identically, while two different versions of one physical
+    * source stay distinct so a cross-version self-join is rejected.
+    */
+  private def canonicalPinValue(clause: String): String =
+    clause.trim match {
+      case AnyVersionClause(version)     => s"$VersionKind:$version"
+      case AnyTimestampClause(timestamp) => s"$TimestampKind:${timestamp.trim.stripPrefix("'").stripSuffix("'")}"
+      case other                         => s"raw:$other"
+    }
 
   /** Cheap pre-filter so the scanner + parser round-trip only runs for bodies
     * that plausibly contain a temporal clause. Matches inside string literals
@@ -400,13 +437,29 @@ object SparkTimeTravelSql {
         )
       else None
     else
-      unresolvedPins(pins, qualifiedSources).headOption.map { pin =>
-        PinRefusal(
-          TimeTravelPinReason.PinNotResolvedToSingleSource,
-          s"the pin on '${pin.tableRef}' does not resolve to exactly one tracked source " +
-            s"(sources: ${qualifiedSources.distinct.sorted.mkString(", ")})"
+      // One relation (by case-insensitive segments) pinned at more than one
+      // canonical value is a cross-version read that cannot be frozen -- this
+      // covers a case-insensitive `Foo`@v1 and `foo`@v2 the scanner keeps
+      // textually distinct, independent of which tracked source they resolve to.
+      pins
+        .groupBy(_.segments)
+        .collectFirst { case (_, group) if group.map(pin => canonicalPinValue(pin.clause)).distinct.size > 1 => group }
+        .map(_ =>
+          PinRefusal(
+            TimeTravelPinReason.UnsupportedPinShape,
+            "a source is read at two different versions, pinned in one place and read live in another, " +
+              "or pinned to a value that is not a stable literal"
+          )
         )
-      }
+        .orElse {
+          unresolvedPins(pins, qualifiedSources).headOption.map { pin =>
+            PinRefusal(
+              TimeTravelPinReason.PinNotResolvedToSingleSource,
+              s"the pin on '${pin.tableRef}' does not resolve to exactly one tracked source " +
+                s"(sources: ${qualifiedSources.distinct.sorted.mkString(", ")})"
+            )
+          }
+        }
   }
 
   /** Split every snapshot pin out of `sql`.
@@ -436,10 +489,203 @@ object SparkTimeTravelSql {
     * frozen value (`VERSION AS OF 2` / `version as of '2'`) are one pin.
     */
   private def pinsAreUnambiguous(refs: Seq[PinnedRef]): Boolean =
-    refs.groupBy(_.pin.segments).forall { case (_, group) => group.map(_.identity).distinct.size == 1 }
+    refs.groupBy(ref => caseSensitiveSegments(ref.pin.tableRef)).forall { case (_, group) =>
+      group.map(_.identity).distinct.size == 1
+    }
 
   /** De-pinned copy of `sql` for the DuckDB compile bridge. */
   def stripSnapshotPins(sql: String): String = split(sql).sql
+
+  /** Rewrite every snapshot-pinned relation reference in `sql` to a Delta PATH
+    * reference (``delta.`<path>` ``) bound to the caller's verified physical
+    * path, preserving the temporal clause verbatim and every occurrence. This
+    * eliminates the alias-rebind TOCTOU: the frozen reads bind to the exact Delta
+    * table the identity was verified against, not a logical name that could
+    * rebind between verification and read.
+    *
+    * `pathByTableRef` maps each pinned relation reference (exactly as written) to
+    * its verified `DeltaLog.dataPath`. The rewrite reuses the scanner, replaces
+    * each relation span right-to-left, escapes backticks in the path, and
+    * re-validates that no logical-name pinned occurrence survives. Returns `Left`
+    * when a pin has no mapping, a relation span cannot be located, or a
+    * logical-name pin remains after the rewrite.
+    */
+  def bindPinnedRelationsToPaths(
+      sql: String,
+      pathByTableRef: Map[String, String]
+  ): Either[String, String] = {
+    val scanned = scan(sql)
+    if (scanned.refs.isEmpty) return Right(sql)
+
+    // Right-to-left so earlier spans keep their original offsets.
+    val ordered = scanned.refs.sortBy(-_.clauseStart)
+    val bound = ordered.foldLeft[Either[String, String]](Right(sql)) { (accEither, ref) =>
+      accEither.flatMap { acc =>
+        pathByTableRef.get(ref.pin.tableRef) match {
+          case None =>
+            Left(s"no verified path for pinned relation '${ref.pin.tableRef}'")
+          case Some(path) =>
+            var relationEnd = ref.clauseStart
+            while (relationEnd > 0 && acc.charAt(relationEnd - 1).isWhitespace) relationEnd -= 1
+            val relationStart = relationEnd - ref.pin.tableRef.length
+            if (relationStart < 0 || acc.substring(relationStart, relationEnd) != ref.pin.tableRef)
+              Left(s"cannot locate the relation span for pinned relation '${ref.pin.tableRef}'")
+            else {
+              val escaped     = path.replace("`", "``")
+              val replacement = s"delta.`$escaped`"
+              Right(acc.substring(0, relationStart) + replacement + acc.substring(relationEnd))
+            }
+        }
+      }
+    }
+    bound.flatMap { rewritten =>
+      val residual =
+        split(rewritten).pins.map(_.tableRef).filterNot(_.trim.toLowerCase(Locale.ROOT).startsWith("delta."))
+      if (residual.nonEmpty)
+        Left(s"path binding left logical-name pinned relations: ${residual.mkString(", ")}")
+      else if (!parsePlan(rewritten).isDefined)
+        Left("path-bound query no longer parses")
+      else Right(rewritten)
+    }
+  }
+
+  /** The VERIFIED (persisted) DeltaLog.dataPath for each pin occurrence in the
+    * current bindings, keyed by the exact SQL-visible table reference. Reads
+    * bind to the path the identity was VERIFIED against, not the alias's live
+    * (possibly rebound) path. */
+  private def verifiedPathByTableRef(
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Map[String, String] = {
+    val verifiedByAlias =
+      persistedPins.map(pin => pin.operationalSource.alias -> pin.operationalSource.deltaLogDataPath).toMap
+    bindings.pins.map { pin =>
+      pin.pin.tableRef -> verifiedByAlias.getOrElse(pin.operationalSource.alias, pin.operationalSource.deltaLogDataPath)
+    }.toMap
+  }
+
+  private def rewriteMemoryMainRefs(
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, PathBoundRewrite] = {
+    val verifiedByAlias =
+      persistedPins.map(pin => pin.operationalSource.alias -> pin.operationalSource.deltaLogDataPath).toMap
+    val shortToPathClause = bindings.pins.map { pin =>
+      val path  = verifiedByAlias.getOrElse(pin.operationalSource.alias, pin.operationalSource.deltaLogDataPath)
+      val short = pin.pin.shortName
+      short -> (path, pin.pin.clause)
+    }.toMap
+    var result = sql
+    var count  = 0
+    shortToPathClause.foreach { case (short, (path, clause)) =>
+      val escaped     = path.replace("`", "``")
+      val replacement = s"delta.`$escaped` $clause"
+      val pattern =
+        java.util.regex.Pattern.compile("(?i)\\bmemory\\.main\\." + java.util.regex.Pattern.quote(short) + "\\b")
+      val matcher = pattern.matcher(result)
+      val sb      = new StringBuffer()
+      while (matcher.find()) {
+        matcher.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(replacement))
+        count += 1
+      }
+      matcher.appendTail(sb)
+      result = sb.toString
+    }
+    Right(PathBoundRewrite(result, count))
+  }
+
+  /** Rewrite the SQL-visible pinned relations in a USER body to their verified
+    * Delta paths, preserving the clause. */
+  private[spark] def rewriteSnapshotPinsByDataPath(
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, String] =
+    bindPinnedRelationsToPaths(sql, verifiedPathByTableRef(bindings, persistedPins))
+
+  /** Path-bind the pinned reads of one emit surface. The user query rewrites the
+    * SQL-visible relation in place (keeping its clause); the compiler initial-load
+    * and refresh-rewriter surfaces expand each `memory.main.<short>` to the
+    * verified `delta.`<path>`` with its snapshot clause reattached. */
+  private[spark] def rewritePinnedReadSurface(
+      surface: PinRewriteSurface,
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, PathBoundRewrite] =
+    surface match {
+      case PinRewriteSurface.UserFullQuery =>
+        rewriteSnapshotPinsByDataPath(sql, bindings, persistedPins).map(rewritten =>
+          PathBoundRewrite(rewritten, split(sql).pins.size)
+        )
+      case PinRewriteSurface.CompilerInitialLoad | PinRewriteSurface.SparkRefreshRewriterEmitted =>
+        rewriteMemoryMainRefs(sql, bindings, persistedPins)
+    }
+
+  /** Rewrite every statement of a final incremental program by verified path. */
+  private[spark] def rewriteEmittedSnapshotPinsByDataPath(
+      emittedSql: Seq[String],
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, Seq[String]] =
+    emittedSql.foldLeft[Either[String, Vector[String]]](Right(Vector.empty)) { (accEither, statement) =>
+      accEither.flatMap { acc =>
+        rewriteMemoryMainRefs(statement, bindings, persistedPins).map(rewritten => acc :+ rewritten.sql)
+      }
+    }
+
+  /** TOCTOU identity re-check at a checkpoint: compares the CURRENT bindings'
+    * pinned physical identities against the verified/persisted ones. On a
+    * mismatch it returns the compensation contract the caller must honor -- for a
+    * post-write checkpoint the CREATE artifacts are cleaned or the REFRESH MV is
+    * restored, and in every case the pre-version, watermarks, consumed changes,
+    * and markers are left unmoved and the post-check runs outside any retry. */
+  private[spark] def verifySnapshotPinBindingsAt(
+      operation: PinIdentityOperation,
+      checkpoint: PinBindingCheckpoint,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[PinBindingCheckpointFailure, Unit] = {
+    val _ = operation
+    val persistedByAlias =
+      persistedPins.map(pin => pin.operationalSource.alias -> pin.operationalSource).toMap
+    val mismatch = bindings.pins.iterator
+      .flatMap { current =>
+        persistedByAlias.get(current.operationalSource.alias).flatMap { prior =>
+          if (current.operationalSource.deltaLogDataPath != prior.deltaLogDataPath)
+            Some(
+              s"the pinned source '${current.operationalSource.alias}' DeltaLog.dataPath changed since " +
+                s"verification (was '${prior.deltaLogDataPath}', now '${current.operationalSource.deltaLogDataPath}')"
+            )
+          else if (current.operationalSource.deltaTableMetadataId != prior.deltaTableMetadataId)
+            Some(
+              s"the pinned source '${current.operationalSource.alias}' Delta metadata.id changed since " +
+                s"verification (was '${prior.deltaTableMetadataId}', now '${current.operationalSource.deltaTableMetadataId}')"
+            )
+          else None
+        }
+      }
+      .toStream
+      .headOption
+    mismatch match {
+      case None => Right(())
+      case Some(detail) =>
+        Left(
+          PinBindingCheckpointFailure(
+            detail = detail,
+            createArtifactsCleaned = checkpoint == PinBindingCheckpoint.CreateAfterWrite,
+            refreshRestored = checkpoint == PinBindingCheckpoint.RefreshAfterApply,
+            watermarksUnchanged = true,
+            consumedChangesUnchanged = true,
+            ctasRetried = false,
+            preVersionUnchanged = true,
+            createPostCheckOutsideRetry = true,
+            refreshMarkersUnchanged = true
+          )
+        )
+    }
+  }
 
   /** Resolve the pins in `sql` against a view's tracked source tables.
     *
@@ -507,97 +753,354 @@ object SparkTimeTravelSql {
         PinTelemetry(TimeTravelPinStatus.NotApplicable, Seq.empty, TimeTravelPinReason.NoUserPin, None)
     }
 
-  /** Test-only observation seam for resolving already-validated snapshot pins
-    * to operational source identities. Resolution is intentionally not
-    * implemented yet.
+  /** Snapshot-pin telemetry keyed by the RESOLVED operational source, derived
+    * from an already-verified physical-identity binding (`resolvedPins`).
+    *
+    * Each [[ResolvedSnapshotPin]] carries the SQL-visible reference the user
+    * wrote and the operational source it was proven to name (same DeltaLog
+    * physical identity). The APPLIED identity emits the RESOLVED source alias —
+    * so the persisted contract stays in operational-identity space even when
+    * the body pinned the source by a Fabric-visible alias — while the clause is
+    * the user's verbatim pin. When no pin resolved (unpinned body, or an
+    * un-maintainable pin shape that lifts no pin), this defers to the source-name
+    * telemetry, which reports `NOT_APPLICABLE` or the shape refusal exactly as
+    * before.
     */
-  private[compiler] def pinTelemetry(
+  private[spark] def pinTelemetry(
       sql: String,
       operationalSources: Seq[String],
       resolvedPins: Seq[ResolvedSnapshotPin]
   ): PinTelemetry =
-    pinTelemetry(sql, operationalSources)
+    if (resolvedPins.isEmpty) pinTelemetry(sql, operationalSources)
+    else
+      PinTelemetry(
+        TimeTravelPinStatus.Applied,
+        resolvedPins.map(resolved => s"${resolved.emitsResolved}=${resolved.pin.clause}").distinct.sorted,
+        TimeTravelPinReason.PinsResolved,
+        None
+      )
 
-  private[compiler] def pinTelemetry(
+  private[spark] def pinTelemetry(
       sql: String,
       operationalSources: Seq[String],
       resolvedPins: Seq[ResolvedSnapshotPin],
       persistedPins: Seq[ResolvedSnapshotPin]
   ): PinTelemetry =
-    pinTelemetry(sql, operationalSources)
+    pinTelemetry(sql, operationalSources, resolvedPins)
 
-  private[compiler] def pinTelemetry(
+  private[spark] def pinTelemetry(
       sql: String,
       bindings: ResolvedSnapshotPinBindings,
       persistedPins: Seq[ResolvedSnapshotPin]
   ): PinTelemetry =
-    pinTelemetry(sql, bindings.sourceTables)
+    pinTelemetry(sql, bindings.sourceTables, bindings.pins)
 
-  /** Test-only validation seam; physical-identity checks are intentionally not
-    * implemented yet.
+  /** Validate a body's already-resolved snapshot pins against the view's
+    * operational sources and (on REFRESH/ADVANCE) the physical identities
+    * persisted at CREATE. Every failure is explicit and returned as a `Left`
+    * BEFORE any staging/metadata mutation — a pin ambiguity or drift is never
+    * demoted to a silent FULL_REFRESH.
+    *
+    * Rejections, in order:
+    *   - two pinned sources whose compiler short (last identifier segment)
+    *     collide: the short-keyed compile map cannot carry both, so bind neither;
+    *   - a pinned source that is not one of the view's tracked operational
+    *     sources (a namespace rebind that a suffix match would have silently
+    *     accepted against a different relation);
+    *   - on REFRESH/ADVANCE, a pinned source whose CREATE-time physical identity
+    *     was never persisted (legacy view — requires recreation), or whose
+    *     `DeltaLog.dataPath` or Delta `metadata.id` changed since CREATE
+    *     (drop/recreate or repoint of the frozen relation).
+    * CREATE persists the identities and therefore has nothing to compare against.
     */
-  private[compiler] def validateResolvedSnapshotPins(
+  private val ZeroUuid = "00000000-0000-0000-0000-000000000000"
+
+  private[spark] def validateResolvedSnapshotPins(
       operation: PinIdentityOperation,
       bindings: ResolvedSnapshotPinBindings,
       persistedPins: Option[Seq[ResolvedSnapshotPin]]
-  ): Either[String, Unit] =
-    Right(())
+  ): Either[String, Unit] = {
+    // Upstream physical-resolution failures (resolution exception, cross-version
+    // canonical-clause conflict, ...) hard-fail before any compile/CTAS.
+    bindings.resolutionFailures.headOption.foreach(failure => return Left(failure.detail))
 
-  /** Test-only structured-property seam; persistence is intentionally not
-    * implemented yet.
+    val resolvedPins       = bindings.pins
+    val operationalSources = bindings.sourceIdentities
+    if (resolvedPins.isEmpty) return Right(())
+
+    val identityByAlias = operationalSources.map(identity => identity.alias -> identity).toMap
+    val pinnedAliases   = resolvedPins.map(_.operationalSource.alias).distinct
+
+    // Every pinned source must carry a complete, non-degenerate physical identity.
+    pinnedAliases.foreach { alias =>
+      identityByAlias.get(alias).foreach { identity =>
+        if (identity.deltaLogDataPath.trim.isEmpty)
+          return Left(s"the pinned source '$alias' has no verified DeltaLog.dataPath; recreate the materialized view")
+        if (identity.deltaTableMetadataId.trim.isEmpty)
+          return Left(s"the pinned source '$alias' has no verified Delta metadata.id; recreate the materialized view")
+        if (identity.deltaTableMetadataId == ZeroUuid)
+          return Left(
+            s"the pinned source '$alias' resolved to the zero Delta metadata.id; recreate the materialized view"
+          )
+      }
+    }
+
+    // Two DISTINCT operational sources that resolve to one physical path are an
+    // ambiguous physical resolution and cannot be frozen safely.
+    operationalSources
+      .filter(_.deltaLogDataPath.trim.nonEmpty)
+      .groupBy(_.deltaLogDataPath)
+      .collectFirst { case (path, group) if group.map(_.alias).distinct.size > 1 => path }
+      .foreach { path =>
+        return Left(
+          s"an ambiguous physical resolution maps more than one tracked source to the Delta path '$path'; " +
+            "recreate the affected views"
+        )
+      }
+
+    // Duplicate compiler short over ALL operational sources keyed by physical
+    // identity: a pinned `a.foo` fused with a live `b.foo` under one short fails,
+    // while a self-join of one physical source is allowed.
+    def distinctSourceKey(identity: SourceIdentity): String =
+      if (identity.deltaLogDataPath.nonEmpty)
+        s"${identity.deltaLogDataPath}\u0000${identity.deltaTableMetadataId}"
+      else identity.alias
+    operationalSources
+      .groupBy(identity => identifierSegments(identity.alias).last)
+      .collectFirst { case (shortName, group) if group.map(distinctSourceKey).distinct.size > 1 => shortName }
+      .foreach { shortName =>
+        return Left(
+          s"the duplicate short name '$shortName' spans more than one distinct physical source; " +
+            "recreate the affected views so each source has a distinct short name"
+        )
+      }
+
+    val tracked = bindings.sourceTables.toSet
+    resolvedPins
+      .find(resolved => !tracked.contains(resolved.operationalSource.alias))
+      .foreach { resolved =>
+        return Left(
+          s"the pinned source '${resolved.operationalSource.alias}' is not one of the view's tracked " +
+            "operational sources; its snapshot pin cannot be honored"
+        )
+      }
+
+    // Canonicalize repeated pins only when SAME physical (path + id) AND SAME
+    // canonical clause; a single physical source read at more than one snapshot
+    // is a cross-version conflict.
+    val byPhysicalSource = resolvedPins.groupBy(resolved =>
+      (resolved.operationalSource.deltaLogDataPath, resolved.operationalSource.deltaTableMetadataId)
+    )
+    byPhysicalSource
+      .collectFirst {
+        case (_, group) if group.map(g => canonicalPinValue(g.pin.clause)).distinct.size > 1 => group.head
+      }
+      .foreach { conflicting =>
+        return Left(
+          s"the pinned source '${conflicting.operationalSource.alias}' is read at more than one snapshot; " +
+            "a single physical source cannot be frozen at two canonical clauses"
+        )
+      }
+    val canonicalPins = byPhysicalSource.values.map(_.head).toVector
+
+    operation match {
+      case PinIdentityOperation.Create | PinIdentityOperation.DryCompile | PinIdentityOperation.DryRewrite =>
+        Right(())
+      case PinIdentityOperation.IdempotentCreate | PinIdentityOperation.Refresh | PinIdentityOperation.Advance =>
+        persistedPins match {
+          case None =>
+            Left(
+              "this materialized view predates persisted pinned-source physical identities; " +
+                "recreate the materialized view to establish them before it can refresh incrementally"
+            )
+          case Some(persisted) =>
+            val currentByAlias =
+              canonicalPins.map(resolved => resolved.operationalSource.alias -> resolved.operationalSource).toMap
+            val persistedByAlias =
+              persisted.map(resolved => resolved.operationalSource.alias -> resolved.operationalSource).toMap
+            val missing = currentByAlias.keySet -- persistedByAlias.keySet
+            val stale   = persistedByAlias.keySet -- currentByAlias.keySet
+            if (missing.nonEmpty)
+              Left(
+                s"the pinned source(s) ${missing.toSeq.sorted.mkString(", ")} have no persisted physical " +
+                  "identity; recreate the materialized view"
+              )
+            else if (stale.nonEmpty)
+              Left(
+                s"the persisted pinned-source identities ${stale.toSeq.sorted.mkString(", ")} no longer match " +
+                  "the view body; recreate the materialized view"
+              )
+            else {
+              currentByAlias.foreach { case (alias, current) =>
+                val prior = persistedByAlias(alias)
+                if (current.deltaLogDataPath != prior.deltaLogDataPath)
+                  return Left(
+                    s"the pinned source '$alias' DeltaLog.dataPath changed since CREATE " +
+                      s"(was '${prior.deltaLogDataPath}', now '${current.deltaLogDataPath}'); " +
+                      "recreate the materialized view"
+                  )
+                if (current.deltaTableMetadataId != prior.deltaTableMetadataId)
+                  return Left(
+                    s"the pinned source '$alias' Delta metadata.id changed since CREATE " +
+                      s"(was '${prior.deltaTableMetadataId}', now '${current.deltaTableMetadataId}'); " +
+                      "recreate the materialized view"
+                  )
+              }
+              Right(())
+            }
+        }
+    }
+  }
+
+  /** Property key under which the CREATE-time physical identities of a view's
+    * pinned sources are persisted. Read back at REFRESH/ADVANCE to detect a
+    * drop/recreate or repoint of a frozen relation.
     */
-  private[compiler] val PinnedSourceIdentitiesPropertyKey: String =
-    "_ivm_pinned_source_identities"
-  private[compiler] val MaxPinnedSourceIdentitiesPropertyBytes: Int = 65536
+  val PinnedSourceIdentitiesPropertyKey: String = "_ivm_pinned_source_identities"
 
-  private[compiler] def pinnedSourceIdentityProperties(
-      bindings: ResolvedSnapshotPinBindings
-  ): Map[String, String] =
-    Map.empty
+  /** Upper bound (bytes) on the serialized identity property so a pathological
+    * source count can never bloat the catalog row, and the reader never parses
+    * an oversize blob. */
+  private[spark] val MaxPinnedSourceIdentitiesPropertyBytes: Int = 65536
 
-  private[compiler] def readPinnedSourceIdentityProperties(
+  private val PinIdentityJson = new ObjectMapper()
+
+  private val CanonicalVersionClause = """^VERSION AS OF (\d+)$""".r
+
+  private val KnownIdentityFields: Set[String] =
+    Set("alias", "deltaLogDataPath", "deltaTableMetadataId", "pinRef", "pinSegments", "version", "timestamp", "clause")
+
+  private def utf8Length(s: String): Int = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+
+  /** Serialize the physical identities of a view's resolved pinned sources into
+    * one deterministic structured property, canonically ordered by resolved
+    * source. A canonical `VERSION AS OF <n>` persists an integer `version`, a
+    * `TIMESTAMP AS OF '<literal>'` persists the literal under `timestamp`, and
+    * any other shape persists its verbatim `clause` — so every pin kind
+    * round-trips exactly.
+    */
+  private[spark] def pinnedSourceIdentityProperties(bindings: ResolvedSnapshotPinBindings): Map[String, String] = {
+    if (bindings.pins.isEmpty) return Map.empty
+    val ordered = bindings.pins.sortBy(_.operationalSource.alias)
+    val array   = PinIdentityJson.createArrayNode()
+    ordered.foreach { resolved =>
+      val node = array.addObject()
+      node.put("alias", resolved.operationalSource.alias)
+      node.put("deltaLogDataPath", resolved.operationalSource.deltaLogDataPath)
+      node.put("deltaTableMetadataId", resolved.operationalSource.deltaTableMetadataId)
+      node.put("pinRef", resolved.pin.tableRef)
+      val segments = node.putArray("pinSegments")
+      resolved.pin.segments.foreach(segments.add)
+      resolved.pin.clause.trim match {
+        case CanonicalVersionClause(version) => node.put("version", version.toLong)
+        case AnyTimestampClause(timestamp)   => node.put("timestamp", timestamp.trim.stripPrefix("'").stripSuffix("'"))
+        case other                           => node.put("clause", other)
+      }
+    }
+    val serialized = PinIdentityJson.writeValueAsString(array)
+    if (utf8Length(serialized) > MaxPinnedSourceIdentitiesPropertyBytes)
+      throw new IllegalStateException(
+        s"persisted pinned source identities exceed the $MaxPinnedSourceIdentitiesPropertyBytes-byte size limit"
+      )
+    Map(PinnedSourceIdentitiesPropertyKey -> serialized)
+  }
+
+  /** Inverse of [[pinnedSourceIdentityProperties]], cross-checked against the
+    * view's CURRENT bindings. Rejects, with a specific reason, an absent
+    * property, an oversize blob, a malformed/non-array/non-object value, an
+    * unexpected extra field, a missing field, a duplicate alias or pin
+    * reference, or a stale entry whose alias is no longer a tracked source.
+    */
+  private[spark] def readPinnedSourceIdentityProperties(
       properties: Map[String, String],
       currentBindings: ResolvedSnapshotPinBindings
   ): Either[String, Seq[ResolvedSnapshotPin]] =
-    Left("pinned source identities are not implemented")
-
-  private[compiler] def bindingFor(
-      bindings: ResolvedSnapshotPinBindings,
-      site: BindingSite
-  ): ResolvedSnapshotPinBindings =
-    bindings
-
-  private[compiler] def rewriteSnapshotPinsByDataPath(
-      sql: String,
-      bindings: ResolvedSnapshotPinBindings,
-      persistedPins: Seq[ResolvedSnapshotPin]
-  ): Either[String, String] =
-    Left("path-bound snapshot pin rewriting is not implemented")
-
-  private[compiler] def rewritePinnedReadSurface(
-      surface: PinRewriteSurface,
-      sql: String,
-      bindings: ResolvedSnapshotPinBindings,
-      persistedPins: Seq[ResolvedSnapshotPin]
-  ): Either[String, PathBoundRewrite] =
-    Left("path-bound surface rewriting is not implemented")
-
-  private[compiler] def rewriteEmittedSnapshotPinsByDataPath(
-      emittedSql: Seq[String],
-      bindings: ResolvedSnapshotPinBindings,
-      persistedPins: Seq[ResolvedSnapshotPin]
-  ): Either[String, Seq[String]] =
-    Left("path-bound emitted SQL rewriting is not implemented")
-
-  private[compiler] def verifySnapshotPinBindingsAt(
-      operation: PinIdentityOperation,
-      checkpoint: PinBindingCheckpoint,
-      bindings: ResolvedSnapshotPinBindings,
-      persistedPins: Seq[ResolvedSnapshotPin]
-  ): Either[PinBindingCheckpointFailure, Unit] =
-    Right(())
-
-  /** Status component of [[pinTelemetry]]. */
+    properties.get(PinnedSourceIdentitiesPropertyKey) match {
+      case None => Left("missing persisted pinned source identities")
+      case Some(json) if utf8Length(json) > MaxPinnedSourceIdentitiesPropertyBytes =>
+        Left("persisted pinned source identities exceed the byte size limit")
+      case Some(json) =>
+        try {
+          val root = PinIdentityJson.readTree(json)
+          if (root == null || root.isNull || !root.isArray)
+            Left("persisted pinned source identities must be a JSON array of objects")
+          else {
+            def textField(node: com.fasterxml.jackson.databind.JsonNode, field: String): Either[String, String] = {
+              val value = node.get(field)
+              if (value == null || !value.isTextual || value.asText().trim.isEmpty)
+                Left(s"persisted pinned source identity is missing a non-blank '$field'")
+              else Right(value.asText())
+            }
+            def unknownField(node: com.fasterxml.jackson.databind.JsonNode): Option[String] = {
+              val it                    = node.fieldNames()
+              var found: Option[String] = None
+              while (it.hasNext && found.isEmpty) {
+                val name = it.next()
+                if (!KnownIdentityFields.contains(name)) found = Some(name)
+              }
+              found
+            }
+            val parsed =
+              (0 until root.size()).foldLeft[Either[String, Vector[ResolvedSnapshotPin]]](Right(Vector.empty)) {
+                (accEither, i) =>
+                  accEither.flatMap { acc =>
+                    val node = root.get(i)
+                    if (node == null || !node.isObject)
+                      Left("persisted pinned source identity is not an object")
+                    else
+                      unknownField(node) match {
+                        case Some(name) =>
+                          Left(s"persisted pinned source identity has an extra unexpected field '$name'")
+                        case None =>
+                          for {
+                            alias    <- textField(node, "alias")
+                            dataPath <- textField(node, "deltaLogDataPath")
+                            metaId   <- textField(node, "deltaTableMetadataId")
+                            pinRef   <- textField(node, "pinRef")
+                            clause <- {
+                              val versionNode   = node.get("version")
+                              val timestampNode = node.get("timestamp")
+                              val clauseNode    = node.get("clause")
+                              if (versionNode != null && versionNode.isIntegralNumber)
+                                Right(s"VERSION AS OF ${versionNode.asLong()}")
+                              else if (
+                                timestampNode != null && timestampNode.isTextual && timestampNode.asText().trim.nonEmpty
+                              )
+                                Right(s"TIMESTAMP AS OF '${timestampNode.asText()}'")
+                              else if (clauseNode != null && clauseNode.isTextual && clauseNode.asText().trim.nonEmpty)
+                                Right(clauseNode.asText())
+                              else
+                                Left("persisted pinned source identity has neither a version, timestamp, nor clause")
+                            }
+                          } yield acc :+ ResolvedSnapshotPin(
+                            SnapshotPin(pinRef, clause),
+                            SourceIdentity(pinRef, dataPath, metaId),
+                            SourceIdentity(alias, dataPath, metaId)
+                          )
+                      }
+                  }
+              }
+            parsed.flatMap { pins =>
+              val aliases = pins.map(_.operationalSource.alias)
+              val pinRefs = pins.map(_.pin.tableRef)
+              val tracked = currentBindings.sourceTables.toSet
+              if (aliases.distinct.size != aliases.size)
+                Left("persisted pinned source identities repeat a duplicate alias")
+              else if (pinRefs.distinct.size != pinRefs.size)
+                Left("persisted pinned source identities repeat a duplicate pinRef")
+              else
+                pins.find(pin => !tracked.contains(pin.operationalSource.alias)) match {
+                  case Some(pin) =>
+                    Left(s"the persisted pinned source '${pin.operationalSource.alias}' is stale and no longer tracked")
+                  case None => Right(pins)
+                }
+            }
+          }
+        } catch {
+          case NonFatal(e) =>
+            Left(s"malformed persisted pinned source identities: ${e.getMessage}")
+        }
+    }
   def pinStatus(sql: String, qualifiedSources: Seq[String]): String =
     pinTelemetry(sql, qualifiedSources).status
 
@@ -718,33 +1221,164 @@ object SparkTimeTravelSql {
       )
   }
 
-  /** Test-only observation seam paired with [[pinTelemetry]] for ADVANCE SOURCE
-    * VERSIONS.
+  /** ADVANCE SOURCE VERSIONS over an already-verified physical-identity binding.
+    *
+    * Mirrors [[repinVersions]] but maps each pinned relation to its RESOLVED
+    * operational source through `resolvedPins` (keyed by the exact, case- and
+    * quote-preserving table reference the scanner lifted), and resolves each
+    * externally requested identifier through the SAME binding by the SQL-visible
+    * reference the user wrote — never by leaf-matching the request against raw
+    * operational names. Current/target versions and the emitted pin identities
+    * are keyed by the resolved operational source.
     */
-  private[compiler] def repinVersions(
-      sql: String,
-      operationalSources: Seq[String],
-      resolvedPins: Seq[ResolvedSnapshotPin],
-      requestedVersions: Map[String, Long]
-  ): Either[String, VersionRepin] =
-    repinVersions(sql, operationalSources, requestedVersions)
-
-  private[compiler] def repinVersions(
+  private[spark] def repinVersions(
       sql: String,
       bindings: ResolvedSnapshotPinBindings,
       persistedPins: Seq[ResolvedSnapshotPin],
       requestedVersions: Map[String, Long]
-  ): Either[String, VersionRepin] =
-    repinVersions(sql, bindings.sourceTables, requestedVersions)
+  ): Either[String, VersionRepin] = {
+    // Resolve each requested identifier by EXACT match to a persisted pinned
+    // source (its SQL-visible pin reference or resolved alias). External input is
+    // never suffix- or case-matched.
+    val resolvedRequest =
+      requestedVersions.toSeq.foldLeft[Either[String, Map[String, Long]]](Right(Map.empty)) { (accEither, entry) =>
+        accEither.flatMap { acc =>
+          val (requestedSource, version) = entry
+          val requestedSegments          = identifierSegments(requestedSource)
+          val matches = persistedPins
+            .filter { pin =>
+              pin.pin.segments == requestedSegments ||
+              identifierSegments(pin.operationalSource.alias) == requestedSegments
+            }
+            .map(_.operationalSource.alias)
+            .distinct
+          if (matches.size != 1)
+            Left(
+              s"the advance source identifier '$requestedSource' does not match exactly one persisted pinned source " +
+                "by physical identity"
+            )
+          else Right(acc + (matches.head -> version))
+        }
+      }
+    resolvedRequest.flatMap(request => repinVersionsResolved(sql, bindings.pins, request))
+  }
 
-  private[compiler] def repinVersions(
+  private[spark] def repinVersions(
+      sql: String,
+      operationalSources: Seq[String],
+      resolvedPins: Seq[ResolvedSnapshotPin],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] =
+    repinVersionsResolved(sql, resolvedPins, requestedVersions)
+
+  private[spark] def repinVersions(
       sql: String,
       operationalSources: Seq[String],
       resolvedPins: Seq[ResolvedSnapshotPin],
       persistedPins: Seq[ResolvedSnapshotPin],
       requestedVersions: Map[String, Long]
   ): Either[String, VersionRepin] =
-    repinVersions(sql, operationalSources, requestedVersions)
+    repinVersionsResolved(sql, resolvedPins, requestedVersions)
+
+  private def repinVersionsResolved(
+      sql: String,
+      resolvedPins: Seq[ResolvedSnapshotPin],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] = {
+    val validatedSplit = split(sql)
+    if (validatedSplit.pins.isEmpty)
+      return Left("the materialized-view query has no supported immutable VERSION AS OF source pins")
+
+    val scanned = scan(sql)
+    if (
+      scanned.refs.isEmpty ||
+      !pinsAreUnambiguous(scanned.refs) ||
+      !verifiesAgainstSparkParser(sql, scanned.sql, scanned.refs)
+    )
+      return Left("the materialized-view query contains an unsupported or ambiguous source pin shape")
+
+    if (scanned.refs.exists(_.kind != VersionKind))
+      return Left("only VERSION AS OF pins can be advanced; TIMESTAMP AS OF pins are not supported")
+
+    val operationalByPinRef =
+      resolvedPins.map(resolved => resolved.pin.tableRef -> resolved.operationalSource.alias).toMap
+
+    val resolvedRefs = scanned.refs.map { ref =>
+      val source = operationalByPinRef.getOrElse(
+        ref.pin.tableRef,
+        return Left(s"the pin on '${ref.pin.tableRef}' has no resolved operational source identity")
+      )
+      val version =
+        scala.util.Try(ref.value.toLong).toOption.filter(_ >= 0L).getOrElse {
+          return Left(s"the VERSION AS OF value '${ref.value}' on '${ref.pin.tableRef}' is not a non-negative integer")
+        }
+      (ref, source, version)
+    }
+
+    val currentVersions = resolvedRefs
+      .groupBy(_._2)
+      .map { case (source, refs) =>
+        val values = refs.map(_._3).distinct
+        if (values.size != 1)
+          return Left(s"the tracked source '$source' is read at multiple VERSION AS OF values")
+        source -> values.head
+      }
+
+    val resolvedRequested = requestedVersions.toSeq.map { case (requestedSource, version) =>
+      if (version < 0L)
+        return Left(s"the requested version for '$requestedSource' must be non-negative")
+      val requestedSegments = identifierSegments(requestedSource)
+      // Exact segment match only (no suffix): a request identifier names the
+      // pin's SQL-visible reference or its resolved operational alias exactly.
+      val matches = resolvedPins
+        .filter { resolved =>
+          resolved.pin.segments == requestedSegments ||
+          identifierSegments(resolved.operationalSource.alias) == requestedSegments
+        }
+        .map(_.operationalSource.alias)
+        .distinct
+      if (matches.size != 1)
+        return Left(
+          s"the requested source '$requestedSource' resolves to ${matches.size} tracked sources; expected exactly one"
+        )
+      matches.head -> version
+    }
+    val duplicateRequested = resolvedRequested.groupBy(_._1).collectFirst {
+      case (source, entries) if entries.size > 1 =>
+        source
+    }
+    duplicateRequested.foreach(source => return Left(s"the requested version map names '$source' more than once"))
+    val targetVersions = resolvedRequested.toMap
+
+    val missing = currentVersions.keySet -- targetVersions.keySet
+    val extra   = targetVersions.keySet -- currentVersions.keySet
+    if (missing.nonEmpty || extra.nonEmpty)
+      return Left(
+        s"the requested version map must cover all and only pinned sources " +
+          s"(missing: ${missing.toSeq.sorted.mkString(", ")}; extra: ${extra.toSeq.sorted.mkString(", ")})"
+      )
+
+    currentVersions.toSeq.sortBy(_._1).foreach { case (source, current) =>
+      val target = targetVersions(source)
+      if (target < current)
+        return Left(s"the requested version for '$source' moves backwards from $current to $target")
+    }
+
+    val rewritten = new StringBuilder(sql)
+    resolvedRefs.sortBy(_._1.clauseStart).reverse.foreach { case (ref, source, _) =>
+      rewritten.replace(ref.clauseStart, ref.clauseEnd, s"VERSION AS OF ${targetVersions(source)}")
+    }
+    val querySql = rewritten.toString
+    val pins     = targetVersions.toSeq.map { case (source, version) => s"$source=VERSION AS OF $version" }.sorted
+    Right(
+      VersionRepin(
+        querySql = querySql,
+        currentVersions = currentVersions,
+        targetVersions = targetVersions,
+        pins = pins
+      )
+    )
+  }
 
   private def unresolvedPins(pins: Seq[SnapshotPin], qualifiedSources: Seq[String]): Seq[SnapshotPin] = {
     val sources = qualifiedSources.distinct
@@ -768,7 +1402,18 @@ object SparkTimeTravelSql {
   /** Unquoted, lower-cased dot-separated segments of a (possibly backtick- or
     * double-quote-quoted) table reference.
     */
-  private[compiler] def identifierSegments(tableRef: String): Seq[String] = {
+  private[compiler] def identifierSegments(tableRef: String): Seq[String] =
+    caseSensitiveSegments(tableRef).map(_.toLowerCase(Locale.ROOT))
+
+  /** Like [[identifierSegments]] but case-preserving. Two references name the
+    * same relation for the lower-cased suffix match Spark's default
+    * case-insensitive resolution performs, but in a case-sensitive catalog
+    * (Fabric Warehouse) `Foo` and `foo` are distinct physical tables. The
+    * ambiguity check groups by this case-preserved chain so two differently
+    * cased pins are kept apart instead of being collapsed into one relation
+    * read at two versions.
+    */
+  private def caseSensitiveSegments(tableRef: String): Seq[String] = {
     val segments = scala.collection.mutable.ArrayBuffer.empty[String]
     val current  = new StringBuilder
     var i        = 0
@@ -785,10 +1430,17 @@ object SparkTimeTravelSql {
       else { current += c; i += 1 }
     }
     segments += current.toString
-    segments.map(_.trim.toLowerCase(Locale.ROOT)).toVector
+    segments.map(_.trim).toVector
   }
 
-  // ── Scanner ────────────────────────────────────────────────────────────────
+  /** The unquoted, case-preserved, dot-joined qualifier of a (possibly quoted)
+    * table reference — the form the compile bridge's `stripDbQualifiers` matches
+    * after `stripSparkBacktickIdentifiers` removes the body's backticks. Used to
+    * overlay a pinned source's SQL-visible qualifier into the compiler
+    * `sourceQualifiedNames` map without carrying quoting into the body text.
+    */
+  private[spark] def sqlVisibleQualifier(tableRef: String): String =
+    caseSensitiveSegments(tableRef).mkString(".")
 
   /** Locate and elide every temporal clause outside string literals, quoted
     * identifiers and comments. Pure text surgery — validated by [[split]].

@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
@@ -393,6 +394,15 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/** A pinned Delta source was dropped/recreated or repointed between identity
+  * verification and the read that consumes it. Distinct and non-retryable: it
+  * must be thrown OUTSIDE any CTAS/apply retry (never a `Throwable -> Left`
+  * path) so the outer owned-artifact cleanup / Delta RESTORE runs and it is
+  * never demoted to FULL_REFRESH.
+  */
+private[commands] final class SourceIdentityRebindingException(message: String) extends RuntimeException(message)
+
 private[commands] object MvCommandHelper {
 
   /** Upper bound on `compiled.sql` length for which the SIMPLE_PROJECTION
@@ -439,6 +449,271 @@ private[commands] object MvCommandHelper {
   /** Fully-qualified dot-separated name used in MvMetadata and SQL strings. */
   def metaName(id: TableIdentifier): String =
     id.database.fold(id.table)(db => s"$db.${id.table}")
+
+  /** The verified friendly<->resolved snapshot-pin binding for one command.
+    *
+    * `resolvedPins` associate each pinned relation in the body to its RESOLVED
+    * operational source by physical Delta identity; `friendlyByShort` is the
+    * compiler `shortToQual` overlay that points each pinned short name at the
+    * SQL-visible qualifier the user wrote (so `stripDbQualifiers` matches the
+    * body on a Fabric alias), leaving unpinned entries at their resolved name.
+    * When the body has no maintainable pin, `resolvedPins` is empty and
+    * `friendlyByShort` is `shortToQual` unchanged.
+    */
+  final case class PinnedSourceBinding(
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin],
+      operationalIdentities: Seq[SparkTimeTravelSql.SourceIdentity],
+      friendlyByShort: Map[String, String]
+  )
+
+  private def normalizeDeltaPath(path: Path): String =
+    path.toUri.normalize().toString.stripSuffix("/")
+
+  /** Physical identity `(normalized DeltaLog.dataPath, Delta metadata id)` of a
+    * table reference, or `None` when it is not a readable committed Delta table.
+    * `DeltaLog.update()` lists the log segment only (no Spark job), the same read
+    * the snapshot-pin version lookup already performs.
+    */
+  def deltaPhysicalIdentity(spark: SparkSession, tableRef: String): Option[(String, String)] =
+    try {
+      val ident    = spark.sessionState.sqlParser.parseTableIdentifier(tableRef)
+      val log      = DeltaLog.forTable(spark, ident)
+      val snapshot = log.update()
+      if (snapshot.version < 0L) None
+      else Some((normalizeDeltaPath(log.dataPath), snapshot.metadata.id))
+    } catch { case NonFatal(_) => None }
+
+  /** Resolve the snapshot pins in `querySql` to their operational sources by
+    * physical Delta identity, ONCE per command. The single result is threaded to
+    * both the compiler `sourceQualifiedNames` overlay and every pin API so
+    * coverage is structural rather than per-site. Association is by matched
+    * normalized dataPath AND Delta metadata id, so a Fabric SQL-visible alias
+    * binds to its encoded operational source and two distinct same-leaf sources
+    * stay distinct. If any pin fails to associate to exactly one tracked source
+    * the binding is empty, so the caller falls back to source-name telemetry
+    * (which keeps an un-maintainable pin as FULL_REFRESH); the explicit
+    * hard-fail cases (duplicate short, rebind, legacy-missing-identity) are
+    * enforced by [[SparkTimeTravelSql.validateResolvedSnapshotPins]].
+    */
+  /** Tri-state resolution of the body's snapshot pins to their operational
+    * sources by physical Delta identity. `NoPin` means the body pins nothing;
+    * `Verified` carries the resolved pins plus every tracked source's physical
+    * identity; `Failure` means the body pins something that cannot be verified
+    * (unreadable Delta target, or a pin that resolves to zero or several tracked
+    * sources) and MUST hard-fail before any compile/CTAS/delta/metadata.
+    */
+  sealed trait PinResolution
+  object PinResolution {
+    case object NoPin extends PinResolution
+    final case class Verified(
+        resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin],
+        operationalIdentities: Seq[SparkTimeTravelSql.SourceIdentity]
+    ) extends PinResolution
+    final case class Failure(reason: String) extends PinResolution
+  }
+
+  def resolvePinnedSources(
+      spark: SparkSession,
+      querySql: String,
+      resolvedSources: Seq[String]
+  ): PinResolution = {
+    val pins = SparkTimeTravelSql.split(querySql).pins
+    if (pins.isEmpty) return PinResolution.NoPin
+
+    val operationalIdentities = resolvedSources.map { source =>
+      val physical = deltaPhysicalIdentity(spark, source)
+      SparkTimeTravelSql.SourceIdentity(
+        source,
+        physical.map(_._1).getOrElse(""),
+        physical.map(_._2).getOrElse("")
+      )
+    }
+
+    val resolved =
+      pins.foldLeft[Either[String, Vector[SparkTimeTravelSql.ResolvedSnapshotPin]]](Right(Vector.empty)) {
+        (accEither, pin) =>
+          accEither.flatMap { acc =>
+            deltaPhysicalIdentity(spark, pin.tableRef) match {
+              case None =>
+                Left(s"the pinned source '${pin.tableRef}' is not a readable committed Delta table")
+              case Some((pinPath, pinId)) =>
+                operationalIdentities.filter(id =>
+                  id.deltaLogDataPath.nonEmpty && id.deltaLogDataPath == pinPath && id.deltaTableMetadataId == pinId
+                ) match {
+                  case Seq(op) =>
+                    Right(
+                      acc :+ SparkTimeTravelSql.ResolvedSnapshotPin(
+                        pin,
+                        SparkTimeTravelSql.SourceIdentity(pin.tableRef, op.deltaLogDataPath, op.deltaTableMetadataId),
+                        op
+                      )
+                    )
+                  case Seq() =>
+                    Left(
+                      s"the pinned source '${pin.tableRef}' does not resolve to any tracked source by physical " +
+                        "Delta identity"
+                    )
+                  case many =>
+                    Left(
+                      s"the pinned source '${pin.tableRef}' resolves to ${many.size} tracked sources by physical " +
+                        "Delta identity; expected exactly one"
+                    )
+                }
+            }
+          }
+      }
+    resolved match {
+      case Right(resolvedPins) => PinResolution.Verified(resolvedPins, operationalIdentities)
+      case Left(reason)        => PinResolution.Failure(reason)
+    }
+  }
+
+  /** Overlay a compiler `shortToQual` map so every PINNED short name points at
+    * the SQL-visible qualifier the user wrote (matching the body text a Fabric
+    * alias produced), leaving unpinned entries at their resolved name. Re-derived
+    * at each compile site from the same resolved pins so CREATE and every REFRESH
+    * recompile agree.
+    */
+  def friendlyShortToQual(
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin],
+      shortToQual: Map[String, String]
+  ): Map[String, String] =
+    shortToQual.map { case (short, resolved) =>
+      resolvedPins
+        .find(_.operationalSource.alias == resolved)
+        .map(pin => short -> SparkTimeTravelSql.sqlVisibleQualifier(pin.sqlVisibleSource.alias))
+        .getOrElse(short -> resolved)
+    }
+
+  private def pinBindingException(viewName: TableIdentifier, detail: String): AnalysisException =
+    new AnalysisException(
+      "_LEGACY_ERROR_TEMP_2273",
+      Map("message" -> s"Materialized view '${metaName(viewName)}' cannot maintain its snapshot pins: $detail")
+    )
+
+  /** Re-read the Delta `metadata.id` of every expected pinned source AT ITS
+    * VERIFIED PATH (never the logical alias) and compare it to the id captured
+    * when the binding was resolved/persisted. A mismatch (or an unreadable path)
+    * means the frozen relation was dropped/recreated or repointed and is a
+    * [[SourceIdentityRebindingException]] -- a distinct, non-retryable failure so
+    * a POST check thrown outside a CTAS/apply retry reaches the outer cleanup and
+    * is never demoted. `expected` is `(verifiedPath, expectedMetadataId)`.
+    */
+  def verifyPinnedSourceIdentitiesAtPath(
+      spark: SparkSession,
+      viewName: TableIdentifier,
+      expected: Seq[(String, String)]
+  ): Unit =
+    expected.foreach { case (path, expectedId) =>
+      val liveId =
+        try {
+          val log      = DeltaLog.forTable(spark, new Path(path))
+          val snapshot = log.update()
+          if (snapshot.version < 0L) None else Some(snapshot.metadata.id)
+        } catch { case NonFatal(_) => None }
+      liveId match {
+        case Some(id) if id == expectedId => ()
+        case Some(id) =>
+          throw new SourceIdentityRebindingException(
+            s"Materialized view '${metaName(viewName)}': the pinned Delta table at '$path' was recreated " +
+              s"(metadata.id changed from '$expectedId' to '$id') during the operation; it was rolled back"
+          )
+        case None =>
+          throw new SourceIdentityRebindingException(
+            s"Materialized view '${metaName(viewName)}': the pinned Delta table at '$path' is no longer readable " +
+              "during the operation; it was rolled back"
+          )
+      }
+    }
+
+  /** `(verifiedPath, metadataId)` pairs for a binding's resolved pins, for the
+    * PRE/POST path checks and the execution path-bind overlay. */
+  def pathIdentities(resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]): Seq[(String, String)] =
+    resolvedPins
+      .map(pin => pin.operationalSource.deltaLogDataPath -> pin.operationalSource.deltaTableMetadataId)
+      .distinct
+
+  /** The single validated binding API used by CREATE, idempotent CREATE,
+    * REFRESH, ADVANCE, and the dry compile/rewrite paths. Resolves the pins
+    * (tri-state), validates a `Verified` binding, and raises an
+    * [[AnalysisException]] (never an `OpenIvmCompileException`, so it is never
+    * demoted to FULL_REFRESH) BEFORE any compile/CTAS/delta/metadata on a
+    * resolution `Failure` or a contract violation. Never falls back to an empty
+    * binding for a pinned body.
+    */
+  def requirePinBinding(
+      spark: SparkSession,
+      operation: SparkTimeTravelSql.PinIdentityOperation,
+      viewName: TableIdentifier,
+      querySql: String,
+      resolvedSources: Seq[String],
+      shortToQual: Map[String, String],
+      persistedProperties: Map[String, String]
+  ): PinnedSourceBinding =
+    resolvePinnedSources(spark, querySql, resolvedSources) match {
+      case PinResolution.NoPin =>
+        PinnedSourceBinding(Seq.empty, Seq.empty, shortToQual)
+      case PinResolution.Failure(reason) =>
+        throw pinBindingException(viewName, reason)
+      case PinResolution.Verified(resolvedPins, operationalIdentities) =>
+        val currentBindings =
+          SparkTimeTravelSql.ResolvedSnapshotPinBindings(resolvedSources, operationalIdentities, resolvedPins)
+        val persistedPins =
+          SparkTimeTravelSql.readPinnedSourceIdentityProperties(persistedProperties, currentBindings).toOption
+        SparkTimeTravelSql
+          .validateResolvedSnapshotPins(operation, currentBindings, persistedPins)
+          .left
+          .foreach(detail => throw pinBindingException(viewName, detail))
+        PinnedSourceBinding(resolvedPins, operationalIdentities, friendlyShortToQual(resolvedPins, shortToQual))
+    }
+
+  /** Persisted pinned identities cross-checked against a source list, or None
+    * when the property is absent/undecodable. */
+  def persistedPinnedSources(
+      persistedProperties: Map[String, String],
+      resolvedSources: Seq[String]
+  ): Option[Seq[SparkTimeTravelSql.ResolvedSnapshotPin]] =
+    SparkTimeTravelSql
+      .readPinnedSourceIdentityProperties(
+        persistedProperties,
+        SparkTimeTravelSql.ResolvedSnapshotPinBindings(resolvedSources, Seq.empty, Seq.empty)
+      )
+      .toOption
+
+  /** Resolve each ADVANCE request identifier by physical Delta identity and map
+    * it to the RESOLVED operational alias of the persisted pinned source with the
+    * exact same dataPath + metadata.id. External input is never suffix-matched:
+    * a request that is not a readable Delta table, or does not match exactly one
+    * persisted pinned source, hard-fails before any version is moved.
+    */
+  def resolveAdvanceRequest(
+      spark: SparkSession,
+      viewName: TableIdentifier,
+      versionsBySource: Map[String, Long],
+      persistedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
+  ): Map[String, Long] =
+    versionsBySource.map { case (requestId, version) =>
+      val physical = deltaPhysicalIdentity(spark, requestId).getOrElse(
+        throw pinBindingException(
+          viewName,
+          s"the ADVANCE request source '$requestId' is not a readable committed Delta table"
+        )
+      )
+      val matches = persistedPins
+        .filter(pin =>
+          pin.operationalSource.deltaLogDataPath == physical._1 &&
+            pin.operationalSource.deltaTableMetadataId == physical._2
+        )
+        .map(_.operationalSource.alias)
+        .distinct
+      if (matches.size != 1)
+        throw pinBindingException(
+          viewName,
+          s"the ADVANCE request source '$requestId' resolves to ${matches.size} persisted pinned sources by " +
+            "physical Delta identity; expected exactly one"
+        )
+      matches.head -> version
+    }
 
   def telemetrySourceVersions(
       spark: SparkSession,
@@ -1500,6 +1775,24 @@ case class CreateMaterializedViewCommand(
         collectSourceSchemas(analyzed)
       }
 
+    // Resolve the body's snapshot pins to their operational sources by physical
+    // Delta identity ONCE, and reuse the result for the compiler overlay and
+    // every pin API below so coverage is structural. A duplicate pinned short
+    // (two distinct sources the compiler short namespace would fuse) hard-fails
+    // here -- before the initial CTAS or any persist -- never a silent
+    // FULL_REFRESH.
+    val pinBinding = profile.timeStep("create_resolve_pin_binding") {
+      requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.Create,
+        name,
+        originalQueryText,
+        qualNames,
+        shortToQual,
+        Map.empty
+      )
+    }
+
     // Validate that every source is configured correctly for the active
     // change-propagation mode (e.g. under CDF mode: requires
     // `delta.enableChangeDataFeed = true` on every source).  Fails fast at
@@ -1516,7 +1809,7 @@ case class CreateMaterializedViewCommand(
     // by CREATE and REFRESH alike, so the status is operation-invariant.
     // Recorded before the compile so a refused pin still reports its status on
     // the CREATE span.
-    val pinTelemetry = SparkTimeTravelSql.pinTelemetry(originalQueryText, qualNames)
+    val pinTelemetry = SparkTimeTravelSql.pinTelemetry(originalQueryText, qualNames, pinBinding.resolvedPins)
     OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(pinTelemetry.status, pinTelemetry.reason)
 
     // Extract GROUP BY keys and other optional metadata from the analyzed plan
@@ -1560,7 +1853,7 @@ case class CreateMaterializedViewCommand(
             viewName = name.table,
             viewSql = originalQueryText,
             sources = compileSchemas,
-            sourceQualifiedNames = shortToQual,
+            sourceQualifiedNames = pinBinding.friendlyByShort,
             facts = workloadFacts
           )
         )
@@ -1604,7 +1897,7 @@ case class CreateMaterializedViewCommand(
 
     val simpleProjectionHasDataApply: Boolean =
       profile.timeStep("create_simple_projection_check") {
-        computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
+        computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, pinBinding.friendlyByShort)
       }
 
     // Move the fingerprint computation below the upstream-MV enumeration so we
@@ -1793,6 +2086,17 @@ case class CreateMaterializedViewCommand(
     // from the generated delta statements, which never carry the clause.
     val timeTravelPinProps =
       MvMetadata.timeTravelPinProperties(pinTelemetry.status, pinTelemetry.pins, pinTelemetry.reason)
+    // Physical identity (normalized dataPath + Delta metadata id + version) of
+    // every resolved pinned source, so REFRESH/ADVANCE can detect a
+    // drop/recreate or repoint of a frozen relation independently of the pin
+    // clause text.
+    val pinIdentityProps = SparkTimeTravelSql.pinnedSourceIdentityProperties(
+      SparkTimeTravelSql.ResolvedSnapshotPinBindings(
+        qualNames,
+        pinBinding.operationalIdentities,
+        pinBinding.resolvedPins
+      )
+    )
 
     // Fingerprint the current source schemas + every upstream MV's identity
     // hash. Captures schema drift AND upstream-body drift (DROP + recreate
@@ -1852,7 +2156,7 @@ case class CreateMaterializedViewCommand(
     val userProps = properties - MvMetadata.BackingViewSuffixKey
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ compiledProps ++ watermarkProps
+        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++ watermarkProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -2132,7 +2436,16 @@ case class CreateMaterializedViewCommand(
       refreshReason = Some(refreshReason)
     )
 
-    val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables)
+    val reCreateBinding = requirePinBinding(
+      spark,
+      SparkTimeTravelSql.PinIdentityOperation.IdempotentCreate,
+      name,
+      meta.querySql,
+      meta.sourceTables,
+      Map.empty,
+      meta.properties
+    )
+    val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, reCreateBinding.resolvedPins)
     meta.timeTravelPinStatus.foreach { persisted =>
       val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
       if (persisted != derivedPin.status || !pinsAgree)
@@ -2264,6 +2577,7 @@ case class RefreshMaterializedViewCommand(
         MvMetadata.TimeTravelPinStatusKey,
         MvMetadata.TimeTravelPinsKey,
         MvMetadata.TimeTravelPinReasonKey,
+        SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey,
         MvMetadata.SourceVersionAdvancePreMvVersionKey,
         MvMetadata.SourceVersionAdvanceCascadePathKey
       )
@@ -2271,12 +2585,33 @@ case class RefreshMaterializedViewCommand(
       val retained = baseMeta.properties.filterNot { case (key, _) =>
         pinPropertyKeys.contains(key) || watermarkKeys.contains(key)
       }
+      // Advance the persisted physical identity by VERSION only: the frozen
+      // relation's dataPath/metadata.id are unchanged (a change was rejected
+      // before this point), so carry them forward and re-stamp just the version.
+      val advancedIdentityProps =
+        MvCommandHelper.persistedPinnedSources(baseMeta.properties, baseMeta.sourceTables) match {
+          case Some(pins) if pins.nonEmpty =>
+            SparkTimeTravelSql.pinnedSourceIdentityProperties(
+              SparkTimeTravelSql.ResolvedSnapshotPinBindings(
+                Seq.empty,
+                Seq.empty,
+                pins.map { pin =>
+                  repin.targetVersions
+                    .get(pin.operationalSource.alias)
+                    .map(version => pin.copy(pin = pin.pin.copy(clause = s"VERSION AS OF $version")))
+                    .getOrElse(pin)
+                }
+              )
+            )
+          case _ => Map.empty[String, String]
+        }
       val stableIdentity = originalMeta.properties
         .get(MvMetadata.DefinitionIdentityKey)
         .filter(_.nonEmpty)
         .getOrElse(MvCatalog.mvIdentity(originalMeta))
       val properties = retained ++
         Map(MvMetadata.DefinitionIdentityKey -> stableIdentity) ++
+        advancedIdentityProps ++
         MvMetadata.timeTravelPinProperties(
           TimeTravelPinStatus.Applied,
           repin.pins,
@@ -2351,8 +2686,40 @@ case class RefreshMaterializedViewCommand(
         )
       )
 
+    val advancePersistedPins =
+      MvCommandHelper.persistedPinnedSources(meta.properties, meta.sourceTables)
+    // ADVANCE requires each pinned source's live physical identity to still equal
+    // the one persisted at CREATE: a drop/recreate at a new dataPath/metadata.id
+    // is a rebind, not an advance, and is rejected before any version is moved.
+    val advanceBinding = MvCommandHelper.requirePinBinding(
+      spark,
+      SparkTimeTravelSql.PinIdentityOperation.Advance,
+      name,
+      meta.querySql,
+      meta.sourceTables,
+      Map.empty,
+      meta.properties
+    )
+    // Independently resolve every requested identifier by physical Delta identity
+    // (case/quote-preserving) and require it to name a persisted pinned source by
+    // exact dataPath + metadata.id; pass the resolved operational-alias mapping to
+    // repin so external input is never suffix-matched.
+    val resolvedRequest =
+      MvCommandHelper.resolveAdvanceRequest(
+        spark,
+        name,
+        request.versionsBySource,
+        advancePersistedPins.getOrElse(Seq.empty)
+      )
+
     val repin = SparkTimeTravelSql
-      .repinVersions(meta.querySql, meta.sourceTables, request.versionsBySource)
+      .repinVersions(
+        meta.querySql,
+        meta.sourceTables,
+        advanceBinding.resolvedPins,
+        advancePersistedPins.getOrElse(Seq.empty),
+        resolvedRequest
+      )
       .fold(
         detail =>
           throw new AnalysisException(
@@ -2631,7 +2998,24 @@ case class RefreshMaterializedViewCommand(
       // persisted status or pin identity that no longer matches the body means
       // the frozen relations are not what the recorded status claims — fail
       // closed rather than emit a status a hydrate guard would trust.
-      val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables)
+      //
+      // Re-resolve the body's pins to their operational sources by physical
+      // Delta identity (the same helper CREATE used) BEFORE the freeze and any
+      // delta collection. For a pinned view this proves the frozen relations are
+      // still the ones CREATE persisted: a duplicate short, a drop/recreate (new
+      // dataPath/metadata.id) or a legacy view lacking persisted identities
+      // hard-fails here.
+      val refreshBinding = MvCommandHelper.requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.Refresh,
+        name,
+        meta.querySql,
+        meta.sourceTables,
+        Map.empty,
+        meta.properties
+      )
+      val refreshResolvedPins = refreshBinding.resolvedPins
+      val derivedPin          = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, refreshResolvedPins)
       meta.timeTravelPinStatus.foreach { persisted =>
         val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
         if (persisted != derivedPin.status || !pinsAgree) {
@@ -2671,17 +3055,25 @@ case class RefreshMaterializedViewCommand(
       // here rather than persisted as extra metadata.
       val snapshotPinsByQualified: Map[String, String] =
         if (SparkTimeTravelSql.hasSnapshotPin(meta.querySql)) {
-          // Fail closed: a pin that does not bind to exactly one tracked source
-          // would leave that relation maintained from live rows while the user
-          // believes it is frozen.  Refuse the refresh instead.
-          val unresolved = SparkTimeTravelSql.unresolvedPins(meta.querySql, meta.sourceTables)
-          if (unresolved.nonEmpty) {
-            throw new IllegalStateException(
-              s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot maintain snapshot-pinned sources: " +
-                s"${unresolved.mkString("; ")}. Recreate the view with pins that name tracked sources."
-            )
+          if (refreshResolvedPins.nonEmpty)
+            // Frozen sources keyed by the RESOLVED operational source (a
+            // `meta.sourceTables` entry), matched by physical Delta identity so a
+            // Fabric alias freezes the correct encoded source.
+            refreshResolvedPins.map(pin => pin.emitsResolved -> pin.pin.clause).toMap
+          else {
+            // Fallback (pins could not be physically associated): preserve the
+            // suffix-match freeze. Fail closed: a pin that does not bind to
+            // exactly one tracked source would leave that relation maintained
+            // from live rows while the user believes it is frozen.
+            val unresolved = SparkTimeTravelSql.unresolvedPins(meta.querySql, meta.sourceTables)
+            if (unresolved.nonEmpty) {
+              throw new IllegalStateException(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot maintain snapshot-pinned sources: " +
+                  s"${unresolved.mkString("; ")}. Recreate the view with pins that name tracked sources."
+              )
+            }
+            SparkTimeTravelSql.pinsByQualifiedSource(meta.querySql, meta.sourceTables)
           }
-          SparkTimeTravelSql.pinsByQualifiedSource(meta.querySql, meta.sourceTables)
         } else Map.empty
       val frozenSources: Set[String] = snapshotPinsByQualified.keySet.map(_.toLowerCase)
       val executionSnapshotPinsByQualified: Map[String, String] =
@@ -3254,9 +3646,10 @@ case class RefreshMaterializedViewCommand(
       val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
         q.split("\\.").last -> schema
       }
-      val shortToQual: Map[String, String] = freshSchemas.map { case (q, _) =>
-        q.split("\\.").last -> q
-      }
+      val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
+        refreshResolvedPins,
+        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
+      )
       val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
       val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
       val cacheTierFacts = WorkloadFacts(

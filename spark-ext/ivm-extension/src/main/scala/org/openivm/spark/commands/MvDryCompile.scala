@@ -88,6 +88,19 @@ object MvDryCompile {
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       collectSourceSchemas(spark, queryText)
 
+    // Same centralized VALIDATED binding the CREATE/REFRESH paths use, so the dry
+    // classification resolves, validates, and compiles against the SQL-visible
+    // qualifiers a Fabric alias produces exactly as the real compile does -- a
+    // duplicate short or an unverifiable pin hard-fails here too.
+    val pinBinding = requirePinBinding(
+      spark,
+      SparkTimeTravelSql.PinIdentityOperation.Create,
+      name,
+      queryText,
+      qualNames,
+      shortToQual,
+      Map.empty
+    )
     val analyzed     = spark.sql(queryText).queryExecution.analyzed
     val outputSchema = spark.sql(queryText).schema
 
@@ -114,7 +127,7 @@ object MvDryCompile {
             viewName = name.table,
             viewSql = queryText,
             sources = compileSchemas,
-            sourceQualifiedNames = shortToQual,
+            sourceQualifiedNames = pinBinding.friendlyByShort,
             facts = workloadFacts
           )
         )
@@ -127,7 +140,7 @@ object MvDryCompile {
 
     val aggregateHavingDataColumns = computeAggregateHavingDataColumns(spark, compiled, queryText)
     val simpleProjectionHasDataApply =
-      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
+      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, pinBinding.friendlyByShort)
     val topKViewSpec = validateTopKViewSpec(
       spark,
       extractTopKViewSpec(spark, queryText),
@@ -160,7 +173,8 @@ object MvDryCompile {
         topKViewSpec,
         queryText,
         qualSchemas,
-        shortToQual
+        pinBinding.friendlyByShort,
+        pinBinding.resolvedPins
       )
 
     DryCompileResult(name, classification, compiled, qualNames, rewrittenStatements, outputSchema)
@@ -180,7 +194,8 @@ object MvDryCompile {
       topKViewSpec: MvCommandHelper.TopKViewSpec,
       queryText: String,
       qualSchemas: Map[String, StructType],
-      shortToQual: Map[String, String]
+      shortToQual: Map[String, String],
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
   ): Seq[String] = {
     import MvCommandHelper._
     if (classification.refreshType == RefreshTypeCode.FullRefresh) {
@@ -221,9 +236,12 @@ object MvDryCompile {
           sourceQualifiedNames = shortToQual,
           // Diagnostics must mirror execution: REFRESH re-applies the user's
           // snapshot pins to openivm's live-source reads, so the dry program
-          // has to show them too.
+          // has to show them too — keyed by the leaf the compiler rewrite uses,
+          // via the verified binding when available.
           sourceSnapshotPins =
-            if (SparkTimeTravelSql.hasSnapshotPin(queryText))
+            if (resolvedPins.nonEmpty)
+              resolvedPins.map(pin => pin.pin.shortName -> pin.pin.clause).toMap
+            else if (SparkTimeTravelSql.hasSnapshotPin(queryText))
               SparkTimeTravelSql.pinsByShortSource(queryText, qualSchemas.keySet.toSeq ++ shortToQual.values.toSeq)
             else Map.empty,
           semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
