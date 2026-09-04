@@ -296,5 +296,107 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
         MvCommandHelper.verifyPinnedSourceIdentitiesAtPath(spark, TableIdentifier("j_check"), Seq(path -> id))
       }
     }
+
+    it("rolls back CREATE and cleans owned artifacts when a pinned source is recreated during the CTAS (CREATE POST)") {
+      spark.sql(s"CREATE TABLE $db.k_src(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.k_src VALUES (1, 10)")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.k_src")
+
+      var ctasAttempts = 0
+      val error = intercept[SourceIdentityRebindingException] {
+        // Count CTAS attempts; recreate the pinned source at its managed path
+        // (new metadata.id) AFTER the write but BEFORE the POST check.
+        CommandConcurrencyInjection.withBeforeCreateDataWrite { ctasAttempts += 1 } {
+          CommandConcurrencyInjection.withAfterCreateDataWrite {
+            spark.sql(s"DROP TABLE $db.k_src")
+            spark.sql(s"CREATE TABLE $db.k_src(id INT, amount INT) USING DELTA")
+            spark.sql(s"INSERT INTO $db.k_src VALUES (1, 10)")
+          } {
+            spark
+              .sql(
+                s"CREATE MATERIALIZED VIEW k_pinned_mv AS " +
+                  s"SELECT id, SUM(amount) AS total FROM `$db`.`k_src` VERSION AS OF $v GROUP BY id"
+              )
+              .collect()
+          }
+        }
+      }
+      error.getMessage.toLowerCase should include("metadata.id")
+      // Exactly one CTAS attempt: the rebinding is non-retryable, never demoted.
+      ctasAttempts shouldBe 1
+      // Owned artifacts cleaned: neither the MV metadata nor a registered table remain.
+      MvCatalog.lookup(spark, TableIdentifier("k_pinned_mv")) shouldBe None
+      spark.catalog.tableExists(db, "k_pinned_mv") shouldBe false
+    }
+
+    it(
+      "path-binds the pinned FULL_REFRESH CREATE read to the verified Delta path even when the alias is repointed mid-write"
+    ) {
+      val pathA = s"$warehouseDir/n_src_a_${UUID.randomUUID().toString.take(8)}"
+      val pathB = s"$warehouseDir/n_src_b_${UUID.randomUUID().toString.take(8)}"
+      spark.sql(s"CREATE TABLE $db.n_src(id INT, tag STRING) USING DELTA LOCATION '$pathA'")
+      spark.sql(s"INSERT INTO $db.n_src VALUES (1, 'A')")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.n_src")
+
+      CommandConcurrencyInjection.withBeforeCreateDataWrite {
+        // Repoint the catalog NAME to a different physical table (different rows)
+        // just before the CTAS reads it. Path binding must ignore this rebind.
+        spark.sql(s"DROP TABLE $db.n_src")
+        spark.sql(s"CREATE TABLE $db.n_src(id INT, tag STRING) USING DELTA LOCATION '$pathB'")
+        spark.sql(s"INSERT INTO $db.n_src VALUES (1, 'B')")
+      } {
+        // `input_file_name()` is Spark-only, so openivm demotes this to
+        // FULL_REFRESH: the initial CTAS uses the path-bound USER body.
+        spark
+          .sql(
+            s"CREATE MATERIALIZED VIEW n_mv AS " +
+              s"SELECT id, tag, input_file_name() AS src_file FROM `$db`.`n_src` VERSION AS OF $v"
+          )
+          .collect()
+      }
+
+      lookup("n_mv").properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
+      // The MV read the VERIFIED path (pathA, tag 'A'), not the repointed pathB.
+      spark.table("n_mv").collect().map(_.getString(1)).toSet shouldBe Set("A")
+    }
+
+    it(
+      "rolls a pinned MV back to its pre-refresh version when a pinned source is recreated during apply (REFRESH POST)"
+    ) {
+      spark.sql(s"CREATE TABLE $db.m_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.m_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.m_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.m_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.m_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW m_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`m_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`m_live` AS live ON p.id = live.id"
+        )
+        .collect()
+
+      val beforeVersion = lookup("m_mv").lastVersion
+      val beforeRows    = spark.table("m_mv").collect().map(_.mkString("|")).sorted.toList
+
+      // Queue a real live delta, then recreate the pinned source at its path
+      // (new metadata.id) after the apply loop but before the POST check.
+      spark.sql(s"INSERT INTO $db.m_live VALUES (1, 11)")
+      val error = intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withBeforeRefreshFinalize {
+          spark.sql(s"DROP TABLE $db.m_pinned")
+          spark.sql(s"CREATE TABLE $db.m_pinned(id INT, grp STRING) USING DELTA")
+          spark.sql(s"INSERT INTO $db.m_pinned VALUES (1, 'x')")
+        } {
+          spark.sql("REFRESH MATERIALIZED VIEW m_mv").collect()
+        }
+      }
+      error.getMessage.toLowerCase should include("metadata.id")
+
+      // MV restored to its pre-refresh content; the catalog version was not
+      // advanced and the live delta was NOT consumed (no marker drift).
+      lookup("m_mv").lastVersion shouldBe beforeVersion
+      spark.table("m_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
+    }
   }
 }

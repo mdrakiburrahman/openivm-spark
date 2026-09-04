@@ -230,6 +230,8 @@ private[spark] object CommandConcurrencyInjection {
   @volatile private var beforeCreateBody: () => Unit      = null
   @volatile private var beforeCreateDataWrite: () => Unit = null
   @volatile private var afterCreateDataWrite: () => Unit  = null
+  @volatile private var beforeRefreshApply: () => Unit    = null
+  @volatile private var beforeRefreshFinalize: () => Unit = null
 
   def withBeforeCreateBody[A](hook: => Unit)(body: => A): A = synchronized {
     val previous = beforeCreateBody
@@ -264,6 +266,38 @@ private[spark] object CommandConcurrencyInjection {
 
   private[commands] def maybePauseAfterCreateDataWrite(): Unit = {
     val hook = afterCreateDataWrite
+    if (hook != null) hook()
+  }
+
+  /** Fires after a REFRESH has resolved+verified its pin binding and captured the
+    * pre-apply MV version, but BEFORE the first data mutation. Lets a test rebind
+    * a pinned source (drop/recreate, alias repoint) to prove the path-bound reads
+    * and POST identity check behave. */
+  def withBeforeRefreshApply[A](hook: => Unit)(body: => A): A = synchronized {
+    val previous = beforeRefreshApply
+    beforeRefreshApply = () => hook
+    try body
+    finally beforeRefreshApply = previous
+  }
+
+  private[commands] def maybePauseBeforeRefreshApply(): Unit = {
+    val hook = beforeRefreshApply
+    if (hook != null) hook()
+  }
+
+  /** Fires after the REFRESH apply loop completed but BEFORE the terminal POST
+    * identity check and markConsumed/watermark/metadata publish. Lets a test
+    * recreate a pinned source at its verified path (new metadata.id) to prove the
+    * POST check rolls the MV back and advances no markers. */
+  def withBeforeRefreshFinalize[A](hook: => Unit)(body: => A): A = synchronized {
+    val previous = beforeRefreshFinalize
+    beforeRefreshFinalize = () => hook
+    try body
+    finally beforeRefreshFinalize = previous
+  }
+
+  private[commands] def maybePauseBeforeRefreshFinalize(): Unit = {
+    val hook = beforeRefreshFinalize
     if (hook != null) hook()
   }
 }
@@ -632,6 +666,71 @@ private[commands] object MvCommandHelper {
     resolvedPins
       .map(pin => pin.operationalSource.deltaLogDataPath -> pin.operationalSource.deltaTableMetadataId)
       .distinct
+
+  /** The compiler-shaped view of a command-layer binding, for the path-bind and
+    * checkpoint pure functions. `sourceIdentities` carries every tracked source's
+    * physical identity; `pins` the resolved pins. */
+  def bindingsView(
+      binding: PinnedSourceBinding,
+      resolvedSources: Seq[String]
+  ): SparkTimeTravelSql.ResolvedSnapshotPinBindings =
+    SparkTimeTravelSql.ResolvedSnapshotPinBindings(
+      resolvedSources,
+      binding.operationalIdentities,
+      binding.resolvedPins
+    )
+
+  /** Compiler-emit seam: each pinned compiler short name mapped to its VERIFIED
+    * `(deltaPath, clause)`. The disjoint compiler-emit agent (OpenIvmCompiler /
+    * SparkRefreshRewriter) consumes this to path-bind the `memory.main.<short>`
+    * reads of its CompilerInitialLoad / SparkRefreshRewriterEmitted surfaces to
+    * the same verified paths the command layer binds its UserFullQuery surface
+    * to. Populated from the one shared `requirePinBinding` result so all surfaces
+    * agree; threaded into the `CompileRequest` path-bind input on integration of
+    * that agent's commit (alongside the existing `sourceQualifiedNames`). */
+  def pinnedPathBindingsByShort(binding: PinnedSourceBinding): Map[String, (String, String)] =
+    binding.resolvedPins.map { pin =>
+      pin.pin.shortName -> (pin.operationalSource.deltaLogDataPath, pin.pin.clause)
+    }.toMap
+
+  /** Path-bind a USER full-query body (full-refresh / initial CTAS surface) to
+    * the VERIFIED Delta paths of its pinned reads, preserving each
+    * VERSION/TIMESTAMP clause and every occurrence. The verified path is the
+    * physical identity the pin was resolved/persisted against, so the executed
+    * read is bound to that path and never re-resolves the (possibly rebound)
+    * alias. Non-pinned relations are left untouched. A body with no maintainable
+    * pin is returned verbatim.
+    */
+  def pathBindUserFullQuery(
+      viewName: TableIdentifier,
+      sql: String,
+      binding: PinnedSourceBinding,
+      resolvedSources: Seq[String],
+      verifiedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
+  ): String =
+    if (binding.resolvedPins.isEmpty) sql
+    else
+      SparkTimeTravelSql
+        .rewritePinnedReadSurface(
+          SparkTimeTravelSql.PinRewriteSurface.UserFullQuery,
+          sql,
+          bindingsView(binding, resolvedSources),
+          verifiedPins
+        )
+        .fold(
+          detail =>
+            throw pinBindingException(viewName, s"path-binding the pinned full-query read surface failed: $detail"),
+          _.sql
+        )
+
+  /** RESTORE a materialized view's backing Delta table to the version captured
+    * before an aborted mutation, so a POST-apply rebind rolls back cleanly with
+    * no markers advanced. Best-effort form of the same `RESTORE TABLE ... TO
+    * VERSION AS OF` the source-advance rollback uses. */
+  def restoreMvToVersion(spark: SparkSession, location: String, version: Long): Unit = {
+    val escaped = location.replace("`", "``")
+    spark.sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $version").collect()
+  }
 
   /** The single validated binding API used by CREATE, idempotent CREATE,
     * REFRESH, ADVANCE, and the dry compile/rewrite paths. Resolves the pins
@@ -1792,6 +1891,11 @@ case class CreateMaterializedViewCommand(
         Map.empty
       )
     }
+    // The verified physical identities `(dataPath, metadata.id)` this CREATE
+    // resolved its pins against. Used to path-bind the pinned reads and to
+    // re-verify identity at the PRE (before CTAS) and POST (after CTAS, before
+    // publish) checkpoints.
+    val createPinnedIdentities = MvCommandHelper.pathIdentities(pinBinding.resolvedPins)
 
     // Validate that every source is configured correctly for the active
     // change-propagation mode (e.g. under CDF mode: requires
@@ -1852,6 +1956,10 @@ case class CreateMaterializedViewCommand(
           CompileRequest(
             viewName = name.table,
             viewSql = originalQueryText,
+            // The shared binding's SQL-visible qualifiers (so a Fabric alias
+            // resolves). The compiler-emit agent's path-bind input is populated
+            // from `MvCommandHelper.pinnedPathBindingsByShort(pinBinding)` on
+            // integration of its commit; both derive from this one binding.
             sources = compileSchemas,
             sourceQualifiedNames = pinBinding.friendlyByShort,
             facts = workloadFacts
@@ -2184,7 +2292,17 @@ case class CreateMaterializedViewCommand(
     // by the incremental MERGE program.
     val viewBodySql =
       if (effectiveRefreshType == RefreshTypeCode.FullRefresh || compiled.initialLoadSql.isEmpty)
-        originalQueryText
+        // UserFullQuery surface: path-bind the user body's pinned reads to their
+        // verified Delta paths (clause + every occurrence preserved) so the
+        // initial CTAS reads the frozen snapshot directly, never re-resolving a
+        // possibly-rebound alias. Non-pinned bodies pass through verbatim.
+        MvCommandHelper.pathBindUserFullQuery(
+          name,
+          originalQueryText,
+          pinBinding,
+          qualNames,
+          pinBinding.resolvedPins
+        )
       else
         org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
@@ -2231,6 +2349,12 @@ case class CreateMaterializedViewCommand(
     var catalogPublicationMs            = 0L
     var reusedDeltaPath                 = false
     var publicationCommitted            = false
+    // CREATE PRE: re-verify each pinned source's physical identity at its
+    // verified path immediately before the initial CTAS. A drop/recreate between
+    // pin resolution and the write is a rebind and hard-fails before any owned
+    // artifact exists (SourceIdentityRebindingException, never demoted).
+    if (createPinnedIdentities.nonEmpty)
+      verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
     try {
       CommandLocalState.withDmlBypass {
         try {
@@ -2293,6 +2417,16 @@ case class CreateMaterializedViewCommand(
           }
 
           CommandConcurrencyInjection.maybePauseAfterCreateDataWrite()
+
+          // CREATE POST: strictly after the successful CTAS retry loop and before
+          // catalog registration / metadata publication. Re-read each pinned
+          // source's metadata.id at its verified path; a same-path drop/recreate
+          // during the CTAS is a rebind. Thrown here (outside the CTAS retry and
+          // its Throwable->Left classification), the SourceIdentityRebindingException
+          // reaches the outer owned-artifact cleanup below (publicationCommitted is
+          // still false) and is never retried or demoted.
+          if (createPinnedIdentities.nonEmpty)
+            verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
 
           try {
             profile.timeStep(
@@ -3015,7 +3149,21 @@ case class RefreshMaterializedViewCommand(
         meta.properties
       )
       val refreshResolvedPins = refreshBinding.resolvedPins
-      val derivedPin          = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, refreshResolvedPins)
+      // The verified physical identities this REFRESH re-resolved (and
+      // requirePinBinding already proved equal to the ones persisted at CREATE).
+      // Reused for the POST identity check in `finalizeRefresh`. The pre-apply MV
+      // Delta version is captured now so a POST rebind rolls the MV back to
+      // exactly this version with no markers advanced.
+      val refreshPinnedIdentities = MvCommandHelper.pathIdentities(refreshResolvedPins)
+      val preRefreshMvVersionForPinGuard: Long =
+        if (refreshPinnedIdentities.isEmpty) -1L
+        else
+          try DeltaTableVersion.requireLatest(spark, meta.location)
+          catch { case NonFatal(_) => -1L }
+      // REFRESH apply hook: fires after the pin binding is verified and the
+      // pre-apply version captured, before the first data mutation.
+      CommandConcurrencyInjection.maybePauseBeforeRefreshApply()
+      val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, refreshResolvedPins)
       meta.timeTravelPinStatus.foreach { persisted =>
         val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
         if (persisted != derivedPin.status || !pinsAgree) {
@@ -3241,6 +3389,24 @@ case class RefreshMaterializedViewCommand(
       }
 
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
+        // REFRESH POST: after the complete apply loop and BEFORE
+        // markConsumed/watermarks/metadata publish (postRefreshCleanup). Re-read
+        // each pinned source's metadata.id at its verified path; a same-path
+        // drop/recreate during the apply is a rebind. The check runs outside the
+        // Delta-conflict retry that wraps the per-statement apply, so on mismatch
+        // the MV is RESTORED to its pre-apply version and no marker, watermark, or
+        // catalog version is advanced.
+        CommandConcurrencyInjection.maybePauseBeforeRefreshFinalize()
+        if (refreshPinnedIdentities.nonEmpty) {
+          try MvCommandHelper.verifyPinnedSourceIdentitiesAtPath(spark, name, refreshPinnedIdentities)
+          catch {
+            case r: SourceIdentityRebindingException =>
+              if (preRefreshMvVersionForPinGuard >= 0L)
+                try MvCommandHelper.restoreMvToVersion(spark, cleanupMeta.location, preRefreshMvVersionForPinGuard)
+                catch { case NonFatal(_) => () }
+              throw r
+          }
+        }
         val dataVersion     = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
         val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
         val consumedBatches = preparedSourceAdvance.map(_.consumedBatches).getOrElse(changeBatches)
@@ -3480,7 +3646,17 @@ case class RefreshMaterializedViewCommand(
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
           if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
             org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
-          else meta.querySql
+          else
+            // UserFullQuery surface at REFRESH: path-bind the user body's pinned
+            // reads to their verified Delta paths so the recompute reads the frozen
+            // snapshot directly rather than re-resolving the alias.
+            MvCommandHelper.pathBindUserFullQuery(
+              name,
+              meta.querySql,
+              refreshBinding,
+              meta.sourceTables,
+              refreshResolvedPins
+            )
         }
         val fullRefreshTarget =
           if (meta.usesBackingDataTable) dataTableId(name) else name
@@ -3628,6 +3804,12 @@ case class RefreshMaterializedViewCommand(
           }
           emitEnd("full_refresh_executed", meta.refreshTypeName, changeBatches.size)
         } catch {
+          // A POST-apply pin rebind (detected in finalizeRefresh, after the MV was
+          // already RESTORED to its pre-apply version) is a distinct, non-retryable
+          // failure: propagate it as-is so it is never wrapped, retried, or demoted.
+          case r: SourceIdentityRebindingException =>
+            emitEnd("full_refresh_failed", meta.refreshTypeName, changeBatches.size)
+            throw r
           case t: Throwable =>
             emitEnd("full_refresh_failed", meta.refreshTypeName, changeBatches.size)
             val sqlSnippet = assembled.statements.mkString(";\n---\n")
