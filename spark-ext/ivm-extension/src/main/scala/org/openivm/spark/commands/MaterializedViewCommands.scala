@@ -857,65 +857,109 @@ private[commands] object MvCommandHelper {
     * state even if the source's physical identity later happens to re-match. */
   val PinRebindRepairRequiredKey: String = "_ivm_pin_rebind_repair_required"
 
-  /** Deterministic per-MV filesystem path for the write-ahead pinned-operation
-    * guard, under openivm-owned MV state. Independent of the catalog so it
-    * survives a catalog failure. */
-  private def pinnedOperationGuardPath(spark: SparkSession, viewName: TableIdentifier): org.apache.hadoop.fs.Path = {
-    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val safe      = metaName(viewName).replaceAll("[^A-Za-z0-9_.-]", "_")
-    new org.apache.hadoop.fs.Path(s"$warehouse/_ivm/pin_guard/$safe.guard")
+  /** Injective serialization of a `TableIdentifier` (length-prefixed db/table),
+    * so two identifiers that would collide under lossy sanitization stay
+    * distinct. Stored verbatim inside the guard and required to match on read. */
+  private def serializeGuardIdentity(viewName: TableIdentifier): String = {
+    val db = viewName.database.getOrElse("")
+    s"${db.length}:$db/${viewName.table.length}:${viewName.table}"
   }
 
-  /** Atomically write (create-temp-then-rename) the per-MV pinned-operation guard
-    * carrying `token` + `detail`, then VERIFY it re-reads the same token. Written
-    * BEFORE any pinned MV data mutation so a crash/rebind/rollback failure leaves
-    * a durable block. Returns true iff durably present with the expected token. */
-  def writePinnedOperationGuard(
+  private def sha256Hex(s: String): String =
+    java.security.MessageDigest
+      .getInstance("SHA-256")
+      .digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      .map("%02x".format(_))
+      .mkString
+
+  /** Per-MV guard path = SHA-256 of the exact serialized identity (collision-
+    * verifiable; no lossy underscore sanitization), under openivm-owned MV state. */
+  private[commands] def pinnedOperationGuardPath(
       spark: SparkSession,
-      viewName: TableIdentifier,
-      token: String,
-      detail: String
-  ): Boolean =
+      viewName: TableIdentifier
+  ): org.apache.hadoop.fs.Path = {
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    new org.apache.hadoop.fs.Path(s"$warehouse/_ivm/pin_guard/${sha256Hex(serializeGuardIdentity(viewName))}.guard")
+  }
+
+  /** Tri-state guard read: `Absent` / `Present(identity, token)` / `Unreadable`.
+    * Any FS exists/open/read/parse/identity error is `Unreadable` — never treated
+    * as absent — so a corrupt/partial file blocks fail-closed. A file whose stored
+    * identity does not match the requested one is an `Unreadable` collision. */
+  sealed trait PinnedOperationGuardState
+  object PinnedOperationGuardState {
+    case object Absent                                        extends PinnedOperationGuardState
+    final case class Present(identity: String, token: String) extends PinnedOperationGuardState
+    final case class Unreadable(error: String)                extends PinnedOperationGuardState
+  }
+
+  def readPinnedOperationGuardState(spark: SparkSession, viewName: TableIdentifier): PinnedOperationGuardState =
+    try {
+      val path   = pinnedOperationGuardPath(spark, viewName)
+      val fs     = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      val expect = serializeGuardIdentity(viewName)
+      if (!fs.exists(path)) PinnedOperationGuardState.Absent
+      else {
+        val is = fs.open(path)
+        val content =
+          try new String(org.apache.commons.io.IOUtils.toByteArray(is), java.nio.charset.StandardCharsets.UTF_8)
+          finally is.close()
+        val lines = content.split("\n", -1)
+        if (lines.length < 2 || lines(0).isEmpty)
+          PinnedOperationGuardState.Unreadable(s"partial/corrupt guard file for '$expect'")
+        else if (lines(0) != expect)
+          PinnedOperationGuardState.Unreadable(s"identity mismatch/collision: expected '$expect' got '${lines(0)}'")
+        else PinnedOperationGuardState.Present(lines(0), lines(1))
+      }
+    } catch { case NonFatal(e) => PinnedOperationGuardState.Unreadable(Option(e.getMessage).getOrElse(e.toString)) }
+
+  /** Atomically ACQUIRE the guard with create-if-absent (`overwrite=false`): never
+    * deletes/replaces an existing guard, so a second concurrent writer is rejected.
+    * Stores the exact identity + token, closes, then rereads and requires the exact
+    * payload. A write failure after creation leaves a blocking partial file. Returns
+    * true only when this token owns a fully-verified guard. */
+  def acquirePinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier, token: String): Boolean =
     try {
       val path = pinnedOperationGuardPath(spark, viewName)
       val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
       fs.mkdirs(path.getParent)
-      val tmp = new org.apache.hadoop.fs.Path(path.getParent, s".${path.getName}.${java.util.UUID.randomUUID()}.tmp")
-      val os  = fs.create(tmp, true)
-      try os.write(s"$token\n$detail".getBytes(java.nio.charset.StandardCharsets.UTF_8))
-      finally os.close()
-      fs.delete(path, false)
-      fs.rename(tmp, path)
-      readPinnedOperationGuardToken(spark, viewName).contains(token)
-    } catch { case NonFatal(_) => false }
-
-  /** The token of the current per-MV guard, or None when absent/unreadable. */
-  def readPinnedOperationGuardToken(spark: SparkSession, viewName: TableIdentifier): Option[String] =
-    try {
-      val path = pinnedOperationGuardPath(spark, viewName)
-      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
-      if (!fs.exists(path)) None
-      else {
-        val is = fs.open(path)
-        try {
-          val bytes = org.apache.commons.io.IOUtils.toByteArray(is)
-          Some(new String(bytes, java.nio.charset.StandardCharsets.UTF_8).linesIterator.next().trim)
-        } finally is.close()
+      val os = fs.create(path, false) // atomic create-if-absent; throws if present
+      try {
+        if (CommandConcurrencyInjection.failOperationGuardWrite)
+          throw new RuntimeException("injected guard write failure after creation (test)")
+        os.write(s"${serializeGuardIdentity(viewName)}\n$token".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        os.hflush()
+      } finally os.close()
+      readPinnedOperationGuardState(spark, viewName) match {
+        case PinnedOperationGuardState.Present(id, t) if id == serializeGuardIdentity(viewName) && t == token => true
+        case _                                                                                                => false
       }
-    } catch { case NonFatal(_) => None }
-
-  /** True iff a pinned-operation guard exists (a prior op is in progress or was
-    * left in a failed/recovery-required state). */
-  def hasPinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier): Boolean =
-    try {
-      val path = pinnedOperationGuardPath(spark, viewName)
-      path.getFileSystem(spark.sparkContext.hadoopConfiguration).exists(path)
     } catch { case NonFatal(_) => false }
 
-  /** Clear the guard. Called only after full success (post-identity gate, all
-    * cascade/markConsumed/watermark, and the final metadata commit) and on
-    * DROP+recreate. */
-  def clearPinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier): Unit =
+  /** True iff a guard is Present OR Unreadable (both block); false only for a
+    * cleanly-Absent guard. */
+  def hasPinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier): Boolean =
+    readPinnedOperationGuardState(spark, viewName) != PinnedOperationGuardState.Absent
+
+  /** Token-owned RELEASE: reread and require the exact identity + token before
+    * deleting; refuse to delete a guard owned by a different token (a newer op) or
+    * an unreadable/absent one. After delete, verify the guard is Absent. Returns
+    * true only on a clean owned release; false means the caller must NOT report
+    * unrestricted success (leave/block). */
+  def releasePinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier, token: String): Boolean =
+    readPinnedOperationGuardState(spark, viewName) match {
+      case PinnedOperationGuardState.Present(id, t) if id == serializeGuardIdentity(viewName) && t == token =>
+        try {
+          val path = pinnedOperationGuardPath(spark, viewName)
+          path.getFileSystem(spark.sparkContext.hadoopConfiguration).delete(path, false)
+          readPinnedOperationGuardState(spark, viewName) == PinnedOperationGuardState.Absent
+        } catch { case NonFatal(_) => false }
+      case _ => false
+    }
+
+  /** Force-clear ANY guard for this identity regardless of token (used ONLY by a
+    * fresh CREATE / DROP+recreate recovery, the explicit operator action). */
+  def forceClearPinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier): Unit =
     try {
       val path = pinnedOperationGuardPath(spark, viewName)
       path.getFileSystem(spark.sparkContext.hadoopConfiguration).delete(path, false)
@@ -2184,10 +2228,10 @@ case class CreateMaterializedViewCommand(
       case None => // proceed
     }
 
-    // A fresh CREATE (the view did not exist above) deterministically clears any
-    // stale pinned-operation guard for this name, so DROP + recreate recovers a
-    // previously repair-required MV whose prior op left the guard set.
-    MvCommandHelper.clearPinnedOperationGuard(spark, name)
+    // A fresh CREATE (the view did not exist above) deterministically FORCE-clears
+    // any stale pinned-operation guard for this name (the explicit DROP+recreate
+    // recovery), regardless of a prior op's token.
+    MvCommandHelper.forceClearPinnedOperationGuard(spark, name)
 
     // Analyze once and reuse the resolved relation nodes for source discovery,
     // query-shape extraction, and full source schemas.
@@ -3534,23 +3578,24 @@ case class RefreshMaterializedViewCommand(
       // MV stays blocked (checked by requirePinBinding) until DROP + recreate.
       val pinnedOpToken = java.util.UUID.randomUUID().toString
       def beginPinnedGuardBeforeMutation(): Unit =
-        if (refreshPinnedIdentities.nonEmpty) {
-          val written =
-            !CommandConcurrencyInjection.failOperationGuardWrite &&
-              MvCommandHelper.writePinnedOperationGuard(
-                spark,
-                name,
-                pinnedOpToken,
-                s"pinned refresh in progress; pre_version=$preRefreshMvVersionForPinGuard"
-              )
-          if (!written)
-            throw new IllegalStateException(
-              s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot write+verify the durable pinned-operation " +
-                "guard required to safely roll back a rebind; aborting before any mutation"
-            )
-        }
+        if (
+          refreshPinnedIdentities.nonEmpty && !MvCommandHelper.acquirePinnedOperationGuard(spark, name, pinnedOpToken)
+        )
+          throw new IllegalStateException(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot acquire the durable pinned-operation guard " +
+              "(already held, unreadable, or unwritable); aborting before any mutation"
+          )
       def clearPinnedGuardOnSuccess(): Unit =
-        if (refreshPinnedIdentities.nonEmpty) MvCommandHelper.clearPinnedOperationGuard(spark, name)
+        if (
+          refreshPinnedIdentities.nonEmpty && !MvCommandHelper.releasePinnedOperationGuard(spark, name, pinnedOpToken)
+        )
+          // Token-owned release failed (delete/verify failed, or a newer guard
+          // appeared): do NOT report unrestricted success — leave the block.
+          throw new IllegalStateException(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' completed its data work but could not cleanly release " +
+              "its pinned-operation guard; the view is left blocked (repair-required) and must be dropped and " +
+              "recreated"
+          )
 
       val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, refreshResolvedPins)
       meta.timeTravelPinStatus.foreach { persisted =>

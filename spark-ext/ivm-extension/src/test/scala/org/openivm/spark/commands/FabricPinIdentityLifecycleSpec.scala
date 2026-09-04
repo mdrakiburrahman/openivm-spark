@@ -983,10 +983,26 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
           spark.sql("REFRESH MATERIALIZED VIEW gw_mv").collect()
         }
       }.getMessage.toLowerCase should include("before any mutation")
-      // Guard-write failure aborts before mutation: no version/rows change, and no
-      // guard is left behind (nothing was written).
+      // Write failure AFTER creation aborts before mutation (version/rows
+      // unchanged) and leaves a blocking partial guard that fails the next command
+      // closed until DROP + recreate clears it.
       DeltaTableVersion.requireLatest(spark, lookup("gw_mv").location) shouldBe beforeVersion
       spark.table("gw_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("gw_mv")) shouldBe true
+      intercept[Exception](
+        spark.sql("REFRESH MATERIALIZED VIEW gw_mv").collect()
+      ).getMessage.toLowerCase should include(
+        "repair-required"
+      )
+      spark.sql("DROP MATERIALIZED VIEW gw_mv")
+      val gpv2 = DeltaTableVersion.requireLatest(spark, s"$db.gw_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW gw_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`gw_pinned` VERSION AS OF $gpv2 AS p " +
+            s"JOIN `$db`.`gw_live` AS live ON p.id = live.id"
+        )
+        .collect()
       MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("gw_mv")) shouldBe false
       noException should be thrownBy spark.sql("REFRESH MATERIALIZED VIEW gw_mv").collect()
     }
@@ -1349,6 +1365,76 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
         Map(s"$db.adv_solo" -> v),
         persisted
       ) shouldBe Map(s"$db.adv_solo" -> v)
+    }
+  }
+
+  // Guard-protocol unit proofs, exercised directly against the helper so the
+  // atomic-ownership / tri-state / token-owned-clear invariants are deterministic.
+  describe("pinned-operation guard protocol") {
+    import MvCommandHelper.PinnedOperationGuardState._
+    def tid(db: String, table: String): TableIdentifier = TableIdentifier(table, Some(db))
+
+    it("gives colliding-under-sanitization identifiers independent guards") {
+      // `a_b`.`c` and `a`.`b_c` both lower to `a_b_c` under lossy sanitization.
+      val id1 = tid("a_b", "c")
+      val id2 = tid("a", "b_c")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id1)
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id2)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id1, "t1") shouldBe true
+      // id2 is independent: still Absent, and acquires its own guard.
+      MvCommandHelper.readPinnedOperationGuardState(spark, id2) shouldBe Absent
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id2, "t2") shouldBe true
+      MvCommandHelper.readPinnedOperationGuardState(spark, id1) shouldBe a[Present]
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id1)
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id2)
+    }
+
+    it("rejects a second concurrent writer without replacing the first owner's guard") {
+      val id = tid("guard_db", "concurrent")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "owner") shouldBe true
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "intruder") shouldBe false
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) match {
+        case Present(_, token) => token shouldBe "owner"
+        case other             => fail(s"expected Present(owner) got $other")
+      }
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+    }
+
+    it("refuses a stale release that does not own the current (newer) token") {
+      val id = tid("guard_db", "stale")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "old") shouldBe true
+      // The old op's guard is force-cleared (DROP) and a new op acquires it.
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "new") shouldBe true
+      // A late release by the OLD token must not delete the NEW token's guard.
+      MvCommandHelper.releasePinnedOperationGuard(spark, id, "old") shouldBe false
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) match {
+        case Present(_, token) => token shouldBe "new"
+        case other             => fail(s"expected Present(new) got $other")
+      }
+      // The owner releases cleanly and verifies Absent.
+      MvCommandHelper.releasePinnedOperationGuard(spark, id, "new") shouldBe true
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) shouldBe Absent
+    }
+
+    it("reads a partial/corrupt guard file as Unreadable (blocks fail-closed), never Absent") {
+      val id = tid("guard_db", "corrupt")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "t") shouldBe true
+      // Overwrite the exact guard file with a single-line (partial) payload.
+      val path = MvCommandHelper.pinnedOperationGuardPath(spark, id)
+      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      val os   = fs.create(path, true)
+      try os.write("only-one-line".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      finally os.close()
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) shouldBe a[Unreadable]
+      MvCommandHelper.hasPinnedOperationGuard(spark, id) shouldBe true
+      // A stale-token release must not delete an Unreadable guard.
+      MvCommandHelper.releasePinnedOperationGuard(spark, id, "t") shouldBe false
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) shouldBe Absent
     }
   }
 }
