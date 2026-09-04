@@ -4,6 +4,7 @@ import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{
   DeltaTableVersion,
+  FeatureGate,
   MvCatalog,
   MvMetadata,
   StagingCatalog,
@@ -47,6 +48,7 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       )
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config("spark.openivm.enabled", "true")
+      .config(FeatureGate.RuntimeEmptyDeltaSkipEnabledKey, "true")
       .config("spark.sql.warehouse.dir", warehouseDir)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "1")
@@ -1521,6 +1523,37 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
     }
     def aggRows(mv: String): Set[(String, Long, Long)] =
       spark.table(mv).collect().map(r => (r.getString(0), r.getLong(1), r.getLong(2))).toSet
+
+    it("clears its own guard on a successful pinned runtime-empty-delta ADVANCE and lets the next operation proceed") {
+      val v0         = createAggMv("arr_empty_src", "arr_empty_mv")
+      val beforeRows = aggRows("arr_empty_mv")
+      // A metadata-only source commit bumps the Delta version with NO data delta,
+      // so the pinned ADVANCE to it takes the runtime-empty-delta skip branch
+      // (gate enabled): a no-MV-write publication that must still release THIS
+      // operation's own write-ahead guard on total success, or the next operation
+      // would be wrongly blocked (repair-required).
+      spark.sql(s"ALTER TABLE $db.arr_empty_src SET TBLPROPERTIES ('openivm.test.touch' = '1')")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_empty_src")
+      v1 should be > v0
+
+      spark
+        .sql(s"ALTER MATERIALIZED VIEW arr_empty_mv ADVANCE SOURCE VERSIONS ($db.arr_empty_src = $v1)")
+        .collect()
+
+      // No-op skip: data unchanged, pin advanced to v1, guard released.
+      aggRows("arr_empty_mv") shouldBe beforeRows
+      lookup("arr_empty_mv").querySql should include(s"VERSION AS OF $v1")
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_empty_mv")) shouldBe false
+
+      // The next pinned operation proceeds because the guard was not left blocking.
+      spark.sql(s"INSERT INTO $db.arr_empty_src VALUES (3, 'a', 5)")
+      val v2 = DeltaTableVersion.requireLatest(spark, s"$db.arr_empty_src")
+      spark
+        .sql(s"ALTER MATERIALIZED VIEW arr_empty_mv ADVANCE SOURCE VERSIONS ($db.arr_empty_src = $v2)")
+        .collect()
+      aggRows("arr_empty_mv") shouldBe Set(("a", 15L, 2L), ("b", 20L, 1L))
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_empty_mv")) shouldBe false
+    }
 
     it("releases the guard and retries cleanly after a pre-commit ADVANCE failure (no marker drift)") {
       val v0         = createAggMv("arr_src", "arr_mv")

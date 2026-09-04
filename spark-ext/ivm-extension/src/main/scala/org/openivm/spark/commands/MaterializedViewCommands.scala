@@ -5072,6 +5072,12 @@ case class RefreshMaterializedViewCommand(
               // Gate on pinned identity before consuming changes or publishing
               // any (source-advance) metadata for this no-MV-write skip.
               enforcePinnedSourceIdentityGate(meta)
+              // Mark the point past which this no-MV-write skip begins durable
+              // publication (frozen-delta consume, source-advance metadata/version
+              // publish, change-consume): a failure from here keeps the write-ahead
+              // guard set, since an in-process advance rollback can no longer prove
+              // a clean revert.
+              preparedSourceAdvance.foreach(_.markFinalizeStarted())
               consumeFrozenSourceDeltas()
               val unchangedVersion = DeltaTableVersion.requireLatest(spark, meta.location)
               preparedSourceAdvance match {
@@ -5086,6 +5092,9 @@ case class RefreshMaterializedViewCommand(
                   consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
               }
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
+              // Total successful completion of this pinned no-op skip: release this
+              // operation's OWN write-ahead guard so the next operation proceeds.
+              clearPinnedGuardOnSuccess()
               return Seq.empty
             }
           }
