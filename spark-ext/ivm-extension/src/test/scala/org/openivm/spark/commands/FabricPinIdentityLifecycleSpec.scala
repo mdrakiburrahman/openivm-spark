@@ -1498,4 +1498,213 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
     }
   }
+
+  // A source-version ADVANCE that hits a transient failure BEFORE any publication
+  // rolls the MV back to its pre-advance state and — only when that rollback is
+  // provably clean — releases its OWN write-ahead operation guard so a retry
+  // proceeds. Every unclean path (rollback RESTORE / metadata-sync failure, a
+  // version regression, a rebind, a foreign guard token, a corrupt guard, or an
+  // incomplete recovery journal) leaves the guard set (repair-required),
+  // fail-closed, exactly as a crash would.
+  describe("pinned ADVANCE pre-commit rollback recovery") {
+    def createAggMv(src: String, mv: String): Long = {
+      spark.sql(s"CREATE TABLE $db.$src(id INT, grp STRING, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.$src VALUES (1, 'a', 10), (2, 'b', 20)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.$src")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW $mv AS " +
+            s"SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM `$db`.`$src` VERSION AS OF $v0 GROUP BY grp"
+        )
+        .collect()
+      v0
+    }
+    def aggRows(mv: String): Set[(String, Long, Long)] =
+      spark.table(mv).collect().map(r => (r.getString(0), r.getLong(1), r.getLong(2))).toSet
+
+    it("releases the guard and retries cleanly after a pre-commit ADVANCE failure (no marker drift)") {
+      val v0         = createAggMv("arr_src", "arr_mv")
+      val beforeRows = aggRows("arr_mv")
+      spark.sql(s"INSERT INTO $db.arr_src VALUES (3, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_src")
+
+      // The ADVANCE mutates the MV, then the injected failure fires BEFORE
+      // finalize/publish. The in-process rollback restores the MV and releases
+      // its own guard.
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[RuntimeException] should be thrownBy
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_mv ADVANCE SOURCE VERSIONS ($db.arr_src = $v1)").collect()
+
+      // Rolled back to the pre-advance state with no marker/journal drift and the
+      // guard released.
+      aggRows("arr_mv") shouldBe beforeRows
+      lookup("arr_mv").querySql should include(s"VERSION AS OF $v0")
+      lookup("arr_mv").properties.keySet should not contain MvMetadata.SourceVersionAdvancePreMvVersionKey
+      lookup("arr_mv").properties.keySet should not contain MvMetadata.SourceVersionAdvanceCascadePathKey
+      lookup("arr_mv").changeWatermarks.collectFirst {
+        case (source, wm) if source.endsWith("arr_src") => wm.encode
+      } shouldBe Some(s"v:$v0")
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_mv")) shouldBe false
+
+      // The retry proceeds and advances to v1.
+      spark.sql(s"ALTER MATERIALIZED VIEW arr_mv ADVANCE SOURCE VERSIONS ($db.arr_src = $v1)").collect()
+      aggRows("arr_mv") shouldBe Set(("a", 15L, 2L), ("b", 20L, 1L))
+      lookup("arr_mv").querySql should include(s"VERSION AS OF $v1")
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_mv")) shouldBe false
+    }
+
+    it("keeps the guard set (repair-required) when the pre-commit rollback RESTORE fails") {
+      val v0 = createAggMv("arr_rf_src", "arr_rf_mv")
+      val _  = v0
+      spark.sql(s"INSERT INTO $db.arr_rf_src VALUES (3, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_rf_src")
+
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[Exception] should be thrownBy {
+        CommandConcurrencyInjection.withForcedPinRollbackRestoreFailure {
+          spark.sql(s"ALTER MATERIALIZED VIEW arr_rf_mv ADVANCE SOURCE VERSIONS ($db.arr_rf_src = $v1)").collect()
+        }
+      }
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_rf_mv")) shouldBe true
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_rf_mv ADVANCE SOURCE VERSIONS ($db.arr_rf_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+    }
+
+    it("keeps the guard set when the backing MV version regresses below pre during pre-commit rollback") {
+      val v0 = createAggMv("arr_vb_src", "arr_vb_mv")
+      val _  = v0
+      spark.sql(s"INSERT INTO $db.arr_vb_src VALUES (3, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_vb_src")
+
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[Exception] should be thrownBy {
+        CommandConcurrencyInjection.withForcedPostMutationVersionBelowPre {
+          spark.sql(s"ALTER MATERIALIZED VIEW arr_vb_mv ADVANCE SOURCE VERSIONS ($db.arr_vb_src = $v1)").collect()
+        }
+      }
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_vb_mv")) shouldBe true
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_vb_mv ADVANCE SOURCE VERSIONS ($db.arr_vb_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+    }
+
+    it("keeps the guard set when the post-rollback metadata/version sync fails") {
+      val v0 = createAggMv("arr_ms_src", "arr_ms_mv")
+      val _  = v0
+      spark.sql(s"INSERT INTO $db.arr_ms_src VALUES (3, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_ms_src")
+
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[Exception] should be thrownBy {
+        CommandConcurrencyInjection.withForcedCatalogRepairMarkerUpsertFailure {
+          spark.sql(s"ALTER MATERIALIZED VIEW arr_ms_mv ADVANCE SOURCE VERSIONS ($db.arr_ms_src = $v1)").collect()
+        }
+      }
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_ms_mv")) shouldBe true
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_ms_mv ADVANCE SOURCE VERSIONS ($db.arr_ms_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+    }
+
+    it("does not clear a foreign/newer guard token during a clean pre-commit rollback") {
+      val v0 = createAggMv("arr_fk_src", "arr_fk_mv")
+      val _  = v0
+      spark.sql(s"INSERT INTO $db.arr_fk_src VALUES (3, 'a', 5)")
+      val v1   = DeltaTableVersion.requireLatest(spark, s"$db.arr_fk_src")
+      val mvId = TableIdentifier("arr_fk_mv")
+
+      // Between the rollback's owned-guard delete and its verify, a cross-driver op
+      // acquires a NEW token. The token-owned release must leave that newer guard
+      // intact (never force-clear), so the MV stays blocked by the new token.
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[RuntimeException] should be thrownBy {
+        CommandConcurrencyInjection.withAfterGuardDeleteBeforeVerify {
+          MvCommandHelper.acquirePinnedOperationGuard(spark, mvId, "foreign-token")
+          ()
+        } {
+          spark.sql(s"ALTER MATERIALIZED VIEW arr_fk_mv ADVANCE SOURCE VERSIONS ($db.arr_fk_src = $v1)").collect()
+        }
+      }
+      MvCommandHelper.readPinnedOperationGuardState(spark, mvId) match {
+        case MvCommandHelper.PinnedOperationGuardState.Present(_, t) => t shouldBe "foreign-token"
+        case other => fail(s"expected Present(foreign-token) got $other")
+      }
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_fk_mv ADVANCE SOURCE VERSIONS ($db.arr_fk_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, mvId)
+    }
+
+    it("stays blocked (repair-required) when a corrupt guard is present before ADVANCE") {
+      val v0 = createAggMv("arr_cg_src", "arr_cg_mv")
+      val _  = v0
+      spark.sql(s"INSERT INTO $db.arr_cg_src VALUES (3, 'a', 5)")
+      val v1   = DeltaTableVersion.requireLatest(spark, s"$db.arr_cg_src")
+      val mvId = TableIdentifier("arr_cg_mv")
+
+      // A corrupt (single-line) guard file reads as Unreadable, which
+      // hasPinnedOperationGuard treats as present (fail-closed).
+      val path = MvCommandHelper.pinnedOperationGuardPath(spark, mvId)
+      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      fs.mkdirs(path.getParent)
+      val os = fs.create(path, true)
+      try os.write("corrupt-single-line".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      finally os.close()
+
+      MvCommandHelper.hasPinnedOperationGuard(spark, mvId) shouldBe true
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_cg_mv ADVANCE SOURCE VERSIONS ($db.arr_cg_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, mvId)
+    }
+
+    it("fails closed when the interrupted-advance recovery journal is incomplete") {
+      val v0 = createAggMv("arr_rj_src", "arr_rj_mv")
+      val _  = v0
+      // An incomplete journal (only the pre-version key, no cascade-path key) must
+      // be rejected by the recovery pass before any pin operation proceeds.
+      val meta = lookup("arr_rj_mv")
+      MvCatalog.upsert(
+        spark,
+        meta.copy(properties = meta.properties + (MvMetadata.SourceVersionAdvancePreMvVersionKey -> "0"))
+      )
+      spark.sql(s"INSERT INTO $db.arr_rj_src VALUES (3, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_rj_src")
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_rj_mv ADVANCE SOURCE VERSIONS ($db.arr_rj_src = $v1)").collect()
+      ).getMessage.toLowerCase should include("incomplete source-version advancement journal")
+    }
+
+    it("publishes no orphaned downstream cascade after a pre-commit ADVANCE failure, then advances on retry") {
+      spark.sql(s"CREATE TABLE $db.arr_cd_src(id INT, grp STRING, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.arr_cd_src VALUES (1, 'a', 10)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.arr_cd_src")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW arr_cd_up AS " +
+            s"SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM `$db`.`arr_cd_src` VERSION AS OF $v0 GROUP BY grp"
+        )
+        .collect()
+      spark.sql("CREATE MATERIALIZED VIEW arr_cd_down AS SELECT grp, total FROM arr_cd_up").collect()
+      def downstreamCascadeRows: Int =
+        StagingCatalog.collectFor(spark, "arr_cd_down", Seq("arr_cd_up", "default.arr_cd_up")).size
+      val before = downstreamCascadeRows
+
+      spark.sql(s"INSERT INTO $db.arr_cd_src VALUES (2, 'a', 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_cd_src")
+
+      RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+      an[RuntimeException] should be thrownBy
+        spark.sql(s"ALTER MATERIALIZED VIEW arr_cd_up ADVANCE SOURCE VERSIONS ($db.arr_cd_src = $v1)").collect()
+      // The failed advance left no orphaned downstream cascade row and released its guard.
+      downstreamCascadeRows shouldBe before
+      MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_cd_up")) shouldBe false
+
+      // Retry publishes the cascade and the downstream consumes it exactly once.
+      spark.sql(s"ALTER MATERIALIZED VIEW arr_cd_up ADVANCE SOURCE VERSIONS ($db.arr_cd_src = $v1)").collect()
+      spark.sql("REFRESH MATERIALIZED VIEW arr_cd_down").collect()
+      spark.table("arr_cd_down").collect().map(r => (r.getString(0), r.getLong(1))).toSet shouldBe Set(("a", 15L))
+    }
+  }
 }

@@ -3384,6 +3384,14 @@ case class RefreshMaterializedViewCommand(
     private val paths                = scala.collection.mutable.LinkedHashSet.empty[String]
     private var frozenStagingBatches = Vector.empty[StagingChangeBatch]
     @volatile private var committed  = false
+    // Set once publication begins (see finalizeRefresh); a failure past that
+    // point may have leaked durable cascade/marker state this in-process rollback
+    // cannot prove reverted, so the write-ahead guard must stay set.
+    @volatile private var finalizeStarted = false
+    // The write-ahead operation-guard token owned by THIS advance, captured the
+    // instant it is acquired (before any mutation). A clean pre-commit rollback
+    // releases exactly this token, never a foreign or newer one.
+    @volatile private var pinnedGuardToken: Option[String] = None
 
     val requestedBatches: Seq[SourceVersionChangeBatch] =
       repin.currentVersions.toSeq
@@ -3473,6 +3481,16 @@ case class RefreshMaterializedViewCommand(
 
     def isCommitted: Boolean = committed
 
+    /** Record that publication has begun (frozen-delta consume, cascade/staging
+      * record, markConsumed, watermark, metadata publish). A failure past this
+      * point may have leaked durable downstream state a pre-commit rollback
+      * cannot prove reverted, so the write-ahead guard must stay set. */
+    def markFinalizeStarted(): Unit = finalizeStarted = true
+
+    /** Bind the write-ahead operation-guard token owned by THIS advance so a
+      * clean pre-commit rollback can release exactly this guard, and no other. */
+    def recordPinnedGuardToken(token: String): Unit = pinnedGuardToken = Some(token)
+
     def rollback(spark: SparkSession, originalError: Throwable): Unit = {
       paths.synchronized(paths.toVector).foreach { path =>
         try StagingCatalog.removeStagingPathEverywhere(spark, path)
@@ -3484,23 +3502,92 @@ case class RefreshMaterializedViewCommand(
         } catch { case cleanupError: Throwable => originalError.addSuppressed(cleanupError) }
       }
 
+      // Track whether the MV data and tracked version were provably rolled back
+      // to the pre-advance state. Any failure — an unreadable backing table, a
+      // version regression below the pre-advance version, or a RESTORE / tracked-
+      // version / metadata sync failure — means we cannot prove a clean revert, so
+      // the write-ahead guard is left set (repair-required).
+      var restoreOk       = true
       var rollbackVersion = originalMeta.lastVersion
       try {
-        DeltaTableVersion.latestOption(spark, originalMeta.location).foreach { currentVersion =>
-          if (currentVersion != preRefreshMvVersion) {
-            val escaped = originalMeta.location.replace("`", "``")
-            CommandLocalState.withDmlBypass {
-              spark
-                .sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $preRefreshMvVersion")
-                .collect()
+        DeltaTableVersion.latestOption(spark, originalMeta.location) match {
+          case None =>
+            // The backing table is unreadable-as-absent: cannot prove a clean revert.
+            restoreOk = false
+          case Some(liveVersion) =>
+            val currentVersion =
+              if (CommandConcurrencyInjection.forceVersionBelowPre) preRefreshMvVersion - 1L else liveVersion
+            if (currentVersion < preRefreshMvVersion)
+              // A backing-MV version below the pre-advance version is an
+              // unrecoverable inconsistency: do not attempt a doomed RESTORE.
+              restoreOk = false
+            else if (currentVersion > preRefreshMvVersion) {
+              CommandConcurrencyInjection.maybeFailPinRollbackRestore()
+              val escaped = originalMeta.location.replace("`", "``")
+              CommandLocalState.withDmlBypass {
+                spark
+                  .sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $preRefreshMvVersion")
+                  .collect()
+              }
+              rollbackVersion = DeltaTableVersion.requireLatest(spark, originalMeta.location)
             }
-            rollbackVersion = DeltaTableVersion.requireLatest(spark, originalMeta.location)
-          }
+          // currentVersion == preRefreshMvVersion: the apply never advanced the
+          // MV, so the pre-advance data is already live and nothing is restored.
         }
-      } catch { case restoreError: Throwable => originalError.addSuppressed(restoreError) }
+      } catch {
+        case restoreError: Throwable =>
+          restoreOk = false
+          originalError.addSuppressed(restoreError)
+      }
 
-      try MvCatalog.upsert(spark, originalMeta.copy(lastVersion = rollbackVersion))
-      catch { case metadataError: Throwable => originalError.addSuppressed(metadataError) }
+      var metadataOk = true
+      try {
+        CommandConcurrencyInjection.maybeFailCatalogRepairMarkerUpsert()
+        MvCatalog.upsert(spark, originalMeta.copy(lastVersion = rollbackVersion))
+      } catch {
+        case metadataError: Throwable =>
+          metadataOk = false
+          originalError.addSuppressed(metadataError)
+      }
+
+      releaseGuardIfCleanlyRolledBack(spark, originalError, restoreOk, metadataOk)
+    }
+
+    /** Release the write-ahead operation guard ONLY when this in-process rollback
+      * is provably complete: the failure struck before any publication (so no
+      * cascade/staging/markConsumed/watermark state escaped), it was not a source
+      * rebind (the frozen relation is intact), the backing MV was RESTORED to its
+      * pre-advance version, and the tracked-version/metadata sync landed. The
+      * release is strictly token-owned, so a foreign or newer guard is never
+      * deleted. Any failure leaves the guard set (repair-required) and is surfaced
+      * through the original error — exactly like a crash, which never runs this
+      * rollback and so also stays fail-closed. */
+    private def releaseGuardIfCleanlyRolledBack(
+        spark: SparkSession,
+        originalError: Throwable,
+        restoreOk: Boolean,
+        metadataOk: Boolean
+    ): Unit = {
+      val cleanlyRolledBack =
+        restoreOk && metadataOk && !finalizeStarted &&
+          !originalError.isInstanceOf[SourceIdentityRebindingException]
+      if (cleanlyRolledBack) pinnedGuardToken.foreach { token =>
+        val released =
+          try MvCommandHelper.releasePinnedOperationGuard(spark, name, token)
+          catch {
+            case releaseError: Throwable =>
+              originalError.addSuppressed(releaseError)
+              false
+          }
+        if (!released)
+          originalError.addSuppressed(
+            new IllegalStateException(
+              s"[openivm-mv] advance_source_versions view='${MvCommandHelper.sqlIdent(name)}' rolled back cleanly " +
+                "but could not release its pinned-operation guard; the view is left blocked (repair-required) and " +
+                "must be dropped and recreated"
+            )
+          )
+      }
     }
   }
 
@@ -3897,13 +3984,16 @@ case class RefreshMaterializedViewCommand(
       // MV stays blocked (checked by requirePinBinding) until DROP + recreate.
       val pinnedOpToken = java.util.UUID.randomUUID().toString
       def beginPinnedGuardBeforeMutation(): Unit =
-        if (
-          refreshPinnedIdentities.nonEmpty && !MvCommandHelper.acquirePinnedOperationGuard(spark, name, pinnedOpToken)
-        )
-          throw new IllegalStateException(
-            s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot acquire the durable pinned-operation guard " +
-              "(already held, unreadable, or unwritable); aborting before any mutation"
-          )
+        if (refreshPinnedIdentities.nonEmpty) {
+          if (!MvCommandHelper.acquirePinnedOperationGuard(spark, name, pinnedOpToken))
+            throw new IllegalStateException(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot acquire the durable pinned-operation guard " +
+                "(already held, unreadable, or unwritable); aborting before any mutation"
+            )
+          // Bind the freshly acquired token to any in-flight source-version advance
+          // so a clean pre-commit rollback releases exactly this guard, and no other.
+          preparedSourceAdvance.foreach(_.recordPinnedGuardToken(pinnedOpToken))
+        }
       def clearPinnedGuardOnSuccess(): Unit =
         if (
           refreshPinnedIdentities.nonEmpty && !MvCommandHelper.releasePinnedOperationGuard(spark, name, pinnedOpToken)
@@ -4256,6 +4346,10 @@ case class RefreshMaterializedViewCommand(
         // immediately after the final source-consuming MV data mutation (before
         // any cascade/staging write), so by here identity is proven. Consume the
         // deferred frozen-source deltas as part of the commit, then publish.
+        // Mark the point past which publication may leak durable cascade/marker
+        // state: a failure from here on keeps the write-ahead guard set, since an
+        // in-process advance rollback can no longer prove a clean revert.
+        preparedSourceAdvance.foreach(_.markFinalizeStarted())
         consumeFrozenSourceDeltas()
         val dataVersion     = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
         val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
