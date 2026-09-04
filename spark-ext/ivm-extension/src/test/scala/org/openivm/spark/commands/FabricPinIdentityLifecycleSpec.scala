@@ -497,12 +497,32 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
           s"JOIN `$db`.`sjx_dim` VERSION AS OF $v1 AS r ON l.id = r.id"
 
       // One physical source read at TWO versions is an ambiguous cross-version
-      // shape: the resolver yields no verified pins (so it can never persist a
-      // conflicting identity) and the pin telemetry reports it refused.
+      // shape OpenIVM refuses to maintain. The pin telemetry reports it refused,
+      // and the resolver is fail-closed: it yields Failure carrying the exact
+      // unsupported reason -- never NoPin, which would leak the still-temporal
+      // body to a COMPILE_FAILED/FULL_REFRESH demotion that could silently
+      // maintain a frozen relation from live rows.
       val telemetry = SparkTimeTravelSql.pinTelemetry(query, sources)
       telemetry.status shouldBe TimeTravelPinStatus.CompileFailed
       telemetry.reason shouldBe TimeTravelPinReason.UnsupportedPinShape
-      MvCommandHelper.resolvePinnedSources(spark, query, sources) shouldBe MvCommandHelper.PinResolution.NoPin
+
+      val unsupportedReason =
+        "the body carries an unsupported snapshot-pin shape OpenIVM cannot maintain incrementally and " +
+          "must not silently read live rows for a frozen relation: a source is read at two different " +
+          "versions, pinned in one place and read live in another, or pinned to a value that is not a " +
+          "stable literal"
+      MvCommandHelper.resolvePinnedSources(spark, query, sources) shouldBe
+        MvCommandHelper.PinResolution.Failure(unsupportedReason)
+
+      // CREATE hard-fails before any compile/data/metadata work: a non-demotable
+      // AnalysisException (never an OpenIvmCompileException that could demote to
+      // COMPILE_FAILED/FULL_REFRESH), and no view or pin identity is persisted.
+      val error = intercept[AnalysisException] {
+        spark.sql(s"CREATE MATERIALIZED VIEW sjx_mv AS $query").collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("sjx_mv")) shouldBe None
     }
 
     it("hard-fails CREATE when a pinned source and a live source share a compiler short name") {

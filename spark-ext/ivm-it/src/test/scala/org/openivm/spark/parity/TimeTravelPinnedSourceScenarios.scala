@@ -479,27 +479,28 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
     /** A pin whose value is an expression re-evaluated on every refresh is not
       * a frozen relation: the same body resolves to a different snapshot
       * tomorrow, so no delta program can maintain it. The bridge refuses it
-      * loudly, and FULL_REFRESH re-executes the body — pin included — so the
-      * rows the user asked for stay correct.
+      * loudly at CREATE as a fail-closed error rather than letting it fall
+      * through to a COMPILE_FAILED/FULL_REFRESH demotion that could silently
+      * maintain a frozen relation from live rows.
       */
-    it("is refused and demoted to FULL_REFRESH for a moving expression") {
+    it("is refused at CREATE as a fail-closed error, never demoted to FULL_REFRESH for a moving expression") {
+      import org.apache.spark.sql.AnalysisException
       val (src, mv) = timestampPinnedFixture("mov")
       val body =
         s"""select grp, sum(val) as total, count(*) as cnt
            |from $src timestamp as of date_sub(current_date(), 1) as s
            |group by grp""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW $mv AS $body")
+      val error = intercept[AnalysisException] {
+        sql(s"CREATE MATERIALIZED VIEW $mv AS $body").collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
 
-      val meta = mvMeta(mv)
-      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      assertMvCorrect(mv, body)
-      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
-
-      sql(s"INSERT INTO $src VALUES (4, 'b', 400)")
-      refreshMv(mv)
-      assertMvCorrect(mv, body)
-      spark.table(mv).selectExpr("SUM(cnt)").head().getLong(0) shouldBe 2L
+      // The fail-closed CREATE leaves nothing behind: no MV/relation, no pin
+      // identity metadata, and no COMPILE_FAILED/FULL_REFRESH classification to
+      // fall back to.
+      MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)) shouldBe None
+      spark.catalog.tableExists(mv) shouldBe false
     }
   }
 
