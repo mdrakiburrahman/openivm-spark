@@ -2632,6 +2632,7 @@ case class RefreshMaterializedViewCommand(
           var deferredWindowTargetSql: Option[(Int, String)] = None
           val cdfWindowNetChangeProbeEligible =
             !propagation.requiresDmlInterception &&
+              downstreamSourceKeysForThisMv.nonEmpty &&
               cdfChangeBatches.size == changeBatches.size &&
               cdfChangeBatches.nonEmpty &&
               !cdfBatchVerdicts.values.forall(_ == BatchVerdict.InsertOnly)
@@ -2639,9 +2640,9 @@ case class RefreshMaterializedViewCommand(
           var skipCdfWindowRefresh             = false
 
           // A CDF batch can contain several real commits whose signed source
-          // rows cancel exactly. Probe only after the bounded-key direct write
-          // has been selected: fallback window plans must not pay for an extra
-          // source CDF scan and shuffle.
+          // rows cancel exactly. Probe only for a downstream feed and after the
+          // bounded-key direct write has been selected: terminal and fallback
+          // window plans must not pay for an extra source CDF scan and shuffle.
           def detectNetZeroDirectCdfWindow(): Unit =
             if (
               !cdfWindowNetChangeProbeCompleted &&

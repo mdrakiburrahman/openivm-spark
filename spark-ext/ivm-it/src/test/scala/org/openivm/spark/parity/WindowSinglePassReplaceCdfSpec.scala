@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pass-replace") with CdfMode {
@@ -8,8 +8,15 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowSinglePassReplaceEnabledKey -> "true",
-      FeatureGate.QueryLogEnabledKey                -> "true"
+      FeatureGate.QueryLogEnabledKey                -> "true",
+      FeatureGate.ProfileRefreshKey                 -> "true"
     )
+
+  private def ranNetChangeProbe(viewName: String): Boolean =
+    RefreshProfileCatalog
+      .scanAll(spark)
+      .filter(_.viewName.split("\\.").last == viewName)
+      .exists(_.detail == "phase=cdf_window_net_change_probe")
 
   describe("WINDOW_PARTITION single-pass replacement with a named affected-key view") {
     it("creates the affected-key view before collecting keys and remains bag-equal") {
@@ -75,10 +82,27 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       refreshMv("wspr_noop_mv")
       assertMvCorrect("wspr_noop_mv", viewSql)
       mvDataVersion("wspr_noop_mv") shouldBe upstreamVersion
+      ranNetChangeProbe("wspr_noop_mv") shouldBe true
 
       refreshMv("wspr_noop_downstream")
       assertMvCorrect("wspr_noop_downstream", downstreamSql)
       mvDataVersion("wspr_noop_downstream") shouldBe downstreamVersion
+    }
+
+    it("does not scan CDF for net-zero detection when the window view has no downstream consumer") {
+      sql("CREATE TABLE wspr_terminal_sales(id INT, region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO wspr_terminal_sales VALUES (1, 'east', 10), (2, 'east', 20), (3, 'west', 30)")
+      val viewSql =
+        "SELECT id, region, amount, " +
+          "ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount, id) AS rn FROM wspr_terminal_sales"
+      sql(s"CREATE MATERIALIZED VIEW wspr_terminal_mv AS $viewSql")
+
+      sql("UPDATE wspr_terminal_sales SET amount = 15 WHERE id = 1")
+      RefreshProfileCatalog.removeAll(spark)
+      refreshMv("wspr_terminal_mv")
+
+      assertMvCorrect("wspr_terminal_mv", viewSql)
+      ranNetChangeProbe("wspr_terminal_mv") shouldBe false
     }
 
     it("feeds a downstream view from the target CDF for the TPC-DI daily-market shape") {
