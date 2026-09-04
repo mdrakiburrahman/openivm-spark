@@ -286,7 +286,8 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
     * verbatim — pins included.
     */
   describe("(TTP-6) A source read at two different versions") {
-    it("is demoted to FULL_REFRESH deliberately and still returns correct rows") {
+    it("is refused at CREATE as a fail-closed error, never demoted to FULL_REFRESH") {
+      import org.apache.spark.sql.AnalysisException
       sql("CREATE TABLE IF NOT EXISTS ttp_tv_src(id INT, grp STRING, val INT) USING DELTA")
       sql("INSERT INTO ttp_tv_src VALUES (1, 'a', 10), (2, 'b', 20)")
       val vThen = latestVersion("ttp_tv_src")
@@ -297,20 +298,15 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
         s"""select a.id, a.val as val_then, b.val as val_now
            |from ttp_tv_src version as of $vThen as a
            |inner join ttp_tv_src version as of $vNow as b on a.id = b.id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW ttp_mv_two_versions AS $body")
-
-      val meta = mvMeta("ttp_mv_two_versions")
-      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      assertMvCorrect("ttp_mv_two_versions", body)
-      spark.table("ttp_mv_two_versions").count() shouldBe 2L
-
-      // Spark honors both pins on every full refresh, so post-pin DML never
-      // reaches the view.
-      sql("INSERT INTO ttp_tv_src VALUES (4, 'd', 40)")
-      refreshMv("ttp_mv_two_versions")
-      assertMvCorrect("ttp_mv_two_versions", body)
-      spark.table("ttp_mv_two_versions").count() shouldBe 2L
+      val error = intercept[AnalysisException] {
+        sql(s"CREATE MATERIALIZED VIEW ttp_mv_two_versions AS $body").collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(
+        spark,
+        spark.sessionState.sqlParser.parseTableIdentifier("ttp_mv_two_versions")
+      ) shouldBe None
     }
   }
 
@@ -575,7 +571,8 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       mvMeta("ttp_tel_mv_live").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
     }
 
-    it("records COMPILE_FAILED for a pin OpenIVM refuses to maintain") {
+    it("refuses a pin OpenIVM cannot maintain at CREATE rather than recording COMPILE_FAILED") {
+      import org.apache.spark.sql.AnalysisException
       sql("CREATE TABLE IF NOT EXISTS ttp_tel_bad(id INT, grp STRING, val INT) USING DELTA")
       sql("INSERT INTO ttp_tel_bad VALUES (1, 'a', 10), (2, 'b', 20)")
       val vThen = latestVersion("ttp_tel_bad")
@@ -586,17 +583,14 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
         s"""select a.id, a.val as val_then, b.val as val_now
            |from ttp_tel_bad version as of $vThen as a
            |inner join ttp_tel_bad version as of $vNow as b on a.id = b.id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW ttp_tel_mv_bad AS $body")
-
-      val meta = mvMeta("ttp_tel_mv_bad")
-      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
-      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.UnsupportedPinShape)
-      meta.timeTravelPins shouldBe empty
-      meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
-
-      refreshMv("ttp_tel_mv_bad")
-      mvMeta("ttp_tel_mv_bad").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
-      assertMvCorrect("ttp_tel_mv_bad", body)
+      val error = intercept[AnalysisException] {
+        sql(s"CREATE MATERIALIZED VIEW ttp_tel_mv_bad AS $body").collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      MvCatalog.lookup(
+        spark,
+        spark.sessionState.sqlParser.parseTableIdentifier("ttp_tel_mv_bad")
+      ) shouldBe None
     }
   }
 

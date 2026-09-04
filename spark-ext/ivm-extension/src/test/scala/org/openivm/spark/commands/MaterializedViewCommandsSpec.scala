@@ -1835,39 +1835,28 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       nopinRefreshSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.NoUserPin
     }
 
-    it("reports COMPILE_FAILED for an unsupported pin instead of claiming it was applied") {
+    it("hard-fails CREATE for an unsupported cross-version pin instead of demoting it to COMPILE_FAILED") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_bad(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t5b_bad VALUES ('east', 100)")
       spark.sql("INSERT INTO sales_t5b_bad VALUES ('west', 200)")
 
-      val createMessages = withLogCapture { appender =>
-        spark.sql(
-          "CREATE MATERIALIZED VIEW mv_t5b_bad AS " +
-            "SELECT a.region, SUM(a.amount) AS total FROM sales_t5b_bad VERSION AS OF 0 a " +
-            "JOIN sales_t5b_bad VERSION AS OF 1 b ON a.region = b.region GROUP BY a.region"
-        )
-        appender.messages
+      // A source read at two versions carries live temporal semantics `split`
+      // refuses to lift, so the command must fail closed BEFORE compile with a
+      // non-demotable AnalysisException -- never persist a COMPILE_FAILED /
+      // FULL_REFRESH view that could silently maintain a frozen relation from
+      // live rows.
+      val error = intercept[AnalysisException] {
+        spark
+          .sql(
+            "CREATE MATERIALIZED VIEW mv_t5b_bad AS " +
+              "SELECT a.region, SUM(a.amount) AS total FROM sales_t5b_bad VERSION AS OF 0 a " +
+              "JOIN sales_t5b_bad VERSION AS OF 1 b ON a.region = b.region GROUP BY a.region"
+          )
+          .collect()
       }
-
-      val createSpan = executionSpanPayloads(createMessages, "mv_t5b_bad")
-      createSpan should have size 1
-      createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.CompileFailed
-      createSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.UnsupportedPinShape
-      createSpan.head.path("compile_refresh_type").asText() shouldBe "COMPILE_FAILED"
-
-      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_bad")).get
-      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.CompileFailed)
-      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.UnsupportedPinShape)
-      meta.timeTravelPins shouldBe empty
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-
-      val refreshMessages = withLogCapture { appender =>
-        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_bad").collect()
-        appender.messages
-      }
-      val badRefreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_bad").head
-      badRefreshSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.CompileFailed
-      badRefreshSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.UnsupportedPinShape
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_t5b_bad")) shouldBe None
     }
 
     it("fails closed when persisted pin metadata disagrees with the view body") {

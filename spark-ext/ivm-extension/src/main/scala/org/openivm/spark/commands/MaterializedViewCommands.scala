@@ -523,18 +523,22 @@ private[commands] object MvCommandHelper {
     * coverage is structural rather than per-site. Association is by matched
     * normalized dataPath AND Delta metadata id, so a Fabric SQL-visible alias
     * binds to its encoded operational source and two distinct same-leaf sources
-    * stay distinct. If any pin fails to associate to exactly one tracked source
-    * the binding is empty, so the caller falls back to source-name telemetry
-    * (which keeps an un-maintainable pin as FULL_REFRESH); the explicit
-    * hard-fail cases (duplicate short, rebind, legacy-missing-identity) are
-    * enforced by [[SparkTimeTravelSql.validateResolvedSnapshotPins]].
+    * stay distinct. If any pin fails to associate to exactly one tracked source,
+    * or the body carries an unsupported snapshot shape `split` refuses to lift,
+    * resolution is a `Failure` the caller hard-fails on -- never a silent
+    * FULL_REFRESH; the explicit identity hard-fail cases (duplicate short,
+    * rebind, legacy-missing-identity) are enforced by
+    * [[SparkTimeTravelSql.validateResolvedSnapshotPins]].
     */
   /** Tri-state resolution of the body's snapshot pins to their operational
-    * sources by physical Delta identity. `NoPin` means the body pins nothing;
-    * `Verified` carries the resolved pins plus every tracked source's physical
-    * identity; `Failure` means the body pins something that cannot be verified
-    * (unreadable Delta target, or a pin that resolves to zero or several tracked
-    * sources) and MUST hard-fail before any compile/CTAS/delta/metadata.
+    * sources by physical Delta identity. `NoPin` means the body pins nothing
+    * (provably no temporal clause); `Verified` carries the resolved pins plus
+    * every tracked source's physical identity; `Failure` means the body pins
+    * something that cannot be verified (unreadable Delta target, a pin that
+    * resolves to zero or several tracked sources, or an unsupported snapshot
+    * shape such as one physical source read at two versions or pinned in one
+    * place and read live in another) and MUST hard-fail before any
+    * compile/CTAS/delta/metadata.
     */
   sealed trait PinResolution
   object PinResolution {
@@ -552,7 +556,25 @@ private[commands] object MvCommandHelper {
       resolvedSources: Seq[String]
   ): PinResolution = {
     val pins = SparkTimeTravelSql.split(querySql).pins
-    if (pins.isEmpty) return PinResolution.NoPin
+    if (pins.isEmpty)
+      // `split` lifts no pins for BOTH a genuinely unpinned body AND an
+      // unsupported snapshot shape it deliberately refuses to rewrite (the same
+      // physical source read at two versions, or a source pinned in one place
+      // and read live in another). Returning NoPin for the latter is the
+      // release blocker: the body still carries live temporal semantics, so the
+      // pin machinery is bypassed and the view is left to a downstream
+      // COMPILE_FAILED/FULL_REFRESH demotion that could -- if any front-end ever
+      // accepts the clause -- silently maintain a frozen relation from live
+      // rows. Consult the authoritative refusal so an unsupported shape becomes
+      // a fail-closed Failure here; NoPin now means provably no temporal clause.
+      return SparkTimeTravelSql.unsupportedSnapshotPinReason(querySql, Nil) match {
+        case Some(reason) =>
+          PinResolution.Failure(
+            s"the body carries an unsupported snapshot-pin shape OpenIVM cannot maintain incrementally and " +
+              s"must not silently read live rows for a frozen relation: $reason"
+          )
+        case None => PinResolution.NoPin
+      }
 
     val operationalIdentities = resolvedSources.map { source =>
       val physical = deltaPhysicalIdentity(spark, source)
@@ -798,35 +820,71 @@ private[commands] object MvCommandHelper {
     * exact same dataPath + metadata.id. External input is never suffix-matched:
     * a request that is not a readable Delta table, or does not match exactly one
     * persisted pinned source, hard-fails before any version is moved.
+    *
+    * Resolution is a SEQUENCE, not a direct `Map` transform: two textually
+    * distinct request identifiers can resolve to the SAME persisted operational
+    * source (e.g. two catalog names over one physical Delta table). Keying the
+    * result map directly on the resolved alias would silently collapse those
+    * into one entry (last-writer-wins, iteration-order dependent) EVEN WHEN the
+    * requested versions differ. Instead every ordered request entry is resolved
+    * first, then grouped by operational identity; any operational source named by
+    * more than one distinct request identifier is rejected -- even if the
+    * requested versions are equal -- with a deterministic diagnostic listing the
+    * conflicting identifiers, and only a proven-unique set is turned into the
+    * operational-source version map.
     */
   def resolveAdvanceRequest(
       spark: SparkSession,
       viewName: TableIdentifier,
       versionsBySource: Map[String, Long],
       persistedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
-  ): Map[String, Long] =
-    versionsBySource.map { case (requestId, version) =>
-      val physical = deltaPhysicalIdentity(spark, requestId).getOrElse(
+  ): Map[String, Long] = {
+    // Resolve the ordered request entries (deterministic by request identifier)
+    // to `(requestId, version, operationalAlias)`, preserving each distinct
+    // request identifier so a physical collapse is caught below instead of
+    // silently absorbed by a `Map`.
+    val resolved: Seq[(String, Long, String)] =
+      versionsBySource.toSeq.sortBy(_._1).map { case (requestId, version) =>
+        val physical = deltaPhysicalIdentity(spark, requestId).getOrElse(
+          throw pinBindingException(
+            viewName,
+            s"the ADVANCE request source '$requestId' is not a readable committed Delta table"
+          )
+        )
+        val matches = persistedPins
+          .filter(pin =>
+            pin.operationalSource.deltaLogDataPath == physical._1 &&
+              pin.operationalSource.deltaTableMetadataId == physical._2
+          )
+          .map(_.operationalSource.alias)
+          .distinct
+        if (matches.size != 1)
+          throw pinBindingException(
+            viewName,
+            s"the ADVANCE request source '$requestId' resolves to ${matches.size} persisted pinned sources by " +
+              "physical Delta identity; expected exactly one"
+          )
+        (requestId, version, matches.head)
+      }
+
+    // Reject any operational source named by more than one distinct request
+    // identifier BEFORE keying the map -- regardless of whether the requested
+    // versions agree -- so a duplicate can never collapse to a single arbitrary
+    // entry. Diagnostics are sorted for determinism.
+    resolved.groupBy(_._3).foreach { case (operationalAlias, group) =>
+      val conflicting = group.map(_._1).distinct.sorted
+      if (conflicting.size > 1)
         throw pinBindingException(
           viewName,
-          s"the ADVANCE request source '$requestId' is not a readable committed Delta table"
+          s"the ADVANCE request identifiers ${conflicting.mkString(", ")} resolve to the same persisted pinned " +
+            s"source '$operationalAlias' by physical Delta identity; each pinned source may be advanced by at most " +
+            "one request identifier"
         )
-      )
-      val matches = persistedPins
-        .filter(pin =>
-          pin.operationalSource.deltaLogDataPath == physical._1 &&
-            pin.operationalSource.deltaTableMetadataId == physical._2
-        )
-        .map(_.operationalSource.alias)
-        .distinct
-      if (matches.size != 1)
-        throw pinBindingException(
-          viewName,
-          s"the ADVANCE request source '$requestId' resolves to ${matches.size} persisted pinned sources by " +
-            "physical Delta identity; expected exactly one"
-        )
-      matches.head -> version
     }
+
+    // Uniqueness proven -- safe to key the operational-source version map.
+    resolved.map { case (_, version, operationalAlias) => operationalAlias -> version }.toMap
+  }
 
   def telemetrySourceVersions(
       spark: SparkSession,

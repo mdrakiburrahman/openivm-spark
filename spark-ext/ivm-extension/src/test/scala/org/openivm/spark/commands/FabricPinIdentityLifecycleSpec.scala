@@ -1,6 +1,6 @@
 package org.openivm.spark.commands
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, MvMetadata, TimeTravelPinStatus}
 import org.openivm.spark.compiler.SparkTimeTravelSql
@@ -65,6 +65,15 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
 
   private def lookup(name: String): MvMetadata =
     MvCatalog.lookup(spark, TableIdentifier(name)).getOrElse(fail(s"missing MV metadata for $name"))
+
+  /** A persisted pin over a real committed Delta table, resolved to its physical
+    * identity, for driving [[MvCommandHelper.resolveAdvanceRequest]] directly. */
+  private def advancePin(alias: String, clause: String): SparkTimeTravelSql.ResolvedSnapshotPin = {
+    val (path, id) =
+      MvCommandHelper.deltaPhysicalIdentity(spark, alias).getOrElse(fail(s"expected Delta identity for $alias"))
+    val identity = SparkTimeTravelSql.SourceIdentity(alias, path, id)
+    SparkTimeTravelSql.ResolvedSnapshotPin(SparkTimeTravelSql.SnapshotPin(alias, clause), identity, identity)
+  }
 
   describe("Fabric snapshot-pin identity lifecycle") {
     it("keeps a pinned MV APPLIED across two refresh recompiles and persists its physical identity") {
@@ -530,6 +539,214 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       bound("sm3a") shouldBe ((pathA, s"VERSION AS OF $va"))
       bound("sm3b") shouldBe ((pathB, s"VERSION AS OF $vb"))
       pathA should not be pathB
+    }
+  }
+
+  // BLOCKER 1: `split` lifts no pins for BOTH a provably unpinned body and an
+  // unsupported snapshot shape it refuses to rewrite (a source read at two
+  // versions, or pinned in one place and read live in another). The command
+  // layer must hard-fail the latter as a fail-closed AnalysisException -- never
+  // let it fall through to NoPin and a COMPILE_FAILED/FULL_REFRESH demotion that
+  // could silently maintain a frozen relation from live rows.
+  describe("Tri-state snapshot-pin resolution refuses unsupported shapes (BLOCKER 1)") {
+    it("resolves a source read at two different versions to Failure, not NoPin") {
+      spark.sql(s"CREATE TABLE $db.ts_xver(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.ts_xver VALUES (1)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.ts_xver")
+      spark.sql(s"INSERT INTO $db.ts_xver VALUES (2)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.ts_xver")
+
+      val body =
+        s"SELECT a.id FROM `$db`.`ts_xver` VERSION AS OF $v0 AS a " +
+          s"JOIN `$db`.`ts_xver` VERSION AS OF $v1 AS b ON a.id = b.id"
+      MvCommandHelper.resolvePinnedSources(spark, body, Seq(s"$db.ts_xver")) match {
+        case MvCommandHelper.PinResolution.Failure(reason) =>
+          reason.toLowerCase should include("unsupported snapshot-pin shape")
+        case other => fail(s"expected Failure, got $other")
+      }
+    }
+
+    it("resolves a source pinned in one place and read live in another to Failure, not NoPin") {
+      spark.sql(s"CREATE TABLE $db.ts_live(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.ts_live VALUES (1)")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.ts_live")
+
+      val body =
+        s"SELECT a.id FROM `$db`.`ts_live` VERSION AS OF $v AS a " +
+          s"JOIN `$db`.`ts_live` AS b ON a.id = b.id"
+      MvCommandHelper.resolvePinnedSources(spark, body, Seq(s"$db.ts_live")) match {
+        case MvCommandHelper.PinResolution.Failure(reason) =>
+          reason.toLowerCase should include("unsupported snapshot-pin shape")
+        case other => fail(s"expected Failure, got $other")
+      }
+    }
+
+    it("resolves a body with no temporal clause to NoPin") {
+      spark.sql(s"CREATE TABLE $db.ts_none(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.ts_none VALUES (1)")
+      MvCommandHelper.resolvePinnedSources(
+        spark,
+        s"SELECT id FROM `$db`.`ts_none`",
+        Seq(s"$db.ts_none")
+      ) shouldBe MvCommandHelper.PinResolution.NoPin
+    }
+
+    it("resolves a same-version self-join to Verified") {
+      spark.sql(s"CREATE TABLE $db.ts_same(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.ts_same VALUES (1)")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.ts_same")
+
+      val body =
+        s"SELECT a.id FROM `$db`.`ts_same` VERSION AS OF $v AS a " +
+          s"JOIN `$db`.`ts_same` VERSION AS OF $v AS b ON a.id = b.id"
+      MvCommandHelper.resolvePinnedSources(spark, body, Seq(s"$db.ts_same")) match {
+        case MvCommandHelper.PinResolution.Verified(resolvedPins, _) =>
+          resolvedPins should not be empty
+        case other => fail(s"expected Verified, got $other")
+      }
+    }
+
+    it("hard-fails CREATE for a cross-version self-join before compile, leaving no view") {
+      spark.sql(s"CREATE TABLE $db.cv_src(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.cv_src VALUES (1)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.cv_src")
+      spark.sql(s"INSERT INTO $db.cv_src VALUES (2)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.cv_src")
+
+      val error = intercept[AnalysisException] {
+        spark
+          .sql(
+            s"CREATE MATERIALIZED VIEW cv_mv AS SELECT a.id FROM `$db`.`cv_src` VERSION AS OF $v0 AS a " +
+              s"JOIN `$db`.`cv_src` VERSION AS OF $v1 AS b ON a.id = b.id"
+          )
+          .collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("cv_mv")) shouldBe None
+    }
+
+    it("hard-fails CREATE for a pinned+live read before compile, leaving no view") {
+      spark.sql(s"CREATE TABLE $db.pl_src(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.pl_src VALUES (1)")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.pl_src")
+
+      val error = intercept[AnalysisException] {
+        spark
+          .sql(
+            s"CREATE MATERIALIZED VIEW pl_mv AS SELECT a.id FROM `$db`.`pl_src` VERSION AS OF $v AS a " +
+              s"JOIN `$db`.`pl_src` AS b ON a.id = b.id"
+          )
+          .collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("pl_mv")) shouldBe None
+    }
+
+    it("hard-fails the dry compile for a cross-version self-join before compile") {
+      spark.sql(s"CREATE TABLE $db.dry_src(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.dry_src VALUES (1)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.dry_src")
+      spark.sql(s"INSERT INTO $db.dry_src VALUES (2)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.dry_src")
+
+      val body =
+        s"SELECT a.id FROM `$db`.`dry_src` VERSION AS OF $v0 AS a " +
+          s"JOIN `$db`.`dry_src` VERSION AS OF $v1 AS b ON a.id = b.id"
+      val error = intercept[AnalysisException] {
+        MvDryCompile.dryCompile(spark, TableIdentifier("dry_mv"), body)
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+    }
+  }
+
+  // BLOCKER 4: `resolveAdvanceRequest` used to `versionsBySource.map` straight
+  // onto the resolved operational alias, so two textually distinct request
+  // identifiers over ONE physical Delta source collapsed to a single entry
+  // (last-writer-wins, iteration-order dependent) EVEN when their versions
+  // disagreed. Duplicate physical identity must be rejected before the map is
+  // keyed; distinct sources that merely share a leaf name must not be fused.
+  describe("ADVANCE request resolution rejects duplicate physical identity (BLOCKER 4)") {
+    it("rejects two distinct identifiers resolving to one physical source with equal versions") {
+      spark.sql(s"CREATE TABLE $db.adv_dup(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.adv_dup VALUES (1)")
+      val v         = DeltaTableVersion.requireLatest(spark, s"$db.adv_dup")
+      val plain     = s"$db.adv_dup"
+      val quoted    = s"`$db`.`adv_dup`"
+      val persisted = Seq(advancePin(plain, s"VERSION AS OF $v"))
+
+      // Both spellings parse to the same TableIdentifier and therefore the same
+      // physical Delta identity, but remain distinct request-map keys.
+      MvCommandHelper.deltaPhysicalIdentity(spark, quoted) shouldBe
+        MvCommandHelper.deltaPhysicalIdentity(spark, plain)
+
+      val error = intercept[AnalysisException] {
+        MvCommandHelper.resolveAdvanceRequest(
+          spark,
+          TableIdentifier("adv_dup_mv"),
+          Map(plain -> v, quoted -> v),
+          persisted
+        )
+      }
+      error.getMessage should include(plain)
+      error.getMessage should include(quoted)
+    }
+
+    it("rejects two distinct identifiers resolving to one physical source when versions differ") {
+      spark.sql(s"CREATE TABLE $db.adv_diff(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.adv_diff VALUES (1)")
+      val v         = DeltaTableVersion.requireLatest(spark, s"$db.adv_diff")
+      val plain     = s"$db.adv_diff"
+      val quoted    = s"`$db`.`adv_diff`"
+      val persisted = Seq(advancePin(plain, s"VERSION AS OF $v"))
+
+      val error = intercept[AnalysisException] {
+        MvCommandHelper.resolveAdvanceRequest(
+          spark,
+          TableIdentifier("adv_diff_mv"),
+          Map(plain -> v, quoted -> (v + 1L)),
+          persisted
+        )
+      }
+      error.getMessage should include(plain)
+      error.getMessage should include(quoted)
+    }
+
+    it("accepts two distinct physical sources that share a leaf name") {
+      spark.sql(s"CREATE TABLE default.adv_leaf(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO default.adv_leaf VALUES (1)")
+      spark.sql(s"CREATE TABLE $db.adv_leaf(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.adv_leaf VALUES (1)")
+      val vLeft  = DeltaTableVersion.requireLatest(spark, "default.adv_leaf")
+      val vRight = DeltaTableVersion.requireLatest(spark, s"$db.adv_leaf")
+      val persisted = Seq(
+        advancePin("default.adv_leaf", s"VERSION AS OF $vLeft"),
+        advancePin(s"$db.adv_leaf", s"VERSION AS OF $vRight")
+      )
+
+      val resolved = MvCommandHelper.resolveAdvanceRequest(
+        spark,
+        TableIdentifier("leaf_mv"),
+        Map("default.adv_leaf" -> vLeft, s"$db.adv_leaf" -> vRight),
+        persisted
+      )
+      resolved shouldBe Map("default.adv_leaf" -> vLeft, s"$db.adv_leaf" -> vRight)
+    }
+
+    it("accepts a single exact request identifier") {
+      spark.sql(s"CREATE TABLE $db.adv_solo(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.adv_solo VALUES (1)")
+      val v         = DeltaTableVersion.requireLatest(spark, s"$db.adv_solo")
+      val persisted = Seq(advancePin(s"$db.adv_solo", s"VERSION AS OF $v"))
+
+      MvCommandHelper.resolveAdvanceRequest(
+        spark,
+        TableIdentifier("solo_mv"),
+        Map(s"$db.adv_solo" -> v),
+        persisted
+      ) shouldBe Map(s"$db.adv_solo" -> v)
     }
   }
 }
