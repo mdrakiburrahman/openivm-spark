@@ -113,6 +113,119 @@ object SparkTimeTravelSql {
       pins: Seq[String]
   )
 
+  /** Test-only pin-resolution contract; production callers do not yet use it. */
+  private[compiler] final case class SourceIdentity(
+      alias: String,
+      deltaLogDataPath: String,
+      deltaTableMetadataId: String
+  ) {
+    def matchesAlias(candidate: String): Boolean = alias == candidate
+  }
+
+  private[compiler] final case class ResolvedSnapshotPin(
+      pin: SnapshotPin,
+      sqlVisibleSource: SourceIdentity,
+      operationalSource: SourceIdentity
+  ) {
+    def emitsResolved: String = operationalSource.alias
+  }
+
+  private[compiler] sealed trait PinIdentityOperation
+
+  private[compiler] object PinIdentityOperation {
+    case object Create           extends PinIdentityOperation
+    case object IdempotentCreate extends PinIdentityOperation
+    case object Refresh          extends PinIdentityOperation
+    case object Advance          extends PinIdentityOperation
+    case object DryCompile       extends PinIdentityOperation
+    case object DryRewrite       extends PinIdentityOperation
+  }
+
+  private[compiler] sealed trait PinBindingCheckpoint
+
+  private[compiler] object PinBindingCheckpoint {
+    case object CreateBeforeWrite              extends PinBindingCheckpoint
+    case object CreateAfterWrite               extends PinBindingCheckpoint
+    case object RefreshBeforeApply             extends PinBindingCheckpoint
+    case object RefreshAfterStagingBeforeMerge extends PinBindingCheckpoint
+    case object RefreshAfterApply              extends PinBindingCheckpoint
+  }
+
+  private[compiler] final case class PinBindingCheckpointFailure(
+      detail: String,
+      createArtifactsCleaned: Boolean,
+      refreshRestored: Boolean,
+      watermarksUnchanged: Boolean,
+      consumedChangesUnchanged: Boolean,
+      ctasRetried: Boolean,
+      preVersionUnchanged: Boolean,
+      createPostCheckOutsideRetry: Boolean,
+      refreshMarkersUnchanged: Boolean
+  )
+
+  private[compiler] sealed trait PinRewriteSurface
+
+  private[compiler] object PinRewriteSurface {
+    case object UserFullQuery               extends PinRewriteSurface
+    case object CompilerInitialLoad         extends PinRewriteSurface
+    case object SparkRefreshRewriterEmitted extends PinRewriteSurface
+  }
+
+  private[compiler] final case class PathBoundRewrite(
+      sql: String,
+      pinnedOccurrenceCount: Int
+  )
+
+  private[compiler] sealed trait BindingSite
+
+  private[compiler] object BindingSite {
+    case object CreateCompileRequest               extends BindingSite
+    case object DryCompileCompileRequest           extends BindingSite
+    case object CreateInitialLoad                  extends BindingSite
+    case object DryCompileInitialLoad              extends BindingSite
+    case object RefreshCompileRequest              extends BindingSite
+    case object RefreshFreshSchemasShortToQual     extends BindingSite
+    case object CreatePinTelemetry                 extends BindingSite
+    case object CreatePersistedIdentity            extends BindingSite
+    case object RefreshPinTelemetry                extends BindingSite
+    case object RefreshFrozenSourceSelection       extends BindingSite
+    case object RefreshRewriterSnapshotPins        extends BindingSite
+    case object AdvanceExternalSourceIdentifiers   extends BindingSite
+    case object AdvancePersistedIdentityValidation extends BindingSite
+
+    val CompilerSites: Seq[BindingSite] = Seq(
+      CreateCompileRequest,
+      DryCompileCompileRequest,
+      CreateInitialLoad,
+      DryCompileInitialLoad,
+      RefreshCompileRequest,
+      RefreshFreshSchemasShortToQual
+    )
+
+    val PinSites: Seq[BindingSite] = Seq(
+      CreatePinTelemetry,
+      CreatePersistedIdentity,
+      RefreshPinTelemetry,
+      RefreshFrozenSourceSelection,
+      RefreshRewriterSnapshotPins,
+      AdvanceExternalSourceIdentifiers,
+      AdvancePersistedIdentityValidation
+    )
+  }
+
+  /** Test-only pin-binding contract; production callers do not yet use it. */
+  private[compiler] final case class PinResolutionFailure(
+      pin: SnapshotPin,
+      detail: String
+  )
+
+  private[compiler] final case class ResolvedSnapshotPinBindings(
+      sourceTables: Seq[String],
+      sourceIdentities: Seq[SourceIdentity],
+      pins: Seq[ResolvedSnapshotPin],
+      resolutionFailures: Seq[PinResolutionFailure] = Seq.empty
+  )
+
   /** A pin as the scanner lifted it, plus the parsed clause KIND and VALUE.
     * Those two are what binds the pin to the `RelationTimeTravel` node Spark's
     * parser produced for the same relation — the clause TEXT is user-facing and
@@ -394,6 +507,96 @@ object SparkTimeTravelSql {
         PinTelemetry(TimeTravelPinStatus.NotApplicable, Seq.empty, TimeTravelPinReason.NoUserPin, None)
     }
 
+  /** Test-only observation seam for resolving already-validated snapshot pins
+    * to operational source identities. Resolution is intentionally not
+    * implemented yet.
+    */
+  private[compiler] def pinTelemetry(
+      sql: String,
+      operationalSources: Seq[String],
+      resolvedPins: Seq[ResolvedSnapshotPin]
+  ): PinTelemetry =
+    pinTelemetry(sql, operationalSources)
+
+  private[compiler] def pinTelemetry(
+      sql: String,
+      operationalSources: Seq[String],
+      resolvedPins: Seq[ResolvedSnapshotPin],
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): PinTelemetry =
+    pinTelemetry(sql, operationalSources)
+
+  private[compiler] def pinTelemetry(
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): PinTelemetry =
+    pinTelemetry(sql, bindings.sourceTables)
+
+  /** Test-only validation seam; physical-identity checks are intentionally not
+    * implemented yet.
+    */
+  private[compiler] def validateResolvedSnapshotPins(
+      operation: PinIdentityOperation,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Option[Seq[ResolvedSnapshotPin]]
+  ): Either[String, Unit] =
+    Right(())
+
+  /** Test-only structured-property seam; persistence is intentionally not
+    * implemented yet.
+    */
+  private[compiler] val PinnedSourceIdentitiesPropertyKey: String =
+    "_ivm_pinned_source_identities"
+  private[compiler] val MaxPinnedSourceIdentitiesPropertyBytes: Int = 65536
+
+  private[compiler] def pinnedSourceIdentityProperties(
+      bindings: ResolvedSnapshotPinBindings
+  ): Map[String, String] =
+    Map.empty
+
+  private[compiler] def readPinnedSourceIdentityProperties(
+      properties: Map[String, String],
+      currentBindings: ResolvedSnapshotPinBindings
+  ): Either[String, Seq[ResolvedSnapshotPin]] =
+    Left("pinned source identities are not implemented")
+
+  private[compiler] def bindingFor(
+      bindings: ResolvedSnapshotPinBindings,
+      site: BindingSite
+  ): ResolvedSnapshotPinBindings =
+    bindings
+
+  private[compiler] def rewriteSnapshotPinsByDataPath(
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, String] =
+    Left("path-bound snapshot pin rewriting is not implemented")
+
+  private[compiler] def rewritePinnedReadSurface(
+      surface: PinRewriteSurface,
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, PathBoundRewrite] =
+    Left("path-bound surface rewriting is not implemented")
+
+  private[compiler] def rewriteEmittedSnapshotPinsByDataPath(
+      emittedSql: Seq[String],
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[String, Seq[String]] =
+    Left("path-bound emitted SQL rewriting is not implemented")
+
+  private[compiler] def verifySnapshotPinBindingsAt(
+      operation: PinIdentityOperation,
+      checkpoint: PinBindingCheckpoint,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin]
+  ): Either[PinBindingCheckpointFailure, Unit] =
+    Right(())
+
   /** Status component of [[pinTelemetry]]. */
   def pinStatus(sql: String, qualifiedSources: Seq[String]): String =
     pinTelemetry(sql, qualifiedSources).status
@@ -514,6 +717,34 @@ object SparkTimeTravelSql {
         )
       )
   }
+
+  /** Test-only observation seam paired with [[pinTelemetry]] for ADVANCE SOURCE
+    * VERSIONS.
+    */
+  private[compiler] def repinVersions(
+      sql: String,
+      operationalSources: Seq[String],
+      resolvedPins: Seq[ResolvedSnapshotPin],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] =
+    repinVersions(sql, operationalSources, requestedVersions)
+
+  private[compiler] def repinVersions(
+      sql: String,
+      bindings: ResolvedSnapshotPinBindings,
+      persistedPins: Seq[ResolvedSnapshotPin],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] =
+    repinVersions(sql, bindings.sourceTables, requestedVersions)
+
+  private[compiler] def repinVersions(
+      sql: String,
+      operationalSources: Seq[String],
+      resolvedPins: Seq[ResolvedSnapshotPin],
+      persistedPins: Seq[ResolvedSnapshotPin],
+      requestedVersions: Map[String, Long]
+  ): Either[String, VersionRepin] =
+    repinVersions(sql, operationalSources, requestedVersions)
 
   private def unresolvedPins(pins: Seq[SnapshotPin], qualifiedSources: Seq[String]): Seq[SnapshotPin] = {
     val sources = qualifiedSources.distinct
