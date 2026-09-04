@@ -835,6 +835,128 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       noException should be thrownBy spark.sql("REFRESH MATERIALIZED VIEW rr_mv").collect()
     }
 
+    it("aborts a pinned refresh before any mutation when the pre-apply version cannot be captured") {
+      spark.sql(s"CREATE TABLE $db.pvc_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.pvc_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.pvc_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.pvc_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.pvc_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW pvc_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`pvc_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`pvc_live` AS live ON p.id = live.id"
+        )
+        .collect()
+      val beforeVersion = DeltaTableVersion.requireLatest(spark, lookup("pvc_mv").location)
+      val beforeRows    = spark.table("pvc_mv").collect().map(_.mkString("|")).sorted.toList
+
+      spark.sql(s"INSERT INTO $db.pvc_live VALUES (1, 11)")
+      val error = intercept[Exception] {
+        CommandConcurrencyInjection.withForcedPreApplyVersionCaptureFailure {
+          spark.sql("REFRESH MATERIALIZED VIEW pvc_mv").collect()
+        }
+      }
+      error.getMessage.toLowerCase should include("before any mutation")
+      // No mutation happened: MV version and rows are unchanged.
+      DeltaTableVersion.requireLatest(spark, lookup("pvc_mv").location) shouldBe beforeVersion
+      spark.table("pvc_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
+    }
+
+    it("establishes a blocking repair state when the post-RESTORE latest-version read fails") {
+      spark.sql(s"CREATE TABLE $db.prr_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.prr_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.prr_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.prr_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.prr_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW prr_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`prr_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`prr_live` AS live ON p.id = live.id"
+        )
+        .collect()
+
+      spark.sql(s"INSERT INTO $db.prr_live VALUES (1, 11)")
+      val error = intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withForcedPostRestoreVersionReadFailure {
+          CommandConcurrencyInjection.withBeforeRefreshFinalize {
+            spark.sql(s"DROP TABLE $db.prr_pinned")
+            spark.sql(s"CREATE TABLE $db.prr_pinned(id INT, grp STRING) USING DELTA")
+            spark.sql(s"INSERT INTO $db.prr_pinned VALUES (1, 'x')")
+          } {
+            spark.sql("REFRESH MATERIALIZED VIEW prr_mv").collect()
+          }
+        }
+      }
+      error.getMessage.toLowerCase should include("post-restore version read failed")
+      error.getMessage.toLowerCase should include("repair-required")
+      // The blocking repair state persists: a subsequent REFRESH is refused.
+      intercept[Exception](
+        spark.sql("REFRESH MATERIALIZED VIEW prr_mv").collect()
+      ).getMessage.toLowerCase should include(
+        "repair-required"
+      )
+    }
+
+    it("writes a filesystem fallback journal when the catalog repair-marker upsert fails, blocking until recreate") {
+      spark.sql(s"CREATE TABLE $db.fb_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.fb_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.fb_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.fb_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.fb_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW fb_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`fb_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`fb_live` AS live ON p.id = live.id"
+        )
+        .collect()
+
+      spark.sql(s"INSERT INTO $db.fb_live VALUES (1, 11)")
+      // Rollback RESTORE fails AND the catalog repair-marker upsert fails -> the
+      // verified filesystem fallback journal must carry the durable repair state.
+      intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withForcedCatalogRepairMarkerUpsertFailure {
+          CommandConcurrencyInjection.withForcedPinRollbackRestoreFailure {
+            CommandConcurrencyInjection.withBeforeRefreshFinalize {
+              spark.sql(s"DROP TABLE $db.fb_pinned")
+              spark.sql(s"CREATE TABLE $db.fb_pinned(id INT, grp STRING) USING DELTA")
+              spark.sql(s"INSERT INTO $db.fb_pinned VALUES (1, 'x')")
+            } {
+              spark.sql("REFRESH MATERIALIZED VIEW fb_mv").collect()
+            }
+          }
+        }
+      }
+      // Catalog property marker absent (upsert failed) but the FS fallback present.
+      lookup("fb_mv").properties.keySet should not contain MvCommandHelper.PinRebindRepairRequiredKey
+      MvCommandHelper.hasPinRepairFallbackMarker(spark, TableIdentifier("fb_mv")) shouldBe true
+      // REFRESH and ADVANCE are blocked by the fallback journal.
+      intercept[Exception](
+        spark.sql("REFRESH MATERIALIZED VIEW fb_mv").collect()
+      ).getMessage.toLowerCase should include(
+        "repair-required"
+      )
+      val liveV = DeltaTableVersion.requireLatest(spark, s"$db.fb_live")
+      intercept[Exception](
+        spark.sql(s"ALTER MATERIALIZED VIEW fb_mv ADVANCE SOURCE VERSIONS ($db.fb_live = $liveV)").collect()
+      ).getMessage.toLowerCase should include("repair-required")
+      // DROP + recreate deterministically clears the fallback journal.
+      spark.sql("DROP MATERIALIZED VIEW fb_mv")
+      val pv2 = DeltaTableVersion.requireLatest(spark, s"$db.fb_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW fb_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`fb_pinned` VERSION AS OF $pv2 AS p " +
+            s"JOIN `$db`.`fb_live` AS live ON p.id = live.id"
+        )
+        .collect()
+      MvCommandHelper.hasPinRepairFallbackMarker(spark, TableIdentifier("fb_mv")) shouldBe false
+      spark.sql(s"INSERT INTO $db.fb_live VALUES (1, 12)")
+      noException should be thrownBy spark.sql("REFRESH MATERIALIZED VIEW fb_mv").collect()
+    }
+
     it("publishes no downstream cascade/staging row when a pinned upstream refresh is rejected (intercept mode)") {
       spark.sql(s"CREATE TABLE $db.up_pinned(id INT, grp STRING) USING DELTA")
       spark.sql(s"CREATE TABLE $db.up_live(id INT, amount INT) USING DELTA")

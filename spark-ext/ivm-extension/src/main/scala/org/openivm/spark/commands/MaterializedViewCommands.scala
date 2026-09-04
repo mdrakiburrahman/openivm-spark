@@ -315,6 +315,47 @@ private[spark] object CommandConcurrencyInjection {
   private[commands] def maybeFailPinRollbackRestore(): Unit =
     if (forcePinRollbackRestoreFailure)
       throw new RuntimeException("injected pin-rollback RESTORE failure (test)")
+
+  @volatile private var forcePreApplyVersionCaptureFailure: Boolean    = false
+  @volatile private var forcePostRestoreVersionReadFailure: Boolean    = false
+  @volatile private var forceCatalogRepairMarkerUpsertFailure: Boolean = false
+
+  /** Forces the pinned pre-apply MV version capture to fail (abort-before-mutation). */
+  def withForcedPreApplyVersionCaptureFailure[A](body: => A): A = synchronized {
+    val previous = forcePreApplyVersionCaptureFailure
+    forcePreApplyVersionCaptureFailure = true
+    try body
+    finally forcePreApplyVersionCaptureFailure = previous
+  }
+
+  private[commands] def maybeFailPreApplyVersionCapture(): Unit =
+    if (forcePreApplyVersionCaptureFailure)
+      throw new RuntimeException("injected pre-apply version capture failure (test)")
+
+  /** Forces the post-RESTORE latest-version read to fail (blocking repair state). */
+  def withForcedPostRestoreVersionReadFailure[A](body: => A): A = synchronized {
+    val previous = forcePostRestoreVersionReadFailure
+    forcePostRestoreVersionReadFailure = true
+    try body
+    finally forcePostRestoreVersionReadFailure = previous
+  }
+
+  private[commands] def maybeFailPostRestoreVersionRead(): Unit =
+    if (forcePostRestoreVersionReadFailure)
+      throw new RuntimeException("injected post-restore version read failure (test)")
+
+  /** Forces the catalog repair-marker upsert to fail, so the filesystem fallback
+    * journal must carry the durable repair state. */
+  def withForcedCatalogRepairMarkerUpsertFailure[A](body: => A): A = synchronized {
+    val previous = forceCatalogRepairMarkerUpsertFailure
+    forceCatalogRepairMarkerUpsertFailure = true
+    try body
+    finally forceCatalogRepairMarkerUpsertFailure = previous
+  }
+
+  private[commands] def maybeFailCatalogRepairMarkerUpsert(): Unit =
+    if (forceCatalogRepairMarkerUpsertFailure)
+      throw new RuntimeException("injected catalog repair-marker upsert failure (test)")
 }
 
 private[commands] object CommandLocalState {
@@ -791,6 +832,46 @@ private[commands] object MvCommandHelper {
     * state even if the source's physical identity later happens to re-match. */
   val PinRebindRepairRequiredKey: String = "_ivm_pin_rebind_repair_required"
 
+  /** Deterministic per-MV filesystem path for the fallback repair-required
+    * journal, under openivm-owned MV state. Used only when the catalog property
+    * marker cannot be durably written. */
+  private def pinRepairMarkerPath(spark: SparkSession, viewName: TableIdentifier): org.apache.hadoop.fs.Path = {
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val safe      = metaName(viewName).replaceAll("[^A-Za-z0-9_.-]", "_")
+    new org.apache.hadoop.fs.Path(s"$warehouse/_ivm/pin_repair/$safe.marker")
+  }
+
+  /** Durably persist the per-MV fallback repair journal by an atomic
+    * create-temp-then-rename, then VERIFY it exists. Returns true iff durable. */
+  def writePinRepairFallbackMarker(spark: SparkSession, viewName: TableIdentifier, detail: String): Boolean =
+    try {
+      val path = pinRepairMarkerPath(spark, viewName)
+      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      fs.mkdirs(path.getParent)
+      val tmp = new org.apache.hadoop.fs.Path(path.getParent, s".${path.getName}.${java.util.UUID.randomUUID()}.tmp")
+      val os  = fs.create(tmp, true)
+      try os.write(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      finally os.close()
+      fs.delete(path, false)
+      fs.rename(tmp, path)
+      fs.exists(path)
+    } catch { case NonFatal(_) => false }
+
+  /** True iff the per-MV fallback repair journal exists on the owned MV state. */
+  def hasPinRepairFallbackMarker(spark: SparkSession, viewName: TableIdentifier): Boolean =
+    try {
+      val path = pinRepairMarkerPath(spark, viewName)
+      path.getFileSystem(spark.sparkContext.hadoopConfiguration).exists(path)
+    } catch { case NonFatal(_) => false }
+
+  /** Deterministically clear the per-MV fallback repair journal (on DROP+recreate). */
+  def clearPinRepairFallbackMarker(spark: SparkSession, viewName: TableIdentifier): Unit =
+    try {
+      val path = pinRepairMarkerPath(spark, viewName)
+      path.getFileSystem(spark.sparkContext.hadoopConfiguration).delete(path, false)
+      ()
+    } catch { case NonFatal(_) => () }
+
   /** The single validated binding API used by CREATE, idempotent CREATE,
     * REFRESH, ADVANCE, and the dry compile/rewrite paths. Resolves the pins
     * (tri-state), validates a `Verified` binding, and raises an
@@ -810,7 +891,15 @@ private[commands] object MvCommandHelper {
   ): PinnedSourceBinding = {
     // Fail-closed: a view left repair-required by a rebind whose rollback failed
     // is blocked from every further pin operation until an explicit recreate.
-    persistedProperties.get(PinRebindRepairRequiredKey).filter(_.trim.nonEmpty).foreach { detail =>
+    // BOTH durable channels are checked: the catalog property marker AND the
+    // filesystem fallback journal (written when the catalog write failed).
+    val repairDetail =
+      persistedProperties.get(PinRebindRepairRequiredKey).filter(_.trim.nonEmpty) match {
+        case some @ Some(_)                                      => some
+        case None if hasPinRepairFallbackMarker(spark, viewName) => Some("fallback journal present")
+        case None                                                => None
+      }
+    repairDetail.foreach { detail =>
       throw pinBindingException(
         viewName,
         s"a prior refresh detected a pinned-source rebind and could not safely roll this materialized view back " +
@@ -1973,6 +2062,11 @@ case class CreateMaterializedViewCommand(
         )
       case None => // proceed
     }
+
+    // A fresh CREATE (the view did not exist above) deterministically clears any
+    // stale filesystem repair journal for this name, so DROP + recreate recovers a
+    // previously repair-required MV even when the catalog marker channel had failed.
+    MvCommandHelper.clearPinRepairFallbackMarker(spark, name)
 
     // Analyze once and reuse the resolved relation nodes for source discovery,
     // query-shape extraction, and full source schemas.
@@ -3284,8 +3378,10 @@ case class RefreshMaterializedViewCommand(
           // version so a post-apply rebind can be rolled back. If it cannot be
           // read, abort BEFORE any mutation rather than proceed without rollback
           // capability.
-          try DeltaTableVersion.requireLatest(spark, meta.location)
-          catch {
+          try {
+            CommandConcurrencyInjection.maybeFailPreApplyVersionCapture()
+            DeltaTableVersion.requireLatest(spark, meta.location)
+          } catch {
             case NonFatal(captureFailure) =>
               throw new IllegalStateException(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot capture the pre-apply MV version required " +
@@ -3452,24 +3548,40 @@ case class RefreshMaterializedViewCommand(
       // true iff the marker is durably present; the caller MUST surface an explicit
       // unavailable/blocked state when it is not (never success-shaped, never a
       // silently-discarded write failure).
-      def persistPinRebindRepairRequired(mismatchDetail: String, failureDetail: String): Boolean =
-        try {
-          MvCatalog.upsert(
-            spark,
-            meta.copy(properties =
-              meta.properties + (MvCommandHelper.PinRebindRepairRequiredKey ->
-                s"rebind: $mismatchDetail | rollback: $failureDetail")
+      // Persist the durable repair marker across BOTH channels and verify. Channel
+      // 1: the catalog property (via MvCatalog.upsert + re-read). Channel 2 (used
+      // when channel 1 fails/unavailable): a verified per-MV filesystem journal on
+      // owned MV state. requirePinBinding reads BOTH, so a later REFRESH/ADVANCE/
+      // idempotent CREATE stays blocked even if the catalog write failed and later
+      // recovered. Returns true iff at least one channel is durably present.
+      def persistPinRebindRepairRequired(mismatchDetail: String, failureDetail: String): Boolean = {
+        val payload = s"rebind: $mismatchDetail | rollback: $failureDetail"
+        val catalogDurable =
+          try {
+            CommandConcurrencyInjection.maybeFailCatalogRepairMarkerUpsert()
+            MvCatalog.upsert(
+              spark,
+              meta.copy(properties = meta.properties + (MvCommandHelper.PinRebindRepairRequiredKey -> payload))
             )
-          )
-          MvCatalog
-            .lookup(spark, name)
-            .exists(_.properties.get(MvCommandHelper.PinRebindRepairRequiredKey).exists(_.trim.nonEmpty))
-        } catch { case NonFatal(_) => false }
+            MvCatalog
+              .lookup(spark, name)
+              .exists(_.properties.get(MvCommandHelper.PinRebindRepairRequiredKey).exists(_.trim.nonEmpty))
+          } catch { case NonFatal(_) => false }
+        // Always write the verified filesystem fallback when the catalog channel is
+        // not durable; the requirePinBinding check treats either channel as blocking.
+        val fallbackDurable =
+          if (catalogDurable) false
+          else MvCommandHelper.writePinRepairFallbackMarker(spark, name, payload)
+        catalogDurable || fallbackDurable
+      }
 
       // Build the coherent, non-retryable failure for any rollback-path failure:
-      // persist+verify the durable repair marker, then surface BOTH the identity
-      // mismatch and the rollback failure. If the durable marker cannot be
-      // written, the message states the MV is UNAVAILABLE (explicit blocked state).
+      // persist+verify the durable repair marker across both channels, then surface
+      // BOTH the identity mismatch and the rollback failure. If neither channel can
+      // be written the message states the MV is UNAVAILABLE (explicit blocked state);
+      // the pre-refresh persisted pins remain in the catalog, so the requirePinBinding
+      // identity-drift check is the structural backstop that still blocks the rebound
+      // source.
       def markRepairRequiredAndCoherent(
           rebind: SourceIdentityRebindingException,
           failureDetail: String
@@ -3480,8 +3592,8 @@ case class RefreshMaterializedViewCommand(
             "the materialized view is marked repair-required and must be dropped and recreated before any " +
               "further REFRESH or ADVANCE"
           else
-            "the durable repair marker could NOT be persisted; the materialized view is UNAVAILABLE and must be " +
-              "dropped and recreated before any further REFRESH or ADVANCE"
+            "the durable repair marker could NOT be persisted on either channel; the materialized view is " +
+              "UNAVAILABLE and must be dropped and recreated before any further REFRESH or ADVANCE"
         val coherent =
           new SourceIdentityRebindingException(s"${rebind.getMessage}; ROLLBACK FAILED ($failureDetail); $suffix")
         coherent.initCause(rebind)
@@ -3533,8 +3645,10 @@ case class RefreshMaterializedViewCommand(
               // pins). NEVER substitute the old pre-refresh version — that would
               // recreate the lastVersion divergence.
               val restoredVersion =
-                try DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
-                catch {
+                try {
+                  CommandConcurrencyInjection.maybeFailPostRestoreVersionRead()
+                  DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+                } catch {
                   case NonFatal(readFailure) =>
                     throw markRepairRequiredAndCoherent(
                       rebind,
