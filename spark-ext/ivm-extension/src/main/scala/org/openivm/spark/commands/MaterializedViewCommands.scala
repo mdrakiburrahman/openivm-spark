@@ -982,6 +982,83 @@ private[commands] object MvCommandHelper {
       )
       .toOption
 
+  /** Direct materialized-view source dependencies of `view`, as RefreshMutex lock
+    * keys, so an ordinary REFRESH serialises against any in-flight refresh of an
+    * upstream MV it consumes.
+    *
+    * The consumer-visibility barrier this backs closes a CDF-visibility race: an
+    * upstream pinned MV refresh publishes its Delta table (making its change feed
+    * visible) BEFORE its post-apply pinned-source identity gate. With only the
+    * refreshed MV's own key held, a concurrent downstream CDF/staging refresh
+    * could consume that intermediate commit in the window before the upstream
+    * detects a source rebind and RESTOREs it. Holding every direct upstream MV
+    * key for the whole downstream refresh — and, symmetrically, the upstream
+    * holding its own key across its gate/restore — makes the two mutually
+    * exclusive against a shared upstream MV.
+    *
+    * Only DIRECT MV sources are keyed (no transitive/global fan-out): an MV whose
+    * sources are all base tables adds no key and stays fully concurrent with
+    * unrelated MVs. Keys feed [[RefreshMutex.withLocks]], which sorts and dedups
+    * them, preserving the single global lock order (deadlock-free) and monitor
+    * reentrancy for a key already held.
+    *
+    * Fail-closed: if the catalog cannot be enumerated while this MV carries
+    * persisted pinned sources, or a source resolves ambiguously to more than one
+    * managed MV, the refresh aborts with [[SourceIdentityRebindingException]]
+    * rather than silently dropping the barrier and reopening the race.
+    */
+  private[commands] def directMvSourceLockKeys(spark: SparkSession, view: TableIdentifier): Seq[String] = {
+    val viewMeta = metaName(view)
+    val selfMeta = MvCatalog.lookup(spark, view).getOrElse(return Seq.empty)
+    val hasPersistedPins =
+      persistedPinnedSources(selfMeta.properties, selfMeta.sourceTables).exists(_.nonEmpty)
+    val others: Seq[MvMetadata] =
+      try MvCatalog.list(spark).filter(candidate => metaName(candidate.name) != viewMeta)
+      catch {
+        case NonFatal(enumerationFailure) =>
+          if (hasPersistedPins)
+            throw new SourceIdentityRebindingException(
+              s"materialized view '$viewMeta' could not enumerate its materialized-view source dependencies to " +
+                s"establish the refresh consumer-visibility barrier (${enumerationFailure.getMessage}); refusing " +
+                "to refresh a pinned materialized view without it"
+            )
+          else return Seq.empty
+      }
+    selfMeta.sourceTables.flatMap { source =>
+      val keys = others
+        .filter(candidate => sourceReferencesMv(source, candidate))
+        .map(candidate => metaName(candidate.name))
+        .distinct
+      keys match {
+        case Seq()    => None
+        case Seq(key) => Some(key)
+        case ambiguous =>
+          throw new SourceIdentityRebindingException(
+            s"materialized view '$viewMeta' source '$source' maps to ${ambiguous.size} managed materialized " +
+              s"views (${ambiguous.sorted.mkString(", ")}); cannot establish a reliable refresh " +
+              "consumer-visibility barrier lock key"
+          )
+      }
+    }.distinct
+  }
+
+  /** Whether `source` (a possibly catalog/db-qualified `MvMetadata.sourceTables`
+    * entry) references the managed MV `mv`. The table name must match; when BOTH
+    * sides carry a database qualifier they must agree, so a same-named MV in a
+    * different database is never mistaken for this source. A source with fewer
+    * qualifiers than the MV name falls back to table-name identity, matching the
+    * convention the source-version-advance cascade already uses. */
+  private def sourceReferencesMv(source: String, mv: MvMetadata): Boolean = {
+    val parts = source.split("\\.")
+    parts.nonEmpty && parts.last == mv.name.identifier && {
+      val sourceDb = if (parts.length >= 2) Some(parts(parts.length - 2)) else None
+      (sourceDb, mv.name.database) match {
+        case (Some(sourceDatabase), Some(mvDatabase)) => sourceDatabase == mvDatabase
+        case _                                        => true
+      }
+    }
+  }
+
   /** Resolve each ADVANCE request identifier by physical Delta identity and map
     * it to the RESOLVED operational alias of the persisted pinned source with the
     * exact same dataPath + metadata.id. External input is never suffix-matched:
@@ -2892,9 +2969,19 @@ case class RefreshMaterializedViewCommand(
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0 = System.nanoTime()
     try {
+      // Every refresh — ordinary or source-version-advance — deterministically
+      // also holds its DIRECT upstream MV source keys, so a downstream CDF/staging
+      // consumer cannot observe an upstream MV's Delta mutation in the window
+      // before that upstream's post-apply pinned-source identity gate RESTOREs it.
+      // See directMvSourceLockKeys (fails closed if a pinned/managed MV dependency
+      // cannot be mapped).
+      val upstreamMvSourceKeys = directMvSourceLockKeys(spark, name)
       val lockKeys =
-        if (sourceVersionAdvance.isEmpty) Seq(viewMeta)
+        if (sourceVersionAdvance.isEmpty)
+          viewMeta +: upstreamMvSourceKeys
         else {
+          // The advance path additionally holds its downstream consumer keys so the
+          // pinned-source-advance cascade into them stays atomic.
           val downstream =
             try
               MvCatalog
@@ -2903,7 +2990,7 @@ case class RefreshMaterializedViewCommand(
                 .filter(_.sourceTables.exists(_.split("\\.").last == name.identifier))
                 .map(meta => metaName(meta.name))
             catch { case _: Throwable => Seq.empty[String] }
-          viewMeta +: downstream
+          viewMeta +: (downstream ++ upstreamMvSourceKeys)
         }
       val rows = RefreshMutex.withLocks(lockKeys) {
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
