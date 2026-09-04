@@ -693,6 +693,20 @@ private[commands] object MvCommandHelper {
       pin.pin.shortName -> (pin.operationalSource.deltaLogDataPath, pin.pin.clause)
     }.toMap
 
+  /** Path half of [[pinnedPathBindingsByShort]]: short -> verified
+    * `DeltaLog.dataPath`. Populates `CompileRequest.sourceSnapshotPinnedPaths`
+    * and the `SparkRefreshRewriter.rewrite` path input at every compile/rewrite
+    * site; stable across ADVANCE (same physical table, new version). */
+  def pinnedPathByShort(binding: PinnedSourceBinding): Map[String, String] =
+    pinnedPathBindingsByShort(binding).map { case (s, (p, _)) => s -> p }
+
+  /** Clause half of [[pinnedPathBindingsByShort]]: short -> exact VERSION/TIMESTAMP
+    * clause. The `SparkRefreshRewriter.rewrite` `sourceSnapshotPins` input on the
+    * non-ADVANCE paths (ADVANCE paths keep the `executionSnapshotPinsByQualified`
+    * target-version clauses). */
+  def pinnedClauseByShort(binding: PinnedSourceBinding): Map[String, String] =
+    pinnedPathBindingsByShort(binding).map { case (s, (_, c)) => s -> c }
+
   /** Path-bind a USER full-query body (full-refresh / initial CTAS surface) to
     * the VERIFIED Delta paths of its pinned reads, preserving each
     * VERSION/TIMESTAMP clause and every occurrence. The verified path is the
@@ -1499,6 +1513,8 @@ private[commands] object MvCommandHelper {
     * statement (i.e. a delta feed with no data-table apply, which would make
     * REFRESH a no-op). Non-SIMPLE_PROJECTION views short-circuit to `true`.
     * Read-only: the rewrite is a pure string transform against a probe path.
+    * The pinned clause/path maps path-bind the probe's pinned reads so the
+    * classification is byte-fidelity with the real refresh emission.
     */
   def computeSimpleProjectionHasDataApply(
       spark: SparkSession,
@@ -1506,7 +1522,9 @@ private[commands] object MvCommandHelper {
       name: TableIdentifier,
       location: String,
       qualSchemas: Map[String, StructType],
-      shortToQual: Map[String, String]
+      shortToQual: Map[String, String],
+      sourceSnapshotPins: Map[String, String] = Map.empty,
+      sourceSnapshotPinnedPaths: Map[String, String] = Map.empty
   ): Boolean =
     if (compiled.refreshType != RefreshTypeCode.SimpleProjection || compiled.sql.isEmpty) true
     // The probe runs the full SparkRefreshRewriter pipeline purely to answer
@@ -1533,7 +1551,9 @@ private[commands] object MvCommandHelper {
           sourceSchemas = qualSchemas.map { case (qual, schema) =>
             qual.split("\\.").last -> schema.fieldNames.toSeq
           },
-          sourceQualifiedNames = shortToQual
+          sourceQualifiedNames = shortToQual,
+          sourceSnapshotPins = sourceSnapshotPins,
+          sourceSnapshotPinnedPaths = sourceSnapshotPinnedPaths
         )
         rewritten.statements.size > 1
       } catch { case _: Throwable => false }
@@ -1957,11 +1977,12 @@ case class CreateMaterializedViewCommand(
             viewName = name.table,
             viewSql = originalQueryText,
             // The shared binding's SQL-visible qualifiers (so a Fabric alias
-            // resolves). The compiler-emit agent's path-bind input is populated
-            // from `MvCommandHelper.pinnedPathBindingsByShort(pinBinding)` on
-            // integration of its commit; both derive from this one binding.
+            // resolves) plus the verified Delta paths so every pinned initial-load
+            // read is emitted as `delta.`<verifiedPath>` <clause>` (path-bound,
+            // never a rebindable alias). Both derive from the one requirePinBinding.
             sources = compileSchemas,
             sourceQualifiedNames = pinBinding.friendlyByShort,
+            sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(pinBinding),
             facts = workloadFacts
           )
         )
@@ -2005,7 +2026,16 @@ case class CreateMaterializedViewCommand(
 
     val simpleProjectionHasDataApply: Boolean =
       profile.timeStep("create_simple_projection_check") {
-        computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, pinBinding.friendlyByShort)
+        computeSimpleProjectionHasDataApply(
+          spark,
+          compiled,
+          name,
+          location,
+          qualSchemas,
+          pinBinding.friendlyByShort,
+          sourceSnapshotPins = pinnedClauseByShort(pinBinding),
+          sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding)
+        )
       }
 
     // Move the fingerprint computation below the upstream-MV enumeration so we
@@ -3912,6 +3942,7 @@ case class RefreshMaterializedViewCommand(
                   viewSql = meta.querySql,
                   sources = compileSchemas,
                   sourceQualifiedNames = shortToQual,
+                  sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
                   facts = compileFacts
                 )
               )
@@ -4289,6 +4320,12 @@ case class RefreshMaterializedViewCommand(
                 sourceSnapshotPins = executionSnapshotPinsByQualified.map { case (qual, clause) =>
                   qual.split("\\.").last -> clause
                 },
+                // Verified Delta path per pinned source so every emitted pinned
+                // read (new-state AND the ADVANCE old-state union) binds to
+                // `delta.`<verifiedPath>` <clause>` instead of a rebindable alias.
+                // Path is stable across ADVANCE; the clause/old-version above and
+                // sourceSnapshotAdvanceOldVersions below carry the version.
+                sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
                 sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
                   case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
                 },

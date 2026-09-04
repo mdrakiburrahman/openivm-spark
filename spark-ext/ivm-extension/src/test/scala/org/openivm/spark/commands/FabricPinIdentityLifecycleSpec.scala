@@ -398,6 +398,69 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       lookup("m_mv").lastVersion shouldBe beforeVersion
       spark.table("m_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
     }
+
+    it("incremental REFRESH reads the pinned source at its verified path even when the alias is repointed mid-apply") {
+      val pathA = s"$warehouseDir/ir_pinned_a_${UUID.randomUUID().toString.take(8)}"
+      val pathB = s"$warehouseDir/ir_pinned_b_${UUID.randomUUID().toString.take(8)}"
+      spark.sql(s"CREATE TABLE $db.ir_pinned(id INT, tag STRING) USING DELTA LOCATION '$pathA'")
+      spark.sql(s"CREATE TABLE $db.ir_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.ir_pinned VALUES (1, 'A')")
+      spark.sql(s"INSERT INTO $db.ir_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.ir_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW ir_mv AS " +
+            s"SELECT p.id, p.tag, live.amount FROM `$db`.`ir_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`ir_live` AS live ON p.id = live.id"
+        )
+        .collect()
+      spark.table("ir_mv").collect().map(_.getString(1)).toSet shouldBe Set("A")
+
+      // Queue a live delta that joins the pinned row, then repoint the pinned
+      // ALIAS to a different physical table (tag 'B') before the incremental
+      // apply reads it. The emitted incremental SQL is path-bound to pathA, so
+      // the new MV row must carry tag 'A', not 'B'.
+      spark.sql(s"INSERT INTO $db.ir_live VALUES (1, 100)")
+      CommandConcurrencyInjection.withBeforeRefreshApply {
+        spark.sql(s"DROP TABLE $db.ir_pinned")
+        spark.sql(s"CREATE TABLE $db.ir_pinned(id INT, tag STRING) USING DELTA LOCATION '$pathB'")
+        spark.sql(s"INSERT INTO $db.ir_pinned VALUES (1, 'B')")
+      } {
+        spark.sql("REFRESH MATERIALIZED VIEW ir_mv").collect()
+      }
+
+      val amounts = spark.table("ir_mv").collect().map(r => (r.getString(1), r.getInt(2))).toSet
+      // Every row read the verified path (tag 'A'); the incremental amount=100 row is present.
+      amounts.map(_._1) shouldBe Set("A")
+      amounts should contain((("A"), 100))
+      lookup("ir_mv").properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") should not be "COMPILE_FAILED"
+    }
+
+    it("path-binds the ADVANCE old-state read so advancing a pinned source recomputes the correct signed delta") {
+      spark.sql(s"CREATE TABLE $db.av_src(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.av_src VALUES (1, 10)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.av_src")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW av_mv AS " +
+            s"SELECT id, SUM(amount) AS total FROM `$db`.`av_src` VERSION AS OF $v0 GROUP BY id"
+        )
+        .collect()
+      spark.table("av_mv").collect().map(r => (r.getInt(0), r.getLong(1))).toSet shouldBe Set((1, 10L))
+
+      // Add rows, then ADVANCE the pin v0 -> v1. The signed delta is
+      // (new-state av@v1) - (old-state av@v0); both reads are path-bound. A
+      // correct total proves the OLD-state read used the verified snapshot.
+      spark.sql(s"INSERT INTO $db.av_src VALUES (1, 5)")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.av_src")
+      spark.sql(s"ALTER MATERIALIZED VIEW av_mv ADVANCE SOURCE VERSIONS ($db.av_src = $v1)").collect()
+
+      spark.table("av_mv").collect().map(r => (r.getInt(0), r.getLong(1))).toSet shouldBe Set((1, 15L))
+      val advanced = MvCommandHelper
+        .persistedPinnedSources(lookup("av_mv").properties, lookup("av_mv").sourceTables)
+        .getOrElse(fail("expected persisted pinned identities after ADVANCE"))
+      advanced.head.pin.clause shouldBe s"VERSION AS OF $v1"
+    }
   }
 
   // The exact `short -> (verifiedPath, clause)` map the disjoint compiler-emit

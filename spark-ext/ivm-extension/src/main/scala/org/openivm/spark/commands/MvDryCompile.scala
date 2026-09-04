@@ -128,6 +128,7 @@ object MvDryCompile {
             viewSql = queryText,
             sources = compileSchemas,
             sourceQualifiedNames = pinBinding.friendlyByShort,
+            sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding),
             facts = workloadFacts
           )
         )
@@ -140,7 +141,16 @@ object MvDryCompile {
 
     val aggregateHavingDataColumns = computeAggregateHavingDataColumns(spark, compiled, queryText)
     val simpleProjectionHasDataApply =
-      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, pinBinding.friendlyByShort)
+      computeSimpleProjectionHasDataApply(
+        spark,
+        compiled,
+        name,
+        location,
+        qualSchemas,
+        pinBinding.friendlyByShort,
+        sourceSnapshotPins = pinnedClauseByShort(pinBinding),
+        sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding)
+      )
     val topKViewSpec = validateTopKViewSpec(
       spark,
       extractTopKViewSpec(spark, queryText),
@@ -244,6 +254,13 @@ object MvDryCompile {
             else if (SparkTimeTravelSql.hasSnapshotPin(queryText))
               SparkTimeTravelSql.pinsByShortSource(queryText, qualSchemas.keySet.toSeq ++ shortToQual.values.toSeq)
             else Map.empty,
+          // Verified Delta path per pinned source so the dry incremental program
+          // path-binds its pinned reads exactly as REFRESH executes them. Same
+          // keys (pin.shortName) as sourceSnapshotPins above when the binding is
+          // resolved; a pinned body always reaches here with resolvedPins set
+          // (requirePinBinding validated it), so no key is left without a path.
+          sourceSnapshotPinnedPaths =
+            resolvedPins.map(pin => pin.pin.shortName -> pin.operationalSource.deltaLogDataPath).toMap,
           semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
           fkTermPruneEnabled = FeatureGate.fkTermPruneEnabled(spark),
           uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark),
