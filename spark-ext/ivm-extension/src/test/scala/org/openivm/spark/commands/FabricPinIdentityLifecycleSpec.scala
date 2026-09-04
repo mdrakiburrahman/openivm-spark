@@ -1561,6 +1561,16 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       spark.sql(s"INSERT INTO $db.arr_src VALUES (3, 'a', 5)")
       val v1 = DeltaTableVersion.requireLatest(spark, s"$db.arr_src")
 
+      def arrSrcWatermark(): Option[String] =
+        lookup("arr_mv").changeWatermarks.collectFirst {
+          case (source, wm) if source.endsWith("arr_src") => wm.encode
+        }
+      // Capture the exact pre-advance watermark state (None under a fresh Intercept
+      // CREATE that has no staged source watermark; Some under modes that do), so
+      // the rollback assertion proves the pre-state is restored rather than any
+      // hardcoded value.
+      val preAdvanceWatermark = arrSrcWatermark()
+
       // The ADVANCE mutates the MV, then the injected failure fires BEFORE
       // finalize/publish. The in-process rollback restores the MV and releases
       // its own guard.
@@ -1574,9 +1584,7 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       lookup("arr_mv").querySql should include(s"VERSION AS OF $v0")
       lookup("arr_mv").properties.keySet should not contain MvMetadata.SourceVersionAdvancePreMvVersionKey
       lookup("arr_mv").properties.keySet should not contain MvMetadata.SourceVersionAdvanceCascadePathKey
-      lookup("arr_mv").changeWatermarks.collectFirst {
-        case (source, wm) if source.endsWith("arr_src") => wm.encode
-      } shouldBe Some(s"v:$v0")
+      arrSrcWatermark() shouldBe preAdvanceWatermark
       MvCommandHelper.hasPinnedOperationGuard(spark, TableIdentifier("arr_mv")) shouldBe false
 
       // The retry proceeds and advances to v1.
