@@ -6,7 +6,7 @@ import java.util.{Comparator, Locale}
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, WorkloadFacts}
+import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
@@ -24,14 +24,40 @@ final case class CompiledRefresh(
   *   keys of [[sources]]) to the fully-qualified Spark table name as it should
   *   appear in the rewritten initial-load SQL. Used to translate
   *   `memory.main.<short>` references emitted by openivm into the correct
-  *   Spark identifier. Empty by default — callers that don't need rewriting
-  *   can leave it unset.
+  *   Spark identifier for an UNPINNED source, and (via `stripDbQualifiers`) to
+  *   forward-strip qualifiers for the DuckDB compile copy. It is the
+  *   user-friendly overlay ONLY — it is never used as the execution path of a
+  *   pinned read. Empty by default — callers that don't need rewriting can
+  *   leave it unset.
+  * @param sourceSnapshotPinnedPaths Optional map from short table name to the
+  *   VERIFIED physical `DeltaLog.dataPath` the source's snapshot pin was
+  *   resolved to (the resolved binding's
+  *   `ResolvedSnapshotPin.operationalSource.deltaLogDataPath`). Every source
+  *   pinned in [[viewSql]] MUST have an entry here: [[OpenIvmCompiler.parseInitialLoadSql]]
+  *   emits each pinned initial-load read as ``delta.`<verified path>` <clause>``
+  *   so the CTAS at CREATE binds to the exact Delta table the identity was
+  *   verified against (closing the alias-rebind TOCTOU). A pinned source with
+  *   no verified path is a hard [[org.openivm.spark.common.PinnedSourcePathMissingException]]
+  *   raised BEFORE initial-load SQL is emitted — never a logical-name fallback
+  *   or FULL_REFRESH demotion. Empty by default (no pins).
+  *
+  *   Command-layer integration: at every compile site (CREATE, REFRESH, and the
+  *   dry-compile probes) populate this from the command agent's shared binding
+  *   helper `MvCommandHelper.pinnedPathBindingsByShort(pinBinding)`
+  *   (`short -> (verifiedPath, clause)`) as
+  *   `sourceSnapshotPinnedPaths = pinnedPathBindingsByShort(pinBinding).map { case (s, (p, _)) => s -> p }`.
+  *   Only the PATH half is threaded here — the compiler re-derives the exact
+  *   VERSION/TIMESTAMP clause from `viewSql` itself; both originate from the one
+  *   shared `requirePinBinding`, so they agree. Keys are `pin.shortName`, so a
+  *   self-joined/repeated pinned source collapses to one entry and is applied to
+  *   every emitted occurrence.
   */
 final case class CompileRequest(
     viewName: String,
     viewSql: String,
     sources: Map[String, StructType],
     sourceQualifiedNames: Map[String, String] = Map.empty,
+    sourceSnapshotPinnedPaths: Map[String, String] = Map.empty,
     facts: WorkloadFacts = WorkloadFacts()
 )
 
@@ -543,11 +569,11 @@ class OpenIvmCompiler private (
     * the initial-load query (including any hidden `openivm_count_star` column).
     *
     * Returns the empty string if the file is missing or no matching CTAS is
-    * found.  The extracted SQL has `memory.main.<short>` references rewritten
-    * to the qualified Spark table name supplied via `req.sourceQualifiedNames`,
-    * any leftover `memory.main.` prefix stripped, and is run through
-    * [[LptsSparkDialect.translate]] to handle DuckDB-isms (e.g. `count_star()`,
-    * `::TIMESTAMP` casts).
+    * found.  The extracted SQL has `memory.main.<short>` references rewritten to
+    * either the verified Delta path of a pinned source (``delta.`<path>` <clause>``)
+    * or the qualified Spark table name of an unpinned source (via
+    * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
+    * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
   private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest): String = {
     import java.util.regex.Pattern
@@ -562,34 +588,14 @@ class OpenIvmCompiler private (
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    var sql = m.group(1).trim
+    val extracted = m.group(1).trim
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
     // tables, so fall back to the original user-supplied view body instead.
-    if ("""(?i)\browid\b""".r.findFirstIn(sql).isDefined) return ""
+    if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
-    // openivm always emits a LIVE read of each source. When the user pinned a
-    // source to a Delta snapshot, re-attach that pin here — otherwise the CTAS
-    // at CREATE would load the current table instead of the version the view
-    // body asked for. Every `memory.main.<source>` reference openivm emits sits
-    // in a FROM position, where Spark's `temporalClause` is grammatical.
-    val pinBySource: Map[String, String] =
-      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName -> pin.clause).toMap
-    val qualifiedByShort: Map[String, String] =
-      req.sourceQualifiedNames.map { case (short, qualified) => short.toLowerCase(Locale.ROOT) -> qualified }
-    // One identifier-bounded pass, NOT a `sql.replace("memory.main.<short>", …)`
-    // loop over a name set: with sources `customer` and `customer_address` the
-    // loop either injects the shorter name's pin into the middle of the longer
-    // identifier or rewrites its prefix first, so the longer name's own pin is
-    // never re-attached and its CTAS silently loads live rows. See
-    // `MemoryMainRefs`, which the refresh rewriter shares.
-    sql = MemoryMainRefs.rewrite(sql) { short =>
-      val key       = short.toLowerCase(Locale.ROOT)
-      val qualified = qualifiedByShort.getOrElse(key, short)
-      pinBySource.get(key).fold(qualified)(clause => s"$qualified $clause")
-    }
-    LptsSparkDialect.translate(sql)
+    LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
   }
 
   /** Fully-qualified name of every source the request tracks, the key space a
@@ -820,6 +826,68 @@ object OpenIvmCompiler {
 
   private[compiler] def renameSparkFunctionShimCalls(sql: String): String =
     SparkFunctionShimSql.renameSparkFunctionShimCalls(sql)
+
+  /** Re-attach source reads to the initial-load CTAS body openivm emitted,
+    * turning each `memory.main.<short>` reference into the Spark relation the
+    * initial-load CTAS must actually read:
+    *
+    *   - a snapshot-PINNED source becomes a VERIFIED physical Delta read
+    *     ``delta.`<escaped path>` <clause>``, where the path is the resolved
+    *     binding's `DeltaLog.dataPath` supplied via
+    *     [[CompileRequest.sourceSnapshotPinnedPaths]] and the clause is the
+    *     exact `VERSION AS OF` / `TIMESTAMP AS OF` the user wrote — so the CTAS
+    *     binds to the exact Delta table the pin's identity was verified against,
+    *     never a logical/friendly name that could rebind (the alias-rebind
+    *     TOCTOU this closes);
+    *   - an UNPINNED source becomes its fully-qualified Spark name from
+    *     [[CompileRequest.sourceQualifiedNames]] (the user-friendly overlay,
+    *     used only for unpinned reads and never mixed into a pinned read's
+    *     execution path);
+    *   - any other `memory.main.<name>` (openivm-internal `openivm_delta_<n>`,
+    *     `openivm_data_<v>`, …) is left as its bare short name.
+    *
+    * A source pinned in `req.viewSql` with NO entry in `sourceSnapshotPinnedPaths`
+    * is a hard [[org.openivm.spark.common.PinnedSourcePathMissingException]]
+    * (fail-closed; never a logical-name fallback). Occurrences, clause kind and
+    * value, and backtick escaping are all preserved, and the rewrite is a
+    * single identifier-bounded [[MemoryMainRefs]] pass shared with the refresh
+    * rewriter (so overlapping short names like `customer`/`customer_address`
+    * cannot cross-contaminate). Pure and deterministic — unit-testable without a
+    * DuckDB subprocess.
+    */
+  private[compiler] def reattachInitialLoadSourceReads(extractedSql: String, req: CompileRequest): String = {
+    // The authoritative set of pins is the user body's own snapshot pins.
+    val pinBySource: Map[String, String] =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName -> pin.clause).toMap
+    val qualifiedByShort: Map[String, String] =
+      req.sourceQualifiedNames.map { case (short, qualified) => short.toLowerCase(Locale.ROOT) -> qualified }
+    val pathByShort: Map[String, String] =
+      req.sourceSnapshotPinnedPaths.map { case (short, path) => short.toLowerCase(Locale.ROOT) -> path }
+    // One identifier-bounded pass, NOT a `sql.replace("memory.main.<short>", …)`
+    // loop over a name set: with sources `customer` and `customer_address` the
+    // loop either injects the shorter name's pin into the middle of the longer
+    // identifier or rewrites its prefix first, so the longer name's own read is
+    // never re-attached and its CTAS silently loads live rows. See
+    // `MemoryMainRefs`, which the refresh rewriter shares.
+    MemoryMainRefs.rewrite(extractedSql) { short =>
+      val key = short.toLowerCase(Locale.ROOT)
+      pinBySource.get(key) match {
+        case Some(clause) =>
+          pathByShort.get(key) match {
+            case Some(path) =>
+              val escaped = path.replace("`", "``")
+              s"delta.`$escaped` $clause"
+            case None =>
+              throw new PinnedSourcePathMissingException(
+                s"initial-load emission for view '${req.viewName}' has no verified Delta path for " +
+                  s"snapshot-pinned source '$short'; refusing to emit a logical-name pinned read"
+              )
+          }
+        case None =>
+          qualifiedByShort.getOrElse(key, short)
+      }
+    }
+  }
 
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would

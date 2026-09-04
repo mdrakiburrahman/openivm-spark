@@ -7,6 +7,24 @@ import org.apache.spark.sql.catalyst.TableIdentifier
   */
 final case class RewrittenRefresh(statements: Seq[String])
 
+/** Thrown when a snapshot-pinned source read is about to be emitted but the
+  * caller supplied no VERIFIED physical Delta path to bind it to.
+  *
+  * Every frozen read of a pinned source MUST bind to the exact Delta table its
+  * physical identity (DeltaLog dataPath + metadata.id) was verified against;
+  * emitting a logical/friendly name that could rebind between verification and
+  * read is the alias-rebind TOCTOU this wiring closes. Missing/ambiguous path
+  * is therefore a HARD, non-retryable abort raised BEFORE any SQL is emitted:
+  * the caller must NOT fall back to a logical name, drop the pin, or demote to
+  * COMPILE_FAILED / FULL_REFRESH.
+  *
+  * Extends [[IllegalStateException]] so `OpenIvmCompiler.compile` re-raises it
+  * verbatim (its `case e: IllegalStateException => throw e` branch) instead of
+  * wrapping it in an `OpenIvmCompileException`, which is the FULL_REFRESH
+  * demotion signal.
+  */
+final class PinnedSourcePathMissingException(message: String) extends IllegalStateException(message)
+
 /** Rewrites the openivm-emitted multi-statement refresh SQL into a sequence of
   * Spark-executable statements.
   *
@@ -105,6 +123,29 @@ object SparkRefreshRewriter {
     * as before.
     */
   private val activeSnapshotPins: ThreadLocal[Map[String, String]] =
+    new ThreadLocal[Map[String, String]] {
+      override def initialValue(): Map[String, String] = Map.empty
+    }
+
+  /** Per-rewrite map of short source-table name → the VERIFIED physical Delta
+    * `DeltaLog.dataPath` its snapshot pin was resolved and bound to (the same
+    * identity persisted by `SparkTimeTravelSql.pinnedSourceIdentityProperties`:
+    * `ResolvedSnapshotPin.operationalSource.deltaLogDataPath`).
+    *
+    * A source registered in [[activeSnapshotPins]] MUST also have an entry here.
+    * Every frozen read openivm emits for that source is rewritten to
+    * ``delta.`<verified path>` <clause>`` rather than a logical/friendly name,
+    * so the read binds to the exact Delta table the identity was verified
+    * against — no logical name that could rebind between verify and read. A
+    * pinned source with no entry here is a hard [[PinnedSourcePathMissingException]]
+    * (fail-closed; never a silent logical-name fallback).
+    *
+    * Empty for every view without a snapshot pin, which keeps
+    * [[rewriteMemoryMainPrefix]] behaving exactly as before for the unpinned
+    * majority. Keyed the same way as [[activeSnapshotPins]] and matched
+    * case-insensitively.
+    */
+  private val activePinnedPaths: ThreadLocal[Map[String, String]] =
     new ThreadLocal[Map[String, String]] {
       override def initialValue(): Map[String, String] = Map.empty
     }
@@ -404,6 +445,31 @@ object SparkRefreshRewriter {
     *                         (`VERSION AS OF 366`). Re-applied to every
     *                         live-source read openivm emits so a pinned source
     *                         stays frozen at the user's version.
+    * @param sourceSnapshotPinnedPaths Map from short source-table name to the
+    *                         VERIFIED physical `DeltaLog.dataPath` the pin's
+    *                         identity was resolved to (from the resolved binding
+    *                         `ResolvedSnapshotPin.operationalSource.deltaLogDataPath`).
+    *                         Every key present in `sourceSnapshotPins` MUST also
+    *                         appear here: each frozen read is emitted as
+    *                         ``delta.`<verified path>` <clause>`` so it binds to
+    *                         the exact Delta table the identity was verified
+    *                         against (closing the alias-rebind TOCTOU). A pinned
+    *                         source with no verified path is a hard
+    *                         [[PinnedSourcePathMissingException]] — never a
+    *                         logical-name fallback or FULL_REFRESH demotion.
+    *
+    *                         Command-layer integration: at every rewrite site
+    *                         (REFRESH and the dry-rewrite/has-data probes) derive
+    *                         BOTH maps from the command agent's shared binding
+    *                         helper `MvCommandHelper.pinnedPathBindingsByShort(pinBinding)`
+    *                         (`short -> (verifiedPath, clause)`) so path and
+    *                         clause come from ONE authoritative binding:
+    *                         `sourceSnapshotPins = m.map { case (s, (_, c)) => s -> c }`
+    *                         and `sourceSnapshotPinnedPaths = m.map { case (s, (p, _)) => s -> p }`.
+    *                         Keys are `pin.shortName`; matched case-insensitively.
+    *                         A self-joined/repeated pinned source collapses to one
+    *                         entry and is applied to every emitted occurrence;
+    *                         VERSION and TIMESTAMP clauses are preserved verbatim.
     * @param sourceSnapshotAdvanceOldVersions Pre-advance snapshot versions for
     *                         pinned sources whose live reads are intentionally
     *                         moved to a caller-supplied target pin.
@@ -423,6 +489,7 @@ object SparkRefreshRewriter {
       sourceSchemas: Map[String, Seq[String]] = Map.empty,
       sourceQualifiedNames: Map[String, String] = Map.empty,
       sourceSnapshotPins: Map[String, String] = Map.empty,
+      sourceSnapshotPinnedPaths: Map[String, String] = Map.empty,
       sourceSnapshotVersions: Map[String, Long] = Map.empty,
       sourceSnapshotAdvanceOldVersions: Map[String, Long] = Map.empty,
       deltaShape: Map[String, DeltaShape] = Map.empty,
@@ -439,10 +506,12 @@ object SparkRefreshRewriter {
     // Make qualified-name remapping visible to every private rewriter below,
     // so `memory.main.<short>` becomes the correct `<db>.<table>` reference
     // in all six call sites instead of a current-schema-bound `<short>`.
-    val prior     = activeQualifiedNames.get()
-    val priorPins = activeSnapshotPins.get()
+    val prior      = activeQualifiedNames.get()
+    val priorPins  = activeSnapshotPins.get()
+    val priorPaths = activePinnedPaths.get()
     activeQualifiedNames.set(sourceQualifiedNames)
     activeSnapshotPins.set(sourceSnapshotPins)
+    activePinnedPaths.set(sourceSnapshotPinnedPaths)
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
@@ -543,6 +612,7 @@ object SparkRefreshRewriter {
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
+      activePinnedPaths.set(priorPaths)
     }
   }
 
@@ -898,7 +968,10 @@ object SparkRefreshRewriter {
     // A normally pinned source is frozen and keeps its pin via
     // rewriteMemoryMainPrefix. An explicit source-version advancement is the
     // exception: live reads use the target pin, while this old-state rewrite
-    // must read the supplied pre-advance version.
+    // must read the supplied pre-advance version — bound to the source's
+    // VERIFIED physical Delta path (see oldStateSourceRelation), so an alias
+    // rebind after the verified ADVANCE request cannot move this data-moving
+    // read onto a different table's old version.
     val pinnedShortNames    = activeSnapshotPins.get().keySet.map(_.toLowerCase)
     val advancingShortNames = advancingPinnedSources.map(shortTableName).map(_.toLowerCase)
     val versionsByShort = sourceSnapshotVersions.collect {
@@ -963,14 +1036,8 @@ object SparkRefreshRewriter {
             case (true, true, Some((source, columns)), Some((deltaSource, _)))
                 if deltaSource.equalsIgnoreCase(s"openivm_delta_$source") =>
               versionsByShort.get(source.toLowerCase).map { version =>
-                val qualified = activeQualifiedNames
-                  .get()
-                  .collectFirst { case (short, name) if short.equalsIgnoreCase(source) => name }
-                  .getOrElse(source)
-                  .split("\\.")
-                  .map(part => s"`${part.replace("`", "``")}`")
-                  .mkString(".")
-                val body = s"SELECT $columns, CAST(1 AS INT) FROM $qualified VERSION AS OF $version"
+                val relation = oldStateSourceRelation(source)
+                val body     = s"SELECT $columns, CAST(1 AS INT) FROM $relation VERSION AS OF $version"
                 (cte.bodyStart, cte.bodyEnd, body)
               }
             case _ => None
@@ -983,6 +1050,40 @@ object SparkRefreshRewriter {
       rewritten.substring(0, start) + body + rewritten.substring(end)
     }
   }
+
+  /** The relation reference the old-state (pre-refresh / pre-advance) read of
+    * `source` must use.
+    *
+    *   - A snapshot-PINNED source (only an ADVANCING one reaches this pass — a
+    *     normally pinned source is frozen and excluded) is a DATA-MOVING read
+    *     whose alias could rebind after the verified ADVANCE request, so it binds
+    *     to the VERIFIED physical Delta path (``delta.`<path>``) exactly like its
+    *     live read — the pre-advance VERSION is reattached by the caller. A
+    *     pinned source with no verified path is a hard
+    *     [[PinnedSourcePathMissingException]] (fail-closed).
+    *   - An UNPINNED incrementally-maintained source keeps its logical
+    *     backtick-qualified name (no pin/verified identity exists for it).
+    */
+  private def oldStateSourceRelation(source: String): String =
+    pinnedPathFor(source, activePinnedPaths.get()) match {
+      case Some(path) =>
+        val escaped = path.replace("`", "``")
+        s"delta.`$escaped`"
+      case None =>
+        if (snapshotPinFor(source, activeSnapshotPins.get()).isDefined)
+          throw new PinnedSourcePathMissingException(
+            s"snapshot-pinned source '$source' has no verified Delta path; refusing to emit a " +
+              s"logical-name old-state read for the incremental refresh program"
+          )
+        else
+          activeQualifiedNames
+            .get()
+            .collectFirst { case (short, name) if short.equalsIgnoreCase(source) => name }
+            .getOrElse(source)
+            .split("\\.")
+            .map(part => s"`${part.replace("`", "``")}`")
+            .mkString(".")
+    }
 
   private def parseLeadingCtes(sql: String): Seq[ParsedCte] = {
     val withStart = findTopLevelSqlKeyword(sql, 0, sql.length, "WITH").getOrElse(return Seq.empty)
@@ -1980,17 +2081,25 @@ object SparkRefreshRewriter {
   }
 
   /** Replace `memory.main.<identifier>` (bare or backticked) → either
-    *   - `` `<db>`.`<table>` `` if `<identifier>` is a tracked source whose
-    *     fully-qualified name is registered in [[activeQualifiedNames]]; OR
+    *   - ``delta.`<verified path>` <clause>`` if `<identifier>` is a
+    *     snapshot-PINNED source (registered in [[activeSnapshotPins]]); OR
+    *   - `` `<db>`.`<table>` `` if `<identifier>` is an UNPINNED tracked source
+    *     whose fully-qualified name is registered in [[activeQualifiedNames]]; OR
     *   - `` `<identifier>` `` otherwise (the default openivm internal name
     *     e.g. `openivm_delta_<n>`, `openivm_data_<v>`).
     *
-    * A tracked source registered in [[activeSnapshotPins]] additionally keeps
-    * the user's Delta snapshot pin (`` `db`.`t` VERSION AS OF 366 ``): openivm
-    * emits a live read for every source, so without this the incremental
-    * program would read a frozen source's current rows. openivm only ever
-    * references a base source from a FROM/JOIN position, where Spark's
-    * `temporalClause` is grammatical.
+    * openivm emits a LIVE read for every source, so a frozen (pinned) source
+    * must be re-pinned or the incremental program would read its current rows.
+    * A pinned read is bound to the VERIFIED physical Delta path (from
+    * [[activePinnedPaths]]), NOT the logical/friendly name: the read then binds
+    * to the exact Delta table the pin's identity was verified against, closing
+    * the alias-rebind TOCTOU. The temporal clause (`VERSION AS OF` /
+    * `TIMESTAMP AS OF`) is preserved verbatim, so both pin kinds path-bind
+    * identically. A pinned source with no verified path is a hard
+    * [[PinnedSourcePathMissingException]] (fail-closed: never a logical-name
+    * fallback, never a demotion). openivm only ever references a base source
+    * from a FROM/JOIN position, where Spark's `temporalClause` and a
+    * ``delta.`<path>`` reference are both grammatical.
     *
     * openivm usually emits the DuckDB catalog prefix `memory.main.` when the
     * SPARK target dialect is selected, but some translated statements arrive
@@ -1998,9 +2107,10 @@ object SparkRefreshRewriter {
     * `` `memory`.`main`.`<identifier>` ``. On the Spark side most of these
     * reference our internal temp views/tables (which we created with the
     * short name), but live-source references (`memory.main.<short>`) must
-    * be expanded to `<db>.<table>` when the user's view body referenced a
-    * Hive-qualified table — otherwise Spark resolves `<short>` against the
-    * session's current_schema (typically `default`) and fails to find it.
+    * be expanded to `<db>.<table>` (unpinned) or ``delta.`<path>`` (pinned)
+    * when the user's view body referenced a Hive-qualified table — otherwise
+    * Spark resolves `<short>` against the session's current_schema (typically
+    * `default`) and fails to find it.
     *
     * Matching is delegated to [[MemoryMainRefs]] so this and the compiler's
     * initial-load reattach share one identifier-bounded pass — see there for
@@ -2009,18 +2119,35 @@ object SparkRefreshRewriter {
   private[common] def rewriteMemoryMainPrefix(sql: String): String = {
     val qualifiedMap = activeQualifiedNames.get()
     val pinMap       = activeSnapshotPins.get()
+    val pathMap      = activePinnedPaths.get()
     MemoryMainRefs.rewrite(sql) { short =>
-      val relation = qualifiedMap.get(short) match {
-        case Some(qual) if qual.contains(".") =>
-          val parts = qual.split("\\.")
-          // Wrap each segment in backticks so Spark resolves the table
-          // against the specific database in the qualified name, not the
-          // current session schema.
-          parts.map(p => s"`$p`").mkString(".")
-        case _ =>
-          s"`$short`"
+      snapshotPinFor(short, pinMap) match {
+        case Some(clause) =>
+          // Frozen pinned read: bind to the verified physical Delta path, never
+          // a logical name that could rebind between verify and read.
+          pinnedPathFor(short, pathMap) match {
+            case Some(path) =>
+              val escaped = path.replace("`", "``")
+              s"delta.`$escaped` $clause"
+            case None =>
+              throw new PinnedSourcePathMissingException(
+                s"snapshot-pinned source '$short' has no verified Delta path; refusing to emit a " +
+                  s"logical-name pinned read for the incremental refresh program"
+              )
+          }
+        case None =>
+          val relation = qualifiedMap.get(short) match {
+            case Some(qual) if qual.contains(".") =>
+              val parts = qual.split("\\.")
+              // Wrap each segment in backticks so Spark resolves the table
+              // against the specific database in the qualified name, not the
+              // current session schema.
+              parts.map(p => s"`$p`").mkString(".")
+            case _ =>
+              s"`$short`"
+          }
+          relation
       }
-      snapshotPinFor(short, pinMap).fold(relation)(clause => s"$relation $clause")
     }
   }
 
@@ -2030,6 +2157,14 @@ object SparkRefreshRewriter {
   private def snapshotPinFor(short: String, pinMap: Map[String, String]): Option[String] =
     if (pinMap.isEmpty) None
     else pinMap.collectFirst { case (name, clause) if name.equalsIgnoreCase(short) => clause }
+
+  /** Case-insensitive lookup of the VERIFIED physical Delta `DeltaLog.dataPath`
+    * a pinned short source was bound to, or `None` when no verified path was
+    * supplied for it (a fail-closed error at emit time).
+    */
+  private def pinnedPathFor(short: String, pathMap: Map[String, String]): Option[String] =
+    if (pathMap.isEmpty) None
+    else pathMap.collectFirst { case (name, path) if name.equalsIgnoreCase(short) => path }
 
   /** Transform openivm's `WITH ... INSERT INTO openivm_delta_<view> (cols) SELECT * FROM <lastCte>`
     * tail into a Spark CTAS that materialises the view delta to a per-refresh

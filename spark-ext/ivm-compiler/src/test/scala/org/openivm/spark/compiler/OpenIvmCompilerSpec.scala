@@ -49,6 +49,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   private val tSchema: StructType =
     StructType.fromDDL("id INT, value INT")
 
+  /** A deterministic verified physical Delta path for a pinned short source,
+    * mirroring the resolved binding's `DeltaLog.dataPath` the command layer
+    * supplies via `CompileRequest.sourceSnapshotPinnedPaths`. Every pinned
+    * initial-load read must bind to this path, not the logical/friendly name.
+    */
+  private def pinPath(short: String): String =
+    s"abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables/$short"
+
   // ── Test 1: Boot ─────────────────────────────────────────────────────────────
 
   "OpenIvmCompiler.build" should "succeed when the extension exists" in {
@@ -332,7 +340,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val req = CompileRequest(
       viewName = "mv_pinned_agg",
       viewSql = "SELECT region, SUM(amount) AS total FROM sales VERSION AS OF 366 GROUP BY region",
-      sources = Map("sales" -> salesSchema)
+      sources = Map("sales" -> salesSchema),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -343,7 +352,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val req = CompileRequest(
       viewName = "mv_pinned_ts",
       viewSql = "SELECT region, SUM(amount) AS total FROM sales TIMESTAMP AS OF '2024-01-01' GROUP BY region",
-      sources = Map("sales" -> salesSchema)
+      sources = Map("sales" -> salesSchema),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -354,7 +364,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_qual",
       viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales VERSION AS OF 366 GROUP BY region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -367,7 +378,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_join",
       viewSql = "SELECT e.emp_id, d.dept_name FROM employees VERSION AS OF 2 e " +
         "JOIN departments VERSION AS OF 5 d ON e.dept_id = d.dept_id",
-      sources = Map("employees" -> emps, "departments" -> depts)
+      sources = Map("employees" -> emps, "departments" -> depts),
+      sourceSnapshotPinnedPaths = Map("employees" -> pinPath("employees"), "departments" -> pinPath("departments"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshType should be >= 0
@@ -379,12 +391,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_initial_load",
       viewSql = "SELECT region, SUM(amount) AS total FROM tpcdi.sales VERSION AS OF 366 GROUP BY region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.initialLoadSql should not be empty
-    result.initialLoadSql should include("tpcdi.sales VERSION AS OF 366")
+    result.initialLoadSql should include(s"delta.`${pinPath("sales")}` VERSION AS OF 366")
     result.initialLoadSql should not include "memory.main."
+    result.initialLoadSql should not include "tpcdi.sales VERSION AS OF"
   }
 
   it should "leave the initial-load SQL unpinned for an unpinned view" in {
@@ -414,7 +428,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_alias_bare",
       viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 p GROUP BY p.region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -426,7 +441,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_alias_as",
       viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 AS p GROUP BY p.region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -438,7 +454,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewSql = "WITH source AS (SELECT p.region, p.amount FROM tpcdi.sales VERSION AS OF 366 AS p) " +
         "SELECT region, SUM(amount) AS total FROM source GROUP BY region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshTypeName shouldBe "AGGREGATE_GROUP"
@@ -452,7 +469,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewSql = "SELECT e.emp_id, d.dept_name FROM tpcdi.employees AS e " +
         "JOIN tpcdi.departments VERSION AS OF 5 AS d ON e.dept_id = d.dept_id",
       sources = Map("employees" -> emps, "departments" -> depts),
-      sourceQualifiedNames = Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments")
+      sourceQualifiedNames = Map("employees" -> "tpcdi.employees", "departments" -> "tpcdi.departments"),
+      sourceSnapshotPinnedPaths = Map("departments" -> pinPath("departments"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshType should be >= 0
@@ -464,12 +482,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewName = "mv_pinned_alias_initial_load",
       viewSql = "SELECT p.region, SUM(p.amount) AS total FROM tpcdi.sales VERSION AS OF 366 AS p GROUP BY p.region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.initialLoadSql should not be empty
-    result.initialLoadSql should include("tpcdi.sales VERSION AS OF 366")
+    result.initialLoadSql should include(s"delta.`${pinPath("sales")}` VERSION AS OF 366")
     result.initialLoadSql should not include "memory.main."
+    result.initialLoadSql should not include "tpcdi.sales VERSION AS OF"
     // The pin must never trail the alias — that order parses in neither dialect.
     """(?i)\bAS\s+p\s+VERSION\s+AS\s+OF""".r.findFirstIn(result.initialLoadSql) shouldBe None
   }
@@ -513,7 +533,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       viewSql = "SELECT a.region FROM tpcdi.sales VERSION AS OF 2 a " +
         "JOIN tpcdi.sales VERSION AS OF 2 b ON a.region = b.region",
       sources = Map("sales" -> salesSchema),
-      sourceQualifiedNames = Map("sales" -> "tpcdi.sales")
+      sourceQualifiedNames = Map("sales" -> "tpcdi.sales"),
+      sourceSnapshotPinnedPaths = Map("sales" -> pinPath("sales"))
     )
     val result = sharedCompiler.compile(req)
     result.refreshType should be >= 0
@@ -552,7 +573,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     viewSql = "SELECT c.name, a.city FROM db.customer VERSION AS OF 3 AS c " +
       "JOIN db.customer_address AS a ON a.id = c.id",
     sources = Map("customer" -> customerSchema, "customer_address" -> customerAddressSchema),
-    sourceQualifiedNames = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+    sourceQualifiedNames = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address"),
+    sourceSnapshotPinnedPaths =
+      Map("customer" -> pinPath("customer"), "customer_address" -> pinPath("customer_address"))
   )
 
   private val prefixCollisionQueries: String =
@@ -561,7 +584,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
   it should "not bleed a shorter source's pin into a longer source name in the initial load" in {
     val sql = initialLoadSqlFor(prefixCollisionRequest, prefixCollisionQueries)
-    sql should include("db.customer VERSION AS OF 3 AS c")
+    sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
     sql should include("db.customer_address AS a")
     sql should not include "memory.main."
     sql should not include "3_address"
@@ -578,8 +601,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       req,
       prefixCollisionQueries.replace("mv_prefix_collision", "mv_prefix_collision_long")
     )
-    sql should include("db.customer_address VERSION AS OF 7 AS a")
-    // The unpinned shorter source must stay live.
+    sql should include(s"delta.`${pinPath("customer_address")}` VERSION AS OF 7 AS a")
+    // The unpinned shorter source must stay live (friendly name, no pin).
+    sql should include("db.customer AS c")
     """(?i)db\.customer\s+VERSION""".r.findFirstIn(sql) shouldBe None
   }
 
@@ -593,8 +617,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       req,
       prefixCollisionQueries.replace("mv_prefix_collision", "mv_prefix_collision_both")
     )
-    sql should include("db.customer VERSION AS OF 3 AS c")
-    sql should include("db.customer_address VERSION AS OF 7 AS a")
+    sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
+    sql should include(s"delta.`${pinPath("customer_address")}` VERSION AS OF 7 AS a")
   }
 
   it should "compile a view whose sources have colliding name prefixes" in {
@@ -918,6 +942,56 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       read("stage.txt").trim shouldBe "CREATE MATERIALIZED VIEW (bind)"
     } finally {
       diagCompiler.close()
+    }
+  }
+
+  // ── parseInitialLoadSql: path-bound pinned reads (TOCTOU wiring) ───────────
+
+  "parseInitialLoadSql" should "path-bind a pinned initial-load source read to its verified Delta path" in {
+    val tmpDir = Files.createTempDirectory("openivm-initload-pin")
+    try {
+      val viewName = "mv_ll_pin"
+      val path     = "abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables/arm_collection_dim"
+      Files.write(
+        tmpDir.resolve(s"openivm_compiled_queries_$viewName.sql"),
+        s"create table openivm_data_$viewName as SELECT arm_collection_id FROM memory.main.arm_collection_dim;"
+          .getBytes("UTF-8")
+      )
+      val req = CompileRequest(
+        viewName = viewName,
+        viewSql = "SELECT arm_collection_id FROM `arc_sql_db_bi`.`arm_collection_dim` VERSION AS OF 46094",
+        sources = Map("arm_collection_dim" -> StructType.fromDDL("arm_collection_id INT")),
+        sourceQualifiedNames = Map("arm_collection_dim" -> "arc_sql_db_bi.arm_collection_dim"),
+        sourceSnapshotPinnedPaths = Map("arm_collection_dim" -> path)
+      )
+      val out = sharedCompiler.parseInitialLoadSql(tmpDir, req)
+      out should include(s"delta.`$path` VERSION AS OF 46094")
+      out should not include "memory.main"
+      out should not include "arc_sql_db_bi"
+    } finally {
+      Files.walk(tmpDir).sorted(java.util.Comparator.reverseOrder()).forEach(p => Files.deleteIfExists(p))
+    }
+  }
+
+  it should "hard-fail when a pinned initial-load source has no verified Delta path" in {
+    val tmpDir = Files.createTempDirectory("openivm-initload-nopath")
+    try {
+      val viewName = "mv_ll_nopath"
+      Files.write(
+        tmpDir.resolve(s"openivm_compiled_queries_$viewName.sql"),
+        s"create table openivm_data_$viewName as SELECT arm_collection_id FROM memory.main.arm_collection_dim;"
+          .getBytes("UTF-8")
+      )
+      val req = CompileRequest(
+        viewName = viewName,
+        viewSql = "SELECT arm_collection_id FROM `arc_sql_db_bi`.`arm_collection_dim` VERSION AS OF 46094",
+        sources = Map("arm_collection_dim" -> StructType.fromDDL("arm_collection_id INT")),
+        sourceQualifiedNames = Map("arm_collection_dim" -> "arc_sql_db_bi.arm_collection_dim")
+      )
+      the[org.openivm.spark.common.PinnedSourcePathMissingException] thrownBy
+        sharedCompiler.parseInitialLoadSql(tmpDir, req)
+    } finally {
+      Files.walk(tmpDir).sorted(java.util.Comparator.reverseOrder()).forEach(p => Files.deleteIfExists(p))
     }
   }
 
