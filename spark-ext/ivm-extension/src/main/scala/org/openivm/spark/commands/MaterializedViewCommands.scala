@@ -3280,8 +3280,19 @@ case class RefreshMaterializedViewCommand(
       val preRefreshMvVersionForPinGuard: Long =
         if (refreshPinnedIdentities.isEmpty) -1L
         else
+          // Fail-closed: a pinned refresh MUST be able to capture its pre-apply
+          // version so a post-apply rebind can be rolled back. If it cannot be
+          // read, abort BEFORE any mutation rather than proceed without rollback
+          // capability.
           try DeltaTableVersion.requireLatest(spark, meta.location)
-          catch { case NonFatal(_) => -1L }
+          catch {
+            case NonFatal(captureFailure) =>
+              throw new IllegalStateException(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot capture the pre-apply MV version required " +
+                  s"to roll back a pinned-source rebind; aborting before any mutation: ${captureFailure.getMessage}",
+                captureFailure
+              )
+          }
       // REFRESH apply hook: fires after the pin binding is verified and the
       // pre-apply version captured, before the first data mutation.
       CommandConcurrencyInjection.maybePauseBeforeRefreshApply()
@@ -3437,8 +3448,12 @@ case class RefreshMaterializedViewCommand(
       // rebind could NOT be rolled back, so requirePinBinding blocks every future
       // REFRESH/ADVANCE until the MV is recreated. Best-effort persist; the thrown
       // exception is the immediate signal for this operation.
-      def persistPinRebindRepairRequired(mismatchDetail: String, failureDetail: String): Unit =
-        try
+      // Persist the durable repair-required journal and VERIFY it re-reads. Returns
+      // true iff the marker is durably present; the caller MUST surface an explicit
+      // unavailable/blocked state when it is not (never success-shaped, never a
+      // silently-discarded write failure).
+      def persistPinRebindRepairRequired(mismatchDetail: String, failureDetail: String): Boolean =
+        try {
           MvCatalog.upsert(
             spark,
             meta.copy(properties =
@@ -3446,7 +3461,32 @@ case class RefreshMaterializedViewCommand(
                 s"rebind: $mismatchDetail | rollback: $failureDetail")
             )
           )
-        catch { case NonFatal(_) => () }
+          MvCatalog
+            .lookup(spark, name)
+            .exists(_.properties.get(MvCommandHelper.PinRebindRepairRequiredKey).exists(_.trim.nonEmpty))
+        } catch { case NonFatal(_) => false }
+
+      // Build the coherent, non-retryable failure for any rollback-path failure:
+      // persist+verify the durable repair marker, then surface BOTH the identity
+      // mismatch and the rollback failure. If the durable marker cannot be
+      // written, the message states the MV is UNAVAILABLE (explicit blocked state).
+      def markRepairRequiredAndCoherent(
+          rebind: SourceIdentityRebindingException,
+          failureDetail: String
+      ): SourceIdentityRebindingException = {
+        val durable = persistPinRebindRepairRequired(rebind.getMessage, failureDetail)
+        val suffix =
+          if (durable)
+            "the materialized view is marked repair-required and must be dropped and recreated before any " +
+              "further REFRESH or ADVANCE"
+          else
+            "the durable repair marker could NOT be persisted; the materialized view is UNAVAILABLE and must be " +
+              "dropped and recreated before any further REFRESH or ADVANCE"
+        val coherent =
+          new SourceIdentityRebindingException(s"${rebind.getMessage}; ROLLBACK FAILED ($failureDetail); $suffix")
+        coherent.initCause(rebind)
+        coherent
+      }
 
       // The single authoritative post-apply pinned-source identity gate. Runs
       // immediately after the final source-consuming MV data mutation and BEFORE
@@ -3467,9 +3507,17 @@ case class RefreshMaterializedViewCommand(
           } catch { case r: SourceIdentityRebindingException => Some(r) }
         mismatch.foreach { rebind =>
           if (preRefreshMvVersionForPinGuard >= 0L) {
+            // Fail-closed: if we cannot read the current version we cannot prove
+            // the MV is un-mutated, so treat it as a rollback failure.
             val currentVersion =
               try DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
-              catch { case NonFatal(_) => -1L }
+              catch {
+                case NonFatal(readFailure) =>
+                  throw markRepairRequiredAndCoherent(
+                    rebind,
+                    s"pre-rollback version read failed: ${readFailure.getMessage}"
+                  )
+              }
             // Only RESTORE if the apply actually advanced the MV; a no-mutation
             // exit leaves current == pre and needs no rollback commit.
             if (currentVersion > preRefreshMvVersionForPinGuard) {
@@ -3478,31 +3526,25 @@ case class RefreshMaterializedViewCommand(
                 MvCommandHelper.restoreMvToVersion(spark, cleanupMeta.location, preRefreshMvVersionForPinGuard)
               } catch {
                 case NonFatal(restoreFailure) =>
-                  persistPinRebindRepairRequired(rebind.getMessage, restoreFailure.getMessage)
-                  val coherent = new SourceIdentityRebindingException(
-                    s"${rebind.getMessage}; ROLLBACK FAILED (${restoreFailure.getMessage}); the materialized view " +
-                      "is marked repair-required and must be dropped and recreated before any further REFRESH " +
-                      "or ADVANCE"
-                  )
-                  coherent.initCause(restoreFailure)
-                  throw coherent
+                  throw markRepairRequiredAndCoherent(rebind, s"rollback RESTORE failed: ${restoreFailure.getMessage}")
               }
-              // RESTORE created a new Delta commit; sync the tracked version to it
-              // while preserving pre-refresh pins/state. Rollback bookkeeping, not
-              // a success publish.
+              // RESTORE created a new Delta commit; require the EXACT new latest
+              // version and sync the tracked version to it (preserving pre-refresh
+              // pins). NEVER substitute the old pre-refresh version — that would
+              // recreate the lastVersion divergence.
               val restoredVersion =
                 try DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
-                catch { case NonFatal(_) => preRefreshMvVersionForPinGuard }
+                catch {
+                  case NonFatal(readFailure) =>
+                    throw markRepairRequiredAndCoherent(
+                      rebind,
+                      s"post-restore version read failed: ${readFailure.getMessage}"
+                    )
+                }
               try MvCatalog.upsert(spark, meta.copy(lastVersion = restoredVersion))
               catch {
                 case NonFatal(syncFailure) =>
-                  persistPinRebindRepairRequired(rebind.getMessage, s"version sync failed: ${syncFailure.getMessage}")
-                  val coherent = new SourceIdentityRebindingException(
-                    s"${rebind.getMessage}; ROLLBACK version sync FAILED (${syncFailure.getMessage}); the " +
-                      "materialized view is marked repair-required and must be dropped and recreated"
-                  )
-                  coherent.initCause(syncFailure)
-                  throw coherent
+                  throw markRepairRequiredAndCoherent(rebind, s"version sync failed: ${syncFailure.getMessage}")
               }
             }
           }
