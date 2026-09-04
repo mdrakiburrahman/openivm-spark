@@ -1436,5 +1436,46 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
       MvCommandHelper.readPinnedOperationGuardState(spark, id) shouldBe Absent
     }
+
+    it("reads an oversize guard file as Unreadable via a bounded read (no OOM, fail-closed)") {
+      val id = tid("guard_db", "oversize")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "t") shouldBe true
+      val path = MvCommandHelper.pinnedOperationGuardPath(spark, id)
+      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      val os   = fs.create(path, true)
+      try os.write(Array.fill(MvCommandHelper.MaxGuardBytes + 64)('x'.toByte))
+      finally os.close()
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) match {
+        case Unreadable(msg) => msg.toLowerCase should include("oversize")
+        case other           => fail(s"expected Unreadable(oversize) got $other")
+      }
+      MvCommandHelper.hasPinnedOperationGuard(spark, id) shouldBe true
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+    }
+
+    it("treats a foreign token acquired between delete and verify as a successful owned release") {
+      val id = tid("guard_db", "release_race")
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "token1") shouldBe true
+      // Between token1's delete and its verify, a cross-driver op acquires token2.
+      val released =
+        CommandConcurrencyInjection.withAfterGuardDeleteBeforeVerify {
+          MvCommandHelper.acquirePinnedOperationGuard(spark, id, "token2")
+          ()
+        } {
+          MvCommandHelper.releasePinnedOperationGuard(spark, id, "token1")
+        }
+      // token1's owned file was removed -> its release succeeded; token2 untouched.
+      released shouldBe true
+      MvCommandHelper.readPinnedOperationGuardState(spark, id) match {
+        case Present(_, t) => t shouldBe "token2"
+        case other         => fail(s"expected Present(token2) got $other")
+      }
+      MvCommandHelper.hasPinnedOperationGuard(spark, id) shouldBe true
+      // A third op is blocked by token2's guard.
+      MvCommandHelper.acquirePinnedOperationGuard(spark, id, "token3") shouldBe false
+      MvCommandHelper.forceClearPinnedOperationGuard(spark, id)
+    }
   }
 }

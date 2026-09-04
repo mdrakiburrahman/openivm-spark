@@ -381,6 +381,22 @@ private[spark] object CommandConcurrencyInjection {
   }
 
   private[commands] def forceVersionBelowPre: Boolean = forcePostMutationVersionBelowPre
+
+  @volatile private var afterGuardDeleteBeforeVerify: () => Unit = null
+
+  /** Runs between a token-owned guard delete and its verification read, so a test
+    * can simulate a cross-driver op acquiring a NEW guard in that window. */
+  def withAfterGuardDeleteBeforeVerify[A](hook: => Unit)(body: => A): A = synchronized {
+    val previous = afterGuardDeleteBeforeVerify
+    afterGuardDeleteBeforeVerify = () => hook
+    try body
+    finally afterGuardDeleteBeforeVerify = previous
+  }
+
+  private[commands] def maybeRunAfterGuardDeleteBeforeVerify(): Unit = {
+    val hook = afterGuardDeleteBeforeVerify
+    if (hook != null) hook()
+  }
 }
 
 private[commands] object CommandLocalState {
@@ -893,6 +909,12 @@ private[commands] object MvCommandHelper {
     final case class Unreadable(error: String)                extends PinnedOperationGuardState
   }
 
+  /** Hard upper bound on a well-formed guard payload. Read is bounded to
+    * `MaxGuardBytes + 1` so an unexpectedly large/garbage file is rejected as
+    * `Unreadable` without allocating unboundedly (no OOM that would escape the
+    * NonFatal catch). */
+  val MaxGuardBytes: Int = 4096
+
   def readPinnedOperationGuardState(spark: SparkSession, viewName: TableIdentifier): PinnedOperationGuardState =
     try {
       val path   = pinnedOperationGuardPath(spark, viewName)
@@ -900,16 +922,26 @@ private[commands] object MvCommandHelper {
       val expect = serializeGuardIdentity(viewName)
       if (!fs.exists(path)) PinnedOperationGuardState.Absent
       else {
-        val is = fs.open(path)
-        val content =
-          try new String(org.apache.commons.io.IOUtils.toByteArray(is), java.nio.charset.StandardCharsets.UTF_8)
-          finally is.close()
-        val lines = content.split("\n", -1)
-        if (lines.length < 2 || lines(0).isEmpty)
-          PinnedOperationGuardState.Unreadable(s"partial/corrupt guard file for '$expect'")
-        else if (lines(0) != expect)
-          PinnedOperationGuardState.Unreadable(s"identity mismatch/collision: expected '$expect' got '${lines(0)}'")
-        else PinnedOperationGuardState.Present(lines(0), lines(1))
+        val is    = fs.open(path)
+        val buf   = new Array[Byte](MaxGuardBytes + 1)
+        var total = 0
+        try {
+          var continue = true
+          while (continue && total < buf.length) {
+            val n = is.read(buf, total, buf.length - total)
+            if (n < 0) continue = false else total += n
+          }
+        } finally is.close()
+        if (total > MaxGuardBytes)
+          PinnedOperationGuardState.Unreadable(s"oversize guard file (> $MaxGuardBytes bytes) for '$expect'")
+        else {
+          val lines = new String(buf, 0, total, java.nio.charset.StandardCharsets.UTF_8).split("\n", -1)
+          if (lines.length < 2 || lines(0).isEmpty)
+            PinnedOperationGuardState.Unreadable(s"partial/corrupt guard file for '$expect'")
+          else if (lines(0) != expect)
+            PinnedOperationGuardState.Unreadable(s"identity mismatch/collision: expected '$expect' got '${lines(0)}'")
+          else PinnedOperationGuardState.Present(lines(0), lines(1))
+        }
       }
     } catch { case NonFatal(e) => PinnedOperationGuardState.Unreadable(Option(e.getMessage).getOrElse(e.toString)) }
 
@@ -946,16 +978,31 @@ private[commands] object MvCommandHelper {
     * an unreadable/absent one. After delete, verify the guard is Absent. Returns
     * true only on a clean owned release; false means the caller must NOT report
     * unrestricted success (leave/block). */
-  def releasePinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier, token: String): Boolean =
+  /** Token-owned RELEASE: reread and require the exact identity + token before
+    * deleting only our own file (never a foreign token's), then re-check. A
+    * cross-driver op may acquire a NEW guard between our delete and our verify:
+    * `Absent` and `Present(same identity, foreign token)` both mean our owned file
+    * was removed, so both are a successful release (we never touch the newer
+    * guard). Only our-same-token-still-present (delete didn't take) or `Unreadable`
+    * is a failure; then the caller must NOT report unrestricted success. */
+  def releasePinnedOperationGuard(spark: SparkSession, viewName: TableIdentifier, token: String): Boolean = {
+    val expect = serializeGuardIdentity(viewName)
     readPinnedOperationGuardState(spark, viewName) match {
-      case PinnedOperationGuardState.Present(id, t) if id == serializeGuardIdentity(viewName) && t == token =>
+      case PinnedOperationGuardState.Present(id, t) if id == expect && t == token =>
         try {
           val path = pinnedOperationGuardPath(spark, viewName)
           path.getFileSystem(spark.sparkContext.hadoopConfiguration).delete(path, false)
-          readPinnedOperationGuardState(spark, viewName) == PinnedOperationGuardState.Absent
+          // A concurrent op may acquire between the delete and this verify.
+          CommandConcurrencyInjection.maybeRunAfterGuardDeleteBeforeVerify()
+          readPinnedOperationGuardState(spark, viewName) match {
+            case PinnedOperationGuardState.Absent                                           => true
+            case PinnedOperationGuardState.Present(id2, t2) if id2 == expect && t2 != token => true
+            case _                                                                          => false
+          }
         } catch { case NonFatal(_) => false }
       case _ => false
     }
+  }
 
   /** Force-clear ANY guard for this identity regardless of token (used ONLY by a
     * fresh CREATE / DROP+recreate recovery, the explicit operator action). */
