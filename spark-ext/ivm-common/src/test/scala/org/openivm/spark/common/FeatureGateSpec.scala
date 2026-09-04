@@ -119,6 +119,36 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.driverAdmission") {
+    it("defaults OFF and leaves maxConcurrent effectively unbounded unless explicitly set") {
+      val conf = new SparkConf(false)
+
+      FeatureGate.driverAdmissionEnabled(conf) shouldBe false
+      FeatureGate.driverAdmissionMaxConcurrent(conf) shouldBe Int.MaxValue
+      FeatureGate.driverAdmissionEnabled(
+        new SparkConf(false).set(FeatureGate.DriverAdmissionEnabledKey, "true")
+      ) shouldBe true
+      FeatureGate.driverAdmissionMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.DriverAdmissionMaxConcurrentKey, "7")
+      ) shouldBe 7
+    }
+  }
+
+  describe("FeatureGate.createCatalogPublicationMaxConcurrent") {
+    it("preserves 32-way capacity by default and clamps explicit bounds to 2 through 32") {
+      FeatureGate.createCatalogPublicationMaxConcurrent(new SparkConf(false)) shouldBe 32
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "7")
+      ) shouldBe 7
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "1")
+      ) shouldBe 2
+      FeatureGate.createCatalogPublicationMaxConcurrent(
+        new SparkConf(false).set(FeatureGate.CreateCatalogPublicationMaxConcurrentKey, "64")
+      ) shouldBe 32
+    }
+  }
+
   describe("FeatureGate.scd2RangeAccelEnabled") {
     it("defaults ON and honours an explicit OFF flag") {
       FeatureGate.scd2RangeAccelEnabled(new SparkConf(false)) shouldBe true
@@ -177,6 +207,21 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.stateSyncUri(
         new SparkConf(false).set(FeatureGate.StateSyncUriKey, "  abfss://ws@onelake/lh/Files/_openivm  ")
       ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm")
+    }
+  }
+
+  describe("FeatureGate.autoCompactSupported") {
+    it("rejects exactly one clustering column (Delta hilbert clustering asserts cols.size > 1)") {
+      FeatureGate.autoCompactSupported(Seq("region")) shouldBe false
+    }
+
+    it("allows an unclustered table — Delta falls back to CompactionStrategy") {
+      FeatureGate.autoCompactSupported(Nil) shouldBe true
+    }
+
+    it("allows two or more clustering columns — the hilbert curve is well defined") {
+      FeatureGate.autoCompactSupported(Seq("region", "day")) shouldBe true
+      FeatureGate.autoCompactSupported(Seq("region", "day", "sku")) shouldBe true
     }
   }
 }

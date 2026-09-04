@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openivm.execution-span",
+  "title": "OpenIVM completed execution span",
+  "x-openivm-w6-required-success-fields": [
+    "schema_id",
+    "schema_version",
+    "campaign_id",
+    "request_id",
+    "correlation_id",
+    "dbt_node_id",
+    "materialized_view",
+    "operation",
+    "phase",
+    "engine_started_at",
+    "engine_completed_at",
+    "duration_ms",
+    "driver_thread",
+    "outcome",
+    "compile_refresh_type",
+    "effective_refresh_type",
+    "refresh_reason",
+    "time_travel_pin_status",
+    "time_travel_pin_reason",
+    "source_versions",
+    "pending_delta_count"
+  ],
+  "x-openivm-operation-success-outcomes": {
+    "create": [
+      "create_executed",
+      "create_already_exists"
+    ],
+    "refresh": [
+      "source_versions_already_applied",
+      "no_pending_deltas",
+      "noop_fast_exit",
+      "full_refresh_executed",
+      "runtime_empty_delta_skip",
+      "incremental_executed",
+      "committed_with_cleanup_warning"
+    ]
+  },
+  "x-openivm-outcomes-requiring-source-versions": [
+    "create_executed",
+    "create_already_exists",
+    "source_versions_already_applied",
+    "no_pending_deltas",
+    "noop_fast_exit",
+    "full_refresh_executed",
+    "runtime_empty_delta_skip",
+    "incremental_executed",
+    "committed_with_cleanup_warning"
+  ],
+  "x-openivm-source-version-order": "canonical_relation_ascending",
+  "x-openivm-source-version-uniqueness": "canonical_relation",
+  "x-openivm-duration-timestamp-tolerance-ms": 5,
+  "x-openivm-duplicate-fields": "reject",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "schema_version",
+    "campaign_id",
+    "request_id",
+    "correlation_id",
+    "dbt_node_id",
+    "materialized_view",
+    "operation",
+    "phase",
+    "engine_started_at",
+    "engine_completed_at",
+    "duration_ms",
+    "driver_thread",
+    "outcome",
+    "source_versions",
+    "pending_delta_count"
+  ],
+  "properties": {
+    "schema_id": {
+      "const": "openivm.execution-span"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "campaign_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "dbt_node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "materialized_view": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "operation": {
+      "enum": [
+        "create",
+        "refresh"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "engine_started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "engine_completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "driver_thread": {
+      "type": "string",
+      "minLength": 1
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compile_refresh_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effective_refresh_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "refresh_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "time_travel_pin_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "time_travel_pin_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_versions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "relation",
+          "start_version",
+          "end_version"
+        ],
+        "properties": {
+          "relation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "start_version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_version": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "pending_delta_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "same_mv_lock_wait_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "driver_admission_wait_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "catalog_publication_admission_width": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "catalog_publication_admission_wait_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "compiler_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "catalog_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "analysis_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "watermark_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ctas_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ctas_data_write_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "hive_catalog_publication_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "metadata_publication_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "delta_version_lookup_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "delta_version_lookup_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_write_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_write_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_flush_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_flush_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_flush_failed_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_jvm_lock_wait_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_external_lock_wait_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rocksdb_backup_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

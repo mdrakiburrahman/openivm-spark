@@ -1,7 +1,8 @@
 # 9. Profiling OpenIVM refreshes: `openivm_refresh_profile` and Spark logs
 
 Question D7 asks how to profile OpenIVM refreshes across the two execution modes used by this repository.
-The short answer is that standalone DuckDB/OpenIVM has a real profile table, while openivm-spark mostly has log evidence.
+Both modes expose step-oriented refresh profiles. Spark persists its profile in
+a dedicated RocksDB catalog and exposes it through SQL.
 
 ## 9.1 TL;DR
 
@@ -14,7 +15,12 @@ The short answer is that standalone DuckDB/OpenIVM has a real profile table, whi
 - That means DuckDB compiles refresh SQL and returns without running the refresh program.
 - Spark executes the rewritten SQL itself.
 - Therefore the DuckDB `openivm_refresh_profile` table is not the place to look for Spark refresh runtime.
-- Today, Spark refresh evidence comes from `[openivm-mv]` log lines in `MaterializedViewCommands.scala` and normal Spark SQL/job logs.
+- Set `spark.openivm.profile.refresh=true` to capture Spark CREATE and REFRESH steps.
+- Query Spark profiles with `SHOW OPENIVM REFRESH PROFILE`.
+- Spark profiles include aggregated `rocksdb_operation` contention rows.
+- Spark profiles include one `query_span` row with start/end epoch milliseconds,
+  thread name, outcome, and duration for trace/Gantt views.
+- Spark also emits `[openivm-mv]` log lines and normal Spark SQL/job metrics.
 - The requested structured tokens such as `compile_start`, `collect_staging_end`, and `stmt_duration_ms` are not emitted in this checkout.
 - Use the actual `[openivm-mv]` prefix and the helper below.
 
@@ -144,6 +150,102 @@ There is no long-lived DuckDB database whose `openivm_refresh_profile` table rep
 The DuckDB compile subprocess is ephemeral, and its profile table is not a Spark telemetry sink.
 
 ## 9.7 Spark-side profiling evidence that exists today
+
+Enable the Spark profile and query it after a refresh:
+
+```sql
+SET spark.openivm.profile.refresh=true;
+
+REFRESH MATERIALIZED VIEW daily_sales;
+
+SHOW OPENIVM REFRESH PROFILE;
+```
+
+`RefreshProfile` buffers lifecycle steps on the driver thread. It writes the
+rows to `<state_path>/_openivm/refresh_profile/rocksdb` after the command ends.
+The profile uses the same seven-column schema as standalone OpenIVM.
+
+RocksDB access adds one `rocksdb_operation` row for each database scope,
+operation, and multi-process mode. Its `duration_ms` is the aggregated
+operation time. The `detail` field preserves exact nanosecond timing for JVM
+lock waits, external lock waits, native open/close, and the operation body.
+
+The collector is thread-local. Concurrent materialized views cannot mix their
+metrics through process-global counters. Collection stops before the profile
+catalog write, so a profile does not measure its own persistence.
+
+`query_span.detail` has the stable shape
+`start_epoch_ms=...;end_epoch_ms=...;thread=...;outcome=...`. Plot one horizontal
+bar per `refresh_id`, from start to end, to compare overlap between an A baseline
+and a B run. A failure before the normal end marker is recorded as
+`outcome=failed_before_end`, and the thread-local collector is still detached.
+Export profile rows as JSON or JSON Lines and run
+`python3 tools/openivm_trace.py spans.jsonl openivm-trace.json`; load the result
+in Chrome tracing or Perfetto to inspect overlap visually.
+
+Independently of the profile gate, the driver now emits a single-line
+`OPENIVM_EXECUTION_SPAN {json}` record for each CREATE / REFRESH lifecycle.
+The JSON fields are stable and intentionally low-cardinality:
+`request_id` (when present from Spark local properties / MDC),
+`dbt_node_id` (from `openivm.node_id`, else `spark.jobGroup.id`, including MDC),
+`materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
+`duration_ms`, `driver_thread`, `outcome`, optional
+`compile_refresh_type`, `effective_refresh_type`, `refresh_reason`, and
+`time_travel_pin_status`, plus optional
+`same_mv_lock_wait_ms`, `driver_admission_wait_ms`, `compiler_ms`,
+`catalog_ms`, `rocksdb_flush_ms`, and `rocksdb_backup_ms`. CREATE spans also
+include `catalog_publication_admission_width`,
+`catalog_publication_admission_wait_ms`, `analysis_ms`, `watermark_ms`,
+`ctas_ms`, `ctas_data_write_ms`, `hive_catalog_publication_ms`, and
+`metadata_publication_ms`. The admission width and wait are emitted even when
+the wait is zero, so benchmark guards can see an explicitly reduced publication
+capacity. `ctas_data_write_ms` directly times the path-identifier Delta CTAS;
+`hive_catalog_publication_ms` directly times the subsequent named
+`CREATE TABLE ... USING DELTA LOCATION` registration. Their sum equals
+`ctas_ms`.
+
+`delta_version_lookup_ms` and `delta_version_lookup_count` report the time and
+number of latest-committed-Delta-version resolutions performed by the span
+(`org.openivm.spark.common.DeltaTableVersion`, metric
+`catalog.delta_version.lookup`). They are emitted only when the span performed
+at least one lookup, and they are deliberately kept out of `catalog_ms` so the
+publication tail can be attributed separately from MV-catalog writes. The
+lookup reads `DeltaLog.update().version` on the driver and submits no Spark
+job: a `DeltaTable.history(1)` read would submit one, and under a wide CREATE
+fan-out that job queues for a task slot behind the concurrent Delta data
+writes, inflating `metadata_publication_ms` for even a three-row output.
+`MaterializedViewCommandsSpec` guards this by asserting that a CREATE submits
+no Spark job after its data-write boundary.
+CREATE records the authoritative classification once it is known. REFRESH reads
+the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
+runs still emit the same three fields without recompiling. Legacy metadata rows
+that pre-date these properties fall back to `effective_refresh_type=refreshTypeName`,
+set `compile_refresh_type` to that same value, and omit `refresh_reason`.
+`time_travel_pin_status` reports whether a user-authored Delta snapshot pin
+(`FROM t VERSION AS OF 366`) was honored: `APPLIED` when every pin resolved and
+its source is frozen, `NOT_APPLICABLE` when the body carries no pin, and
+`COMPILE_FAILED` for a pin OpenIVM refuses to maintain. It is derived from the
+user's body and persisted at CREATE
+(`_ivm_time_travel_pin_status` / `_ivm_time_travel_pins`), never inferred from
+the compiled program, so a REFRESH whose delta statements carry no temporal
+clause still reports `APPLIED`; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7.3.
+`rocksdb_backup_ms` is best-effort only: async state backup may finish after the
+primary span is emitted, and that late completion does NOT trigger a duplicate
+`OPENIVM_EXECUTION_SPAN` line.
+
+When query logging is enabled, CREATE records the path CTAS as
+`category=initial_load_ctas, stmt_order=0`, the named registration as
+`category=catalog_registration, stmt_order=1`, and an optional backing user
+view as `category=backing_user_view, stmt_order=2`.
+
+The CREATE phase fields are collected even when
+`spark.openivm.profile.refresh=false` and
+`spark.openivm.metrics.enabled=false`; they therefore remain available in
+ordinary driver logs without enabling RocksDB profile persistence.
+
+The profile complements Spark event metrics. Use event metrics for records,
+files, shuffle, and spill. Use `rocksdb_operation` for state-layer contention.
 
 The current Spark source emits operational log lines with the prefix `[openivm-mv]`.
 The emit sites found by `grep -rn "logInfo.*refresh" spark-ext/` and related `logError`/`logWarning` searches are below.

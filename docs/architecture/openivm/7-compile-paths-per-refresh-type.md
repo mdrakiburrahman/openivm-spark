@@ -800,8 +800,9 @@ Consequences:
 
 - there is no `compile_top_k.cpp`;
 - there is no top-k-specific emitted maintenance program;
-- openivm-spark demotes explicit top-k views to full refresh when needed;
-- otherwise the inner aggregate or projection refreshes all candidate rows and the read-time view applies ordering/limit.
+- openivm-spark maintains the inner aggregate or projection in an unlimited
+  sibling table and applies ordering/limit in the read-time Spark VIEW;
+- unsupported `TAIL` extraction remains a conservative full refresh.
 
 ## 19. Concrete walkthrough: `AGGREGATE_GROUP`
 

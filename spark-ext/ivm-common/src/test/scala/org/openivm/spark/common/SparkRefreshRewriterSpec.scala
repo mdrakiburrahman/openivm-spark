@@ -1,6 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -906,6 +907,13 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
       rewritten.filter(_.contains("WHEN MATCHED THEN DELETE")) should have size 2
       rewritten.mkString("\n") should not include "UNION ALL"
+      // Even in the legacy one-MERGE-per-IN shape, the affected-key subquery
+      // must alias the source column (t_id) to the MV key (trade_id) so the
+      // `d.trade_id` reference in the ON clause resolves.
+      val legacyDeletes = rewritten.filter(_.contains("WHEN MATCHED THEN DELETE"))
+      legacyDeletes.head should include("t_id AS trade_id")
+      legacyDeletes.head should include("ON v.trade_id IS NOT DISTINCT FROM d.trade_id")
+      legacyDeletes.head should not include "d.t_id"
     }
 
     it("collapses same-target partition deletes to one MERGE over unioned affected keys when enabled") {
@@ -1965,6 +1973,617 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |SELECT * FROM t2_join""".stripMargin
 
       SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
+    }
+  }
+
+  describe("user snapshot pins") {
+    val pinnedSource = """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM memory.main.accounts
+        |),
+        |t1_delta (t1_id, t1_value, t1_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+        |),
+        |t2_join (t2_id, t2_mul) AS (
+        |  SELECT t0_id, t1_mul FROM t0_scan INNER JOIN t1_delta ON t0_id = t1_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t2_join""".stripMargin
+
+    def pinnedPath(short: String): String = s"dbfs:/delta/src/$short"
+
+    def rewriteWithPins(
+        sql: String,
+        pins: Map[String, String],
+        qualified: Map[String, String] = Map.empty,
+        snapshotVersions: Map[String, Long] = Map.empty,
+        advanceOldVersions: Map[String, Long] = Map.empty,
+        pinnedPaths: Option[Map[String, String]] = None
+    ): RewrittenRefresh =
+      SparkRefreshRewriter.rewrite(
+        compiledSql = sql,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("orders" -> "openivm_delta_orders"),
+        viewDeltaPath = viewDeltaPath,
+        sourceQualifiedNames = qualified,
+        sourceSnapshotPins = pins,
+        // Default: every pinned short gets a deterministic verified path. Tests
+        // that exercise the fail-closed missing-path guard pass `Some(Map.empty)`.
+        sourceSnapshotPinnedPaths = pinnedPaths.getOrElse(pins.map { case (k, _) => k -> pinnedPath(k) }),
+        sourceSnapshotVersions = snapshotVersions,
+        sourceSnapshotAdvanceOldVersions = advanceOldVersions
+      )
+
+    it("path-binds a pinned live source read to its verified Delta path") {
+      val rewritten = rewriteWithPins(pinnedSource, Map("accounts" -> "VERSION AS OF 366"))
+      rewritten.statements.head should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 366")
+    }
+
+    it("path-binds a pinned source read even when a friendly qualified name is supplied") {
+      val rewritten = rewriteWithPins(
+        pinnedSource,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        qualified = Map("accounts" -> "db.accounts")
+      )
+      // The friendly qualified name is NOT used for a pinned read's execution
+      // path — only the verified physical path is.
+      rewritten.statements.head should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 366")
+      rewritten.statements.head should not include "`db`.`accounts` VERSION AS OF"
+    }
+
+    it("hard-fails a pinned source read with no verified path instead of a logical-name fallback") {
+      val ex = the[PinnedSourcePathMissingException] thrownBy
+        rewriteWithPins(
+          pinnedSource,
+          pins = Map("accounts" -> "VERSION AS OF 366"),
+          pinnedPaths = Some(Map.empty)
+        )
+      ex.getMessage should include("accounts")
+      ex.getMessage.toUpperCase should not include "FULL_REFRESH"
+    }
+
+    it("never pins the openivm delta temp view of an unpinned source") {
+      val rewritten = rewriteWithPins(pinnedSource, Map("accounts" -> "VERSION AS OF 366"))
+      rewritten.statements.head should include("FROM `openivm_delta_orders`")
+      rewritten.statements.head should not include "`openivm_delta_orders` VERSION AS OF"
+    }
+
+    it("leaves every source unpinned when no pins are registered") {
+      val rewritten = rewriteWithPins(pinnedSource, Map.empty)
+      rewritten.statements.head should include("FROM `accounts`")
+      rewritten.statements.head.toUpperCase should not include "VERSION AS OF"
+    }
+
+    it("keeps the user pin instead of the pre-refresh snapshot version") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        snapshotVersions = Map("accounts" -> 17L)
+      ).statements.head
+      rewritten should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 366")
+      rewritten should not include "VERSION AS OF 17"
+    }
+
+    it("uses the target pin for live reads and the old pin for source advancement old-state terms") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map("accounts" -> "VERSION AS OF 18"),
+        advanceOldVersions = Map("accounts" -> 17L)
+      ).statements.head
+      // Both the live read (target pin) AND the source-advancement old-state term
+      // (pre-advance version) bind to the SAME verified physical Delta path — an
+      // alias rebind after the verified ADVANCE request cannot move either read
+      // onto a different table.
+      rewritten should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 18")
+      rewritten should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 17")
+      rewritten should not include "`accounts` VERSION AS OF"
+    }
+
+    it("still collapses the old-state union for an unpinned source") {
+      val canonicalPinned =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM `memory`.`main`.`accounts`
+          |),
+          |t1_projection (t1_id, t1_value, t1_mul) AS (
+          |  SELECT t0_id, t0_value, 1 FROM t0_scan
+          |),
+          |t2_scan (t2_id, t2_value, t2_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`
+          |),
+          |t3_aggregate (t3_id, t3_value, t3_mul) AS (
+          |  SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value
+          |),
+          |t4_filter (t4_id, t4_value, t4_mul) AS (
+          |  SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0
+          |),
+          |t5_projection (t5_id, t5_value, t5_mul) AS (
+          |  SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter
+          |),
+          |t6_projection (t6_id, t6_value, t6_mul) AS (
+          |  SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection
+          |),
+          |t7_union (t7_id, t7_value, t7_mul) AS (
+          |  SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+      val rewritten = rewriteWithPins(
+        canonicalPinned,
+        pins = Map.empty,
+        snapshotVersions = Map("accounts" -> 17L)
+      ).statements.head
+      rewritten should include("VERSION AS OF 17")
+    }
+
+    // Spark's grammar is `identifierReference temporalClause? tableAlias`, so a
+    // re-applied pin must land BETWEEN the relation and any alias openivm
+    // carried through. `... `accounts` p VERSION AS OF 366` would not parse.
+    it("re-applies the pin before a bare alias on the source read") {
+      val aliased = pinnedSource.replace("FROM memory.main.accounts", "FROM memory.main.accounts p")
+      val stmt    = rewriteWithPins(aliased, Map("accounts" -> "VERSION AS OF 366")).statements.head
+      stmt should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 366 p")
+      stmt should not include "p VERSION AS OF"
+    }
+
+    it("re-applies the pin before an AS alias on a qualified source read") {
+      val aliased = pinnedSource.replace("FROM memory.main.accounts", "FROM memory.main.accounts AS p")
+      val stmt = rewriteWithPins(
+        aliased,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        qualified = Map("accounts" -> "db.accounts")
+      ).statements.head
+      stmt should include(s"FROM delta.`${pinnedPath("accounts")}` VERSION AS OF 366 AS p")
+      stmt should not include "AS p VERSION AS OF"
+    }
+
+    // `customer` is a strict prefix of `customer_address`: an unbounded
+    // `sql.replace("memory.main.customer", …)` rewrites the FIRST source's name
+    // inside the SECOND one, injecting the clause mid-identifier
+    // (`customer VERSION AS OF 3_address`) or consuming the longer name so its
+    // own pin never lands.  Both directions must stay bounded.
+    val prefixCollisionSource = """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT `id`, `value` FROM memory.main.customer c
+        |),
+        |t1_scan (t1_id, t1_city) AS (
+        |  SELECT `id`, `city` FROM memory.main.customer_address AS ca
+        |),
+        |t2_delta (t2_id, t2_mul) AS (
+        |  SELECT `id`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+        |),
+        |t3_join (t3_id, t3_mul) AS (
+        |  SELECT t0_id, t2_mul FROM t0_scan INNER JOIN t1_scan ON t0_id = t1_id
+        |    INNER JOIN t2_delta ON t0_id = t2_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t3_join""".stripMargin
+
+    it("pins only the shorter prefix-colliding source") {
+      val stmt = rewriteWithPins(prefixCollisionSource, Map("customer" -> "VERSION AS OF 3")).statements.head
+      stmt should include(s"FROM delta.`${pinnedPath("customer")}` VERSION AS OF 3 c")
+      stmt should include("FROM `customer_address` AS ca")
+      stmt should not include "customer VERSION AS OF 3_address"
+      stmt should not include "`customer_address` VERSION AS OF"
+    }
+
+    it("pins only the longer prefix-colliding source") {
+      val stmt = rewriteWithPins(prefixCollisionSource, Map("customer_address" -> "VERSION AS OF 9")).statements.head
+      stmt should include(s"FROM delta.`${pinnedPath("customer_address")}` VERSION AS OF 9 AS ca")
+      stmt should include("FROM `customer` c")
+      stmt should not include "FROM `customer` VERSION AS OF"
+    }
+
+    it("pins both prefix-colliding sources at their own versions") {
+      val stmt = rewriteWithPins(
+        prefixCollisionSource,
+        pins = Map("customer" -> "VERSION AS OF 3", "customer_address" -> "VERSION AS OF 9"),
+        qualified = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+      ).statements.head
+      stmt should include(s"FROM delta.`${pinnedPath("customer")}` VERSION AS OF 3 c")
+      stmt should include(s"FROM delta.`${pinnedPath("customer_address")}` VERSION AS OF 9 AS ca")
+    }
+
+    it("qualifies both prefix-colliding sources when neither is pinned") {
+      val stmt = rewriteWithPins(
+        prefixCollisionSource,
+        pins = Map.empty,
+        qualified = Map("customer" -> "db.customer", "customer_address" -> "db.customer_address")
+      ).statements.head
+      stmt should include("FROM `db`.`customer` c")
+      stmt should include("FROM `db`.`customer_address` AS ca")
+    }
+  }
+
+  describe("path-bound pinned source reads (TOCTOU wiring)") {
+    val mvName1                     = TableIdentifier("mv_r", Some("mydb"))
+    def path(short: String): String = s"abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables/$short"
+
+    def rewriteProgram(
+        program: String,
+        pins: Map[String, String],
+        paths: Map[String, String]
+    ): RewrittenRefresh =
+      SparkRefreshRewriter.rewrite(
+        compiledSql = program,
+        mvName = mvName1,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("orders" -> "openivm_delta_orders"),
+        viewDeltaPath = viewDeltaPath,
+        sourceSnapshotPins = pins,
+        sourceSnapshotPinnedPaths = paths
+      )
+
+    // A self-join of one pinned physical source: openivm emits `memory.main.accounts`
+    // twice, both frozen at the same version.
+    val selfJoinPinned =
+      """WITH
+        |t0_scan (t0_id, t0_value) AS (
+        |  SELECT l.`id`, r.`value` FROM memory.main.accounts l INNER JOIN memory.main.accounts r ON l.`id` = r.`id`
+        |),
+        |t1_delta (t1_id, t1_value, t1_mul) AS (
+        |  SELECT `id`, `value`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+        |),
+        |t2_join (t2_id, t2_mul) AS (
+        |  SELECT t0_id, t1_mul FROM t0_scan INNER JOIN t1_delta ON t0_id = t1_id
+        |)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t2_join""".stripMargin
+
+    it("path-binds every self-join occurrence of a pinned source at the same version") {
+      val stmt = rewriteProgram(
+        selfJoinPinned,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        paths = Map("accounts" -> path("accounts"))
+      ).statements.head
+      val bound = s"delta.`${path("accounts")}` VERSION AS OF 366"
+      // Both scanned occurrences path-bind.
+      java.util.regex.Pattern.quote(bound).r.findAllMatchIn(stmt).size shouldBe 2
+      stmt should not include "memory.main.accounts"
+      stmt should not include "`accounts` VERSION AS OF"
+    }
+
+    it("path-binds a repeated TIMESTAMP AS OF pin across every occurrence, unchanged") {
+      val clause = "TIMESTAMP AS OF '2026-09-04 05:00:00'"
+      val stmt = rewriteProgram(
+        selfJoinPinned,
+        pins = Map("accounts" -> clause),
+        paths = Map("accounts" -> path("accounts"))
+      ).statements.head
+      val bound = s"delta.`${path("accounts")}` $clause"
+      java.util.regex.Pattern.quote(bound).r.findAllMatchIn(stmt).size shouldBe 2
+      stmt.toUpperCase should not include "VERSION AS OF"
+    }
+
+    it("escapes backticks in the verified path when binding a pinned read") {
+      val weird = "s3://bucket/weird`name"
+      val stmt = rewriteProgram(
+        selfJoinPinned,
+        pins = Map("accounts" -> "VERSION AS OF 7"),
+        paths = Map("accounts" -> weird)
+      ).statements.head
+      stmt should include("delta.`s3://bucket/weird``name` VERSION AS OF 7")
+    }
+
+    it("leaves no logical pinned name and emits parseable Spark SQL for every statement") {
+      val program =
+        """WITH
+          |t0_scan (t0_id, t0_value) AS (
+          |  SELECT `id`, `value` FROM memory.main.accounts
+          |),
+          |t1_delta (t1_id, t1_value, t1_mul) AS (
+          |  SELECT `id`, `value`, `openivm_multiplicity` FROM memory.main.openivm_delta_orders
+          |),
+          |t2_join (t2_id, t2_mul) AS (
+          |  SELECT t0_id, t1_mul FROM t0_scan INNER JOIN t1_delta ON t0_id = t1_id
+          |)
+          |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t2_join""".stripMargin
+      val rewritten = rewriteProgram(
+        program,
+        pins = Map("accounts" -> "VERSION AS OF 366"),
+        paths = Map("accounts" -> path("accounts"))
+      )
+      rewritten.statements should not be empty
+      rewritten.statements.foreach { stmt =>
+        stmt should not include "memory.main.accounts"
+        stmt should not include "`accounts` VERSION AS OF"
+        stmt should include(s"delta.`${path("accounts")}` VERSION AS OF 366")
+        noException should be thrownBy CatalystSqlParser.parsePlan(stmt)
+      }
+    }
+
+    it("hard-fails a pinned read with no verified path before emitting any statement") {
+      val ex = the[PinnedSourcePathMissingException] thrownBy
+        rewriteProgram(
+          selfJoinPinned,
+          pins = Map("accounts" -> "VERSION AS OF 366"),
+          paths = Map.empty
+        )
+      ex.getMessage should include("accounts")
+      ex.getMessage.toUpperCase should not include "COMPILE_FAILED"
+      ex.getMessage.toUpperCase should not include "FULL_REFRESH"
+    }
+  }
+
+  describe("path-bound ADVANCE old-state reads (TOCTOU wiring)") {
+    def path(short: String): String = s"abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables/$short"
+
+    // Canonical regular N-term old-state reconstruction for one source that
+    // openivm emits (current+1 UNION ALL negated-delta): rewriteRegularOldStateUnions
+    // collapses it to a direct read of the source's pre-advance snapshot.
+    def oldStateProgram(short: String): String =
+      s"""WITH
+         |t0_scan (t0_id, t0_value) AS (SELECT `id`, `value` FROM `memory`.`main`.`$short`),
+         |t1_projection (t1_id, t1_value, t1_mul) AS (SELECT t0_id, t0_value, 1 FROM t0_scan),
+         |t2_scan (t2_id, t2_value, t2_mul) AS (SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_$short`),
+         |t3_aggregate (t3_id, t3_value, t3_mul) AS (SELECT t2_id, t2_value, SUM(t2_mul) FROM t2_scan GROUP BY t2_id, t2_value),
+         |t4_filter (t4_id, t4_value, t4_mul) AS (SELECT t3_id, t3_value, t3_mul FROM t3_aggregate WHERE t3_mul != 0),
+         |t5_projection (t5_id, t5_value, t5_mul) AS (SELECT t4_id, t4_value, CAST(t4_mul AS INTEGER) FROM t4_filter),
+         |t6_projection (t6_id, t6_value, t6_mul) AS (SELECT t5_id, t5_value, (-1 * t5_mul) FROM t5_projection),
+         |t7_union (t7_id, t7_value, t7_mul) AS (SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection)
+         |INSERT INTO openivm_delta_mv_r (region, total) SELECT * FROM t7_union""".stripMargin
+
+    // Two independent advancing sources, each with its own old-state union CTE.
+    val twoSourceOldState =
+      """WITH
+        |a0_scan (a0_id, a0_value) AS (SELECT `id`, `value` FROM `memory`.`main`.`accounts`),
+        |a1_projection (a1_id, a1_value, a1_mul) AS (SELECT a0_id, a0_value, 1 FROM a0_scan),
+        |a2_scan (a2_id, a2_value, a2_mul) AS (SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_accounts`),
+        |a3_aggregate (a3_id, a3_value, a3_mul) AS (SELECT a2_id, a2_value, SUM(a2_mul) FROM a2_scan GROUP BY a2_id, a2_value),
+        |a4_filter (a4_id, a4_value, a4_mul) AS (SELECT a3_id, a3_value, a3_mul FROM a3_aggregate WHERE a3_mul != 0),
+        |a5_projection (a5_id, a5_value, a5_mul) AS (SELECT a4_id, a4_value, CAST(a4_mul AS INTEGER) FROM a4_filter),
+        |a6_projection (a6_id, a6_value, a6_mul) AS (SELECT a5_id, a5_value, (-1 * a5_mul) FROM a5_projection),
+        |a7_union (a7_id, a7_value, a7_mul) AS (SELECT * FROM a1_projection UNION ALL SELECT * FROM a6_projection),
+        |b0_scan (b0_id, b0_value) AS (SELECT `id`, `value` FROM `memory`.`main`.`orders`),
+        |b1_projection (b1_id, b1_value, b1_mul) AS (SELECT b0_id, b0_value, 1 FROM b0_scan),
+        |b2_scan (b2_id, b2_value, b2_mul) AS (SELECT `id`, `value`, `openivm_multiplicity` FROM `memory`.`main`.`openivm_delta_orders`),
+        |b3_aggregate (b3_id, b3_value, b3_mul) AS (SELECT b2_id, b2_value, SUM(b2_mul) FROM b2_scan GROUP BY b2_id, b2_value),
+        |b4_filter (b4_id, b4_value, b4_mul) AS (SELECT b3_id, b3_value, b3_mul FROM b3_aggregate WHERE b3_mul != 0),
+        |b5_projection (b5_id, b5_value, b5_mul) AS (SELECT b4_id, b4_value, CAST(b4_mul AS INTEGER) FROM b4_filter),
+        |b6_projection (b6_id, b6_value, b6_mul) AS (SELECT b5_id, b5_value, (-1 * b5_mul) FROM b5_projection),
+        |b7_union (b7_id, b7_value, b7_mul) AS (SELECT * FROM b1_projection UNION ALL SELECT * FROM b6_projection)
+        |INSERT INTO openivm_delta_mv_r (region, total) SELECT a7_id, b7_value FROM a7_union JOIN b7_union ON a7_id = b7_id""".stripMargin
+
+    def rewriteAdvancing(
+        program: String,
+        pins: Map[String, String],
+        paths: Map[String, String],
+        oldVersions: Map[String, Long]
+    ): RewrittenRefresh =
+      SparkRefreshRewriter.rewrite(
+        compiledSql = program,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        sourceSnapshotPins = pins,
+        sourceSnapshotPinnedPaths = paths,
+        sourceSnapshotAdvanceOldVersions = oldVersions
+      )
+
+    it("path-binds an ADVANCE old-state read to the verified path at the pre-advance version") {
+      val stmt = rewriteAdvancing(
+        oldStateProgram("accounts"),
+        pins = Map("accounts" -> "VERSION AS OF 20"),
+        paths = Map("accounts" -> path("accounts")),
+        oldVersions = Map("accounts" -> 17L)
+      ).statements.head
+      // The data-moving old-state read binds to the verified path at the exact
+      // pre-advance version — never a logical/friendly name that could rebind.
+      stmt should include(s"delta.`${path("accounts")}` VERSION AS OF 17")
+    }
+
+    it("emits no logical/aliased qualifier for a path-bound ADVANCE old-state read") {
+      val stmt = rewriteAdvancing(
+        oldStateProgram("accounts"),
+        pins = Map("accounts" -> "VERSION AS OF 20"),
+        paths = Map("accounts" -> path("accounts")),
+        oldVersions = Map("accounts" -> 17L)
+      ).statements.head
+      stmt should not include "`accounts` VERSION AS OF"
+      stmt should not include "`db`.`accounts`"
+    }
+
+    it("hard-fails an ADVANCE old-state read with no verified path (fail-closed)") {
+      val ex = the[PinnedSourcePathMissingException] thrownBy
+        rewriteAdvancing(
+          oldStateProgram("accounts"),
+          pins = Map("accounts" -> "VERSION AS OF 20"),
+          paths = Map.empty,
+          oldVersions = Map("accounts" -> 17L)
+        )
+      ex.getMessage should include("accounts")
+      ex.getMessage should include("old-state")
+      ex.getMessage.toUpperCase should not include "FULL_REFRESH"
+    }
+
+    it("path-binds multiple advancing sources' old-state reads at their own pre-advance versions") {
+      val stmt = rewriteAdvancing(
+        twoSourceOldState,
+        pins = Map("accounts" -> "VERSION AS OF 20", "orders" -> "VERSION AS OF 30"),
+        paths = Map("accounts" -> path("accounts"), "orders" -> path("orders")),
+        oldVersions = Map("accounts" -> 17L, "orders" -> 27L)
+      ).statements.head
+      stmt should include(s"delta.`${path("accounts")}` VERSION AS OF 17")
+      stmt should include(s"delta.`${path("orders")}` VERSION AS OF 27")
+      stmt should not include "`accounts` VERSION AS OF"
+      stmt should not include "`orders` VERSION AS OF"
+    }
+
+    it("escapes backticks in the verified path of an ADVANCE old-state read") {
+      val weird = "s3://bucket/weird`name"
+      val stmt = rewriteAdvancing(
+        oldStateProgram("accounts"),
+        pins = Map("accounts" -> "VERSION AS OF 20"),
+        paths = Map("accounts" -> weird),
+        oldVersions = Map("accounts" -> 17L)
+      ).statements.head
+      stmt should include("delta.`s3://bucket/weird``name` VERSION AS OF 17")
+    }
+
+    it("keeps an UNPINNED source's old-state read logical (no verified path required)") {
+      val stmt = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = oldStateProgram("accounts"),
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          sourceQualifiedNames = Map("accounts" -> "db.accounts"),
+          sourceSnapshotVersions = Map("accounts" -> 17L)
+        )
+        .statements
+        .head
+      // No pin/verified identity exists for an unpinned source: it stays logical.
+      stmt should include("`db`.`accounts` VERSION AS OF 17")
+      stmt should not include s"delta.`${path("accounts")}`"
+    }
+  }
+
+  describe("deduplicateCteColumnAliases") {
+    it("renames duplicate CTE column aliases while leaving unique ones intact") {
+      val sql =
+        "prefix scan_0 (t3_mul, t3_mul, t3_region) AS (SELECT openivm_multiplicity, " +
+          "openivm_multiplicity, region FROM x)"
+      val out = SparkRefreshRewriter.deduplicateCteColumnAliases(sql)
+      out should include("scan_0 (t3_mul, t3_mul_1, t3_region) AS (")
+    }
+
+    it("is a no-op when there are no duplicate column aliases") {
+      val sql = "cte_a (c1, c2, c3) AS (SELECT 1, 2, 3)"
+      SparkRefreshRewriter.deduplicateCteColumnAliases(sql) shouldBe sql
+    }
+
+    it("does NOT hang on a long word-run token before a CTE column list (ReDoS guard)") {
+      // Regression: the group-1 `\w+` char class caused Matcher.find to restart
+      // inside a long word-run and re-scan to its end from every offset — O(L^2).
+      // A single multi-MB compiled openivm SQL drove one has-data-probe rewrite
+      // to 4+ minutes. A token-boundary lookbehind + possessive quantifiers make
+      // this linear.
+      val huge          = "a" * 500000 + " scan_0 (c, c) AS (SELECT 1)"
+      val deadlineNanos = System.nanoTime() + 5000000000L // 5s ceiling
+      val out           = SparkRefreshRewriter.deduplicateCteColumnAliases(huge)
+      assert(
+        System.nanoTime() < deadlineNanos,
+        "deduplicateCteColumnAliases took too long — O(n^2) regression"
+      )
+      out should include("scan_0 (c, c_1) AS (")
+    }
+  }
+
+  describe("stripTimestampPredicate") {
+    it("strips standalone, leading-AND, and trailing-AND timestamp predicates") {
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
+      ) shouldBe "SELECT * FROM t"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE region = 'r' AND d.openivm_timestamp >= CAST('2024-01-01' AS TIMESTAMP)"
+      ) shouldBe "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE (openivm_timestamp >= '2024-01-01'::TIMESTAMP) AND region = 'r'"
+      ) shouldBe "SELECT * FROM t WHERE region = 'r'"
+    }
+
+    it("does NOT hang on a long identifier before a timestamp predicate (ReDoS guard)") {
+      val huge          = "a" * 500000 + " SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.stripTimestampPredicate(huge)
+      assert(System.nanoTime() < deadlineNanos, "stripTimestampPredicate took too long — regex backtracking regression")
+      out should endWith(" SELECT * FROM t")
+    }
+  }
+
+  describe("equalityPredicates") {
+    it("extracts dotted equality predicates with bare and backtick identifiers") {
+      SparkRefreshRewriter.equalityPredicates("a.b = `c`.`d`") shouldBe Seq(("a", "b", "c", "`d`"))
+    }
+
+    it("does NOT hang on a long identifier before a dotted equality (ReDoS guard)") {
+      val huge          = "a" * 500000 + " x.y = z.w"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.equalityPredicates(huge)
+      assert(System.nanoTime() < deadlineNanos, "equalityPredicates took too long — O(n^2) regression")
+      out shouldBe Seq(("x", "y", "z", "w"))
+    }
+  }
+
+  describe("rewriteMemoryMainPrefix") {
+    it("does NOT hang on a long identifier before a memory.main reference (ReDoS guard)") {
+      val huge          = "a" * 500000 + " SELECT * FROM memory.main.openivm_delta_orders"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.rewriteMemoryMainPrefix(huge)
+      assert(System.nanoTime() < deadlineNanos, "rewriteMemoryMainPrefix took too long — regex regression")
+      out should endWith(" SELECT * FROM `openivm_delta_orders`")
+    }
+  }
+
+  describe("rewriteInsertToCtas") {
+    it("rewrites the INSERT column-list CTAS form after a long non-match prefix without hanging") {
+      val sql = "a" * 500000 +
+        " WITH scan_0 (c, m) AS (SELECT c, m FROM src) INSERT INTO openivm_delta_mv (c, m) SELECT * FROM scan_0"
+      val deadlineNanos = System.nanoTime() + 5000000000L
+      val out           = SparkRefreshRewriter.rewriteInsertToCtas(sql, "mv", "target/openivm-view-delta")
+      assert(System.nanoTime() < deadlineNanos, "rewriteInsertToCtas took too long — regex regression")
+      out should include("CREATE OR REPLACE TABLE delta.`target/openivm-view-delta` USING DELTA AS")
+      out should include("SELECT c AS c, m AS m FROM scan_0")
     }
   }
 }

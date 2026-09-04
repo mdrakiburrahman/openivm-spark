@@ -252,6 +252,8 @@ final case class MvMetadata(
 | `_ivm_compiled_sql`              | full OpenIVM refresh SQL string | CREATE MV compile cache (`MaterializedViewCommands.scala:658-664`) or refresh backfill | Cached incremental refresh (`MaterializedViewCommands.scala:908-918`)     | Incremental paths only; absent for FullRefresh                                   |
 | `_ivm_compiled_initial_load_sql` | OpenIVM initial-load SQL string | CREATE MV compile cache                                                                | Cached `CompiledRefresh` reconstruction                                   | Incremental paths; used with `_ivm_compiled_sql`                                 |
 | `_ivm_watermark:<source>`        | `Timestamp.toString`            | CREATE MV, before initial CTAS (`MaterializedViewCommands.scala:665-670`)              | `meta.sourceWatermarks` and `StagingCatalog.collectFor`                   | All paths that collect staging deltas                                            |
+| `_ivm_time_travel_pin_status`    | `APPLIED` / `NOT_APPLICABLE` / `COMPILE_FAILED` | CREATE MV (`MvMetadata.timeTravelPinProperties`)                      | `MvMetadata.timeTravelPinStatus`; REFRESH telemetry + fail-closed re-proof | All paths — reported on every REFRESH span and `[openivm-mv]` line               |
+| `_ivm_time_travel_pins`          | `;`-joined `<source>=<clause>`  | CREATE MV (`MvMetadata.timeTravelPinProperties`)                                       | `MvMetadata.timeTravelPins`; REFRESH pin-identity re-proof                 | All paths on a pinned view                                                       |
 | user TBLPROPERTIES               | string                          | `CREATE MATERIALIZED VIEW ... TBLPROPERTIES`                                           | Preserved and available for future behavior                               | Only if a future path reads them                                                 |
 
 There is no persisted `demotion_reason` field in the current RocksDB schema.
@@ -500,6 +502,49 @@ multi-process:
 The relevant code is `OpenIvmRocksDB.scala:358-395`.
 Prefix scans are special: in multi-process mode they materialize the result into
 a `Vector` before the handle closes (`OpenIvmRocksDB.scala:411-430`).
+
+### Measure lock contention
+
+Enable refresh profiling before you create or refresh materialized views:
+
+```sql
+SET spark.openivm.profile.refresh=true;
+
+REFRESH MATERIALIZED VIEW daily_sales;
+
+SHOW OPENIVM REFRESH PROFILE;
+```
+
+Each `rocksdb_operation` row aggregates one operation against one database
+scope. The scope is `index`, `mv`, `table`, `refresh_profile`,
+`refresh_sql_log`, or `other`. The row never contains the local database path.
+
+The `detail` field contains these counters and nanosecond timings:
+
+| Field | Description |
+|---|---|
+| `operation_count` | Number of matching operations. |
+| `failed_count` | Number of operations that threw an exception. |
+| `total_ns` | Total time from the JVM lock attempt through lock release. |
+| `jvm_lock_wait_ns` | Sum of time waiting for the per-database JVM mutex. |
+| `max_jvm_lock_wait_ns` | Longest single wait for the JVM mutex. |
+| `jvm_lock_held_ns` | Sum of time holding the JVM mutex. |
+| `external_lock_wait_ns` | Sum of time waiting for the cross-process file lock. |
+| `max_external_lock_wait_ns` | Longest single wait for the file lock. |
+| `native_open_ns` | Time opening RocksDB in multi-process mode or on first use. |
+| `native_close_ns` | Time closing RocksDB in multi-process mode. |
+| `body_ns` | Time in the requested RocksDB operation. |
+
+Use `jvm_lock_wait_ns` to diagnose same-driver contention. Use
+`external_lock_wait_ns` to diagnose contention between driver processes.
+Compare `native_open_ns + native_close_ns` with `body_ns` to measure the
+multi-process open/close amplification.
+
+Timings are inclusive. A `with_batch` body can contain nested `get` or
+`prefix_scan` calls. Do not add operation rows together as mutually exclusive
+wall-clock phases. In single-process mode, `prefix_scan` measures iterator
+creation because iteration continues after the lock is released. In
+multi-process mode, it measures the full materialized scan.
 
 ______________________________________________________________________
 

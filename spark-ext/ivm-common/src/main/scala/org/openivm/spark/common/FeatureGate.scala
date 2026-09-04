@@ -49,6 +49,41 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Optional campaign-scoped Hadoop filesystem URI for completed execution
+    * span objects. Unset preserves the historical log-only behavior.
+    */
+  val TelemetryUriKey: String = "spark.openivm.telemetry.uri"
+
+  /** Optional Hadoop-filesystem directory into which each completed
+    * `OPENIVM_EXECUTION_SPAN` line is also mirrored, one object per span. It
+    * exists for managed Fabric Spark, whose driver log4j is only reachable
+    * through a browser-authenticated Spark UI: the benchmark harness cannot
+    * scrape the driver log there, so without this mirror the classification
+    * spans never reach dbt-server. Unset preserves the historical log-only
+    * behavior; when set, a failed write is fatal (never a silent gap).
+    */
+  val OneLakeTelemetryDirKey: String = "spark.openivm.telemetry.oneLakeDir"
+
+  /** Nonsecret campaign identity required when [[TelemetryUriKey]] is set. */
+  val TelemetryCampaignIdKey: String = "spark.openivm.telemetry.campaignId"
+
+  /** Nonsecret request correlation identity used when no request-scoped local
+    * property is present.
+    */
+  val TelemetryCorrelationIdKey: String = "spark.openivm.telemetry.correlationId"
+
+  /** Campaign phase required when [[TelemetryUriKey]] is set. */
+  val TelemetryPhaseKey: String = "spark.openivm.telemetry.phase"
+
+  /** Authoritative MV catalog backend. `rocksdb` preserves the local
+    * compatibility layout; `delta` stores shared metadata in a Delta table and
+    * is the production setting for multi-driver/object-store deployments.
+    */
+  val CatalogBackendKey: String = "spark.openivm.catalog.backend"
+
+  /** Root URI for Delta-backed OpenIVM catalog tables. */
+  val CatalogPathKey: String = "spark.openivm.catalog.path"
+
   /** Delta table performance knobs for MV backing data tables.
     *
     * `DeltaEnableDeletionVectorsKey` enables Delta deletion vectors so MERGE
@@ -128,6 +163,22 @@ object FeatureGate {
     * joinable.
     */
   val QueryLogEnabledKey: String = "spark.openivm.queryLog.enabled"
+
+  /** Register and update Spark-native OpenIVM Dropwizard metrics.
+    * Default ON so benchmark containers only need to add the SparkPlugin and
+    * Prometheus sink wiring; flip OFF to remove hot-path metric updates.
+    */
+  val MetricsEnabledKey: String = "spark.openivm.metrics.enabled"
+
+  /** Optional bound for the named external-catalog registration that follows
+    * an MV's path-based Delta CTAS. The default preserves 32-way request
+    * capacity; operators can reduce it explicitly, and execution spans expose
+    * both the configured width and any resulting wait.
+    */
+  val CreateCatalogPublicationMaxConcurrentKey: String =
+    "spark.openivm.create.maxConcurrentCatalogPublications"
+  val CreateCatalogPublicationDefaultMaxConcurrent: Int = 32
+  val CreateCatalogPublicationMaximum: Int              = 32
 
   /** Capture a Spark `EXPLAIN FORMATTED` physical plan per executed refresh
     * statement, recorded alongside the SQL in the query log. Default OFF so it
@@ -371,6 +422,17 @@ object FeatureGate {
     */
   val UnifiedRefreshIntelligenceEnabledKey: String = "spark.openivm.refresh.unifiedIntelligence.enabled"
 
+  /** Optional process-wide admission for driver-heavy CREATE/REFRESH work.
+    * Default OFF: normal dbt concurrency should scale like vanilla Spark CTAS.
+    * Operators may opt in only for pathological data-volume runs where driver
+    * heap headroom needs a pressure gate.
+    */
+  val DriverAdmissionEnabledKey: String = "spark.openivm.driverAdmission.enabled"
+  val DriverAdmissionMaxConcurrentKey: String =
+    "spark.openivm.driverAdmission.maxConcurrentHeavyStatements"
+  val DriverAdmissionMinHeapHeadroomKey: String =
+    "spark.openivm.driverAdmission.minHeapHeadroom"
+
   def enabled(conf: SparkConf): Boolean =
     conf.getBoolean(EnabledKey, defaultValue = false)
 
@@ -393,6 +455,38 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def telemetryUri(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(TelemetryUriKey)
+      .orElse(spark.sparkContext.getConf.getOption(TelemetryUriKey))
+      .map(_.trim)
+      .filter(_.nonEmpty)
+
+  def oneLakeTelemetryDir(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(OneLakeTelemetryDirKey)
+      .orElse(spark.sparkContext.getConf.getOption(OneLakeTelemetryDirKey))
+      .map(_.trim)
+      .filter(_.nonEmpty)
+
+  def catalogBackend(spark: SparkSession): String = {
+    val backend = spark.conf.getOption(CatalogBackendKey).getOrElse("rocksdb").trim.toLowerCase(java.util.Locale.ROOT)
+    require(
+      backend == "rocksdb" || backend == "delta",
+      s"$CatalogBackendKey must be 'rocksdb' or 'delta', found '$backend'."
+    )
+    backend
+  }
+
+  def deltaCatalogEnabled(spark: SparkSession): Boolean = catalogBackend(spark) == "delta"
+
+  def catalogPath(spark: SparkSession): String =
+    spark.conf
+      .getOption(CatalogPathKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .getOrElse(spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/") + "/_openivm_catalog")
 
   private def boolConf(conf: SparkConf, key: String, default: Boolean): Boolean =
     conf.getBoolean(key, default)
@@ -429,6 +523,27 @@ object FeatureGate {
 
   def queryLogEnabled(conf: SparkConf): Boolean =
     boolConf(conf, QueryLogEnabledKey, default = false)
+
+  def metricsEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, MetricsEnabledKey, default = true)
+
+  def metricsEnabled(spark: SparkSession): Boolean =
+    metricsEnabled(spark.sparkContext.getConf)
+
+  def createCatalogPublicationMaxConcurrent(conf: SparkConf): Int =
+    math.max(
+      2,
+      math.min(
+        CreateCatalogPublicationMaximum,
+        conf.getInt(
+          CreateCatalogPublicationMaxConcurrentKey,
+          CreateCatalogPublicationDefaultMaxConcurrent
+        )
+      )
+    )
+
+  def createCatalogPublicationMaxConcurrent(spark: SparkSession): Int =
+    createCatalogPublicationMaxConcurrent(spark.sparkContext.getConf)
 
   def explainCaptureEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, ExplainCaptureKey, default = false)
@@ -596,6 +711,32 @@ object FeatureGate {
   def unifiedRefreshIntelligenceEnabled(spark: SparkSession): Boolean =
     unifiedRefreshIntelligenceEnabled(spark.sparkContext.getConf)
 
+  def driverAdmissionEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, DriverAdmissionEnabledKey, default = false)
+
+  def driverAdmissionEnabled(spark: SparkSession): Boolean =
+    driverAdmissionEnabled(spark.sparkContext.getConf)
+
+  def driverAdmissionMaxConcurrent(conf: SparkConf): Int =
+    scala.util
+      .Try(conf.getInt(DriverAdmissionMaxConcurrentKey, Int.MaxValue))
+      .getOrElse(Int.MaxValue)
+      .max(1)
+
+  def driverAdmissionMaxConcurrent(spark: SparkSession): Int =
+    driverAdmissionMaxConcurrent(spark.sparkContext.getConf)
+
+  def driverAdmissionMinHeapHeadroomBytes(conf: SparkConf): Long =
+    scala.util
+      .Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(conf.get(DriverAdmissionMinHeapHeadroomKey)))
+      .getOrElse {
+        val runtime = Runtime.getRuntime
+        math.max(4L * 1024L * 1024L * 1024L, runtime.maxMemory() / 5L)
+      }
+
+  def driverAdmissionMinHeapHeadroomBytes(spark: SparkSession): Long =
+    driverAdmissionMinHeapHeadroomBytes(spark.sparkContext.getConf)
+
   /** Spark conf overrides that switch on runtime-filter pushdown for the wrapped
     * refresh statements. Empty when [[RuntimeFilterEnabledKey]] is off. The
     * application-side threshold is lowered from Spark's 10 GiB default so the
@@ -620,14 +761,49 @@ object FeatureGate {
   def changeFeedMode(conf: SparkConf): ChangeFeedMode =
     ChangeFeedMode.fromConf(conf)
 
-  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled. */
-  def buildMvDataTblProperties(spark: SparkSession): Seq[String] = {
+  /** Whether Delta can actually service auto-compaction for a table created with
+    * `clusterColumns` as its liquid-clustering key.
+    *
+    * Delta picks `OptimizeTableMode.CLUSTERING` for *any* clustered table with at
+    * least one clustering column (`OptimizeTableStrategy.getMode`), and
+    * `ClusteringStrategy.curve` is hard-coded to `"hilbert"`. Hilbert clustering
+    * asserts on more than one column:
+    *
+    * {{{
+    * // delta 3.2.0 skipping/MultiDimClustering.scala
+    * assert(cols.size > 1, "Cannot do Hilbert clustering by zero or one column!")
+    * }}}
+    *
+    * A clustered table with *exactly one* clustering column therefore throws
+    * `AssertionError` on every auto-compaction that finds work to do — clustering
+    * mode keeps single-file bins (`isMultiDimClustering`), so the hook fires on
+    * the very first commit. Delta logs the post-commit hook failure and keeps the
+    * commit, so the table is never compacted either way; the property only buys a
+    * wasted snapshot/bin-packing pass plus an ERROR per commit.
+    *
+    * Zero clustering columns falls to `CompactionStrategy` and two or more to a
+    * valid hilbert curve, so both remain eligible.
+    */
+  def autoCompactSupported(clusterColumns: Seq[String]): Boolean =
+    clusterColumns.size != 1
+
+  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled.
+    *
+    * `clusterColumns` is the liquid-clustering key the same DDL will emit as
+    * `CLUSTER BY (...)`; it gates `delta.autoOptimize.autoCompact` (see
+    * [[autoCompactSupported]]).
+    */
+  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] = {
     val props = scala.collection.mutable.ArrayBuffer.empty[String]
     if (deletionVectorsEnabled(spark)) props += "'delta.enableDeletionVectors' = 'true'"
     if (optimizeWriteEnabled(spark)) props += "'delta.autoOptimize.optimizeWrite' = 'true'"
-    if (autoCompactEnabled(spark)) props += "'delta.autoOptimize.autoCompact' = 'true'"
+    if (autoCompactEnabled(spark) && autoCompactSupported(clusterColumns))
+      props += "'delta.autoOptimize.autoCompact' = 'true'"
     if (ChangePropagationFactory.forSession(spark).requiresMvCdf)
       props += "'delta.enableChangeDataFeed' = 'true'"
     props.toSeq
   }
+
+  def buildMvDataTblProperties(spark: SparkSession): Seq[String] =
+    buildMvDataTblProperties(spark, Nil)
 }

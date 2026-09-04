@@ -747,7 +747,7 @@ Use this workflow for every parity-gap PR.
    ```
    On smaller hosts, cap forks:
    ```bash
-   ./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8
+   ./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8
    ```
    Fix regressions before opening the PR.
 

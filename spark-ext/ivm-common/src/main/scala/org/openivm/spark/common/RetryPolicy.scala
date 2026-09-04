@@ -11,13 +11,16 @@ import scala.util.{Failure, Success, Try}
   *                     class name AND message of every exception in the cause
   *                     chain.  A match triggers a retry.
   * @param maxAttempts  Maximum total attempts including the first (default 5).
-  * @param backoffMs    Per-attempt backoff in milliseconds; multiplied by the
-  *                     attempt number for a linear ramp.
-  */
+ * @param backoffMs    Per-attempt backoff in milliseconds; multiplied by the
+ *                     attempt number for a linear ramp.
+ * @param jitterMs     Maximum random delay added to each retry. Jitter keeps
+ *                     independent Spark drivers from retrying in lockstep.
+ */
 final case class RetryPolicy(
     patterns: Array[Regex],
     maxAttempts: Int = RetryPolicy.DefaultMaxAttempts,
-    backoffMs: Long = RetryPolicy.DefaultBackoffMs
+    backoffMs: Long = RetryPolicy.DefaultBackoffMs,
+    jitterMs: Long = 0L
 ) {
 
   private val log = LoggerFactory.getLogger(getClass)
@@ -26,6 +29,10 @@ final case class RetryPolicy(
     * by-name so each retry re-evaluates the block.
     */
   def execute[T](operation: => T): T = executeInternal(operation, attempt = 1)
+
+  /** Execute `operation` and notify `onRetry` before each retry sleep. */
+  def executeWithRetryCallback[T](onRetry: (Int, Throwable) => Unit)(operation: => T): T =
+    executeInternal(operation, attempt = 1, onRetry = onRetry)
 
   /** Execute `operation` with this retry policy, passing the 1-based attempt
     * number on each invocation. Use this when the body needs to record
@@ -47,7 +54,7 @@ final case class RetryPolicy(
         result
 
       case Failure(exception) if attempt < maxAttempts && matchesPattern(exception) =>
-        val sleep = backoffMs * attempt
+        val sleep = retryDelayMs(attempt)
         log.warn(
           s"openivm-spark retry: retryable error on attempt $attempt/$maxAttempts " +
             s"— sleeping ${sleep}ms then retrying. Cause: ${exception.getClass.getSimpleName}: " +
@@ -64,7 +71,11 @@ final case class RetryPolicy(
     }
   }
 
-  private def executeInternal[T](operation: => T, attempt: Int): T = {
+  private def executeInternal[T](
+      operation: => T,
+      attempt: Int,
+      onRetry: (Int, Throwable) => Unit = (_, _) => ()
+  ): T = {
     Try(operation) match {
       case Success(result) =>
         if (attempt > 1) {
@@ -73,14 +84,15 @@ final case class RetryPolicy(
         result
 
       case Failure(exception) if attempt < maxAttempts && matchesPattern(exception) =>
-        val sleep = backoffMs * attempt
+        val sleep = retryDelayMs(attempt)
+        onRetry(attempt, exception)
         log.warn(
           s"openivm-spark retry: retryable error on attempt $attempt/$maxAttempts " +
             s"— sleeping ${sleep}ms then retrying. Cause: ${exception.getClass.getSimpleName}: " +
             Option(exception.getMessage).getOrElse("<no message>").linesIterator.next()
         )
         Thread.sleep(sleep)
-        executeInternal(operation, attempt + 1)
+        executeInternal(operation, attempt + 1, onRetry)
 
       case Failure(exception) =>
         if (attempt > 1) {
@@ -105,6 +117,13 @@ final case class RetryPolicy(
       if (ex == null) acc else collect(ex.getCause, ex :: acc)
     collect(exception, Nil).reverse
   }
+
+  private def retryDelayMs(attempt: Int): Long = {
+    val jitter =
+      if (jitterMs <= 0L) 0L
+      else java.util.concurrent.ThreadLocalRandom.current().nextLong(jitterMs + 1L)
+    backoffMs * attempt + jitter
+  }
 }
 
 /** Companion object with predefined policies.
@@ -125,4 +144,17 @@ object RetryPolicy {
     */
   val DeltaConflicts: RetryPolicy =
     RetryPolicy(SparkExceptions.DefaultDeltaRetryPatterns.map(_.r))
+
+  /** Longer, jittered retry window for the small shared Delta catalog tables.
+    * Metadata commits are cheap, but many independent Spark drivers can keep
+    * the same catalog partition busy for longer than the query-write policy's
+    * five attempts.
+    */
+  val DeltaCatalogConflicts: RetryPolicy =
+    RetryPolicy(
+      SparkExceptions.DefaultDeltaRetryPatterns.map(_.r),
+      maxAttempts = 20,
+      backoffMs = 200L,
+      jitterMs = 250L
+    )
 }

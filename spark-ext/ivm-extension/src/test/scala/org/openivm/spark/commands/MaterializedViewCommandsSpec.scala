@@ -1,25 +1,51 @@
 package org.openivm.spark.commands
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import io.delta.tables.DeltaTable
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.apache.logging.log4j.core.{LogEvent, Logger}
+import org.apache.hadoop.fs.Path
+import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.types.{ArrayType, IntegerType, MapType, StringType, StructField, StructType}
 import org.openivm.spark.common.{
   BatchVerdict,
+  CdfChangePropagation,
   ChangeWatermark,
+  DeltaTableVersion,
+  FeatureGate,
+  InterceptChangePropagation,
   MvCatalog,
   MvMetadata,
   RefreshTypeCode,
   StagingCatalog,
   StagingChangeBatch,
-  StagingDelta
+  StagingDelta,
+  TimeTravelPinReason,
+  TimeTravelPinStatus
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
+import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.telemetry.{OpenIvmTelemetryContract, OpenIvmTelemetryPublicationInjection}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
+import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.sql.Timestamp
+import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import scala.collection.JavaConverters._
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
 /**
  * End-to-end integration tests for the three materialized-view DDL commands.
@@ -29,6 +55,8 @@ import java.util.UUID
  * OPENIVM_EXTENSION_PATH / OPENIVM_CLI_PATH (propagated via build.sbt envVars).
  */
 class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
+
+  private val Json = new ObjectMapper()
 
   private val warehouseDir: String = {
     val d = new File(s"target/test-warehouse-cmds-${UUID.randomUUID().toString.take(8)}")
@@ -42,7 +70,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     super.beforeAll()
     spark = SparkSession
       .builder()
-      .master("local[1]")
+      .master("local[4]")
       .appName("openivm-spark-CommandsSpec")
       .config(
         "spark.sql.extensions",
@@ -63,7 +91,11 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   override def afterAll(): Unit =
     try {
-      if (spark != null) spark.stop()
+      if (spark != null) {
+        spark.stop()
+        SparkSession.clearActiveSession()
+        SparkSession.clearDefaultSession()
+      }
       deleteDir(new File(warehouseDir))
     } finally {
       super.afterAll()
@@ -80,6 +112,257 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     ()
   }
 
+  private def pathExists(location: String): Boolean = {
+    val path = new Path(location)
+    path.getFileSystem(spark.sessionState.newHadoopConf()).exists(path)
+  }
+
+  /** Nest [[ParkedCommandBarrier.use]] INSIDE this scope: the parked command
+    * must be released before the pool is drained, and the drain interrupts
+    * anything that ignored the polite shutdown.
+    */
+  private def withPool[A](parallelism: Int)(body: ExecutionContext => A): A =
+    TestPools.withPool(parallelism)(body)
+
+  private def awaitResult[A](future: Future[A], timeout: FiniteDuration = 600.seconds): A =
+    Await.result(future, timeout)
+
+  /** Upper bound on a single command observed while another command is parked
+    * inside a concurrency-injection hook.  Generous because a full-suite run
+    * oversubscribes the box; exceeding it means the observed command is
+    * genuinely blocked, not merely slow.
+    */
+  private val CommandObservationBudget: FiniteDuration = 300.seconds
+
+  /** Fail with a self-describing message unless `barrier` still holds the
+    * command inside the injected hook.  Distinguishes "still parked" (the
+    * invariant under test) from "the park failsafe expired" and "the command
+    * left the hook and finished", neither of which says anything about
+    * locking.
+    */
+  private def assertStillParked(barrier: ParkedCommandBarrier, parkedCommand: Future[_]): Unit =
+    if (!barrier.isParked) {
+      val outcome = parkedCommand.value
+        .map {
+          case scala.util.Failure(t) => s"failed with ${t.getClass.getName}: ${t.getMessage}"
+          case scala.util.Success(_) => "completed successfully"
+        }
+        .getOrElse("still running")
+      fail(
+        s"the parked command left the injected hook before the observation finished " +
+          s"(${barrier.describe}); it $outcome. This observation is void — it does not " +
+          "prove or disprove anything about locking."
+      )
+    }
+
+  private final class BufferingAppender(name: String)
+      extends AbstractAppender(
+        name,
+        null,
+        PatternLayout.createDefaultLayout(),
+        false,
+        Property.EMPTY_ARRAY
+      ) {
+    private val buffer = scala.collection.mutable.ArrayBuffer.empty[String]
+
+    override def append(event: LogEvent): Unit =
+      buffer.synchronized {
+        buffer += event.getMessage.getFormattedMessage
+      }
+
+    def messages: Seq[String] = buffer.synchronized(buffer.toVector)
+  }
+
+  private def withLogCapture[A](body: BufferingAppender => A): A = {
+    val appender = new BufferingAppender(s"commands-span-${UUID.randomUUID()}")
+    val root     = LogManager.getRootLogger.asInstanceOf[Logger]
+    appender.start()
+    root.addAppender(appender)
+    try body(appender)
+    finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
+
+  /** Parse an `[openivm-mv]` KV line the way a downstream telemetry reader
+    * does, so a test fails if a value ever closes its own field.
+    */
+  private val KvLogRe = """(\w+)='([^']*)'""".r
+
+  private def parseKv(line: String): Map[String, String] =
+    KvLogRe.findAllMatchIn(line).map(m => m.group(1) -> m.group(2)).toMap
+
+  private def executionSpanPayloads(messages: Seq[String], materializedView: String): Seq[JsonNode] =
+    messages
+      .collect {
+        case line if line.startsWith("OPENIVM_EXECUTION_SPAN ") =>
+          Json.readTree(line.stripPrefix("OPENIVM_EXECUTION_SPAN "))
+      }
+      .filter(_.path("materialized_view").asText() == materializedView)
+
+  private def withSparkLocalProperties[A](entries: (String, String)*)(body: => A): A = {
+    val previous = entries.map { case (key, _) => key -> spark.sparkContext.getLocalProperty(key) }
+    entries.foreach { case (key, value) => spark.sparkContext.setLocalProperty(key, value) }
+    try body
+    finally
+      previous.foreach { case (key, value) =>
+        spark.sparkContext.setLocalProperty(key, value)
+      }
+  }
+
+  private def withSparkConfs[A](entries: (String, String)*)(body: => A): A = {
+    val previous = entries.map { case (key, _) => key -> spark.conf.getOption(key) }
+    entries.foreach { case (key, value) => spark.conf.set(key, value) }
+    try body
+    finally
+      previous.foreach {
+        case (key, Some(value)) => spark.conf.set(key, value)
+        case (key, None)        => spark.conf.unset(key)
+      }
+  }
+
+  private def completedTelemetryPayloads(root: Path): Seq[JsonNode] = {
+    val completed =
+      new Path(
+        new Path(root, OpenIvmTelemetryContract.CompletedDirectory),
+        OpenIvmTelemetryContract.VersionDirectory
+      )
+    val fs = completed.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(completed)) Seq.empty
+    else
+      fs.listStatus(completed)
+        .filter(status => status.isFile && OpenIvmTelemetryContract.isCompletedPath(status.getPath))
+        .sortBy(_.getPath.getName)
+        .map { status =>
+          val input = fs.open(status.getPath)
+          try Json.readTree(input)
+          finally input.close()
+        }
+        .toSeq
+  }
+
+  private def assertW6SuccessFields(payload: JsonNode): Unit = {
+    Seq(
+      "schema_id",
+      "schema_version",
+      "campaign_id",
+      "request_id",
+      "correlation_id",
+      "dbt_node_id",
+      "materialized_view",
+      "operation",
+      "phase",
+      "engine_started_at",
+      "engine_completed_at",
+      "duration_ms",
+      "outcome",
+      "compile_refresh_type",
+      "effective_refresh_type",
+      "refresh_reason",
+      "time_travel_pin_status",
+      "time_travel_pin_reason",
+      "source_versions",
+      "pending_delta_count"
+    ).foreach(field => withClue(s"missing W6 success field '$field': ") { payload.hasNonNull(field) shouldBe true })
+    payload.path("compile_refresh_type").asText() should not be empty
+    payload.path("effective_refresh_type").asText() should not be empty
+    payload.path("refresh_reason").asText() should not be empty
+    payload.path("time_travel_pin_status").asText() should not be empty
+    payload.path("time_travel_pin_reason").asText() should not be empty
+    Instant.parse(payload.path("engine_completed_at").asText()) should be >=
+      Instant.parse(payload.path("engine_started_at").asText())
+    payload.path("duration_ms").asLong() should be >= 0L
+    payload.path("pending_delta_count").asLong() should be >= 0L
+    payload.path("source_versions").isArray shouldBe true
+    payload.path("source_versions").size() should be > 0
+  }
+
+  private def assertBagEqual(tableName: String, expectedSql: String): Unit = {
+    val expected = spark.sql(expectedSql)
+    val cols     = expected.columns.toSeq
+    val actual   = spark.table(tableName).select(cols.head, cols.tail: _*)
+    val wanted   = expected.select(cols.head, cols.tail: _*)
+    withClue(s"$tableName EXCEPT ALL <expected>: ") {
+      actual.exceptAll(wanted).count() shouldBe 0L
+    }
+    withClue(s"<expected> EXCEPT ALL $tableName: ") {
+      wanted.exceptAll(actual).count() shouldBe 0L
+    }
+  }
+
+  private def assertSqlBagEqual(actualSql: String, expectedSql: String): Unit = {
+    val actual   = spark.sql(actualSql)
+    val expected = spark.sql(expectedSql)
+    withClue(s"$actualSql EXCEPT ALL $expectedSql: ") {
+      actual.exceptAll(expected).count() shouldBe 0L
+    }
+    withClue(s"$expectedSql EXCEPT ALL $actualSql: ") {
+      expected.exceptAll(actual).count() shouldBe 0L
+    }
+  }
+
+  private def realDeltaSql(viewLogicalName: String): String =
+    s"""INSERT INTO openivm_delta_$viewLogicalName
+       |SELECT 1 AS id, CAST(1 AS INTEGER) AS openivm_multiplicity
+       |""".stripMargin
+
+  /** The empty-placeholder delta openivm emits when it cannot compute an
+    * incremental change for the view.
+    */
+  private def placeholderDeltaSql(viewLogicalName: String): String =
+    s"""INSERT INTO openivm_delta_$viewLogicalName
+       |SELECT CAST(NULL AS INTEGER) AS id, CAST(1 AS INTEGER) AS openivm_multiplicity WHERE false
+       |""".stripMargin
+
+  /** The FULL_REFRESH program shape openivm emits for the Spark dialect with
+    * `CompileFacts::force_view_delta_cascade`: `build_split_safe_full_refresh_companion`
+    * retracts the pre-refresh data table with `-1` before the recompute and adds
+    * the post-refresh data table with `+1` after it.
+    */
+  private def splitSafeFullRefreshCompanionSql(viewLogicalName: String): String =
+    s"""DELETE FROM openivm_delta_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_delta_$viewLogicalName (id, openivm_multiplicity)
+       |SELECT id, -1 FROM openivm_data_$viewLogicalName;
+       |DELETE FROM openivm_data_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_data_$viewLogicalName (id) SELECT id FROM base;
+       |INSERT INTO openivm_delta_$viewLogicalName (id, openivm_multiplicity)
+       |SELECT id, 1 FROM openivm_data_$viewLogicalName;
+       |""".stripMargin
+
+  /** The FULL_REFRESH program shape openivm emits for a TERMINAL view: a
+    * one-row constant query with no source table, no upstream MV and no
+    * downstream consumer (`SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)`).
+    * `force_view_delta_cascade` forces `has_downstream = true` for FULL_REFRESH
+    * in `refresh_sql.cpp`, so the split-safe signed companion is emitted here
+    * too — there is no `FROM` in the recompute, but the retract/add pair is the
+    * same.
+    */
+  private def terminalConstantCompanionSql(viewLogicalName: String): String =
+    s"""DELETE FROM openivm_delta_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_delta_$viewLogicalName (ingested_at, openivm_multiplicity)
+       |SELECT ingested_at, -1 FROM openivm_data_$viewLogicalName;
+       |DELETE FROM openivm_data_$viewLogicalName WHERE 1=1;
+       |INSERT INTO openivm_data_$viewLogicalName (ingested_at)
+       |SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP);
+       |INSERT INTO openivm_delta_$viewLogicalName (ingested_at, openivm_multiplicity)
+       |SELECT ingested_at, 1 FROM openivm_data_$viewLogicalName;
+       |""".stripMargin
+
+  private def upstreamMeta(shortName: String, classification: MvCommandHelper.EffectiveClassification): MvMetadata =
+    MvMetadata(
+      name = TableIdentifier(shortName, Some("default")),
+      querySql = "SELECT 1",
+      refreshType = classification.refreshType,
+      refreshTypeName = classification.refreshTypeName,
+      lastVersion = 0L,
+      sourceTables = Seq.empty,
+      sourceSchemaFingerprint = s"fp-$shortName",
+      location = s"target/$shortName",
+      createdAt = new Timestamp(0L),
+      properties = MvMetadata.cascadeViewDeltaProperties(classification.emitsCascadeViewDelta)
+    )
+
   /**
    * Create a staging Delta table that holds `rows` and register it in
    * StagingCatalog.  Returns the staging path so tests can track it.
@@ -93,7 +376,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       stagingSubPath: String,
       rows: Seq[(String, Int)]
   ): String = {
-    val stagingPath = s"$warehouseDir/_ivm/staging/$stagingSubPath"
+    val stagingPath    = s"$warehouseDir/_ivm/staging/$stagingSubPath"
+    val previousBypass = IvmDmlInterceptorRule.bypass.get()
     IvmDmlInterceptorRule.bypass.set(true)
     try {
       spark.sql(
@@ -114,7 +398,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         )
       )
     } finally {
-      IvmDmlInterceptorRule.bypass.set(false)
+      IvmDmlInterceptorRule.bypass.set(previousBypass)
     }
     stagingPath
   }
@@ -140,6 +424,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
     }
 
+    describe("CREATE data and catalog SQL shape") {
+      it("uses a path CTAS followed by a named Delta registration") {
+        val dataSql = MvCommandHelper.createDataWriteSql(
+          location = "/warehouse/mv_shape",
+          clusterClause = "CLUSTER BY (`id`) ",
+          tablePropertiesClause = "TBLPROPERTIES ('delta.appendOnly' = 'false') ",
+          querySql = "SELECT id FROM source_shape"
+        )
+        val registrationSql = MvCommandHelper.createCatalogRegistrationSql(
+          TableIdentifier("mv_shape", Some("default")),
+          "/warehouse/mv_shape"
+        )
+
+        dataSql shouldBe
+          "CREATE TABLE delta.`/warehouse/mv_shape` USING DELTA " +
+          "CLUSTER BY (`id`) TBLPROPERTIES ('delta.appendOnly' = 'false') " +
+          "AS SELECT id FROM source_shape"
+        dataSql should not include "default.mv_shape"
+        registrationSql shouldBe
+          "CREATE TABLE IF NOT EXISTS `default`.`mv_shape` USING DELTA LOCATION '/warehouse/mv_shape'"
+        registrationSql should not include " AS SELECT "
+      }
+
+      it("rejects a named relation that points at a different backing table") {
+        spark.sql("CREATE TABLE mv_shape_conflict(id INT) USING DELTA")
+
+        an[AnalysisException] should be thrownBy {
+          MvCommandHelper.validateCatalogRegistration(
+            spark,
+            TableIdentifier("mv_shape_conflict"),
+            s"$warehouseDir/_ivm/views/mv_shape_conflict",
+            requireExists = false
+          )
+        }
+      }
+    }
+
     it("recognizes replacement CDF verdicts and explicit staging overwrites") {
       MvCommandHelper.hasReplacementBatch(Seq.empty, Seq(BatchVerdict.Replace)) shouldBe true
       MvCommandHelper.hasReplacementBatch(
@@ -152,6 +473,555 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       MvCommandHelper.hasReplacementBatch(
         Seq(stagingBatch(StagingDelta.OpTypes.MvViewDelta)),
         Seq.empty
+      ) shouldBe false
+    }
+
+    it("skips the SIMPLE_PROJECTION apply probe for pathologically large compiled SQL") {
+      val compiled = CompiledRefresh(
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        sql = "x" * (MvCommandHelper.SimpleProjectionProbeMaxSqlChars + 1),
+        initialLoadSql = ""
+      )
+
+      MvCommandHelper.computeSimpleProjectionHasDataApply(
+        spark = null,
+        compiled = compiled,
+        name = TableIdentifier("mv_large_probe"),
+        location = "target/mv_large_probe",
+        qualSchemas = Map.empty,
+        shortToQual = Map.empty
+      ) shouldBe true
+    }
+  }
+
+  describe("effective refresh classification") {
+    it("keeps incremental classifications when the compiled delta is real") {
+      val viewShortName = "mv_incremental_kept"
+      val compiled = CompiledRefresh(
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        sql = realDeltaSql(viewShortName),
+        initialLoadSql = ""
+      )
+
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiled,
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.compileRefreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      classification.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.reason shouldBe "kept"
+      classification.isDemotionToFullRefresh shouldBe false
+    }
+
+    it("records the upstream snapshot-trigger detail without demoting the dependent") {
+      val upstream = MvMetadata(
+        name = TableIdentifier("upstream_mv", Some("default")),
+        querySql = "SELECT 1",
+        refreshType = RefreshTypeCode.SimpleProjection,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        lastVersion = 0L,
+        sourceTables = Seq.empty,
+        sourceSchemaFingerprint = "fp-upstream",
+        location = "target/upstream_mv",
+        createdAt = new Timestamp(0L),
+        properties = Map(MvMetadata.EmitsCascadeViewDeltaKey -> "false")
+      )
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map("default.upstream_mv" -> upstream))
+
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.SimpleProjection,
+          refreshTypeName = "SIMPLE_PROJECTION",
+          sql = realDeltaSql("mv_non_cascade"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_non_cascade",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = detail,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      detail shouldBe Some("snapshot_trigger:default.upstream_mv")
+      // The dependent keeps its own incremental type: an upstream that cannot
+      // cascade leaves an OVERWRITE snapshot trigger, which `hasReplacementBatch`
+      // routes through a recompute for THAT batch only.
+      classification.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      classification.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      classification.reason shouldBe "kept"
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.upstreamSnapshotTrigger shouldBe Some("snapshot_trigger:default.upstream_mv")
+      classification.reason.toUpperCase should not startWith "NON_CASCADE_UPSTREAM"
+    }
+
+    it("keeps compile_failed authoritative over the generic full-refresh fallback") {
+      val compiledFallback = CompiledRefresh(
+        refreshType = RefreshTypeCode.FullRefresh,
+        refreshTypeName = "FULL_REFRESH",
+        sql = "",
+        initialLoadSql = ""
+      )
+
+      val generic = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiledFallback,
+        viewShortName = "mv_compile_failed",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+      val authoritative = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = compiledFallback,
+        viewShortName = "mv_compile_failed",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None,
+        authoritativeClassification = Some(
+          MvCommandHelper.authoritativeFullRefreshClassification(
+            compileRefreshTypeName = "COMPILE_FAILED",
+            refreshReason = "compile_failed"
+          )
+        )
+      )
+
+      generic.reason shouldBe "no_real_delta"
+      authoritative.compileRefreshTypeName shouldBe "COMPILE_FAILED"
+      authoritative.refreshTypeName shouldBe "FULL_REFRESH"
+      authoritative.reason shouldBe "compile_failed"
+      authoritative.isDemotionToFullRefresh shouldBe true
+      generic.emitsCascadeViewDelta shouldBe false
+      authoritative.emitsCascadeViewDelta shouldBe false
+    }
+
+    it("reports a verified FULL_REFRESH companion as SIGNED_DELTA_RECOMPUTE, never as a full rebuild") {
+      val viewShortName = "mv_full_refresh_cascade"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = splitSafeFullRefreshCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      // Execution stays a recompute (the code is unchanged) …
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      // … but the REPORTED strategy is its own, so it never normalizes to FULL.
+      classification.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
+      classification.refreshTypeName should not be RefreshTypeCode.FullRefreshName
+      classification.reason shouldBe "signed_delta_recompute_verified"
+      // The native compile type is preserved diagnostically.
+      classification.compileRefreshTypeName shouldBe "FULL_REFRESH"
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("reports the terminal current_timestamp view as a signed-delta recompute, not FULL") {
+      // `meta_ingestion` / `ingestion_metadata_mat_view` in the
+      // local-spark-openivm canary:
+      //     SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)
+      // No source table, no upstream MV, no downstream consumer — the archived
+      // canary logged it as compiled=FULL_REFRESH effective=FULL_REFRESH
+      // reason='kept', which the benchmark's refresh-type guard rejects even
+      // though openivm emitted a valid signed companion for it.
+      val viewShortName = "ingestion_metadata_mat_view"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = terminalConstantCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        // Terminal AND no upstream: nothing can supply a snapshot trigger.
+        upstreamSnapshotTriggerDetail = None,
+        simpleProjectionHasDataApply = true,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
+      classification.reason shouldBe "signed_delta_recompute_verified"
+      classification.compileRefreshTypeName shouldBe "FULL_REFRESH"
+      classification.emitsCascadeViewDelta shouldBe true
+      classification.isDemotionToFullRefresh shouldBe false
+      classification.upstreamSnapshotTrigger shouldBe None
+      // The benchmark guard normalizes exactly FULL/FULL_REFRESH to FULL and
+      // fails the canary on it, plus any COMPILE_FAILED/NON_CASCADE_UPSTREAM
+      // reason prefix. This shape must clear all three.
+      Set("FULL", "FULL_REFRESH") should not contain classification.refreshTypeName
+      classification.reason.toUpperCase should not startWith "COMPILE_FAILED"
+      classification.reason.toUpperCase should not startWith "NON_CASCADE_UPSTREAM"
+    }
+
+    it("keeps a FULL_REFRESH with no verified companion reported as FULL_REFRESH") {
+      val viewShortName = "mv_full_refresh_placeholder_only"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = placeholderDeltaSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      classification.reason shouldBe "no_real_delta"
+      classification.emitsCascadeViewDelta shouldBe false
+    }
+
+    it("never launders a demoted incremental type into the signed-delta-recompute strategy") {
+      // A real signed delta is present, but the compiled type was INCREMENTAL and
+      // the view still lost its incremental path — that is a genuine degradation
+      // and must keep reporting FULL_REFRESH.
+      val viewShortName = "mv_demoted_with_delta"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.AggregateHaving,
+          refreshTypeName = "AGGREGATE_HAVING",
+          sql = realDeltaSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.reason shouldBe "having_pred_empty"
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      classification.isDemotionToFullRefresh shouldBe true
+    }
+
+    it("retains downstream incrementality over a verified FULL_REFRESH upstream") {
+      val upstreamShortName = "stg_full_refresh_upstream"
+      val upstream = upstreamMeta(
+        upstreamShortName,
+        MvCommandHelper.classifyEffectiveRefreshType(
+          compiled = CompiledRefresh(
+            refreshType = RefreshTypeCode.FullRefresh,
+            refreshTypeName = "FULL_REFRESH",
+            sql = splitSafeFullRefreshCompanionSql(upstreamShortName),
+            initialLoadSql = ""
+          ),
+          viewShortName = upstreamShortName,
+          topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+          simpleProjectionHasDataApply = true,
+          upstreamSnapshotTriggerDetail = None,
+          rawHavingPred = None,
+          aggregateHavingDataColumns = None
+        )
+      )
+
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map(s"default.$upstreamShortName" -> upstream))
+      val downstream = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          sql = realDeltaSql("mv_downstream_of_full_refresh"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_downstream_of_full_refresh",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = detail,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      upstream.emitsCascadeViewDelta shouldBe true
+      upstream.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
+      detail shouldBe None
+      downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
+      downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
+      downstream.reason shouldBe "window_partition_kept"
+      downstream.isDemotionToFullRefresh shouldBe false
+      downstream.upstreamSnapshotTrigger shouldBe None
+    }
+
+    it("does not demote downstream when the FULL_REFRESH upstream carries no real delta") {
+      val upstreamShortName = "stg_full_refresh_placeholder"
+      val upstreamClassification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = placeholderDeltaSql(upstreamShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = upstreamShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+      val upstream = upstreamMeta(upstreamShortName, upstreamClassification)
+
+      val detail =
+        MvCommandHelper.computeUpstreamSnapshotTriggerDetail(Map(s"default.$upstreamShortName" -> upstream))
+      val downstream = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.WindowPartition,
+          refreshTypeName = "WINDOW_PARTITION",
+          sql = realDeltaSql("mv_downstream_of_placeholder"),
+          initialLoadSql = ""
+        ),
+        viewShortName = "mv_downstream_of_placeholder",
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = false, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = detail,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      // The upstream stays fail-closed: no verified companion, no cascade, and
+      // it keeps reporting FULL_REFRESH so the benchmark guard still sees it.
+      upstreamClassification.reason shouldBe "no_real_delta"
+      upstreamClassification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      upstreamClassification.emitsCascadeViewDelta shouldBe false
+      detail shouldBe Some(s"snapshot_trigger:default.$upstreamShortName")
+      // The dependent is NOT demoted — it recomputes only the batches carrying
+      // that upstream's OVERWRITE snapshot trigger, and stays incremental
+      // otherwise, so the old transitive `non_cascade_upstream` collapse of whole
+      // DAG branches cannot happen.
+      downstream.refreshType shouldBe RefreshTypeCode.WindowPartition
+      downstream.refreshTypeName shouldBe "WINDOW_PARTITION"
+      downstream.reason shouldBe "window_partition_kept"
+      downstream.isDemotionToFullRefresh shouldBe false
+      downstream.upstreamSnapshotTrigger shouldBe Some(s"snapshot_trigger:default.$upstreamShortName")
+      downstream.emitsCascadeViewDelta shouldBe true
+    }
+
+    it("keeps an unsupported Top-K FULL_REFRESH non-cascade even with a real compiled delta") {
+      val viewShortName = "mv_top_k_unsupported"
+      val classification = MvCommandHelper.classifyEffectiveRefreshType(
+        compiled = CompiledRefresh(
+          refreshType = RefreshTypeCode.FullRefresh,
+          refreshTypeName = "FULL_REFRESH",
+          sql = splitSafeFullRefreshCompanionSql(viewShortName),
+          initialLoadSql = ""
+        ),
+        viewShortName = viewShortName,
+        topKViewSpec = MvCommandHelper.TopKViewSpec(detected = true, suffixSql = None),
+        simpleProjectionHasDataApply = true,
+        upstreamSnapshotTriggerDetail = None,
+        rawHavingPred = None,
+        aggregateHavingDataColumns = None
+      )
+
+      classification.reason shouldBe "top_k_unsupported"
+      classification.refreshType shouldBe RefreshTypeCode.FullRefresh
+      classification.refreshTypeName shouldBe RefreshTypeCode.FullRefreshName
+      classification.emitsCascadeViewDelta shouldBe false
+    }
+  }
+
+  describe("full-refresh cascade view-delta") {
+    def cascadeFixture(): (String, Long, Seq[String]) = {
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_cascade_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      try {
+        spark.sql(
+          s"""CREATE TABLE delta.`$path` USING DELTA AS
+             |SELECT col1 AS k, col2 AS v FROM VALUES ('a', 1), ('b', 2), ('b', 2) AS t(col1, col2)
+             |""".stripMargin
+        )
+        val preVersion = DeltaTableVersion.requireLatest(spark, path)
+        spark.sql(
+          s"""INSERT OVERWRITE TABLE delta.`$path`
+             |SELECT col1 AS k, col2 AS v FROM VALUES ('b', 2), ('c', 3) AS t(col1, col2)
+             |""".stripMargin
+        )
+        (path, preVersion, spark.read.format("delta").load(path).schema.fieldNames.toSeq)
+      } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+    }
+
+    def signedRows(sql: String): Seq[(String, Int, Int)] =
+      spark
+        .sql(sql)
+        .collect()
+        .map(r => (r.getAs[String]("k"), r.getAs[Int]("v"), r.getAs[Int]("openivm_multiplicity")))
+        .toSeq
+        .sorted
+
+    it("emits the exact signed multiset difference across the recompute") {
+      val (path, preVersion, columns) = cascadeFixture()
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = columns,
+        preRefreshVersion = preVersion,
+        exactDiff = true
+      )
+
+      sql should include(s"VERSION AS OF $preVersion")
+      sql should include("EXCEPT ALL")
+      // old = {a1, b2, b2}, new = {b2, c3}: one b2 cancels, the surplus retracts.
+      signedRows(sql) shouldBe Seq(("a", 1, -1), ("b", 2, -1), ("c", 3, 1))
+    }
+
+    it("falls back to the unconditional split-safe snapshot pair with the same net effect") {
+      val (path, preVersion, columns) = cascadeFixture()
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = columns,
+        preRefreshVersion = preVersion,
+        exactDiff = false
+      )
+
+      sql should include(s"VERSION AS OF $preVersion")
+      sql should not include "EXCEPT ALL"
+      signedRows(sql) shouldBe Seq(
+        ("a", 1, -1),
+        ("b", 2, -1),
+        ("b", 2, -1),
+        ("b", 2, 1),
+        ("c", 3, 1)
+      )
+    }
+
+    it("emits the signed old/new pair for a terminal one-row constant view") {
+      // `SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)`: no upstream, no
+      // consumer, one row that changes on every recompute. The delta is
+      // produced for the refreshed view ITSELF, which is what makes
+      // SIGNED_DELTA_RECOMPUTE an honest report rather than a label.
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_terminal_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      val (preVersion, schema) =
+        try {
+          spark.sql(
+            s"CREATE TABLE delta.`$path` USING DELTA AS SELECT TIMESTAMP'2024-01-01 00:00:00' AS ingested_at"
+          )
+          val v = DeltaTableVersion.requireLatest(spark, path)
+          spark.sql(
+            s"INSERT OVERWRITE TABLE delta.`$path` SELECT TIMESTAMP'2024-01-02 00:00:00' AS ingested_at"
+          )
+          (v, spark.read.format("delta").load(path).schema)
+        } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+
+      MvCommandHelper.supportsExactDiffCascade(schema) shouldBe true
+      val sql = MvCommandHelper.buildFullRefreshCascadeSql(
+        dataPath = path,
+        targetColumns = schema.fieldNames.toSeq,
+        preRefreshVersion = preVersion,
+        exactDiff = true
+      )
+
+      val pairs = spark
+        .sql(sql)
+        .collect()
+        .map(r => (r.getAs[java.sql.Timestamp]("ingested_at").toString, r.getAs[Int]("openivm_multiplicity")))
+        .toSeq
+        .sorted
+      pairs shouldBe Seq(
+        ("2024-01-01 00:00:00.0", -1),
+        ("2024-01-02 00:00:00.0", 1)
+      )
+    }
+
+    it("records the same signed pair through the MV change feed under cdf mode") {
+      // The benchmark canary runs `spark.openivm.changeFeed.mode=cdf`, where
+      // the MV data table itself carries `delta.enableChangeDataFeed = true`
+      // (FeatureGate.buildMvDataTblProperties) and the explicit view-delta
+      // write is deliberately skipped: Delta records the recompute as the old
+      // snapshot deleted and the new snapshot inserted, which IS the signed
+      // `old x -1 / new x +1` pair. The two modes are complementary, so
+      // SIGNED_DELTA_RECOMPUTE is backed by a real signed record either way.
+      new InterceptChangePropagation().requiresDmlInterception shouldBe true
+      new InterceptChangePropagation().requiresMvCdf shouldBe false
+      new CdfChangePropagation().requiresDmlInterception shouldBe false
+      new CdfChangePropagation().requiresMvCdf shouldBe true
+
+      val path           = s"$warehouseDir/_ivm/test/full_refresh_cdf_${UUID.randomUUID().toString.take(8)}"
+      val previousBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      val preVersion =
+        try {
+          spark.sql(
+            s"CREATE TABLE delta.`$path` USING DELTA " +
+              s"TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true') " +
+              s"AS SELECT TIMESTAMP'2024-01-01 00:00:00' AS ingested_at"
+          )
+          val v = DeltaTableVersion.requireLatest(spark, path)
+          spark.sql(
+            s"INSERT OVERWRITE TABLE delta.`$path` SELECT TIMESTAMP'2024-01-02 00:00:00' AS ingested_at"
+          )
+          v
+        } finally IvmDmlInterceptorRule.bypass.set(previousBypass)
+
+      val signed = spark.read
+        .format("delta")
+        .option("readChangeFeed", "true")
+        .option("startingVersion", preVersion + 1)
+        .load(path)
+        .collect()
+        .map { r =>
+          val multiplicity = r.getAs[String]("_change_type") match {
+            case "insert" => 1
+            case "delete" => -1
+            case other    => fail(s"unexpected change type '$other'")
+          }
+          (r.getAs[java.sql.Timestamp]("ingested_at").toString, multiplicity)
+        }
+        .toSeq
+        .sorted
+      signed shouldBe Seq(
+        ("2024-01-01 00:00:00.0", -1),
+        ("2024-01-02 00:00:00.0", 1)
+      )
+    }
+
+    it("only reduces to the exact difference for set-operable schemas") {
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(Seq(StructField("k", StringType), StructField("v", IntegerType)))
+      ) shouldBe true
+
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(Seq(StructField("k", StringType), StructField("tags", MapType(StringType, StringType))))
+      ) shouldBe false
+
+      MvCommandHelper.supportsExactDiffCascade(
+        StructType(
+          Seq(
+            StructField(
+              "nested",
+              StructType(Seq(StructField("tags", ArrayType(MapType(StringType, StringType)))))
+            )
+          )
+        )
       ) shouldBe false
     }
   }
@@ -173,6 +1043,312 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
       // Catalog metadata must be present
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
+    }
+  }
+
+  describe("(1a) CREATE MATERIALIZED VIEW — always-on phase telemetry") {
+    it("splits CTAS data work from post-commit Hive publication with profiling and metrics off") {
+      FeatureGate.profileRefreshEnabled(spark) shouldBe false
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a VALUES (1, 'one'), (2, 'two')")
+
+      val metricsWereEnabled = OpenIvmMetrics.enabled
+      val payloads =
+        try {
+          OpenIvmMetrics.configure(enabled = false)
+          withLogCapture { appender =>
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-create-phases",
+              "openivm.node_id"    -> "model.create.phases"
+            ) {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_phases AS " +
+                    "SELECT id, label FROM sales_t1a WHERE id >= 0"
+                )
+                .collect()
+            }
+            executionSpanPayloads(appender.messages, "mv_t1a_phases")
+          }
+        } finally OpenIvmMetrics.configure(metricsWereEnabled)
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("request_id").asText() shouldBe "req-create-phases"
+      payload.path("dbt_node_id").asText() shouldBe "model.create.phases"
+      payload.path("operation").asText() shouldBe "create"
+      payload.path("outcome").asText() shouldBe "create_executed"
+      payload.has("analysis_ms") shouldBe true
+      payload.has("watermark_ms") shouldBe true
+      payload.path("catalog_publication_admission_width").asInt() shouldBe 32
+      payload.has("catalog_publication_admission_wait_ms") shouldBe true
+      payload.has("ctas_ms") shouldBe true
+      payload.has("ctas_data_write_ms") shouldBe true
+      payload.has("hive_catalog_publication_ms") shouldBe true
+      payload.has("metadata_publication_ms") shouldBe true
+      payload.path("ctas_data_write_ms").asLong() +
+        payload.path("hive_catalog_publication_ms").asLong() shouldBe
+        payload.path("ctas_ms").asLong()
+      assertBagEqual("mv_t1a_phases", "SELECT id, label FROM sales_t1a WHERE id >= 0")
+    }
+
+    it("publishes the catalog entry without submitting another Spark job") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_publish(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_publish VALUES (1, 'one'), (2, 'two')")
+
+      // Job submission timestamps, not listener delivery times, decide which
+      // side of the data-write boundary a job belongs to.
+      val jobSubmittedAtMs = new CopyOnWriteArrayList[java.lang.Long]()
+      val boundaryMs       = new AtomicLong(Long.MaxValue)
+      val listener = new SparkListener {
+        override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+          jobSubmittedAtMs.add(java.lang.Long.valueOf(jobStart.time))
+          ()
+        }
+      }
+      spark.sparkContext.addSparkListener(listener)
+
+      val payloads =
+        try
+          withLogCapture { appender =>
+            CommandConcurrencyInjection.withAfterCreateDataWrite({
+              Thread.sleep(50L)
+              boundaryMs.set(System.currentTimeMillis())
+            }) {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_publish AS " +
+                    "SELECT id, label FROM sales_t1a_publish"
+                )
+                .collect()
+            }
+            // Drain the asynchronous listener bus before reading the buffer.
+            Thread.sleep(1000L)
+            executionSpanPayloads(appender.messages, "mv_t1a_publish")
+          }
+        finally spark.sparkContext.removeSparkListener(listener)
+
+      val boundary = boundaryMs.get()
+      boundary should be < Long.MaxValue
+      val publicationJobs = jobSubmittedAtMs.asScala.count(_.longValue() >= boundary)
+      withClue("catalog publication must not submit Spark jobs that queue behind concurrent data writes: ") {
+        publicationJobs shouldBe 0
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("outcome").asText() shouldBe "create_executed"
+      payload.path("delta_version_lookup_count").asLong() shouldBe 1L
+      payload.has("delta_version_lookup_ms") shouldBe true
+      payload.path("catalog_publication_admission_width").asInt() shouldBe 32
+      payload.has("hive_catalog_publication_ms") shouldBe true
+      payload.has("metadata_publication_ms") shouldBe true
+      assertBagEqual("mv_t1a_publish", "SELECT id, label FROM sales_t1a_publish")
+    }
+
+    it("records non-zero CTAS timing when the initial save fails before returning") {
+      val udfName = s"sleep_then_divzero_${UUID.randomUUID().toString.replace("-", "")}"
+      spark.udf.register(
+        udfName,
+        (_: Long) => {
+          Thread.sleep(50L)
+          1 / 0
+        }
+      )
+
+      val payloads =
+        withLogCapture { appender =>
+          intercept[Throwable] {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-create-save-fail",
+              "openivm.node_id"    -> "model.create.save_fail"
+            ) {
+              spark
+                .sql(s"CREATE MATERIALIZED VIEW mv_t1a_save_fail AS SELECT $udfName(id) AS id FROM range(1)")
+                .collect()
+            }
+          }
+          executionSpanPayloads(appender.messages, "mv_t1a_save_fail")
+        }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("request_id").asText() shouldBe "req-create-save-fail"
+      payload.path("dbt_node_id").asText() shouldBe "model.create.save_fail"
+      payload.path("outcome").asText() shouldBe "create_failed"
+      payload.has("ctas_ms") shouldBe true
+      payload.has("ctas_data_write_ms") shouldBe true
+      payload.path("ctas_data_write_ms").asLong() should be > 0L
+      payload.path("ctas_ms").asLong() shouldBe payload.path("ctas_data_write_ms").asLong()
+      payload.has("hive_catalog_publication_ms") shouldBe false
+    }
+
+    it("rolls back a newly-created Delta path after failure before named registration") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_retry(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_retry VALUES (1, 'one'), (2, 'two'), (2, 'two')")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t1a_retry_keeper AS " +
+          "SELECT id, label FROM sales_t1a_retry"
+      )
+
+      val name     = "mv_t1a_retry"
+      val viewBody = "SELECT id, label FROM sales_t1a_retry WHERE id >= 0"
+      val location = MvCommandHelper.mvLocation(spark, TableIdentifier(name))
+      val injected = new AtomicBoolean(false)
+
+      val failure = intercept[IllegalStateException] {
+        CommandConcurrencyInjection.withAfterCreateDataWrite({
+          if (injected.compareAndSet(false, true))
+            throw new IllegalStateException("fail between data commit and catalog registration")
+        }) {
+          spark.sql(s"CREATE MATERIALIZED VIEW $name AS $viewBody").collect()
+        }
+      }
+      failure.getMessage should include("between data commit and catalog registration")
+      pathExists(location) shouldBe false
+      DeltaTable.isDeltaTable(spark, location) shouldBe false
+      spark.catalog.tableExists(name) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier(name)) shouldBe empty
+
+      spark.sql("INSERT INTO sales_t1a_retry VALUES (3, 'three')")
+      spark.sql(s"CREATE MATERIALIZED VIEW $name AS $viewBody").collect()
+
+      MvCatalog.lookup(spark, TableIdentifier(name)).map(_.location) shouldBe Some(location)
+      val tableMetadata = spark.sessionState.catalog.getTableMetadata(TableIdentifier(name))
+      tableMetadata.provider shouldBe Some("delta")
+      new Path(tableMetadata.location).toUri shouldBe new Path(location).toUri
+      assertBagEqual(name, viewBody)
+    }
+
+    it("does not delete a preexisting Delta path when an unpublished CREATE fails") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_existing(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_existing VALUES (1, 'one'), (2, 'two'), (2, 'two')")
+
+      val name     = TableIdentifier("mv_t1a_existing")
+      val viewBody = "SELECT id, label FROM sales_t1a_existing WHERE id >= 0"
+      val location = MvCommandHelper.mvLocation(spark, name)
+
+      spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+      val rowsAtLocation = DeltaTable.forPath(spark, location).toDF.count()
+      spark.sql(s"DROP TABLE IF EXISTS ${MvCommandHelper.sqlIdent(name)}")
+      MvCatalog.remove(spark, name)
+
+      spark.catalog.tableExists(name.table) shouldBe false
+      MvCatalog.lookup(spark, name) shouldBe empty
+      pathExists(location) shouldBe true
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+
+      val injected = new AtomicBoolean(false)
+      val failure = intercept[IllegalStateException] {
+        CommandConcurrencyInjection.withAfterCreateDataWrite({
+          if (injected.compareAndSet(false, true))
+            throw new IllegalStateException("fail before registering preexisting delta path")
+        }) {
+          spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+        }
+      }
+
+      failure.getMessage should include("preexisting delta path")
+      spark.catalog.tableExists(name.table) shouldBe false
+      MvCatalog.lookup(spark, name) shouldBe empty
+      pathExists(location) shouldBe true
+      DeltaTable.isDeltaTable(spark, location) shouldBe true
+      DeltaTable.forPath(spark, location).toDF.count() shouldBe rowsAtLocation
+
+      spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $viewBody").collect()
+      assertBagEqual(name.table, viewBody)
+    }
+
+    it("allows independent path CTAS phases to enter concurrently") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_1(id INT, label STRING) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_2(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_t1a_overlap_1 VALUES (1, 'one'), (2, 'two')")
+      spark.sql("INSERT INTO sales_t1a_overlap_2 VALUES (3, 'three'), (4, 'four')")
+
+      val barrier = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+      CommandConcurrencyInjection.withBeforeCreateDataWrite(barrier.park()) {
+        withPool(2) { implicit ec =>
+          barrier.use {
+            val first = Future {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_overlap_1 AS " +
+                    "SELECT id, label FROM sales_t1a_overlap_1"
+                )
+                .collect()
+            }
+            val second = Future {
+              spark
+                .sql(
+                  "CREATE MATERIALIZED VIEW mv_t1a_overlap_2 AS " +
+                    "SELECT id, label FROM sales_t1a_overlap_2"
+                )
+                .collect()
+            }
+            withClue(s"both CTAS phases must be inside the data-write hook together (${barrier.describe}): ") {
+              barrier.awaitParked(2) shouldBe true
+            }
+            first.isCompleted shouldBe false
+            second.isCompleted shouldBe false
+            barrier.release()
+            awaitResult(Future.sequence(Seq(first, second)))
+          }
+        }
+      }
+
+      assertBagEqual("mv_t1a_overlap_1", "SELECT id, label FROM sales_t1a_overlap_1")
+      assertBagEqual("mv_t1a_overlap_2", "SELECT id, label FROM sales_t1a_overlap_2")
+    }
+
+    it("releases resources so a same-process retry succeeds after an injected create failure") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_create_retry(id INT, label STRING) USING DELTA")
+      spark.sql("INSERT INTO sales_create_retry VALUES (1, 'one'), (2, 'two')")
+      val body = "SELECT id, label FROM sales_create_retry"
+
+      // First attempt fails inside the initial data write (the per-MV RocksDB
+      // watermark handle is opened around CREATE). A failed CREATE must release
+      // its per-MV RocksDB lock and roll back its partial catalog artifacts.
+      intercept[Exception] {
+        CommandConcurrencyInjection.withBeforeCreateDataWrite(
+          throw new RuntimeException("injected create failure")
+        ) {
+          spark.sql("CREATE MATERIALIZED VIEW mv_create_retry AS " + body).collect()
+        }
+      }
+
+      // Same-session retry with the hook cleared: must succeed — no leaked
+      // "lock hold by current process", no stale half-registered MV.
+      noException should be thrownBy {
+        spark.sql("CREATE MATERIALIZED VIEW mv_create_retry AS " + body).collect()
+      }
+      assertBagEqual("mv_create_retry", body)
+    }
+
+    it("concurrent DROP+CREATE of MVs sharing one source stays lock-safe (bounded fan-out)") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_fanout(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_fanout VALUES ('north', 10), ('south', 20)")
+      val n    = 8
+      val body = (i: Int) => s"SELECT region, SUM(amount) AS total_$i FROM sales_fanout GROUP BY region"
+      (0 until n).foreach(i => spark.sql(s"CREATE MATERIALIZED VIEW mv_fanout_$i AS ${body(i)}").collect())
+
+      // All MVs share `sales_fanout`, so each DROP exercises removeForBaseTable
+      // fan-out (now bounded by the reverse index) and closeAndDelete of the
+      // per-MV RocksDB while other workers concurrently CREATE against the same
+      // source. Before the lifecycle fix this raced into
+      // "lock hold by current process".
+      withPool(n) { implicit ec =>
+        val futures = (0 until n).map { i =>
+          Future {
+            (0 until 2).foreach { _ =>
+              spark.sql(s"DROP MATERIALIZED VIEW mv_fanout_$i").collect()
+              spark.sql(s"CREATE MATERIALIZED VIEW mv_fanout_$i AS ${body(i)}").collect()
+            }
+          }
+        }
+        awaitResult(Future.sequence(futures))
+      }
+
+      (0 until n).foreach(i => assertBagEqual(s"mv_fanout_$i", body(i)))
     }
   }
 
@@ -258,10 +1434,525 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(
         "CREATE MATERIALIZED VIEW mv_t5 AS SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
       )
-      val countBefore = spark.table("mv_t5").count()
       // No staging records → REFRESH must be a no-op
       noException should be thrownBy { spark.sql("REFRESH MATERIALIZED VIEW mv_t5") }
-      spark.table("mv_t5").count() shouldBe countBefore
+      assertBagEqual(
+        "mv_t5",
+        "SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
+      )
+    }
+  }
+
+  describe("(5a) REFRESH execution spans reconstruct persisted classification on refresh-only runs") {
+    it("reads compile/effective type and reason from metadata without recompiling") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5a(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5a VALUES ('east', 100), ('west', 200)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t5a_span AS " +
+          "SELECT region, SUM(amount) AS total FROM sales_t5a GROUP BY region"
+      )
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5a_span")).get
+      meta.properties.contains(MvMetadata.CompileRefreshTypeKey) shouldBe true
+      meta.properties.contains(MvMetadata.RefreshReasonKey) shouldBe true
+
+      val payloads = withLogCapture { appender =>
+        withSparkLocalProperties(
+          "openivm.request_id" -> "req-refresh-only",
+          "openivm.node_id"    -> "model.refresh.only"
+        ) {
+          spark.sql("REFRESH MATERIALIZED VIEW mv_t5a_span").collect()
+        }
+        executionSpanPayloads(appender.messages, "mv_t5a_span")
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("operation").asText() shouldBe "refresh"
+      payload.path("request_id").asText() shouldBe "req-refresh-only"
+      payload.path("dbt_node_id").asText() shouldBe "model.refresh.only"
+      payload.path("compile_refresh_type").asText() shouldBe meta.properties(MvMetadata.CompileRefreshTypeKey)
+      payload.path("effective_refresh_type").asText() shouldBe meta.refreshTypeName
+      payload.path("refresh_reason").asText() shouldBe meta.properties(MvMetadata.RefreshReasonKey)
+    }
+  }
+
+  describe("(5aa) campaign-scoped completed telemetry export") {
+    it("writes one bound completed object for CREATE and one for REFRESH") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5aa").toURI)
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5aa",
+        FeatureGate.TelemetryPhaseKey         -> "full"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5aa_export(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5aa_export VALUES (1, 10)")
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5aa-create",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5aa_export"
+        ) {
+          spark
+            .sql(
+              "CREATE MATERIALIZED VIEW mv_t5aa_export AS " +
+                "SELECT id, SUM(amount) AS total FROM src_t5aa_export GROUP BY id"
+            )
+            .collect()
+        }
+
+        spark.conf.set(FeatureGate.TelemetryPhaseKey, "refresh")
+        spark.sql("INSERT INTO src_t5aa_export VALUES (1, 5)")
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5aa-refresh",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5aa_export"
+        ) {
+          spark.sql("REFRESH MATERIALIZED VIEW mv_t5aa_export").collect()
+        }
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 2
+      val byOperation = payloads.map(payload => payload.path("operation").asText() -> payload).toMap
+
+      val create = byOperation("create")
+      create.path("schema_version").asInt() shouldBe OpenIvmTelemetryContract.SchemaVersion
+      create.path("campaign_id").asText() shouldBe "central-frozen-fast"
+      create.path("request_id").asText() shouldBe "request-t5aa-create"
+      create.path("phase").asText() shouldBe "full"
+      create.path("pending_delta_count").asLong() shouldBe 0L
+      create.path("compile_refresh_type").asText() should not be empty
+      create.path("effective_refresh_type").asText() should not be empty
+      create.path("refresh_reason").asText() should not be empty
+
+      val refresh = byOperation("refresh")
+      refresh.path("request_id").asText() shouldBe "request-t5aa-refresh"
+      refresh.path("phase").asText() shouldBe "refresh"
+      refresh.path("pending_delta_count").asLong() should be > 0L
+      refresh.path("compile_refresh_type").asText() shouldBe create.path("compile_refresh_type").asText()
+      refresh.path("effective_refresh_type").asText() shouldBe create.path("effective_refresh_type").asText()
+      refresh.path("refresh_reason").asText() shouldBe create.path("refresh_reason").asText()
+      Instant.parse(refresh.path("engine_completed_at").asText()) should be >=
+        Instant.parse(refresh.path("engine_started_at").asText())
+
+      assertBagEqual("mv_t5aa_export", "SELECT id, SUM(amount) AS total FROM src_t5aa_export GROUP BY id")
+    }
+  }
+
+  describe("(5ab) idempotent CREATE telemetry replay") {
+    it("reuses the completed object for the same request and emits a complete object for a new request") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ab").toURI)
+      val createSql =
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t5ab_replay AS " +
+          "SELECT id, SUM(amount) AS total FROM src_t5ab_replay GROUP BY id"
+
+      def create(requestId: String): Unit =
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ab_replay"
+        ) {
+          spark.sql(createSql).collect()
+        }
+
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ab",
+        FeatureGate.TelemetryPhaseKey         -> "full"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5ab_replay(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5ab_replay VALUES (1, 10)")
+
+        create("request-t5ab-original")
+        val original = completedTelemetryPayloads(telemetryRoot)
+        original should have size 1
+        assertW6SuccessFields(original.head)
+
+        create("request-t5ab-original")
+        completedTelemetryPayloads(telemetryRoot) shouldBe original
+
+        create("request-t5ab-new")
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 2
+      val byRequest = payloads.map(payload => payload.path("request_id").asText() -> payload).toMap
+      byRequest.keySet shouldBe Set("request-t5ab-original", "request-t5ab-new")
+      byRequest.values.foreach(assertW6SuccessFields)
+      byRequest("request-t5ab-original").path("outcome").asText() shouldBe "create_executed"
+      byRequest("request-t5ab-new").path("outcome").asText() shouldBe "create_already_exists"
+    }
+
+    it("keeps the actual CREATE as publication winner when a retry arrives before its rename") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ab-concurrent").toURI)
+      val enteredRename = new CountDownLatch(1)
+      val releaseRename = new CountDownLatch(1)
+      val retryStarted  = new CountDownLatch(1)
+      val requestId     = "request-t5ab-concurrent"
+      val createSql =
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t5ab_concurrent AS " +
+          "SELECT id, SUM(amount) AS total FROM src_t5ab_concurrent GROUP BY id"
+
+      def create(): Unit =
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ab_concurrent"
+        ) {
+          spark.sql(createSql).collect()
+        }
+
+      OpenIvmTelemetryPublicationInjection.installBeforeRenameOnce(requestId) {
+        enteredRename.countDown()
+        if (!releaseRename.await(30L, TimeUnit.SECONDS))
+          throw new IllegalStateException("timed out waiting to release the original telemetry rename")
+      }
+      try {
+        withSparkConfs(
+          FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+          FeatureGate.TelemetryCampaignIdKey    -> "central-frozen-fast",
+          FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ab-concurrent",
+          FeatureGate.TelemetryPhaseKey         -> "full"
+        ) {
+          spark.sql("CREATE TABLE IF NOT EXISTS src_t5ab_concurrent(id INT, amount INT) USING DELTA")
+          spark.sql("INSERT INTO src_t5ab_concurrent VALUES (1, 10)")
+
+          withPool(2) { implicit ec =>
+            val original = Future(create())
+            enteredRename.await(30L, TimeUnit.SECONDS) shouldBe true
+            val retry = Future {
+              retryStarted.countDown()
+              create()
+            }
+            retryStarted.await(30L, TimeUnit.SECONDS) shouldBe true
+            try {
+              Thread.sleep(500L)
+              retry.isCompleted shouldBe false
+              completedTelemetryPayloads(telemetryRoot) shouldBe empty
+            } finally {
+              releaseRename.countDown()
+            }
+            awaitResult(original)
+            awaitResult(retry)
+          }
+        }
+      } finally {
+        releaseRename.countDown()
+        OpenIvmTelemetryPublicationInjection.clear()
+      }
+
+      val payloads = completedTelemetryPayloads(telemetryRoot)
+      payloads should have size 1
+      payloads.head.path("request_id").asText() shouldBe requestId
+      payloads.head.path("outcome").asText() shouldBe "create_executed"
+      assertW6SuccessFields(payloads.head)
+    }
+  }
+
+  describe("(5ac) already-applied source-version telemetry") {
+    it("records complete classification, pin, version, delta, and timing fields before publishing") {
+      val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ac").toURI)
+      withSparkConfs(
+        FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+        FeatureGate.TelemetryCampaignIdKey    -> "central-advance-fast",
+        FeatureGate.TelemetryCorrelationIdKey -> "correlation-t5ac",
+        FeatureGate.TelemetryPhaseKey         -> "source_refresh_staging"
+      ) {
+        spark.sql("CREATE TABLE IF NOT EXISTS src_t5ac_advance(id INT, amount INT) USING DELTA")
+        spark.sql("INSERT INTO src_t5ac_advance VALUES (1, 10)")
+        val oldVersion = DeltaTableVersion.requireLatest(spark, "src_t5ac_advance")
+
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5ac-create",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+        ) {
+          spark
+            .sql(
+              s"CREATE MATERIALIZED VIEW mv_t5ac_advance AS " +
+                s"SELECT id, SUM(amount) AS total FROM src_t5ac_advance VERSION AS OF $oldVersion GROUP BY id"
+            )
+            .collect()
+        }
+
+        spark.sql("INSERT INTO src_t5ac_advance VALUES (1, 5)")
+        val targetVersion = DeltaTableVersion.requireLatest(spark, "src_t5ac_advance")
+
+        def advance(requestId: String): Unit =
+          withSparkLocalProperties(
+            OpenIvmTelemetryContract.RequestIdProperty -> requestId,
+            OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+          ) {
+            spark
+              .sql(
+                s"ALTER MATERIALIZED VIEW mv_t5ac_advance ADVANCE SOURCE VERSIONS " +
+                  s"(src_t5ac_advance = $targetVersion)"
+              )
+              .collect()
+          }
+
+        advance("request-t5ac-advance")
+        val accepted = completedTelemetryPayloads(telemetryRoot)
+          .find(_.path("request_id").asText() == "request-t5ac-advance")
+          .getOrElse(fail("missing accepted source-version advancement telemetry"))
+        accepted.path("outcome").asText() shouldBe "incremental_executed"
+        assertW6SuccessFields(accepted)
+
+        advance("request-t5ac-advance")
+        completedTelemetryPayloads(telemetryRoot)
+          .find(_.path("request_id").asText() == "request-t5ac-advance") shouldBe Some(accepted)
+
+        withSparkLocalProperties(
+          OpenIvmTelemetryContract.RequestIdProperty -> "request-t5ac-already-applied",
+          OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.benchmark.mv_t5ac_advance"
+        ) {
+          spark
+            .sql(
+              s"ALTER MATERIALIZED VIEW mv_t5ac_advance ADVANCE SOURCE VERSIONS " +
+                s"(src_t5ac_advance = $targetVersion)"
+            )
+            .collect()
+        }
+      }
+
+      val advance = completedTelemetryPayloads(telemetryRoot)
+        .find(_.path("request_id").asText() == "request-t5ac-already-applied")
+        .getOrElse(fail("missing already-applied advancement telemetry"))
+      assertW6SuccessFields(advance)
+      advance.path("outcome").asText() shouldBe "source_versions_already_applied"
+      advance.path("operation").asText() shouldBe "refresh"
+      advance.path("pending_delta_count").asLong() shouldBe 0L
+      advance.path("time_travel_pin_status").asText() shouldBe "APPLIED"
+      advance.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      advance.path("delta_version_lookup_count").asLong() should be > 0L
+      val versions = advance.path("source_versions").elements().asScala.toSeq
+      versions should have size 1
+      versions.head.path("relation").asText() should endWith("src_t5ac_advance")
+      versions.head.path("start_version").asLong() shouldBe versions.head.path("end_version").asLong()
+    }
+  }
+
+  describe("(5b) snapshot-pin telemetry contract") {
+    it("reports APPLIED on CREATE and on a later REFRESH whose delta program carries no clause") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b")
+      spark.sql("INSERT INTO sales_t5b VALUES ('west', 200)")
+
+      val createMessages = withLogCapture { appender =>
+        spark.sql(
+          s"CREATE MATERIALIZED VIEW mv_t5b_pin AS SELECT region, SUM(amount) AS total " +
+            s"FROM sales_t5b VERSION AS OF $pinnedVersion GROUP BY region"
+        )
+        appender.messages
+      }
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_pin")).get
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      meta.timeTravelPins should have size 1
+      meta.timeTravelPins.head should endWith(s"=VERSION AS OF $pinnedVersion")
+
+      val createSpan = executionSpanPayloads(createMessages, "mv_t5b_pin")
+      createSpan should have size 1
+      createSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      createSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.PinsResolved
+      val createClassification = createMessages.filter(m =>
+        m.contains("[openivm-mv] view='`mv_t5b_pin`'") && m.contains("compiled_refresh_type=")
+      )
+      createClassification should have size 1
+      createClassification.head should include(s"time_travel_pin_status='${TimeTravelPinStatus.Applied}'")
+      createClassification.head should include(s"time_travel_pin_reason='${TimeTravelPinReason.PinsResolved}'")
+      createClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+      parseKv(createClassification.head)("time_travel_pins") shouldBe meta.timeTravelPins.mkString(";")
+
+      // A delta arriving after the pinned version is consumed but never applied,
+      // and the generated refresh program carries no temporal clause — the
+      // status must still come back APPLIED, from metadata.
+      spark.sql("INSERT INTO sales_t5b VALUES ('south', 300)")
+      val refreshMessages = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_pin").collect()
+        appender.messages
+      }
+
+      val refreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_pin")
+      refreshSpan should have size 1
+      refreshSpan.head.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.Applied
+      refreshSpan.head.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.PinsResolved
+      val refreshClassification = refreshMessages.filter(m =>
+        m.contains("[openivm-mv] refresh view='`mv_t5b_pin`'") && m.contains("time_travel_pin_status=")
+      )
+      refreshClassification should have size 1
+      refreshClassification.head should include(s"time_travel_pin_status='${TimeTravelPinStatus.Applied}'")
+      refreshClassification.head should include(s"time_travel_pin_reason='${TimeTravelPinReason.PinsResolved}'")
+      refreshClassification.head should include(s"time_travel_pins='${meta.timeTravelPins.mkString(";")}'")
+
+      // Operation-invariance: CREATE and REFRESH must publish the identical
+      // status/reason/identity triple for the same view.
+      val createKv  = parseKv(createClassification.head)
+      val refreshKv = parseKv(refreshClassification.head)
+      Seq("time_travel_pin_status", "time_travel_pin_reason", "time_travel_pins").foreach { key =>
+        withClue(s"$key: ") { refreshKv.get(key) shouldBe createKv.get(key) }
+      }
+
+      assertBagEqual(
+        "mv_t5b_pin",
+        s"SELECT region, SUM(amount) AS total FROM sales_t5b VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+    }
+
+    it("reports NOT_APPLICABLE for a view whose body carries no pin") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_nopin(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_nopin VALUES ('east', 100)")
+
+      val createMessages = withLogCapture { appender =>
+        spark.sql(
+          "CREATE MATERIALIZED VIEW mv_t5b_nopin AS " +
+            "SELECT region, SUM(amount) AS total FROM sales_t5b_nopin GROUP BY region"
+        )
+        appender.messages
+      }
+
+      val nopinCreateSpan = executionSpanPayloads(createMessages, "mv_t5b_nopin").head
+      nopinCreateSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.NotApplicable
+      nopinCreateSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.NoUserPin
+      createMessages.filter(m =>
+        m.contains("[openivm-mv] view='`mv_t5b_nopin`'") && m.contains("compiled_refresh_type=")
+      ) foreach { line =>
+        line should include(s"time_travel_pin_status='${TimeTravelPinStatus.NotApplicable}'")
+        line should include(s"time_travel_pin_reason='${TimeTravelPinReason.NoUserPin}'")
+        line should not include "time_travel_pins="
+      }
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5b_nopin")).get
+      meta.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.NotApplicable)
+      meta.timeTravelPinReason shouldBe Some(TimeTravelPinReason.NoUserPin)
+      meta.timeTravelPins shouldBe empty
+
+      spark.sql("INSERT INTO sales_t5b_nopin VALUES ('west', 200)")
+      val refreshMessages = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_nopin").collect()
+        appender.messages
+      }
+      val nopinRefreshSpan = executionSpanPayloads(refreshMessages, "mv_t5b_nopin").head
+      nopinRefreshSpan.path("time_travel_pin_status").asText() shouldBe TimeTravelPinStatus.NotApplicable
+      nopinRefreshSpan.path("time_travel_pin_reason").asText() shouldBe TimeTravelPinReason.NoUserPin
+    }
+
+    it("hard-fails CREATE for an unsupported cross-version pin instead of demoting it to COMPILE_FAILED") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_bad(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_bad VALUES ('east', 100)")
+      spark.sql("INSERT INTO sales_t5b_bad VALUES ('west', 200)")
+
+      // A source read at two versions carries live temporal semantics `split`
+      // refuses to lift, so the command must fail closed BEFORE compile with a
+      // non-demotable AnalysisException -- never persist a COMPILE_FAILED /
+      // FULL_REFRESH view that could silently maintain a frozen relation from
+      // live rows.
+      val error = intercept[AnalysisException] {
+        spark
+          .sql(
+            "CREATE MATERIALIZED VIEW mv_t5b_bad AS " +
+              "SELECT a.region, SUM(a.amount) AS total FROM sales_t5b_bad VERSION AS OF 0 a " +
+              "JOIN sales_t5b_bad VERSION AS OF 1 b ON a.region = b.region GROUP BY a.region"
+          )
+          .collect()
+      }
+      error.getMessage.toLowerCase should include("unsupported snapshot-pin shape")
+      classOf[org.openivm.spark.compiler.OpenIvmCompileException].isInstance(error) shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_t5b_bad")) shouldBe None
+    }
+
+    it("fails closed when persisted pin metadata disagrees with the view body") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_drift(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_drift VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b_drift")
+      spark.sql(
+        s"CREATE MATERIALIZED VIEW mv_t5b_drift AS SELECT region, SUM(amount) AS total " +
+          s"FROM sales_t5b_drift VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_drift")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinStatusKey -> TimeTravelPinStatus.NotApplicable)
+      )
+
+      spark.sql("INSERT INTO sales_t5b_drift VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_drift").collect()
+      }
+      failure.getMessage should include("snapshot-pin metadata disagrees with the view body")
+    }
+
+    it("fails closed when the persisted pin identity no longer matches the body") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_pindrift(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_pindrift VALUES ('east', 100)")
+      val pinnedVersion = DeltaTableVersion.latest(spark, "default.sales_t5b_pindrift")
+      spark.sql(
+        s"CREATE MATERIALIZED VIEW mv_t5b_pindrift AS SELECT region, SUM(amount) AS total " +
+          s"FROM sales_t5b_pindrift VERSION AS OF $pinnedVersion GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_pindrift")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinsKey -> "default.sales_t5b_pindrift=VERSION AS OF 99")
+      )
+
+      spark.sql("INSERT INTO sales_t5b_pindrift VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_pindrift").collect()
+      }
+      failure.getMessage should include("snapshot-pin metadata disagrees with the view body")
+      failure.getMessage should include("VERSION AS OF 99")
+    }
+
+    it("fails closed on a persisted status outside the contract vocabulary") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t5b_corrupt(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t5b_corrupt VALUES ('east', 100)")
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t5b_corrupt AS SELECT region, SUM(amount) AS total " +
+          "FROM sales_t5b_corrupt GROUP BY region"
+      )
+
+      val id   = TableIdentifier("mv_t5b_corrupt")
+      val meta = MvCatalog.lookup(spark, id).get
+      MvCatalog.updateProperties(
+        spark,
+        id,
+        meta.properties + (MvMetadata.TimeTravelPinStatusKey -> "MAYBE")
+      )
+
+      spark.sql("INSERT INTO sales_t5b_corrupt VALUES ('west', 200)")
+      val failure = intercept[IllegalStateException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5b_corrupt").collect()
+      }
+      // The message must show what was on disk, not its fail-closed reading.
+      failure.getMessage should include("recorded status='MAYBE'")
+    }
+
+    it("renders a quoted pin clause so the classification line stays machine-readable") {
+      // `TIMESTAMP AS OF '2024-01-01'` carries the same single quote the
+      // `[openivm-mv]` KV format uses as its field delimiter; unsanitized it
+      // truncates `time_travel_pins` to its prefix and the pinned value is lost.
+      val kv = MvCommandHelper.pinTelemetryKv(
+        TimeTravelPinStatus.Applied,
+        TimeTravelPinReason.PinsResolved,
+        Seq("default.sales=TIMESTAMP AS OF '2024-01-01'", "default.dim=VERSION AS OF 7")
+      )
+      val line   = s"[openivm-mv] view='`mv_kv`' $kv upstream_snapshot_trigger='default.sales'"
+      val fields = parseKv(line)
+
+      fields("time_travel_pin_status") shouldBe TimeTravelPinStatus.Applied
+      fields("time_travel_pin_reason") shouldBe TimeTravelPinReason.PinsResolved
+      fields("time_travel_pins") shouldBe
+        """default.sales=TIMESTAMP AS OF "2024-01-01";default.dim=VERSION AS OF 7"""
+      fields("upstream_snapshot_trigger") shouldBe "default.sales"
+
+      MvCommandHelper.pinTelemetryKv(TimeTravelPinStatus.NotApplicable, TimeTravelPinReason.NoUserPin, Nil) shouldBe
+        s"time_travel_pin_status='${TimeTravelPinStatus.NotApplicable}' " +
+        s"time_travel_pin_reason='${TimeTravelPinReason.NoUserPin}'"
     }
   }
 
@@ -374,10 +2065,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   // ---------------------------------------------------------------------------
-  // Test 11 — downstream demotion uses persisted cascade capability
+  // Test 11 — a non-cascade upstream drives snapshot triggers, not demotion
   // ---------------------------------------------------------------------------
-  describe("(11) MV-over-MV demotion uses the persisted cascade capability") {
-    it("demotes downstreams and synthesizes OVERWRITE triggers when an upstream opts out of cascade view-delta") {
+  describe("(11) MV-over-MV cascade capability drives snapshot triggers, not demotion") {
+    it(
+      "keeps downstreams incremental and recomputes only the trigger batch when an upstream opts out of cascade view-delta"
+    ) {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t11(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t11 VALUES ('east', 100), ('west', 200)")
       spark.sql("CREATE MATERIALIZED VIEW mv_t11_up AS SELECT region, amount FROM sales_t11")
@@ -395,9 +2088,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           "SELECT region, COUNT(*) AS cnt FROM mv_t11_up GROUP BY region"
       )
 
+      // An upstream that cannot cascade no longer costs the dependent its
+      // incremental refresh type: the OVERWRITE trigger below routes the
+      // affected batch through a recompute, and every other batch stays
+      // incremental.
       val downstreamMeta = MvCatalog.lookup(spark, TableIdentifier("mv_t11_down")).get
-      downstreamMeta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      downstreamMeta.refreshTypeName shouldBe "FULL_REFRESH"
+      downstreamMeta.refreshType should not be RefreshTypeCode.FullRefresh
+      downstreamMeta.refreshTypeName should not be RefreshTypeCode.FullRefreshName
 
       spark.sql("INSERT INTO sales_t11 VALUES ('east', 50), ('north', 300)")
       spark.sql("REFRESH MATERIALIZED VIEW mv_t11_up")
@@ -421,6 +2118,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val mv = spark.table("mv_t11_down").select("region", "cnt")
       mv.exceptAll(expected).count() shouldBe 0L
       expected.exceptAll(mv).count() shouldBe 0L
+
+      // Still incremental after the trigger batch was absorbed.
+      MvCatalog
+        .lookup(spark, TableIdentifier("mv_t11_down"))
+        .get
+        .refreshType should not be RefreshTypeCode.FullRefresh
     }
   }
 
@@ -500,6 +2203,277 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val mvRefresh       = spark.table("mv_t13_value_join").select("id", "last_name", "priority")
       mvRefresh.exceptAll(expectedRefresh).count() shouldBe 0L
       expectedRefresh.exceptAll(mvRefresh).count() shouldBe 0L
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 14 — unrelated CREATE and REFRESH must overlap
+  // ---------------------------------------------------------------------------
+  describe("(14) Unrelated CREATE and REFRESH overlap") {
+    it("CREATE on one MV does not take a global lock that blocks REFRESH on another MV") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14_create(region STRING, amount INT) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14_refresh(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t14_create VALUES ('east', 10), ('west', 20), ('north', 30)")
+      spark.sql("INSERT INTO sales_t14_refresh VALUES ('east', 5), ('west', 7)")
+
+      val createSql  = "SELECT region, SUM(amount) AS total FROM sales_t14_create GROUP BY region"
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM sales_t14_refresh GROUP BY region"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_refresh AS $refreshSql")
+      spark.sql("INSERT INTO sales_t14_refresh VALUES ('north', 11)")
+
+      val barrier = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+
+      CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
+        withPool(2) { implicit ec =>
+          barrier.use {
+            val createFuture =
+              Future { spark.sql(s"CREATE MATERIALIZED VIEW mv_t14_create AS $createSql").collect() }
+            withClue(s"CREATE never reached the before-create hook (${barrier.describe}): ") {
+              barrier.awaitEntered() shouldBe true
+            }
+            val refreshFuture =
+              Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t14_refresh").collect() }
+            try awaitResult(refreshFuture, CommandObservationBudget)
+            catch {
+              case _: TimeoutException =>
+                fail(
+                  s"REFRESH on mv_t14_refresh did not complete within $CommandObservationBudget while " +
+                    s"CREATE of mv_t14_create was parked before its body — CREATE is holding a lock " +
+                    s"that is not scoped to its own view (${barrier.describe})"
+                )
+            }
+            assertStillParked(barrier, createFuture)
+            createFuture.isCompleted shouldBe false
+            barrier.release()
+            awaitResult(createFuture)
+            barrier.parkCount shouldBe 1
+          }
+        }
+      }
+
+      assertBagEqual("mv_t14_refresh", refreshSql)
+      assertBagEqual("mv_t14_create", createSql)
+    }
+  }
+
+  describe("(14a) Same-MV CREATE execution spans") {
+    it("emit one primary span per CREATE and capture queued same-MV lock waits") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t14a_create(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t14a_create VALUES ('east', 10), ('west', 20)")
+
+      val createSql = "SELECT region, SUM(amount) AS total FROM sales_t14a_create GROUP BY region"
+      val barrier   = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+
+      val payloads = withLogCapture { appender =>
+        CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
+          withPool(2) { implicit ec =>
+            barrier.use {
+              val create1 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-create-1",
+                  "openivm.node_id"    -> "model.create.one"
+                ) {
+                  spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+                }
+              }
+              withClue(s"first CREATE never reached the before-create hook (${barrier.describe}): ") {
+                barrier.awaitEntered() shouldBe true
+              }
+              val create2 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-create-2",
+                  "openivm.node_id"    -> "model.create.two"
+                ) {
+                  spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t14a_create_span AS $createSql").collect()
+                }
+              }
+              Thread.sleep(150L)
+              create2.isCompleted shouldBe false
+              assertStillParked(barrier, create1)
+              barrier.release()
+              awaitResult(create1)
+              awaitResult(create2)
+            }
+          }
+        }
+        executionSpanPayloads(appender.messages, "mv_t14a_create_span")
+      }
+
+      val byRequest = payloads.groupBy(_.path("request_id").asText())
+      byRequest.keySet shouldBe Set("req-create-1", "req-create-2")
+      byRequest.values.foreach(_.size shouldBe 1)
+      byRequest("req-create-1").head.path("dbt_node_id").asText() shouldBe "model.create.one"
+      val waitingCreate = byRequest("req-create-2").head
+      waitingCreate.path("dbt_node_id").asText() shouldBe "model.create.two"
+      waitingCreate.path("same_mv_lock_wait_ms").asLong() should be > 0L
+
+      assertBagEqual("mv_t14a_create_span", createSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 15 — same-MV refreshes serialize and the queued one sees newer deltas
+  // ---------------------------------------------------------------------------
+  describe("(15) Same-MV REFRESH requests serialize and re-read queued deltas") {
+    it("queues by fully-qualified MV name so the waiting refresh sees a later batch exactly once") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t15(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t15 VALUES ('seed', 1)")
+
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM sales_t15 GROUP BY region"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t15_serial AS $refreshSql")
+
+      spark.sql(
+        "INSERT INTO sales_t15 " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
+      )
+
+      val payloads = withLogCapture { appender =>
+        withPool(2) { implicit ec =>
+          val refresh1 = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-refresh-1",
+              "openivm.node_id"    -> "model.refresh.one"
+            ) {
+              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+            }
+          }
+          Thread.sleep(150L)
+          val refresh2 = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-refresh-2",
+              "openivm.node_id"    -> "model.refresh.two"
+            ) {
+              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+            }
+          }
+          Thread.sleep(150L)
+          spark.sql(
+            "INSERT INTO sales_t15 " +
+              "SELECT CASE " +
+              "  WHEN id % 4 = 0 THEN 'east' " +
+              "  WHEN id % 4 = 1 THEN 'west' " +
+              "  WHEN id % 4 = 2 THEN 'north' " +
+              "  ELSE 'south' END AS region, " +
+              "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+          )
+
+          awaitResult(refresh1, 600.seconds)
+          refresh2.isCompleted shouldBe false
+          awaitResult(refresh2, 600.seconds)
+        }
+        executionSpanPayloads(appender.messages, "mv_t15_serial")
+      }
+
+      val byRequest = payloads.groupBy(_.path("request_id").asText())
+      byRequest.keySet shouldBe Set("req-refresh-1", "req-refresh-2")
+      byRequest.values.foreach(_.size shouldBe 1)
+      byRequest("req-refresh-1").head.path("dbt_node_id").asText() shouldBe "model.refresh.one"
+      val waitingRefresh = byRequest("req-refresh-2").head
+      waitingRefresh.path("dbt_node_id").asText() shouldBe "model.refresh.two"
+      waitingRefresh.path("same_mv_lock_wait_ms").asLong() should be > 0L
+
+      assertBagEqual("mv_t15_serial", refreshSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 16 — DROP beside an unrelated REFRESH must not share a global lock
+  // ---------------------------------------------------------------------------
+  describe("(16) DROP beside an unrelated REFRESH") {
+    it("drops one MV while another refresh is in flight without cross-MV blocking") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t16_drop(region STRING, amount INT) USING DELTA")
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t16_keep(region STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t16_drop VALUES ('east', 3), ('west', 4)")
+      spark.sql("INSERT INTO sales_t16_keep VALUES ('east', 8), ('west', 9)")
+
+      val keepSql = "SELECT region, SUM(amount) AS total FROM sales_t16_keep GROUP BY region"
+      spark.sql(
+        "CREATE MATERIALIZED VIEW mv_t16_drop AS SELECT region, SUM(amount) AS total FROM sales_t16_drop GROUP BY region"
+      )
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t16_keep AS $keepSql")
+      spark.sql(
+        "INSERT INTO sales_t16_keep " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
+      )
+
+      withPool(2) { implicit ec =>
+        val refreshFuture = Future { spark.sql("REFRESH MATERIALIZED VIEW mv_t16_keep").collect() }
+        Thread.sleep(150L)
+        val dropFuture = Future { spark.sql("DROP MATERIALIZED VIEW mv_t16_drop").collect() }
+        awaitResult(dropFuture, 300.seconds)
+        refreshFuture.isCompleted shouldBe false
+        awaitResult(refreshFuture, 600.seconds)
+      }
+
+      spark.catalog.tableExists("mv_t16_drop") shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_t16_drop")) shouldBe empty
+      assertBagEqual("mv_t16_keep", keepSql)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 17 — failed REFRESH can retry without replaying a successful batch
+  // ---------------------------------------------------------------------------
+  describe("(17) REFRESH failure + retry does not double-apply staged changes") {
+    it("retries a compensated WINDOW_PARTITION refresh from a fresh command state") {
+      spark.sql("CREATE TABLE IF NOT EXISTS sales_t18_window(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      spark.sql(
+        "INSERT INTO sales_t18_window " +
+          "SELECT id, 1 AS seq, id AS payload FROM range(1001)"
+      )
+
+      val viewSql =
+        "SELECT id, seq, payload, " +
+          "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
+          "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
+          "FROM sales_t18_window"
+      val downstreamSql = "SELECT id, seq, payload FROM mv_t18_window"
+
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t18_window AS $viewSql")
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t18_downstream AS $downstreamSql")
+      spark.sql(
+        "CREATE TABLE mv_t18_before_failure USING DELTA AS " +
+          "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_window"
+      )
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t18_window")).get
+      meta.refreshType shouldBe RefreshTypeCode.WindowPartition
+      meta.refreshTypeName shouldBe "WINDOW_PARTITION"
+
+      assertBagEqual("mv_t18_window", viewSql)
+      assertBagEqual("mv_t18_downstream", downstreamSql)
+
+      spark.sql("UPDATE sales_t18_window SET payload = payload + 100000 WHERE seq = 1")
+      spark.sql(
+        "INSERT INTO sales_t18_window " +
+          "SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001)"
+      )
+      spark.sql("DELETE FROM sales_t18_window WHERE seq = 1 AND id % 11 = 0")
+
+      RefreshFailureInjection.failNextWindowCascadeInsert(spark)
+      intercept[RuntimeException] {
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t18_window")
+      }
+
+      assertSqlBagEqual(
+        "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_window",
+        "SELECT id, seq, payload, previous_payload, row_num FROM mv_t18_before_failure"
+      )
+
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t18_window")
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t18_downstream")
+
+      assertBagEqual("mv_t18_window", viewSql)
+      assertBagEqual("mv_t18_downstream", downstreamSql)
     }
   }
 

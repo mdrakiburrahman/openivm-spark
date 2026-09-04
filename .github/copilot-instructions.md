@@ -19,7 +19,7 @@ it through `spark-ext/dev/dev.sh`:
 ./spark-ext/dev/dev.sh test                             # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
 ./spark-ext/dev/dev.sh verify                           # lint + compile + Test/compile + assembly + test
-./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8 # cap forked-test concurrency
+./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8    # cap forked-test concurrency
 PRE_CLEAN=1 ./spark-ext/dev/dev.sh verify               # nuke every running container first, then verify
 ```
 
@@ -56,10 +56,11 @@ Read top-to-bottom; each module depends only on the one above it
   (ANTLR4 grammar `IvmSqlBase.g4`), an `IvmDmlInterceptorRule` (resolution
   rule), and an `IvmStrategy` (planner). All behaviour is gated by
   `spark.openivm.enabled` (`FeatureGate.EnabledKey`, default `false`).
-- **Parser**: `IvmSqlBase.g4` only declares `CREATE / REFRESH / DROP
-MATERIALIZED VIEW`. Everything else (including the MV body, captured as raw
+- **Parser**: `IvmSqlBase.g4` declares `CREATE / REFRESH / DROP MATERIALIZED
+VIEW` plus exact-map `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`.
+Everything else (including the MV body, captured as raw
   text `.+?`) is re-parsed via Spark's own `ParserInterface`. No `REFRESH
-EVERY`, no `ALTER MATERIALIZED VIEW`, no double-quoted identifiers.
+EVERY`, no generic ALTER surface, no double-quoted identifiers.
 - **MV-body constraint**: the body must parse in **both** DuckDB (for openivm
   classification) and Spark — use only the intersection of both dialects.
 - **DML interception**: `IvmDmlInterceptorRule` tees every DML on a tracked

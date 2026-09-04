@@ -37,9 +37,20 @@ object LptsSparkDialect {
     *
     * Type (group 2): one or more uppercase letters optionally followed by
     * `(digits[, digits])`, e.g. `TIMESTAMP`, `DECIMAL(10,2)`.
+    *
+    * The leading `(?<![a-zA-Z0-9_.])` negative lookbehind anchors the match to a
+    * token boundary. Without it, `Matcher.find` restarts one character at a time
+    * inside a long identifier-class run (the group-1 class includes `.`), and the
+    * greedy `[a-zA-Z0-9_.]*` re-scans to the run's end from every offset — O(L^2)
+    * on a single long token that is NOT followed by `::`. A large LPTS refresh SQL
+    * that contained such a token drove a single `translate` call to spend 30+
+    * minutes here (openivm SIMPLE_PROJECTION has-data probe). The lookbehind makes
+    * interior offsets fail in O(1), restoring linear scanning; leftmost-match
+    * semantics are unchanged for all well-formed SQL (tokens always begin at a
+    * non-token-char boundary).
     */
   private val CastRe =
-    """((?:[a-zA-Z_][a-zA-Z0-9_.]*|[0-9]+(?:\.[0-9]+)?|__STRLIT_[0-9]+__))::([A-Z]+(?:\([0-9]+(?:,\s*[0-9]+)?\))?)""".r
+    """(?<![a-zA-Z0-9_.])((?:[a-zA-Z_][a-zA-Z0-9_.]*|[0-9]+(?:\.[0-9]+)?|__STRLIT_[0-9]+__))::([A-Z]+(?:\([0-9]+(?:,\s*[0-9]+)?\))?)""".r
 
   /** Matches a closing paren immediately followed by `::TYPE`.
     *
@@ -59,6 +70,16 @@ object LptsSparkDialect {
     * standard `COUNT(*)` form.
     */
   private val CountStarRe = """(?i)\bcount_star\s*\(\s*\)""".r
+
+  /** Bare `count()` (empty argument list) — DuckDB serializes a windowed
+    * `COUNT(*) OVER (...)` as an argument-less `count()` window function (the
+    * star is implicit in its plan node). Re-emitted verbatim this is invalid in
+    * Spark, which rejects a zero-arg `count` (`WRONG_NUM_ARGS`). A zero-arg
+    * `count()` is never legal SQL, so it is unambiguously the star form and is
+    * rewritten to `COUNT(*)`. The `_star` spelling is matched separately above;
+    * `\bcount` won't match inside `approx_count_distinct` / `bit_count(x)`.
+    */
+  private val CountEmptyRe = """(?i)\bcount\s*\(\s*\)""".r
 
   /** `error(<args>)` — DuckDB function used by lpts when emitting assertion-style
     * checks (e.g. divide-by-zero guards in scalar-subquery rewrites).  Spark has
@@ -97,25 +118,35 @@ object LptsSparkDialect {
     *   - [[rewriteNowTimestamp]] must precede [[rewritePostfixCasts]] so that
     *     `now()::timestamp` becomes `current_timestamp()` rather than
     *     `CAST(now() AS timestamp)`.
-    *   - [[rewriteDoubleQuotedIdentifiers]] runs after all other passes so it
-    *     normalises DuckDB double-quoted column names produced by openivm
-    *     (e.g. `AS "name"`) to Spark backtick-quoted identifiers.
+    *   - [[rewriteDoubleQuotedIdentifiers]] runs before [[rewriteTrimTwoArg]]
+    *     so DuckDB's `"trim"(...)` spelling has already become the
+    *     backtick-quoted `` `trim`(...) `` [[SparkFunctionShimSql]] matches.
+    *   - [[rewriteTrimTwoArg]] must run before [[rewriteBareBackslashLiterals]]
+    *     so the latter sees the (possibly relocated, never mutated) literal
+    *     arguments in their final position.
+    *   - [[rewriteBareBackslashLiterals]] runs LAST (outermost), after every
+    *     other pass has finished producing the final literal text, so it
+    *     sees the exact string-literal content Spark's parser will receive.
     */
   def translate(sql: String): String =
-    rewriteDoubleQuotedIdentifiers(
-      rewriteErrorFn(
-        rewriteCountStar(
-          rewriteIntervalLiterals(
-            rewriteToTemporalUnit(
-              rewriteGenerateSeries(
-                rewriteBareHugeIntCast(
-                  rewriteBareVarcharCast(
-                    rewritePostfixCasts(
-                      rewriteStructExtract(
-                        rewriteTimestampWithTimeZone(
-                          rewriteSparkFunctionInlinings(
-                            rewriteToTimestampDoubleCast(
-                              rewriteNowTimestamp(sql)
+    rewriteBareBackslashLiterals(
+      rewriteTrimTwoArg(
+        rewriteDoubleQuotedIdentifiers(
+          rewriteErrorFn(
+            rewriteCountStar(
+              rewriteIntervalLiterals(
+                rewriteToTemporalUnit(
+                  rewriteGenerateSeries(
+                    rewriteBareHugeIntCast(
+                      rewriteBareVarcharCast(
+                        rewritePostfixCasts(
+                          rewriteStructExtract(
+                            rewriteTimestampWithTimeZone(
+                              rewriteSparkFunctionInlinings(
+                                rewriteToTimestampDoubleCast(
+                                  rewriteNowTimestamp(sql)
+                                )
+                              )
                             )
                           )
                         )
@@ -155,6 +186,8 @@ object LptsSparkDialect {
     *   - `strptime(s, '%Y-%m-%d %H:%M:%S')`       -> `to_timestamp(s)`
     *   - `strptime(s, fmt)`                       -> `to_timestamp(s, fmt)`
     *   - `strftime(d, fmt)`                       -> `date_format(d, fmt)`
+    *   - `__sparkfn_make_interval` marker body    -> `make_interval(...)`
+    *   - `__sparkfn_get_json_object` marker body  -> `get_json_object(...)`
     *   - `last_value(expr IGNORE NULLS) OVER (...)` -> `last_value(expr, true) OVER (...)`
     *   - `last(expr) OVER (...)`                  -> `last_value(expr) OVER (...)`
     *
@@ -172,6 +205,16 @@ object LptsSparkDialect {
       regexpMatches.replaceAllIn(sql, "regexp_like(")
     )
   }
+
+  /** Rewrites DuckDB's native positional 2-arg `` `trim`(<str>, <chars>) ``
+    * call (produced once [[rewriteDoubleQuotedIdentifiers]] has turned
+    * DuckDB's own `"trim"(...)` spelling into a Spark-legal backtick
+    * identifier) into Spark's unambiguous ANSI `TRIM(<chars> FROM <str>)`
+    * form. See [[SparkFunctionShimSql.rewriteTrimTwoArgToAnsiFrom]] for why
+    * the positional argument order must be swapped, not merely renamed.
+    */
+  private[compiler] def rewriteTrimTwoArg(sql: String): String =
+    SparkFunctionShimSql.rewriteTrimTwoArgToAnsiFrom(sql)
 
   private def normalizeSparkTypeName(rawType: String): String =
     rawType.toUpperCase match {
@@ -484,7 +527,7 @@ object LptsSparkDialect {
 
   /** Rewrites DuckDB's `count_star()` to standard SQL `COUNT(*)`. */
   private[compiler] def rewriteCountStar(sql: String): String =
-    CountStarRe.replaceAllIn(sql, "COUNT(*)")
+    CountEmptyRe.replaceAllIn(CountStarRe.replaceAllIn(sql, "COUNT(*)"), "COUNT(*)")
 
   /** Rewrites bare `error(...)` to Spark's `raise_error(...)`.
     *
@@ -600,5 +643,105 @@ object LptsSparkDialect {
     literals.zipWithIndex.foldLeft(rewritten) { case (s, (literal, idx)) =>
       s.replace(s"__STRLIT_${idx}__", literal)
     }
+  }
+
+  /** Rewrites every single-quoted string literal in the final emitted
+    * refresh SQL that contains a backslash or an escaped quote into an
+    * unambiguous `concat(...)` / `chr(...)` expression Spark can re-parse
+    * exactly as DuckDB intended, instead of leaving it as DuckDB-native
+    * literal syntax.
+    *
+    * DuckDB's own literal syntax recognizes only doubled-quote (`''`) as an
+    * escape (a bare backslash has no special meaning and is serialized raw).
+    * This project's Spark build, however, does NOT reliably decode either
+    * of those forms the way Spark itself needs to re-parse them:
+    *   - A bare `\` immediately before the closing quote (or before any
+    *     character) desyncs Spark's mandatory two-character escape-pair
+    *     scanning.
+    *   - Two adjacent `'` tokens are treated as the boundary between two
+    *     (here, empty) adjacent string literals that are silently
+    *     concatenated, not as an escaped quote -- so `''''` (DuckDB's
+    *     encoding of a lone `'` character) would round-trip to Spark as an
+    *     EMPTY string, silently dropping the quote.
+    *
+    * Re-escaping instead to Spark's own backslash-escape convention
+    * (`\\`, `\'`) would fix a single `translate` application, but this
+    * method is invoked twice on the same SQL text in production (once while
+    * parsing the compiled initial-load SQL, again by the extension when
+    * materializing it), and backslash-escaped text is INDISTINGUISHABLE at
+    * the character level from raw DuckDB-native text containing the same
+    * literal backslash/quote characters -- so a second application would
+    * mis-decode the first application's own output (double-escaping it).
+    * `concat(chr(N), ...)` sidesteps the ambiguity entirely: the affected
+    * characters are lifted out of string-literal syntax altogether (as a
+    * decimal codepoint, `92` for `\`, `39` for `'`), so nothing resembling
+    * a special character remains inside any surviving quoted segment, and a
+    * second scan is a guaranteed no-op -- a genuine fixed point.
+    *
+    * This is the refresh-SQL-emission counterpart of
+    * [[SparkFunctionShimSql.translateSparkStringLiteralEscapes]], which
+    * performs the opposite (Spark → DuckDB) translation on the way in — for
+    * example, the `normalize_os_name` fragment's `'\\'` (Spark: one
+    * backslash) round-trips to DuckDB's `'\'` (one raw backslash, rewritten
+    * here to `concat(chr(92))`) and its `'\''` (Spark: one quote) round-trips
+    * to DuckDB's `''''` (rewritten here to `concat(chr(39))`).
+    *
+    * Only single-quoted literal regions are rewritten; everything else is
+    * copied through unchanged. A no-op for the overwhelming majority of
+    * literals, which contain neither character.
+    */
+  private[compiler] def rewriteBareBackslashLiterals(sql: String): String = {
+    val out = new StringBuilder(sql.length)
+    var i   = 0
+    while (i < sql.length) {
+      if (sql.charAt(i) == '\'') {
+        i += 1
+        val content = new StringBuilder
+        var closed  = false
+        while (i < sql.length && !closed) {
+          if (sql.charAt(i) == '\'') {
+            if (i + 1 < sql.length && sql.charAt(i + 1) == '\'') { content += '\''; i += 2 }
+            else { closed = true; i += 1 }
+          } else {
+            content += sql.charAt(i)
+            i += 1
+          }
+        }
+        val text = content.toString
+        if (text.indexOf('\\') < 0 && text.indexOf('\'') < 0) {
+          out += '\''
+          out ++= text
+          out += '\''
+        } else {
+          out ++= unsafeLiteralToConcatExpr(text)
+        }
+      } else {
+        out += sql.charAt(i)
+        i += 1
+      }
+    }
+    out.toString
+  }
+
+  /** Renders a decoded literal VALUE (containing at least one backslash or
+    * quote character) as a `concat(...)` expression: runs of ordinary
+    * characters become plain `'...'` segments, and each backslash/quote
+    * character becomes `chr(92)`/`chr(39)` respectively. See
+    * [[rewriteBareBackslashLiterals]] for why this representation -- rather
+    * than a backslash-escaped literal -- is required for idempotency.
+    */
+  private def unsafeLiteralToConcatExpr(text: String): String = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    val seg   = new StringBuilder
+    def flushSeg(): Unit = {
+      if (seg.nonEmpty) { parts += s"'${seg.toString}'"; seg.clear() }
+    }
+    text.foreach {
+      case '\\' => flushSeg(); parts += "chr(92)"
+      case '\'' => flushSeg(); parts += "chr(39)"
+      case c    => seg += c
+    }
+    flushSeg()
+    s"concat(${parts.mkString(", ")})"
   }
 }

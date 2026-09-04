@@ -3,6 +3,7 @@ package org.openivm.spark.common
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.StructType
 
@@ -62,9 +63,10 @@ object WorkloadFactsRegistry {
   def forRefresh(): WorkloadFactsRegistry = new WorkloadFactsRegistry
 
   private[common] def tableFacts(spark: SparkSession, table: String): WorkloadConstraintFacts = {
-    val properties = tableProperties(spark, table)
-    val schema     = tableSchema(spark, table)
-    val generated  = schema.toSeq.flatMap(generatedColumn(table, _))
+    val catalogTable = resolveCatalogTable(spark, table)
+    val properties   = tableProperties(spark, table, catalogTable)
+    val schema       = tableSchema(spark, table)
+    val generated    = schema.toSeq.flatMap(generatedColumn(table, _))
     val identityKeys = generated
       .filter(_.expression == IdentityGeneratedValue)
       .map(col => UniqueKey(table, Seq(col.column)))
@@ -177,21 +179,58 @@ object WorkloadFactsRegistry {
     }
   }
 
-  private def tableProperties(spark: SparkSession, table: String): Map[String, String] =
-    deltaProperties(spark, table) ++ catalogProperties(spark, table)
+  /**
+   * Resolve the source table's `CatalogTable` exactly once.
+   *
+   * Every Hive metastore read runs inside Spark's globally synchronized Hive
+   * client, so each redundant lookup is a serialized section shared by all
+   * concurrent commands. `getTableMetadata` is the single call that both
+   * [[catalogProperties]] and [[deltaProperties]] need, so it is issued once
+   * and the result is threaded through.
+   *
+   * Returning `None` reproduces the previous per-helper `catch` fallbacks: a
+   * `delta.`/path`` identifier fails `requireDbExists`, a temp view is not an
+   * external-catalog table, and a missing table throws — in all three cases
+   * the old code also degraded to the path-based/empty behaviour.
+   */
+  private def resolveCatalogTable(spark: SparkSession, table: String): Option[CatalogTable] =
+    try Some(spark.sessionState.catalog.getTableMetadata(parseTableIdentifier(spark, table)))
+    catch { case _: Throwable => None }
 
-  private def deltaProperties(spark: SparkSession, table: String): Map[String, String] =
+  private def tableProperties(
+      spark: SparkSession,
+      table: String,
+      catalogTable: Option[CatalogTable]
+  ): Map[String, String] =
+    deltaProperties(spark, table, catalogTable) ++ catalogProperties(catalogTable)
+
+  /**
+   * `DeltaLog.forTable(spark, id)` resolves `id` through
+   * `SessionCatalog.getTableMetadata` and then delegates to
+   * `DeltaLog.forTable(spark, catalogTable)`, so passing the already-resolved
+   * `CatalogTable` is the identical code path with the metastore round-trip
+   * removed. The identifier form is kept for the unresolved case, where
+   * `DeltaLog` still has to run its own `delta.`/path`` detection.
+   */
+  private def deltaProperties(
+      spark: SparkSession,
+      table: String,
+      catalogTable: Option[CatalogTable]
+  ): Map[String, String] =
     try {
-      DeltaLog.forTable(spark, parseTableIdentifier(spark, table)).update().metadata.configuration
+      val log = catalogTable match {
+        case Some(resolved) => DeltaLog.forTable(spark, resolved)
+        case None           => DeltaLog.forTable(spark, parseTableIdentifier(spark, table))
+      }
+      log.update().metadata.configuration
     } catch {
       case _: Throwable =>
         try DeltaLog.forTable(spark, new Path(table)).update().metadata.configuration
         catch { case _: Throwable => Map.empty[String, String] }
     }
 
-  private def catalogProperties(spark: SparkSession, table: String): Map[String, String] =
-    try spark.sessionState.catalog.getTableMetadata(parseTableIdentifier(spark, table)).properties
-    catch { case _: Throwable => Map.empty[String, String] }
+  private def catalogProperties(catalogTable: Option[CatalogTable]): Map[String, String] =
+    catalogTable.fold(Map.empty[String, String])(_.properties)
 
   private def tableSchema(spark: SparkSession, table: String): StructType =
     try spark.table(table).schema

@@ -8,6 +8,9 @@
  *
  *   REFRESH MATERIALIZED VIEW <multipart_identifier>
  *
+ *   ALTER MATERIALIZED VIEW <multipart_identifier>
+ *     ADVANCE SOURCE VERSIONS (<source>=<version> [, ...])
+ *
  *   DROP MATERIALIZED VIEW [IF EXISTS] <multipart_identifier>
  *
  *   EXPLAIN CREATE MATERIALIZED VIEW ... AS <query>       (dry-run verdict)
@@ -45,6 +48,7 @@ ivmStatement
     | showRefreshSql
     | createMaterializedView
     | refreshMaterializedView
+    | advanceMaterializedViewSourceVersions
     | dropMaterializedView
     | showOpenivmRefreshProfile
     | showOpenivmQueryLog
@@ -77,6 +81,15 @@ showRefreshSql
 
 refreshMaterializedView
     : REFRESH MATERIALIZED VIEW multipartIdentifier
+    ;
+
+advanceMaterializedViewSourceVersions
+    : ALTER MATERIALIZED VIEW multipartIdentifier
+      ADVANCE SOURCE VERSIONS '(' sourceVersionEntry (',' sourceVersionEntry)* ')'
+    ;
+
+sourceVersionEntry
+    : multipartIdentifier EQ INTEGER_VALUE
     ;
 
 dropMaterializedView
@@ -128,13 +141,18 @@ identifier
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
-    | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR
+    | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
+    | SOURCE | VERSIONS
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
 MATERIALIZED  : [Mm][Aa][Tt][Ee][Rr][Ii][Aa][Ll][Ii][Zz][Ee][Dd];
 VIEW          : [Vv][Ii][Ee][Ww];
 REFRESH       : [Rr][Ee][Ff][Rr][Ee][Ss][Hh];
+ALTER         : [Aa][Ll][Tt][Ee][Rr];
+ADVANCE       : [Aa][Dd][Vv][Aa][Nn][Cc][Ee];
+SOURCE        : [Ss][Oo][Uu][Rr][Cc][Ee];
+VERSIONS      : [Vv][Ee][Rr][Ss][Ii][Oo][Nn][Ss];
 DROP          : [Dd][Rr][Oo][Pp];
 IF            : [Ii][Ff];
 NOT           : [Nn][Oo][Tt];

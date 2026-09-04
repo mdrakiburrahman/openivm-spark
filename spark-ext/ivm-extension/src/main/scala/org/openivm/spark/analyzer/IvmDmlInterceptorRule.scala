@@ -12,6 +12,7 @@ import org.rocksdb.RocksDBException
 
 import java.time.format.DateTimeFormatter
 import java.time.{Instant, ZoneOffset}
+import java.util.UUID
 
 /**
  * Catalyst resolution rule that intercepts V2 DML operations on base tables
@@ -297,7 +298,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
       .ofPattern("yyyy-MM-dd'T'HH-mm-ss.SSS'Z'")
       .withZone(ZoneOffset.UTC)
       .format(Instant.now())
-    s"$warehouse/_ivm/staging/$safeTable/$opType/$txnTs"
+    s"$warehouse/_ivm/staging/$safeTable/$opType/$txnTs-${UUID.randomUUID()}"
   }
 }
 

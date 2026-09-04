@@ -1,12 +1,13 @@
 package org.openivm.spark.compiler
 
 import java.io.{BufferedReader, File, InputStreamReader}
-import java.nio.file.{Files, Path}
-import java.util.Comparator
+import java.nio.file.{Files, Path, Paths}
+import java.util.{Comparator, Locale}
 import java.util.concurrent.{Callable, Executors, TimeUnit}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -23,14 +24,40 @@ final case class CompiledRefresh(
   *   keys of [[sources]]) to the fully-qualified Spark table name as it should
   *   appear in the rewritten initial-load SQL. Used to translate
   *   `memory.main.<short>` references emitted by openivm into the correct
-  *   Spark identifier. Empty by default — callers that don't need rewriting
-  *   can leave it unset.
+  *   Spark identifier for an UNPINNED source, and (via `stripDbQualifiers`) to
+  *   forward-strip qualifiers for the DuckDB compile copy. It is the
+  *   user-friendly overlay ONLY — it is never used as the execution path of a
+  *   pinned read. Empty by default — callers that don't need rewriting can
+  *   leave it unset.
+  * @param sourceSnapshotPinnedPaths Optional map from short table name to the
+  *   VERIFIED physical `DeltaLog.dataPath` the source's snapshot pin was
+  *   resolved to (the resolved binding's
+  *   `ResolvedSnapshotPin.operationalSource.deltaLogDataPath`). Every source
+  *   pinned in [[viewSql]] MUST have an entry here: [[OpenIvmCompiler.parseInitialLoadSql]]
+  *   emits each pinned initial-load read as ``delta.`<verified path>` <clause>``
+  *   so the CTAS at CREATE binds to the exact Delta table the identity was
+  *   verified against (closing the alias-rebind TOCTOU). A pinned source with
+  *   no verified path is a hard [[org.openivm.spark.common.PinnedSourcePathMissingException]]
+  *   raised BEFORE initial-load SQL is emitted — never a logical-name fallback
+  *   or FULL_REFRESH demotion. Empty by default (no pins).
+  *
+  *   Command-layer integration: at every compile site (CREATE, REFRESH, and the
+  *   dry-compile probes) populate this from the command agent's shared binding
+  *   helper `MvCommandHelper.pinnedPathBindingsByShort(pinBinding)`
+  *   (`short -> (verifiedPath, clause)`) as
+  *   `sourceSnapshotPinnedPaths = pinnedPathBindingsByShort(pinBinding).map { case (s, (p, _)) => s -> p }`.
+  *   Only the PATH half is threaded here — the compiler re-derives the exact
+  *   VERSION/TIMESTAMP clause from `viewSql` itself; both originate from the one
+  *   shared `requirePinBinding`, so they agree. Keys are `pin.shortName`, so a
+  *   self-joined/repeated pinned source collapses to one entry and is applied to
+  *   every emitted occurrence.
   */
 final case class CompileRequest(
     viewName: String,
     viewSql: String,
     sources: Map[String, StructType],
     sourceQualifiedNames: Map[String, String] = Map.empty,
+    sourceSnapshotPinnedPaths: Map[String, String] = Map.empty,
     facts: WorkloadFacts = WorkloadFacts()
 )
 
@@ -52,7 +79,8 @@ final class OpenIvmCompileException(message: String, cause: Throwable) extends R
 class OpenIvmCompiler private (
     val extensionPath: String,
     val cliPath: String,
-    val isolation: OpenIvmCompiler.Isolation
+    val isolation: OpenIvmCompiler.Isolation,
+    private val failureBundleDir: Option[String]
 ) extends AutoCloseable {
 
   @volatile private var closed: Boolean = false
@@ -72,30 +100,85 @@ class OpenIvmCompiler private (
   def compile(req: CompileRequest): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
 
+    // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
+    // DuckDB cannot parse and the bridge's row-less compile tables cannot
+    // model, so the pin is split out of the COMPILE COPY only. The pin is
+    // re-applied to every openivm-emitted source read (initial load below,
+    // refresh program in `SparkRefreshRewriter`), and `MvMetadata.querySql`
+    // keeps the user's pinned SQL verbatim.
+    //
+    // A pin OpenIVM cannot honor per-source is refused HERE rather than left to
+    // the downstream parser: an LPTS build that accepts Spark's `temporalClause`
+    // would otherwise compile the body, register no pin, and silently maintain a
+    // frozen relation from live rows. FULL_REFRESH re-executes the pinned body
+    // verbatim, so the fallback stays correct.
+    //
+    // The refusal runs BEFORE any metric bookkeeping: no compile is started, so
+    // the inflight gauge must not move (its decrement lives in the `finally`
+    // below, which an early throw would skip).
+    //
+    // `requireTrackedSources` keeps this refusal identical to the one
+    // `SparkTimeTravelSql.pinTelemetry` reports: a pinned body with no tracked
+    // source cannot be maintained from anything, so it must not compile into an
+    // incremental program that would claim a pin it cannot honor.
+    SparkTimeTravelSql
+      .unsupportedSnapshotPinReason(req.viewSql, trackedSourceNames(req), requireTrackedSources = true)
+      .foreach { reason =>
+        throw new OpenIvmCompileException(
+          s"View '${req.viewName}' pins a source to a Delta snapshot in a shape OpenIVM cannot maintain " +
+            s"incrementally: $reason. Falling back to FULL_REFRESH, which re-executes the pinned body verbatim.",
+          null
+        )
+      }
+
+    OpenIvmMetrics.increment("compiler.compile.count")
+    OpenIvmMetrics.CompilerInflight.incrementAndGet()
+    val compileStarted = System.nanoTime()
+
     // Compute CREATE TABLE DDLs *before* any try-catch so that a
     // NotImplementedError from an unsupported type propagates directly to the
     // caller without being caught or wrapped by the CLI error handler below.
     val tableDdls: Seq[(String, String)] = req.sources.toSeq.map { case (name, schema) =>
-      val cols = schema.fields.map(f => s"${f.name} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
+      val cols = schema.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       name -> s"CREATE TABLE $name ($cols)"
     }
+    val depinnedViewSql = SparkTimeTravelSql.stripSnapshotPins(req.viewSql)
+    val normalizedViewSql =
+      normalizeSparkSqlForDuckdb(
+        stripDbQualifiers(stripSparkBacktickIdentifiers(depinnedViewSql), req.sourceQualifiedNames)
+      )
 
     val tmpDir = Files.createTempDirectory("openivm_compiler_")
+    // Captured for diagnostics (failure-bundle persistence below) — updated
+    // right after `runCli` returns, so a failure bundle written from either
+    // catch branch reflects the actual CLI output for this attempt even
+    // though `stdout`/`stderr` themselves are scoped to the `try` block.
+    var lastStdout = ""
+    var lastStderr = ""
     try {
-      val script           = buildScript(req, tableDdls, tmpDir)
-      val (stdout, stderr) = runCli(script)
-      val partial          = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad         = parseInitialLoadSql(tmpDir, req)
+      val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
+      val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+        runCli(script)
+      }
+      lastStdout = stdout
+      lastStderr = stderr
+      val partial  = parseCompileResult(stdout, req.viewName, stderr)
+      val initLoad = parseInitialLoadSql(tmpDir, req)
       partial.copy(initialLoadSql = initLoad)
     } catch {
-      case e: OpenIvmCompileException => throw e
-      case e: IllegalStateException   => throw e
+      case e: OpenIvmCompileException =>
+        persistFailureBundleIfConfigured(req, normalizedViewSql, lastStdout, lastStderr)
+        throw e
+      case e: IllegalStateException => throw e
       case e: Exception =>
+        persistFailureBundleIfConfigured(req, normalizedViewSql, lastStdout, lastStderr)
         throw new OpenIvmCompileException(
           s"DuckDB CLI error during compile of '${req.viewName}': ${e.getMessage}",
           e
         )
     } finally {
+      OpenIvmMetrics.updateTimer("compiler.compile", System.nanoTime() - compileStarted)
+      OpenIvmMetrics.CompilerInflight.decrementAndGet()
       deleteDirRecursively(tmpDir)
     }
   }
@@ -104,6 +187,14 @@ class OpenIvmCompiler private (
     * [[IllegalStateException]].  Idempotent.
     */
   def close(): Unit = { closed = true }
+
+  /** Quotes an identifier for DuckDB DDL using double quotes, escaping any
+    * embedded double quote by doubling it.  Source columns may be named with
+    * DuckDB reserved words (e.g. `collation`), which fail to parse unquoted in
+    * a `CREATE TABLE` column list.
+    */
+  private[compiler] def quoteDuckdbIdent(name: String): String =
+    "\"" + name.replace("\"", "\"\"") + "\""
 
   /** Maps a Spark [[DataType]] to its DuckDB SQL type string.
     *
@@ -134,7 +225,7 @@ class OpenIvmCompiler private (
     case a: ArrayType =>
       s"${sparkToDuckdbType(a.elementType)}[]"
     case s: StructType =>
-      val fields = s.fields.map(f => s"${f.name} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
+      val fields = s.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       s"STRUCT($fields)"
     case m: MapType =>
       s"MAP(${sparkToDuckdbType(m.keyType)}, ${sparkToDuckdbType(m.valueType)})"
@@ -147,7 +238,8 @@ class OpenIvmCompiler private (
   private def buildScript(
       req: CompileRequest,
       tableDdls: Seq[(String, String)],
-      tmpDir: Path
+      tmpDir: Path,
+      normalizedViewSql: String
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
@@ -186,7 +278,7 @@ class OpenIvmCompiler private (
     // Each macro is type-correct (returns a value of the type Spark would
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
-    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS ${normalizeSparkSqlForDuckdb(stripDbQualifiers(req.viewSql, req.sourceQualifiedNames))};\n"
+    sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS $normalizedViewSql;\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
     // takes the view name plus a JSON CompileFacts payload and returns one
     // row per top-level refresh statement without mutating openivm aux
@@ -242,17 +334,116 @@ class OpenIvmCompiler private (
     }
   }
 
+  /** Rewrites Spark backtick-quoted identifiers into a form DuckDB's parser
+    * accepts, so the compile-bridge copy of the MV body binds cleanly.
+    *
+    * dbt-style Spark SQL qualifies sources as `` `db`.table `` (the whole
+    * dbt-server corpus does this). DuckDB uses double-quote identifier quoting
+    * and rejects backticks outright with `Parser Error: syntax error at or near
+    * "`"`, which silently demotes every affected view to
+    * COMPILE_FAILED -> FULL_REFRESH — defeating incremental maintenance. The
+    * backtick also hides the `db.` prefix from [[stripDbQualifiers]] (its
+    * pattern matches the unquoted qualified name), so the source is never
+    * reduced to the short table registered in DuckDB.
+    *
+    * A simple bare identifier (`[A-Za-z_][A-Za-z0-9_]*`) is emitted unquoted so
+    * the downstream [[stripDbQualifiers]] rewrite still matches the now-plain
+    * `db.table` reference; anything else is emitted double-quoted (with internal
+    * double-quotes escaped). Backticks inside single-quoted string literals are
+    * left untouched. `` `` `` (a doubled backtick) is the Spark escape for a
+    * literal backtick within an identifier.
+    */
+  private[compiler] def stripSparkBacktickIdentifiers(sql: String): String = {
+    val out = new StringBuilder(sql.length)
+    val n   = sql.length
+    var i   = 0
+    while (i < n) {
+      sql.charAt(i) match {
+        case '-' if i + 1 < n && sql.charAt(i + 1) == '-' =>
+          // Copy a -- line comment verbatim so apostrophes/backticks inside it
+          // never desync the string-literal / identifier scanner.
+          while (i < n && sql.charAt(i) != '\n') {
+            out += sql.charAt(i)
+            i += 1
+          }
+        case '/' if i + 1 < n && sql.charAt(i + 1) == '*' =>
+          // Copy a /* */ block comment verbatim.
+          out += '/'
+          out += '*'
+          i += 2
+          var closed = false
+          while (i < n && !closed) {
+            if (sql.charAt(i) == '*' && i + 1 < n && sql.charAt(i + 1) == '/') {
+              out += '*'
+              out += '/'
+              i += 2
+              closed = true
+            } else {
+              out += sql.charAt(i)
+              i += 1
+            }
+          }
+        case '\'' =>
+          // Copy a Spark-dialect single-quoted string literal verbatim,
+          // honoring BOTH '' escapes and Spark's backslash escapes (e.g.
+          // `\'`) so an escaped quote inside the literal is never mistaken
+          // for its closing quote.
+          val litEnd = SparkFunctionShimSql.consumeSparkSingleQuoted(sql, i)
+          out ++= sql.substring(i, litEnd)
+          i = litEnd
+        case '`' =>
+          val ident = new StringBuilder
+          i += 1
+          var closed = false
+          while (i < n && !closed) {
+            val ch = sql.charAt(i)
+            if (ch == '`' && i + 1 < n && sql.charAt(i + 1) == '`') {
+              ident += '`'
+              i += 2
+            } else if (ch == '`') {
+              closed = true
+              i += 1
+            } else {
+              ident += ch
+              i += 1
+            }
+          }
+          val id = ident.toString
+          if (id.matches("[A-Za-z_][A-Za-z0-9_]*")) out ++= id
+          else { out += '"'; out ++= id.replace("\"", "\"\""); out += '"' }
+        case other =>
+          out += other
+          i += 1
+      }
+    }
+    out.toString
+  }
+
   /** Spark-specific pre-normalizations applied before the MV body is handed to
     * DuckDB's parser/binder.
     *
     * Currently translated:
+    *   - Spark single-quoted string literal escaping (both `''` and
+    *     backslash escapes like `\'`, `\\`, `\n`, ...) → DuckDB's
+    *     doubled-quote-only convention, so literals DuckDB would otherwise
+    *     reject (`\'`) or silently misvalue (`\\`) parse correctly. Must run
+    *     FIRST, before any other pass scans for quoted regions, since every
+    *     later pass assumes DuckDB-dialect literal syntax.
     *   - Spark 1-arg / 2-arg `to_date` / `to_timestamp` and 2-arg
-    *     `date_format` → collision-free `__sparkfn_*` names so DuckDB binds
-    *     our shim macro instead of its own incompatible built-in overloads /
-    *     arities.
-    *   - Spark literal-boolean `last_value(expr, true|false)` → DuckDB's
-    *     native window spelling (`last_value(expr IGNORE NULLS)` or
-    *     `last_value(expr)`) so null-handling semantics survive planning.
+    *     `date_format`, 7-arg `make_interval`, and 2-arg `get_json_object` →
+    *     collision-free `__sparkfn_*` names so DuckDB binds our shim macro
+    *     instead of its own incompatible built-in overloads / arities (or,
+    *     for Spark-only functions, a missing DuckDB function).
+    *   - Spark literal-boolean `last_value(expr, true|false)` /
+    *     `first_value(expr, true|false)` → DuckDB's native window spelling
+    *     (`last_value(expr IGNORE NULLS)` or `last_value(expr)`, and the
+    *     `first_value` equivalents) so null-handling semantics survive
+    *     planning.
+    *   - 0-arg `current_date()` / `current_timestamp()` → collision-free
+    *     `__sparkfn_*` names bound to macros that produce a deterministic,
+    *     compile-time-stable value (DuckDB's own `current_date`/
+    *     `current_timestamp` are non-deterministic builtins that
+    *     `openivm_compile_with_facts` rejects during planning).
     *   - `LEFT SEMI JOIN` → `SEMI JOIN` (DuckDB does not accept the LEFT prefix)
     *   - `LEFT ANTI JOIN` → `ANTI JOIN`
     *
@@ -261,9 +452,10 @@ class OpenIvmCompiler private (
     * compile-bridge copy sent to DuckDB.
     */
   private[compiler] def normalizeSparkSqlForDuckdb(sql: String): String = {
-    val leftSemi   = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
-    val leftAnti   = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
-    val renamedFns = OpenIvmCompiler.renameSparkFunctionShimCalls(sql)
+    val leftSemi          = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
+    val leftAnti          = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
+    val literalsRewritten = SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql)
+    val renamedFns        = OpenIvmCompiler.renameSparkFunctionShimCalls(literalsRewritten)
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
@@ -360,9 +552,10 @@ class OpenIvmCompiler private (
       case line if line.contains("\"refresh_type\"") => parseRefreshLine(line)
     }.toVector
     if (rows.isEmpty) {
-      val hint = if (stderr.nonEmpty) s"\nCLI stderr:\n$stderr" else ""
+      val stage = OpenIvmCompiler.classifyCompileFailureStage(stdout)
+      val hint  = if (stderr.nonEmpty) s"\nCLI stderr:\n$stderr" else ""
       throw new OpenIvmCompileException(
-        s"openivm_compile_with_facts('$viewName', ...) produced no result$hint",
+        s"openivm_compile_with_facts('$viewName', ...) produced no result (failed during ${stage.label})$hint",
         null
       )
     }
@@ -376,11 +569,11 @@ class OpenIvmCompiler private (
     * the initial-load query (including any hidden `openivm_count_star` column).
     *
     * Returns the empty string if the file is missing or no matching CTAS is
-    * found.  The extracted SQL has `memory.main.<short>` references rewritten
-    * to the qualified Spark table name supplied via `req.sourceQualifiedNames`,
-    * any leftover `memory.main.` prefix stripped, and is run through
-    * [[LptsSparkDialect.translate]] to handle DuckDB-isms (e.g. `count_star()`,
-    * `::TIMESTAMP` casts).
+    * found.  The extracted SQL has `memory.main.<short>` references rewritten to
+    * either the verified Delta path of a pinned source (``delta.`<path>` <clause>``)
+    * or the qualified Spark table name of an unpinned source (via
+    * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
+    * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
   private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest): String = {
     import java.util.regex.Pattern
@@ -395,19 +588,22 @@ class OpenIvmCompiler private (
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    var sql = m.group(1).trim
+    val extracted = m.group(1).trim
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
     // tables, so fall back to the original user-supplied view body instead.
-    if ("""(?i)\browid\b""".r.findFirstIn(sql).isDefined) return ""
+    if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
-    for ((short, qual) <- req.sourceQualifiedNames) {
-      sql = sql.replace(s"memory.main.$short", qual)
-    }
-    sql = sql.replaceAll("memory\\.main\\.", "")
-    LptsSparkDialect.translate(sql)
+    LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
   }
+
+  /** Fully-qualified name of every source the request tracks, the key space a
+    * snapshot pin has to resolve against.
+    */
+  private def trackedSourceNames(req: CompileRequest): Seq[String] =
+    (req.sources.keySet ++ req.sourceQualifiedNames.keySet).toSeq
+      .map(short => req.sourceQualifiedNames.getOrElse(short, short))
 
   /** Parses a single `-jsonlines` row of the form
     * `{"refresh_type":N,"refresh_type_name":"...","sql":"..."}`.
@@ -469,6 +665,57 @@ class OpenIvmCompiler private (
     (sb.toString, i + 1)
   }
 
+  /** Persists a diagnostic bundle for a failed compile when a failure-bundle
+    * directory is configured (via the `failureBundleDir` constructor
+    * parameter, which [[OpenIvmCompiler.build]] defaults to the
+    * `OPENIVM_COMPILE_FAILURE_BUNDLE_DIR` environment variable), so a
+    * failure can be triaged without reproducing it interactively. Off by
+    * default (unset → no-op), so normal operation is unaffected.
+    *
+    * Writes, under a unique subdirectory of the configured root
+    * (`<viewName>-<nanoTime>/`):
+    *   - `original.sql`   — `req.viewSql` as supplied by the caller
+    *   - `normalized.sql` — the compile-bridge copy actually sent to DuckDB
+    *   - `facts.json`     — the exact `WorkloadFacts` JSON payload used
+    *   - `stdout.log` / `stderr.log` — the DuckDB CLI subprocess output
+    *   - `stage.txt`      — [[OpenIvmCompiler.classifyCompileFailureStage]]'s
+    *     label, so a CREATE/bind failure is distinguished from an
+    *     `openivm_compile_with_facts` failure without re-parsing stdout
+    *
+    * Called from the `catch` branches in [[compile]], strictly before the
+    * `finally` block's `deleteDirRecursively(tmpDir)` runs, so the bundle
+    * reflects this attempt's state.  None of the persisted content includes
+    * credentials or environment secrets — it is exactly the SQL/JSON/CLI
+    * output already visible in the thrown exception and DuckDB CLI streams.
+    */
+  private def persistFailureBundleIfConfigured(
+      req: CompileRequest,
+      normalizedViewSql: String,
+      stdout: String,
+      stderr: String
+  ): Unit =
+    failureBundleDir.foreach { rootDir =>
+      try {
+        val safeName  = req.viewName.replaceAll("[^A-Za-z0-9_.-]", "_")
+        val bundleDir = Paths.get(rootDir, s"$safeName-${System.nanoTime()}")
+        Files.createDirectories(bundleDir)
+        val stage = OpenIvmCompiler.classifyCompileFailureStage(stdout)
+        Files.write(bundleDir.resolve("original.sql"), req.viewSql.getBytes("UTF-8"))
+        Files.write(bundleDir.resolve("normalized.sql"), normalizedViewSql.getBytes("UTF-8"))
+        Files.write(bundleDir.resolve("facts.json"), req.facts.toJson.getBytes("UTF-8"))
+        Files.write(bundleDir.resolve("stdout.log"), stdout.getBytes("UTF-8"))
+        Files.write(bundleDir.resolve("stderr.log"), stderr.getBytes("UTF-8"))
+        Files.write(bundleDir.resolve("stage.txt"), stage.label.getBytes("UTF-8"))
+      } catch {
+        // Narrow on purpose: a bundle-write failure must be logged, not
+        // swallowed into the original compile exception being diagnosed, and
+        // must not mask it either — so only the I/O failure mode particular
+        // to this best-effort persistence step is caught here.
+        case e: java.io.IOException =>
+          System.err.println(s"openivm compiler: failed to persist compile-failure bundle: ${e.getMessage}")
+      }
+    }
+
   private def deleteDirRecursively(dir: Path): Unit = {
     val stream = Files.walk(dir)
     try stream.sorted(Comparator.reverseOrder[Path]()).forEach(p => Files.delete(p))
@@ -477,6 +724,43 @@ class OpenIvmCompiler private (
 }
 
 object OpenIvmCompiler {
+
+  /** Distinguishes which stage of the compile script a DuckDB CLI failure
+    * occurred in, for [[classifyCompileFailureStage]].
+    */
+  sealed trait CompileFailureStage { def label: String }
+  object CompileFailureStage       {
+
+    /** The `CREATE OR REPLACE MATERIALIZED VIEW ... AS <sql>` statement
+      * itself failed to parse/bind (e.g. a syntax error in the normalized
+      * SQL, or an unresolvable column/table reference).
+      */
+    case object CreateOrBind extends CompileFailureStage { val label = "CREATE MATERIALIZED VIEW (bind)" }
+
+    /** The view bound successfully but `openivm_compile_with_facts` itself
+      * failed (e.g. an unsupported refresh shape, or a malformed facts
+      * payload).
+      */
+    case object CompileWithFacts extends CompileFailureStage { val label = "openivm_compile_with_facts" }
+  }
+
+  /** Classifies a failed compile attempt's stage from the DuckDB CLI's
+    * `-jsonlines` stdout alone.
+    *
+    * `buildScript` always emits `CREATE OR REPLACE MATERIALIZED VIEW ...`
+    * immediately followed by `SELECT * FROM openivm_compile_with_facts(...)`.
+    * When `CREATE` fails, the DuckDB CLI reports the error on stderr and
+    * (in `-jsonlines` mode) simply continues to the next statement without
+    * emitting any output line for the failed one — so stdout never contains
+    * the view-creation confirmation row. When `CREATE` succeeds but
+    * `openivm_compile_with_facts` itself fails, that confirmation row IS
+    * present, followed by nothing further (no `refresh_type` rows). This
+    * gives a reliable, non-heuristic signal from stdout content alone,
+    * without parsing or pattern-matching stderr text.
+    */
+  private[compiler] def classifyCompileFailureStage(stdout: String): CompileFailureStage =
+    if (stdout.contains("\"MATERIALIZED VIEW CREATION\"")) CompileFailureStage.CompileWithFacts
+    else CompileFailureStage.CreateOrBind
 
   /** Isolation strategy for the underlying DuckDB runtime. */
   sealed trait Isolation
@@ -500,6 +784,11 @@ object OpenIvmCompiler {
     *                       `OPENIVM_CLI_PATH` environment variable, or the
     *                       `duckdb` executable co-located with `extensionPath`.
     * @param isolation      `InProcess` (default) or `ChildProcess` (not yet implemented).
+    * @param failureBundleDir Directory to persist a per-failure diagnostic
+    *                       bundle under (see `persistFailureBundleIfConfigured`).
+    *                       Defaults to the `OPENIVM_COMPILE_FAILURE_BUNDLE_DIR`
+    *                       environment variable; `None`/unset disables the
+    *                       feature entirely (the default, zero-overhead path).
     * @throws IllegalArgumentException if `extensionPath` or `cliPath` does not exist on disk.
     * @throws NotImplementedError      if `isolation == ChildProcess`.
     */
@@ -509,7 +798,8 @@ object OpenIvmCompiler {
         "/opt/openivm/openivm.duckdb_extension"
       ),
       cliPath: String = sys.env.getOrElse("OPENIVM_CLI_PATH", defaultCliPath()),
-      isolation: Isolation = InProcess
+      isolation: Isolation = InProcess,
+      failureBundleDir: Option[String] = sys.env.get("OPENIVM_COMPILE_FAILURE_BUNDLE_DIR").filter(_.nonEmpty)
   ): OpenIvmCompiler = isolation match {
     case ChildProcess =>
       throw new NotImplementedError(
@@ -524,7 +814,7 @@ object OpenIvmCompiler {
         throw new IllegalArgumentException(
           s"OpenIVM DuckDB CLI not found at: $cliPath"
         )
-      new OpenIvmCompiler(extensionPath, cliPath, isolation)
+      new OpenIvmCompiler(extensionPath, cliPath, isolation, failureBundleDir)
   }
 
   private def defaultCliPath(): String = {
@@ -537,6 +827,68 @@ object OpenIvmCompiler {
   private[compiler] def renameSparkFunctionShimCalls(sql: String): String =
     SparkFunctionShimSql.renameSparkFunctionShimCalls(sql)
 
+  /** Re-attach source reads to the initial-load CTAS body openivm emitted,
+    * turning each `memory.main.<short>` reference into the Spark relation the
+    * initial-load CTAS must actually read:
+    *
+    *   - a snapshot-PINNED source becomes a VERIFIED physical Delta read
+    *     ``delta.`<escaped path>` <clause>``, where the path is the resolved
+    *     binding's `DeltaLog.dataPath` supplied via
+    *     [[CompileRequest.sourceSnapshotPinnedPaths]] and the clause is the
+    *     exact `VERSION AS OF` / `TIMESTAMP AS OF` the user wrote — so the CTAS
+    *     binds to the exact Delta table the pin's identity was verified against,
+    *     never a logical/friendly name that could rebind (the alias-rebind
+    *     TOCTOU this closes);
+    *   - an UNPINNED source becomes its fully-qualified Spark name from
+    *     [[CompileRequest.sourceQualifiedNames]] (the user-friendly overlay,
+    *     used only for unpinned reads and never mixed into a pinned read's
+    *     execution path);
+    *   - any other `memory.main.<name>` (openivm-internal `openivm_delta_<n>`,
+    *     `openivm_data_<v>`, …) is left as its bare short name.
+    *
+    * A source pinned in `req.viewSql` with NO entry in `sourceSnapshotPinnedPaths`
+    * is a hard [[org.openivm.spark.common.PinnedSourcePathMissingException]]
+    * (fail-closed; never a logical-name fallback). Occurrences, clause kind and
+    * value, and backtick escaping are all preserved, and the rewrite is a
+    * single identifier-bounded [[MemoryMainRefs]] pass shared with the refresh
+    * rewriter (so overlapping short names like `customer`/`customer_address`
+    * cannot cross-contaminate). Pure and deterministic — unit-testable without a
+    * DuckDB subprocess.
+    */
+  private[compiler] def reattachInitialLoadSourceReads(extractedSql: String, req: CompileRequest): String = {
+    // The authoritative set of pins is the user body's own snapshot pins.
+    val pinBySource: Map[String, String] =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName -> pin.clause).toMap
+    val qualifiedByShort: Map[String, String] =
+      req.sourceQualifiedNames.map { case (short, qualified) => short.toLowerCase(Locale.ROOT) -> qualified }
+    val pathByShort: Map[String, String] =
+      req.sourceSnapshotPinnedPaths.map { case (short, path) => short.toLowerCase(Locale.ROOT) -> path }
+    // One identifier-bounded pass, NOT a `sql.replace("memory.main.<short>", …)`
+    // loop over a name set: with sources `customer` and `customer_address` the
+    // loop either injects the shorter name's pin into the middle of the longer
+    // identifier or rewrites its prefix first, so the longer name's own read is
+    // never re-attached and its CTAS silently loads live rows. See
+    // `MemoryMainRefs`, which the refresh rewriter shares.
+    MemoryMainRefs.rewrite(extractedSql) { short =>
+      val key = short.toLowerCase(Locale.ROOT)
+      pinBySource.get(key) match {
+        case Some(clause) =>
+          pathByShort.get(key) match {
+            case Some(path) =>
+              val escaped = path.replace("`", "``")
+              s"delta.`$escaped` $clause"
+            case None =>
+              throw new PinnedSourcePathMissingException(
+                s"initial-load emission for view '${req.viewName}' has no verified Delta path for " +
+                  s"snapshot-pinned source '$short'; refusing to emit a logical-name pinned read"
+              )
+          }
+        case None =>
+          qualifiedByShort.getOrElse(key, short)
+      }
+    }
+  }
+
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would
     * otherwise reject. The set is driven by the dbt-server corpus (TPC-DI
@@ -548,20 +900,23 @@ object OpenIvmCompiler {
     * must preserve enough structure for `LptsSparkDialect.translate` to
     * recover Spark's original spelling at refresh time.
     *
-    * Collision-prone or arity-incompatible Spark built-ins (1-arg / 2-arg
-    * `to_date`, 1-arg / 2-arg `to_timestamp`, 2-arg `date_format`) are renamed
-    * to `__sparkfn_*` by [[renameSparkFunctionShimCalls]] before the SQL reaches
-    * DuckDB. The 1-arg date/time spellings use dedicated `*_1arg` macro names
-    * because DuckDB macros do not overload by arity. The macros below define
-    * the corresponding DuckDB-side bodies that openivm will inline.
-    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses the date/time
-    * inlinings back to Spark's original functions in the emitted refresh SQL.
+    * Collision-prone, arity-incompatible, or Spark-only built-ins (1-arg /
+    * 2-arg `to_date`, 1-arg / 2-arg `to_timestamp`, 2-arg `date_format`,
+    * 7-arg `make_interval`, 2-arg `get_json_object`, 0-arg `current_date`,
+    * 0-arg `current_timestamp`) are renamed to `__sparkfn_*` by
+    * [[renameSparkFunctionShimCalls]] before the SQL reaches DuckDB. The
+    * 1-arg date/time spellings use dedicated `*_1arg` macro names because
+    * DuckDB macros do not overload by arity. The macros below define the
+    * corresponding DuckDB-side bodies that openivm will inline.
+    * `LptsSparkDialect.rewriteSparkFunctionInlinings` reverses the inlinings
+    * back to Spark's original functions in the emitted refresh SQL.
     *
-    * Literal-boolean `last_value(expr, true|false)` calls are normalized to
-    * DuckDB's native window syntax before compile. `__sparkfn_last_value`
-    * remains as a compatibility fallback for non-literal second arguments; it
-    * still uses DuckDB's `last(expr)` stand-in and therefore cannot preserve
-    * dynamic ignore-null flags.
+    * Literal-boolean `last_value(expr, true|false)` / `first_value(expr,
+    * true|false)` calls are normalized to DuckDB's native window syntax
+    * before compile. `__sparkfn_last_value` / `__sparkfn_first_value` remain
+    * as compatibility fallbacks for non-literal second arguments; they still
+    * use DuckDB's `last(expr)` / `first(expr)` stand-ins and therefore cannot
+    * preserve dynamic ignore-null flags.
     */
   private[compiler] val sparkFunctionShimsPrologue: String = {
     val macros = Seq(
@@ -584,11 +939,32 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      // The nonnumeric marker branch is always NULL, but keeps all seven
+      // arguments visible to LPTS for exact scanner-based recovery. The
+      // interval fallback keeps the DuckDB macro type- and value-correct.
+      s"CREATE OR REPLACE MACRO __sparkfn_make_interval(years, months, weeks, days, hours, mins, secs) AS COALESCE(to_seconds(TRY_CAST(concat('${SparkFunctionShimSql.MakeIntervalMarker}', years, '${SparkFunctionShimSql.MarkerArgSeparator}', months, '${SparkFunctionShimSql.MarkerArgSeparator}', weeks, '${SparkFunctionShimSql.MarkerArgSeparator}', days, '${SparkFunctionShimSql.MarkerArgSeparator}', hours, '${SparkFunctionShimSql.MarkerArgSeparator}', mins, '${SparkFunctionShimSql.MarkerArgSeparator}', secs) AS DOUBLE)), to_years(CAST(years AS BIGINT)) + to_months(CAST(months AS BIGINT)) + to_days(CAST(weeks AS BIGINT) * 7) + to_days(CAST(days AS BIGINT)) + to_hours(CAST(hours AS BIGINT)) + to_minutes(CAST(mins AS BIGINT)) + to_seconds(CAST(secs AS DOUBLE)));",
+      // The pinned DuckDB binary has no JSON extension. Encode both arguments
+      // in a collision-free VARCHAR marker, then restore Spark's exact call.
+      s"CREATE OR REPLACE MACRO __sparkfn_get_json_object(json_text, path) AS concat('${SparkFunctionShimSql.GetJsonObjectMarker}', json_text, '${SparkFunctionShimSql.MarkerArgSeparator}', path);",
       // Fallback for non-literal Spark `last_value(expr, ignoreNulls)` calls.
       // Literal boolean flags are handled in the pre-pass with DuckDB's native
       // `IGNORE NULLS` modifier; dynamic flags keep the legacy compile-time
       // stand-in and cannot preserve ignore-null semantics.
-      "CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);"
+      "CREATE OR REPLACE MACRO __sparkfn_last_value(expr, ignore_nulls) AS last(expr);",
+      // Fallback for non-literal Spark `first_value(expr, ignoreNulls)` calls,
+      // mirroring `__sparkfn_last_value` above.
+      "CREATE OR REPLACE MACRO __sparkfn_first_value(expr, ignore_nulls) AS first(expr);",
+      // Spark's `current_date()` / `current_timestamp()` are non-deterministic
+      // and would otherwise be rejected by `openivm_compile_with_facts`
+      // planning (or worse, bound to DuckDB's own volatile builtins and
+      // evaluated at a different time than Spark would). `get_current_timestamp()`
+      // is used as the inlined body's distinguishing marker (rather than
+      // `now()`) specifically because Spark has no function of that name, so
+      // the LptsSparkDialect post-pass can recognize the inlined shape without
+      // risk of misfiring on genuine user SQL. DuckDB has no direct
+      // TIMESTAMPTZ -> DATE cast, hence the intermediate TIMESTAMP cast.
+      "CREATE OR REPLACE MACRO __sparkfn_current_timestamp() AS CAST(get_current_timestamp() AS TIMESTAMP);",
+      "CREATE OR REPLACE MACRO __sparkfn_current_date() AS CAST(CAST(get_current_timestamp() AS TIMESTAMP) AS DATE);"
     )
     macros.mkString("", "\n", "\n")
   }

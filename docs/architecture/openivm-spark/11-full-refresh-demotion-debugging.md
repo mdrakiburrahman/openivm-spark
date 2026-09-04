@@ -117,13 +117,13 @@ flowchart TD
   G -- no --> H[FULL_REFRESH: compile_failed]
   G -- yes --> I[CompiledRefresh refresh_type]
   I --> J{Spark demotion ladder}
-  J -- top_k --> K[FULL_REFRESH]
+  J -- unsupported top_k tail --> K[FULL_REFRESH]
   J -- no data apply --> K
   J -- non-cascade upstream --> K
   J -- window initial-load mismatch --> K
   J -- unsafe HAVING --> K
   J -- no real delta --> K
-  J -- kept --> L[Persist incremental type]
+  J -- kept / top_k_kept --> L[Persist incremental type]
   H --> M[MvMetadata refreshTypeName=FULL_REFRESH]
   K --> M
   L --> N[MvMetadata refreshTypeName=compiled type]
@@ -141,16 +141,16 @@ persisted field, the value that should be stored in `MvMetadata.demotionReason`.
 
 | Reason string                   | Trigger                                                                                                                                                                                                                                   | File:line                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `top_k`                         | Top-level `ORDER BY`, `LIMIT`, `OFFSET`, or `TAIL` wrapper is present. Spark does not maintain the OpenIVM inner-table + outer-view split for top-k in this code path.                                                                    | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:183-206`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-599` |
+| `top_k_unsupported`             | Spark detected a top-level Top-K wrapper that cannot be represented as a backing-view suffix (currently `TAIL`).                                                                                                                         | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala`                                                                                                                                                                                                                           |
 | `simple_projection_no_apply`    | OpenIVM classified `SIMPLE_PROJECTION`, but Spark's rewrite probe did not produce a data-table apply statement after the view-delta statement.                                                                                            | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:429-451`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:597-600`                                                                                                             |
-| `non_cascade_upstream:<detail>` | A source table is itself an MV whose persisted instance cannot emit a downstream-consumable `MV_VIEW_DELTA`. The only sub-tag emitted today is `non_cascade:<upstream>` (upstream MV is `FULL_REFRESH` or otherwise not cascade-capable). | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:516-559`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:601-602`                                                                                                             |
+| `non_cascade_upstream:<detail>` | **Removed.** An MV source that could not emit a downstream-consumable `MV_VIEW_DELTA` used to demote its dependents. Upstream capability is now verified per compiled program and dependents keep their own type; see §3.3. | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala` (`computeUpstreamSnapshotTriggerDetail`, diagnostic only) |
 | `window_initial_load_mismatch`  | OpenIVM classified `WINDOW_PARTITION`, but Spark-translated initial-load SQL is not bag-equal to the user query on current data.                                                                                                          | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:395-407`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:603-604`                                                                                                             |
 | `having_pred_empty`             | OpenIVM classified `AGGREGATE_HAVING`, but Spark could not extract the HAVING predicate from the analyzed `Filter(cond, Aggregate)` shape.                                                                                                | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:245-277`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:512-515`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:609-610` |
 | `having_pred_hidden_agg`        | HAVING references an aggregate or synthetic analyzer attribute that is not materialized as a data-table column.                                                                                                                           | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:279-288`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:410-427`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:611-615` |
 | `no_real_delta`                 | The compiled SQL has no real `INSERT INTO openivm_delta_<view>` carrying source deltas; OpenIVM emitted only an empty placeholder such as `SELECT ... WHERE false`.                                                                       | `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala:1868-1904`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:459-486`, `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:616-617`        |
 | `compile_failed:<msg>`          | The DuckDB CLI bridge failed before returning a `refresh_type` JSON row. Current logging uses `reason='compile_failed' cause=<msg>`; a persisted field should prefix the truncated cause.                                                 | `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:378-392`, `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:301-310`                                                                                                                       |
 
-### 3.1 `top_k`
+### 3.1 `top_k_kept` and `top_k_unsupported`
 
 User SQL that triggers it:
 
@@ -166,50 +166,41 @@ ORDER BY amount DESC
 LIMIT 3;
 ```
 
-Why Spark demotes:
+How Spark keeps this query incremental:
 
 - Spark parses the unresolved plan and checks whether the root is `GlobalLimit`,
   `LocalLimit`, `Sort`, `Offset`, or `Tail`; see
   `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:183-206`.
-- The code comment explains the correctness issue: OpenIVM strips the top-k
-  suffix and maintains an unlimited inner table plus a user-facing view, but
-  this Spark implementation has a single Delta table addressed by the MV name;
-  see
-  `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`.
+- OpenIVM strips the top-k suffix and classifies the unlimited inner query.
+- Spark stores that complete state in `mv_top3__ivm_data` and creates `mv_top3`
+  as a Spark VIEW that projects user columns and applies `ORDER BY ... LIMIT`.
+- Refresh writes target the backing Delta table. This preserves rows outside
+  the current K so deletes and updates can promote the next-best rows.
+- Top-K does not advertise a cascade view-delta because the inner-table delta
+  is not the same as the user-visible Top-K output delta.
 
 Expected metadata:
 
 | field                    | value          |
 | ------------------------ | -------------- |
-| `refreshType`            | `3`            |
-| `refreshTypeName`        | `FULL_REFRESH` |
-| `demotionReason` concept | `top_k`        |
+| `refreshType`            | inner compiler type, for example `2` |
+| `refreshTypeName`        | for example `SIMPLE_PROJECTION`      |
+| `demotionReason` concept | `top_k_kept`                         |
 
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='top_k' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_top3`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='top_k_kept' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Expected refresh SQL:
 
 ```sql
-INSERT OVERWRITE TABLE `mv_top3`
-SELECT * FROM (
-  SELECT id, region, amount FROM sales_t1 ORDER BY amount DESC LIMIT 3
-)
+MERGE INTO `mv_top3__ivm_data` ...;
 ```
 
-Recovery:
-
-- Accept full refresh if the top-k result is small and source scans are cheap.
-- Or implement the OpenIVM table/view split in Spark: maintain an internal
-  unlimited data table incrementally and expose the user MV name as a Spark VIEW
-  that applies `ORDER BY ... LIMIT` at read time.
-- Do not simply store the unlimited inner result under the user MV name; that
-  returns too many rows.
-- Do not store only the current top-k incrementally without a replenishment
-  strategy; deletes can require rows that were previously outside the top-k.
+`TAIL` remains conservatively demoted with `top_k_unsupported`. Ordinary
+`ORDER BY`, `LIMIT`, and `OFFSET` use the incremental backing-table layout.
 
 ### 3.2 `simple_projection_no_apply`
 
@@ -257,7 +248,7 @@ Expected metadata:
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_sp`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='simple_projection_no_apply' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_sp`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='simple_projection_no_apply' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Expected refresh SQL:
@@ -279,60 +270,79 @@ Recovery:
   delete all matching copies; see
   `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala:768-771`.
 
-### 3.3 `non_cascade_upstream:<detail>`
+### 3.3 `non_cascade_upstream:<detail>` — removed; capability is verified, not assumed
 
-User SQL that triggers it:
+User SQL that used to trigger it:
 
 ```sql
-CREATE TABLE agg_src(k INT, v INT) USING DELTA;
-INSERT INTO agg_src VALUES (1, 10), (1, 20), (2, 5);
+CREATE TABLE src(k INT, v INT, d DATE) USING DELTA;
+INSERT INTO src VALUES (1, 10, DATE'2024-01-01');
 
-CREATE MATERIALIZED VIEW mv_scalar AS
-SELECT SUM(v) AS total_v
-FROM agg_src;
+-- current_date() in the predicate is enough for openivm to classify FULL_REFRESH
+CREATE MATERIALIZED VIEW mv_recent AS
+SELECT k, v FROM src WHERE d >= current_date() - INTERVAL 7 DAYS;
 
 CREATE MATERIALIZED VIEW mv_downstream AS
-SELECT total_v
-FROM mv_scalar;
+SELECT k, v FROM mv_recent;
 ```
 
 A downstream MV over another MV needs the upstream refresh to emit a
-view-delta that can be staged as `MV_VIEW_DELTA`. Spark checks every upstream
-source resolved as an MV and demotes when `m.emitsCascadeViewDelta` is false or
-when the downstream shape has a known unsafe cascade combination; see
-`spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:522-559`.
+view-delta that can be staged as `MV_VIEW_DELTA`. The old rule demoted the
+dependent to `FULL_REFRESH` whenever the upstream's persisted
+`emitsCascadeViewDelta` was `false` — a judgement made from the upstream's
+refresh-type LABEL. Because `FULL_REFRESH` is excluded from that coarse set,
+every dependent of a view openivm classified `FULL_REFRESH` (a `current_date()`
+source predicate is enough) was demoted, transitively.
 
-The coarse capability rule lives in `RefreshTypeCode.emitsCascadeViewDelta`.
-It includes `AGGREGATE_GROUP`, `AGGREGATE_HAVING`, `SIMPLE_PROJECTION`,
-`WINDOW_PARTITION`, and `GROUP_RECOMPUTE`, and excludes `SIMPLE_AGGREGATE`,
-`FULL_REFRESH`, `DISTINCT_INCREMENTAL`, `SEMI_ANTI_RECOMPUTE`, and `TOP_K`; see
-`spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/RefreshTypeCode.scala:20-76`.
+That rule is gone. Capability is now a property of the compiled program:
 
-Expected metadata:
+```scala
+!topKViewSpec.detected &&
+  RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
+  SparkRefreshRewriter.hasRealDelta(compiled.sql, viewShortName)
+```
 
-| field                                      | value                                       |
-| ------------------------------------------ | ------------------------------------------- |
-| upstream `mv_scalar.refreshTypeName`       | often `SIMPLE_AGGREGATE`                    |
-| downstream `mv_downstream.refreshTypeName` | `FULL_REFRESH`                              |
-| `demotionReason` concept                   | `non_cascade_upstream:non_cascade:<source>` |
+`mayEmitCascadeViewDelta` adds `FULL_REFRESH` to the permission set because
+openivm emits `build_split_safe_full_refresh_companion` — an exact signed
+`old x -1 / new x +1` pair around the recompute — for every Spark-dialect
+FULL_REFRESH compile (`force_view_delta_cascade` forces `has_downstream = true`,
+so terminal views with no consumer get it too). `hasRealDelta` verifies the
+emitted program actually carries it, so the fail-closed cases (compile failure,
+unsupported plan, empty-placeholder delta) are unchanged.
 
-Expected log line:
+A FULL_REFRESH view that passes that verification reports its own strategy —
+`SIGNED_DELTA_RECOMPUTE` with `reason='signed_delta_recompute_verified'` — and
+is never conflated with a view that FELL BACK to a full rebuild. When an
+upstream genuinely cannot cascade, the dependent is still not demoted: the
+upstream stages one `StagingDelta.OpTypes.Overwrite` row per dependent in
+`postRefreshCleanup`, `hasReplacementBatch` routes it through the existing
+recompute branch, and the diagnostic detail is logged as
+`upstream_snapshot_trigger='snapshot_trigger:<parents>'`.
+
+Expected metadata for a verified FULL_REFRESH upstream:
+
+| field                                       | value                                   |
+| ------------------------------------------- | --------------------------------------- |
+| upstream `mv_recent.refreshTypeName`        | `SIGNED_DELTA_RECOMPUTE`                |
+| upstream `mv_recent.refreshType` (code)     | `3` (`FULL_REFRESH`) — unchanged        |
+| upstream `mv_recent.emitsCascadeViewDelta`  | `true`                                  |
+| downstream `mv_downstream.refreshTypeName`  | compiled type, e.g. `SIMPLE_PROJECTION` |
+| downstream reason                           | `kept`                                  |
+
+Expected log lines:
 
 ```text
-[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='FULL_REFRESH' reason='non_cascade_upstream:non_cascade:default.mv_scalar' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_recent`' compiled_refresh_type='FULL_REFRESH' effective_refresh_type='SIGNED_DELTA_RECOMPUTE' reason='signed_delta_recompute_verified' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
+[openivm-mv] view='`mv_downstream`' compiled_refresh_type='SIMPLE_PROJECTION' effective_refresh_type='SIMPLE_PROJECTION' reason='kept' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
-Expected refresh SQL:
+Recovery when a dependent still recomputes:
 
-```sql
-INSERT OVERWRITE TABLE `mv_downstream`
-SELECT * FROM (SELECT total_v FROM mv_scalar)
-```
-
-Recovery:
-
-- Keep the downstream full-refresh if the upstream MV is cheap to scan.
-- Or change the upstream MV into a cascade-capable shape.
+- Check `emits_cascade_view_delta` on the UPSTREAM — `false` there means
+  `hasRealDelta` rejected the compiled program, not that the label was wrong.
+- Read the upstream's compiled refresh SQL: an `INSERT INTO
+  openivm_delta_<view>` that self-references or is `WHERE FALSE` is the
+  empty placeholder.
 - Or add Spark-side support for the missing upstream view-delta companion.
 
 Note: two earlier sub-tags of `non_cascade_upstream` —
@@ -450,7 +460,7 @@ and applies the demotion at
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_h2`' compiled_refresh_type='AGGREGATE_HAVING' effective_refresh_type='FULL_REFRESH' reason='having_pred_hidden_agg' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_h2`' compiled_refresh_type='AGGREGATE_HAVING' effective_refresh_type='FULL_REFRESH' reason='having_pred_hidden_agg' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Recovery:
@@ -491,7 +501,7 @@ not update the MV after source changes. The detector is
 Expected log line:
 
 ```text
-[openivm-mv] view='`mv_join`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='FULL_REFRESH' reason='no_real_delta' emits_cascade_view_delta='false'
+[openivm-mv] view='`mv_join`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='FULL_REFRESH' reason='no_real_delta' emits_cascade_view_delta='false' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Recovery:
@@ -679,6 +689,47 @@ The compile bridge pre-normalizes function calls and semi/anti joins before
 DuckDB sees the SQL; see
 `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala:236-262`.
 
+Delta snapshot pins (`FROM t VERSION AS OF 366`, `FROM t TIMESTAMP AS OF '…'`)
+used to land in the second row of that table: DuckDB fails with
+`Parser Error: syntax error at or near "as"`, and the view was demoted to
+`COMPILE_FAILED` → `FULL_REFRESH`. They are now split out of the compile-bridge
+copy of the body by
+`spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/SparkTimeTravelSql.scala`
+and re-applied to everything Spark executes; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7. If you see
+`reason='compile_failed'` on a pinned view, check that the pin shape is one the
+splitter recognises — an unrecognised shape is deliberately passed through
+unchanged so the failure stays loud. dbt bodies pin an ALIASED relation
+(`` from `db`.`model` version as of 366 as p ``); §7.1 covers that shape and the
+pin-bump policy that goes with it. A view that reads ONE source at two different
+versions (or pinned in one place and live in another) is refused by the bridge
+itself with `cause=View '<name>' pins a source to a Delta snapshot in a shape
+OpenIVM cannot maintain incrementally` — that demotion is deliberate and the
+rows stay correct, see §7.2. The same refusal covers a pin that resolves to no
+tracked source (or to several) and a MOVING pin value such as
+`TIMESTAMP AS OF current_timestamp()` or
+`TIMESTAMP AS OF date_sub(current_date(), 1)`: those name a different snapshot
+on every refresh, so only literal values (`VERSION AS OF 4`,
+`TIMESTAMP AS OF '2026-08-24 00:00:00'`) stay incremental. Rewrite the body with
+a literal snapshot if you want incremental maintenance.
+
+Every CREATE and REFRESH classification line — and the matching
+`OPENIVM_EXECUTION_SPAN` JSON — also carries `time_travel_pin_status`
+(`APPLIED` / `NOT_APPLICABLE` / `COMPILE_FAILED`), so a pinned view that fell
+back can be told apart from an unpinned one without reading the body:
+
+```text
+[openivm-mv] view='`mv_pinned`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='false' time_travel_pin_status='APPLIED' time_travel_pins='db.dim=VERSION AS OF 366'
+[openivm-mv] refresh view='`mv_pinned`' refresh_type='AGGREGATE_GROUP' time_travel_pin_status='APPLIED' time_travel_pins='db.dim=VERSION AS OF 366'
+```
+
+`time_travel_pin_status='COMPILE_FAILED'` means the PIN was refused (§7.2 of the
+compile-bridge doc); a demotion for any other cause keeps the status the pin
+itself earned. The status is persisted in MV metadata
+(`_ivm_time_travel_pin_status`, `_ivm_time_travel_pins`), so REFRESH reports it
+even though the delta program it runs contains no temporal clause; see
+`docs/architecture/openivm-spark/4-duckdb-cli-compile-bridge.md` §7.3.
+
 ### 5.2 Timeout and stderr caveat
 
 The bridge calls `process.waitFor(120, TimeUnit.SECONDS)` before collecting the
@@ -706,7 +757,7 @@ A useful debug report looks like this:
 
 | mv              | compiled_refresh_type | effective_refresh_type | reason                   | compiled_cache | refresh_plan                      |
 | --------------- | --------------------- | ---------------------- | ------------------------ | -------------- | --------------------------------- |
-| `mv_top3`       | `SIMPLE_PROJECTION`   | `FULL_REFRESH`         | `top_k`                  | absent         | `INSERT OVERWRITE TABLE`          |
+| `mv_top3`       | `SIMPLE_PROJECTION`   | `SIMPLE_PROJECTION`    | `top_k_kept`             | present        | `MERGE INTO <mv>__ivm_data`       |
 | `mv_h2`         | `AGGREGATE_HAVING`    | `FULL_REFRESH`         | `having_pred_hidden_agg` | absent         | `INSERT OVERWRITE TABLE`          |
 | `mv_join`       | `AGGREGATE_GROUP`     | `FULL_REFRESH`         | `no_real_delta`          | absent         | `INSERT OVERWRITE TABLE`          |
 | `mv_region_sum` | `AGGREGATE_GROUP`     | `AGGREGATE_GROUP`      | `kept`                   | present        | `MERGE INTO` plus view-delta CTAS |
@@ -750,8 +801,8 @@ answer.
 never assigns it; OpenIVM strips `ORDER BY/LIMIT` and classifies the inner
 query. See
 `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/RefreshTypeCode.scala:14-18`.
-Spark still demotes the user-facing top-k query because the single-table Spark
-MV layout cannot preserve top-k semantics incrementally.
+Spark keeps the compiler's inner refresh type and uses a sibling unlimited
+Delta table plus user-facing Spark VIEW. Enum value 7 remains unused.
 
 ## 8. Minimal reproduction checklist
 

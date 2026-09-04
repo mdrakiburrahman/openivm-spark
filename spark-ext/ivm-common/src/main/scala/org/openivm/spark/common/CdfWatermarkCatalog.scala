@@ -2,99 +2,202 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.slf4j.LoggerFactory
 
-import java.nio.file.{Files, Paths}
+import java.nio.file.Files
+import scala.util.control.NonFatal
 
 /**
- * RocksDB-backed catalog of `(viewName, source)` last-consumed Delta versions
- * used by [[CdfChangePropagation]].
+ * Per-MV RocksDB catalog of last-consumed Delta versions.
  *
- * Layout: shares the index DB at `<warehouse>/_openivm/index/rocksdb` with
- * [[MvCatalog]] and [[StagingCatalog]] via a dedicated column family
- * `cdf_watermarks`.
- *
- * Key encoding:
- *   `RocksDBCodec.compositeKey(Seq(utf8(viewName), utf8(source)))`
- * Value encoding:
- *   `RocksDBCodec.encodeLongBE(lastConsumedVersion)`
+ * New state lives beside the owning MV metadata at
+ * `<warehouse>/_openivm/mvs/<view>/rocksdb`, so independent refreshes never
+ * contend on a global watermark database. Reads lazily migrate legacy rows
+ * from the former shared index DB.
  */
-object CdfWatermarkCatalog {
+private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
 
-  private val Cf: String                          = IndexDbColumnFamilies.CdfWatermarks
-  private[common] val ColumnFamilies: Seq[String] = IndexDbColumnFamilies.All
+  private val log = LoggerFactory.getLogger(getClass)
 
-  private def warehouseDir(spark: SparkSession): String =
-    RocksDBCodec.requireLocalPath(FeatureGate.stateWarehouse(spark).stripSuffix("/"))
+  private val Cf: String       = IndexDbColumnFamilies.CdfWatermarks
+  private val LegacyCf: String = IndexDbColumnFamilies.CdfWatermarks
 
-  private def indexDbPath(spark: SparkSession): String =
-    Paths.get(warehouseDir(spark), "_openivm", "index", "rocksdb").toString
+  private def openMvDb(spark: SparkSession, viewName: String): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.perMvDbPath(spark, viewName),
+      OpenIvmStatePaths.PerMvColumnFamilies
+    )
 
-  private def openIndexDb(spark: SparkSession): OpenIvmRocksDB =
-    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath(spark), ColumnFamilies)
+  private def sourceKey(source: String): Array[Byte] = RocksDBCodec.utf8(source)
 
-  private def key(viewName: String, source: String): Array[Byte] =
+  private def legacyKey(viewName: String, source: String): Array[Byte] =
     RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(viewName), RocksDBCodec.utf8(source)))
 
+  private def openLegacyIndexDb(spark: SparkSession): Option[OpenIvmRocksDB] = {
+    val path = OpenIvmStatePaths.indexDbPath(spark)
+    if (OpenIvmStatePaths.isExistingDb(path)) {
+      Some(OpenIvmRocksDBRegistry.getOrOpen(spark, path, IndexDbColumnFamilies.All))
+    } else None
+  }
+
   def ensureTables(spark: SparkSession): Unit = {
-    openIndexDb(spark)
+    Files.createDirectories(OpenIvmStatePaths.mvsRoot(spark))
     ()
   }
 
-  def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
-    openIndexDb(spark).get(Cf, key(viewName, source)).map(RocksDBCodec.decodeLongBE)
-
-  def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit = {
-    val db = openIndexDb(spark)
-    db.withBatch { batch =>
-      OpenIvmRocksDBBatchOps.put(db, batch, Cf, key(viewName, source), RocksDBCodec.encodeLongBE(version))
+  def get(spark: SparkSession, viewName: String, source: String): Option[Long] = {
+    val db  = openMvDb(spark, viewName)
+    val key = sourceKey(source)
+    db.get(Cf, key).map(RocksDBCodec.decodeLongBE).orElse {
+      openLegacyIndexDb(spark)
+        .flatMap(_.get(LegacyCf, legacyKey(viewName, source)))
+        .map { encoded =>
+          db.withBatch { batch =>
+            OpenIvmRocksDBBatchOps.put(db, batch, Cf, key, encoded)
+          }
+          RocksDBCodec.decodeLongBE(encoded)
+        }
     }
   }
 
+  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
+    sources.distinct.flatMap(source => get(spark, viewName, source).map(source -> _)).toMap
+
+  def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
+    putAll(spark, viewName, Map(source -> version))
+
   def putAll(spark: SparkSession, viewName: String, versionsBySource: Map[String, Long]): Unit = {
     if (versionsBySource.isEmpty) return
-    val db = openIndexDb(spark)
+    val db = openMvDb(spark, viewName)
     db.withBatch { batch =>
       versionsBySource.foreach { case (source, version) =>
-        OpenIvmRocksDBBatchOps.put(db, batch, Cf, key(viewName, source), RocksDBCodec.encodeLongBE(version))
+        OpenIvmRocksDBBatchOps.put(db, batch, Cf, sourceKey(source), RocksDBCodec.encodeLongBE(version))
       }
     }
   }
 
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
-    if (!Files.exists(Paths.get(indexDbPath(spark)))) return
-    val db        = openIndexDb(spark)
-    val baseBytes = RocksDBCodec.utf8(baseTable)
-    val victims = db
-      .prefixScan(Cf, Array.emptyByteArray)
-      .flatMap { case (k, _) =>
-        val parts = RocksDBCodec.splitComposite(k, 2)
-        if (parts.length == 2 && java.util.Arrays.equals(parts(1), baseBytes)) Iterator.single(k.clone())
-        else Iterator.empty
+    // Guard: only proceed with per-MV cleanup when the reverse dependency index
+    // DB exists. If it does not exist, no MV has been registered with baseTable
+    // as a source (MvCatalog.upsert creates the DB on first registration), so
+    // there is nothing to clean up. Without this guard, MvCatalog.viewsForSource
+    // would fall back to scanning all per-MV DBs via MvCatalog.list — the exact
+    // open-all fanout that this reverse-index path eliminates.
+    val depDbPath = OpenIvmStatePaths.sourceDependencyDbPath(spark, baseTable)
+    if (OpenIvmStatePaths.isExistingDb(depDbPath)) {
+      // Use the authoritative reverse dependency index instead of enumerating
+      // existingMvDbPaths and opening every per-MV RocksDB. Under concurrent
+      // source-sharing DROP+CREATE the old open-all fanout raced with sibling
+      // MvCatalog.remove close+delete cycles, opening DBs mid-deletion and
+      // amplifying the registry orphan race. viewsForSource validates each
+      // reverse-index entry against authoritative per-MV metadata, so stale
+      // entries (a dropped MV whose index row was not yet pruned) are silently
+      // skipped rather than opening a being-deleted or absent DB.
+      val key = sourceKey(baseTable)
+      MvCatalog.viewsForSource(spark, baseTable).foreach { meta =>
+        val serializedName = meta.name.database.fold(meta.name.identifier)(db => s"$db.${meta.name.identifier}")
+        val path           = OpenIvmStatePaths.perMvDbPath(spark, serializedName)
+        // A concurrent DROP may delete this DB between viewsForSource's metadata
+        // read and the open below. Guard with isExistingDb first; the NonFatal
+        // catch is then narrowed to that benign concurrent-deletion window only.
+        if (OpenIvmStatePaths.isExistingDb(path)) {
+          try {
+            val db = openMvDb(spark, serializedName)
+            if (db.get(Cf, key).nonEmpty) {
+              db.withBatch(batch => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, key))
+            }
+          } catch {
+            case NonFatal(e) =>
+              // The catch is benign ONLY when the DB genuinely disappeared under
+              // us (the concurrent-DROP race). Re-check the path: if the DB is
+              // still present the failure is a real watermark write error /
+              // corruption / lock regression and MUST surface — never swallow it.
+              if (OpenIvmStatePaths.isExistingDb(path)) {
+                log.error(
+                  s"openivm-cdf-watermark removeForBaseTable: cleanup of view '$serializedName' failed " +
+                    s"while its RocksDB is still present; surfacing (not a concurrent-deletion race)",
+                  e
+                )
+                throw e
+              } else {
+                log.warn(
+                  s"openivm-cdf-watermark removeForBaseTable: skipped view '$serializedName' " +
+                    s"(RocksDB concurrently deleted): ${e.getMessage}"
+                )
+              }
+          }
+        }
       }
-      .toList
-    if (victims.nonEmpty) {
-      db.withBatch { batch =>
-        victims.foreach(k => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, k))
+    }
+
+    // Legacy shared-index cleanup. The shared index stores (viewName, source)
+    // composite keys and must be scanned by source value; it predates per-MV
+    // sharding and cannot use the reverse-dependency index. Exercised only on
+    // pre-sharding installations where the legacy DB exists on disk; new installs
+    // never write to it, so the scan is a no-op.
+    openLegacyIndexDb(spark).foreach { db =>
+      val baseBytes = RocksDBCodec.utf8(baseTable)
+      val victims = db
+        .prefixScan(LegacyCf, Array.emptyByteArray)
+        .flatMap { case (candidate, _) =>
+          val parts = RocksDBCodec.splitComposite(candidate, 2)
+          if (parts.length == 2 && java.util.Arrays.equals(parts(1), baseBytes)) Iterator.single(candidate.clone())
+          else Iterator.empty
+        }
+        .toList
+      if (victims.nonEmpty) {
+        db.withBatch { batch =>
+          victims.foreach(candidate => OpenIvmRocksDBBatchOps.delete(db, batch, LegacyCf, candidate))
+        }
       }
     }
   }
 
   def removeForView(spark: SparkSession, viewName: String): Unit = {
-    if (!Files.exists(Paths.get(indexDbPath(spark)))) return
-    val db        = openIndexDb(spark)
-    val viewBytes = RocksDBCodec.utf8(viewName)
-    val victims = db
-      .prefixScan(Cf, Array.emptyByteArray)
-      .flatMap { case (k, _) =>
-        val parts = RocksDBCodec.splitComposite(k, 2)
-        if (parts.length == 2 && java.util.Arrays.equals(parts(0), viewBytes)) Iterator.single(k.clone())
-        else Iterator.empty
+    val path = OpenIvmStatePaths.perMvDbPath(spark, viewName)
+    if (OpenIvmStatePaths.isExistingDb(path)) {
+      val db      = openMvDb(spark, viewName)
+      val victims = db.prefixScan(Cf, Array.emptyByteArray).map { case (key, _) => key.clone() }.toList
+      if (victims.nonEmpty) {
+        db.withBatch { batch =>
+          victims.foreach(key => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, key))
+        }
       }
-      .toList
-    if (victims.nonEmpty) {
-      db.withBatch { batch =>
-        victims.foreach(k => OpenIvmRocksDBBatchOps.delete(db, batch, Cf, k))
+    }
+
+    openLegacyIndexDb(spark).foreach { db =>
+      val prefix  = RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(viewName), Array.emptyByteArray))
+      val victims = db.prefixScan(LegacyCf, prefix).map { case (key, _) => key.clone() }.toList
+      if (victims.nonEmpty) {
+        db.withBatch { batch =>
+          victims.foreach(key => OpenIvmRocksDBBatchOps.delete(db, batch, LegacyCf, key))
+        }
       }
     }
   }
+}
+
+object CdfWatermarkCatalog {
+  private def backend(spark: SparkSession): CdfWatermarkBackend = CdfWatermarkBackend.forSession(spark)
+
+  def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
+
+  def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
+    backend(spark).get(spark, viewName, source)
+
+  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
+    backend(spark).getAll(spark, viewName, sources)
+
+  def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
+    backend(spark).put(spark, viewName, source, version)
+
+  def putAll(spark: SparkSession, viewName: String, versionsBySource: Map[String, Long]): Unit =
+    backend(spark).putAll(spark, viewName, versionsBySource)
+
+  def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
+    backend(spark).removeForBaseTable(spark, baseTable)
+
+  def removeForView(spark: SparkSession, viewName: String): Unit =
+    backend(spark).removeForView(spark, viewName)
 }

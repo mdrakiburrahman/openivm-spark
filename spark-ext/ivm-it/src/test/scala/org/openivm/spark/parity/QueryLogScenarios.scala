@@ -4,6 +4,9 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
 import org.openivm.spark.common.RefreshSqlLogCatalog
+import org.openivm.spark.testkit.HotPathBudget
+
+import scala.concurrent.duration._
 
 /** End-to-end coverage of `RefreshSqlLog` instrumentation in
   * `MaterializedViewCommands` + the `SHOW OPENIVM QUERY LOG` SQL
@@ -47,7 +50,7 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
     }
 
   describe("RefreshSqlLog — CREATE path") {
-    it("emits original_query and initial_load_ctas rows with mode=create") {
+    it("emits path CTAS and named registration rows in stable order") {
       clearLog()
       sql("CREATE TABLE qlog_t1 (k INT, v INT) USING DELTA")
       sql("INSERT INTO qlog_t1 VALUES (1, 10), (2, 20)")
@@ -63,6 +66,7 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
       val cats      = byRid(createRid).toSet
       cats should contain("original_query")
       cats should contain("initial_load_ctas")
+      cats should contain("catalog_registration")
 
       val createRows = rows.filter(_.getString(ColRefreshId) == createRid)
       createRows.foreach(_.getString(ColMode) shouldBe "create")
@@ -74,7 +78,40 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
 
       val initRow = createRows.find(_.getString(ColCategory) == "initial_load_ctas").get
       initRow.getInt(ColStmtOrder) shouldBe 0
-      initRow.getString(ColSqlText) should include("CREATE TABLE")
+      initRow.getString(ColSqlText) should include("CREATE TABLE delta.`")
+
+      val registrationRow = createRows.find(_.getString(ColCategory) == "catalog_registration").get
+      registrationRow.getInt(ColStmtOrder) shouldBe 1
+      registrationRow.getString(ColSqlText) should include("CREATE TABLE IF NOT EXISTS")
+      registrationRow.getString(ColSqlText) should include("USING DELTA LOCATION")
+      registrationRow.getString(ColSqlText) should not include " AS SELECT "
+    }
+
+    it("logs an optional backing user view after catalog registration") {
+      clearLog()
+      sql("CREATE TABLE qlog_t1_backing (k INT, v INT) USING DELTA")
+      sql("INSERT INTO qlog_t1_backing VALUES (1, 10), (1, 20), (2, 5)")
+      sql(
+        "CREATE MATERIALIZED VIEW qlog_mv1_backing AS " +
+          "SELECT k, SUM(v) AS s FROM qlog_t1_backing GROUP BY k HAVING SUM(v) > 10"
+      )
+
+      val rows      = showLog()
+      val createRid = categoriesByRefresh(rows).keys.find(_.contains("_create_mv_")).get
+      val createRows = rows
+        .filter(_.getString(ColRefreshId) == createRid)
+        .sortBy(_.getInt(ColStmtOrder))
+
+      createRows.map(_.getString(ColCategory)) should contain inOrderOnly (
+        "original_query",
+        "initial_load_ctas",
+        "catalog_registration",
+        "backing_user_view"
+      )
+      createRows
+        .find(_.getString(ColCategory) == "backing_user_view")
+        .get
+        .getInt(ColStmtOrder) shouldBe 2
     }
   }
 
@@ -160,7 +197,25 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
   }
 
   describe("RefreshSqlLog — hot-path budget") {
-    it("10_000 record(...) calls complete in under 50 ms (≤ 5 µs each)") {
+
+    /** How much slower than a bare buffered append `record()` may be.  Also
+      * the relief factor: a JVM whose reference workload measures 10x its
+      * idle cost gets 10x the budget.  `record()` measures ~3.5x idle and
+      * ~5.7x under a 34-suite parallel load (the metrics update degrades
+      * faster than a plain append under cache pressure), so the ratio itself
+      * is not a stable enough quantity to assert on directly — it is used
+      * only to scale the budget.
+      */
+    val RecordRatioBudget = 8.0
+
+    /** The original absolute gate, retained as a floor so this assertion never
+      * becomes stricter than it used to be on an idle box.  It only relaxes
+      * above this when the calibration proves the JVM itself is slower right
+      * now (full-suite runs oversubscribe the machine 4x).
+      */
+    val RecordFloor = 50.millis
+
+    it("10_000 record(...) calls stay within a small constant factor of a bare buffered append") {
       restartSpark(Map("spark.openivm.queryLog.enabled" -> "true"))
       org.openivm.spark.common.RefreshSqlLogCatalog.ensureTables(spark)
 
@@ -172,24 +227,24 @@ abstract class QueryLogScenarios extends IvmParitySpecBase("query-log") {
       )
       log.isActive shouldBe true
 
-      // Warm up the JIT.
-      var i = 0
-      while (i < 1000) {
-        log.record("rewritten_stmt", i, 0, "merge", "SELECT 1", 0L)
-        i += 1
-      }
-
-      val t0 = System.nanoTime()
-      i = 0
-      while (i < 10000) {
-        log.record("rewritten_stmt", i, 0, "merge", "SELECT 1", 0L)
-        i += 1
-      }
-      val elapsedMs = (System.nanoTime() - t0) / 1000000L
       // Don't flush — we don't want the RocksDB write in the budget. The
       // buffer is cleared by GC when this method exits.
-      withClue(s"record() 10k iterations took ${elapsedMs}ms (budget=50ms): ") {
-        elapsedMs should be < 50L
+      val measured = HotPathBudget.measure("RefreshSqlLog.record", iterations = 10000) { iterations =>
+        var i = 0
+        while (i < iterations) {
+          log.record("rewritten_stmt", i, 0, "merge", "SELECT 1", 0L)
+          i += 1
+        }
+      }
+      info(measured.describe(RecordRatioBudget, RecordFloor))
+
+      // The budget is the original constant, relaxed only by a slowdown that
+      // the reference workload measured in this same JVM, in this same
+      // instant. It is never tightened below the constant, and a hot path
+      // that starts doing IO / serialization / locking blows past it at any
+      // load level.
+      withClue(measured.describe(RecordRatioBudget, RecordFloor) + ": ") {
+        measured.subjectNanos should be <= measured.budgetNanos(RecordRatioBudget, RecordFloor)
       }
     }
   }

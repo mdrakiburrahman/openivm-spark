@@ -674,6 +674,20 @@ Result: `CreateMaterializedViewCommand` with `clusterColumns = Seq("region",
 intercepted — it falls through to Delta and runs liquid clustering on the MV's
 real table.
 
+The resolved clustering key also gates one Delta table property. Delta's
+clustered-table OPTIMIZE path (`OptimizeTableStrategy.getMode` →
+`ClusteringStrategy`) always uses the hilbert curve, and
+`HilbertClustering.getClusteringExpression` asserts `cols.size > 1`. A table
+clustered by *exactly one* column therefore fails every auto-compaction with
+`AssertionError: Cannot do Hilbert clustering by zero or one column!`; Delta
+swallows the post-commit hook failure, so the commit stands and the table is
+never compacted. `FeatureGate.buildMvDataTblProperties` consequently omits
+`'delta.autoOptimize.autoCompact' = 'true'` when the MV resolves to a
+single-column clustering key, and keeps it for zero columns (Delta uses
+`CompactionStrategy`) and for two or more. `spark.openivm.delta.autoCompact`
+keeps its meaning and default (`true`); the guard only skips the cases Delta
+cannot service. Covered by `AutoCompactClusteringSpec`.
+
 ### Explain (dry-run verdict, #4)
 
 ```sql

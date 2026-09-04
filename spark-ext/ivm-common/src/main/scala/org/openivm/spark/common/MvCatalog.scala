@@ -84,9 +84,12 @@ final case class MvMetadata(
       .toMap
 
   /** Whether this persisted MV instance writes a downstream-consumable
-    * `openivm_delta_<view>` on REFRESH. Falls back to the coarse refresh-type
-    * capability for pre-property metadata rows created before
-    * `_ivm_emits_cascade_view_delta` existed.
+    * `openivm_delta_<view>` on REFRESH. The property is the per-MV verdict
+    * recorded at CREATE (compiled program verified by
+    * `SparkRefreshRewriter.hasRealDelta`). Missing property means legacy
+    * metadata written before `_ivm_emits_cascade_view_delta` existed, which
+    * falls back — fail-closed for FULL_REFRESH — to the coarse refresh-type
+    * capability.
     */
   def emitsCascadeViewDelta: Boolean =
     properties
@@ -120,6 +123,50 @@ final case class MvMetadata(
         case "false" => false
       }
       .getOrElse(true)
+
+  /** SQL suffix applied by the user-facing Spark VIEW when the physical Delta
+    * table stores a larger incremental state (currently Top-K). Empty for a
+    * materialized view whose user-facing object is the Delta table itself.
+    */
+  def backingViewSuffix: Option[String] =
+    properties.get(MvMetadata.BackingViewSuffixKey).map(_.trim).filter(_.nonEmpty)
+
+  /** Whether writes must target the sibling `<mv>__ivm_data` Delta table. */
+  def usesBackingDataTable: Boolean =
+    refreshType == RefreshTypeCode.AggregateHaving ||
+      backingViewSuffix.nonEmpty ||
+      properties.get(MvMetadata.BackingDataTableKey).contains("true")
+
+  /** CREATE-time [[TimeTravelPinStatus]] of this view's user-authored snapshot
+    * pins, or `None` for a view created before the status was persisted (the
+    * refresh path re-derives it from [[querySql]] in that case).
+    *
+    * Fail-closed: a property that is present but not a contract value reads as
+    * [[TimeTravelPinStatus.CompileFailed]], never as "absent" — otherwise a
+    * corrupt property would silently fall back to re-derivation and hide the
+    * corruption.
+    */
+  def timeTravelPinStatus: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinStatusKey).flatMap(TimeTravelPinStatus.normalizeOrRefuse)
+
+  /** The persisted status exactly as stored, for error messages that must show
+    * what was actually on disk rather than its fail-closed interpretation.
+    */
+  def timeTravelPinStatusRaw: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinStatusKey).map(_.trim).filter(_.nonEmpty)
+
+  /** CREATE-time [[TimeTravelPinReason]] explaining the persisted status. */
+  def timeTravelPinReason: Option[String] =
+    properties.get(MvMetadata.TimeTravelPinReasonKey).flatMap(TimeTravelPinReason.normalize)
+
+  /** CREATE-time identity of every resolved pin, `<qualified source>=<clause>`,
+    * sorted by source. Empty when the view has no resolved pin.
+    */
+  def timeTravelPins: Seq[String] =
+    properties
+      .get(MvMetadata.TimeTravelPinsKey)
+      .map(_.split(MvMetadata.TimeTravelPinSeparator).iterator.map(_.trim).filter(_.nonEmpty).toVector)
+      .getOrElse(Vector.empty)
 }
 
 object MvMetadata {
@@ -134,6 +181,14 @@ object MvMetadata {
     * cascade-usable view-delta at REFRESH time.
     */
   val EmitsCascadeViewDeltaKey: String = "_ivm_emits_cascade_view_delta"
+
+  /** SQL suffix (for example `ORDER BY ... LIMIT ...`) evaluated by the
+    * user-facing VIEW over an unlimited incremental backing table.
+    */
+  val BackingViewSuffixKey: String = "_ivm_backing_view_suffix"
+
+  /** Property recording a user-facing view over the physical state table. */
+  val BackingDataTableKey: String = "_ivm_uses_backing_data_table"
 
   /** Property recording whether Spark's analyzed CREATE plan contains a join. */
   val QueryHasJoinKey: String = "_ivm_query_has_join"
@@ -157,8 +212,44 @@ object MvMetadata {
   def queryShapeProperties(hasJoin: Boolean): Map[String, String] =
     Map(QueryHasJoinKey -> hasJoin.toString)
 
+  /** CREATE-time compiled refresh type captured for refresh-span correlation. */
+  val CompileRefreshTypeKey: String = "_ivm_compile_refresh_type"
+
+  /** CREATE-time refresh classification reason captured for refresh-span correlation. */
+  val RefreshReasonKey: String = "_ivm_refresh_reason"
+
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
+
+  /** CREATE-time [[TimeTravelPinStatus]] of the view's user-authored snapshot
+    * pins. Persisted so a REFRESH still reports `APPLIED` even though the
+    * generated delta statements carry no temporal clause of their own.
+    */
+  val TimeTravelPinStatusKey: String = "_ivm_time_travel_pin_status"
+
+  /** CREATE-time pin identity, `<qualified source>=<clause>` entries joined by
+    * [[TimeTravelPinSeparator]] and sorted by source. Lets REFRESH prove the
+    * persisted status still describes the same frozen relations.
+    */
+  val TimeTravelPinsKey: String = "_ivm_time_travel_pins"
+
+  val TimeTravelPinSeparator: String = ";"
+
+  /** CREATE-time [[TimeTravelPinReason]] for the persisted status. */
+  val TimeTravelPinReasonKey: String = "_ivm_time_travel_pin_reason"
+
+  /** Stable identity used by downstream schema fingerprints. Source-version
+    * advancement seeds this with the pre-advance identity so changing only an
+    * immutable VERSION pin does not masquerade as a DROP/CREATE definition
+    * change to downstream materialized views.
+    */
+  val DefinitionIdentityKey: String = "_ivm_definition_identity"
+
+  /** Crash-recovery journal for an in-flight source-version advancement. The
+    * user query/pin/watermark fields remain unchanged while these keys exist.
+    */
+  val SourceVersionAdvancePreMvVersionKey: String = "_ivm_source_version_advance_pre_mv_version"
+  val SourceVersionAdvanceCascadePathKey: String  = "_ivm_source_version_advance_cascade_path"
 
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
   private val CompileCacheSqlSuffix: String             = "sql"
@@ -188,6 +279,34 @@ object MvMetadata {
   def clusterColumnsProperties(cols: Seq[String]): Map[String, String] =
     if (cols.isEmpty) Map.empty
     else Map(ClusterColumnsKey -> cols.mkString(","))
+
+  /** Build the property entries recording the CREATE-time classification
+    * metadata that REFRESH spans can reconstruct later without recompiling.
+    */
+  def refreshClassificationProperties(
+      compileRefreshTypeName: String,
+      refreshReason: String
+  ): Map[String, String] = {
+    val compile = Option(compileRefreshTypeName).map(_.trim).filter(_.nonEmpty).map(CompileRefreshTypeKey -> _).toMap
+    val reason  = Option(refreshReason).map(_.trim).filter(_.nonEmpty).map(RefreshReasonKey -> _).toMap
+    compile ++ reason
+  }
+
+  /** Build the property entries recording the CREATE-time snapshot-pin
+    * telemetry contract. `pins` are `<qualified source>=<clause>` entries; they
+    * are stored sorted so the property is byte-stable, and omitted entirely
+    * when the view has no resolved pin. The clause is stored VERBATIM (never
+    * log-sanitized) so REFRESH can compare it byte for byte.
+    */
+  def timeTravelPinProperties(status: String, pins: Seq[String], reason: String): Map[String, String] = {
+    val statusProp = TimeTravelPinStatus.normalize(status).map(TimeTravelPinStatusKey -> _).toMap
+    val reasonProp = TimeTravelPinReason.normalize(reason).map(TimeTravelPinReasonKey -> _).toMap
+    val pinList    = Option(pins).getOrElse(Seq.empty).map(_.trim).filter(_.nonEmpty).distinct.sorted
+    val pinsProp =
+      if (pinList.isEmpty) Map.empty[String, String]
+      else Map(TimeTravelPinsKey -> pinList.mkString(TimeTravelPinSeparator))
+    statusProp ++ reasonProp ++ pinsProp
+  }
 
   /** Tier component for the compile cache key.  It includes only facts
     * that may change the emitted SQL shape/classification, not quantitative
@@ -281,17 +400,16 @@ object MvMetadata {
 }
 
 /** RocksDB-backed catalog for materialized-view metadata. */
-object MvCatalog {
+private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  private val IndexColumnFamilies = IndexDbColumnFamilies.All
-  private val PerMvColumnFamilies = Seq("meta", "properties", "consumed")
+  private val PerMvColumnFamilies            = OpenIvmStatePaths.PerMvColumnFamilies
+  private val SourceDependencyColumnFamilies = OpenIvmStatePaths.SourceDependencyColumnFamilies
 
-  private val MvIndexCf     = "mv_index"
-  private val SourceToMvsCf = "source_to_mvs"
-  private val MetaCf        = "meta"
-  private val PropertiesCf  = "properties"
+  private val DependentMvsCf = "dependent_mvs"
+  private val MetaCf         = "meta"
+  private val PropertiesCf   = "properties"
 
   private val EmptyBytes = Array.emptyByteArray
 
@@ -308,25 +426,18 @@ object MvCatalog {
   private def canonicalLocalPath(path: String): String =
     new File(RocksDBCodec.requireLocalPath(path)).getCanonicalPath
 
-  private def warehouseRoot(spark: SparkSession): Path =
-    Paths.get(canonicalLocalPath(FeatureGate.stateWarehouse(spark)))
-
-  private def indexDbPath(spark: SparkSession): String =
-    warehouseRoot(spark).resolve("_openivm").resolve("index").resolve("rocksdb").toString
-
   private def perMvDbPath(spark: SparkSession, serializedName: String): String =
-    warehouseRoot(spark)
-      .resolve("_openivm")
-      .resolve("mvs")
-      .resolve(RocksDBCodec.safePathSegment(serializedName))
-      .resolve("rocksdb")
-      .toString
-
-  private def openIndexDb(spark: SparkSession): OpenIvmRocksDB =
-    OpenIvmRocksDBRegistry.getOrOpen(spark, indexDbPath(spark), IndexColumnFamilies)
+    OpenIvmStatePaths.perMvDbPath(spark, serializedName)
 
   private def openPerMvDb(spark: SparkSession, serializedName: String): OpenIvmRocksDB =
     OpenIvmRocksDBRegistry.getOrOpen(spark, perMvDbPath(spark, serializedName), PerMvColumnFamilies)
+
+  private def openSourceDependencyDb(spark: SparkSession, sourceTable: String): OpenIvmRocksDB =
+    OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable),
+      SourceDependencyColumnFamilies
+    )
 
   private def openExistingPerMvDbAt(spark: SparkSession, path: String): Option[OpenIvmRocksDB] = {
     val canonicalPath = canonicalLocalPath(path)
@@ -386,17 +497,7 @@ object MvCatalog {
     if (encoded.isEmpty) Seq.empty
     else RocksDBCodec.splitComposite(encoded).map(RocksDBCodec.fromUtf8)
 
-  private def sourceToMvKey(sourceTable: String, serializedName: String): Array[Byte] =
-    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(sourceTable), RocksDBCodec.utf8(serializedName)))
-
-  private def sourceToMvsPrefix(sourceTable: String): Array[Byte] =
-    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(sourceTable), EmptyBytes))
-
-  private def lookupPath(indexDb: OpenIvmRocksDB, serializedName: String): Option[String] =
-    indexDb
-      .get(MvIndexCf, RocksDBCodec.utf8(serializedName))
-      .map(RocksDBCodec.fromUtf8)
-      .map(canonicalLocalPath)
+  private def dependentMvKey(serializedName: String): Array[Byte] = RocksDBCodec.utf8(serializedName)
 
   private def readProperties(db: OpenIvmRocksDB): Map[String, String] =
     collectPrefix(db, PropertiesCf, EmptyBytes).map { case (key, value) =>
@@ -404,41 +505,69 @@ object MvCatalog {
     }.toMap
 
   private def readMetadata(db: OpenIvmRocksDB): Option[MvMetadata] =
-    for {
-      serializedName          <- getUtf8(db, MetaCf, NameMetaKey)
-      querySql                <- getUtf8(db, MetaCf, QuerySqlMetaKey)
-      refreshType             <- getInt(db, MetaCf, RefreshTypeMetaKey)
-      refreshTypeName         <- getUtf8(db, MetaCf, RefreshTypeNameMetaKey)
-      lastVersion             <- getLong(db, MetaCf, LastVersionMetaKey)
-      sourceTablesEncoded     <- db.get(MetaCf, SourceTablesMetaKey)
-      sourceSchemaFingerprint <- getUtf8(db, MetaCf, SourceSchemaFingerprintMetaKey)
-      location                <- getUtf8(db, MetaCf, LocationMetaKey)
-      createdAtMillis         <- getLong(db, MetaCf, CreatedAtMetaKey)
-    } yield MvMetadata(
-      name = deserializeName(serializedName),
-      querySql = querySql,
-      refreshType = refreshType,
-      refreshTypeName = refreshTypeName,
-      lastVersion = lastVersion,
-      sourceTables = decodeSourceTables(sourceTablesEncoded),
-      sourceSchemaFingerprint = sourceSchemaFingerprint,
-      location = location,
-      createdAt = new Timestamp(createdAtMillis),
-      properties = readProperties(db)
-    )
+    db.withSession {
+      val keys = Seq(
+        NameMetaKey,
+        QuerySqlMetaKey,
+        RefreshTypeMetaKey,
+        RefreshTypeNameMetaKey,
+        LastVersionMetaKey,
+        SourceTablesMetaKey,
+        SourceSchemaFingerprintMetaKey,
+        LocationMetaKey,
+        CreatedAtMetaKey
+      )
+      val values                           = db.multiGet(MetaCf, keys)
+      def utf8(index: Int): Option[String] = values(index).map(RocksDBCodec.fromUtf8)
+
+      for {
+        serializedName          <- utf8(0)
+        querySql                <- utf8(1)
+        refreshType             <- utf8(2).flatMap(value => Try(value.toInt).toOption)
+        refreshTypeName         <- utf8(3)
+        lastVersion             <- utf8(4).flatMap(value => Try(value.toLong).toOption)
+        sourceTablesEncoded     <- values(5)
+        sourceSchemaFingerprint <- utf8(6)
+        location                <- utf8(7)
+        createdAtMillis         <- utf8(8).flatMap(value => Try(value.toLong).toOption)
+      } yield MvMetadata(
+        name = deserializeName(serializedName),
+        querySql = querySql,
+        refreshType = refreshType,
+        refreshTypeName = refreshTypeName,
+        lastVersion = lastVersion,
+        sourceTables = decodeSourceTables(sourceTablesEncoded),
+        sourceSchemaFingerprint = sourceSchemaFingerprint,
+        location = location,
+        createdAt = new Timestamp(createdAtMillis),
+        properties = readProperties(db)
+      )
+    }
 
   private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
     openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
 
-  private def indexedSources(indexDb: OpenIvmRocksDB, serializedName: String): Set[String] =
-    collectPrefix(indexDb, SourceToMvsCf, EmptyBytes).flatMap { case (key, _) =>
-      RocksDBCodec.splitComposite(key, 2) match {
-        case Seq(sourceBytes, mvBytes) if RocksDBCodec.fromUtf8(mvBytes) == serializedName =>
-          Some(RocksDBCodec.fromUtf8(sourceBytes))
-        case _ =>
-          None
+  private def dependentViewNames(spark: SparkSession, sourceTable: String): Seq[String] = {
+    val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+    if (OpenIvmStatePaths.isExistingDb(path)) {
+      collectPrefix(openSourceDependencyDb(spark, sourceTable), DependentMvsCf, EmptyBytes).map { case (key, _) =>
+        RocksDBCodec.fromUtf8(key)
+      }.sorted
+    } else {
+      val names = list(spark)
+        .filter(_.sourceTables.contains(sourceTable))
+        .map(meta => serializeName(meta.name))
+        .distinct
+        .sorted
+      if (names.nonEmpty) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          names.foreach(name => OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(name), EmptyBytes))
+        }
       }
-    }.toSet
+      names
+    }
+  }
 
   private def rewriteProperties(
       db: OpenIvmRocksDB,
@@ -496,88 +625,68 @@ object MvCatalog {
     }
 
   def ensureTables(spark: SparkSession): Unit = {
-    openIndexDb(spark)
+    Files.createDirectories(OpenIvmStatePaths.mvsRoot(spark))
+    Files.createDirectories(OpenIvmStatePaths.sourcesRoot(spark))
     ()
   }
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit = {
     val serializedName = serializeName(meta.name)
-    val perMvPath      = perMvDbPath(spark, serializedName)
-    val indexDb        = openIndexDb(spark)
     val perMvDb        = openPerMvDb(spark, serializedName)
-    val oldSources =
-      readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
-        indexDb,
-        serializedName
-      )
+    val oldSources = perMvDb.withSession {
+      readMetadata(perMvDb).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
+    }
     val newSources = meta.sourceTables.toSet
 
-    perMvDb.withBatch { batch =>
-      writeMetadata(perMvDb, batch, meta)
-      rewriteProperties(perMvDb, batch, meta.properties)
+    // Reverse-index entries are published first. viewsForSource validates
+    // them against authoritative per-MV metadata, so an interrupted update
+    // can leave a harmless extra entry but cannot hide a real dependency.
+    newSources.toSeq.sorted.foreach { sourceTable =>
+      val db = openSourceDependencyDb(spark, sourceTable)
+      db.withBatch { batch =>
+        OpenIvmRocksDBBatchOps.put(db, batch, DependentMvsCf, dependentMvKey(serializedName), EmptyBytes)
+      }
     }
 
-    indexDb.withBatch { batch =>
-      (oldSources -- newSources).toSeq.sorted.foreach { sourceTable =>
-        OpenIvmRocksDBBatchOps.delete(indexDb, batch, SourceToMvsCf, sourceToMvKey(sourceTable, serializedName))
+    perMvDb.withSession {
+      perMvDb.withBatch { batch =>
+        writeMetadata(perMvDb, batch, meta)
+        rewriteProperties(perMvDb, batch, meta.properties)
       }
-      newSources.toSeq.sorted.foreach { sourceTable =>
-        OpenIvmRocksDBBatchOps.put(
-          indexDb,
-          batch,
-          SourceToMvsCf,
-          sourceToMvKey(sourceTable, serializedName),
-          EmptyBytes
-        )
+    }
+
+    (oldSources -- newSources).toSeq.sorted.foreach { sourceTable =>
+      val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+      if (OpenIvmStatePaths.isExistingDb(path)) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          OpenIvmRocksDBBatchOps.delete(db, batch, DependentMvsCf, dependentMvKey(serializedName))
+        }
       }
-      OpenIvmRocksDBBatchOps.put(
-        indexDb,
-        batch,
-        MvIndexCf,
-        RocksDBCodec.utf8(serializedName),
-        RocksDBCodec.utf8(perMvPath)
-      )
     }
   }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
-    lookupPath(indexDb, serializedName).flatMap(path => readMetadataAtPath(spark, path))
+    readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
   def list(spark: SparkSession): Seq[MvMetadata] = {
-    val indexDb = openIndexDb(spark)
-    collectPrefix(indexDb, MvIndexCf, EmptyBytes)
-      .sortBy { case (key, _) => RocksDBCodec.fromUtf8(key) }
-      .flatMap { case (_, value) =>
-        readMetadataAtPath(spark, RocksDBCodec.fromUtf8(value))
-      }
+    OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
   }
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
-    val indexDb = openIndexDb(spark)
-    val names = collectPrefix(indexDb, SourceToMvsCf, sourceToMvsPrefix(table))
-      .flatMap { case (key, _) =>
-        RocksDBCodec.splitComposite(key, 2) match {
-          case Seq(_, mvBytes) => Some(RocksDBCodec.fromUtf8(mvBytes))
-          case _               => None
-        }
+    dependentViewNames(spark, table)
+      .flatMap { serializedName =>
+        readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
       }
-      .distinct
-      .sorted
-
-    names.flatMap { serializedName =>
-      lookupPath(indexDb, serializedName).flatMap(path => readMetadataAtPath(spark, path))
-    }
+      .filter(_.sourceTables.contains(table))
   }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
 
-    lookupPath(indexDb, serializedName)
-      .flatMap(path => openExistingPerMvDbAt(spark, path))
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName))
       .foreach { perMvDb =>
         val current = getLong(perMvDb, MetaCf, LastVersionMetaKey).getOrElse(-1L)
         if (newVersion > current) {
@@ -602,11 +711,9 @@ object MvCatalog {
       name: TableIdentifier,
       properties: Map[String, String]
   ): Unit = {
-    val indexDb        = openIndexDb(spark)
     val serializedName = serializeName(name)
 
-    lookupPath(indexDb, serializedName)
-      .flatMap(path => openExistingPerMvDbAt(spark, path))
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName))
       .foreach { perMvDb =>
         if (readProperties(perMvDb) != properties) {
           perMvDb.withBatch { batch =>
@@ -618,23 +725,24 @@ object MvCatalog {
 
   def remove(spark: SparkSession, name: TableIdentifier): Unit = {
     val serializedName = serializeName(name)
-    val indexDb        = openIndexDb(spark)
-    val indexedPath    = lookupPath(indexDb, serializedName)
-    val candidatePath  = indexedPath.getOrElse(perMvDbPath(spark, serializedName))
-    val sourceTables =
-      readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String]) ++ indexedSources(
-        indexDb,
-        serializedName
-      )
+    val candidatePath  = perMvDbPath(spark, serializedName)
+    val sourceTables   = readMetadataAtPath(spark, candidatePath).map(_.sourceTables.toSet).getOrElse(Set.empty[String])
 
-    OpenIvmRocksDBRegistry.close(candidatePath)
-    deleteRecursively(Paths.get(candidatePath))
+    // Close and delete as one atomic lifecycle step. Separating Registry.close
+    // from deleteRecursively left a window where a concurrent getOrOpen (e.g.
+    // from removeForBaseTable) could reopen the DB against a being-deleted
+    // directory. closeAndDelete holds the per-path slot lock across both the
+    // close and the filesystem removal, so a racing open blocks and then retries
+    // into a fresh DB instead of a "lock held by current process" / "already
+    // closed" failure.
+    OpenIvmRocksDBRegistry.closeAndDelete(candidatePath)(canonical => deleteRecursively(Paths.get(canonical)))
 
-    if (indexedPath.nonEmpty || sourceTables.nonEmpty) {
-      indexDb.withBatch { batch =>
-        OpenIvmRocksDBBatchOps.delete(indexDb, batch, MvIndexCf, RocksDBCodec.utf8(serializedName))
-        sourceTables.toSeq.sorted.foreach { sourceTable =>
-          OpenIvmRocksDBBatchOps.delete(indexDb, batch, SourceToMvsCf, sourceToMvKey(sourceTable, serializedName))
+    sourceTables.toSeq.sorted.foreach { sourceTable =>
+      val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
+      if (OpenIvmStatePaths.isExistingDb(path)) {
+        val db = openSourceDependencyDb(spark, sourceTable)
+        db.withBatch { batch =>
+          OpenIvmRocksDBBatchOps.delete(db, batch, DependentMvsCf, dependentMvKey(serializedName))
         }
       }
     }
@@ -676,9 +784,57 @@ object MvCatalog {
    * of the same MV name with a different body is detected as drift.
    */
   def mvIdentity(meta: MvMetadata): String = {
+    if (
+      meta.properties.contains(MvMetadata.SourceVersionAdvancePreMvVersionKey) ||
+      meta.properties.contains(MvMetadata.SourceVersionAdvanceCascadePathKey)
+    )
+      throw new IllegalStateException(
+        s"Materialized view '${serializeName(meta.name)}' has an in-flight source-version advancement; " +
+          "refresh or retry that view before refreshing a dependent materialized view"
+      )
+    meta.properties.get(MvMetadata.DefinitionIdentityKey).filter(_.nonEmpty).getOrElse {
+      legacyMvIdentity(meta)
+    }
+  }
+
+  private def legacyMvIdentity(meta: MvMetadata): String = {
     val serialized = serializeName(meta.name)
     val content    = s"$serialized|${meta.location}|${meta.querySql}"
     val digest     = MessageDigest.getInstance("SHA-256").digest(content.getBytes("UTF-8"))
     digest.map("%02x".format(_)).mkString
   }
+}
+
+/** Session-selected facade over the local RocksDB and shared Delta catalog backends. */
+object MvCatalog {
+  private def backend(spark: SparkSession): MvCatalogBackend = MvCatalogBackend.forSession(spark)
+
+  def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
+
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit = backend(spark).upsert(spark, meta)
+
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
+
+  def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
+
+  def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
+    backend(spark).viewsForSource(spark, table)
+
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+    backend(spark).advance(spark, name, newVersion)
+
+  def updateProperties(
+      spark: SparkSession,
+      name: TableIdentifier,
+      properties: Map[String, String]
+  ): Unit = backend(spark).updateProperties(spark, name, properties)
+
+  def remove(spark: SparkSession, name: TableIdentifier): Unit = backend(spark).remove(spark, name)
+
+  def schemaFingerprint(
+      sources: Map[String, StructType],
+      mvIdentityBySource: Map[String, String] = Map.empty
+  ): String = RocksDbMvCatalogBackend.schemaFingerprint(sources, mvIdentityBySource)
+
+  def mvIdentity(meta: MvMetadata): String = RocksDbMvCatalogBackend.mvIdentity(meta)
 }

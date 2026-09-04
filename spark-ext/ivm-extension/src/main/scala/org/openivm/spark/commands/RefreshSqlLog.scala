@@ -2,6 +2,7 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshSqlLogAsyncFlusher, RefreshSqlLogCatalog, RefreshSqlLogRow}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 
@@ -35,9 +36,8 @@ final class RefreshSqlLog private (
     private val active: Boolean
 ) {
 
-  // Per-instance, per-thread buffer. RefreshMutex serialises refreshes of
-  // the same MV in the same JVM, and CREATE is never concurrent with itself
-  // on the same MV, so no contention here.
+  // Per-instance, per-thread buffer. RefreshMutex serialises CREATE /
+  // REFRESH / DROP of the same MV in the same JVM, so no contention here.
   private val buffer = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
 
   def isActive: Boolean = active
@@ -46,7 +46,8 @@ final class RefreshSqlLog private (
     * inactive. NEVER throws — telemetry must not fail the refresh.
     *
     * @param category   stable enum tag (`original_query`, `initial_load_ctas`,
-    *                   `aggregate_having_view`, `register_source_delta`,
+    *                   `catalog_registration`, `backing_user_view`,
+    *                   `register_source_delta`,
     *                   `rewritten_stmt`, `count_monoid_cleanup`,
     *                   `post_cleanup_stage`, `drop_cleanup`,
     *                   `full_refresh_stmt`, `fused_view_delta_select`).
@@ -70,6 +71,8 @@ final class RefreshSqlLog private (
       sql: String,
       durationMs: Long
   ): Unit = {
+    if (durationMs >= 0L)
+      OpenIvmMetrics.recordSqlStatement(stmtKind, durationMs * 1000000L, Option(sql).fold(0)(_.length), attemptIdx)
     if (!active) return
     try {
       buffer += RefreshSqlLogRow(

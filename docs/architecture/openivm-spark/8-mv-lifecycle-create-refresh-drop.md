@@ -116,7 +116,24 @@ The helper returns four values:
   Source:
 - `MaterializedViewCommands.scala:165-168`
 
-### 1.6 Additional analyzed-plan metadata
+### 1.5b Source constraint facts and metastore cost
+
+CREATE also discovers per-source constraint facts — foreign keys, unique keys, Delta `CHECK` constraints, and generated columns — through `WorkloadFactsRegistry.discover`. Those facts feed the refresh rewriter, so they are collected for every source of every MV.
+Source:
+
+- `MaterializedViewCommands.scala:1196`
+- `WorkloadFactsRegistry.scala:34-48`
+  Each fact source needs one `CatalogTable`: the Delta metadata is read from the resolved table location and the catalog properties come from the same object. `WorkloadFactsRegistry` therefore issues a single `SessionCatalog.getTableMetadata` per source and threads the result into both `deltaProperties` and `catalogProperties`.
+  Source:
+- `WorkloadFactsRegistry.scala:65-68`
+- `WorkloadFactsRegistry.scala:196-233`
+  This matters because every Hive metastore read runs inside Spark's globally synchronized Hive client (`HiveExternalCatalog.withClient`). A redundant `getTableMetadata` is not local work — it is a serialized section that every concurrent CREATE and REFRESH queues behind. `DeltaLog.forTable(spark, tableIdentifier)` resolves the identifier through `getTableMetadata` and then delegates to `DeltaLog.forTable(spark, catalogTable)`, so passing the already-resolved `CatalogTable` is the identical code path with the round-trip removed.
+  Source:
+- `DeltaLog.scala:770-781` (delta-spark 3.2.0)
+  `WorkloadFactsCatalogBudgetSpec` pins the budget against a real (Derby-backed) Hive metastore by counting `HiveMetaStore.audit` records: one warmed `discover` of a single Delta source must stay within 4 `get_table` and 2 `get_database` calls. Resolving the table twice costs 6 and 3.
+  Source:
+- `WorkloadFactsCatalogBudgetSpec.scala`
+
 
 CREATE analyzes the view body with Spark. It extracts group-by key names. It extracts a `COUNT(*)` alias when the query exposes one. It later extracts a HAVING predicate for `AGGREGATE_HAVING`.
 Source:
@@ -254,13 +271,19 @@ CREATE computes whether this MV emits a downstream-consumable view delta.
 The condition is:
 
 ```scala
-RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
   SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 ```
 
-Source:
+`mayEmitCascadeViewDelta` is a permission set, never a verdict — it adds
+`FULL_REFRESH` on top of `emitsCascadeViewDelta` (which stays the fail-closed
+fallback for legacy metadata) because openivm's
+`refresh_sql.cpp build_split_safe_full_refresh_companion` emits an exact signed
+companion around every Spark-dialect FULL_REFRESH recompute. Capability is
+decided by `hasRealDelta` over the actual compiled program, not by the label.
 
-- `MaterializedViewCommands.scala:626-629`
+Source:
+- `MaterializedViewCommands.scala` (`classifyEffectiveRefreshType`)
 - `RefreshTypeCode.scala:20-76`
 - `SparkRefreshRewriter.scala:1868-1879`
   The classification log line includes `emits_cascade_view_delta='<boolean>'`. That boolean is true only when both conditions are true.
@@ -405,7 +428,7 @@ sequenceDiagram
         Cmd->>Spark: CREATE OR REPLACE VIEW v AS SELECT user columns WHERE HAVING
     end
     Cmd->>MvCat: upsert(MvMetadata(...))
-    Cmd->>Delta: history(1)
+    Cmd->>Delta: DeltaLog snapshot version (no Spark job)
     Cmd->>MvCat: advance(v, initialVersion)
     Cmd-->>Caller: empty result
 ```
@@ -834,8 +857,8 @@ flowchart TD
     S --> AF[Advance lastVersion]
     AF --> AG[markConsumed input staging]
     AG --> AH[pruneFullyConsumed]
-    AH --> AI{non-cascade upstream has downstream?}
-    AI -- yes --> AJ[Record synthetic trigger row]
+    AH --> AI{upstream snapshot trigger needed?}
+    AI -- yes --> AJ[Record synthetic replacement trigger row]
     AI -- no --> AK[Return]
     AJ --> AK
 ```
@@ -1235,7 +1258,7 @@ Source:
 A kept incremental aggregate view logs a classification line like:
 
 ```text
-[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true'
+[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Source:

@@ -416,8 +416,7 @@ Citation: `MvCatalog.scala:485-503`.
 `postRefreshCleanup` calls that advance before marking consumed:
 
 ```scala
-val newVersion =
-  DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+val newVersion = DeltaTableVersion.requireLatest(spark, meta.location)
 MvCatalog.advance(spark, name, newVersion)
 ```
 
@@ -607,7 +606,8 @@ Therefore a downstream MV can detect that its upstream MV was dropped and recrea
 At CREATE time the compiler's refresh type is converted to an effective refresh type.
 The effective refresh type can be demoted to `FULL_REFRESH` for reasons such as:
 
-- Top-K view;
+- unsupported Top-K wrapper (for example, `TAIL`; supported ORDER/LIMIT
+  wrappers retain the inner refresh type);
 - simple projection with no data-apply statement;
 - non-cascade-capable upstream;
 - window initial-load mismatch;

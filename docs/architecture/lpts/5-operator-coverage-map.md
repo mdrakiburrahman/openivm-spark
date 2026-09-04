@@ -3,8 +3,8 @@
 This chapter maps DuckDB logical-plan and expression coverage at the pinned
 OpenIVM/LPTS versions used by this repository:
 
-- `spark-ext/dev/pins.env`: `OPENIVM_COMMIT=aab817f...`.
-- `spark-ext/dev/pins.env`: `LPTS_COMMIT=21e7e31...`.
+- `spark-ext/dev/pins.env`: `OPENIVM_COMMIT=c5f0845f...`.
+- `spark-ext/dev/pins.env`: `LPTS_COMMIT=dbac36d...`.
 - DuckDB submodule pinned by both forks: `8a585197...`.
 
 LPTS means the upstream `lpts` DuckDB extension, not the Scala post-processor in

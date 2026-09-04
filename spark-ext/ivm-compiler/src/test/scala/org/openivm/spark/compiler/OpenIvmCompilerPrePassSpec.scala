@@ -69,5 +69,108 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
       OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
         "SELECT 'it''s still text: date_format(ts, ''yyyyMMdd'')' AS note, __sparkfn_date_format(ts, 'yyyyMMdd') FROM src"
     }
+
+    it("rewrites first_value(expr, true) exactly as last_value(expr, true), mirroring the existing shim") {
+      val sql =
+        "SELECT first_value(raw) OVER (PARTITION BY grp ORDER BY ts), " +
+          "first_value(raw, true) OVER (PARTITION BY grp ORDER BY ts), " +
+          "first_value(coalesce(a, b), false) OVER (PARTITION BY grp ORDER BY ts) FROM src"
+
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        "SELECT first_value(raw) OVER (PARTITION BY grp ORDER BY ts), " +
+        "first_value(raw IGNORE NULLS) OVER (PARTITION BY grp ORDER BY ts), " +
+        "first_value(coalesce(a, b)) OVER (PARTITION BY grp ORDER BY ts) FROM src"
+    }
+
+    it("rewrites 0-arg current_date() and current_timestamp() to collision-free shim names") {
+      val sql = "SELECT id, current_date() AS today, current_timestamp() AS now_ts FROM src"
+
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        "SELECT id, __sparkfn_current_date() AS today, __sparkfn_current_timestamp() AS now_ts FROM src"
+    }
+
+    it("rewrites the exact make_interval and get_json_object calls from the local-openivm canary") {
+      val sql =
+        """SELECT
+          |  to_timestamp(dim_date_billing_usage_event_key, 'yyyyMMdd') +
+          |    make_interval(0, 0, 0, 0, 0, 0, cast(dim_time_billing_usage_event_key AS int)) AS event_time,
+          |  LOWER(GET_JSON_OBJECT(additionalinfo, '$.ArcMachineResourceUri')) AS container_resource_id,
+          |  TRY_CAST(GET_JSON_OBJECT(additionalinfo, '$.NumberOfCores') AS INT) AS billing_reported_cores
+          |FROM src""".stripMargin
+
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        """SELECT
+          |  __sparkfn_to_timestamp(dim_date_billing_usage_event_key, 'yyyyMMdd') +
+          |    __sparkfn_make_interval(0, 0, 0, 0, 0, 0, cast(dim_time_billing_usage_event_key AS int)) AS event_time,
+          |  LOWER(__sparkfn_get_json_object(additionalinfo, '$.ArcMachineResourceUri')) AS container_resource_id,
+          |  TRY_CAST(__sparkfn_get_json_object(additionalinfo, '$.NumberOfCores') AS INT) AS billing_reported_cores
+          |FROM src""".stripMargin
+    }
+
+    it("does not rewrite current_date/current_timestamp inside string literals or comments") {
+      val sql =
+        """SELECT 'current_date()' AS txt,
+          |       -- current_timestamp()
+          |       current_date() AS today
+          |FROM src""".stripMargin
+
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        """SELECT 'current_date()' AS txt,
+          |       -- current_timestamp()
+          |       __sparkfn_current_date() AS today
+          |FROM src""".stripMargin
+    }
+  }
+
+  describe("translateSparkStringLiteralEscapes") {
+    it(
+      "decodes Spark's backslash escapes in the normalize_os_name REPLACE fragment to DuckDB's doubled-quote convention"
+    ) {
+      // Verbatim (modulo Jinja `{{ expr }}` -> `os_name` substitution) from
+      // dbt-server's codegen/macros/spark/os_helpers.sql normalize_os_name
+      // macro -- the exact fragment named in the task.
+      val sparkFragment =
+        """TRIM('_' FROM
+          |        REPLACE(REPLACE(REPLACE(REPLACE(
+          |            LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(os_name,
+          |                ' ', '_'), '-', '_'), '.', '_'), '/', '_'), '\\', '_'), '(', '_'), ')', '_'), ',', '_'), ':', '_'), '\'', '_'))
+          |        , '____', '_'), '___', '_'), '__', '_'), '__', '_')
+          |    )""".stripMargin
+
+      val expectedDuckdbFragment =
+        """TRIM('_' FROM
+          |        REPLACE(REPLACE(REPLACE(REPLACE(
+          |            LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(os_name,
+          |                ' ', '_'), '-', '_'), '.', '_'), '/', '_'), '\', '_'), '(', '_'), ')', '_'), ',', '_'), ':', '_'), '''', '_'))
+          |        , '____', '_'), '___', '_'), '__', '_'), '__', '_')
+          |    )""".stripMargin
+
+      SparkFunctionShimSql.translateSparkStringLiteralEscapes(sparkFragment) shouldBe expectedDuckdbFragment
+    }
+
+    it("decodes each documented Spark backslash escape sequence") {
+      val sql  = raw"SELECT '\0', '\b', '\n', '\r', '\t', '\Z', '\%', '\_', '\q' FROM src"
+      val nul  = 0.toChar.toString
+      val ctlZ = 26.toChar.toString
+      SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql) shouldBe
+        s"SELECT '$nul', '\b', '\n', '\r', '\t', '$ctlZ', '\\%', '\\_', 'q' FROM src"
+    }
+
+    it("passes through literals with no backslash escapes unchanged") {
+      val sql = "SELECT REPLACE(s, ' ', '_'), REPLACE(s, '-', '_') FROM src"
+      SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql) shouldBe sql
+    }
+
+    it("passes through an already doubled-quote-escaped literal unchanged") {
+      val sql = "SELECT 'it''s fine' AS note FROM src"
+      SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql) shouldBe sql
+    }
+
+    it("does not rewrite backslashes inside double-quoted identifiers or comments") {
+      val sql =
+        raw"""SELECT "weird\name" AS c1 -- literal backslash \' not a string: '\\'
+             |FROM src""".stripMargin
+      SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql) shouldBe sql
+    }
   }
 }

@@ -4,7 +4,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common._
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, LptsSparkDialect, OpenIvmCompileException}
+import org.openivm.spark.compiler.{
+  CompiledRefresh,
+  CompileRequest,
+  LptsSparkDialect,
+  OpenIvmCompileException,
+  SparkTimeTravelSql
+}
 
 /**
  * Session-scoped "cold DAG" registry for dry-run materialized views.
@@ -82,6 +88,19 @@ object MvDryCompile {
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       collectSourceSchemas(spark, queryText)
 
+    // Same centralized VALIDATED binding the CREATE/REFRESH paths use, so the dry
+    // classification resolves, validates, and compiles against the SQL-visible
+    // qualifiers a Fabric alias produces exactly as the real compile does -- a
+    // duplicate short or an unverifiable pin hard-fails here too.
+    val pinBinding = requirePinBinding(
+      spark,
+      SparkTimeTravelSql.PinIdentityOperation.Create,
+      name,
+      queryText,
+      qualNames,
+      shortToQual,
+      Map.empty
+    )
     val analyzed     = spark.sql(queryText).queryExecution.analyzed
     val outputSchema = spark.sql(queryText).schema
 
@@ -108,7 +127,8 @@ object MvDryCompile {
             viewName = name.table,
             viewSql = queryText,
             sources = compileSchemas,
-            sourceQualifiedNames = shortToQual,
+            sourceQualifiedNames = pinBinding.friendlyByShort,
+            sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding),
             facts = workloadFacts
           )
         )
@@ -121,26 +141,51 @@ object MvDryCompile {
 
     val aggregateHavingDataColumns = computeAggregateHavingDataColumns(spark, compiled, queryText)
     val simpleProjectionHasDataApply =
-      computeSimpleProjectionHasDataApply(spark, compiled, name, location, qualSchemas, shortToQual)
-    val isTopKView = hasTopLevelTopK(spark, queryText)
+      computeSimpleProjectionHasDataApply(
+        spark,
+        compiled,
+        name,
+        location,
+        qualSchemas,
+        pinBinding.friendlyByShort,
+        sourceSnapshotPins = pinnedClauseByShort(pinBinding),
+        sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding)
+      )
+    val topKViewSpec = validateTopKViewSpec(
+      spark,
+      extractTopKViewSpec(spark, queryText),
+      compiled,
+      analyzed.output.map(_.name)
+    )
     val rawHavingPred =
       if (compiled.refreshType == RefreshTypeCode.AggregateHaving) extractHavingPredicateSql(analyzed)
       else None
-    val upstreamMvByQual         = computeUpstreamMvByQual(spark, qualNames)
-    val nonCascadeUpstreamReason = computeNonCascadeUpstreamReason(upstreamMvByQual)
+    val upstreamMvByQual              = computeUpstreamMvByQual(spark, qualNames)
+    val upstreamSnapshotTriggerDetail = computeUpstreamSnapshotTriggerDetail(upstreamMvByQual)
 
     val classification = classifyEffectiveRefreshType(
       compiled = compiled,
       viewShortName = name.table,
-      isTopKView = isTopKView,
+      topKViewSpec = topKViewSpec,
       simpleProjectionHasDataApply = simpleProjectionHasDataApply,
-      nonCascadeUpstreamReason = nonCascadeUpstreamReason,
+      upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
       rawHavingPred = rawHavingPred,
       aggregateHavingDataColumns = aggregateHavingDataColumns
     )
 
     val rewrittenStatements =
-      dryRewrite(spark, name, location, compiled, classification, queryText, qualSchemas, shortToQual)
+      dryRewrite(
+        spark,
+        name,
+        location,
+        compiled,
+        classification,
+        topKViewSpec,
+        queryText,
+        qualSchemas,
+        pinBinding.friendlyByShort,
+        pinBinding.resolvedPins
+      )
 
     DryCompileResult(name, classification, compiled, qualNames, rewrittenStatements, outputSchema)
   }
@@ -156,9 +201,11 @@ object MvDryCompile {
       location: String,
       compiled: CompiledRefresh,
       classification: MvCommandHelper.EffectiveClassification,
+      topKViewSpec: MvCommandHelper.TopKViewSpec,
       queryText: String,
       qualSchemas: Map[String, StructType],
-      shortToQual: Map[String, String]
+      shortToQual: Map[String, String],
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
   ): Seq[String] = {
     import MvCommandHelper._
     if (classification.refreshType == RefreshTypeCode.FullRefresh) {
@@ -180,10 +227,14 @@ object MvDryCompile {
       Seq.empty
     } else {
       val viewDeltaPath = s"${location.stripSuffix("/")}/__openivm_view_delta"
+      val writeTarget =
+        if (classification.refreshType == RefreshTypeCode.AggregateHaving || topKViewSpec.suffixSql.nonEmpty)
+          dataTableId(name)
+        else name
       SparkRefreshRewriter
         .rewrite(
           compiledSql = compiled.sql,
-          mvName = name,
+          mvName = writeTarget,
           mvLocation = location,
           viewLogicalName = name.table,
           sourceTempViews = Map.empty,
@@ -193,6 +244,23 @@ object MvDryCompile {
             qual.split("\\.").last -> schema.fieldNames.toSeq
           },
           sourceQualifiedNames = shortToQual,
+          // Diagnostics must mirror execution: REFRESH re-applies the user's
+          // snapshot pins to openivm's live-source reads, so the dry program
+          // has to show them too — keyed by the leaf the compiler rewrite uses,
+          // via the verified binding when available.
+          sourceSnapshotPins =
+            if (resolvedPins.nonEmpty)
+              resolvedPins.map(pin => pin.pin.shortName -> pin.pin.clause).toMap
+            else if (SparkTimeTravelSql.hasSnapshotPin(queryText))
+              SparkTimeTravelSql.pinsByShortSource(queryText, qualSchemas.keySet.toSeq ++ shortToQual.values.toSeq)
+            else Map.empty,
+          // Verified Delta path per pinned source so the dry incremental program
+          // path-binds its pinned reads exactly as REFRESH executes them. Same
+          // keys (pin.shortName) as sourceSnapshotPins above when the binding is
+          // resolved; a pinned body always reaches here with resolvedPins set
+          // (requirePinBinding validated it), so no key is left without a path.
+          sourceSnapshotPinnedPaths =
+            resolvedPins.map(pin => pin.pin.shortName -> pin.operationalSource.deltaLogDataPath).toMap,
           semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
           fkTermPruneEnabled = FeatureGate.fkTermPruneEnabled(spark),
           uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark),
