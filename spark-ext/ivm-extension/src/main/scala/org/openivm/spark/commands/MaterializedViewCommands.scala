@@ -300,6 +300,21 @@ private[spark] object CommandConcurrencyInjection {
     val hook = beforeRefreshFinalize
     if (hook != null) hook()
   }
+
+  @volatile private var forcePinRollbackRestoreFailure: Boolean = false
+
+  /** Forces the post-apply pinned-identity gate's rollback RESTORE to fail, so a
+    * test can exercise the durable repair-required journal path. */
+  def withForcedPinRollbackRestoreFailure[A](body: => A): A = synchronized {
+    val previous = forcePinRollbackRestoreFailure
+    forcePinRollbackRestoreFailure = true
+    try body
+    finally forcePinRollbackRestoreFailure = previous
+  }
+
+  private[commands] def maybeFailPinRollbackRestore(): Unit =
+    if (forcePinRollbackRestoreFailure)
+      throw new RuntimeException("injected pin-rollback RESTORE failure (test)")
 }
 
 private[commands] object CommandLocalState {
@@ -768,6 +783,14 @@ private[commands] object MvCommandHelper {
     spark.sql(s"RESTORE TABLE delta.`$escaped` TO VERSION AS OF $version").collect()
   }
 
+  /** Set on a pinned MV when a REFRESH detected a source rebind but could NOT
+    * roll the MV back to its pre-refresh version. A durable, fail-closed
+    * repair-required signal: every subsequent pin operation (REFRESH / ADVANCE /
+    * idempotent re-CREATE) hard-fails at [[requirePinBinding]] until the MV is
+    * dropped and recreated, so a corrupt MV never re-publishes success-shaped
+    * state even if the source's physical identity later happens to re-match. */
+  val PinRebindRepairRequiredKey: String = "_ivm_pin_rebind_repair_required"
+
   /** The single validated binding API used by CREATE, idempotent CREATE,
     * REFRESH, ADVANCE, and the dry compile/rewrite paths. Resolves the pins
     * (tri-state), validates a `Verified` binding, and raises an
@@ -784,7 +807,17 @@ private[commands] object MvCommandHelper {
       resolvedSources: Seq[String],
       shortToQual: Map[String, String],
       persistedProperties: Map[String, String]
-  ): PinnedSourceBinding =
+  ): PinnedSourceBinding = {
+    // Fail-closed: a view left repair-required by a rebind whose rollback failed
+    // is blocked from every further pin operation until an explicit recreate.
+    persistedProperties.get(PinRebindRepairRequiredKey).filter(_.trim.nonEmpty).foreach { detail =>
+      throw pinBindingException(
+        viewName,
+        s"a prior refresh detected a pinned-source rebind and could not safely roll this materialized view back " +
+          s"($detail); it is marked repair-required and must be dropped and recreated before any further " +
+          "REFRESH or ADVANCE"
+      )
+    }
     resolvePinnedSources(spark, querySql, resolvedSources) match {
       case PinResolution.NoPin =>
         PinnedSourceBinding(Seq.empty, Seq.empty, shortToQual)
@@ -801,6 +834,7 @@ private[commands] object MvCommandHelper {
           .foreach(detail => throw pinBindingException(viewName, detail))
         PinnedSourceBinding(resolvedPins, operationalIdentities, friendlyShortToQual(resolvedPins, shortToQual))
     }
+  }
 
   /** Persisted pinned identities cross-checked against a source list, or None
     * when the property is absent/undecodable. */
@@ -3385,13 +3419,97 @@ case class RefreshMaterializedViewCommand(
             case _: SourceVersionChangeBatch => false
             case batch                       => frozenSources.contains(batch.baseTable.toLowerCase)
           }
-      if (frozenChangeBatches.nonEmpty) {
-        propagation.markConsumed(spark, viewNameStr, frozenChangeBatches)
-        logInfo(
-          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='frozen_source_deltas_skipped' " +
-            s"sources='${frozenSources.toSeq.sorted.mkString(",")}' batches='${frozenChangeBatches.size}'"
-        )
+      // Frozen-source deltas are consumed-not-applied, but the markConsumed is
+      // DEFERRED until AFTER the post-apply pinned-identity gate passes, so a
+      // rejected (rebound) refresh leaves no consumed state anywhere.
+      var frozenConsumed = false
+      def consumeFrozenSourceDeltas(): Unit =
+        if (!frozenConsumed && frozenChangeBatches.nonEmpty) {
+          propagation.markConsumed(spark, viewNameStr, frozenChangeBatches)
+          frozenConsumed = true
+          logInfo(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='frozen_source_deltas_skipped' " +
+              s"sources='${frozenSources.toSeq.sorted.mkString(",")}' batches='${frozenChangeBatches.size}'"
+          )
+        }
+
+      // Durable, fail-closed repair-required journal: set only when a detected
+      // rebind could NOT be rolled back, so requirePinBinding blocks every future
+      // REFRESH/ADVANCE until the MV is recreated. Best-effort persist; the thrown
+      // exception is the immediate signal for this operation.
+      def persistPinRebindRepairRequired(mismatchDetail: String, failureDetail: String): Unit =
+        try
+          MvCatalog.upsert(
+            spark,
+            meta.copy(properties =
+              meta.properties + (MvCommandHelper.PinRebindRepairRequiredKey ->
+                s"rebind: $mismatchDetail | rollback: $failureDetail")
+            )
+          )
+        catch { case NonFatal(_) => () }
+
+      // The single authoritative post-apply pinned-source identity gate. Runs
+      // immediately after the final source-consuming MV data mutation and BEFORE
+      // every cascade write, MV_VIEW_DELTA/staging record, source markConsumed,
+      // watermark/offset update, and metadata/catalog publication. On a rebind it
+      // rolls the MV data back to its pre-refresh version (if the apply advanced
+      // it), synchronizes the tracked version to the RESTORE commit while
+      // preserving pre-refresh pins, and throws OUTSIDE every retry/demotion
+      // handler. A failed rollback persists the repair-required journal and
+      // surfaces both the identity mismatch and the rollback failure coherently.
+      def enforcePinnedSourceIdentityGate(cleanupMeta: MvMetadata): Unit = {
+        CommandConcurrencyInjection.maybePauseBeforeRefreshFinalize()
+        if (refreshPinnedIdentities.isEmpty) return
+        val mismatch: Option[SourceIdentityRebindingException] =
+          try {
+            MvCommandHelper.verifyPinnedSourceIdentitiesAtPath(spark, name, refreshPinnedIdentities)
+            None
+          } catch { case r: SourceIdentityRebindingException => Some(r) }
+        mismatch.foreach { rebind =>
+          if (preRefreshMvVersionForPinGuard >= 0L) {
+            val currentVersion =
+              try DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+              catch { case NonFatal(_) => -1L }
+            // Only RESTORE if the apply actually advanced the MV; a no-mutation
+            // exit leaves current == pre and needs no rollback commit.
+            if (currentVersion > preRefreshMvVersionForPinGuard) {
+              try {
+                CommandConcurrencyInjection.maybeFailPinRollbackRestore()
+                MvCommandHelper.restoreMvToVersion(spark, cleanupMeta.location, preRefreshMvVersionForPinGuard)
+              } catch {
+                case NonFatal(restoreFailure) =>
+                  persistPinRebindRepairRequired(rebind.getMessage, restoreFailure.getMessage)
+                  val coherent = new SourceIdentityRebindingException(
+                    s"${rebind.getMessage}; ROLLBACK FAILED (${restoreFailure.getMessage}); the materialized view " +
+                      "is marked repair-required and must be dropped and recreated before any further REFRESH " +
+                      "or ADVANCE"
+                  )
+                  coherent.initCause(restoreFailure)
+                  throw coherent
+              }
+              // RESTORE created a new Delta commit; sync the tracked version to it
+              // while preserving pre-refresh pins/state. Rollback bookkeeping, not
+              // a success publish.
+              val restoredVersion =
+                try DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+                catch { case NonFatal(_) => preRefreshMvVersionForPinGuard }
+              try MvCatalog.upsert(spark, meta.copy(lastVersion = restoredVersion))
+              catch {
+                case NonFatal(syncFailure) =>
+                  persistPinRebindRepairRequired(rebind.getMessage, s"version sync failed: ${syncFailure.getMessage}")
+                  val coherent = new SourceIdentityRebindingException(
+                    s"${rebind.getMessage}; ROLLBACK version sync FAILED (${syncFailure.getMessage}); the " +
+                      "materialized view is marked repair-required and must be dropped and recreated"
+                  )
+                  coherent.initCause(syncFailure)
+                  throw coherent
+              }
+            }
+          }
+          throw rebind
+        }
       }
+
       pendingDeltasForFailure = changeBatches.size
       OpenIvmExecutionSpan.recordActiveSourceVersions {
         val versionBatchesBySource =
@@ -3421,6 +3539,11 @@ case class RefreshMaterializedViewCommand(
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
       if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+        // No source-consuming mutation, but the frozen deltas are still consumed
+        // here: gate on pinned identity first so a rebound pinned MV never reports
+        // a clean no-op or consumes frozen state.
+        enforcePinnedSourceIdentityGate(meta)
+        consumeFrozenSourceDeltas()
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
             "outcome='no_pending_deltas'"
@@ -3467,6 +3590,10 @@ case class RefreshMaterializedViewCommand(
         cdfChangeBatches.nonEmpty &&
         cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
       ) {
+        // All-noop CDF batch: gate on pinned identity, then consume (frozen +
+        // noop) as a clean commit. A rebind throws before any consume.
+        enforcePinnedSourceIdentityGate(meta)
+        consumeFrozenSourceDeltas()
         propagation.markConsumed(spark, viewNameStr, changeBatches)
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
@@ -3477,24 +3604,11 @@ case class RefreshMaterializedViewCommand(
       }
 
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
-        // REFRESH POST: after the complete apply loop and BEFORE
-        // markConsumed/watermarks/metadata publish (postRefreshCleanup). Re-read
-        // each pinned source's metadata.id at its verified path; a same-path
-        // drop/recreate during the apply is a rebind. The check runs outside the
-        // Delta-conflict retry that wraps the per-statement apply, so on mismatch
-        // the MV is RESTORED to its pre-apply version and no marker, watermark, or
-        // catalog version is advanced.
-        CommandConcurrencyInjection.maybePauseBeforeRefreshFinalize()
-        if (refreshPinnedIdentities.nonEmpty) {
-          try MvCommandHelper.verifyPinnedSourceIdentitiesAtPath(spark, name, refreshPinnedIdentities)
-          catch {
-            case r: SourceIdentityRebindingException =>
-              if (preRefreshMvVersionForPinGuard >= 0L)
-                try MvCommandHelper.restoreMvToVersion(spark, cleanupMeta.location, preRefreshMvVersionForPinGuard)
-                catch { case NonFatal(_) => () }
-              throw r
-          }
-        }
+        // The authoritative pinned-identity gate has already run at the boundary
+        // immediately after the final source-consuming MV data mutation (before
+        // any cascade/staging write), so by here identity is proven. Consume the
+        // deferred frozen-source deltas as part of the commit, then publish.
+        consumeFrozenSourceDeltas()
         val dataVersion     = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
         val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
         val consumedBatches = preparedSourceAdvance.map(_.consumedBatches).getOrElse(changeBatches)
@@ -3819,6 +3933,13 @@ case class RefreshMaterializedViewCommand(
               stmtCounter += 1
             }
           }
+          // Authoritative post-apply pinned-identity gate: immediately after the
+          // final source-consuming MV write (the recompute INSERT OVERWRITE) and
+          // BEFORE the cascade write, staging record, markConsumed, watermark, and
+          // metadata publication below. On a rebind it rolls the MV back and
+          // throws (as SourceIdentityRebindingException, rethrown as-is by the
+          // catch below — never wrapped/retried/demoted).
+          enforcePinnedSourceIdentityGate(meta)
           // Strict ordering (mirrors the incremental path): the view-delta and
           // any `MV_VIEW_DELTA` staging rows are published BEFORE
           // markConsumed / MvCatalog.advance, so a crash in between leaves an
@@ -4196,6 +4317,10 @@ case class RefreshMaterializedViewCommand(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='runtime_empty_delta_skip' " +
                   "reason='all_source_delta_views_empty'"
               )
+              // Gate on pinned identity before consuming changes or publishing
+              // any (source-advance) metadata for this no-MV-write skip.
+              enforcePinnedSourceIdentityGate(meta)
+              consumeFrozenSourceDeltas()
               val unchangedVersion = DeltaTableVersion.requireLatest(spark, meta.location)
               preparedSourceAdvance match {
                 case Some(advance) =>
@@ -5172,6 +5297,14 @@ case class RefreshMaterializedViewCommand(
               }
             }
 
+            // Authoritative post-apply pinned-identity gate: immediately after the
+            // final source-consuming MV write (the incremental MERGE program and
+            // any count-monoid cleanup) and BEFORE the SIMPLE_AGGREGATE cascade,
+            // MV_VIEW_DELTA staging record, markConsumed, watermark, and metadata
+            // publication below. On a rebind it rolls the MV back and throws (as
+            // SourceIdentityRebindingException, rethrown as-is by the catch below).
+            enforcePinnedSourceIdentityGate(meta)
+
             // Isolated OpenIVM compilation cannot see Spark's downstream MV
             // catalog, so SIMPLE_AGGREGATE does not get OpenIVM's snapshot
             // companion. Build the exact logical delta here: retract the one-row
@@ -5325,6 +5458,14 @@ case class RefreshMaterializedViewCommand(
               }
             }
           } catch {
+            // A post-apply pin rebind (detected by the gate above, after the MV
+            // was already rolled back to its pre-refresh version) is a distinct,
+            // non-retryable failure: clean any orphan view-delta and propagate it
+            // as-is so it is never wrapped, retried, or demoted.
+            case r: SourceIdentityRebindingException =>
+              if (!preserveViewDeltaOnFailure) deletePathIfExists(viewDeltaPath)
+              emitEnd("incremental_failed", meta.refreshTypeName, changeBatches.size)
+              throw r
             case t: Throwable =>
               // Best-effort cleanup of any partial view-delta on failure. Phase 7
               // orphan-sweep is the long-tail safety net.

@@ -2,7 +2,7 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, MvMetadata, TimeTravelPinStatus}
+import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, MvMetadata, StagingCatalog, TimeTravelPinStatus}
 import org.openivm.spark.compiler.SparkTimeTravelSql
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -402,10 +402,14 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       }
       error.getMessage.toLowerCase should include("metadata.id")
 
-      // MV restored to its pre-refresh content; the catalog version was not
-      // advanced and the live delta was NOT consumed (no marker drift).
-      lookup("m_mv").lastVersion shouldBe beforeVersion
+      // MV data rolled back to its pre-refresh content; the live delta was NOT
+      // consumed (no marker drift) and no cascade/staging row was published.
       spark.table("m_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
+      // The tracked version is synchronized to the RESTORE commit (a new Delta
+      // version), never left stale at the pre-refresh value.
+      val restoredVersion = DeltaTableVersion.requireLatest(spark, lookup("m_mv").location)
+      lookup("m_mv").lastVersion shouldBe restoredVersion
+      restoredVersion should be > beforeVersion
     }
 
     it("incremental REFRESH reads the pinned source at its verified path even when the alias is repointed mid-apply") {
@@ -469,6 +473,148 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
         .persistedPinnedSources(lookup("av_mv").properties, lookup("av_mv").sourceTables)
         .getOrElse(fail("expected persisted pinned identities after ADVANCE"))
       advanced.head.pin.clause shouldBe s"VERSION AS OF $v1"
+    }
+
+    it("rolls a FULL_REFRESH pinned MV back and publishes no cascade/metadata when a source is recreated (FULL POST)") {
+      spark.sql(s"CREATE TABLE $db.fr_src(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.fr_src VALUES (1, 10)")
+      val v = DeltaTableVersion.requireLatest(spark, s"$db.fr_src")
+      // `input_file_name()` is Spark-only, so the MV is FULL_REFRESH: every
+      // REFRESH re-executes the pinned body via INSERT OVERWRITE.
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW fr_mv AS " +
+            s"SELECT id, amount, input_file_name() AS f FROM `$db`.`fr_src` VERSION AS OF $v"
+        )
+        .collect()
+      lookup("fr_mv").properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") shouldBe "COMPILE_FAILED"
+      val beforeRows    = spark.table("fr_mv").collect().map(r => (r.getInt(0), r.getInt(1))).toSet
+      val beforeVersion = DeltaTableVersion.requireLatest(spark, lookup("fr_mv").location)
+
+      val error = intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withBeforeRefreshFinalize {
+          spark.sql(s"DROP TABLE $db.fr_src")
+          spark.sql(s"CREATE TABLE $db.fr_src(id INT, amount INT) USING DELTA")
+          spark.sql(s"INSERT INTO $db.fr_src VALUES (1, 10)")
+        } {
+          spark.sql("REFRESH MATERIALIZED VIEW fr_mv").collect()
+        }
+      }
+      error.getMessage.toLowerCase should include("metadata.id")
+
+      // Rolled back: data unchanged, tracked version synced to the RESTORE commit,
+      // and the persisted pin status is still the pre-refresh APPLIED (no
+      // success-shaped metadata publication for the rejected refresh).
+      spark.table("fr_mv").collect().map(r => (r.getInt(0), r.getInt(1))).toSet shouldBe beforeRows
+      val restoredVersion = DeltaTableVersion.requireLatest(spark, lookup("fr_mv").location)
+      lookup("fr_mv").lastVersion shouldBe restoredVersion
+      restoredVersion should be > beforeVersion
+      lookup("fr_mv").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+    }
+
+    it(
+      "marks a pinned MV repair-required when rollback fails, blocking REFRESH/ADVANCE until recreate"
+    ) {
+      spark.sql(s"CREATE TABLE $db.rr_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.rr_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.rr_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.rr_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.rr_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW rr_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`rr_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`rr_live` AS live ON p.id = live.id"
+        )
+        .collect()
+
+      spark.sql(s"INSERT INTO $db.rr_live VALUES (1, 11)")
+      // A rebind is detected AND the rollback RESTORE is forced to fail.
+      val error = intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withForcedPinRollbackRestoreFailure {
+          CommandConcurrencyInjection.withBeforeRefreshFinalize {
+            spark.sql(s"DROP TABLE $db.rr_pinned")
+            spark.sql(s"CREATE TABLE $db.rr_pinned(id INT, grp STRING) USING DELTA")
+            spark.sql(s"INSERT INTO $db.rr_pinned VALUES (1, 'x')")
+          } {
+            spark.sql("REFRESH MATERIALIZED VIEW rr_mv").collect()
+          }
+        }
+      }
+      // The failure surfaces both the identity mismatch and the rollback failure.
+      error.getMessage.toLowerCase should include("rollback failed")
+      error.getMessage.toLowerCase should include("repair-required")
+
+      // The durable journal is persisted and now blocks REFRESH and ADVANCE.
+      lookup("rr_mv").properties.keySet should contain(MvCommandHelper.PinRebindRepairRequiredKey)
+      val refreshBlocked = intercept[Exception](spark.sql("REFRESH MATERIALIZED VIEW rr_mv").collect())
+      refreshBlocked.getMessage.toLowerCase should include("repair-required")
+      val liveV = DeltaTableVersion.requireLatest(spark, s"$db.rr_live")
+      val advanceBlocked =
+        intercept[Exception](
+          spark.sql(s"ALTER MATERIALIZED VIEW rr_mv ADVANCE SOURCE VERSIONS ($db.rr_live = $liveV)").collect()
+        )
+      advanceBlocked.getMessage.toLowerCase should include("repair-required")
+
+      // Recreate clears the journal: a fresh CREATE + REFRESH works again.
+      spark.sql("DROP MATERIALIZED VIEW rr_mv")
+      val pv2 = DeltaTableVersion.requireLatest(spark, s"$db.rr_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW rr_mv AS " +
+            s"SELECT p.id, p.grp, live.amount FROM `$db`.`rr_pinned` VERSION AS OF $pv2 AS p " +
+            s"JOIN `$db`.`rr_live` AS live ON p.id = live.id"
+        )
+        .collect()
+      lookup("rr_mv").properties.keySet should not contain MvCommandHelper.PinRebindRepairRequiredKey
+      spark.sql(s"INSERT INTO $db.rr_live VALUES (1, 12)")
+      noException should be thrownBy spark.sql("REFRESH MATERIALIZED VIEW rr_mv").collect()
+    }
+
+    it("publishes no downstream cascade/staging row when a pinned upstream refresh is rejected (intercept mode)") {
+      spark.sql(s"CREATE TABLE $db.up_pinned(id INT, grp STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.up_live(id INT, amount INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.up_pinned VALUES (1, 'x')")
+      spark.sql(s"INSERT INTO $db.up_live VALUES (1, 10)")
+      val pv = DeltaTableVersion.requireLatest(spark, s"$db.up_pinned")
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW up_mv AS " +
+            s"SELECT p.id AS id, SUM(live.amount) AS total FROM `$db`.`up_pinned` VERSION AS OF $pv AS p " +
+            s"JOIN `$db`.`up_live` AS live ON p.id = live.id GROUP BY p.id"
+        )
+        .collect()
+      spark.sql("CREATE MATERIALIZED VIEW down_mv AS SELECT id, total FROM up_mv").collect()
+
+      def downstreamCascadeRows: Int =
+        StagingCatalog.collectFor(spark, "down_mv", Seq("up_mv", s"default.up_mv")).size
+
+      // Control: a normal upstream refresh publishes a cascade staging row that
+      // down_mv's next refresh would consume.
+      spark.sql(s"INSERT INTO $db.up_live VALUES (1, 5)")
+      spark.sql("REFRESH MATERIALIZED VIEW up_mv").collect()
+      val afterSuccess = downstreamCascadeRows
+      afterSuccess should be >= 1
+
+      // Reject: a rebind during the next upstream refresh must publish NO new
+      // cascade/staging row, and roll the upstream back.
+      val upVersionBeforeReject = DeltaTableVersion.requireLatest(spark, lookup("up_mv").location)
+      spark.sql(s"INSERT INTO $db.up_live VALUES (1, 7)")
+      intercept[SourceIdentityRebindingException] {
+        CommandConcurrencyInjection.withBeforeRefreshFinalize {
+          spark.sql(s"DROP TABLE $db.up_pinned")
+          spark.sql(s"CREATE TABLE $db.up_pinned(id INT, grp STRING) USING DELTA")
+          spark.sql(s"INSERT INTO $db.up_pinned VALUES (1, 'x')")
+        } {
+          spark.sql("REFRESH MATERIALIZED VIEW up_mv").collect()
+        }
+      }
+      // No new downstream cascade row; the upstream data rolled back (version
+      // synchronized to the RESTORE commit, no forward MERGE published).
+      downstreamCascadeRows shouldBe afterSuccess
+      val upVersionAfterReject = DeltaTableVersion.requireLatest(spark, lookup("up_mv").location)
+      lookup("up_mv").lastVersion shouldBe upVersionAfterReject
+      upVersionAfterReject should be > upVersionBeforeReject
     }
   }
 
