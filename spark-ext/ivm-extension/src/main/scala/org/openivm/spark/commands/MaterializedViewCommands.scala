@@ -1,5 +1,6 @@
 package org.openivm.spark.commands
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
@@ -1073,82 +1074,329 @@ private[commands] object MvCommandHelper {
       )
       .toOption
 
-  /** Direct materialized-view source dependencies of `view`, as RefreshMutex lock
-    * keys, so an ordinary REFRESH serialises against any in-flight refresh of an
-    * upstream MV it consumes.
+  // ── Authoritative direct managed-MV dependency map (CDF consumer-visibility barrier) ──
+  //
+  // The consumer-visibility barrier closes a CDF-visibility race: an upstream
+  // pinned MV refresh publishes its Delta table (making its change feed visible)
+  // BEFORE its post-apply pinned-source identity gate. With only the refreshed
+  // MV's own key held, a concurrent downstream CDF/staging refresh could consume
+  // that intermediate, about-to-be-restored commit in the window before the
+  // upstream detects a source rebind and RESTOREs it. A downstream refresh must
+  // therefore also hold the RefreshMutex key of every DIRECT upstream MV it
+  // consumes, and — symmetrically — the upstream holds its own key across its
+  // gate/restore, making the two mutually exclusive against the shared upstream.
+  //
+  // The set of direct upstream MVs is resolved ONCE, at CREATE, AUTHORITATIVELY
+  // by physical Delta identity (normalized dataPath + metadata id) — never by
+  // lexical source-name matching — and persisted as a strict, bounded,
+  // schema-versioned property. REFRESH/ADVANCE consume that persisted map without
+  // re-enumerating the catalog for upstream keys. An absent (legacy), corrupt, or
+  // schema-mismatched map fails the refresh closed; zero upstream keys are taken
+  // ONLY from an explicit, well-formed EMPTY map that positively proves the view
+  // is base-only. Keys feed [[RefreshMutex.withLocks]], which sorts and dedups
+  // them, preserving the single global lock order (deadlock-free) and monitor
+  // reentrancy for a key already held.
+
+  /** One authoritative direct managed-MV dependency: the upstream MV's canonical
+    * RefreshMutex key ([[metaName]]) and the physical Delta identity — normalized
+    * `DeltaLog.dataPath` + Delta `metadata.id` — of its backing table when this
+    * dependent was created. */
+  private[commands] final case class DirectMvDependency(
+      key: String,
+      deltaLogDataPath: String,
+      deltaTableMetadataId: String
+  )
+
+  /** Schema-versioned catalog property holding the authoritative direct
+    * managed-MV dependency map. Always present on an MV created with the barrier;
+    * its absence marks a legacy MV whose managed-vs-base classification cannot be
+    * proven. */
+  val MvDependencyMapPropertyKey: String = "_ivm_direct_mv_dependency_map"
+
+  private val MvDependencyMapSchemaVersion: Int    = 1
+  private val MaxMvDependencyMapPropertyBytes: Int = 65536
+  private val MvDependencyMapJson                  = new ObjectMapper()
+  private val MvDependencyMapKnownFields: Set[String] =
+    Set("key", "deltaLogDataPath", "deltaTableMetadataId")
+
+  private def mvDependencyMapUtf8Length(s: String): Int =
+    s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+
+  /** Physical Delta identity `(normalized dataPath, metadata id)` of a managed
+    * MV's BACKING table, read directly from its persisted `location` — no name
+    * resolution, so a catalog alias or a rebind of the MV's registered name
+    * cannot mask the physical table. `None` when the location is not a readable
+    * committed Delta table. */
+  private[commands] def mvBackingIdentity(spark: SparkSession, mv: MvMetadata): Option[(String, String)] =
+    try {
+      val log      = DeltaLog.forTable(spark, new Path(mv.location))
+      val snapshot = log.update()
+      if (snapshot.version < 0L) None
+      else Some((normalizeDeltaPath(log.dataPath), snapshot.metadata.id))
+    } catch { case NonFatal(_) => None }
+
+  /** Resolve, at CREATE, the DIRECT managed-MV dependencies of the view being
+    * created, AUTHORITATIVELY by physical Delta identity.
     *
-    * The consumer-visibility barrier this backs closes a CDF-visibility race: an
-    * upstream pinned MV refresh publishes its Delta table (making its change feed
-    * visible) BEFORE its post-apply pinned-source identity gate. With only the
-    * refreshed MV's own key held, a concurrent downstream CDF/staging refresh
-    * could consume that intermediate commit in the window before the upstream
-    * detects a source rebind and RESTOREs it. Holding every direct upstream MV
-    * key for the whole downstream refresh — and, symmetrically, the upstream
-    * holding its own key across its gate/restore — makes the two mutually
-    * exclusive against a shared upstream MV.
+    * Every existing managed MV is enumerated ONCE (CREATE is not the refresh hot
+    * path) and indexed by the physical identity of its backing table. Each
+    * analyzed/resolved downstream source is resolved to its own physical Delta
+    * identity ([[deltaPhysicalIdentity]] — the same `DeltaLog` resolution the
+    * snapshot-pin binding uses, so Fabric encoded/friendly aliases, quoted dots,
+    * catalog/schema qualifiers and case are all canonicalised away) and matched
+    * against that index. A match by BOTH dataPath AND metadata.id — never by name
+    * — marks the source a managed-MV dependency.
     *
-    * Only DIRECT MV sources are keyed (no transitive/global fan-out): an MV whose
-    * sources are all base tables adds no key and stays fully concurrent with
-    * unrelated MVs. Keys feed [[RefreshMutex.withLocks]], which sorts and dedups
-    * them, preserving the single global lock order (deadlock-free) and monitor
-    * reentrancy for a key already held.
-    *
-    * Fail-closed: if the catalog cannot be enumerated while this MV carries
-    * persisted pinned sources, or a source resolves ambiguously to more than one
-    * managed MV, the refresh aborts with [[SourceIdentityRebindingException]]
-    * rather than silently dropping the barrier and reopening the race.
-    */
-  private[commands] def directMvSourceLockKeys(spark: SparkSession, view: TableIdentifier): Seq[String] = {
-    val viewMeta = metaName(view)
-    val selfMeta = MvCatalog.lookup(spark, view).getOrElse(return Seq.empty)
-    val hasPersistedPins =
-      persistedPinnedSources(selfMeta.properties, selfMeta.sourceTables).exists(_.nonEmpty)
-    val others: Seq[MvMetadata] =
-      try MvCatalog.list(spark).filter(candidate => metaName(candidate.name) != viewMeta)
+    * Fail-closed: the CREATE aborts if the catalog cannot be enumerated (the map
+    * cannot be proven) or if a source's identity matches more than one managed MV.
+    * A source that is a base table (or any Delta table that is not a managed MV)
+    * contributes no entry. */
+  private[commands] def resolveDirectMvDependencies(
+      spark: SparkSession,
+      self: TableIdentifier,
+      qualNames: Seq[String]
+  ): Seq[DirectMvDependency] = {
+    val selfMeta = metaName(self)
+    val managed: Seq[MvMetadata] =
+      try MvCatalog.list(spark)
       catch {
         case NonFatal(enumerationFailure) =>
-          if (hasPersistedPins)
-            throw new SourceIdentityRebindingException(
-              s"materialized view '$viewMeta' could not enumerate its materialized-view source dependencies to " +
-                s"establish the refresh consumer-visibility barrier (${enumerationFailure.getMessage}); refusing " +
-                "to refresh a pinned materialized view without it"
-            )
-          else return Seq.empty
-      }
-    selfMeta.sourceTables.flatMap { source =>
-      val keys = others
-        .filter(candidate => sourceReferencesMv(source, candidate))
-        .map(candidate => metaName(candidate.name))
-        .distinct
-      keys match {
-        case Seq()    => None
-        case Seq(key) => Some(key)
-        case ambiguous =>
           throw new SourceIdentityRebindingException(
-            s"materialized view '$viewMeta' source '$source' maps to ${ambiguous.size} managed materialized " +
-              s"views (${ambiguous.sorted.mkString(", ")}); cannot establish a reliable refresh " +
-              "consumer-visibility barrier lock key"
+            s"materialized view '$selfMeta' could not enumerate existing managed materialized views to derive its " +
+              s"authoritative direct managed-MV dependency map (${enumerationFailure.getMessage}); refusing to " +
+              "create a materialized view whose managed-vs-base source classification cannot be proven"
           )
       }
-    }.distinct
+    val byIdentity: Map[(String, String), Seq[MvMetadata]] =
+      managed
+        .filter(candidate => metaName(candidate.name) != selfMeta)
+        .flatMap(candidate => mvBackingIdentity(spark, candidate).map(identity => identity -> candidate))
+        .groupBy(_._1)
+        .map { case (identity, entries) => identity -> entries.map(_._2) }
+    val deps = qualNames.distinct.flatMap { qn =>
+      deltaPhysicalIdentity(spark, qn).flatMap { identity =>
+        byIdentity.get(identity) match {
+          case None => None
+          case Some(Seq(single)) =>
+            Some(DirectMvDependency(metaName(single.name), identity._1, identity._2))
+          case Some(ambiguous) =>
+            throw new SourceIdentityRebindingException(
+              s"materialized view '$selfMeta' source '$qn' resolves by physical Delta identity to ${ambiguous.size} " +
+                s"managed materialized views (${ambiguous.map(m => metaName(m.name)).sorted.mkString(", ")}); cannot " +
+                "establish a reliable refresh consumer-visibility barrier lock key"
+            )
+        }
+      }
+    }
+    deps.groupBy(_.key).values.map(_.head).toSeq.sortBy(_.key)
   }
 
-  /** Whether `source` (a possibly catalog/db-qualified `MvMetadata.sourceTables`
-    * entry) references the managed MV `mv`. The table name must match; when BOTH
-    * sides carry a database qualifier they must agree, so a same-named MV in a
-    * different database is never mistaken for this source. A source with fewer
-    * qualifiers than the MV name falls back to table-name identity, matching the
-    * convention the source-version-advance cascade already uses. */
-  private def sourceReferencesMv(source: String, mv: MvMetadata): Boolean = {
-    val parts = source.split("\\.")
-    parts.nonEmpty && parts.last == mv.name.identifier && {
-      val sourceDb = if (parts.length >= 2) Some(parts(parts.length - 2)) else None
-      (sourceDb, mv.name.database) match {
-        case (Some(sourceDatabase), Some(mvDatabase)) => sourceDatabase == mvDatabase
-        case _                                        => true
+  /** Serialize the authoritative direct managed-MV dependency map into one
+    * deterministic, schema-versioned property. The property is ALWAYS emitted —
+    * an empty `deps` array positively proves the view is base-only, so REFRESH can
+    * distinguish it from a legacy MV that never persisted a map. */
+  private[commands] def mvDependencyMapProperties(deps: Seq[DirectMvDependency]): Map[String, String] = {
+    val root = MvDependencyMapJson.createObjectNode()
+    root.put("v", MvDependencyMapSchemaVersion)
+    val array = root.putArray("deps")
+    deps.sortBy(_.key).foreach { dep =>
+      val node = array.addObject()
+      node.put("key", dep.key)
+      node.put("deltaLogDataPath", dep.deltaLogDataPath)
+      node.put("deltaTableMetadataId", dep.deltaTableMetadataId)
+    }
+    val serialized = MvDependencyMapJson.writeValueAsString(root)
+    if (mvDependencyMapUtf8Length(serialized) > MaxMvDependencyMapPropertyBytes)
+      throw new IllegalStateException(
+        s"persisted direct managed-MV dependency map exceeds the $MaxMvDependencyMapPropertyBytes-byte size limit"
+      )
+    Map(MvDependencyMapPropertyKey -> serialized)
+  }
+
+  /** Strict inverse of [[mvDependencyMapProperties]].
+    *
+    * `Right(Seq.empty)` ONLY for an explicit, well-formed empty map (proven
+    * base-only). `Left(reason)` for an ABSENT property (a legacy MV created before
+    * this barrier, or a mutation that dropped it), an oversize blob, a
+    * malformed / wrong-version / non-object value, an unknown or missing field, or
+    * a duplicate upstream key. The caller fails the refresh closed on any
+    * `Left`. */
+  private[commands] def readMvDependencyMap(
+      properties: Map[String, String]
+  ): Either[String, Seq[DirectMvDependency]] =
+    properties.get(MvDependencyMapPropertyKey) match {
+      case None => Left("no authoritative direct managed-MV dependency map is persisted")
+      case Some(json) if mvDependencyMapUtf8Length(json) > MaxMvDependencyMapPropertyBytes =>
+        Left("the persisted direct managed-MV dependency map exceeds the byte size limit")
+      case Some(json) =>
+        try {
+          val root = MvDependencyMapJson.readTree(json)
+          if (root == null || !root.isObject)
+            Left("the persisted direct managed-MV dependency map must be a JSON object")
+          else {
+            val versionNode = root.get("v")
+            if (versionNode == null || !versionNode.isInt || versionNode.asInt() != MvDependencyMapSchemaVersion)
+              Left(
+                s"the persisted direct managed-MV dependency map is not schema version $MvDependencyMapSchemaVersion"
+              )
+            else {
+              val depsNode = root.get("deps")
+              if (depsNode == null || !depsNode.isArray)
+                Left("the persisted direct managed-MV dependency map has no 'deps' array")
+              else {
+                val parsed =
+                  (0 until depsNode.size())
+                    .foldLeft[Either[String, Vector[DirectMvDependency]]](Right(Vector.empty)) { (accEither, i) =>
+                      accEither.flatMap { acc =>
+                        val node = depsNode.get(i)
+                        if (node == null || !node.isObject)
+                          Left("a persisted direct managed-MV dependency entry is not an object")
+                        else {
+                          val unknownField = {
+                            val it                    = node.fieldNames()
+                            var found: Option[String] = None
+                            while (it.hasNext && found.isEmpty) {
+                              val fieldName = it.next()
+                              if (!MvDependencyMapKnownFields.contains(fieldName)) found = Some(fieldName)
+                            }
+                            found
+                          }
+                          unknownField match {
+                            case Some(fieldName) =>
+                              Left(
+                                s"a persisted direct managed-MV dependency entry has an unexpected field '$fieldName'"
+                              )
+                            case None =>
+                              def textField(field: String): Either[String, String] = {
+                                val value = node.get(field)
+                                if (value == null || !value.isTextual || value.asText().trim.isEmpty)
+                                  Left(
+                                    s"a persisted direct managed-MV dependency entry is missing a non-blank '$field'"
+                                  )
+                                else Right(value.asText())
+                              }
+                              for {
+                                key      <- textField("key")
+                                dataPath <- textField("deltaLogDataPath")
+                                metaId   <- textField("deltaTableMetadataId")
+                              } yield acc :+ DirectMvDependency(key, dataPath, metaId)
+                          }
+                        }
+                      }
+                    }
+                parsed.flatMap { deps =>
+                  val keys = deps.map(_.key)
+                  if (keys.distinct.size != keys.size)
+                    Left("the persisted direct managed-MV dependency map repeats a duplicate upstream key")
+                  else Right(deps)
+                }
+              }
+            }
+          }
+        } catch {
+          case NonFatal(parseFailure) =>
+            Left(s"the persisted direct managed-MV dependency map is unparseable (${parseFailure.getMessage})")
+        }
+    }
+
+  /** The strict missing/legacy/corrupt-map policy, documented in the thrown
+    * error so an operator sees exactly why the refresh was refused and how to
+    * clear it. */
+  private[commands] def mvDependencyMapFailClosed(viewMeta: String, reason: String): Nothing =
+    throw new SourceIdentityRebindingException(
+      s"materialized view '$viewMeta' cannot establish its refresh consumer-visibility barrier: $reason. A " +
+        "materialized view created before this barrier — or whose catalog row was corrupted — cannot prove which " +
+        "of its sources are managed materialized views versus base tables, so its refresh is refused rather than " +
+        "silently run without the barrier. Recreate the materialized view (DROP + CREATE) to regenerate its " +
+        "authoritative direct managed-MV dependency map."
+    )
+
+  /** Phase A of the barrier (BEFORE locking): read + schema-validate this view's
+    * persisted dependency map and derive the sorted, de-duplicated upstream
+    * RefreshMutex lock keys. Fails closed on a catalog read failure or any
+    * missing/corrupt/legacy map; returns empty keys ONLY for an explicit,
+    * well-formed empty map. The parsed dependencies are returned so
+    * [[validateUpstreamMvDependenciesUnderLock]] can re-verify physical identity
+    * once the locks are held. */
+  private[commands] def resolveUpstreamMvDependencyLockKeys(
+      spark: SparkSession,
+      view: TableIdentifier
+  ): (Seq[String], Seq[DirectMvDependency]) = {
+    val viewMeta = metaName(view)
+    val selfMetaOpt =
+      try MvCatalog.lookup(spark, view)
+      catch {
+        case NonFatal(readFailure) =>
+          mvDependencyMapFailClosed(viewMeta, s"its catalog row could not be read (${readFailure.getMessage})")
+      }
+    selfMetaOpt match {
+      case None => (Seq.empty, Seq.empty)
+      case Some(selfMeta) =>
+        readMvDependencyMap(selfMeta.properties) match {
+          case Left(reason) => mvDependencyMapFailClosed(viewMeta, reason)
+          case Right(deps)  => (deps.map(_.key).distinct.sorted, deps)
+        }
+    }
+  }
+
+  /** Phase B of the barrier (UNDER the acquired locks): re-verify every persisted
+    * upstream dependency still resolves to a managed MV whose backing table has
+    * the EXACT physical identity `(dataPath, metadata.id)` the map recorded at
+    * CREATE. A targeted [[MvCatalog.lookup]] (never a global enumeration) proves
+    * the upstream is still managed; [[mvBackingIdentity]] proves it was not
+    * dropped/recreated/repointed. Any mismatch, vanished upstream, or catalog/read
+    * failure fails the refresh closed. */
+  private[commands] def validateUpstreamMvDependenciesUnderLock(
+      spark: SparkSession,
+      view: TableIdentifier,
+      deps: Seq[DirectMvDependency]
+  ): Unit = {
+    val viewMeta = metaName(view)
+    deps.foreach { dep =>
+      val upstreamKey = spark.sessionState.sqlParser.parseTableIdentifier(dep.key)
+      val upstreamMeta =
+        try MvCatalog.lookup(spark, upstreamKey)
+        catch {
+          case NonFatal(readFailure) =>
+            mvDependencyMapFailClosed(
+              viewMeta,
+              s"upstream managed materialized view '${dep.key}' could not be read (${readFailure.getMessage})"
+            )
+        }
+      upstreamMeta match {
+        case None =>
+          mvDependencyMapFailClosed(viewMeta, s"upstream managed materialized view '${dep.key}' no longer exists")
+        case Some(meta) =>
+          mvBackingIdentity(spark, meta) match {
+            case Some((path, id)) if path == dep.deltaLogDataPath && id == dep.deltaTableMetadataId => ()
+            case Some((path, id)) =>
+              mvDependencyMapFailClosed(
+                viewMeta,
+                s"upstream managed materialized view '${dep.key}' was recreated or repointed (recorded identity " +
+                  s"('${dep.deltaLogDataPath}', '${dep.deltaTableMetadataId}'), now ('$path', '$id'))"
+              )
+            case None =>
+              mvDependencyMapFailClosed(
+                viewMeta,
+                s"upstream managed materialized view '${dep.key}' backing Delta table is no longer readable"
+              )
+          }
       }
     }
   }
+
+  /** Whether `candidate` authoritatively depends — by its persisted direct
+    * managed-MV dependency map — on the upstream MV identified by `upstreamKey`.
+    * Used by the ADVANCE cascade to discover downstream consumers by the SAME
+    * authoritative map, never by a lexical source-name suffix scan. A candidate
+    * with a legacy/corrupt map contributes no downstream key: it cannot refresh at
+    * all (its own refresh fails closed), so it can never consume an intermediate
+    * commit and needs no advance-time barrier. */
+  private[commands] def dependsOnUpstreamKey(candidate: MvMetadata, upstreamKey: String): Boolean =
+    readMvDependencyMap(candidate.properties) match {
+      case Right(deps) => deps.exists(_.key == upstreamKey)
+      case Left(_)     => false
+    }
 
   /** Resolve each ADVANCE request identifier by physical Delta identity and map
     * it to the RESOLVED operational alias of the persisted pinned source with the
@@ -2690,9 +2938,19 @@ case class CreateMaterializedViewCommand(
       }
     )
     val userProps = properties - MvMetadata.BackingViewSuffixKey
+    // Authoritative direct managed-MV dependency map: resolve which sources are
+    // managed MVs by PHYSICAL Delta identity (never lexical name matching) and
+    // persist a strict, versioned map so REFRESH/ADVANCE can take the upstream
+    // consumer-visibility barrier locks without re-enumerating the catalog. An
+    // empty map is persisted explicitly to positively prove a base-only view.
+    val mvDependencyMapProps =
+      profile.timeStep("create_resolve_direct_mv_dependency_map", s"sources=${qualNames.size}") {
+        mvDependencyMapProperties(resolveDirectMvDependencies(spark, name, qualNames))
+      }
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++ watermarkProps
+        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++
+        watermarkProps ++ mvDependencyMapProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -3061,29 +3319,43 @@ case class RefreshMaterializedViewCommand(
     val lockT0 = System.nanoTime()
     try {
       // Every refresh — ordinary or source-version-advance — deterministically
-      // also holds its DIRECT upstream MV source keys, so a downstream CDF/staging
-      // consumer cannot observe an upstream MV's Delta mutation in the window
-      // before that upstream's post-apply pinned-source identity gate RESTOREs it.
-      // See directMvSourceLockKeys (fails closed if a pinned/managed MV dependency
-      // cannot be mapped).
-      val upstreamMvSourceKeys = directMvSourceLockKeys(spark, name)
+      // also holds the DIRECT upstream MV keys taken from its AUTHORITATIVE
+      // persisted dependency map, so a downstream CDF/staging consumer cannot
+      // observe an upstream MV's Delta mutation in the window before that
+      // upstream's post-apply pinned-source identity gate RESTOREs it.
+      // resolveUpstreamMvDependencyLockKeys fails closed on a missing/corrupt/
+      // legacy map; the parsed deps are re-verified by physical identity UNDER the
+      // acquired locks (validateUpstreamMvDependenciesUnderLock).
+      val (upstreamMvSourceKeys, upstreamMvDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
       val lockKeys =
         if (sourceVersionAdvance.isEmpty)
           viewMeta +: upstreamMvSourceKeys
         else {
           // The advance path additionally holds its downstream consumer keys so the
-          // pinned-source-advance cascade into them stays atomic.
+          // pinned-source-advance cascade into them stays atomic. Consumers are
+          // discovered by the SAME authoritative dependency map (each candidate's
+          // persisted map referencing this MV's key) — never a lexical source-name
+          // scan. A catalog read failure fails the advance closed.
           val downstream =
-            try
-              MvCatalog
-                .list(spark)
-                .filter(meta => metaName(meta.name) != viewMeta)
-                .filter(_.sourceTables.exists(_.split("\\.").last == name.identifier))
-                .map(meta => metaName(meta.name))
-            catch { case _: Throwable => Seq.empty[String] }
+            (try MvCatalog.list(spark)
+            catch {
+              case NonFatal(readFailure) =>
+                mvDependencyMapFailClosed(
+                  viewMeta,
+                  s"downstream consumers could not be enumerated for the source-version-advance cascade " +
+                    s"(${readFailure.getMessage})"
+                )
+            })
+              .filter(meta => metaName(meta.name) != viewMeta)
+              .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
+              .map(meta => metaName(meta.name))
           viewMeta +: (downstream ++ upstreamMvSourceKeys)
         }
       val rows = RefreshMutex.withLocks(lockKeys) {
+        // Under the acquired upstream locks, re-verify each upstream MV still has
+        // the exact physical Delta identity the map recorded at CREATE; a rebind,
+        // vanished upstream, or catalog read failure fails the refresh closed.
+        validateUpstreamMvDependenciesUnderLock(spark, name, upstreamMvDeps)
         val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
         OpenIvmMetrics.RefreshInflight.incrementAndGet()
         try {

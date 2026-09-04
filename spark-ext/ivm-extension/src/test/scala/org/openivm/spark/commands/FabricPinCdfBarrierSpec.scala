@@ -27,8 +27,9 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   * source rebind and RESTOREd it, leaving the downstream ahead of a frontier
   * that no longer exists.
   *
-  * [[MvCommandHelper.directMvSourceLockKeys]] makes an ordinary refresh also hold
-  * every DIRECT upstream MV source key, so the two are mutually exclusive against
+  * [[MvCommandHelper.resolveUpstreamMvDependencyLockKeys]] makes an ordinary
+  * refresh also hold every DIRECT upstream MV key from its authoritative,
+  * physical-identity dependency map, so the two are mutually exclusive against
   * the shared upstream MV. These tests drive the exact interleaving
   * deterministically: the upstream is parked at the pre-gate boundary
   * ([[CommandConcurrencyInjection.withBeforeRefreshFinalize]]) while a downstream
