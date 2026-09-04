@@ -399,4 +399,74 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       spark.table("m_mv").collect().map(_.mkString("|")).sorted.toList shouldBe beforeRows
     }
   }
+
+  // The exact `short -> (verifiedPath, clause)` map the disjoint compiler-emit
+  // agent consumes (via CompileRequest.sourceSnapshotPinnedPaths and
+  // SparkRefreshRewriter.rewrite) to path-bind every emitted pinned read. Locking
+  // it here de-risks that integration: the command layer already produces the
+  // precise data every compile/rewrite site will pass.
+  describe("pinnedPathBindingsByShort compiler-emit seam") {
+    def probeBinding(view: String, querySql: String, sources: Seq[String]): MvCommandHelper.PinnedSourceBinding =
+      MvCommandHelper.requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.Create,
+        TableIdentifier(view),
+        querySql,
+        sources,
+        sources.map(s => s.split("\\.").last -> s).toMap,
+        Map.empty
+      )
+
+    it("collapses a self-joined pinned source to one verified path + VERSION clause entry") {
+      spark.sql(s"CREATE TABLE $db.sm1(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sm1 VALUES (1)")
+      val v         = DeltaTableVersion.requireLatest(spark, s"$db.sm1")
+      val (path, _) = MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sm1").getOrElse(fail("expected identity"))
+
+      val binding = probeBinding(
+        "sm1_probe",
+        s"SELECT a.id FROM `$db`.`sm1` VERSION AS OF $v AS a JOIN `$db`.`sm1` VERSION AS OF $v AS b ON a.id = b.id",
+        Seq(s"$db.sm1")
+      )
+      binding.resolvedPins should have size 2
+      val bound = MvCommandHelper.pinnedPathBindingsByShort(binding)
+      bound should have size 1
+      bound("sm1") shouldBe ((path, s"VERSION AS OF $v"))
+    }
+
+    it("preserves a TIMESTAMP AS OF clause verbatim, keyed by the verified path") {
+      spark.sql(s"CREATE TABLE $db.sm2(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sm2 VALUES (1)")
+      val (path, _) = MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sm2").getOrElse(fail("expected identity"))
+      val clause    = "TIMESTAMP AS OF '2020-01-01 00:00:00'"
+
+      val binding = probeBinding("sm2_probe", s"SELECT id FROM `$db`.`sm2` $clause", Seq(s"$db.sm2"))
+      val bound   = MvCommandHelper.pinnedPathBindingsByShort(binding)
+      bound should have size 1
+      bound("sm2") shouldBe ((path, clause))
+    }
+
+    it("maps two distinct pinned sources each to its own verified path and clause") {
+      spark.sql(s"CREATE TABLE $db.sm3a(id INT) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.sm3b(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sm3a VALUES (1)")
+      spark.sql(s"INSERT INTO $db.sm3b VALUES (1)")
+      val va         = DeltaTableVersion.requireLatest(spark, s"$db.sm3a")
+      val vb         = DeltaTableVersion.requireLatest(spark, s"$db.sm3b")
+      val (pathA, _) = MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sm3a").getOrElse(fail("a"))
+      val (pathB, _) = MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sm3b").getOrElse(fail("b"))
+
+      val binding = probeBinding(
+        "sm3_probe",
+        s"SELECT a.id FROM `$db`.`sm3a` VERSION AS OF $va AS a " +
+          s"JOIN `$db`.`sm3b` VERSION AS OF $vb AS b ON a.id = b.id",
+        Seq(s"$db.sm3a", s"$db.sm3b")
+      )
+      val bound = MvCommandHelper.pinnedPathBindingsByShort(binding)
+      bound.keySet shouldBe Set("sm3a", "sm3b")
+      bound("sm3a") shouldBe ((pathA, s"VERSION AS OF $va"))
+      bound("sm3b") shouldBe ((pathB, s"VERSION AS OF $vb"))
+      pathA should not be pathB
+    }
+  }
 }
