@@ -255,19 +255,17 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       mvDataVersion("wcm_mv") shouldBe upstreamVersion
 
       val noOpRows = rewrittenRows("wcm_mv")
-      if (changeFeedMode == ChangeFeedMode.Cdf) noOpRows shouldBe empty
-      else
-        withClue(noOpRows.map(_.getString(ColSqlText)).mkString("\n---\n")) {
-          noOpRows.exists { row =>
-            val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
-            upper.startsWith("SELECT 1") &&
-            upper.contains("HAVING SUM(CAST(`OPENIVM_MULTIPLICITY` AS BIGINT)) <> 0")
-          } shouldBe true
-          noOpRows.exists { row =>
-            val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
-            upper.startsWith("MERGE INTO") && upper.contains("WHEN MATCHED THEN DELETE")
-          } shouldBe false
-        }
+      withClue(noOpRows.map(_.getString(ColSqlText)).mkString("\n---\n")) {
+        noOpRows.exists { row =>
+          val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("SELECT 1") &&
+          upper.contains("HAVING SUM(CAST(`OPENIVM_MULTIPLICITY` AS BIGINT)) <> 0")
+        } shouldBe true
+        noOpRows.exists { row =>
+          val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("MERGE INTO") && upper.contains("WHEN MATCHED THEN DELETE")
+        } shouldBe false
+      }
 
       refreshMv("wcm_downstream")
       assertMvCorrect("wcm_downstream", downstreamSql)
