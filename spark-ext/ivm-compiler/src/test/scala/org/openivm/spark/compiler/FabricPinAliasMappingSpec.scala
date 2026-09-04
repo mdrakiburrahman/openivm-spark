@@ -494,6 +494,69 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
       validate(SparkTimeTravelSql.PinIdentityOperation.Create, Seq(source), pins, None) shouldBe Right(())
     }
 
+    it("collapses a same-version self-join to one canonical persisted identity the strict reader accepts") {
+      val source = sourceIdentity("__fabric_encoded_self_join.foo")
+      val sql =
+        "SELECT left_source.id FROM db.foo VERSION AS OF 7 AS left_source " +
+          "JOIN db.foo VERSION AS OF 7 AS right_source ON left_source.id = right_source.id"
+      val pins     = resolvedPins(sql, Map("db.foo" -> source))
+      val resolved = bindings(Seq(source), pins)
+      val key      = SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey
+
+      // Every textual occurrence is retained in the live bindings for
+      // occurrence-aware execution rewriting; the persisted contract records the
+      // one physical identity ONCE.
+      pins should have size 2
+      val expected =
+        s"""[{"alias":"${source.alias}","deltaLogDataPath":"${source.deltaLogDataPath}","deltaTableMetadataId":"${source.deltaTableMetadataId}","pinRef":"db.foo","pinSegments":["db","foo"],"version":7}]"""
+      val properties = SparkTimeTravelSql.pinnedSourceIdentityProperties(resolved)
+      properties shouldBe Map(key -> expected)
+
+      // Canonical output is byte-stable under pin reordering.
+      SparkTimeTravelSql.pinnedSourceIdentityProperties(resolved.copy(pins = pins.reverse)) shouldBe properties
+
+      // The strict reader accepts the single canonical record and round-trips it.
+      val expectedPin = SparkTimeTravelSql.ResolvedSnapshotPin(
+        SparkTimeTravelSql.SnapshotPin("db.foo", "VERSION AS OF 7"),
+        SparkTimeTravelSql.SourceIdentity("db.foo", source.deltaLogDataPath, source.deltaTableMetadataId),
+        SparkTimeTravelSql.SourceIdentity(source.alias, source.deltaLogDataPath, source.deltaTableMetadataId)
+      )
+      SparkTimeTravelSql.readPinnedSourceIdentityProperties(properties, resolved) shouldBe Right(Seq(expectedPin))
+
+      // REFRESH validates cleanly: current occurrences and the persisted record
+      // canonicalize to the same one-per-physical set.
+      validate(
+        SparkTimeTravelSql.PinIdentityOperation.Refresh,
+        Seq(source),
+        pins,
+        Some(Seq(expectedPin))
+      ) shouldBe Right(())
+
+      // The pre-fix duplicate serialization (one record per textual occurrence)
+      // is exactly the corrupt shape the strict reader still refuses.
+      val duplicated = expected.dropRight(1) + "," + expected.drop(1)
+      assertPropertyReadFails(Map(key -> duplicated), resolved, "duplicate alias")
+    }
+
+    it("collapses a repeated TIMESTAMP self-join to one canonical record without converting it to a version") {
+      val source = sourceIdentity("__fabric_encoded_ts_self_join.foo")
+      val sql =
+        "SELECT l.id FROM db.foo TIMESTAMP AS OF '2026-09-04 05:00:00' AS l " +
+          "JOIN db.foo TIMESTAMP AS OF '2026-09-04 05:00:00' AS r ON l.id = r.id"
+      val pins     = resolvedPins(sql, Map("db.foo" -> source))
+      val resolved = bindings(Seq(source), pins)
+      val key      = SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey
+
+      pins should have size 2
+      pins.map(_.pin.clause).distinct shouldBe Seq("TIMESTAMP AS OF '2026-09-04 05:00:00'")
+
+      val expected =
+        s"""[{"alias":"${source.alias}","deltaLogDataPath":"${source.deltaLogDataPath}","deltaTableMetadataId":"${source.deltaTableMetadataId}","pinRef":"db.foo","pinSegments":["db","foo"],"timestamp":"2026-09-04 05:00:00"}]"""
+      val properties = SparkTimeTravelSql.pinnedSourceIdentityProperties(resolved)
+      properties shouldBe Map(key -> expected)
+      SparkTimeTravelSql.readPinnedSourceIdentityProperties(properties, resolved).map(_.size) shouldBe Right(1)
+    }
+
     it(
       "hard-fails a same-physical source at two canonical versions, including Foo and foo in a case-insensitive catalog"
     ) {

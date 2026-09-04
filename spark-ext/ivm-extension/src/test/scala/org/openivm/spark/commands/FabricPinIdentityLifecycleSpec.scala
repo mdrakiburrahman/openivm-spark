@@ -2,7 +2,14 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, MvMetadata, StagingCatalog, TimeTravelPinStatus}
+import org.openivm.spark.common.{
+  DeltaTableVersion,
+  MvCatalog,
+  MvMetadata,
+  StagingCatalog,
+  TimeTravelPinReason,
+  TimeTravelPinStatus
+}
 import org.openivm.spark.compiler.SparkTimeTravelSql
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -74,6 +81,17 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
     val identity = SparkTimeTravelSql.SourceIdentity(alias, path, id)
     SparkTimeTravelSql.ResolvedSnapshotPin(SparkTimeTravelSql.SnapshotPin(alias, clause), identity, identity)
   }
+
+  private def countSubstring(haystack: String, needle: String): Int =
+    if (needle.isEmpty) 0
+    else {
+      @annotation.tailrec
+      def loop(from: Int, acc: Int): Int = {
+        val idx = haystack.indexOf(needle, from)
+        if (idx < 0) acc else loop(idx + needle.length, acc + 1)
+      }
+      loop(0, 0)
+    }
 
   describe("Fabric snapshot-pin identity lifecycle") {
     it("keeps a pinned MV APPLIED across two refresh recompiles and persists its physical identity") {
@@ -239,6 +257,252 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
         )
         .collect()
       lookup("g_selfjoin_mv").timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+    }
+
+    it(
+      "keeps an identical-version self-join APPLIED with ONE canonical identity across CREATE, two REFRESHes, and ADVANCE"
+    ) {
+      spark.sql(s"CREATE TABLE $db.sj_dim(id INT, label STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.sj_facts(fid INT, cur_id INT, prev_id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sj_dim VALUES (1, 'a'), (2, 'b')")
+      spark.sql(s"INSERT INTO $db.sj_facts VALUES (10, 1, 2)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.sj_dim")
+      val (dimPath, dimMetaId) =
+        MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sj_dim").getOrElse(fail("expected sj_dim identity"))
+
+      // Two SQL-visible aliases (ct, pt) of the SAME physical Delta table at the
+      // SAME pinned version, joined to a live driver so each REFRESH applies a
+      // real upstream delta and the MV is an incrementally maintained
+      // SIMPLE_PROJECTION that ADVANCE accepts.
+      val query =
+        s"SELECT f.fid, ct.label AS cur_label, pt.label AS prev_label " +
+          s"FROM `$db`.`sj_facts` AS f " +
+          s"JOIN `$db`.`sj_dim` VERSION AS OF $v0 AS ct ON f.cur_id = ct.id " +
+          s"JOIN `$db`.`sj_dim` VERSION AS OF $v0 AS pt ON f.prev_id = pt.id"
+      spark.sql(s"CREATE MATERIALIZED VIEW sj_selfjoin_mv AS $query").collect()
+
+      val created = lookup("sj_selfjoin_mv")
+      val key     = SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey
+      created.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+
+      // (a) The persisted identity is EXACTLY ONE canonical record even though the
+      // body reads the pinned source twice: verified path + metadata.id + version.
+      created.properties(key) should not include "},{"
+      val persistedAtCreate = MvCommandHelper
+        .persistedPinnedSources(created.properties, created.sourceTables)
+        .getOrElse(fail("expected persisted pinned identities at CREATE"))
+      persistedAtCreate should have size 1
+      persistedAtCreate.head.operationalSource.deltaLogDataPath shouldBe dimPath
+      persistedAtCreate.head.operationalSource.deltaTableMetadataId shouldBe dimMetaId
+      persistedAtCreate.head.pin.clause shouldBe s"VERSION AS OF $v0"
+
+      // (b) BOTH SQL-visible occurrences bind to the verified delta path on the
+      // executed full-query surface; no logical temporal read and no unbound
+      // memory.main read survive; the compiler-emit surface collapses to one path.
+      val binding = MvCommandHelper.requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.Create,
+        TableIdentifier("sj_selfjoin_mv"),
+        query,
+        created.sourceTables,
+        created.sourceTables.map(source => source.split("\\.").last -> source).toMap,
+        Map.empty
+      )
+      binding.resolvedPins should have size 2
+      val bound = MvCommandHelper.pathBindUserFullQuery(
+        TableIdentifier("sj_selfjoin_mv"),
+        query,
+        binding,
+        created.sourceTables,
+        binding.resolvedPins
+      )
+      countSubstring(bound, s"delta.`$dimPath`") shouldBe 2
+      bound should not include s"`$db`.`sj_dim` VERSION AS OF"
+      bound.toLowerCase should not include "memory.main."
+      bound should include(s"VERSION AS OF $v0")
+      MvCommandHelper.pinnedPathByShort(binding) shouldBe Map("sj_dim" -> dimPath)
+
+      // Data reflects the frozen self-join joined to the live fact row.
+      spark
+        .table("sj_selfjoin_mv")
+        .collect()
+        .map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+        .toSet shouldBe Set((10, "a", "b"))
+
+      // (c) Identity survives TWO REFRESH round trips; each applies a live delta,
+      // and the persisted property is byte-stable (never re-serialized into a
+      // duplicate the strict reader would later reject).
+      spark.sql(s"INSERT INTO $db.sj_facts VALUES (20, 2, 1)")
+      spark.sql("REFRESH MATERIALIZED VIEW sj_selfjoin_mv").collect()
+      val afterR1 = lookup("sj_selfjoin_mv")
+      afterR1.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      afterR1.properties(key) shouldBe created.properties(key)
+
+      spark.sql(s"INSERT INTO $db.sj_facts VALUES (30, 1, 1)")
+      spark.sql("REFRESH MATERIALIZED VIEW sj_selfjoin_mv").collect()
+      val afterR2 = lookup("sj_selfjoin_mv")
+      afterR2.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
+      afterR2.properties(key) shouldBe created.properties(key)
+      spark
+        .table("sj_selfjoin_mv")
+        .collect()
+        .map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+        .toSet shouldBe Set((10, "a", "b"), (20, "b", "a"), (30, "a", "a"))
+
+      // (d) ADVANCE moves the pinned version, keeps ONE canonical record, same
+      // dataPath + metadata.id, and rewrites BOTH occurrences in the stored body.
+      // The advanced-past row (id 99) is unreferenced, so the signed old-state vs
+      // new-state delta is empty: the identity contract is verified in isolation
+      // from self-join delta expansion, and both old-/new-state reads stay
+      // path-bound (a logical/rebound old-state read would fail identity checks).
+      spark.sql(s"INSERT INTO $db.sj_dim VALUES (99, 'z')")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.sj_dim")
+      v1 should be > v0
+      spark.sql(s"ALTER MATERIALIZED VIEW sj_selfjoin_mv ADVANCE SOURCE VERSIONS ($db.sj_dim = $v1)").collect()
+
+      val advanced = lookup("sj_selfjoin_mv")
+      val persistedAfterAdvance = MvCommandHelper
+        .persistedPinnedSources(advanced.properties, advanced.sourceTables)
+        .getOrElse(fail("expected persisted pinned identities after ADVANCE"))
+      persistedAfterAdvance should have size 1
+      persistedAfterAdvance.head.pin.clause shouldBe s"VERSION AS OF $v1"
+      persistedAfterAdvance.head.operationalSource.deltaLogDataPath shouldBe dimPath
+      persistedAfterAdvance.head.operationalSource.deltaTableMetadataId shouldBe dimMetaId
+      advanced.properties(key) should not include "},{"
+      countSubstring(advanced.querySql, s"VERSION AS OF $v1 ") shouldBe 2
+      advanced.querySql should not include s"VERSION AS OF $v0 "
+      spark
+        .table("sj_selfjoin_mv")
+        .collect()
+        .map(r => (r.getInt(0), r.getString(1), r.getString(2)))
+        .toSet shouldBe Set((10, "a", "b"), (20, "b", "a"), (30, "a", "a"))
+    }
+
+    it("collapses an identical TIMESTAMP self-join to ONE canonical persisted record with the clause verbatim") {
+      spark.sql(s"CREATE TABLE $db.sjt_dim(id INT, label STRING) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sjt_dim VALUES (1, 'a')")
+      val (path, metaId) =
+        MvCommandHelper.deltaPhysicalIdentity(spark, s"$db.sjt_dim").getOrElse(fail("expected sjt_dim identity"))
+      val clause  = "TIMESTAMP AS OF '2026-09-04 05:00:00'"
+      val sources = Seq(s"$db.sjt_dim")
+      val query =
+        s"SELECT l.id FROM `$db`.`sjt_dim` $clause AS l " +
+          s"JOIN `$db`.`sjt_dim` $clause AS r ON l.id = r.id"
+
+      // Physical identity resolves without executing the (unresolvable-on-a-fresh
+      // table) historical read, so this exercises the binding + serialization
+      // seam the same way the live TIMESTAMP path does.
+      val binding = MvCommandHelper.requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.Create,
+        TableIdentifier("sjt_probe"),
+        query,
+        sources,
+        Map("sjt_dim" -> s"$db.sjt_dim"),
+        Map.empty
+      )
+      // Both SQL-visible occurrences are retained for execution rewriting...
+      binding.resolvedPins should have size 2
+      MvCommandHelper.pinnedPathBindingsByShort(binding) shouldBe Map("sjt_dim" -> ((path, clause)))
+
+      // ...but the persisted identity records the one physical source ONCE, with
+      // the exact TIMESTAMP clause verbatim (never folded to a version).
+      val props = SparkTimeTravelSql.pinnedSourceIdentityProperties(MvCommandHelper.bindingsView(binding, sources))
+      val key   = SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey
+      props(key) should not include "},{"
+      props(key) should include("\"timestamp\":\"2026-09-04 05:00:00\"")
+      props(key) should not include "\"version\""
+      val readBack = MvCommandHelper
+        .persistedPinnedSources(props, sources)
+        .getOrElse(fail("expected the canonical TIMESTAMP record to round-trip"))
+      readBack should have size 1
+      readBack.head.operationalSource.deltaLogDataPath shouldBe path
+      readBack.head.operationalSource.deltaTableMetadataId shouldBe metaId
+      readBack.head.pin.clause shouldBe clause
+    }
+
+    it("still rejects malformed persisted duplicate identity records for a self-join at REFRESH") {
+      spark.sql(s"CREATE TABLE $db.sjm_dim(id INT, label STRING) USING DELTA")
+      spark.sql(s"CREATE TABLE $db.sjm_facts(fid INT, cur_id INT, prev_id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sjm_dim VALUES (1, 'a'), (2, 'b')")
+      spark.sql(s"INSERT INTO $db.sjm_facts VALUES (10, 1, 2)")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.sjm_dim")
+      val query =
+        s"SELECT f.fid, ct.label AS cur_label, pt.label AS prev_label " +
+          s"FROM `$db`.`sjm_facts` AS f " +
+          s"JOIN `$db`.`sjm_dim` VERSION AS OF $v0 AS ct ON f.cur_id = ct.id " +
+          s"JOIN `$db`.`sjm_dim` VERSION AS OF $v0 AS pt ON f.prev_id = pt.id"
+      spark.sql(s"CREATE MATERIALIZED VIEW sjm_selfjoin_mv AS $query").collect()
+
+      val created   = lookup("sjm_selfjoin_mv")
+      val key       = SparkTimeTravelSql.PinnedSourceIdentitiesPropertyKey
+      val canonical = created.properties(key)
+      canonical should not include "},{"
+
+      // Re-introduce the PRE-FIX duplicate serialization (one record per textual
+      // occurrence). The strict reader must still refuse it: duplicates in
+      // PERSISTED input remain invalid even though canonical OUTPUT is deduped.
+      val duplicated = canonical.dropRight(1) + "," + canonical.drop(1)
+      duplicated should include("},{")
+      MvCommandHelper.persistedPinnedSources(
+        created.properties + (key -> duplicated),
+        created.sourceTables
+      ) shouldBe None
+      MvCatalog.upsert(spark, created.copy(properties = created.properties + (key -> duplicated)))
+
+      spark.sql(s"INSERT INTO $db.sjm_facts VALUES (20, 2, 1)")
+      val refreshError = intercept[Exception] {
+        spark.sql("REFRESH MATERIALIZED VIEW sjm_selfjoin_mv").collect()
+      }
+      refreshError.getMessage.toLowerCase should include("recreate")
+    }
+
+    it("hard-fails CREATE of a pinned self-join short name shared by two DISTINCT physical sources") {
+      val leftDb  = "pil_dshort_l"
+      val rightDb = "pil_dshort_r"
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $leftDb")
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $rightDb")
+      spark.sql(s"CREATE TABLE $leftDb.dim(id INT) USING DELTA")
+      spark.sql(s"CREATE TABLE $rightDb.dim(id INT) USING DELTA")
+      spark.sql(s"INSERT INTO $leftDb.dim VALUES (1)")
+      spark.sql(s"INSERT INTO $rightDb.dim VALUES (1)")
+      val lv = DeltaTableVersion.requireLatest(spark, s"$leftDb.dim")
+      val rv = DeltaTableVersion.requireLatest(spark, s"$rightDb.dim")
+
+      // Two DISTINCT physical `dim` tables, BOTH pinned, colliding on the compiler
+      // short name `dim` -- rejected before any persist, never fused to one
+      // identity record.
+      val error = intercept[Exception] {
+        spark
+          .sql(
+            s"CREATE MATERIALIZED VIEW dshort_mv AS " +
+              s"SELECT l.id FROM `$leftDb`.`dim` VERSION AS OF $lv AS l " +
+              s"JOIN `$rightDb`.`dim` VERSION AS OF $rv AS r ON l.id = r.id"
+          )
+          .collect()
+      }
+      error.getMessage.toLowerCase should include("duplicate short")
+    }
+
+    it("refuses a same-physical two-version self-join as an unsupported pin shape, persisting no pin identity") {
+      spark.sql(s"CREATE TABLE $db.sjx_dim(id INT, label STRING) USING DELTA")
+      spark.sql(s"INSERT INTO $db.sjx_dim VALUES (1, 'a')")
+      val v0 = DeltaTableVersion.requireLatest(spark, s"$db.sjx_dim")
+      spark.sql(s"INSERT INTO $db.sjx_dim VALUES (2, 'b')")
+      val v1 = DeltaTableVersion.requireLatest(spark, s"$db.sjx_dim")
+      v1 should be > v0
+      val sources = Seq(s"$db.sjx_dim")
+      val query =
+        s"SELECT l.id FROM `$db`.`sjx_dim` VERSION AS OF $v0 AS l " +
+          s"JOIN `$db`.`sjx_dim` VERSION AS OF $v1 AS r ON l.id = r.id"
+
+      // One physical source read at TWO versions is an ambiguous cross-version
+      // shape: the resolver yields no verified pins (so it can never persist a
+      // conflicting identity) and the pin telemetry reports it refused.
+      val telemetry = SparkTimeTravelSql.pinTelemetry(query, sources)
+      telemetry.status shouldBe TimeTravelPinStatus.CompileFailed
+      telemetry.reason shouldBe TimeTravelPinReason.UnsupportedPinShape
+      MvCommandHelper.resolvePinnedSources(spark, query, sources) shouldBe MvCommandHelper.PinResolution.NoPin
     }
 
     it("hard-fails CREATE when a pinned source and a live source share a compiler short name") {

@@ -972,17 +972,53 @@ object SparkTimeTravelSql {
 
   private def utf8Length(s: String): Int = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
 
+  /** The canonical persisted identity of one resolved pin: the physical Delta
+    * source it froze (`DeltaLog.dataPath` + Delta `metadata.id`) plus its
+    * canonical temporal clause (VERSION or exact TIMESTAMP semantics). Every
+    * SQL-visible occurrence of a same-source same-version self-join shares this
+    * key, so the occurrences collapse to a single persisted record. A single
+    * physical source read at two canonical clauses is a cross-version conflict
+    * rejected upstream by [[validateResolvedSnapshotPins]] before serialization,
+    * so the key can never merge two genuinely distinct pins. */
+  private def canonicalPinIdentityKey(resolved: ResolvedSnapshotPin): (String, String, String) =
+    (
+      resolved.operationalSource.deltaLogDataPath,
+      resolved.operationalSource.deltaTableMetadataId,
+      canonicalPinValue(resolved.pin.clause)
+    )
+
   /** Serialize the physical identities of a view's resolved pinned sources into
-    * one deterministic structured property, canonically ordered by resolved
-    * source. A canonical `VERSION AS OF <n>` persists an integer `version`, a
-    * `TIMESTAMP AS OF '<literal>'` persists the literal under `timestamp`, and
-    * any other shape persists its verbatim `clause` — so every pin kind
-    * round-trips exactly.
+    * one deterministic structured property. Exactly ONE record is emitted per
+    * canonical physical source (`DeltaLog.dataPath` + Delta `metadata.id`) and
+    * canonical temporal clause: a same-source same-version self-join contributes
+    * several SQL-visible occurrences that all resolve to one physical identity,
+    * and the persisted contract records that identity ONCE, sorted and unique.
+    * Every textual occurrence is still bound at execution by the transient
+    * rewrite surfaces, which read the live `bindings.pins` (not this property),
+    * so occurrence-aware path binding is unaffected by the collapse. Records are
+    * ordered by resolved source so the output is byte-stable and the strict
+    * reader — which still rejects a duplicate alias or pinRef in PERSISTED input
+    * — accepts the canonical output. A canonical `VERSION AS OF <n>` persists an
+    * integer `version`, a `TIMESTAMP AS OF '<literal>'` persists the literal
+    * under `timestamp`, and any other shape persists its verbatim `clause` — so
+    * every pin kind round-trips exactly.
     */
   private[spark] def pinnedSourceIdentityProperties(bindings: ResolvedSnapshotPinBindings): Map[String, String] = {
     if (bindings.pins.isEmpty) return Map.empty
-    val ordered = bindings.pins.sortBy(_.operationalSource.alias)
-    val array   = PinIdentityJson.createArrayNode()
+    val ordered = bindings.pins
+      .groupBy(canonicalPinIdentityKey)
+      .valuesIterator
+      .map(_.minBy(pin => (pin.pin.tableRef, pin.pin.segments.mkString("."))))
+      .toVector
+      .sortBy { resolved =>
+        (
+          resolved.operationalSource.alias,
+          resolved.operationalSource.deltaLogDataPath,
+          resolved.operationalSource.deltaTableMetadataId,
+          canonicalPinValue(resolved.pin.clause)
+        )
+      }
+    val array = PinIdentityJson.createArrayNode()
     ordered.foreach { resolved =>
       val node = array.addObject()
       node.put("alias", resolved.operationalSource.alias)
