@@ -605,15 +605,23 @@ private[commands] object MvCommandHelper {
     * table reference, or `None` when it is not a readable committed Delta table.
     * `DeltaLog.update()` lists the log segment only (no Spark job), the same read
     * the snapshot-pin version lookup already performs.
+    *
+    * Resolution goes through [[DeltaTableVersion.deltaLogOption]], which also
+    * binds references the session catalog alone cannot: a source as the analyzer
+    * reports it (CATALOG-qualified `spark_catalog.<db>.<table>`, which
+    * `parseTableIdentifier` rejects) and a managed-lakehouse alias whose database
+    * the platform rewrites to an encoded namespace. Both must land on the SAME
+    * physical identity, or a pinned body can never be matched to its tracked
+    * source.
     */
   def deltaPhysicalIdentity(spark: SparkSession, tableRef: String): Option[(String, String)] =
-    try {
-      val ident    = spark.sessionState.sqlParser.parseTableIdentifier(tableRef)
-      val log      = DeltaLog.forTable(spark, ident)
-      val snapshot = log.update()
-      if (snapshot.version < 0L) None
-      else Some((normalizeDeltaPath(log.dataPath), snapshot.metadata.id))
-    } catch { case NonFatal(_) => None }
+    DeltaTableVersion.deltaLogOption(spark, tableRef).flatMap { deltaLog =>
+      try {
+        val snapshot = deltaLog.update()
+        if (snapshot.version < 0L) None
+        else Some((normalizeDeltaPath(deltaLog.dataPath), snapshot.metadata.id))
+      } catch { case NonFatal(_) => None }
+    }
 
   /** Resolve the snapshot pins in `querySql` to their operational sources by
     * physical Delta identity, ONCE per command. The single result is threaded to

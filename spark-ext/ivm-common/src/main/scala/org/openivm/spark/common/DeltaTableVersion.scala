@@ -4,6 +4,8 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.files.TahoeFileIndex
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.util.control.NonFatal
@@ -70,7 +72,51 @@ object DeltaTableVersion {
 
   private[common] def deltaLogFor(spark: SparkSession, tableNameOrPath: String): DeltaLog =
     if (looksLikePath(tableNameOrPath)) DeltaLog.forTable(spark, new Path(tableNameOrPath))
-    else DeltaLog.forTable(spark, CatalystSqlParser.parseTableIdentifier(tableNameOrPath))
+    else
+      sessionCatalogDeltaLog(spark, tableNameOrPath)
+        .orElse(analyzerDeltaLog(spark, tableNameOrPath))
+        .getOrElse(DeltaLog.forTable(spark, CatalystSqlParser.parseTableIdentifier(tableNameOrPath)))
+
+  /** The committed `DeltaLog` `tableNameOrPath` names, or `None` when it is not
+    * a readable committed Delta table. Same resolution as [[deltaLogFor]] with
+    * the terminal throw replaced by `None`.
+    */
+  def deltaLogOption(spark: SparkSession, tableNameOrPath: String): Option[DeltaLog] = {
+    val log =
+      if (looksLikePath(tableNameOrPath))
+        try Some(DeltaLog.forTable(spark, new Path(tableNameOrPath)))
+        catch { case NonFatal(_) => None }
+      else sessionCatalogDeltaLog(spark, tableNameOrPath).orElse(analyzerDeltaLog(spark, tableNameOrPath))
+    log.filter { candidate =>
+      try candidate.tableExists
+      catch { case NonFatal(_) => false }
+    }
+  }
+
+  private def sessionCatalogDeltaLog(spark: SparkSession, tableRef: String): Option[DeltaLog] =
+    try {
+      val log = DeltaLog.forTable(spark, CatalystSqlParser.parseTableIdentifier(tableRef))
+      if (log.tableExists) Some(log) else None
+    } catch { case NonFatal(_) => None }
+
+  /** The `DeltaLog` `tableRef` names, resolved through Spark's own analyzer.
+    *
+    * `CatalystSqlParser.parseTableIdentifier` accepts at most `db.table`, and
+    * `DeltaLog.forTable(spark, id)` looks that up in the SESSION catalog. Two
+    * references OpenIVM has to read are outside that space: a source as the
+    * analyzer reports it (CATALOG-qualified `spark_catalog.<db>.<table>`), and a
+    * managed-lakehouse alias whose database the platform rewrites to an encoded
+    * namespace. Both resolve normally through `spark.table` and land on the same
+    * `TahoeFileIndex`, so the log is taken from the analyzed plan instead of
+    * failing closed. Analysis only — no Spark job is submitted.
+    */
+  private[common] def analyzerDeltaLog(spark: SparkSession, tableRef: String): Option[DeltaLog] =
+    try
+      spark.table(tableRef).queryExecution.analyzed.collectFirst {
+        case LogicalRelation(hfs: HadoopFsRelation, _, _, _) if hfs.location.isInstanceOf[TahoeFileIndex] =>
+          hfs.location.asInstanceOf[TahoeFileIndex].deltaLog
+      }
+    catch { case NonFatal(_) => None }
 
   private def looksLikePath(tableNameOrPath: String): Boolean =
     tableNameOrPath.startsWith("/") || tableNameOrPath.startsWith("file:") || tableNameOrPath.contains("/")
