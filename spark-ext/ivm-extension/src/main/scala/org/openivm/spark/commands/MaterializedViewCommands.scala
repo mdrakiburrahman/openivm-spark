@@ -1,6 +1,5 @@
 package org.openivm.spark.commands
 
-import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -1250,8 +1249,7 @@ case class CreateMaterializedViewCommand(
 
       profile.timeStep("create_mv_publish_metadata", "phase=advance_version") {
         // Record the Delta version of the initial snapshot
-        val version =
-          DeltaTable.forPath(spark, location).history(1).collect().head.getAs[Long]("version")
+        val version = DeltaCommitClassifier.latestVersion(spark, location)
         MvCatalog.advance(spark, name, version)
       }
     } finally {
@@ -1460,18 +1458,6 @@ case class RefreshMaterializedViewCommand(
       try MvCatalog.list(spark)
       catch { case _: Throwable => Seq.empty[MvMetadata] }
 
-    if (
-      meta.refreshType != RefreshTypeCode.FullRefresh &&
-      !propagation.hasPendingChanges(spark, viewNameStr, meta.sourceTables, sourceWatermarks)
-    ) {
-      logInfo(
-        s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
-          "outcome='no_pending_deltas'"
-      )
-      emitEnd("no_pending_deltas", meta.refreshTypeName, 0)
-      return Seq.empty
-    }
-
     val changeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
       RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
         propagation.collectChanges(
@@ -1483,8 +1469,6 @@ case class RefreshMaterializedViewCommand(
       }
     }
 
-    // Defensive backstop: the cheap existence probe above and the full collect
-    // can diverge if another refresh consumes the same rows before we collect.
     if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
       logInfo(
         s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
@@ -4154,28 +4138,31 @@ case class RefreshMaterializedViewCommand(
   ): Unit = {
     import MvCommandHelper._
     val propagation = ChangePropagationFactory.forSession(spark)
-    val newVersion =
-      DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+    val newVersion  = DeltaCommitClassifier.latestVersion(spark, meta.location)
     MvCatalog.advance(spark, name, newVersion)
 
     propagation.markConsumed(spark, viewNameStr, changeBatches)
 
-    val allMvs = MvCatalog.list(spark)
-    val viewsByTable = allMvs
-      .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
-      .groupBy(_._1)
-      .map { case (t, pairs) => t -> pairs.map(_._2) }
-    propagation.pruneConsumed(spark, viewsByTable)
-
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
     // the downstream MV's next REFRESH naturally sees the new MV-data Delta
-    // version via its own [[CdfChangePropagation.hasPendingChanges]] probe.
-    if (propagation.requiresDmlInterception && !meta.emitsCascadeViewDelta) {
-      val upstreamShortName = name.identifier
-      val downstreamSourceKeys = allMvs
-        .filterNot(m => metaName(m.name) == viewNameStr)
-        .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
-        .distinct
+    // version when changes are collected.
+    if (propagation.requiresDmlInterception) {
+      val allMvs = MvCatalog.list(spark)
+      val viewsByTable = allMvs
+        .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+        .groupBy(_._1)
+        .map { case (t, pairs) => t -> pairs.map(_._2) }
+      propagation.pruneConsumed(spark, viewsByTable)
+
+      val downstreamSourceKeys =
+        if (meta.emitsCascadeViewDelta) Seq.empty
+        else {
+          val upstreamShortName = name.identifier
+          allMvs
+            .filterNot(m => metaName(m.name) == viewNameStr)
+            .flatMap(_.sourceTables.filter(_.split("\\.").last == upstreamShortName))
+            .distinct
+        }
 
       if (downstreamSourceKeys.nonEmpty) {
         val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
@@ -4241,12 +4228,14 @@ case class RefreshMaterializedViewCommand(
 
     val propagation = ChangePropagationFactory.forSession(spark)
     propagation.markConsumed(spark, viewNameStr, changeBatches)
-    val viewsByTable = MvCatalog
-      .list(spark)
-      .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
-      .groupBy(_._1)
-      .map { case (t, pairs) => t -> pairs.map(_._2) }
-    propagation.pruneConsumed(spark, viewsByTable)
+    if (propagation.requiresDmlInterception) {
+      val viewsByTable = MvCatalog
+        .list(spark)
+        .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+        .groupBy(_._1)
+        .map { case (t, pairs) => t -> pairs.map(_._2) }
+      propagation.pruneConsumed(spark, viewsByTable)
+    }
   }
 
   /** True for refresh types whose openivm-emitted MERGE preserves rows whose
