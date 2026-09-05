@@ -1623,6 +1623,23 @@ private[commands] object MvCommandHelper {
       }
     } catch { case NonFatal(_) => None }
 
+  /** True when the session catalog stores column names case-exactly, so an MV
+    * whose user-authored output has mixed-case columns needs no case-preserving
+    * VIEW wrapper.
+    *
+    * The wrapper exists for metastores that lower-case column identifiers (Hive).
+    * A Delta-backed managed lakehouse catalog preserves case verbatim, and there
+    * `CREATE OR REPLACE VIEW` cannot even express the catalog's own multi-part
+    * identifier — Spark folds it into `spark_catalog`.`default`.`<whole name>`
+    * and then fails TABLE_OR_VIEW_ALREADY_EXISTS — so the wrapper is both
+    * unnecessary and unbuildable. Off by default: only a deployment that knows
+    * its catalog is case-exact opts in via
+    * `spark.openivm.catalogPreservesColumnCase=true`. */
+  def catalogPreservesColumnCase(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption("spark.openivm.catalogPreservesColumnCase")
+      .exists(_.trim.equalsIgnoreCase("true"))
+
   /** True when `ident` resolves to a relation whose physical path is exactly
     * `location` — used to prove ownership before reaping a registration. */
   def registrationResolvesTo(
@@ -2982,7 +2999,8 @@ case class CreateMaterializedViewCommand(
     val topKViewSuffix =
       if (effectiveRefreshType != RefreshTypeCode.FullRefresh) topKViewSpec.suffixSql else None
     val requiresCasePreservingView =
-      analyzed.output.exists(column => column.name != column.name.toLowerCase(java.util.Locale.ROOT))
+      analyzed.output.exists(column => column.name != column.name.toLowerCase(java.util.Locale.ROOT)) &&
+        !catalogPreservesColumnCase(spark)
     val usesBackingDataTable =
       isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresCasePreservingView
     val dataIdent: TableIdentifier =
