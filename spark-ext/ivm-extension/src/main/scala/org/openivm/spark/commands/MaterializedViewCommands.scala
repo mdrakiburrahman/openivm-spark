@@ -93,11 +93,29 @@ private[commands] object OpenIvmCompilers {
         .map(dir => new java.io.File(dir, "duckdb").getAbsolutePath)
         .getOrElse("/opt/openivm/duckdb")
     )
+    // Managed Spark images can ship a libstdc++ older than the one the DuckDB
+    // CLI was linked against; the loader then kills the CLI before it reads the
+    // compile script and every view falls back to FULL_REFRESH. This conf
+    // prepends directories carrying a sufficient C++ runtime to the CLI
+    // subprocess only.
+    val cliLibraryPath = spark.conf
+      .getOption("spark.openivm.compiler.cliLibraryPath")
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
     if (new java.io.File(extEnv).exists() && new java.io.File(cliEnv).exists())
-      OpenIvmCompiler.build(extensionPath = extEnv, cliPath = cliEnv)
+      OpenIvmCompiler.build(
+        extensionPath = extEnv,
+        cliPath = cliEnv,
+        nativeLibraryPath = cliLibraryPath
+      )
     else {
       val (extPath, cliPath) = extractBundledAssets(spark)
-      OpenIvmCompiler.build(extensionPath = extPath, cliPath = cliPath)
+      OpenIvmCompiler.build(
+        extensionPath = extPath,
+        cliPath = cliPath,
+        nativeLibraryPath = cliLibraryPath
+      )
     }
   }
 

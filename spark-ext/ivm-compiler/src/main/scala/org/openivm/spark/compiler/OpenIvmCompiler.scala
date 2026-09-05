@@ -80,7 +80,8 @@ class OpenIvmCompiler private (
     val extensionPath: String,
     val cliPath: String,
     val isolation: OpenIvmCompiler.Isolation,
-    private val failureBundleDir: Option[String]
+    private val failureBundleDir: Option[String],
+    private val nativeLibraryPath: Option[String]
 ) extends AutoCloseable {
 
   @volatile private var closed: Boolean = false
@@ -512,7 +513,22 @@ class OpenIvmCompiler private (
     * parallel threads to avoid pipe-buffer deadlocks.
     */
   private def runCli(script: String): (String, String) = {
-    val pb      = new ProcessBuilder(cliPath, ":memory:", "-jsonlines")
+    val pb = new ProcessBuilder(cliPath, ":memory:", "-jsonlines")
+    // The CLI is a separate native binary, so the host's default C++ runtime
+    // may be older than the one it was linked against (a managed Spark image
+    // can ship a libstdc++ without the `GLIBCXX_3.4.3x` symbols the CLI needs,
+    // and the loader then kills it before it reads a single byte of the
+    // script). `nativeLibraryPath` prepends directories that carry a
+    // sufficient runtime FOR THIS SUBPROCESS ONLY — the driver JVM's own
+    // library resolution is deliberately left untouched.
+    nativeLibraryPath.foreach { extra =>
+      val env      = pb.environment()
+      val existing = Option(env.get("LD_LIBRARY_PATH")).getOrElse("")
+      env.put(
+        "LD_LIBRARY_PATH",
+        if (existing.isEmpty) extra else s"$extra:$existing"
+      )
+    }
     val process = pb.start()
 
     val executor = Executors.newFixedThreadPool(2)
@@ -789,6 +805,12 @@ object OpenIvmCompiler {
     *                       Defaults to the `OPENIVM_COMPILE_FAILURE_BUNDLE_DIR`
     *                       environment variable; `None`/unset disables the
     *                       feature entirely (the default, zero-overhead path).
+    * @param nativeLibraryPath Directories prepended to `LD_LIBRARY_PATH` of the
+    *                       DuckDB CLI subprocess only, for hosts whose default
+    *                       C++ runtime is older than the one the CLI was linked
+    *                       against. Defaults to `OPENIVM_CLI_LD_LIBRARY_PATH`;
+    *                       `None`/unset leaves the subprocess environment
+    *                       untouched.
     * @throws IllegalArgumentException if `extensionPath` or `cliPath` does not exist on disk.
     * @throws NotImplementedError      if `isolation == ChildProcess`.
     */
@@ -799,7 +821,8 @@ object OpenIvmCompiler {
       ),
       cliPath: String = sys.env.getOrElse("OPENIVM_CLI_PATH", defaultCliPath()),
       isolation: Isolation = InProcess,
-      failureBundleDir: Option[String] = sys.env.get("OPENIVM_COMPILE_FAILURE_BUNDLE_DIR").filter(_.nonEmpty)
+      failureBundleDir: Option[String] = sys.env.get("OPENIVM_COMPILE_FAILURE_BUNDLE_DIR").filter(_.nonEmpty),
+      nativeLibraryPath: Option[String] = sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").filter(_.trim.nonEmpty)
   ): OpenIvmCompiler = isolation match {
     case ChildProcess =>
       throw new NotImplementedError(
@@ -814,7 +837,7 @@ object OpenIvmCompiler {
         throw new IllegalArgumentException(
           s"OpenIVM DuckDB CLI not found at: $cliPath"
         )
-      new OpenIvmCompiler(extensionPath, cliPath, isolation, failureBundleDir)
+      new OpenIvmCompiler(extensionPath, cliPath, isolation, failureBundleDir, nativeLibraryPath)
   }
 
   private def defaultCliPath(): String = {
