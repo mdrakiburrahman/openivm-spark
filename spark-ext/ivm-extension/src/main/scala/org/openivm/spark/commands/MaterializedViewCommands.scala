@@ -1601,16 +1601,66 @@ private[commands] object MvCommandHelper {
       }
     }
 
+  /** Physical identity of a registered relation, as read back from the catalog. */
+  final case class RegisteredRelation(
+      provider: Option[String],
+      location: Path,
+      tableId: Option[String],
+      properties: Option[Map[String, String]]
+  )
+
+  /** Delta identity (`metadata.id`) and properties at a physical path. */
+  def deltaIdentityAt(
+      spark: SparkSession,
+      path: String
+  ): Option[(Option[String], Map[String, String])] =
+    try {
+      if (!DeltaTable.isDeltaTable(spark, path)) None
+      else {
+        val row = DeltaTable.forPath(spark, path).detail().select("id", "properties").head()
+        val props = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
+        Some((Option(row.getString(0)), props))
+      }
+    } catch { case NonFatal(_) => None }
+
+  /** True when `ident` resolves to a relation whose physical path is exactly
+    * `location` — used to prove ownership before reaping a registration. */
+  def registrationResolvesTo(
+      spark: SparkSession,
+      ident: TableIdentifier,
+      location: String
+  ): Boolean =
+    try {
+      def normalize(path: Path): String = {
+        val hconf = spark.sparkContext.hadoopConfiguration
+        path.getFileSystem(hconf).makeQualified(path).toUri.normalize().toString.stripSuffix("/")
+      }
+      val registered =
+        try Some(new Path(spark.sessionState.catalog.getTableMetadata(ident).location))
+        catch {
+          case NonFatal(_) =>
+            spark
+              .sql(s"DESCRIBE DETAIL ${sqlIdent(ident)}")
+              .select("location")
+              .take(1)
+              .headOption
+              .flatMap(r => Option(r.getString(0)))
+              .map(new Path(_))
+        }
+      registered.exists(path => normalize(path) == normalize(new Path(location)))
+    } catch { case NonFatal(_) => false }
+
   def validateCatalogRegistration(
       spark: SparkSession,
       dataIdent: TableIdentifier,
       expectedLocation: String,
-      requireExists: Boolean
+      requireExists: Boolean,
+      expectedTableId: Option[String] = None
   ): Boolean = {
-    // The registered data table's (provider, physical location), or None when
-    // it does not exist. The primary probe is the job-free V1 SessionCatalog
-    // metastore read used against a local Hive metastore — it must not submit a
-    // Spark job (catalog publication runs inside a serialized admission window).
+    // The registered data table's physical identity, or None when it does not
+    // exist. The primary probe is the job-free V1 SessionCatalog metastore read
+    // used against a local Hive metastore — it must not submit a Spark job
+    // (catalog publication runs inside a serialized admission window).
     //
     // A managed Fabric Spark lakehouse routes that V1 probe through its OneLake
     // external catalog, which rejects a bare `schema.table` identifier as a
@@ -1628,33 +1678,40 @@ private[commands] object MvCommandHelper {
 
     // Outer None => the V1 probe is unusable here (Fabric); fall back.
     // Inner None => the V1 probe ran and the table does not exist.
-    def viaSessionCatalog: Option[Option[(Option[String], Path)]] =
+    def viaSessionCatalog: Option[Option[RegisteredRelation]] =
       try {
         val catalog = spark.sessionState.catalog
-        if (requireExists) {
+        def read = {
           val m = catalog.getTableMetadata(dataIdent)
-          Some(Some((m.provider, new Path(m.location))))
-        } else if (!catalog.tableExists(dataIdent)) {
-          Some(None)
-        } else {
-          val m = catalog.getTableMetadata(dataIdent)
-          Some(Some((m.provider, new Path(m.location))))
+          Some(RegisteredRelation(m.provider, new Path(m.location), None, None))
         }
+        if (requireExists) Some(read)
+        else if (!catalog.tableExists(dataIdent)) Some(None)
+        else Some(read)
       } catch {
         case _: NoSuchTableException | _: NoSuchDatabaseException => Some(None)
         case NonFatal(_)                                          => None
       }
 
-    def viaDescribeDetail: Option[(Option[String], Path)] = {
+    def viaDescribeDetail: Option[RegisteredRelation] = {
       val rows =
-        try spark.sql(s"DESCRIBE DETAIL $ident").select("format", "location").take(1)
+        try
+          spark
+            .sql(s"DESCRIBE DETAIL $ident")
+            .select("format", "location", "id", "properties")
+            .take(1)
         catch { case _: AnalysisException => Array.empty[Row] }
       rows.headOption.map { r =>
-        (Option(r.getString(0)), new Path(Option(r.getString(1)).getOrElse("")))
+        RegisteredRelation(
+          Option(r.getString(0)),
+          new Path(Option(r.getString(1)).getOrElse("")),
+          Option(r.getString(2)),
+          Option(r.getAs[Map[String, String]]("properties"))
+        )
       }
     }
 
-    val found: Option[(Option[String], Path)] = viaSessionCatalog.getOrElse(viaDescribeDetail)
+    val found: Option[RegisteredRelation] = viaSessionCatalog.getOrElse(viaDescribeDetail)
 
     found match {
       case None =>
@@ -1663,10 +1720,39 @@ private[commands] object MvCommandHelper {
             s"Catalog registration did not create $ident"
           )
         false
-      case Some((provider, actualLocation)) =>
-        val expectedProvider = provider.exists(_.equalsIgnoreCase("delta"))
-        val expectedPath     = qualified(actualLocation) == qualified(new Path(expectedLocation))
-        if (!expectedProvider || !expectedPath)
+      case Some(relation) =>
+        // A relation already carries this name. Accept it ONLY when it is
+        // provably the exact physical backing this operation intended (or just
+        // wrote); anything else — a different path, a different Delta table id,
+        // a non-Delta relation, or a foreign same-named table — still fails
+        // closed exactly as before. `CREATE TABLE IF NOT EXISTS` is therefore
+        // idempotent for our own backing and for nothing else.
+        val providerOk = relation.provider.exists(_.equalsIgnoreCase("delta"))
+        val actualPath = qualified(relation.location)
+        val pathOk     = actualPath == qualified(new Path(expectedLocation))
+        // Read Delta identity/ownership only when the cheap probe did not carry
+        // it, and only for a relation that already matched name+provider+path.
+        lazy val deltaIdentity: Option[(Option[String], Map[String, String])] =
+          if (relation.tableId.isDefined && relation.properties.isDefined)
+            Some((relation.tableId, relation.properties.get))
+          else deltaIdentityAt(spark, actualPath)
+        val idOk = expectedTableId match {
+          case Some(expected) =>
+            // Post-registration: the relation must be the very table we wrote.
+            providerOk && pathOk && deltaIdentity.exists(_._1.contains(expected))
+          case None => true
+        }
+        // Adopting a pre-existing registration requires proof that OpenIVM
+        // created it (its CREATE-time marker), so a foreign table that merely
+        // happens to sit at this name and path is never silently reused.
+        val ownedOk =
+          if (expectedTableId.isDefined) true
+          else if (!providerOk || !pathOk) false
+          else
+            deltaIdentity.exists { case (_, props) =>
+              props.get(CreateRecoveryWatermarksMarker).exists(_.equalsIgnoreCase("true"))
+            }
+        if (!providerOk || !pathOk || !idOk || !ownedOk)
           throw new AnalysisException(
             "TABLE_OR_VIEW_ALREADY_EXISTS",
             Map("relationName" -> ident)
@@ -1768,7 +1854,8 @@ private[commands] object MvCommandHelper {
       spark: SparkSession,
       name: TableIdentifier,
       dataIdent: TableIdentifier,
-      location: String
+      location: String,
+      ownedDataTableId: Option[String] = None
   ): Unit = {
     val catalog = spark.sessionState.catalog
     val namedRegistrationPublished =
@@ -1782,7 +1869,33 @@ private[commands] object MvCommandHelper {
         case _: Throwable => true
       }
 
-    if (namedRegistrationPublished || mvMetadataPublished) return
+    // A registration under this name normally means the CREATE partially
+    // succeeded and must not be touched. But a managed catalog (Fabric) can
+    // publish the backing relation itself while this operation still failed, so
+    // bailing unconditionally strands the exact artifact this operation owns and
+    // poisons every dbt retry. Reap it only when it is provably ours: a Delta
+    // relation at exactly the path we wrote, carrying OpenIVM's CREATE-time
+    // marker and — when known — the very Delta metadata.id we just committed. A
+    // foreign same-named table never satisfies this and is never dropped.
+    val registrationIsOperationOwned =
+      namedRegistrationPublished && !mvMetadataPublished && {
+        deltaIdentityAt(spark, location).exists { case (actualId, props) =>
+          val ownedMarker =
+            props.get(CreateRecoveryWatermarksMarker).exists(_.equalsIgnoreCase("true"))
+          val idMatches = ownedDataTableId.forall(expected => actualId.contains(expected))
+          ownedMarker && idMatches && registrationResolvesTo(spark, dataIdent, location)
+        }
+      }
+
+    if (registrationIsOperationOwned) {
+      try spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataIdent)}")
+      catch { case _: Throwable => () }
+      try {
+        val path = new Path(location)
+        val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+        if (fs.exists(path)) fs.delete(path, true)
+      } catch { case _: Throwable => () }
+    } else if (namedRegistrationPublished || mvMetadataPublished) return
 
     val mvQual      = metaName(name)
     val mvShort     = name.identifier
@@ -2874,6 +2987,21 @@ case class CreateMaterializedViewCommand(
       isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresCasePreservingView
     val dataIdent: TableIdentifier =
       if (usesBackingDataTable) dataTableId(name) else name
+    // A managed lakehouse catalog (Fabric) ignores the `LOCATION` clause and
+    // materialises a catalog table inside its managed area keyed by the table
+    // NAME. When the MV's user-facing object is a VIEW over a separate backing
+    // table the registered identifier is `<mv>__ivm_data`, so the relation that
+    // actually exists is `<managedTablesRoot>/<db>/<mv>__ivm_data` while
+    // `mvLocation(name)` points at `<managedTablesRoot>/<db>/<mv>`. The path
+    // OpenIVM intended could then never equal the path that exists, so the
+    // registration probe failed closed on the first CREATE *and* on every retry
+    // — the node could never recover. Derive the backing table's path from the
+    // identifier that is actually registered so the data write, the named
+    // registration and the identity probe all address exactly one physical
+    // Delta table. Identical to `location` whenever the MV owns its own data
+    // table (`dataIdent == name`), which is every non-backing-table layout.
+    val dataLocation: String =
+      if (dataIdent == name) location else mvLocation(spark, dataIdent)
     val havingPred: Option[String] = if (isHavingViewIncremental) rawHavingPred else None
     val userOutputCols: Seq[String] =
       if (usesBackingDataTable) analyzed.output.map(_.name) else Nil
@@ -2947,7 +3075,7 @@ case class CreateMaterializedViewCommand(
     // absorbed via the CTAS).  Encoded opaquely so the same property key
     // round-trips both `intercept`-mode timestamps and `cdf`-mode versions.
     val watermarkProps = profile.timeStep("create_capture_watermarks", s"sources=${qualNames.size}") {
-      recoverCreateWatermarkProperties(spark, location).getOrElse {
+      recoverCreateWatermarkProperties(spark, dataLocation).getOrElse {
         MvMetadata.changeWatermarkProperties(
           propagation.currentWatermarks(spark, qualNames)
         )
@@ -2987,7 +3115,7 @@ case class CreateMaterializedViewCommand(
       lastVersion = -1L,
       sourceTables = qualNames,
       sourceSchemaFingerprint = fingerprint,
-      location = location,
+      location = dataLocation,
       createdAt = now,
       properties = allProps
     )
@@ -3039,11 +3167,11 @@ case class CreateMaterializedViewCommand(
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val dataWriteSql =
-      createDataWriteSql(location, clusterClause, tblPropsClause, viewBodySql)
+      createDataWriteSql(dataLocation, clusterClause, tblPropsClause, viewBodySql)
     val catalogRegistrationSql =
-      createCatalogRegistrationSql(dataIdent, location)
+      createCatalogRegistrationSql(dataIdent, dataLocation)
     val preexistingCatalogRegistration = profile.timeStep("create_validate_catalog_registration") {
-      validateCatalogRegistration(spark, dataIdent, location, requireExists = false)
+      validateCatalogRegistration(spark, dataIdent, dataLocation, requireExists = false)
     }
     // Wipe stray files from a previous aborted CREATE so Delta's
     // "non-empty location, not a Delta table" check does not fail dbt
@@ -3051,15 +3179,18 @@ case class CreateMaterializedViewCommand(
     // forensics — trades_history failed 24× over 87 minutes because the
     // location had non-Delta Parquet from a prior partial write).
     profile.timeStep("create_cleanup_stale_location") {
-      cleanupStaleMvLocation(spark, location)
+      cleanupStaleMvLocation(spark, dataLocation)
     }
     val preexistingDeltaPath = profile.timeStep("create_probe_existing_delta_path") {
-      DeltaTable.isDeltaTable(spark, location)
+      DeltaTable.isDeltaTable(spark, dataLocation)
     }
     val rollbackOwnedArtifactsOnFailure = !preexistingCatalogRegistration && !preexistingDeltaPath
     var dataWriteMs                     = 0L
     var catalogPublicationMs            = 0L
     var reusedDeltaPath                 = false
+    // Delta identity of the backing table this operation actually wrote, used
+    // to prove the catalog registration resolved to that exact table.
+    var writtenDataTableId: Option[String] = None
     var publicationCommitted            = false
     // CREATE PRE: re-verify each pinned source's physical identity at its
     // verified path immediately before the initial CTAS. A drop/recreate between
@@ -3075,7 +3206,7 @@ case class CreateMaterializedViewCommand(
               "create_mv_initial_load",
               s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
             ) {
-              reusedDeltaPath = DeltaTable.isDeltaTable(spark, location)
+              reusedDeltaPath = DeltaTable.isDeltaTable(spark, dataLocation)
               if (!reusedDeltaPath) {
                 val ctasStmtKind = RefreshPerf.classify(dataWriteSql, "")
                 var attempt      = 0
@@ -3096,7 +3227,7 @@ case class CreateMaterializedViewCommand(
                         done = true
                       case Left(t)
                           if attempt < 3 &&
-                            isCtasCleanupMissingTarget(t, dataIdent.identifier, location) =>
+                            isCtasCleanupMissingTarget(t, dataIdent.identifier, dataLocation) =>
                         attempt += 1
                         try Thread.sleep(100L * attempt)
                         catch {
@@ -3140,6 +3271,8 @@ case class CreateMaterializedViewCommand(
           if (createPinnedIdentities.nonEmpty)
             verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
 
+          writtenDataTableId = deltaIdentityAt(spark, dataLocation).flatMap(_._1)
+
           try {
             profile.timeStep(
               "create_mv_catalog_registration",
@@ -3149,7 +3282,17 @@ case class CreateMaterializedViewCommand(
                 val publicationT0 = System.nanoTime()
                 try {
                   spark.sql(catalogRegistrationSql)
-                  validateCatalogRegistration(spark, dataIdent, location, requireExists = true)
+                  // The registration must resolve to the exact Delta table this
+                  // operation just wrote — same path AND same Delta metadata.id.
+                  // A managed catalog that relocated or substituted the relation
+                  // still fails closed here.
+                  validateCatalogRegistration(
+                    spark,
+                    dataIdent,
+                    dataLocation,
+                    requireExists = true,
+                    expectedTableId = writtenDataTableId
+                  )
                   publicationCommitted = true
                 } finally {
                   catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
@@ -3240,14 +3383,14 @@ case class CreateMaterializedViewCommand(
           // The committed version is read straight off the Delta log snapshot:
           // a `DeltaTable.history` read would submit a Spark job that has to
           // queue behind the concurrent Delta data writes for a task slot.
-          val version = DeltaTableVersion.requireLatest(spark, location)
+          val version = DeltaTableVersion.requireLatest(spark, dataLocation)
           MvCatalog.upsert(spark, meta.copy(lastVersion = version))
         }
       }
     } catch {
       case t: Throwable =>
         if (rollbackOwnedArtifactsOnFailure && !publicationCommitted) {
-          cleanupFailedCreateArtifacts(spark, name, dataIdent, location)
+          cleanupFailedCreateArtifacts(spark, name, dataIdent, dataLocation, writtenDataTableId)
         }
         throw t
     }
