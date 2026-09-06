@@ -1,7 +1,7 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
 import org.openivm.spark.commands.RefreshFailureInjection
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
@@ -105,6 +105,14 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
     rows.map(_.getString(ColSqlText)).mkString("\n") should not include "REPLACE WHERE"
   }
 
+  private def assertDirectCdfTargetWrite(viewName: String): Unit = {
+    val text = rewrittenRows(viewName).map(_.getString(ColSqlText)).mkString("\n")
+    text should include("REPLACE WHERE")
+    text should include(s"openivm_new_$viewName")
+    text should not include "/_ivm/view_deltas/"
+    text should not include "WHEN MATCHED THEN DELETE"
+  }
+
   private def assertBagEqual(leftSql: String, rightSql: String): Unit = {
     sql(s"SELECT * FROM ($leftSql) openivm_left EXCEPT ALL SELECT * FROM ($rightSql) openivm_right")
       .count() shouldBe 0L
@@ -113,7 +121,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   }
 
   describe("joined WINDOW_PARTITION cascade reuse") {
-    it("reuses the persisted signed snapshot for existing and new partitions") {
+    it("refreshes existing and new partitions and preserves the downstream feed") {
       sql(
         "CREATE TABLE wcr_trade(" +
           "t_id INT, t_dts TIMESTAMP, t_ca_id INT, t_st_id INT, t_tt_id INT, t_qty INT) USING DELTA"
@@ -171,7 +179,8 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       refreshMv("wcr_mv")
 
       assertMvCorrect("wcr_mv", viewSql)
-      assertCascadeFirstTargetWrite("wcr_mv")
+      if (changeFeedMode == ChangeFeedMode.Cdf) assertDirectCdfTargetWrite("wcr_mv")
+      else assertCascadeFirstTargetWrite("wcr_mv")
 
       sql("INSERT INTO wcr_trade VALUES (400, TIMESTAMP '2026-01-03 12:00:00', 504, 1, 10, 80)")
       sql("INSERT INTO wcr_trade_history VALUES (400, TIMESTAMP '2026-01-03 12:05:00', 1)")
@@ -179,7 +188,8 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       refreshMv("wcr_mv")
 
       assertMvCorrect("wcr_mv", viewSql)
-      assertCascadeFirstTargetWrite("wcr_mv")
+      if (changeFeedMode == ChangeFeedMode.Cdf) assertDirectCdfTargetWrite("wcr_mv")
+      else assertCascadeFirstTargetWrite("wcr_mv")
     }
 
     it("uses the persisted cascade when more than 1,000 partitions change") {

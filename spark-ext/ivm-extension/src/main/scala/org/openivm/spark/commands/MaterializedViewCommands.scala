@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
@@ -2624,10 +2625,47 @@ case class RefreshMaterializedViewCommand(
           val windowInsertIdx = rewrittenSql.indexWhere(isWindowNewSnapshotInsertSql(_, mergeTargetId))
           def useCascadeFirstWindowPlan: Boolean =
             windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite]) &&
+              propagation.requiresDmlInterception &&
               !FeatureGate.windowSnapshotCacheEnabled(spark) &&
               windowCascadeCtasIdx > windowInsertIdx &&
               windowInsertIdx >= 0
           var deferredWindowTargetSql: Option[(Int, String)] = None
+          val cdfWindowNetChangeProbeEligible =
+            !propagation.requiresDmlInterception &&
+              downstreamSourceKeysForThisMv.nonEmpty &&
+              cdfChangeBatches.size == changeBatches.size &&
+              cdfChangeBatches.nonEmpty &&
+              !cdfBatchVerdicts.values.forall(_ == BatchVerdict.InsertOnly)
+          var cdfWindowNetChangeProbeCompleted = false
+          var skipCdfWindowRefresh             = false
+
+          // A CDF batch can contain several real commits whose signed source
+          // rows cancel exactly. Probe only for a downstream feed and after the
+          // bounded-key direct write has been selected: terminal and fallback
+          // window plans must not pay for an extra source CDF scan and shuffle.
+          def detectNetZeroDirectCdfWindow(): Unit =
+            if (
+              !cdfWindowNetChangeProbeCompleted &&
+              cdfWindowNetChangeProbeEligible &&
+              windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite])
+            ) {
+              cdfWindowNetChangeProbeCompleted = true
+              val hasNetChanges =
+                profile.timeStep("metadata_pre_sql", "phase=cdf_window_net_change_probe") {
+                  RefreshPerf.timePhase(refreshId, viewLabel, "cdf_window_net_change_probe") {
+                    cdfBatchesHaveNetChanges(spark, cdfChangeBatches)
+                  }
+                }
+              if (!hasNetChanges) {
+                skipCdfWindowRefresh = true
+                cascadeProducedChanges = false
+                RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='cdf_net_zero_fast_exit'")
+                logInfo(
+                  s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
+                    "outcome='cdf_net_zero_fast_exit'"
+                )
+              }
+            }
 
           def activateMaterializedWindowKeys(shape: WindowCascadeMergeShape, stmtIdx: Int): Unit = {
             executeSqlAt(s"CACHE TABLE ${quoteCol(shape.affectedViewName)}", stmtIdx)
@@ -2649,6 +2687,7 @@ case class RefreshMaterializedViewCommand(
             if (windowSinglePassPlan.isEmpty) {
               windowCascadeMergePlan = buildWindowCascadeMergePlan(spark, mergeTargetId, shape, viewDeltaPath)
             }
+            detectNetZeroDirectCdfWindow()
             logInfo(
               s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                 s"outcome='window_affected_keys_materialized' key_view='${shape.affectedViewName}'"
@@ -2659,6 +2698,7 @@ case class RefreshMaterializedViewCommand(
             executeSqlAt(shape.affectedCreateSql.get, shape.deleteStmtIdx)
             activateMaterializedWindowKeys(shape, shape.deleteStmtIdx)
           }
+          detectNetZeroDirectCdfWindow()
 
           rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
             val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
@@ -2686,13 +2726,20 @@ case class RefreshMaterializedViewCommand(
               isWindowPartitionInsertSql(sql, mergeTargetId) && windowSinglePassPlan.isDefined
             val materializeWindowAffectedKeys =
               windowCascadeMergeShape.exists(_.affectedStmtIdx.contains(idx))
+            val skipRedundantCdfWindowCascade =
+              !propagation.requiresDmlInterception &&
+                windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite]) &&
+                idx == windowCascadeCtasIdx &&
+                isRawWindowSnapshotCtas(sql, mergeTargetId, viewDeltaPath)
             val cacheWindowSinglePassSnapshot =
               isWindowNewSnapshotCreateSql(sql, mergeTargetId) &&
                 windowSinglePassPlan.isDefined &&
                 !useCascadeFirstWindowPlan &&
                 FeatureGate.windowSnapshotCacheEnabled(spark)
 
-            if (materializeWindowAffectedKeys) {
+            if (skipCdfWindowRefresh) {
+              logSkippedWindowStmt(idx, "window_cdf_net_zero_skipped")
+            } else if (materializeWindowAffectedKeys) {
               executeSqlAt(sql, idx)
               val shape = windowCascadeMergeShape.get
               activateMaterializedWindowKeys(shape, idx)
@@ -2779,6 +2826,13 @@ case class RefreshMaterializedViewCommand(
                     executeSqlAt(plan.directSql, idx)
                   }
               }
+            } else if (skipRedundantCdfWindowCascade) {
+              RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_target_cdf_cascade_skip'")
+              logInfo(
+                s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
+                  "outcome='window_target_cdf_cascade_skip' reason='target_cdf_is_downstream_feed'"
+              )
+              logSkippedWindowStmt(idx, "window_target_cdf_cascade_skipped")
             } else {
               // Apply the per-statement plan-time broadcast disable to BOTH
               // statement shapes that wrap the full MV body, matching the
@@ -3141,6 +3195,43 @@ case class RefreshMaterializedViewCommand(
       case NonFatal(error) =>
         logWarning("[openivm-mv] CDF insert-only probe failed; using the conservative refresh path", error)
         false
+    }
+
+  private def cdfBatchesHaveNetChanges(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
+    try {
+      batches
+        .groupBy(_.baseTable)
+        .exists { case (source, sourceBatches) =>
+          val sourceSchema = spark.table(source).schema
+          if (sourceSchema.isEmpty || !sourceSchema.forall(field => RowOrdering.isOrderable(field.dataType))) true
+          else {
+            val startVersion  = sourceBatches.map(_.startVersionExclusive).min + 1L
+            val endVersion    = sourceBatches.map(_.endVersionInclusive).max
+            val sourceColumns = sourceSchema.fieldNames.toSeq.map(col)
+            val signed = spark.read
+              .format("delta")
+              .option("readChangeFeed", "true")
+              .option("startingVersion", startVersion)
+              .option("endingVersion", endVersion)
+              .table(source)
+              .filter(col("_change_type").isin("insert", "delete", "update_preimage", "update_postimage"))
+              .select(
+                sourceColumns :+ when(col("_change_type").isin("insert", "update_postimage"), lit(1L))
+                  .otherwise(lit(-1L))
+                  .as("openivm_cdf_multiplicity"): _*
+              )
+            signed
+              .groupBy(sourceColumns: _*)
+              .agg(sum(col("openivm_cdf_multiplicity")).as("openivm_cdf_net_multiplicity"))
+              .filter(col("openivm_cdf_net_multiplicity") =!= lit(0L))
+              .head(1)
+              .nonEmpty
+          }
+        }
+    } catch {
+      case NonFatal(error) =>
+        logWarning("[openivm-mv] CDF net-zero probe failed; using the conservative refresh path", error)
+        true
     }
 
   /** Diagnostic gated by OPENIVM_REFRESH_DIAGNOSTICS=1 or
