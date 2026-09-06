@@ -11,6 +11,8 @@ import org.apache.logging.log4j.core.{LogEvent, Logger}
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
 
+import org.openivm.spark.common.ChangeFeedMode
+
 /** Verifies the scratch-CTAS fuse fast path emits `fused='true'` on
   * stmt_kind='view_delta_ctas' for SIMPLE_PROJECTION MVs, reuses the cached
   * view-delta as an MV-over-MV cascade input, and preserves correctness in
@@ -20,10 +22,17 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    Map(
-      "spark.openivm.fuseScratch.enabled"              -> "true",
-      "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
-    )
+    if (changeFeedMode == ChangeFeedMode.Cdf)
+      Map(
+        // CDF must fuse automatically without either intercept-only opt-in.
+        "spark.openivm.fuseScratch.enabled"              -> "false",
+        "spark.openivm.fuseScratch.cascadeCache.enabled" -> "false"
+      )
+    else
+      Map(
+        "spark.openivm.fuseScratch.enabled"              -> "true",
+        "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+      )
 
   private final class BufferingAppender(name: String)
       extends AbstractAppender(

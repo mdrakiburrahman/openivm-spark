@@ -85,8 +85,9 @@ object FeatureGate {
     * intercept-mode downstream MV exists, the same cached view is recorded as
     * the cascade input and pruned after downstream consumption.
     *
-    * Default ON. Flip OFF via `spark.openivm.fuseScratch.enabled=false` to
-    * fall back to the on-disk scratch path (e.g. for diagnostics).
+    * CDF mode always uses this path because downstream MVs consume the backing
+    * table's change feed rather than the scratch artifact. Intercept mode keeps
+    * it opt-in because cached cascade state cannot cross Spark sessions.
     */
   val FuseScratchEnabledKey: String             = "spark.openivm.fuseScratch.enabled"
   val FuseScratchCascadeCacheEnabledKey: String = "spark.openivm.fuseScratch.cascadeCache.enabled"

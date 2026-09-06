@@ -2232,7 +2232,7 @@ case class RefreshMaterializedViewCommand(
         } catch { case _: Throwable => () }
 
       val fuseEligible =
-        FeatureGate.fuseScratchEnabled(spark) &&
+        (FeatureGate.fuseScratchEnabled(spark) || !propagation.requiresDmlInterception) &&
           meta.refreshType == RefreshTypeCode.SimpleProjection &&
           rewritten.statements.nonEmpty
 
