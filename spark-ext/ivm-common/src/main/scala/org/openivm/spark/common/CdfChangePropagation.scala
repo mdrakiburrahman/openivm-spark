@@ -1,6 +1,5 @@
 package org.openivm.spark.common
 
-import io.delta.tables.DeltaTable
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types.StructType
@@ -54,27 +53,6 @@ final class CdfChangePropagation extends ChangePropagation {
     sources.distinct.flatMap { src =>
       CdfChangePropagation.tableLatestVersion(spark, src).map(v => src -> ChangeWatermark.DeltaVersion(v))
     }.toMap
-
-  override def hasPendingChanges(
-      spark: SparkSession,
-      viewName: String,
-      sources: Seq[String],
-      persisted: Map[String, ChangeWatermark]
-  ): Boolean = {
-    val effective = effectivePersistedVersions(spark, viewName, sources, persisted)
-    sources.distinct.exists { src =>
-      val currentOpt   = CdfChangePropagation.tableLatestVersion(spark, src)
-      val persistedVer = effective.get(src)
-      currentOpt match {
-        case None => false
-        case Some(cur) =>
-          persistedVer match {
-            case Some(p) => cur > p
-            case None    => true
-          }
-      }
-    }
-  }
 
   override def collectChanges(
       spark: SparkSession,
@@ -221,7 +199,7 @@ object CdfChangePropagation {
    * `true` when the Delta table identified by `name` has
    * `delta.enableChangeDataFeed` set to `true`.  Names are resolved through
    * Spark's catalog: bare names are looked up in the active database, and
-   * `db.table` is resolved via [[DeltaTable.forName]].  Returns `false` when
+   * `db.table` is resolved through the Spark catalog. Returns `false` when
    * the table cannot be resolved (caller handles that as a "missing source"
    * upstream).
    */
@@ -244,16 +222,9 @@ object CdfChangePropagation {
   }
 
   /** Current Delta `version` of `name`, or `None` if the table cannot be loaded as Delta. */
-  def tableLatestVersion(spark: SparkSession, name: String): Option[Long] = {
-    val resolved = name
-    try {
-      val dt   = DeltaTable.forName(spark, resolved)
-      val hist = dt.history(1).collect()
-      hist.headOption.map(_.getAs[Long]("version"))
-    } catch {
-      case _: Throwable => None
-    }
-  }
+  def tableLatestVersion(spark: SparkSession, name: String): Option[Long] =
+    try Some(DeltaCommitClassifier.latestVersion(spark, name))
+    catch { case _: Throwable => None }
 
   private def quoteForCatalog(name: String): String =
     name.split("\\.").map(p => s"`${p.replace("`", "``")}`").mkString(".")

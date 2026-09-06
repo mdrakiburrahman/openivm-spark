@@ -38,17 +38,6 @@ trait ChangePropagation {
   def currentWatermarks(spark: SparkSession, sources: Seq[String]): Map[String, ChangeWatermark]
 
   /**
-   * Cheap probe: are there ANY unconsumed changes since the persisted
-   * watermarks?  Refresh short-circuits when this returns `false`.
-   */
-  def hasPendingChanges(
-      spark: SparkSession,
-      viewName: String,
-      sources: Seq[String],
-      persisted: Map[String, ChangeWatermark]
-  ): Boolean
-
-  /**
    * Collect the change batches that this refresh will consume.  One batch per
    * source with pending data (a source with no pending data is absent from
    * the returned sequence; the caller still registers an empty temp view for

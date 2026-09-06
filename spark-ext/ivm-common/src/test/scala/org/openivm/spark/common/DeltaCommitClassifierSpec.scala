@@ -63,6 +63,13 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
     DeltaCommitClassifier.classify(spark, table, lastConsumedVersion)
 
   describe("DeltaCommitClassifier") {
+    it("rejects a path without a Delta log") {
+      val path = new File(warehouseDir, uniqueTable("missing")).getAbsolutePath
+
+      val error = intercept[IllegalArgumentException](latest(path))
+      error.getMessage should include("is not a Delta table")
+    }
+
     it("classifies an append-only insert as InsertOnly") {
       val table  = createTable("insert")
       val before = latest(table)

@@ -39,14 +39,14 @@ class RuntimeEmptyDeltaSkipSpec extends IvmParitySpecBase("runtime-empty-delta-s
           consumedBy = Seq.empty
         )
       )
-      StagingCatalog.hasPendingDeltas(spark, "rteds_mv", Seq(source)) shouldBe true
+      StagingCatalog.collectFor(spark, "rteds_mv", Seq(source)).nonEmpty shouldBe true
 
       refreshMv("rteds_mv")
 
       mvRows() shouldBe beforeRows
       assertMvCorrect("rteds_mv", "SELECT id, name FROM rteds_users")
       DeltaCommitClassifier.latestVersion(spark, meta.location) shouldBe beforeMvVersion
-      StagingCatalog.hasPendingDeltas(spark, "rteds_mv", Seq(source)) shouldBe false
+      StagingCatalog.collectFor(spark, "rteds_mv", Seq(source)).isEmpty shouldBe true
 
       sql("INSERT INTO rteds_users VALUES (3, 'Carol')")
       refreshMv("rteds_mv")
