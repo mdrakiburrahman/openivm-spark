@@ -23,14 +23,6 @@ final class InterceptChangePropagation extends ChangePropagation {
       src -> ChangeWatermark.TxnTs(ts)
     }
 
-  override def hasPendingChanges(
-      spark: SparkSession,
-      viewName: String,
-      sources: Seq[String],
-      persisted: Map[String, ChangeWatermark]
-  ): Boolean =
-    StagingCatalog.hasPendingDeltas(spark, viewName, sources, toTsMap(persisted))
-
   override def collectChanges(
       spark: SparkSession,
       viewName: String,

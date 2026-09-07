@@ -54,27 +54,6 @@ final class CdfChangePropagation extends ChangePropagation {
       CdfChangePropagation.tableLatestVersion(spark, src).map(v => src -> ChangeWatermark.DeltaVersion(v))
     }.toMap
 
-  override def hasPendingChanges(
-      spark: SparkSession,
-      viewName: String,
-      sources: Seq[String],
-      persisted: Map[String, ChangeWatermark]
-  ): Boolean = {
-    val effective = effectivePersistedVersions(spark, viewName, sources, persisted)
-    sources.distinct.exists { src =>
-      val currentOpt   = CdfChangePropagation.tableLatestVersion(spark, src)
-      val persistedVer = effective.get(src)
-      currentOpt match {
-        case None => false
-        case Some(cur) =>
-          persistedVer match {
-            case Some(p) => cur > p
-            case None    => true
-          }
-      }
-    }
-  }
-
   override def collectChanges(
       spark: SparkSession,
       viewName: String,

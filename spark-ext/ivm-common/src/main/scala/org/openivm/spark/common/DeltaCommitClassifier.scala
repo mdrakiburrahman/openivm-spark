@@ -31,8 +31,11 @@ object DeltaCommitClassifier {
 
   import BatchVerdict._
 
-  def latestVersion(spark: SparkSession, tableNameOrPath: String): Long =
-    DeltaTableVersion.latest(spark, tableNameOrPath)
+  def latestVersion(spark: SparkSession, tableNameOrPath: String): Long = {
+    val version = DeltaTableVersion.latest(spark, tableNameOrPath)
+    require(version >= 0L, s"$tableNameOrPath is not a Delta table")
+    version
+  }
 
   def classify(spark: SparkSession, tableNameOrPath: String, lastConsumedVersion: Long): BatchVerdict = {
     val deltaLog = deltaLogFor(spark, tableNameOrPath)
