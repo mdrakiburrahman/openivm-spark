@@ -43,8 +43,8 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       .find { row =>
         val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
         upper.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
-        upper.contains(s"FROM OPENIVM_OLD_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
-        upper.contains(s"FROM OPENIVM_NEW_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
+        upper.contains(s"OPENIVM_OLD_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
+        upper.contains(s"OPENIVM_NEW_${viewName.toUpperCase(java.util.Locale.ROOT)}") &&
         upper.contains("UNION ALL")
       }
       .getOrElse(fail("missing raw signed window cascade CTAS"))
@@ -77,7 +77,35 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
 
   private def assertCascadeMergeTargetWrite(viewName: String): Unit = {
     val (rows, cascadeRow, cascadePath) = cascadeLog(viewName)
-    val affectedView                    = s"openivm_affected_$viewName"
+    val cascadeSql                      = cascadeRow.getString(ColSqlText)
+    if (cascadeSql.contains("openivm_changed") && cascadeSql.contains("FULL OUTER JOIN openivm_new")) {
+      val compactDelete = rows
+        .find { row =>
+          val sql   = row.getString(ColSqlText)
+          val upper = sql.toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("MERGE INTO") &&
+          upper.contains(viewName.toUpperCase(java.util.Locale.ROOT)) &&
+          sql.contains(s"delta.`$cascadePath`") &&
+          sql.contains("`openivm_multiplicity` < 0") &&
+          upper.contains("WHEN MATCHED THEN DELETE")
+        }
+        .getOrElse(fail("missing compact cascade-backed target DELETE"))
+      val compactInsert = rows
+        .find { row =>
+          val sql   = row.getString(ColSqlText)
+          val upper = sql.toUpperCase(java.util.Locale.ROOT)
+          upper.startsWith("INSERT INTO") &&
+          upper.contains(viewName.toUpperCase(java.util.Locale.ROOT)) &&
+          sql.contains(s"FROM delta.`$cascadePath`") &&
+          sql.contains("`openivm_multiplicity` > 0")
+        }
+        .getOrElse(fail("missing compact cascade-backed target INSERT"))
+      compactDelete.getInt(ColStmtOrder) should be > cascadeRow.getInt(ColStmtOrder)
+      compactInsert.getInt(ColStmtOrder) should be > compactDelete.getInt(ColStmtOrder)
+      rows.map(_.getString(ColSqlText)).mkString("\n") should not include "REPLACE WHERE"
+      return
+    }
+    val affectedView = s"openivm_affected_$viewName"
     val cacheRow = rows
       .find(_.getString(ColSqlText).equalsIgnoreCase(s"CACHE TABLE `$affectedView`"))
       .getOrElse(fail("missing affected-key materialization"))
