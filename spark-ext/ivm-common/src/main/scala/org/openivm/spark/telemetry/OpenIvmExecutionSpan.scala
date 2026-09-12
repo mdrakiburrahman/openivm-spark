@@ -627,7 +627,9 @@ object OpenIvmExecutionSpan extends Logging {
   def hasCurrentSpan: Boolean = current.get() != null
 
   def hasActiveExport: Boolean =
-    Option(current.get()).exists(_.configuredExport.nonEmpty)
+    Option(current.get()).exists(span =>
+      span.configuredExport.nonEmpty || span.oneLakeSink.nonEmpty
+    )
 
   def captureCurrent(): Option[OpenIvmExecutionSpan] = Option(current.get())
 
