@@ -2659,7 +2659,10 @@ case class CreateMaterializedViewCommand(
       Seq.empty
     } finally {
       try finalizeCreate()
-      finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+      finally {
+        sqlLog.finish(createOutcome)
+        OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+      }
     }
   }
 
@@ -4087,6 +4090,7 @@ case class RefreshMaterializedViewCommand(
     profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
     RefreshPerf.emit(refreshId, viewLabel, "start", s"thread='$threadName'")
     var endEmitted                                                  = false
+    var queryLogOutcome                                             = "refresh_failed"
     var refreshTypeForFailure                                       = "UNKNOWN"
     var pendingDeltasForFailure                                     = 0
     var preparedSourceAdvance: Option[PreparedSourceVersionAdvance] = None
@@ -4094,6 +4098,7 @@ case class RefreshMaterializedViewCommand(
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
       if (!endEmitted) {
         endEmitted = true
+        queryLogOutcome = outcome
         OpenIvmExecutionSpan.recordActivePendingDeltaCount(pendingDeltas.toLong)
         val totalMs = (System.nanoTime() - refreshT0) / 1000000L
         RefreshPerf.emit(
@@ -6702,6 +6707,8 @@ case class RefreshMaterializedViewCommand(
             emitEnd("refresh_failed", refreshTypeForFailure, pendingDeltasForFailure)
             throw t
         }
+    } finally {
+      sqlLog.finish(queryLogOutcome)
     }
   }
 

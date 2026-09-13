@@ -147,9 +147,9 @@ object FeatureGate {
     */
   val CompileClassificationCacheEnabledKey: String = "spark.openivm.compile.classificationCache.enabled"
 
-  /** Capture every SQL statement actually executed by a CREATE / REFRESH
-    * MATERIALIZED VIEW lifecycle into the RocksDB `refresh_sql_log` column
-    * family ([[RefreshSqlLogCatalog]]).
+  /** Capture the existing CREATE / REFRESH MATERIALIZED VIEW SQL logger's
+    * statements and related diagnostics in [[RefreshSqlLogCatalog]]. This is
+    * not universal interception of Spark SQL or DataFrame operations.
     *
     * Default OFF — production paths pay only a microsecond-per-statement
     * inline cost when the gate is OFF (a NoOp recorder is returned).
@@ -159,7 +159,9 @@ object FeatureGate {
     * benchmark runs always collect the full per-MV SQL trace while normal
     * users get the silent-fast-path default.
     *
-    * Read via `SHOW OPENIVM QUERY LOG`. The catalog row's `refresh_id`
+    * Read via `SHOW OPENIVM QUERY LOG`, or use [[QueryLogExport]] for bounded,
+    * request-scoped export without a global flush barrier. Neither requires
+    * refresh profiling. The catalog row's `refresh_id`
     * matches the corresponding `RefreshProfileCatalog` row so the two are
     * joinable.
     */
