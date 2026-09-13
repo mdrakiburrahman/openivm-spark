@@ -206,7 +206,8 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         ("properties", "_ivm_watermark:db.one", RocksDBCodec.utf8("v:7")),
         ("cdf_watermarks", "db.one", RocksDBCodec.encodeLongBE(7L)),
         ("consumed", "staging-path", Array.emptyByteArray),
-        ("dependent_mvs", "db.consumer", Array.emptyByteArray)
+        ("dependent_mvs", "db.consumer", Array.emptyByteArray),
+        ("staging", "staging-record", RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8("insert"))))
       )
       db.withBatch { batch =>
         values.foreach { case (family, key, value) => db.put(batch, family, RocksDBCodec.utf8(key), value) }

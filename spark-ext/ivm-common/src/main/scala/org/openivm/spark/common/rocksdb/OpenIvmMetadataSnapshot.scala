@@ -13,7 +13,7 @@ object OpenIvmMetadataSnapshot {
   private val mapper = new ObjectMapper()
 
   private[rocksdb] val ColumnFamilies =
-    Vector("meta", "properties", "cdf_watermarks", "consumed", "dependent_mvs")
+    Vector("meta", "properties", "cdf_watermarks", "consumed", "dependent_mvs", "staging")
 
   private[rocksdb] final case class Entry(keyBase64: String, valueBase64: String)
   private[rocksdb] final case class Captured(
