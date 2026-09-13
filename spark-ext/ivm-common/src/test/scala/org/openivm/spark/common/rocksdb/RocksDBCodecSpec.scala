@@ -38,12 +38,14 @@ class RocksDBCodecSpec extends AnyFunSpec with Matchers {
     it("keeps long qualified Fabric identities distinct without case-folding, truncation or namespace collisions") {
       val root =
         "delta.abfss://11111111-1111-1111-1111-111111111111@test-onelake.dfs.fabric.microsoft.com/" +
-          "22222222-2222-2222-2222-222222222222/Tables/openivm_debug_fabric_12345678/"
-      val source = root + "analytics_instance_machine_reported_cores_snapshot__ivm_data"
+          "22222222-2222-2222-2222-222222222222/Tables/synthetic_schema_012345678901/"
+      val source = root + "synthetic_" + ("r" * 50) + "__ivm_data"
+      RocksDBCodec.utf8(source.stripPrefix("delta.")).length shouldBe 227
+      legacy(source.stripPrefix("delta.")).length shouldBe 303
       val names = Seq(
         source,
         source.replace("22222222", "33333333"),
-        source.replace("analytics", "Analytics"),
+        source.replace("synthetic_r", "Synthetic_r"),
         source + "_other",
         root + ("same_prefix_" * 30) + "one",
         root + ("same_prefix_" * 30) + "two"

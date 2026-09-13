@@ -129,7 +129,7 @@ class FabricPinAliasObservationSpec extends AnyFunSpec with Matchers with Before
   describe("Fabric V1 source observation") {
     it("publishes bounded shards for Fabric path-backed and public-projection source plans") {
       val backing    = s"$friendlyDatabase.fpa_bounded_backing"
-      val publicName = "fpa_analytics_instance_machine_reported_cores_public_projection"
+      val publicName = "synthetic_" + ("r" * 50)
       val public     = s"$friendlyDatabase.$publicName"
       spark.sql(s"CREATE DATABASE IF NOT EXISTS $friendlyDatabase")
       spark.sql(s"CREATE TABLE $backing(id INT, maintenance_count BIGINT) USING DELTA")
@@ -138,8 +138,10 @@ class FabricPinAliasObservationSpec extends AnyFunSpec with Matchers with Before
       )
       val namespace =
         "abfss://11111111-1111-1111-1111-111111111111@test-onelake.dfs.fabric.microsoft.com/" +
-          "22222222-2222-2222-2222-222222222222/Tables/openivm_debug_fabric_12345678/"
-      val uri            = namespace + "analytics_instance_machine_reported_cores_snapshot__ivm_data"
+          "22222222-2222-2222-2222-222222222222/Tables/synthetic_schema_012345678901/"
+      val uri = namespace + publicName + "__ivm_data"
+      publicName.length shouldBe 60
+      RocksDBCodec.utf8(uri).length shouldBe 227
       val physicalSchema = spark.table(backing).schema
       val table = new Table {
         override def name(): String       = uri

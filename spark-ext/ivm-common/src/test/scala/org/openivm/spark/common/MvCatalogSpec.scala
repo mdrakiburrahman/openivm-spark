@@ -105,8 +105,8 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
     it("uses bounded Fabric shard paths throughout metadata, backlinks, CDF, staging and reopen/drop") {
       val root =
         "delta.abfss://11111111-1111-1111-1111-111111111111@test-onelake.dfs.fabric.microsoft.com/" +
-          "22222222-2222-2222-2222-222222222222/Tables/openivm_debug_fabric_12345678/"
-      val source      = root + "analytics_instance_machine_reported_cores_snapshot__ivm_data"
+          "22222222-2222-2222-2222-222222222222/Tables/synthetic_schema_012345678901/"
+      val source      = root + "synthetic_" + ("r" * 50) + "__ivm_data"
       val otherSource = source.replace("22222222", "33333333")
       val short       = sampleMeta("bounded_fabric", Seq(source, otherSource))
       // This first upsert exercises the observed source-dependency opening
@@ -114,7 +114,7 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       MvCatalog.upsert(spark, short)
       val long = sampleMeta("bounded_" + ("m" * 190), Seq(source)).copy(
         properties = Map(MvMetadata.BackingDataTableKey -> "true"),
-        location = root.stripPrefix("delta.") + "public_projection__ivm_data"
+        location = root.stripPrefix("delta.") + "synthetic_" + ("v" * 50) + "__ivm_data"
       )
       MvCatalog.upsert(spark, long)
       val longName  = s"${long.name.database.get}.${long.name.table}"
