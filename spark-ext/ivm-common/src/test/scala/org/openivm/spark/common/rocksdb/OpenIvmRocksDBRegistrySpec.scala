@@ -1,5 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, OpenIvmStatePaths}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -14,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import java.util.UUID
+import java.util.Base64
 
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.JavaConverters._
@@ -30,6 +32,29 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
 
   private val sparks = ArrayBuffer.empty[SparkSession]
   private val dirs   = ArrayBuffer.empty[File]
+  private val json   = new ObjectMapper()
+
+  private def snapshot(spark: SparkSession, path: String, timeoutMs: Long = 1000L): JsonNode =
+    json.readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, path, 8192, 8L * 1024 * 1024, timeoutMs))
+
+  private def capturedRows(snapshot: JsonNode, family: String): Map[String, Array[Byte]] =
+    snapshot
+      .path("column_families")
+      .path(family)
+      .elements()
+      .asScala
+      .map { row =>
+        RocksDBCodec.fromUtf8(Base64.getDecoder.decode(row.path("key_base64").asText())) ->
+          Base64.getDecoder.decode(row.path("value_base64").asText())
+      }
+      .toMap
+
+  private def assertUnavailable(snapshot: JsonNode, reason: String): Unit = {
+    snapshot.path("available").asBoolean() shouldBe false
+    snapshot.path("reason").asText() shouldBe reason
+    snapshot.has("version") shouldBe false
+    snapshot.has("column_families") shouldBe false
+  }
 
   override def afterEach(): Unit = {
     OpenIvmRocksDBRegistry.clearAfterSlotSelectionHookForTesting()
@@ -159,6 +184,229 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     )
 
   describe("OpenIvmRocksDBRegistry") {
+    it("snapshot API reports absent paths without opening, restoring, or creating slots and files") {
+      val spark  = newSpark("registry-snapshot-absent")
+      val absent = new File(newDir("snapshot-absent-parent"), "not-created")
+      val before = OpenIvmRocksDBRegistry.handleSnapshotForTesting
+      assertUnavailable(snapshot(spark, absent.getAbsolutePath), "absent")
+      assertUnavailable(snapshot(spark, absent.toURI.toString), "absent")
+      absent.exists() shouldBe false
+      OpenIvmRocksDBRegistry.handleSnapshotForTesting shouldBe before
+    }
+
+    it("snapshot API returns immutable versioned metadata and binary values without writes or native reopen") {
+      val spark = newSpark("registry-snapshot-values")
+      val dir   = newDir("snapshot-values")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, OpenIvmMetadataSnapshot.ColumnFamilies)
+      val query = "(\nSELECT id FROM sample_source VERSION AS OF 7\n)"
+      val sourceTables = RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8("db.one"), RocksDBCodec.utf8("db.two")))
+      val values = Seq(
+        ("meta", "query_sql", RocksDBCodec.utf8(query)),
+        ("meta", "source_tables", sourceTables),
+        ("properties", "_ivm_watermark:db.one", RocksDBCodec.utf8("v:7")),
+        ("cdf_watermarks", "db.one", RocksDBCodec.encodeLongBE(7L)),
+        ("consumed", "staging-path", Array.emptyByteArray),
+        ("dependent_mvs", "db.consumer", Array.emptyByteArray)
+      )
+      db.withBatch { batch =>
+        values.foreach { case (family, key, value) => db.put(batch, family, RocksDBCodec.utf8(key), value) }
+      }
+      val version = db.currentVersion
+      db.markDirtyForTesting(Seq("meta"))
+      db.setAfterRawOpenHookForTesting(() => fail("snapshot reopened RocksDB"))
+      db.setBeforeFlushHookForTesting(_ => fail("snapshot flushed RocksDB"))
+      db.setBeforeSyncWalHookForTesting(() => fail("snapshot synced the WAL"))
+      db.setAfterManifestHookForTesting(() => fail("snapshot wrote a manifest"))
+      val captured =
+        try {
+          // Verify the exact static Java entry point Py4J calls, not Scala's MODULE$ implementation.
+          val method = Class
+            .forName("org.openivm.spark.common.rocksdb.OpenIvmMetadataSnapshot")
+            .getMethod("captureIfOpenJson", classOf[SparkSession], classOf[String])
+          val encoded = method.invoke(null, spark, dir.getAbsolutePath).asInstanceOf[String]
+          val result  = json.readTree(encoded)
+          result.path("schema_id").asText() shouldBe "openivm.metadata-snapshot"
+          result.path("schema_version").asInt() shouldBe 1
+          result.path("available").asBoolean() shouldBe true
+          result.path("version").asLong() shouldBe version
+          result.path("entry_count").asInt() shouldBe values.size
+          result.path("byte_count").asLong() shouldBe values.map { case (_, key, value) =>
+            RocksDBCodec.utf8(key).length.toLong + value.length
+          }.sum
+          result.path("absent_column_families").size() shouldBe 0
+          result.path("column_families").has("__openivm_txn") shouldBe false
+          values.foreach { case (family, key, value) =>
+            capturedRows(result, family)(key).toSeq shouldBe value.toSeq
+          }
+          db.currentVersion shouldBe version
+          encoded
+        } finally {
+          db.setAfterRawOpenHookForTesting(() => ())
+          db.setBeforeFlushHookForTesting(_ => ())
+          db.setBeforeSyncWalHookForTesting(() => ())
+          db.setAfterManifestHookForTesting(() => ())
+        }
+      db.withBatch(batch =>
+        db.put(batch, "properties", RocksDBCodec.utf8("_ivm_watermark:db.one"), RocksDBCodec.utf8("v:8"))
+      )
+      OpenIvmRocksDBRegistry.close(dir.getAbsolutePath)
+      RocksDBCodec.fromUtf8(capturedRows(json.readTree(captured), "meta")("query_sql")) shouldBe query
+      RocksDBCodec.fromUtf8(capturedRows(json.readTree(captured), "properties")("_ivm_watermark:db.one")) shouldBe "v:7"
+      assertUnavailable(snapshot(spark, dir.getAbsolutePath), "absent")
+    }
+
+    it("snapshot API distinguishes missing families and rejects limits without returning partial metadata") {
+      val spark = newSpark("registry-snapshot-bounds")
+      val dir   = newDir("snapshot-bounds")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      db.withBatch { batch =>
+        db.put(batch, "meta", RocksDBCodec.utf8("a"), RocksDBCodec.utf8("one"))
+        db.put(batch, "meta", RocksDBCodec.utf8("b"), new Array[Byte](8192))
+      }
+      val before   = db.currentVersion
+      val complete = snapshot(spark, dir.getAbsolutePath)
+      complete.path("available").asBoolean() shouldBe true
+      complete.path("absent_column_families").elements().asScala.map(_.asText()).toSet shouldBe
+        OpenIvmMetadataSnapshot.ColumnFamilies.filterNot(_ == "meta").toSet
+      val countLimited =
+        json.readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, dir.getAbsolutePath, 1, 16384L, 1000L))
+      val byteLimited =
+        json.readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, dir.getAbsolutePath, 10, 4L, 1000L))
+      assertUnavailable(countLimited, "limit_exceeded")
+      assertUnavailable(byteLimited, "limit_exceeded")
+      db.currentVersion shouldBe before
+      snapshot(spark, dir.getAbsolutePath).path("available").asBoolean() shouldBe true
+      an[IllegalArgumentException] should be thrownBy
+        OpenIvmMetadataSnapshot.captureIfOpenJson(spark, dir.getAbsolutePath, 0, 1024L, 1000L)
+      an[IllegalArgumentException] should be thrownBy
+        OpenIvmMetadataSnapshot.captureIfOpenJson(spark, dir.getAbsolutePath, 10, 16777217L, 1000L)
+    }
+
+    it("snapshot API refuses directly closed and foreign-owned handles without adopting or reopening them") {
+      val spark = newSpark("registry-snapshot-ownership")
+      val dir   = newDir("snapshot-ownership")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      val appId = spark.sparkContext.applicationId
+      OpenIvmRocksDBRegistry.overrideAppIdsForTesting(dir.getAbsolutePath, Set("other-app"))
+      assertUnavailable(snapshot(spark, dir.getAbsolutePath), "not_owned")
+      OpenIvmRocksDBRegistry.closeAllForSparkContext(appId)
+      db.currentVersion shouldBe 0L
+      OpenIvmRocksDBRegistry.overrideAppIdsForTesting(dir.getAbsolutePath, Set(appId))
+      db.close()
+      db.setAfterRawOpenHookForTesting(() => fail("snapshot reopened a directly closed handle"))
+      assertUnavailable(snapshot(spark, dir.getAbsolutePath), "not_open")
+      spark.stop()
+      assertUnavailable(snapshot(spark, dir.getAbsolutePath), "application_stopped")
+    }
+
+    it("snapshot API never opens a multi-process wrapper, even inside an existing native session") {
+      val spark = newSpark("registry-snapshot-multi-process", Seq("spark.openivm.rocksdb.multiProcess" -> "true"))
+      val dir   = newDir("snapshot-multi-process")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      db.conf.multiProcess shouldBe true
+      val observer = Thread.currentThread()
+      db.setAfterRawOpenHookForTesting(() => {
+        if (Thread.currentThread() eq observer) fail("snapshot opened an idle multi-process wrapper")
+      })
+      assertUnavailable(snapshot(spark, dir.getAbsolutePath), "not_open")
+      db.setAfterRawOpenHookForTesting(() => ())
+      db.withSession {
+        assertUnavailable(snapshot(spark, dir.getAbsolutePath), "multi_process")
+      }
+    }
+
+    it("snapshot API does not expose a reentrant in-progress logical write") {
+      val spark = newSpark("registry-snapshot-writing")
+      val dir   = newDir("snapshot-writing")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      db.withBatch { batch =>
+        db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("value"))
+        assertUnavailable(snapshot(spark, dir.getAbsolutePath), "write_in_progress")
+      }
+      snapshot(spark, dir.getAbsolutePath).path("version").asLong() shouldBe 1L
+    }
+
+    it("snapshot API leases exclude registry close/delete and direct close but never serialize unrelated paths") {
+      val spark = newSpark("registry-snapshot-lifetime")
+      val other = newDir("snapshot-independent")
+      OpenIvmRocksDBRegistry.getOrOpen(spark, other.getAbsolutePath, Seq("meta"))
+      Seq(false, true).foreach { directClose =>
+        val dir = newDir(s"snapshot-close-$directClose")
+        val db  = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+        db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("value")))
+        val leased       = new CountDownLatch(1)
+        val release      = new CountDownLatch(1)
+        val closeStarted = new CountDownLatch(1)
+        val closed       = new CountDownLatch(1)
+        db.setBeforeMetadataSnapshotHookForTesting(() => {
+          leased.countDown()
+          awaitLatch(release, "snapshot lease release")
+        })
+        withPool(3) { ec =>
+          val inspecting = Future(snapshot(spark, dir.getAbsolutePath, 5000L))(ec)
+          try {
+            awaitLatch(leased, "snapshot native lifetime lease")
+            assertUnavailable(snapshot(spark, dir.getAbsolutePath, 50L), "busy")
+            val closing = Future {
+              closeStarted.countDown()
+              if (directClose) db.close()
+              else OpenIvmRocksDBRegistry.closeAndDelete(dir.getAbsolutePath)(path => deleteRecursively(new File(path)))
+              closed.countDown()
+            }(ec)
+            awaitLatch(closeStarted, "close attempted during inspection")
+            closed.await(150L, TimeUnit.MILLISECONDS) shouldBe false
+            val independent = Future(snapshot(spark, other.getAbsolutePath))(ec)
+            Await.result(independent, 2.seconds).path("available").asBoolean() shouldBe true
+            release.countDown()
+            val result = Await.result(inspecting, RegistryRaceTimeout)
+            Await.result(closing, RegistryRaceTimeout)
+            result.path("available").asBoolean() shouldBe true
+            result.path("version").asLong() shouldBe 1L
+            RocksDBCodec.fromUtf8(capturedRows(result, "meta")("key")) shouldBe "value"
+            assertUnavailable(snapshot(spark, dir.getAbsolutePath), if (directClose) "not_open" else "absent")
+            if (!directClose) dir.exists() shouldBe false
+          } finally {
+            release.countDown()
+            db.setBeforeMetadataSnapshotHookForTesting(() => ())
+          }
+        }
+      }
+    }
+
+    it("snapshot API has a bounded wait for an occupied native session and releases its registry lease") {
+      val spark   = newSpark("registry-snapshot-busy")
+      val dir     = newDir("snapshot-busy")
+      val db      = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      withPool(2) { ec =>
+        val writing = Future {
+          db.withSession {
+            entered.countDown()
+            awaitLatch(release, "busy session release")
+          }
+        }(ec)
+        try {
+          awaitLatch(entered, "busy native session")
+          val reading = Future(snapshot(spark, dir.getAbsolutePath, 50L))(ec)
+          assertUnavailable(Await.result(reading, 2.seconds), "busy")
+        } finally release.countDown()
+        Await.result(writing, RegistryRaceTimeout)
+      }
+      snapshot(spark, dir.getAbsolutePath).path("available").asBoolean() shouldBe true
+      OpenIvmRocksDBRegistry.close(dir.getAbsolutePath)
+    }
+
+    it("snapshot API returns no partial metadata when the scan budget expires") {
+      val spark = newSpark("registry-snapshot-timeout")
+      val dir   = newDir("snapshot-timeout")
+      val db    = OpenIvmRocksDBRegistry.getOrOpen(spark, dir.getAbsolutePath, Seq("meta"))
+      db.setBeforeMetadataSnapshotHookForTesting(() => Thread.sleep(40L))
+      try assertUnavailable(snapshot(spark, dir.getAbsolutePath, 5L), "timeout")
+      finally db.setBeforeMetadataSnapshotHookForTesting(() => ())
+      snapshot(spark, dir.getAbsolutePath).path("available").asBoolean() shouldBe true
+    }
+
     it("returns the same instance for repeated opens of the same path") {
       val spark = newSpark("registry-same-instance")
       val dbDir = newDir("same-instance-db")

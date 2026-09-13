@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory
 
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.locks.ReentrantLock
 import scala.collection.JavaConverters._
@@ -164,6 +165,19 @@ object OpenIvmRocksDBRegistry {
       finally lock.unlock()
     }
 
+    def captureMetadataIfOpen(
+        appId: String,
+        budget: OpenIvmMetadataSnapshot.Budget
+    ): Either[String, OpenIvmMetadataSnapshot.Captured] = {
+      if (!lock.tryLock(budget.remainingNanos, TimeUnit.NANOSECONDS))
+        return Left("busy")
+      try {
+        if (retired || entry == null) Left("not_open")
+        else if (!entry.appIds.contains(appId)) Left("not_owned")
+        else entry.db.captureMetadataIfOpen(budget)
+      } finally lock.unlock()
+    }
+
     /** Close any live entry, then run `afterClose` (a caller-supplied filesystem
       * delete) — all while holding `lock`, so no concurrent [[getOrOpen]] can
       * install a handle on this path between the close and the delete (the
@@ -270,6 +284,28 @@ object OpenIvmRocksDBRegistry {
       pruneSlotIfEmpty(canonicalPath)
     }
     OpenIvmMaintenanceCoordinator.shutdownIfIdle()
+  }
+
+  /** Lookup only: no slot creation, registry ownership changes, state restore,
+    * native open, migration, or maintenance registration. The selected slot is
+    * leased until every value has been copied, excluding close/delete/eviction;
+    * the DB session additionally excludes direct close and concurrent writes.
+    * A stale retired slot reports unavailable rather than reopening or retrying.
+    */
+  private[rocksdb] def captureMetadataIfOpen(
+      spark: SparkSession,
+      dbPath: String,
+      budget: OpenIvmMetadataSnapshot.Budget
+  ): (String, Either[String, OpenIvmMetadataSnapshot.Captured]) = {
+    val canonicalPath = canonicalLocalPath(dbPath)
+    val result =
+      if (spark.sparkContext.isStopped) Left("application_stopped")
+      else {
+        val slot = entries.get(canonicalPath)
+        if (slot == null) Left("absent")
+        else slot.captureMetadataIfOpen(spark.sparkContext.applicationId, budget)
+      }
+    canonicalPath -> result
   }
 
   /** Close the RocksDB at `dbPath` (if open) and run `delete` under the SAME

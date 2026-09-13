@@ -13,8 +13,11 @@ import org.rocksdb.{
 }
 
 import java.nio.channels.{FileChannel, FileLock, OverlappingFileLockException}
+import java.nio.ByteBuffer
 import java.nio.file.{Files, Paths, StandardCopyOption, StandardOpenOption}
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -100,12 +103,13 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   @volatile private var dirtySinceFlush                                      = false
   @volatile private var dirtyColumnFamilies                                  = Set.empty[String]
 
-  private val compactCalls                                             = new AtomicLong(0L)
-  @volatile private var beforeFlushHookForTesting: Seq[String] => Unit = (_: Seq[String]) => ()
-  @volatile private var beforeSyncWalHookForTesting: () => Unit        = () => ()
-  @volatile private var afterManifestHookForTesting: () => Unit        = () => ()
-  @volatile private var beforeCloseHookForTesting: () => Unit          = () => ()
-  @volatile private var afterRawOpenHookForTesting: () => Unit         = () => ()
+  private val compactCalls                                               = new AtomicLong(0L)
+  @volatile private var beforeFlushHookForTesting: Seq[String] => Unit   = (_: Seq[String]) => ()
+  @volatile private var beforeSyncWalHookForTesting: () => Unit          = () => ()
+  @volatile private var afterManifestHookForTesting: () => Unit          = () => ()
+  @volatile private var beforeCloseHookForTesting: () => Unit            = () => ()
+  @volatile private var afterRawOpenHookForTesting: () => Unit           = () => ()
+  @volatile private var beforeMetadataSnapshotHookForTesting: () => Unit = () => ()
 
   private def cf(name: String): ColumnFamilyHandle =
     columnFamilyHandles.getOrElse(
@@ -531,6 +535,9 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private[common] def setAfterRawOpenHookForTesting(hook: () => Unit): Unit =
     afterRawOpenHookForTesting = hook
 
+  private[rocksdb] def setBeforeMetadataSnapshotHookForTesting(hook: () => Unit): Unit =
+    beforeMetadataSnapshotHookForTesting = hook
+
   private[rocksdb] def markDirtyForTesting(columnFamilies: Seq[String]): Unit = withWriteLock {
     dirtySinceFlush = true
     dirtyColumnFamilies = dirtyColumnFamilies ++ columnFamilies
@@ -907,6 +914,60 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * RocksDB shard in multi-process mode.
     */
   def withSession[A](body: => A): A = withNativeHandle("session")(body)
+
+  /** The write/session mutex protects both lifetime and cross-family coherence.
+    * Check the cached handle under that mutex BEFORE entering withSession:
+    * an ordinary session alone is allowed to open or recover an unloaded DB.
+    */
+  private[rocksdb] def captureMetadataIfOpen(
+      budget: OpenIvmMetadataSnapshot.Budget
+  ): Either[String, OpenIvmMetadataSnapshot.Captured] = {
+    import OpenIvmMetadataSnapshot.{Captured, Entry, Unavailable}
+    if (!writeMutex.tryLock(budget.remainingNanos, TimeUnit.NANOSECONDS))
+      return Left("busy")
+    try {
+      if (closed || dbHandle == null) Left("not_open")
+      else if (conf.multiProcess) Left("multi_process")
+      else if (activeBatchStats.get() != null) Left("write_in_progress")
+      else {
+        try {
+          Right(withSession {
+            budget.checkTime()
+            beforeMetadataSnapshotHookForTesting()
+            val encoder   = Base64.getEncoder
+            val sizeProbe = ByteBuffer.allocate(0)
+            val families = OpenIvmMetadataSnapshot.ColumnFamilies.flatMap { name =>
+              columnFamilyHandles.get(name).map { handle =>
+                budget.checkTime()
+                val iterator = dbHandle.newIterator(handle)
+                try {
+                  val rows = Vector.newBuilder[Entry]
+                  iterator.seekToFirst()
+                  while (iterator.isValid) {
+                    // The ByteBuffer overload reports the full length even when
+                    // its buffer is empty, so oversized values are never copied.
+                    val bytes = iterator.key(sizeProbe).toLong + iterator.value(sizeProbe).toLong
+                    budget.addEntry(bytes)
+                    rows += Entry(
+                      encoder.encodeToString(iterator.key()),
+                      encoder.encodeToString(iterator.value())
+                    )
+                    iterator.next()
+                  }
+                  iterator.status()
+                  name -> rows.result()
+                } finally iterator.close()
+              }
+            }.toMap
+            budget.checkTime()
+            Captured(versionValue, families, budget.entryCount, budget.byteCount)
+          })
+        } catch {
+          case Unavailable(reason) => Left(reason)
+        }
+      }
+    } finally writeMutex.unlock()
+  }
 
   def get(columnFamily: String, key: Array[Byte]): Option[Array[Byte]] = withNativeHandle("get") {
     val value = Option(dbHandle.get(cf(columnFamily), key))

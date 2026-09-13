@@ -92,6 +92,36 @@ Source:
 
 For a backing-table layout, CREATE also rejects an existing public TABLE or VIEW before the data write. Public VIEW publication uses `CREATE VIEW`, never `CREATE OR REPLACE VIEW`, so an object appearing after that preflight cannot be overwritten. Failure cleanup removes a public VIEW only when it matches this operation's captured catalog definition and no MV metadata was published; backing-table cleanup still requires path, Delta identity, and ownership-marker proof.
 
+### 1.4a Existing-handle-only metadata observation
+
+`OpenIvmMetadataSnapshot.captureIfOpenJson` is the supported read-only observer API. Do not retain `liveHandleForTesting` results: they do not carry a lifetime lease. Do not substitute `MvCatalog.lookup`, CDF catalog reads, or ordinary `withSession` calls; those paths may open, restore, or migrate state.
+
+```python
+import base64
+import json
+
+captured = json.loads(
+    spark._jvm.org.openivm.spark.common.rocksdb.OpenIvmMetadataSnapshot.captureIfOpenJson(
+        spark._jsparkSession, db_path, 8192, 8 * 1024 * 1024, 1000
+    )
+)
+if not captured["available"]:
+    raise RuntimeError("Native metadata unavailable: " + captured["reason"])
+families = {
+    family: {
+        base64.b64decode(row["key_base64"]): base64.b64decode(row["value_base64"])
+        for row in rows
+    }
+    for family, rows in captured["column_families"].items()
+}
+```
+
+`db_path` is the already-known absolute local shard path or its equivalent `file:` URI. The API does not discover shards, create directories/slots, open native databases, restore state, migrate keys, flush, or write. It requires an existing cached single-process handle owned by the supplied Spark application. Registry close/delete/eviction and direct DB close cannot invalidate the handle during capture: the per-path registry lease and native session mutex are held until all values and the logical `version` have been copied. Serialization occurs after releasing those leases; only an immutable JSON string leaves the API.
+
+Schema `openivm.metadata-snapshot`, version `1`, returns `available`, canonical `path`, and either `reason` or `version`, `entry_count`, `byte_count`, `column_families`, and `absent_column_families`. Only existing `meta`, `properties`, `cdf_watermarks`, `consumed`, and `dependent_mvs` families are included. Base64 preserves exact binary values, including composite `source_tables` metadata and big-endian CDF version longs; no query text is normalized. A missing family is explicitly listed, not fabricated as an empty family. MV and source-dependency shards are separate: each call is coherent for one shard, not an atomic cross-shard graph snapshot.
+
+The final arguments bound total records, raw key-plus-value bytes, and lock/scan time. Defaults for the two-argument overload are 8192 records, 8 MiB, and 1000 ms; hard maxima are 100000 records, 16 MiB, and 5000 ms. Value lengths are checked before copying oversized values. Time is checked between native reads, not by interrupting an in-flight JNI operation. `absent`, `not_open`, `not_owned`, `application_stopped`, `multi_process`, `write_in_progress`, `busy`, `timeout`, and `limit_exceeded` are unavailable outcomes with **no partial metadata or version**. Invalid arguments and actual native read failures raise errors. Unavailable is not permission to open a handle or infer an empty catalog.
+
 ### 1.5 Discovering source tables
 
 CREATE calls `collectSourceSchemas(spark, originalQueryText)`.
