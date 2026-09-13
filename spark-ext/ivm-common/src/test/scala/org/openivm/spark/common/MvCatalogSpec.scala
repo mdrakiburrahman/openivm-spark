@@ -1,9 +1,10 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.rocksdb.OpenIvmRocksDBRegistry
+import org.openivm.spark.common.rocksdb.{OpenIvmMetadataSnapshot, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
@@ -15,6 +16,7 @@ import java.sql.Timestamp
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CyclicBarrier
 import java.util.UUID
+import java.util.Base64
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -100,6 +102,100 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
   // Test 2: upsert insert + lookup round-trip
   // ---------------------------------------------------------------------------
   describe("MvCatalog.upsert + lookup") {
+    it("uses bounded Fabric shard paths throughout metadata, backlinks, CDF, staging and reopen/drop") {
+      val root =
+        "delta.abfss://11111111-1111-1111-1111-111111111111@test-onelake.dfs.fabric.microsoft.com/" +
+          "22222222-2222-2222-2222-222222222222/Tables/openivm_debug_fabric_12345678/"
+      val source      = root + "analytics_instance_machine_reported_cores_snapshot__ivm_data"
+      val otherSource = source.replace("22222222", "33333333")
+      val short       = sampleMeta("bounded_fabric", Seq(source, otherSource))
+      // This first upsert exercises the observed source-dependency opening
+      // failure before testing an independently oversized MV name.
+      MvCatalog.upsert(spark, short)
+      val long = sampleMeta("bounded_" + ("m" * 190), Seq(source)).copy(
+        properties = Map(MvMetadata.BackingDataTableKey -> "true"),
+        location = root.stripPrefix("delta.") + "public_projection__ivm_data"
+      )
+      MvCatalog.upsert(spark, long)
+      val longName  = s"${long.name.database.get}.${long.name.table}"
+      val shortName = s"${short.name.database.get}.${short.name.table}"
+
+      val dependencyPath      = OpenIvmStatePaths.sourceDependencyDbPath(spark, source)
+      val otherDependencyPath = OpenIvmStatePaths.sourceDependencyDbPath(spark, otherSource)
+      val mvPath              = OpenIvmStatePaths.perMvDbPath(spark, longName)
+      val stagingPath         = OpenIvmStatePaths.baseTableDbPath(spark, source)
+      dependencyPath should not be otherDependencyPath
+      Seq(dependencyPath, otherDependencyPath, mvPath, stagingPath).foreach { path =>
+        val segment = Paths.get(path).getParent.getFileName.toString
+        segment should fullyMatch regex "sha256\\.[0-9a-f]{64}"
+        segment.length shouldBe 71
+      }
+      MvCatalog.lookup(spark, long.name) shouldBe Some(long)
+      MvCatalog.lookup(spark, short.name) shouldBe Some(short)
+      MvCatalog.list(spark).map(_.name).toSet shouldBe Set(short.name, long.name)
+      MvCatalog.viewsForSource(spark, source).map(_.name).toSet shouldBe Set(short.name, long.name)
+      MvCatalog.viewsForSource(spark, otherSource).map(_.name).toSet shouldBe Set(short.name)
+      MvCatalog.lookup(spark, long.name).get.usesBackingDataTable shouldBe true
+
+      CdfWatermarkCatalog.put(spark, longName, source, 7L)
+      CdfWatermarkCatalog.putAll(spark, shortName, Map(source -> 11L, otherSource -> 13L))
+      val delta =
+        StagingDelta(source, "INSERT", s"$warehouseDir/staged-bounded-fabric", new Timestamp(1700000000000L), Seq.empty)
+      StagingCatalog.record(spark, delta)
+      StagingCatalog.collectFor(spark, longName, Seq(source)).map(_.stagingPath) shouldBe Seq(delta.stagingPath)
+      StagingCatalog.markConsumed(spark, longName, Seq(delta.stagingPath))
+      StagingCatalog.collectFor(spark, longName, Seq(source)) shouldBe empty
+
+      OpenIvmRocksDBRegistry.closeAllForSparkContext(spark.sparkContext.applicationId)
+      MvCatalog.lookup(spark, long.name) shouldBe Some(long)
+      CdfWatermarkCatalog.get(spark, longName, source) shouldBe Some(7L)
+      CdfWatermarkCatalog.getAll(spark, shortName, Seq(source, otherSource)) shouldBe Map(
+        source      -> 11L,
+        otherSource -> 13L
+      )
+      StagingCatalog.collectFor(spark, longName, Seq(source)) shouldBe empty
+      StagingCatalog.collectFor(spark, shortName, Seq(source)).map(_.baseTable) shouldBe Seq(source)
+      val snapshot = new com.fasterxml.jackson.databind.ObjectMapper()
+        .readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, mvPath))
+      snapshot.path("available").asBoolean() shouldBe true
+      snapshot.path("column_families").has("consumed") shouldBe true
+
+      val updated = long.copy(sourceTables = Seq(otherSource), properties = long.properties + ("revision" -> "two"))
+      MvCatalog.upsert(spark, updated)
+      MvCatalog.advance(spark, long.name, 42L)
+      MvCatalog.lookup(spark, long.name) shouldBe Some(updated.copy(lastVersion = 42L))
+      MvCatalog.viewsForSource(spark, source).map(_.name).toSet shouldBe Set(short.name)
+      MvCatalog.viewsForSource(spark, otherSource).map(_.name).toSet shouldBe Set(short.name, long.name)
+      CdfWatermarkCatalog.removeForBaseTable(spark, source)
+      CdfWatermarkCatalog.get(spark, shortName, source) shouldBe None
+      CdfWatermarkCatalog.get(spark, shortName, otherSource) shouldBe Some(13L)
+      StagingCatalog.removeForBaseTable(spark, source)
+      Files.exists(Paths.get(stagingPath)) shouldBe false
+
+      CdfWatermarkCatalog.removeForView(spark, longName)
+      MvCatalog.remove(spark, long.name)
+      MvCatalog.lookup(spark, long.name) shouldBe None
+      Files.exists(Paths.get(mvPath)) shouldBe false
+      MvCatalog.viewsForSource(spark, otherSource).map(_.name).toSet shouldBe Set(short.name)
+      MvCatalog.lookup(spark, short.name) shouldBe Some(short)
+    }
+
+    it("keeps valid 255-byte legacy shard locations readable without renaming state") {
+      val serialized = "v" * 191
+      val legacy     = Base64.getUrlEncoder.withoutPadding.encodeToString(RocksDBCodec.utf8(serialized))
+      legacy.length shouldBe 255
+      val expectedPath = Paths.get(warehouseDir, "_openivm", "mvs", legacy, "rocksdb").toString
+      val metadata     = sampleMeta("legacy_bounded").copy(name = TableIdentifier(serialized))
+      MvCatalog.upsert(spark, metadata)
+      OpenIvmStatePaths.perMvDbPath(spark, serialized) shouldBe expectedPath
+      Files.exists(Paths.get(expectedPath, "CURRENT")) shouldBe true
+      OpenIvmRocksDBRegistry.closeAllForSparkContext(spark.sparkContext.applicationId)
+      MvCatalog.lookup(spark, metadata.name) shouldBe Some(metadata)
+      MvCatalog.viewsForSource(spark, "orders").map(_.name) should contain(metadata.name)
+      MvCatalog.remove(spark, metadata.name)
+      Files.exists(Paths.get(expectedPath)) shouldBe false
+    }
+
     it("preserves every field including properties map and source_tables order") {
       val original = sampleMeta("rt", sources = Seq("orders", "products", "customers"))
       MvCatalog.upsert(spark, original)

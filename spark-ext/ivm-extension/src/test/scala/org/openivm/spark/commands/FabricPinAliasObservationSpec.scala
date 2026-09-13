@@ -3,19 +3,24 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, View}
+import org.apache.spark.sql.connector.catalog.{Identifier, Table, TableCapability}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common.{
   CdfWatermarkCatalog,
   ChangeWatermark,
   FeatureGate,
   MvCatalog,
   MvMetadata,
+  MvProjectionSource,
   RefreshTypeCode,
   StagingCatalog,
   TimeTravelPinStatus
 }
+import org.openivm.spark.common.rocksdb.{OpenIvmMetadataSnapshot, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -122,6 +127,76 @@ class FabricPinAliasObservationSpec extends AnyFunSpec with Matchers with Before
   }
 
   describe("Fabric V1 source observation") {
+    it("publishes bounded shards for Fabric path-backed and public-projection source plans") {
+      val backing    = s"$friendlyDatabase.fpa_bounded_backing"
+      val publicName = "fpa_analytics_instance_machine_reported_cores_public_projection"
+      val public     = s"$friendlyDatabase.$publicName"
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $friendlyDatabase")
+      spark.sql(s"CREATE TABLE $backing(id INT, maintenance_count BIGINT) USING DELTA")
+      spark.sql(
+        s"CREATE VIEW $public TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') AS SELECT id FROM $backing"
+      )
+      val namespace =
+        "abfss://11111111-1111-1111-1111-111111111111@test-onelake.dfs.fabric.microsoft.com/" +
+          "22222222-2222-2222-2222-222222222222/Tables/openivm_debug_fabric_12345678/"
+      val uri            = namespace + "analytics_instance_machine_reported_cores_snapshot__ivm_data"
+      val physicalSchema = spark.table(backing).schema
+      val table = new Table {
+        override def name(): String       = uri
+        override def schema(): StructType = physicalSchema
+        override def capabilities(): java.util.Set[TableCapability] =
+          java.util.Collections.emptySet[TableCapability]()
+      }
+      val pathBacked = DataSourceV2Relation.create(table, None, Some(Identifier.of(Array("delta"), uri)))
+      val publicPlan = spark.table(public).queryExecution.analyzed
+      val encodedPublic = publicPlan.transformDown {
+        case view: View if MvProjectionSource.isProjection(view) =>
+          view.copy(desc = view.desc.copy(identifier = view.desc.identifier.copy(database = Some(s"delta.$namespace"))))
+      }
+      val cases = Seq(
+        (pathBacked, s"delta.$uri", Seq("id", "maintenance_count"), true),
+        (encodedPublic, s"delta.$namespace.$publicName", Seq("id"), true),
+        (publicPlan, public, Seq("id"), false)
+      )
+      cases.zipWithIndex.foreach { case ((plan, source, columns, hashed), index) =>
+        val (sources, schemas, _, _) = MvCommandHelper.collectSourceSchemas(plan)
+        sources shouldBe Seq(source)
+        schemas(source).fieldNames.toSeq shouldBe columns
+        val segment = RocksDBCodec.safePathSegment(source)
+        segment.startsWith("sha256.") shouldBe hashed
+        segment.length should be <= 255
+        val metadata = MvMetadata(
+          name = TableIdentifier(s"fpa_bounded_$index"),
+          querySql = s"SELECT id FROM $public",
+          refreshType = RefreshTypeCode.SimpleProjection,
+          refreshTypeName = "SIMPLE_PROJECTION",
+          lastVersion = 0L,
+          sourceTables = sources,
+          sourceSchemaFingerprint = MvCatalog.schemaFingerprint(schemas),
+          location = s"$warehouseDir/fpa_bounded_$index",
+          createdAt = new Timestamp(1700000000000L),
+          properties = Map(MvMetadata.BackingDataTableKey -> "true")
+        )
+        val dependencyPath = new File(warehouseDir, s"_openivm/sources/$segment/rocksdb").getAbsolutePath
+        try {
+          MvCatalog.upsert(spark, metadata)
+          MvCatalog.lookup(spark, metadata.name) shouldBe Some(metadata)
+          CdfWatermarkCatalog.put(spark, metadata.name.table, source, 7L)
+          OpenIvmRocksDBRegistry.close(dependencyPath)
+          MvCatalog.viewsForSource(spark, source).map(_.name) should contain(metadata.name)
+          CdfWatermarkCatalog.get(spark, metadata.name.table, source) shouldBe Some(7L)
+          val captured = new com.fasterxml.jackson.databind.ObjectMapper()
+            .readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, dependencyPath))
+          captured.path("available").asBoolean() shouldBe true
+          captured.path("column_families").path("dependent_mvs").size() shouldBe 1
+        } finally {
+          CdfWatermarkCatalog.removeForView(spark, metadata.name.table)
+          MvCatalog.remove(spark, metadata.name)
+        }
+        MvCatalog.viewsForSource(spark, source) shouldBe empty
+      }
+    }
+
     it("keeps resolved operational names through temp and global-temp expansions, catalog, and CDF") {
       val tempSource   = s"$friendlyDatabase.fpa_temp_source"
       val globalSource = s"$friendlyDatabase.fpa_global_source"

@@ -75,11 +75,11 @@ Full tree:
 │   │   ├── CF "mv_index"
 │   │   ├── CF "source_to_mvs"
 │   │   └── CF "table_index"
-│   ├── mvs/<base64url(db.mvname)>/rocksdb/
+│   ├── mvs/<safePathSegment(db.mvname)>/rocksdb/
 │   │   ├── CF "meta"
 │   │   ├── CF "properties"
 │   │   └── CF "consumed"
-│   ├── tables/<base64url(db.table)>/rocksdb/
+│   ├── tables/<safePathSegment(db.table)>/rocksdb/
 │   │   └── CF "staging"
 │   └── triggers/<safe>/<uuid>/
 └── _ivm/
@@ -118,26 +118,58 @@ ______________________________________________________________________
 
 ## 7.3 Safe path segment encoding
 
-RocksDB directory names use URL-safe base64 without padding.  The source is
-`RocksDBCodec.safePathSegment`:
+Every per-MV, per-source staging, and source-dependency RocksDB directory uses
+`RocksDBCodec.safePathSegment`. The codec preserves URL-safe base64 without
+padding when the encoded ASCII component is at most 255 bytes (POSIX
+`NAME_MAX`). Longer identities use `sha256.` followed by the full 64-character
+lowercase SHA-256 digest of the **original UTF-8 identity**, a 71-byte component.
+The dot is outside the base64url alphabet, keeping the namespaces disjoint.
 
 ```scala
-// RocksDBCodec.scala:122-123
-def safePathSegment(name: String): String =
-  Base64.getUrlEncoder.withoutPadding.encodeToString(utf8(name))
+def safePathSegment(name: String): String = {
+  val bytes = utf8(name)
+  val legacy = Base64.getUrlEncoder.withoutPadding.encodeToString(bytes)
+  if (legacy.length <= 255) legacy
+  else "sha256." + MessageDigest.getInstance("SHA-256").digest(bytes).map(b => f"${b & 0xff}%02x").mkString
+}
 ```
 
 Equivalent Python:
 
 ```python
 import base64
+import hashlib
 
 def safe(name):
-    return base64.urlsafe_b64encode(name.encode()).rstrip(b'=').decode()
+    raw = name.encode("utf-8")
+    legacy = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    return legacy if len(legacy) <= 255 else "sha256." + hashlib.sha256(raw).hexdigest()
 
 def unsafe(s):
+    if s.startswith("sha256."):
+        raise ValueError("Digest directories are not reversible; use captured metadata identities")
     return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4)).decode()
 ```
+
+The preferred JVM/Py4J mapping is
+`spark._jvm.org.openivm.spark.common.rocksdb.RocksDBCodec.safePathSegment(identifier)`.
+It is a pure mapping, not a catalog lookup or native open. Do not truncate,
+case-fold, normalize, or change the original source identity before mapping it.
+Records, backlink keys, CDF keys, SQL definitions, and Delta locations remain
+unchanged; only overlong local directory components are digested.
+
+All valid existing base64url paths remain byte-for-byte identical, including
+the 255-byte boundary. No valid short-state migration or rename is needed.
+The old longer components could not be created on the affected POSIX
+filesystems. An older JAR cannot address new digest-named long-identity state,
+so do not downgrade such a state directory to the old codec.
+
+Inspectors must not blindly decode directory names. For a hashed MV directory,
+obtain the identity from the `meta.name` value using the supported
+existing-handle-only snapshot API. Map source/dependency directories from
+known original identities (including captured `meta.source_tables`) through
+the shared codec; a directory digest alone cannot recover a source name.
+Preserve opaque/unavailable identities rather than opening state or guessing.
 
 Examples from the live TPC-DI warehouse:
 
@@ -150,7 +182,7 @@ Examples from the live TPC-DI warehouse:
 Do not confuse this with the older `replace(".", "_")` safe name used by
 some Delta paths, such as `_ivm/view_deltas/<safe>/<uuid>` and
 `_ivm/staging/<safe-table>/<op>/<ts>`.  RocksDB catalog directories are
-base64url.  View-delta and DML-staging Delta paths are string-sanitized.
+bounded base64url/digest components. View-delta and DML-staging Delta paths are string-sanitized.
 
 ______________________________________________________________________
 
@@ -303,7 +335,7 @@ _ivm_compiled_initial_load_sql
 Those properties live in:
 
 ```text
-<warehouse>/_openivm/mvs/<base64url(db.mvname)>/rocksdb
+<warehouse>/_openivm/mvs/<safePathSegment(db.mvname)>/rocksdb
 └── CF "properties"
     ├── _ivm_compiled_sql
     └── _ivm_compiled_initial_load_sql
@@ -915,7 +947,7 @@ ______________________________________________________________________
 
 ## 7.12 Reproducibility recipe
 
-The following is a self-contained probe.  It enumerates base64url RocksDB
+The following is a self-contained probe. It enumerates RocksDB shard
 catalog directories, inspects Delta MV tables, lists view-delta tables, and
 prints `openivm_refresh_profile` from a DuckDB database if one is found.
 
@@ -940,6 +972,8 @@ from pathlib import Path
 import duckdb
 from deltalake import DeltaTable
 def unsafe(segment: str) -> str:
+    if segment.startswith("sha256."):
+        return "<opaque digest; identity requires captured metadata>"
     return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)).decode()
 def size_kb(path: Path) -> float:
     total = 0
@@ -1125,7 +1159,7 @@ RocksDB answers "what should be read?"  Delta answers "what rows are there?"
 The most compact explanation of an incremental MV is still:
 
 ```text
-<warehouse>/_openivm/mvs/<base64url(db.mvname)>/rocksdb/CF properties/_ivm_compiled_sql
+<warehouse>/_openivm/mvs/<safePathSegment(db.mvname)>/rocksdb/CF properties/_ivm_compiled_sql
 ```
 
 Read that value first when debugging refresh behavior.

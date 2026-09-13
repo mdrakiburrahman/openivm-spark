@@ -7,7 +7,9 @@ import java.io.File
 import java.nio.file.{Files, Path, Paths}
 import scala.collection.JavaConverters._
 
-/** Deterministic local paths for sharded OpenIVM state. */
+/** Deterministic local paths for sharded OpenIVM state. Every identity component
+  * uses the same bounded, legacy-compatible codec across readers and writers.
+  */
 private[common] object OpenIvmStatePaths {
   val PerMvColumnFamilies: Seq[String]            = Seq("meta", "properties", "consumed", "cdf_watermarks")
   val BaseTableColumnFamilies: Seq[String]        = Seq("staging")
