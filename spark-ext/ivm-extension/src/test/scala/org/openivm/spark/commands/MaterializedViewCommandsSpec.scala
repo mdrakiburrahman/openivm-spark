@@ -459,6 +459,55 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           )
         }
       }
+
+      it("retains the ownership marker and rejects a mismatched Delta table ID") {
+        val ident  = TableIdentifier("mv_shape_owned")
+        val marker = MvCommandHelper.CreateRecoveryWatermarksMarker
+        spark.sql(s"CREATE TABLE mv_shape_owned(id INT) USING DELTA TBLPROPERTIES ('$marker' = 'true')")
+        val log      = DeltaTableVersion.registeredDeltaLogOption(spark, ident.table).get
+        val location = log.dataPath.toString
+        val identity = MvCommandHelper.deltaIdentityAt(spark, location).get
+        identity._1 should not be empty
+        identity._2(marker) shouldBe "true"
+
+        MvCommandHelper.validateCatalogRegistration(
+          spark,
+          ident,
+          location,
+          requireExists = false
+        ) shouldBe true
+        MvCommandHelper.validateCatalogRegistration(
+          spark,
+          ident,
+          location,
+          requireExists = true,
+          expectedTableId = identity._1
+        ) shouldBe true
+        an[AnalysisException] should be thrownBy {
+          MvCommandHelper.validateCatalogRegistration(
+            spark,
+            ident,
+            location,
+            requireExists = true,
+            expectedTableId = Some("different-table-id")
+          )
+        }
+      }
+
+      it("refuses to adopt an unmarked Delta table even at the expected path") {
+        val ident = TableIdentifier("mv_shape_unowned")
+        spark.sql("CREATE TABLE mv_shape_unowned(id INT) USING DELTA")
+        val location = DeltaTableVersion.registeredDeltaLogOption(spark, ident.table).get.dataPath.toString
+
+        an[AnalysisException] should be thrownBy {
+          MvCommandHelper.validateCatalogRegistration(
+            spark,
+            ident,
+            location,
+            requireExists = false
+          )
+        }
+      }
     }
 
     it("recognizes replacement CDF verdicts and explicit staging overwrites") {

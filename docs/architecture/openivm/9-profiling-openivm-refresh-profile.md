@@ -216,6 +216,17 @@ fan-out that job queues for a task slot behind the concurrent Delta data
 writes, inflating `metadata_publication_ms` for even a three-row output.
 `MaterializedViewCommandsSpec` guards this by asserting that a CREATE submits
 no Spark job after its data-write boundary.
+
+Identity and ownership checks have the same constraint: they read
+`snapshot.metadata.id` and `snapshot.metadata.configuration` directly.
+`DESCRIBE DETAIL` computes file statistics even when its result is projected
+down to identity columns, so it is not suitable inside catalog publication.
+When the V1 catalog probe is unavailable, `DeltaTableVersion.registeredDeltaLogOption`
+resolves the actual Delta table through the analyzer and rejects VIEW wrappers
+and non-Delta relations. Registration still verifies the normalized physical
+path, Delta table ID, and ownership marker; a missing post-write ID fails
+before catalog publication rather than weakening those checks.
+
 CREATE records the authoritative classification once it is known. REFRESH reads
 the CREATE-time classification from `MvMetadata` so even refresh-only / no-op
 runs still emit the same three fields without recompiling. Legacy metadata rows

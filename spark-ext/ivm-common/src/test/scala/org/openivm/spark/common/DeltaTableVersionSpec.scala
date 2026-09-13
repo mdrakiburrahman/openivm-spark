@@ -161,6 +161,48 @@ class DeltaTableVersionSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       historyJobs should be >= 1
     }
 
+    it("reads registered Delta identity and properties without file-stat Spark jobs") {
+      val location = newLocation("registered_identity")
+      val ident    = s"dtv_identity_${UUID.randomUUID().toString.replace("-", "").take(8)}"
+      spark.sql(
+        s"CREATE TABLE $ident USING DELTA LOCATION '$location' " +
+          "TBLPROPERTIES ('ivm.test.marker' = 'owned') AS SELECT 1 AS id"
+      )
+      val expectedId = DeltaTableVersion.deltaLogOption(spark, location).get.update().metadata.id
+
+      val (_, jobs) = countingJobs {
+        Seq(s"default.$ident", s"spark_catalog.default.$ident").foreach { name =>
+          val log      = DeltaTableVersion.registeredDeltaLogOption(spark, name).get
+          val snapshot = log.update()
+          snapshot.version shouldBe 0L
+          snapshot.metadata.id shouldBe expectedId
+          snapshot.metadata.configuration("ivm.test.marker") shouldBe "owned"
+          log.dataPath.toUri.getPath shouldBe location
+        }
+      }
+      jobs shouldBe 0
+    }
+
+    it("does not mistake a view or non-Delta relation for a registered Delta table") {
+      val suffix   = UUID.randomUUID().toString.replace("-", "").take(8)
+      val delta    = s"dtv_delta_$suffix"
+      val view     = s"dtv_view_$suffix"
+      val tempView = s"dtv_temp_$suffix"
+      val parquet  = s"dtv_parquet_$suffix"
+      spark.sql(s"CREATE TABLE $delta USING DELTA AS SELECT 1 AS id")
+      spark.sql(s"CREATE VIEW $view AS SELECT id FROM $delta")
+      spark.table(delta).createOrReplaceTempView(tempView)
+      spark.sql(s"CREATE TABLE $parquet USING PARQUET AS SELECT 1 AS id")
+
+      val (_, jobs) = countingJobs {
+        DeltaTableVersion.deltaLogOption(spark, view) should not be empty
+        Seq(view, tempView, parquet, s"dtv_missing_$suffix").foreach { name =>
+          DeltaTableVersion.registeredDeltaLogOption(spark, name) shouldBe empty
+        }
+      }
+      jobs shouldBe 0
+    }
+
     it("resolves a version while every task slot is held by a running job") {
       val location = newLocation("contended")
       spark.sql(s"CREATE TABLE delta.`$location` USING DELTA AS SELECT 1 AS id")

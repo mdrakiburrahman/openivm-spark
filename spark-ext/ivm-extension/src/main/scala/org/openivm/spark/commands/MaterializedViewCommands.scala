@@ -1615,14 +1615,12 @@ private[commands] object MvCommandHelper {
       spark: SparkSession,
       path: String
   ): Option[(Option[String], Map[String, String])] =
-    try {
-      if (!DeltaTable.isDeltaTable(spark, path)) None
-      else {
-        val row   = DeltaTable.forPath(spark, path).detail().select("id", "properties").head()
-        val props = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
-        Some((Option(row.getString(0)), props))
+    try
+      DeltaTableVersion.deltaLogOption(spark, path).map { log =>
+        val metadata = log.update().metadata
+        (Option(metadata.id), metadata.configuration)
       }
-    } catch { case NonFatal(_) => None }
+    catch { case NonFatal(_) => None }
 
   /** True when the session catalog stores column names case-exactly, so an MV
     * whose user-authored output has mixed-case columns needs no case-preserving
@@ -1657,13 +1655,7 @@ private[commands] object MvCommandHelper {
         try Some(new Path(spark.sessionState.catalog.getTableMetadata(ident).location))
         catch {
           case NonFatal(_) =>
-            spark
-              .sql(s"DESCRIBE DETAIL ${sqlIdent(ident)}")
-              .select("location")
-              .take(1)
-              .headOption
-              .flatMap(r => Option(r.getString(0)))
-              .map(new Path(_))
+            DeltaTableVersion.registeredDeltaLogOption(spark, sqlIdent(ident)).map(_.dataPath)
         }
       registered.exists(path => normalize(path) == normalize(new Path(location)))
     } catch { case NonFatal(_) => false }
@@ -1683,10 +1675,10 @@ private[commands] object MvCommandHelper {
     // A managed Fabric Spark lakehouse routes that V1 probe through its OneLake
     // external catalog, which rejects a bare `schema.table` identifier as a
     // single-part namespace ("Missing namespace parts in non-system context").
-    // When (and only when) the V1 probe fails that way, fall back to Delta's
-    // `DESCRIBE DETAIL`, which resolves through the analyzer / current-catalog
-    // path — identical to the `CREATE TABLE ... USING DELTA LOCATION` that
-    // registers the table — so it works on the Fabric lakehouse too.
+    // When the V1 probe is unusable, resolve the registered Delta relation
+    // through the analyzer / current catalog. Read identity directly from its
+    // log metadata: DESCRIBE DETAIL also computes file statistics and submits
+    // Spark jobs inside the publication admission window.
     val ident = sqlIdent(dataIdent)
 
     def qualified(path: Path): String = {
@@ -1711,25 +1703,18 @@ private[commands] object MvCommandHelper {
         case NonFatal(_)                                          => None
       }
 
-    def viaDescribeDetail: Option[RegisteredRelation] = {
-      val rows =
-        try
-          spark
-            .sql(s"DESCRIBE DETAIL $ident")
-            .select("format", "location", "id", "properties")
-            .take(1)
-        catch { case _: AnalysisException => Array.empty[Row] }
-      rows.headOption.map { r =>
+    def viaAnalyzer: Option[RegisteredRelation] =
+      DeltaTableVersion.registeredDeltaLogOption(spark, ident).map { log =>
+        val metadata = log.update().metadata
         RegisteredRelation(
-          Option(r.getString(0)),
-          new Path(Option(r.getString(1)).getOrElse("")),
-          Option(r.getString(2)),
-          Option(r.getAs[Map[String, String]]("properties"))
+          Some("delta"),
+          log.dataPath,
+          Option(metadata.id),
+          Some(metadata.configuration)
         )
       }
-    }
 
-    val found: Option[RegisteredRelation] = viaSessionCatalog.getOrElse(viaDescribeDetail)
+    val found: Option[RegisteredRelation] = viaSessionCatalog.getOrElse(viaAnalyzer)
 
     found match {
       case None =>
@@ -3290,7 +3275,16 @@ case class CreateMaterializedViewCommand(
           if (createPinnedIdentities.nonEmpty)
             verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
 
-          writtenDataTableId = deltaIdentityAt(spark, dataLocation).flatMap(_._1)
+          writtenDataTableId = Some(
+            deltaIdentityAt(spark, dataLocation)
+              .flatMap(_._1)
+              .filter(_.nonEmpty)
+              .getOrElse(
+                throw new IllegalStateException(
+                  s"Committed MV Delta path $dataLocation has no readable table ID; refusing catalog publication"
+                )
+              )
+          )
 
           try {
             profile.timeStep(

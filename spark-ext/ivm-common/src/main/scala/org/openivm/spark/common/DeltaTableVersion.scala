@@ -1,8 +1,9 @@
 package org.openivm.spark.common
 
 import org.apache.hadoop.fs.Path
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, View}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
@@ -93,6 +94,17 @@ object DeltaTableVersion {
     }
   }
 
+  /** Resolve a registered Delta table through the analyzer without computing
+    * file statistics. A VIEW over a Delta table is not a table registration.
+    * Unexpected metadata read failures propagate instead of implying absence.
+    */
+  def registeredDeltaLogOption(spark: SparkSession, tableRef: String): Option[DeltaLog] =
+    try {
+      val plan = spark.table(tableRef).queryExecution.analyzed
+      if (plan.exists(_.isInstanceOf[View])) None
+      else deltaLogFromPlan(plan).filter(_.tableExists)
+    } catch { case _: AnalysisException => None }
+
   private def sessionCatalogDeltaLog(spark: SparkSession, tableRef: String): Option[DeltaLog] =
     try {
       val log = DeltaLog.forTable(spark, CatalystSqlParser.parseTableIdentifier(tableRef))
@@ -111,12 +123,14 @@ object DeltaTableVersion {
     * failing closed. Analysis only — no Spark job is submitted.
     */
   private[common] def analyzerDeltaLog(spark: SparkSession, tableRef: String): Option[DeltaLog] =
-    try
-      spark.table(tableRef).queryExecution.analyzed.collectFirst {
-        case LogicalRelation(hfs: HadoopFsRelation, _, _, _) if hfs.location.isInstanceOf[TahoeFileIndex] =>
-          hfs.location.asInstanceOf[TahoeFileIndex].deltaLog
-      }
+    try deltaLogFromPlan(spark.table(tableRef).queryExecution.analyzed)
     catch { case NonFatal(_) => None }
+
+  private def deltaLogFromPlan(plan: LogicalPlan): Option[DeltaLog] =
+    plan.collectFirst {
+      case LogicalRelation(hfs: HadoopFsRelation, _, _, _) if hfs.location.isInstanceOf[TahoeFileIndex] =>
+        hfs.location.asInstanceOf[TahoeFileIndex].deltaLog
+    }
 
   private def looksLikePath(tableNameOrPath: String): Boolean =
     tableNameOrPath.startsWith("/") || tableNameOrPath.startsWith("file:") || tableNameOrPath.contains("/")
