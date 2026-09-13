@@ -11,17 +11,17 @@ abstract class WindowPartitionPruneScenarios extends IvmParitySpecBase("window-p
     Map(FeatureGate.WindowClusterPruneEnabledKey -> "true")
 
   private def deltaClusteringMetadata(tableName: String): String = {
-    val escaped = tableName.replace("`", "``")
-    val detail  = spark.sql(s"DESCRIBE DETAIL `$escaped`")
+    val location = mvDataLocation(tableName)
+    val escaped  = location.replace("`", "``")
+    val detail   = spark.sql(s"DESCRIBE DETAIL delta.`$escaped`")
     val describeClustering =
       if (detail.schema.fieldNames.contains("clusteringColumns"))
         Option(detail.select("clusteringColumns").head().getAs[Seq[String]]("clusteringColumns"))
           .getOrElse(Seq.empty)
           .mkString(",")
       else ""
-    val id = spark.sessionState.sqlParser.parseTableIdentifier(tableName)
     val configClustering = DeltaLog
-      .forTable(spark, id)
+      .forTable(spark, location)
       .update()
       .metadata
       .configuration

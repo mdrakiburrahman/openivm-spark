@@ -10,7 +10,7 @@ import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
   *
   * Verifies the user-supplied `CLUSTER BY` columns are (a) injected into the MV's
   * Delta `CREATE TABLE ... USING DELTA CLUSTER BY (...)` CTAS, (b) persisted in
-  * `MvMetadata` under `_ivm_cluster_cols`, (c) leave `OPTIMIZE <mv>` working as a
+  * `MvMetadata` under `_ivm_cluster_cols`, (c) leave `OPTIMIZE` on physical MV data working as a
   * plain Delta command (openivm does NOT intercept OPTIMIZE), and — critically —
   * (d) do NOT regress the MV's incremental refresh classification to FULL_REFRESH.
   *
@@ -34,17 +34,17 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
     * is robust to which surface a given Delta build reports clustering on.
     */
   private def deltaClusteringMetadata(tableName: String): String = {
-    val escaped = tableName.replace("`", "``")
-    val detail  = spark.sql(s"DESCRIBE DETAIL `$escaped`")
+    val location = mvDataLocation(tableName)
+    val escaped  = location.replace("`", "``")
+    val detail   = spark.sql(s"DESCRIBE DETAIL delta.`$escaped`")
     val describeClustering =
       if (detail.schema.fieldNames.contains("clusteringColumns"))
         Option(detail.select("clusteringColumns").head().getAs[Seq[String]]("clusteringColumns"))
           .getOrElse(Seq.empty)
           .mkString(",")
       else ""
-    val id = spark.sessionState.sqlParser.parseTableIdentifier(tableName)
     val configClustering = DeltaLog
-      .forTable(spark, id)
+      .forTable(spark, location)
       .update()
       .metadata
       .configuration
@@ -83,7 +83,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       assertMvCorrect("cbc_mv_multi", viewBody)
     }
 
-    it("leaves OPTIMIZE <mv> working as a plain Delta command and preserves correctness") {
+    it("leaves OPTIMIZE on physical MV data working as a plain Delta command and preserves correctness") {
       sql("CREATE TABLE cbc_opt (region STRING, day STRING, amount INT) USING DELTA")
       sql(
         "INSERT INTO cbc_opt VALUES " +
@@ -98,7 +98,8 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       sql(s"CREATE MATERIALIZED VIEW cbc_mv_opt CLUSTER BY (region, day) AS $viewBody")
 
       // OPTIMIZE is NOT intercepted by openivm — it falls through to Delta.
-      noException should be thrownBy spark.sql("OPTIMIZE cbc_mv_opt").collect()
+      val location = mvDataLocation("cbc_mv_opt").replace("`", "``")
+      noException should be thrownBy spark.sql(s"OPTIMIZE delta.`$location`").collect()
       assertMvCorrect("cbc_mv_opt", viewBody)
     }
 

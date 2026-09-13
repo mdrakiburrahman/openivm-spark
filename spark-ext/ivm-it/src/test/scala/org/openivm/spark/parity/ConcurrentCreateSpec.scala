@@ -53,6 +53,9 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
   describe("concurrent CREATE MATERIALIZED VIEW against a fresh schema") {
     it("admits eight independent CREATEs at the data-write boundary with correct results") {
       val schema = "cc_schema"
+      def query(idx: Int): String =
+        if (idx % 2 == 0) s"SELECT label, SUM(id) AS total FROM $schema.cc_src_$idx GROUP BY label"
+        else s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
       sql(s"CREATE DATABASE IF NOT EXISTS $schema")
 
       (1 to 8).foreach { idx =>
@@ -73,7 +76,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
             Future {
               sql(
                 s"CREATE MATERIALIZED VIEW $schema.cc_mv_$idx AS " +
-                  s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
+                  query(idx)
               ).collect()
             }
           }
@@ -83,10 +86,12 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
       writesEntered.getCount shouldBe 0L
 
       (1 to 8).foreach { idx =>
-        assertMvCorrect(
-          s"$schema.cc_mv_$idx",
-          s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
-        )
+        val name = s"$schema.cc_mv_$idx"
+        spark.table(name).schema.fields.map(field => field.name -> field.dataType).toSeq shouldBe
+          spark.sql(query(idx)).schema.fields.map(field => field.name -> field.dataType).toSeq
+        MvCatalog.lookup(spark, TableIdentifier(s"cc_mv_$idx", Some(schema))).get.usesBackingDataTable shouldBe
+          (idx % 2 == 0)
+        assertMvCorrect(name, query(idx))
       }
     }
 

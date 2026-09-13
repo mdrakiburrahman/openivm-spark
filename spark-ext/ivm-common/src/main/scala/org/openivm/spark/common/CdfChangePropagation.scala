@@ -126,13 +126,11 @@ final class CdfChangePropagation extends ChangePropagation {
       case Some(b) =>
         val from = b.startVersionExclusive + 1L
         val to   = b.endVersionInclusive
-        val raw =
-          spark.read
-            .format("delta")
-            .option("readChangeFeed", "true")
-            .option("startingVersion", from)
-            .option("endingVersion", to)
-            .table(sourceTable)
+        val raw = MvProjectionSource.read(
+          spark,
+          sourceTable,
+          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
+        )
 
         val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
         val transformedAlias = s"_openivm_cdf_raw_$short"
@@ -204,6 +202,10 @@ object CdfChangePropagation {
    * upstream).
    */
   def tableHasCdf(spark: SparkSession, name: String): Boolean = {
+    if (MvProjectionSource.isProjection(spark, name))
+      return DeltaTableVersion.deltaLogOption(spark, name).exists { log =>
+        log.update().metadata.configuration.get("delta.enableChangeDataFeed").exists(_.equalsIgnoreCase("true"))
+      }
     val identifier = CatalystSqlParser.parseTableIdentifier(name)
     val resolved = identifier.database match {
       case Some(_) => name

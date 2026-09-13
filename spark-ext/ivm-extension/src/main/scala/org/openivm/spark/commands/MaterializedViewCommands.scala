@@ -25,7 +25,8 @@ import org.apache.spark.sql.catalyst.plans.logical.{
   LogicalPlan,
   Offset,
   Sort,
-  Tail
+  Tail,
+  View
 }
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -1647,9 +1648,9 @@ private[commands] object MvCommandHelper {
       location: String
   ): Boolean =
     try {
-      def normalize(path: Path): String = {
+      def normalize(path: Path): java.net.URI = {
         val hconf = spark.sparkContext.hadoopConfiguration
-        path.getFileSystem(hconf).makeQualified(path).toUri.normalize().toString.stripSuffix("/")
+        path.getFileSystem(hconf).makeQualified(path).toUri.normalize()
       }
       val registered =
         try Some(new Path(spark.sessionState.catalog.getTableMetadata(ident).location))
@@ -1681,9 +1682,9 @@ private[commands] object MvCommandHelper {
     // Spark jobs inside the publication admission window.
     val ident = sqlIdent(dataIdent)
 
-    def qualified(path: Path): String = {
+    def qualified(path: Path): java.net.URI = {
       val hconf = spark.sparkContext.hadoopConfiguration
-      path.getFileSystem(hconf).makeQualified(path).toUri.normalize().toString.stripSuffix("/")
+      path.getFileSystem(hconf).makeQualified(path).toUri.normalize()
     }
 
     // Outer None => the V1 probe is unusable here (Fabric); fall back.
@@ -1738,7 +1739,7 @@ private[commands] object MvCommandHelper {
         lazy val deltaIdentity: Option[(Option[String], Map[String, String])] =
           if (relation.tableId.isDefined && relation.properties.isDefined)
             Some((relation.tableId, relation.properties.get))
-          else deltaIdentityAt(spark, actualPath)
+          else deltaIdentityAt(spark, actualPath.toString)
         val idOk = expectedTableId match {
           case Some(expected) =>
             // Post-registration: the relation must be the very table we wrote.
@@ -1975,38 +1976,29 @@ private[commands] object MvCommandHelper {
     // Extract (qualifiedName, shortName, schema) tuples from the already-analyzed
     // relation nodes. Re-querying spark.table for every source duplicates catalog
     // resolution and becomes a severe metastore bottleneck across concurrent drivers.
-    def sourcesFromPlan(plan: LogicalPlan): Seq[(String, String, StructType)] =
-      plan.collect {
+    def collectAllSources(plan: LogicalPlan): Seq[(String, String, StructType)] =
+      plan match {
+        case view: View if MvProjectionSource.isProjection(view) =>
+          // Keep the public MV alias and schema as the compiler/change-feed
+          // source; descending into its backing table loses the query's name
+          // and leaks maintenance state into downstream source contracts.
+          val id        = view.desc.identifier
+          val qualified = id.database.fold(id.table)(db => s"$db.${id.table}")
+          Seq((qualified, id.table, view.schema))
         case r: LogicalRelation if r.catalogTable.isDefined =>
           val id        = r.catalogTable.get.identifier
           val qualified = id.database.fold(id.table)(db => s"$db.${id.table}")
-          (qualified, id.table, r.schema)
+          Seq((qualified, id.table, r.schema))
         case r: DataSourceV2Relation if r.identifier.isDefined =>
           val ident     = r.identifier.get
           val ns        = ident.namespace()
           val short     = ident.name()
           val qualified = if (ns.nonEmpty) (ns :+ short).mkString(".") else short
-          (qualified, short, r.schema)
+          Seq((qualified, short, r.schema))
+        case other =>
+          val subqueries = other.expressions.flatMap(_.collect { case s: SubqueryExpression => s.plan })
+          (other.children ++ subqueries).flatMap(collectAllSources).distinct
       }
-
-    // Collect table pairs from a plan AND from any SubqueryExpression plans nested
-    // within node expressions (covers WHERE EXISTS / IN subqueries whose inner plan
-    // is not reachable via LogicalPlan.children alone).
-    def collectAllSources(plan: LogicalPlan): Seq[(String, String, StructType)] = {
-      val direct = sourcesFromPlan(plan)
-      // plan.collect { case p => p } enumerates every LogicalPlan node in the tree.
-      // For each node we look inside its expressions for SubqueryExpression instances
-      // (Exists, ListQuery, ScalarSubquery, etc.) and recurse into their inner plans.
-      val fromSubqueries = plan
-        .collect { case p: LogicalPlan => p }
-        .flatMap { node =>
-          node.expressions.flatMap { expr =>
-            expr.collect { case s: SubqueryExpression => s }
-          }
-        }
-        .flatMap(s => collectAllSources(s.plan))
-      (direct ++ fromSubqueries).distinct
-    }
 
     val sources = collectAllSources(analyzed)
 
@@ -2976,6 +2968,29 @@ case class CreateMaterializedViewCommand(
         logInfo(msg)
     }
 
+    // Analyze the physical initial load, not column-name prefixes: user projections
+    // can legitimately use openivm_* names, while native maintenance adds counts,
+    // join keys and null state that must never become public result columns.
+    val viewBodySql =
+      if (effectiveRefreshType == RefreshTypeCode.FullRefresh || compiled.initialLoadSql.isEmpty)
+        MvCommandHelper.pathBindUserFullQuery(
+          name,
+          originalQueryText,
+          pinBinding,
+          qualNames,
+          pinBinding.resolvedPins
+        )
+      else
+        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+    val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
+      spark.sql(viewBodySql).queryExecution.analyzed.output
+    }
+    val requiresPublicProjection =
+      physicalOutput.size != analyzed.output.size ||
+        physicalOutput.zip(analyzed.output).exists { case (physical, logical) =>
+          !physical.name.equalsIgnoreCase(logical.name) || physical.dataType != logical.dataType
+        }
+
     // AGGREGATE_HAVING split: the data table stores ALL groups (so a group
     // whose aggregate later crosses the threshold can be re-promoted by an
     // incremental MERGE), and the user-facing object is a Spark VIEW that
@@ -2988,7 +3003,7 @@ case class CreateMaterializedViewCommand(
       analyzed.output.exists(column => column.name != column.name.toLowerCase(java.util.Locale.ROOT)) &&
         !catalogPreservesColumnCase(spark)
     val usesBackingDataTable =
-      isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresCasePreservingView
+      isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresPublicProjection || requiresCasePreservingView
     val dataIdent: TableIdentifier =
       if (usesBackingDataTable) dataTableId(name) else name
     // A managed lakehouse catalog (Fabric) ignores the `LOCATION` clause and
@@ -3007,8 +3022,6 @@ case class CreateMaterializedViewCommand(
     val dataLocation: String =
       if (dataIdent == name) location else mvLocation(spark, dataIdent)
     val havingPred: Option[String] = if (isHavingViewIncremental) rawHavingPred else None
-    val userOutputCols: Seq[String] =
-      if (usesBackingDataTable) analyzed.output.map(_.name) else Nil
 
     // Persist internal metadata alongside any user-provided properties.
     val baseProps  = Map("_ivm_group_keys" -> groupKeys.mkString(","))
@@ -3123,32 +3136,6 @@ case class CreateMaterializedViewCommand(
       createdAt = now,
       properties = allProps
     )
-
-    // Materialize the MV with an initial full-load CREATE TABLE AS SELECT.
-    // For FULL_REFRESH (type 3) always use the original user query: the
-    // openivm-emitted LPTS SQL may contain DuckDB-specific syntax (e.g. SEMI JOIN
-    // instead of LEFT SEMI JOIN, or correlated subquery rewrites) that Spark
-    // cannot parse, and FULL_REFRESH data tables carry no hidden bookkeeping
-    // columns — the FullRefreshAssembler already re-executes the original query
-    // at refresh time via INSERT OVERWRITE.
-    // For incremental types (0, 1, 2, …), prefer the LPTS SQL when available
-    // because it includes openivm_count_star and other hidden columns required
-    // by the incremental MERGE program.
-    val viewBodySql =
-      if (effectiveRefreshType == RefreshTypeCode.FullRefresh || compiled.initialLoadSql.isEmpty)
-        // UserFullQuery surface: path-bind the user body's pinned reads to their
-        // verified Delta paths (clause + every occurrence preserved) so the
-        // initial CTAS reads the frozen snapshot directly, never re-resolving a
-        // possibly-rebound alias. Non-pinned bodies pass through verbatim.
-        MvCommandHelper.pathBindUserFullQuery(
-          name,
-          originalQueryText,
-          pinBinding,
-          qualNames,
-          pinBinding.resolvedPins
-        )
-      else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
 
     val windowClusterCols =
       if (effectiveRefreshType == RefreshTypeCode.WindowPartition && FeatureGate.windowClusterPruneEnabled(spark))
@@ -3339,8 +3326,8 @@ case class CreateMaterializedViewCommand(
         // preserves user-authored output case, and applies HAVING/Top-K at read time.
         if (usesBackingDataTable) {
           profile.timeStep("create_mv_user_view", s"having=$isHavingViewIncremental;top_k=${topKViewSuffix.nonEmpty}") {
-            val dataFields = spark.table(sqlIdent(dataIdent)).schema.fieldNames.toSeq
-            val dataCols   = dataFields.toSet
+            val dataSchema = spark.table(sqlIdent(dataIdent)).schema
+            val dataCols   = dataSchema.fieldNames.toSet
             val pred       = havingPred.getOrElse("TRUE")
             if (!havingPredicateIsSafe(pred, dataCols)) {
               throw new RuntimeException(
@@ -3351,24 +3338,32 @@ case class CreateMaterializedViewCommand(
                   "path — they will be retried as FULL_REFRESH on the next CREATE."
               )
             }
-            val colList = userOutputCols
+            val colList = analyzed.output
               .map { userColumn =>
-                val matches = dataFields.filter(_.equalsIgnoreCase(userColumn))
+                val matches = dataSchema.fields.filter(_.name.equalsIgnoreCase(userColumn.name))
                 if (matches.size != 1) {
                   throw new RuntimeException(
-                    s"User column '$userColumn' did not resolve uniquely on backing table " +
+                    s"User column '${userColumn.name}' did not resolve uniquely on backing table " +
                       s"${sqlIdent(dataIdent)} (matches: ${matches.mkString(", ")})"
                   )
                 }
-                val physical = matches.head.replace("`", "``")
-                val logical  = userColumn.replace("`", "``")
-                s"`$physical` AS `$logical`"
+                val field    = matches.head
+                val physical = s"`${field.name.replace("`", "``")}`"
+                val logical  = userColumn.name.replace("`", "``")
+                val value =
+                  if (field.dataType == userColumn.dataType) physical
+                  else s"CAST($physical AS ${userColumn.dataType.sql})"
+                s"$value AS `$logical`"
               }
               .mkString(", ")
             val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
             val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
+            val projectionProperties =
+              if (havingPred.isEmpty && topKViewSuffix.isEmpty)
+                s"TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') "
+              else ""
             val viewSql =
-              s"CREATE OR REPLACE VIEW ${sqlIdent(name)} AS " +
+              s"CREATE OR REPLACE VIEW ${sqlIdent(name)} ${projectionProperties}AS " +
                 s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
             val t0 = System.nanoTime()
             try {

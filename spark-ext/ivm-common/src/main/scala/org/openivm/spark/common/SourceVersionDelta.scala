@@ -1,6 +1,6 @@
 package org.openivm.spark.common
 
-import org.apache.spark.sql.functions.{col, lit, when}
+import org.apache.spark.sql.functions.{col, current_timestamp, lit, when}
 import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, MapType, StructType, TimestampType}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.storage.StorageLevel
@@ -123,12 +123,16 @@ object SourceVersionDelta {
       sourceSchema: StructType
   ): String = {
     val from = batch.startVersionInclusive + 1L
-    val raw = spark.read
-      .format("delta")
-      .option("readChangeFeed", "true")
-      .option("startingVersion", from)
-      .option("endingVersion", batch.endVersionInclusive)
-      .table(batch.baseTable)
+    val raw = MvProjectionSource
+      .read(
+        spark,
+        batch.baseTable,
+        Map(
+          "readChangeFeed"  -> "true",
+          "startingVersion" -> from.toString,
+          "endingVersion"   -> batch.endVersionInclusive.toString
+        )
+      )
       .filter(col("_change_type").isin("insert", "delete", "update_preimage", "update_postimage"))
 
     val sourceColumns = sourceSchema.fieldNames.map(name => col(quoteIdent(name)))
@@ -161,13 +165,26 @@ object SourceVersionDelta {
       batch: SourceVersionChangeBatch,
       sourceSchema: StructType
   ): String = {
+    if (MvProjectionSource.isProjection(spark, batch.baseTable)) {
+      val oldRows = snapshot(spark, batch.baseTable, batch.startVersionInclusive)
+      val newRows = snapshot(spark, batch.baseTable, batch.endVersionInclusive)
+      def signed(rows: DataFrame, sign: Int): DataFrame =
+        rows
+          .withColumn("openivm_timestamp", current_timestamp())
+          .withColumn("openivm_multiplicity", lit(sign).cast(IntegerType))
+      signed(oldRows.exceptAll(newRows), -1)
+        .unionAll(signed(newRows.exceptAll(oldRows), 1))
+        .createOrReplaceTempView(StagingDeltaView.deltaViewName(batch.baseTable))
+      return s"/* exact public-projection bag diff ${batch.baseTable} " +
+        s"${batch.startVersionInclusive}..${batch.endVersionInclusive} */"
+    }
     val sql = buildBagDiffSql(batch, sourceSchema)
     spark.sql(sql)
     sql
   }
 
   private def snapshot(spark: SparkSession, source: String, version: Long): DataFrame =
-    spark.read.format("delta").option("versionAsOf", version).table(source)
+    MvProjectionSource.read(spark, source, Map("versionAsOf" -> version.toString))
 
   private def quoteMultipart(name: String): String =
     name.split("\\.").map(quoteIdent).mkString(".")

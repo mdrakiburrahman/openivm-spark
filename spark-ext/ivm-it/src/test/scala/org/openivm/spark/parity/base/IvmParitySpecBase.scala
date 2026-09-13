@@ -155,11 +155,14 @@ abstract class IvmParitySpecBase(val specSlug: String) extends AnyFunSpec with M
   protected def refreshMv(name: String): Unit =
     spark.sql(s"REFRESH MATERIALIZED VIEW $name").collect()
 
-  protected def mvDataVersion(name: String): Long = {
+  protected def mvDataLocation(name: String): String = {
     val id   = spark.sessionState.sqlParser.parseTableIdentifier(name)
     val meta = MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog"))
-    DeltaCommitClassifier.latestVersion(spark, meta.location)
+    meta.location
   }
+
+  protected def mvDataVersion(name: String): Long =
+    DeltaCommitClassifier.latestVersion(spark, mvDataLocation(name))
 
   /** Register a test case that only makes sense under intercept mode (e.g.
     * one that asserts directly on `StagingCatalog` contents or simulates a

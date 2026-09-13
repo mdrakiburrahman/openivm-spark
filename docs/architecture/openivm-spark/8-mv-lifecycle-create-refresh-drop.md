@@ -110,6 +110,7 @@ The helper returns four values:
   Source:
 - `MaterializedViewCommands.scala:127-142`
   The helper also walks `SubqueryExpression` plans. That catches tables referenced inside nested `EXISTS`, `IN`, and scalar subqueries.
+  For an OpenIVM row-local public projection, discovery stops at the persistent VIEW boundary and records its logical alias and public schema, not the sibling maintenance table. This keeps the compiler's source names, dependency tracking, and change-feed schemas consistent with the original query.
   Source:
 - `MaterializedViewCommands.scala:144-160`
   After table names are discovered, CREATE reads schemas with `spark.table(n).schema`.
@@ -290,24 +291,15 @@ Source:
   Source:
 - `MaterializedViewCommands.scala:630-639`
 
-### 1.12 `AGGREGATE_HAVING` special handling
+### 1.12 Public schema and backing-table layouts
 
-`AGGREGATE_HAVING` uses a table/view split. The internal Delta table stores all aggregate groups. The user-facing object is a Spark view that applies HAVING at read time. The internal data table name is `<table>__ivm_data`.
-Source:
+CREATE analyzes both the original SELECT and the physical initial-load SELECT. Compiler-added counts, null-state counters, join keys, or a different output order/type require a sibling Delta table `<mv>__ivm_data` and a persistent public VIEW. The VIEW selects only the original output columns, in order, with their original names and types. Matching uses analyzed columns, never an `openivm_*` prefix blacklist: user-authored columns with that prefix remain public. The physical table retains every maintenance column.
 
-- `MaterializedViewCommands.scala:232-243`
-  CREATE detects incremental `AGGREGATE_HAVING` after effective classification. If true, the Delta target is `dataTableId(name)`. If false, the Delta target is `name`.
-  Source:
-- `MaterializedViewCommands.scala:641-649`
-  After creating the internal Delta table, CREATE creates or replaces the user-facing Spark view. The view selects user output columns from `<mv>__ivm_data`. The view filters with the extracted HAVING predicate.
-  Source:
-- `MaterializedViewCommands.scala:719-743`
-  REFRESH also redirects merge targets to `<mv>__ivm_data` for `AGGREGATE_HAVING`.
-  Source:
-- `MaterializedViewCommands.scala:974-982`
-  DROP removes both the Spark view and the sibling Delta table.
-  Source:
-- `MaterializedViewCommands.scala:1376-1382`
+`AGGREGATE_HAVING` and Top-K also use this split: the backing table retains all groups/rows, and the public VIEW applies the HAVING predicate or ordering/limit. `spark.openivm.catalogPreservesColumnCase=true` suppresses case-only wrappers, not projections needed to hide maintenance state or preserve output types.
+
+The persisted `_ivm_uses_backing_data_table` flag makes `MvMetadata.usesBackingDataTable` authoritative across refresh and restart. `meta.location` always names the physical Delta data; managed-catalog paths use the actual backing identifier. Incremental and replacement writes target that data, and DROP removes both objects. Delta-only inspection/maintenance commands such as DESCRIBE DETAIL and OPTIMIZE must use the physical path or backing-table identifier, not a public VIEW.
+
+Row-local projection VIEWs carry `_ivm_public_projection_v1=true` in their persistent catalog properties. Source discovery preserves that logical boundary. `MvProjectionSource` resolves the same physical Delta log for bounded CDF/snapshot reads, reapplies the public schema, and retains signed multiplicity when consuming intercepted cascade deltas. It does not open OpenIVM state. HAVING/Top-K wrappers are not marked as row-local projections; their existing filtered/snapshot handling remains separate.
 
 ### 1.13 Source watermarks
 
@@ -1237,18 +1229,18 @@ Source:
 
 ### 5.4 Delta after CREATE
 
-The Delta table exists at:
+For this grouped SUM, the Delta maintenance table exists at:
 
 ```text
-<warehouse>/_ivm/views/v
+<warehouse>/_ivm/views/v__ivm_data
 ```
 
-It contains the grouped SUM snapshot. It may include hidden OpenIVM bookkeeping columns required by incremental refresh.
+It contains the grouped SUM snapshot and the hidden OpenIVM bookkeeping columns required by incremental refresh.
 Source:
 
 - `OpenIvmCompiler.scala:313-349`
 - `MaterializedViewCommands.scala:696-718`
-  The Spark catalog has a table named `v` registered at that location. For this non-HAVING example, there is no `v__ivm_data` table. For `AGGREGATE_HAVING`, `v` would be a view and `v__ivm_data` would be the Delta table.
+  The Spark catalog registers `v__ivm_data` at that location. `v` is a VIEW exposing only the original SELECT output, even though this example has no HAVING clause.
   Source:
 - `MaterializedViewCommands.scala:641-649`
 - `MaterializedViewCommands.scala:719-743`

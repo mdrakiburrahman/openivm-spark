@@ -70,8 +70,9 @@ class CascadeUnderCdfSpec extends IvmParitySpecBase("cdf-cascade") with CdfMode 
       sql("INSERT INTO cdf_csc_src3 VALUES (1, 'a', 10)")
       sql("CREATE MATERIALIZED VIEW cdf_csc_mv_props AS SELECT grp, SUM(v) AS s FROM cdf_csc_src3 GROUP BY grp")
 
+      val location = mvDataLocation("cdf_csc_mv_props").replace("`", "``")
       val props = spark
-        .sql("DESCRIBE DETAIL `cdf_csc_mv_props`")
+        .sql(s"DESCRIBE DETAIL delta.`$location`")
         .select("properties")
         .head()
         .getAs[Map[String, String]]("properties")
