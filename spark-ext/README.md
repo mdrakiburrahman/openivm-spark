@@ -13,7 +13,7 @@ spark-ext/
 ├── .sbtopts, .scalafmt.conf
 ├── ivm-executor/      # executor-side classes (DeltaStagingExec, MergeWriterExec)
 ├── ivm-common/        # library: catalogs, metadata, assemblers, FeatureGate
-├── ivm-compiler/      # OpenIvmCompiler (DuckDB JDBC) + LptsSparkDialect
+├── ivm-compiler/      # OpenIvmCompiler (DuckDB CLI) + LptsSparkDialect
 ├── ivm-extension/     # SparkSessionExtensions entry + ANTLR grammar + commands + rules
 ├── ivm-it/            # integration tests + 100-spec parity suite vs openivm
 └── dev/
@@ -102,9 +102,14 @@ running it on an already-aligned tree is a no-op.
 | `PRE_CLEAN`               | `0`     | `verify` | When `1`, force-removes every running Docker container on the host before sbt starts. Named cache volumes (`sbt-cache`, `ivy-cache`, `coursier-cache`) are preserved. |
 | `openivm.test.forks` (-D) | `32`    | sbt JVM  | Cap on parallel forked test JVMs. Pass via `./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8` on smaller hosts.                                                   |
 
-The container image is named `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}` so that bumping
-SHAs in `pins.env` produces a fresh image, leaving any in-progress workspace
-caches intact.
+The container image is named
+`openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` so
+dependency or ABI changes produce a fresh image without replacing workspace
+caches. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env` explicitly select
+DuckDB v1.5.2 for both the CLI and native extension; do not infer the deployed ABI
+from OpenIVM's upstream submodule or CI version. JDBC stays on 1.5.2.1.
+`NATIVE_BUILD_JOBS` bounds native build parallelism (default 8); lower it on
+shared hosts.
 
 ## Activation in spark-shell / spark-submit
 

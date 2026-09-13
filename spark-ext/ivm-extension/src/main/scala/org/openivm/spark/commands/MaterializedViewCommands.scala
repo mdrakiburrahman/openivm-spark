@@ -1618,7 +1618,7 @@ private[commands] object MvCommandHelper {
     try {
       if (!DeltaTable.isDeltaTable(spark, path)) None
       else {
-        val row = DeltaTable.forPath(spark, path).detail().select("id", "properties").head()
+        val row   = DeltaTable.forPath(spark, path).detail().select("id", "properties").head()
         val props = Option(row.getAs[Map[String, String]]("properties")).getOrElse(Map.empty)
         Some((Option(row.getString(0)), props))
       }
@@ -3210,7 +3210,7 @@ case class CreateMaterializedViewCommand(
     // Delta identity of the backing table this operation actually wrote, used
     // to prove the catalog registration resolved to that exact table.
     var writtenDataTableId: Option[String] = None
-    var publicationCommitted            = false
+    var publicationCommitted               = false
     // CREATE PRE: re-verify each pinned source's physical identity at its
     // verified path immediately before the initial CTAS. A drop/recreate between
     // pin resolution and the write is a rebind and hard-fails before any owned
@@ -4974,7 +4974,6 @@ case class RefreshMaterializedViewCommand(
         deltaShape = sourceDeltaShape,
         fkRelations = constraintFacts.fkRelations,
         uniqueKeys = constraintFacts.uniqueKeys,
-        scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
       )
       val compileCacheTier                            = MvMetadata.compileCacheTier(cacheTierFacts)
@@ -4990,7 +4989,6 @@ case class RefreshMaterializedViewCommand(
           uniqueKeys = constraintFacts.uniqueKeys,
           declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
           runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-          scd2RangeJoinAccel = FeatureGate.scd2RangeJoinAccelEnabled(spark),
           forceViewDeltaCascade = !terminalInsertOnlyAggregate,
           assumeInsertOnly = insertOnlyAggregate ||
             (FeatureGate.windowRunningIncrementalEnabled(spark) &&

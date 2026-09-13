@@ -138,6 +138,14 @@ class DeltaTableVersionSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       spark.sql(s"CREATE TABLE IF NOT EXISTS $ident USING DELTA LOCATION '$location'")
       DeltaTableVersion.latest(spark, ident) shouldBe historyVersion(ident)
       DeltaTableVersion.latest(spark, s"default.$ident") shouldBe historyVersion(location)
+
+      val (qualifiedVersion, qualifiedJobs) = countingJobs {
+        val qualified = s"spark_catalog.default.$ident"
+        DeltaTableVersion.deltaLogOption(spark, qualified).isDefined shouldBe true
+        DeltaTableVersion.latest(spark, qualified)
+      }
+      qualifiedVersion shouldBe historyVersion(location)
+      qualifiedJobs shouldBe 0
     }
 
     it("submits no Spark job, unlike the Delta history read it replaces") {

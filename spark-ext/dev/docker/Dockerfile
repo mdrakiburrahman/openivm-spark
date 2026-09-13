@@ -20,6 +20,7 @@
 #    OPENIVM_REPO, OPENIVM_COMMIT
 #    LPTS_REPO,    LPTS_COMMIT
 #    JDK_VERSION,  SBT_VERSION, SCALA_VERSION
+#    DUCKDB_REF, DUCKDB_COMMIT, NATIVE_BUILD_JOBS
 #    DUCKDB_JDBC_VERSION
 #    UBUNTU_MIRROR (optional)
 # =============================================================================
@@ -36,6 +37,9 @@ ARG OPENIVM_COMMIT
 ARG LPTS_REPO
 ARG LPTS_BRANCH=dev/mdrrahman/spark-add-months
 ARG LPTS_COMMIT
+ARG DUCKDB_REF=v1.5.2
+ARG DUCKDB_COMMIT=8a5851971fae891f292c2714d86046ee018e9737
+ARG NATIVE_BUILD_JOBS=8
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -61,6 +65,9 @@ RUN --mount=type=cache,target=/root/.gitcache \
     git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" && \
     git submodule sync --recursive && \
     git submodule update --init --recursive --depth 1 duckdb extension-ci-tools && \
+    git -C duckdb fetch --depth 1 origin tag "${DUCKDB_REF}" && \
+    git -C duckdb checkout --detach "${DUCKDB_COMMIT}" && \
+    test "$(git -C duckdb rev-parse HEAD)" = "${DUCKDB_COMMIT}" && \
     (cd third_party/lpts && \
         git init -q && \
         (git remote add origin "${LPTS_REPO}" 2>/dev/null || git remote set-url origin "${LPTS_REPO}") && \
@@ -72,7 +79,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
 # CLI and the loadable .duckdb_extension binary. We bypass the optional
 # third_party/benchbase + sqlstorm benchmarks (heavyweight, not on the test
 # critical path).
-RUN GEN=ninja make -j"$(nproc)"
+RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
 
 # Collect deliverables into a stable location.
 RUN mkdir -p /artifacts && \
@@ -99,7 +106,7 @@ FROM eclipse-temurin:17-jdk AS spark-ext
 
 ARG SBT_VERSION=1.9.7
 ARG SCALA_VERSION=2.12.17
-ARG DUCKDB_JDBC_VERSION=1.5.2
+ARG DUCKDB_JDBC_VERSION=1.5.2.1
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive

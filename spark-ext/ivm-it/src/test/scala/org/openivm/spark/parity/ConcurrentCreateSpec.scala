@@ -10,6 +10,7 @@ import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -50,7 +51,7 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
   }
 
   describe("concurrent CREATE MATERIALIZED VIEW against a fresh schema") {
-    it("creates eight independent leaf MVs at full configured capacity without changing results") {
+    it("admits eight independent CREATEs at the data-write boundary with correct results") {
       val schema = "cc_schema"
       sql(s"CREATE DATABASE IF NOT EXISTS $schema")
 
@@ -60,17 +61,26 @@ abstract class ConcurrentCreateScenarios extends IvmParitySpecBase("concurrent-c
         sql(s"INSERT INTO $schema.cc_src_$idx VALUES $rows")
       }
 
-      TestPools.withPool(8) { implicit ec: ExecutionContext =>
-        val futures = (1 to 8).map { idx =>
-          Future {
-            sql(
-              s"CREATE MATERIALIZED VIEW $schema.cc_mv_$idx AS " +
-                s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
-            ).collect()
-          }
+      val writesEntered = new CountDownLatch(8)
+      CommandConcurrencyInjection.withBeforeCreateDataWrite {
+        writesEntered.countDown()
+        withClue("all eight CREATEs must reach their data-write boundary concurrently: ") {
+          writesEntered.await(120, TimeUnit.SECONDS) shouldBe true
         }
-        Await.result(Future.sequence(futures), 180.seconds)
+      } {
+        TestPools.withPool(8) { implicit ec: ExecutionContext =>
+          val futures = (1 to 8).map { idx =>
+            Future {
+              sql(
+                s"CREATE MATERIALIZED VIEW $schema.cc_mv_$idx AS " +
+                  s"SELECT id, label FROM $schema.cc_src_$idx WHERE id >= 0"
+              ).collect()
+            }
+          }
+          Await.result(Future.sequence(futures), 180.seconds)
+        }
       }
+      writesEntered.getCount shouldBe 0L
 
       (1 to 8).foreach { idx =>
         assertMvCorrect(

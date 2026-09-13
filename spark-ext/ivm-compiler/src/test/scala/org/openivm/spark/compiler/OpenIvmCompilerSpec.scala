@@ -1,8 +1,10 @@
 package org.openivm.spark.compiler
 
 import java.nio.file.Files
-import java.util.concurrent.{CountDownLatch, Executors}
+import java.time.LocalDate
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
@@ -12,6 +14,7 @@ import org.scalatest.matchers.should.Matchers
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
+import scala.io.Source
 
 /** Integration tests for [[OpenIvmCompiler]].
   *
@@ -100,6 +103,60 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
     result.sql should not be empty
+  }
+
+  it should "preserve native and Spark add_months parity in the compiled initial load" in {
+    val cases = Seq(
+      ("2015-02-28", 1),
+      ("2016-02-29", 1),
+      ("2015-04-30", 1),
+      ("2015-09-30", -1),
+      ("2015-01-31", 1)
+    )
+    cases.zipWithIndex.foreach { case ((date, months), index) =>
+      val expected = LocalDate
+        .ofEpochDay(DateTimeUtils.dateAddMonths(LocalDate.parse(date).toEpochDay.toInt, months))
+        .toString
+      val result = sharedCompiler.compile(
+        CompileRequest(
+          viewName = s"mv_month_end_$index",
+          viewSql = s"SELECT id, add_months(DATE '$date', $months) AS shifted FROM month_src",
+          sources = Map("month_src" -> tSchema)
+        )
+      )
+      result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      val script =
+        s"""LOAD '${extensionPath.replace("'", "''")}';
+           |CREATE TABLE month_src(id INTEGER, value INTEGER);
+           |INSERT INTO month_src VALUES (1, 0);
+           |SELECT shifted FROM (${result.initialLoadSql}) actual;
+           |""".stripMargin
+      val builder = new ProcessBuilder(
+        sharedCompiler.cliPath,
+        ":memory:",
+        "-unsigned",
+        "-csv",
+        "-noheader",
+        "-c",
+        script
+      ).redirectErrorStream(true)
+      sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").filter(_.trim.nonEmpty).foreach { extra =>
+        val inherited = Option(builder.environment().get("LD_LIBRARY_PATH")).filter(_.nonEmpty).toSeq
+        builder.environment().put("LD_LIBRARY_PATH", (Seq(extra) ++ inherited).mkString(java.io.File.pathSeparator))
+      }
+      val process = builder.start()
+      try {
+        process.waitFor(30, TimeUnit.SECONDS) shouldBe true
+        val output = Source.fromInputStream(process.getInputStream)
+        val actual =
+          try output.mkString.trim
+          finally output.close()
+        withClue(actual) {
+          process.exitValue() shouldBe 0
+          actual shouldBe expected
+        }
+      } finally process.destroyForcibly()
+    }
   }
 
   it should "emit signed cascade-delta SQL for WINDOW_PARTITION recomputes" in {
@@ -687,9 +744,41 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
   // ── Test 8: Thread safety ─────────────────────────────────────────────────
 
-  it should "handle 8 concurrent compile calls without errors" in {
+  it should "overlap 8 independent DuckDB subprocesses and compile without errors" in {
     val pool                          = Executors.newFixedThreadPool(8)
     implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+    val barrierDir                    = Files.createTempDirectory("openivm_compile_overlap_")
+    val wrapper                       = barrierDir.resolve("duckdb-barrier")
+    val parentLibraryPath             = Option(System.getenv("LD_LIBRARY_PATH"))
+    val nativeLibraryPath = (Seq(barrierDir.toString) ++
+      sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").filter(_.trim.nonEmpty))
+      .mkString(java.io.File.pathSeparator)
+    val subprocessLibraryPath = (Seq(nativeLibraryPath) ++ parentLibraryPath.filter(_.nonEmpty))
+      .mkString(java.io.File.pathSeparator)
+    def shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
+    Files.write(
+      wrapper,
+      s"""#!/usr/bin/env bash
+         |set -euo pipefail
+         |[[ "$${LD_LIBRARY_PATH:-}" == ${shellQuote(subprocessLibraryPath)} ]]
+         |touch ${shellQuote(barrierDir.toString)}/started-$$$$
+         |for attempt in {1..1200}; do
+         |  peers=(${shellQuote(barrierDir.toString)}/started-*)
+         |  if [[ $${#peers[@]} -eq 8 ]]; then
+         |    exec ${shellQuote(sharedCompiler.cliPath)} "$$@"
+         |  fi
+         |  sleep 0.05
+         |done
+         |echo 'Eight DuckDB subprocesses did not overlap' >&2
+         |exit 1
+         |""".stripMargin.getBytes("UTF-8")
+    )
+    wrapper.toFile.setExecutable(true) shouldBe true
+    val concurrentCompiler = OpenIvmCompiler.build(
+      extensionPath,
+      cliPath = wrapper.toString,
+      nativeLibraryPath = Some(nativeLibraryPath)
+    )
     try {
       val req = CompileRequest(
         viewName = "mv_concurrent_agg",
@@ -697,14 +786,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
         sources = Map("sales" -> salesSchema)
       )
 
-      // All futures wait on the latch then call compile() simultaneously.
-      // Our mutex serialises the actual JDBC work, but each caller must
-      // eventually succeed and produce a non-empty SQL string.
+      // No process can execute DuckDB until all eight have entered the CLI
+      // boundary. A global compiler mutex fails the barrier instead of passing
+      // merely because all calls eventually finish.
       val latch = new CountDownLatch(1)
       val futures = (1 to 8).map { _ =>
         Future {
           latch.await()
-          sharedCompiler.compile(req)
+          concurrentCompiler.compile(req)
         }
       }
       latch.countDown()
@@ -716,8 +805,15 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
         r.refreshTypeName shouldBe "AGGREGATE_GROUP"
         r.sql should not be empty
       }
+      Option(System.getenv("LD_LIBRARY_PATH")) shouldBe parentLibraryPath
     } finally {
-      pool.shutdown()
+      pool.shutdownNow()
+      pool.awaitTermination(120, TimeUnit.SECONDS) shouldBe true
+      concurrentCompiler.close()
+      val files = Files.list(barrierDir)
+      try files.forEach(path => Files.deleteIfExists(path))
+      finally files.close()
+      Files.deleteIfExists(barrierDir)
     }
   }
 

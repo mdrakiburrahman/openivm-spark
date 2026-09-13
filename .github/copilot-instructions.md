@@ -36,7 +36,7 @@ Notes:
 - Scala 2.12.17 / JDK 17 / Spark 3.5.1 / Delta 3.2.0 — all pinned in
   `spark-ext/dev/pins.env` and `project/Dependencies.scala`. Bumping any of
   these requires bumping the matching SHA in `pins.env`, which is what cuts a
-  fresh `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}` image.
+  fresh `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` image.
 - The compiler is `-Xfatal-warnings -Ywarn-unused:imports`: any unused import
   fails the whole compile, so strip imports before pushing.
 - `scalafmt` config is at `spark-ext/.scalafmt.conf` (max column 120,

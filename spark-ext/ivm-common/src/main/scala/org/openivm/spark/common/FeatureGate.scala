@@ -329,12 +329,6 @@ object FeatureGate {
     */
   val Scd2RangeAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeAccel.enabled"
 
-  /** Enable openivm-side SCD-2 range-join acceleration during refresh SQL
-    * compilation. Default OFF: when opted in, openivm narrows SCD-2 dimension
-    * scans with delta-fact bounds filters in the emitted refresh program.
-    */
-  val Scd2RangeJoinAccelEnabledKey: String = "spark.openivm.refresh.scd2RangeJoinAccel.enabled"
-
   /** Enable bounded recompute for top-K ROW_NUMBER/RANK WINDOW_PARTITION MVs.
     *
     * Default OFF: when opted in, eligible top-K ranking refreshes replace the
@@ -633,12 +627,6 @@ object FeatureGate {
 
   def scd2RangeAccelEnabled(spark: SparkSession): Boolean =
     scd2RangeAccelEnabled(spark.sparkContext.getConf)
-
-  def scd2RangeJoinAccelEnabled(conf: SparkConf): Boolean =
-    boolConf(conf, Scd2RangeJoinAccelEnabledKey, default = false)
-
-  def scd2RangeJoinAccelEnabled(spark: SparkSession): Boolean =
-    scd2RangeJoinAccelEnabled(spark.sparkContext.getConf)
 
   def boundedRankEnabled(conf: SparkConf): Boolean =
     boolConf(conf, BoundedRankEnabledKey, default = false)

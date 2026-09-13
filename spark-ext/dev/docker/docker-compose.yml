@@ -22,12 +22,15 @@ x-spark-ext: &spark-ext
       LPTS_REPO: ${LPTS_REPO}
       LPTS_BRANCH: ${LPTS_BRANCH}
       LPTS_COMMIT: ${LPTS_COMMIT}
+      DUCKDB_REF: ${DUCKDB_REF}
+      DUCKDB_COMMIT: ${DUCKDB_COMMIT}
+      NATIVE_BUILD_JOBS: ${NATIVE_BUILD_JOBS:-8}
       JDK_VERSION: ${JDK_VERSION}
       SBT_VERSION: ${SBT_VERSION}
       SCALA_VERSION: ${SCALA_VERSION}
       DUCKDB_JDBC_VERSION: ${DUCKDB_JDBC_VERSION}
       UBUNTU_MIRROR: ${UBUNTU_MIRROR}
-  image: openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}
+  image: openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}
   volumes:
     - ..:/work/spark-ext-dev:ro
     - ../..:/work/spark-ext:rw
@@ -84,8 +87,11 @@ services:
         LPTS_REPO: ${LPTS_REPO}
         LPTS_BRANCH: ${LPTS_BRANCH}
         LPTS_COMMIT: ${LPTS_COMMIT}
+        DUCKDB_REF: ${DUCKDB_REF}
+        DUCKDB_COMMIT: ${DUCKDB_COMMIT}
+        NATIVE_BUILD_JOBS: ${NATIVE_BUILD_JOBS:-8}
         UBUNTU_MIRROR: ${UBUNTU_MIRROR}
-    image: openivm-spark/openivm-tester:${OPENIVM_COMMIT}-${LPTS_COMMIT}
+    image: openivm-spark/openivm-tester:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}
     command: ["make", "test"]
 
 volumes:
