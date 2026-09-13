@@ -156,7 +156,10 @@ final class CdfChangePropagation extends ChangePropagation {
     CdfWatermarkCatalog.putAll(
       spark,
       viewName,
-      batches.collect { case b: CdfChangeBatch => b.baseTable -> b.endVersionInclusive }.toMap
+      batches.collect {
+        case b: CdfChangeBatch           => b.baseTable -> b.endVersionInclusive
+        case b: SourceVersionChangeBatch => b.baseTable -> b.endVersionInclusive
+      }.toMap
     )
 
   override def pruneConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = ()

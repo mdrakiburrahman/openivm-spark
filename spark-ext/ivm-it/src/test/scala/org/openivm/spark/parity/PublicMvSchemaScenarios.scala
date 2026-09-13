@@ -8,6 +8,7 @@ import org.openivm.spark.common.{
   RefreshTypeCode,
   SourceVersionChangeBatch,
   SourceVersionDelta,
+  StagingCatalog,
   StagingDeltaView
 }
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
@@ -35,8 +36,12 @@ abstract class PublicMvSchemaScenarios extends IvmParitySpecBase("public-mv-sche
     val actual   = spark.table(name)
     actual.schema.fields.map(field => field.name -> field.dataType).toSeq shouldBe
       expected.schema.fields.map(field => field.name -> field.dataType).toSeq
-    actual.exceptAll(expected).count() shouldBe 0L
-    expected.exceptAll(actual).count() shouldBe 0L
+    withClue(s"$name unexpected public rows: ") {
+      actual.exceptAll(expected).limit(8).collect().toSeq shouldBe empty
+    }
+    withClue(s"$name missing public rows: ") {
+      expected.exceptAll(actual).limit(8).collect().toSeq shouldBe empty
+    }
   }
 
   private def assertBackingState(name: String, query: String): Unit = {
@@ -115,6 +120,56 @@ abstract class PublicMvSchemaScenarios extends IvmParitySpecBase("public-mv-sche
         refreshMv(name)
         assertBackingState(name, query)
       }
+    }
+
+    it("uses typed old-state snapshots when both sides of a downstream join change") {
+      sql("CREATE TABLE ps_snapshot_amounts(id INT, bucket STRING, amount INT) USING DELTA")
+      sql("CREATE TABLE ps_snapshot_labels(bucket STRING, label STRING) USING DELTA")
+      sql("INSERT INTO ps_snapshot_amounts VALUES (1, 'a', 10), (2, 'b', 20)")
+      sql("INSERT INTO ps_snapshot_labels VALUES ('a', 'first'), ('b', 'second')")
+      val upstream = "SELECT bucket, SUM(amount) AS total FROM ps_snapshot_amounts GROUP BY bucket"
+      val downstream =
+        """SELECT a.bucket, a.total, l.label FROM ps_snapshot_upstream a
+          |JOIN ps_snapshot_labels l ON a.bucket = l.bucket""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW default.ps_snapshot_upstream AS $upstream")
+      sql(s"CREATE MATERIALIZED VIEW default.ps_snapshot_downstream AS $downstream")
+      assertBackingState("ps_snapshot_upstream", upstream)
+      assertPublicResult("ps_snapshot_downstream", downstream)
+      metadata("ps_snapshot_downstream").refreshType should not be RefreshTypeCode.FullRefresh
+
+      sql("INSERT INTO ps_snapshot_amounts VALUES (3, 'a', 5), (4, 'c', 30)")
+      sql("INSERT INTO ps_snapshot_labels VALUES ('a', 'other'), ('c', 'new')")
+      refreshMv("ps_snapshot_upstream")
+      val cascades =
+        StagingCatalog.collectFor(spark, "default.ps_snapshot_downstream", Seq("default.ps_snapshot_upstream"))
+      if (changeFeedMode == org.openivm.spark.common.ChangeFeedMode.Intercept)
+        cascades should have size 1
+      cascades.foreach { entry =>
+        val frame      = spark.read.format("delta").load(entry.stagingPath)
+        val signedRows = frame.select("bucket", "total", "openivm_multiplicity")
+        val expectedRows = sql(
+          """SELECT bucket, CAST(total AS BIGINT) AS total, sign AS openivm_multiplicity
+              |FROM VALUES ('a', 10, -1), ('a', 15, 1), ('c', 30, 1)
+              |AS changes(bucket, total, sign)""".stripMargin
+        )
+        signedRows.exceptAll(expectedRows).collect().toSeq shouldBe empty
+        expectedRows.exceptAll(signedRows).collect().toSeq shouldBe empty
+      }
+      refreshMv("ps_snapshot_downstream")
+      assertBackingState("ps_snapshot_upstream", upstream)
+      assertPublicResult("ps_snapshot_downstream", downstream)
+
+      if (changeFeedMode == org.openivm.spark.common.ChangeFeedMode.Intercept)
+        sql(
+          "ALTER TABLE default.ps_snapshot_upstream__ivm_data " +
+            "SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'false')"
+        )
+      sql("DELETE FROM ps_snapshot_amounts WHERE id = 1")
+      sql("DELETE FROM ps_snapshot_labels WHERE label = 'first'")
+      refreshMv("ps_snapshot_upstream")
+      refreshMv("ps_snapshot_downstream")
+      assertBackingState("ps_snapshot_upstream", upstream)
+      assertPublicResult("ps_snapshot_downstream", downstream)
     }
 
     it("chains incrementally through a typed public projection and reopens its persisted layout after restart") {

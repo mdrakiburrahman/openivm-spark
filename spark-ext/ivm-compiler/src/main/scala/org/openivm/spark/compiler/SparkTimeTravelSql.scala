@@ -967,6 +967,24 @@ object SparkTimeTravelSql {
 
   private val CanonicalVersionClause = """^VERSION AS OF (\d+)$""".r
 
+  /** Numeric consumption endpoints keyed by the verified operational alias,
+    * never by a friendly SQL spelling or the current Delta head.
+    */
+  private[spark] def resolvedVersionPins(pins: Seq[ResolvedSnapshotPin]): Map[String, Long] =
+    pins
+      .flatMap { resolved =>
+        resolved.pin.clause.trim match {
+          case AnyVersionClause(version) => Some(resolved.emitsResolved -> version.toLong)
+          case _                         => None
+        }
+      }
+      .groupBy(_._1)
+      .map { case (source, entries) =>
+        val versions = entries.map(_._2).distinct
+        require(versions.size == 1, s"Pinned source '$source' has conflicting consumption versions")
+        source -> versions.head
+      }
+
   private val KnownIdentityFields: Set[String] =
     Set("alias", "deltaLogDataPath", "deltaTableMetadataId", "pinRef", "pinSegments", "version", "timestamp", "clause")
 

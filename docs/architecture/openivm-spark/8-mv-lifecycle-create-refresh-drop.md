@@ -90,6 +90,8 @@ Source:
   Source:
 - `MaterializedViewCommands.scala:339-348`
 
+For a backing-table layout, CREATE also rejects an existing public TABLE or VIEW before the data write. Public VIEW publication uses `CREATE VIEW`, never `CREATE OR REPLACE VIEW`, so an object appearing after that preflight cannot be overwritten. Failure cleanup removes a public VIEW only when it matches this operation's captured catalog definition and no MV metadata was published; backing-table cleanup still requires path, Delta identity, and ownership-marker proof.
+
 ### 1.5 Discovering source tables
 
 CREATE calls `collectSourceSchemas(spark, originalQueryText)`.
@@ -111,6 +113,8 @@ The helper returns four values:
 - `MaterializedViewCommands.scala:127-142`
   The helper also walks `SubqueryExpression` plans. That catches tables referenced inside nested `EXISTS`, `IN`, and scalar subqueries.
   For an OpenIVM row-local public projection, discovery stops at the persistent VIEW boundary and records its logical alias and public schema, not the sibling maintenance table. This keeps the compiler's source names, dependency tracking, and change-feed schemas consistent with the original query.
+  CDF old-state reads resolve the backing Delta snapshot and reapply the public projection through a command-local temporary view; Spark cannot apply `VERSION AS OF` to the persistent VIEW itself. Explicitly pinned sources continue to use their verified physical Delta paths, never these logical snapshot overrides.
+  In intercept mode, a grouped aggregate's native additive maintenance delta is not a public row delta. A projected aggregate therefore enables CDF on its own backing table and publishes bounded, typed old/new row changes to downstream consumers after successful maintenance. Existing backing state without CDF uses the exact snapshot bag-diff path. Internal counters stay in the maintenance table; no original-source rebuild or source mutation is involved.
   Source:
 - `MaterializedViewCommands.scala:144-160`
   After table names are discovered, CREATE reads schemas with `spark.table(n).schema`.
@@ -302,6 +306,12 @@ The persisted `_ivm_uses_backing_data_table` flag makes `MvMetadata.usesBackingD
 Row-local projection VIEWs carry `_ivm_public_projection_v1=true` in their persistent catalog properties. Source discovery preserves that logical boundary. `MvProjectionSource` resolves the same physical Delta log for bounded CDF/snapshot reads, reapplies the public schema, and retains signed multiplicity when consuming intercepted cascade deltas. It does not open OpenIVM state. HAVING/Top-K wrappers are not marked as row-local projections; their existing filtered/snapshot handling remains separate.
 
 ### 1.13 Source watermarks
+
+For a verified `VERSION AS OF N` source, CREATE records `v:N` under the resolved operational source key, even when the live head is newer. This initializes both the MV metadata watermark and the backing Delta table's immutable CREATE-recovery watermark. Unpinned sources retain their change-feed-specific initialization.
+
+An ordinary REFRESH excludes frozen sources from CDF collection and does not advance their numeric cursors. Intercepted staging for a frozen source may still be discarded; it is not the input to ADVANCE. `ADVANCE SOURCE VERSIONS` derives its old endpoint from the verified query/identity pin, reads exactly `(N, M]` (bounded CDF or exact snapshot bag difference), and publishes the new pin, MV metadata watermark, and (in CDF mode) CDF cursor at `M` under the existing operation guard. The backing table's original CREATE-recovery watermark remains `N`. Clean pre-commit rollback retains the old pin/cursor; an idempotent advance does not move them. A failure after publication starts retains the durable repair-required guard.
+
+A persisted VERSION-pin watermark or CDF cursor that disagrees with the verified pin is rejected before REFRESH/ADVANCE, including an otherwise-idempotent advance. Legacy live-head cursors are not silently relabeled: those MVs must be dropped and recreated. Reusing an unpublished CREATE path likewise requires its recovery watermark to match the requested pin.
 
 CREATE captures current source watermarks before the initial materialization.
 The call is:

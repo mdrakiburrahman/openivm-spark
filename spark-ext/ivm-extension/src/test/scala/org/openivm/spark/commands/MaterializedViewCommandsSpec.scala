@@ -1269,6 +1269,31 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual(name, viewBody)
     }
 
+    it("cleans only the owned unpublished public VIEW after a failed CREATE") {
+      val name = TableIdentifier("mv_t1a_owned_view")
+      spark.sql(s"CREATE VIEW ${name.table} AS SELECT 1 AS value")
+      val original = spark.sessionState.catalog.getTableMetadata(name)
+      MvCommandHelper.cleanupFailedCreatePublicView(spark, name, Some(original))
+      spark.catalog.tableExists(name.table) shouldBe false
+
+      spark.sql(s"CREATE VIEW ${name.table} AS SELECT 1 AS value")
+      val replaced = spark.sessionState.catalog.getTableMetadata(name)
+      spark.sql(s"CREATE OR REPLACE VIEW ${name.table} AS SELECT 'foreign' AS label")
+      MvCommandHelper.cleanupFailedCreatePublicView(spark, name, Some(replaced))
+      spark.table(name.table).schema.fieldNames.toSeq shouldBe Seq("label")
+      spark.table(name.table).head().getString(0) shouldBe "foreign"
+      spark.sql(s"DROP VIEW ${name.table}")
+
+      spark.sql("CREATE TABLE owned_view_source(bucket STRING, amount INT) USING DELTA")
+      spark.sql("INSERT INTO owned_view_source VALUES ('a', 10)")
+      val query = "SELECT bucket, SUM(amount) AS total FROM owned_view_source GROUP BY bucket"
+      spark.sql(s"CREATE MATERIALIZED VIEW ${name.table} AS $query")
+      val published = spark.sessionState.catalog.getTableMetadata(name)
+      MvCommandHelper.cleanupFailedCreatePublicView(spark, name, Some(published))
+      MvCatalog.lookup(spark, name).nonEmpty shouldBe true
+      assertBagEqual(name.table, query)
+    }
+
     it("does not delete a preexisting Delta path when an unpublished CREATE fails") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_existing(id INT, label STRING) USING DELTA")
       spark.sql("INSERT INTO sales_t1a_existing VALUES (1, 'one'), (2, 'two'), (2, 'two')")

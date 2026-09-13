@@ -1,7 +1,17 @@
 package org.openivm.spark.parity
 
 import org.openivm.spark.commands.RefreshFailureInjection
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode, TimeTravelPinReason, TimeTravelPinStatus}
+import org.openivm.spark.common.{
+  CdfWatermarkCatalog,
+  ChangeFeedMode,
+  ChangeWatermark,
+  DeltaTableVersion,
+  MvCatalog,
+  MvMetadata,
+  RefreshTypeCode,
+  TimeTravelPinReason,
+  TimeTravelPinStatus
+}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Regression coverage for materialized views whose sources are pinned to a
@@ -17,7 +27,9 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   * The pin is a storage concern with no meaning for the row-less DuckDB tables
   * the bridge registers, so it is split out of the compile-bridge copy of the
   * body only, and re-applied to every source read Spark executes. That makes a
-  * pinned source a FROZEN relation: post-pin DML is consumed but never applied.
+  * pinned source a FROZEN relation: post-pin DML is never applied. Intercepted
+  * staging can be discarded, but numeric consumption cursors remain at the pin
+  * until an explicit ADVANCE consumes the next immutable interval.
   */
 abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-travel-pin") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
@@ -114,7 +126,7 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
       assertMvCorrect(mv, pinnedExpectation(src, pinned))
     }
 
-    it("consumes frozen deltas so repeated refreshes stay no-ops") {
+    it("keeps repeated refreshes frozen across post-pin DML") {
       val (src, mv, pinned) = pinnedAggregateFixture("consume")
       sql(s"INSERT INTO $src VALUES (7, 'a', 700)")
       refreshMv(mv)
@@ -596,6 +608,178 @@ abstract class TimeTravelPinnedSourceScenarios extends IvmParitySpecBase("time-t
   }
 
   describe("(TTP-11) Atomic immutable source-version advancement") {
+    it("refuses recovered CREATE state with a consumption watermark beyond the requested pin") {
+      val source = "ttp_recovery_cursor_source"
+      val mv     = "ttp_recovery_cursor_mv"
+      sql(s"CREATE TABLE $source(id INT) USING DELTA")
+      sql(s"INSERT INTO $source VALUES (1), (1)")
+      val pinned = latestVersion(source)
+      sql(s"INSERT INTO $source VALUES (2)")
+      val head     = latestVersion(source)
+      val location = s"${spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")}/_ivm/views/$mv"
+      val body     = s"SELECT id FROM $source VERSION AS OF $pinned"
+      sql(
+        s"""CREATE TABLE delta.`$location` USING DELTA
+           |TBLPROPERTIES ('_ivm_create_watermarks_v1' = 'true',
+           |  '${MvMetadata.WatermarkKeyPrefix}default.$source' = 'v:$head')
+           |AS $body""".stripMargin
+      )
+      val dataVersion = DeltaTableVersion.requireLatest(spark, location)
+      val error       = intercept[IllegalStateException] { sql(s"CREATE MATERIALIZED VIEW $mv AS $body").collect() }
+      error.getMessage should include("CREATE consumption watermark inconsistent")
+      DeltaTableVersion.requireLatest(spark, location) shouldBe dataVersion
+      MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)) shouldBe None
+      val actual = spark.read.format("delta").load(location)
+      actual.exceptAll(sql(body)).count() shouldBe 0L
+      sql(body).exceptAll(actual).count() shouldBe 0L
+    }
+
+    it("rejects a legacy consumption cursor ahead of the pin without rewriting data or accepting a no-op advance") {
+      val (source, mv, pinned) = pinnedAggregateFixture("cursor_corrupt")
+      val metadata             = mvMeta(mv)
+      val operationalSource    = metadata.sourceTables.head
+      val ahead                = latestVersion(source)
+      MvCatalog.upsert(
+        spark,
+        metadata.copy(properties =
+          metadata.properties +
+            (s"${MvMetadata.WatermarkKeyPrefix}$operationalSource" -> s"v:$ahead")
+        )
+      )
+      val error = intercept[org.apache.spark.sql.AnalysisException] { refreshMv(mv) }
+      error.getMessage should include("pinned consumption watermark")
+      val retryError = intercept[org.apache.spark.sql.AnalysisException] {
+        sql(s"ALTER MATERIALIZED VIEW $mv ADVANCE SOURCE VERSIONS ($source = $pinned)").collect()
+      }
+      retryError.getMessage should include("pinned consumption watermark")
+      mvMeta(mv).lastVersion shouldBe metadata.lastVersion
+      assertMvCorrect(mv, pinnedExpectation(source, pinned))
+    }
+
+    itCdf("rejects a CDF consumption cursor ahead of a correct persisted pin") {
+      val (source, mv, pinned) = pinnedAggregateFixture("cdf_cursor_corrupt")
+      val metadata             = mvMeta(mv)
+      val operationalSource    = metadata.sourceTables.head
+      CdfWatermarkCatalog.put(spark, mv, operationalSource, latestVersion(source))
+      val error = intercept[org.apache.spark.sql.AnalysisException] { refreshMv(mv) }
+      error.getMessage should include("pinned consumption watermark")
+      mvMeta(mv).changeWatermarks shouldBe Map(operationalSource -> ChangeWatermark.DeltaVersion(pinned))
+      mvMeta(mv).lastVersion shouldBe metadata.lastVersion
+      assertMvCorrect(mv, pinnedExpectation(source, pinned))
+    }
+
+    it("keeps every consumption watermark at an older pin and advances only the exact requested interval") {
+      val database       = "ttp_cursor_db"
+      val source         = s"$database.source_rows"
+      val mv             = s"$database.pinned_totals"
+      val managedRootKey = "spark.openivm.managedTablesRoot"
+      val previousRoot   = spark.conf.getOption(managedRootKey)
+      spark.conf.set(managedRootKey, s"$warehouseDir/managed/Tables")
+      try {
+        sql(s"CREATE DATABASE $database")
+        sql(s"CREATE TABLE $source(id INT, grp STRING, val INT) USING DELTA")
+        sql(s"INSERT INTO $source VALUES (1, 'a', 10), (2, 'a', 10), (3, 'b', 20)")
+        val pinned = latestVersion(source)
+        sql(s"INSERT INTO $source VALUES (4, 'a', 10), (5, 'c', 30)")
+        sql(s"DELETE FROM $source WHERE id = 3")
+        val target = latestVersion(source)
+        sql(s"UPDATE $source SET val = 99 WHERE id = 4")
+        val head = latestVersion(source)
+        pinned should be < target
+        target should be < head
+        val sourceIdentity = DeltaTableVersion.deltaLogOption(spark, source).get.update().metadata.id
+        def query(version: Long): String =
+          s"SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM $source VERSION AS OF $version GROUP BY grp"
+        sql(s"CREATE MATERIALIZED VIEW $mv AS ${query(pinned)}")
+        assertNotCompileFailed(mv)
+
+        final case class Observed(
+            phase: String,
+            expected: Long,
+            watermarks: Map[String, ChangeWatermark],
+            property: Option[String],
+            cdf: Map[String, Long],
+            createProperty: Option[String]
+        )
+        val observations = scala.collection.mutable.ArrayBuffer.empty[Observed]
+        def observe(phase: String, version: Long): Unit = {
+          val metadata = mvMeta(mv)
+          val expected = sql(query(version))
+          val actual   = spark.table(mv)
+          actual.schema.fields.map(f => f.name -> f.dataType).toSeq shouldBe
+            expected.schema.fields.map(f => f.name -> f.dataType).toSeq
+          actual.exceptAll(expected).count() shouldBe 0L
+          expected.exceptAll(actual).count() shouldBe 0L
+          metadata.sourceTables shouldBe Seq(source)
+          val identities = new com.fasterxml.jackson.databind.ObjectMapper()
+            .readTree(metadata.properties("_ivm_pinned_source_identities"))
+          identities.size() shouldBe 1
+          identities.get(0).get("alias").asText() shouldBe source
+          identities.get(0).get("deltaTableMetadataId").asText() shouldBe sourceIdentity
+          identities.get(0).get("version").asLong() shouldBe version
+          val createProps =
+            DeltaTableVersion.deltaLogOption(spark, metadata.location).get.update().metadata.configuration
+          observations += Observed(
+            phase,
+            version,
+            metadata.changeWatermarks,
+            metadata.properties.get(s"${MvMetadata.WatermarkKeyPrefix}$source"),
+            CdfWatermarkCatalog.getAll(spark, mv, Seq(source)),
+            createProps.get(s"${MvMetadata.WatermarkKeyPrefix}$source")
+          )
+        }
+
+        observe("create below head", pinned)
+        val beforeNoop = mvMeta(mv).lastVersion
+        refreshMv(mv)
+        mvMeta(mv).lastVersion shouldBe beforeNoop
+        observe("pinned no-op below head", pinned)
+
+        RefreshFailureInjection.failNextSourceVersionAdvanceBeforeCommit(spark)
+        an[RuntimeException] should be thrownBy {
+          sql(s"ALTER MATERIALIZED VIEW $mv ADVANCE SOURCE VERSIONS ($source = $target)").collect()
+        }
+        observe("rolled-back advance", pinned)
+
+        sql(s"ALTER MATERIALIZED VIEW $mv ADVANCE SOURCE VERSIONS ($source = $target)").collect()
+        observe("advance below head", target)
+        val afterAdvance = mvMeta(mv).lastVersion
+        refreshMv(mv)
+        mvMeta(mv).lastVersion shouldBe afterAdvance
+        observe("no-op after advance", target)
+        sql(s"ALTER MATERIALIZED VIEW $mv ADVANCE SOURCE VERSIONS ($source = $target)").collect()
+        mvMeta(mv).lastVersion shouldBe afterAdvance
+        observe("idempotent advance", target)
+
+        sql(s"ALTER MATERIALIZED VIEW $mv ADVANCE SOURCE VERSIONS ($source = $head)").collect()
+        observe("advance remaining interval", head)
+        info("Exact initial, frozen, rollback and both advanced data snapshots verified before cursor assertions")
+
+        observations.foreach { observed =>
+          withClue(s"${observed.phase}: ") {
+            observed.watermarks shouldBe Map(source -> ChangeWatermark.DeltaVersion(observed.expected))
+            observed.property shouldBe Some(s"v:${observed.expected}")
+            observed.createProperty shouldBe Some(s"v:$pinned")
+            val expectedCdf =
+              if (changeFeedMode == ChangeFeedMode.Cdf && observed.expected > pinned)
+                Map(source -> observed.expected)
+              else Map.empty[String, Long]
+            observed.cdf shouldBe expectedCdf
+            observed.cdf
+              .get(source)
+              .orElse(
+                observed.watermarks.get(source).collect { case ChangeWatermark.DeltaVersion(version) => version }
+              ) shouldBe Some(observed.expected)
+          }
+        }
+      } finally {
+        previousRoot match {
+          case Some(value) => spark.conf.set(managedRootKey, value)
+          case None        => spark.conf.unset(managedRootKey)
+        }
+      }
+    }
+
     it("applies an exact duplicate-sensitive source delta and is idempotent on retry") {
       sql("CREATE TABLE IF NOT EXISTS ttp_adv_src(id INT, grp STRING, val INT) USING DELTA")
       sql("INSERT INTO ttp_adv_src VALUES (1, 'a', 10), (2, 'a', 10), (3, 'b', 20)")

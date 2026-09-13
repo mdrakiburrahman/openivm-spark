@@ -1913,6 +1913,17 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
     }
 
+    it("reads a public projection's already-pinned snapshot without time-travelling through a VIEW") {
+      val rewritten = SparkRefreshRewriter.rewriteRegularOldStateUnions(
+        canonical,
+        Map("db.accounts" -> 17L),
+        sourceSnapshotRelations = Map("db.accounts" -> "`private_accounts_snapshot`")
+      )
+      rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `private_accounts_snapshot`")
+      rewritten should not include "VERSION AS OF"
+      rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+    }
+
     it("leaves non-canonical projection-wrapped source arms unchanged") {
       val wrapped = canonical
         .replace(
@@ -2404,7 +2415,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         program: String,
         pins: Map[String, String],
         paths: Map[String, String],
-        oldVersions: Map[String, Long]
+        oldVersions: Map[String, Long],
+        snapshotRelations: Map[String, String] = Map.empty
     ): RewrittenRefresh =
       SparkRefreshRewriter.rewrite(
         compiledSql = program,
@@ -2415,7 +2427,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         viewDeltaPath = viewDeltaPath,
         sourceSnapshotPins = pins,
         sourceSnapshotPinnedPaths = paths,
-        sourceSnapshotAdvanceOldVersions = oldVersions
+        sourceSnapshotAdvanceOldVersions = oldVersions,
+        sourceSnapshotRelations = snapshotRelations
       )
 
     it("path-binds an ADVANCE old-state read to the verified path at the pre-advance version") {
@@ -2452,6 +2465,27 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       ex.getMessage should include("accounts")
       ex.getMessage should include("old-state")
       ex.getMessage.toUpperCase should not include "FULL_REFRESH"
+    }
+
+    it("never substitutes a projection snapshot relation for a verified ADVANCE path") {
+      val stmt = rewriteAdvancing(
+        oldStateProgram("accounts"),
+        pins = Map("accounts" -> "VERSION AS OF 20"),
+        paths = Map("accounts" -> path("accounts")),
+        oldVersions = Map("accounts" -> 17L),
+        snapshotRelations = Map("accounts" -> "`unverified_snapshot`")
+      ).statements.head
+      stmt should include(s"delta.`${path("accounts")}` VERSION AS OF 17")
+      stmt should not include "unverified_snapshot"
+
+      val ex = the[PinnedSourcePathMissingException] thrownBy rewriteAdvancing(
+        oldStateProgram("accounts"),
+        pins = Map("accounts" -> "VERSION AS OF 20"),
+        paths = Map.empty,
+        oldVersions = Map("accounts" -> 17L),
+        snapshotRelations = Map("accounts" -> "`unverified_snapshot`")
+      )
+      ex.getMessage should include("old-state")
     }
 
     it("path-binds multiple advancing sources' old-state reads at their own pre-advance versions") {

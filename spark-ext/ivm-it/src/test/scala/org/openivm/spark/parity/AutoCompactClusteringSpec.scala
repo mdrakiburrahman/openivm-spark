@@ -105,15 +105,11 @@ class AutoCompactClusteringSpec extends IvmParitySpecBase("auto-compact-clusteri
     (result, fromMessages ++ fromThrowables)
   }
 
-  private def deltaMetadataConfig(mvName: String): Map[String, String] = {
-    val id = spark.sessionState.sqlParser.parseTableIdentifier(mvName)
-    DeltaLog.forTable(spark, id).update().metadata.configuration
-  }
+  private def deltaMetadataConfig(mvName: String): Map[String, String] =
+    DeltaLog.forTable(spark, mvDataLocation(mvName)).update().metadata.configuration
 
-  private def deltaVersion(mvName: String): Long = {
-    val id = spark.sessionState.sqlParser.parseTableIdentifier(mvName)
-    DeltaLog.forTable(spark, id).update().version
-  }
+  private def deltaVersion(mvName: String): Long =
+    DeltaLog.forTable(spark, mvDataLocation(mvName)).update().version
 
   private val AutoCompactProperty = "delta.autoOptimize.autoCompact"
 

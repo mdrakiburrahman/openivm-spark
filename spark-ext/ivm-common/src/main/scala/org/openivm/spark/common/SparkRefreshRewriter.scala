@@ -499,7 +499,8 @@ object SparkRefreshRewriter {
       uniqueKeys: Seq[UniqueKey] = Seq.empty,
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
-      mvVersionBeforeRefresh: Option[Long] = None
+      mvVersionBeforeRefresh: Option[Long] = None,
+      sourceSnapshotRelations: Map[String, String] = Map.empty
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -534,7 +535,8 @@ object SparkRefreshRewriter {
                   uniqueKeys,
                   uniqueJoinSimplifyEnabled,
                   sourceSnapshotVersions ++ sourceSnapshotAdvanceOldVersions,
-                  sourceSnapshotAdvanceOldVersions.keySet
+                  sourceSnapshotAdvanceOldVersions.keySet,
+                  sourceSnapshotRelations
                 )
               } else {
                 rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
@@ -917,7 +919,8 @@ object SparkRefreshRewriter {
       uniqueKeys: Seq[UniqueKey],
       uniqueJoinSimplifyEnabled: Boolean,
       sourceSnapshotVersions: Map[String, Long],
-      advancingPinnedSources: Set[String]
+      advancingPinnedSources: Set[String],
+      sourceSnapshotRelations: Map[String, String]
   ): String = {
     var s = stmt
     s = pruneUnchangedDeltaUnionTerms(s, deltaShape)
@@ -926,7 +929,7 @@ object SparkRefreshRewriter {
     s = simplifyUniqueKeyJoins(s, uniqueKeys, uniqueJoinSimplifyEnabled)
     s = deduplicateCteColumnAliases(s)
     s = stripTimestampPredicate(s)
-    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions, advancingPinnedSources)
+    s = rewriteRegularOldStateUnions(s, sourceSnapshotVersions, advancingPinnedSources, sourceSnapshotRelations)
     s = rewriteMemoryMainPrefix(s)
     s = rewriteInsertToCtas(s, viewLogicalName, viewDeltaPath)
     s = rewriteInsertNoColumnListToCtas(s, viewLogicalName, viewDeltaPath)
@@ -958,7 +961,8 @@ object SparkRefreshRewriter {
   private[common] def rewriteRegularOldStateUnions(
       sql: String,
       sourceSnapshotVersions: Map[String, Long],
-      advancingPinnedSources: Set[String] = Set.empty
+      advancingPinnedSources: Set[String] = Set.empty,
+      sourceSnapshotRelations: Map[String, String] = Map.empty
   ): String = {
     if (sourceSnapshotVersions.isEmpty) return sql
 
@@ -981,6 +985,9 @@ object SparkRefreshRewriter {
         shortTableName(table).toLowerCase -> version
     }
     if (versionsByShort.isEmpty) return sql
+    val relationsByShort = sourceSnapshotRelations.map { case (source, relation) =>
+      shortTableName(source).toLowerCase -> relation
+    }
 
     def singleDependency(body: String): Option[String] = {
       val refs = "(?is)\\b(?:FROM|JOIN)\\s+`?([A-Za-z][A-Za-z0-9_]*)`?".r
@@ -1036,8 +1043,15 @@ object SparkRefreshRewriter {
             case (true, true, Some((source, columns)), Some((deltaSource, _)))
                 if deltaSource.equalsIgnoreCase(s"openivm_delta_$source") =>
               versionsByShort.get(source.toLowerCase).map { version =>
-                val relation = oldStateSourceRelation(source)
-                val body     = s"SELECT $columns, CAST(1 AS INT) FROM $relation VERSION AS OF $version"
+                val relation =
+                  if (pinnedShortNames.contains(source.toLowerCase))
+                    s"${oldStateSourceRelation(source)} VERSION AS OF $version"
+                  else
+                    relationsByShort.getOrElse(
+                      source.toLowerCase,
+                      s"${oldStateSourceRelation(source)} VERSION AS OF $version"
+                    )
+                val body = s"SELECT $columns, CAST(1 AS INT) FROM $relation"
                 (cte.bodyStart, cte.bodyEnd, body)
               }
             case _ => None

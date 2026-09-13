@@ -181,6 +181,18 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
   }
 
   describe("Fabric V1 snapshot-pin resolution") {
+    it("derives consumption versions from pinned values under the operational identity") {
+      val operational = sourceIdentity("__managed_namespace.clock_rows")
+      val sql         = "SELECT p.id FROM `friendly`.`clock_rows` VERSION AS OF '7' AS p"
+      val pins        = resolvedPins(sql, Map("`friendly`.`clock_rows`" -> operational))
+      SparkTimeTravelSql.resolvedVersionPins(pins ++ pins) shouldBe Map(operational.alias -> 7L)
+      SparkTimeTravelSql.resolvedVersionPins(pins).keySet should not contain "friendly.clock_rows"
+      val conflicting = pins.head.copy(pin = pins.head.pin.copy(clause = "VERSION AS OF 8"))
+      an[IllegalArgumentException] should be thrownBy {
+        SparkTimeTravelSql.resolvedVersionPins(pins :+ conflicting)
+      }
+    }
+
     it("resolves the exact backticked arc_sql_db_bi windowed staging pin by DeltaLog.dataPath") {
       val operational = sourceIdentity(OperationalArmCollection)
       val pins = resolvedPins(
