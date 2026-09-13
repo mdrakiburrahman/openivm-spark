@@ -7,7 +7,7 @@ import org.openivm.spark.common.{FeatureGate, TimeTravelPinReason, TimeTravelPin
 import org.slf4j.MDC
 
 import java.time.Instant
-import java.util.LinkedHashMap
+import java.util.{LinkedHashMap, UUID}
 import java.util.concurrent.TimeUnit
 import scala.util.control.NonFatal
 
@@ -384,7 +384,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
             }
             Some(
               OpenIvmExecutionSpan.RenderedPayload(
-                logPayload,
+                exportPayload.map(_._2).getOrElse(logPayload),
                 exportPayload,
                 completedExportReuseAllowed
               )
@@ -605,7 +605,9 @@ object OpenIvmExecutionSpan extends Logging {
     val span = new OpenIvmExecutionSpan(
       materializedView = normalizeString(materializedView),
       operation = normalizeOperation(operation),
-      requestId = requestId.map(normalizeString).filter(_.nonEmpty),
+      requestId = normalizeOption(requestId)
+        .orElse(configuredExport.map(_.identity.requestId))
+        .orElse(Some(s"openivm-span-${UUID.randomUUID()}")),
       dbtNodeId = dbtNodeId.map(normalizeString).filter(_.nonEmpty),
       startedAtEpochMs = nowEpochMs,
       startedAtNanos = nowNanos,
@@ -874,10 +876,8 @@ object OpenIvmExecutionSpan extends Logging {
       fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
     }
     rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
-    if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
-    if (rocksDbFlushFailures > 0L) {
-      fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
-    }
+    fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
+    fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
     rocksDbJvmLockWaitMs.foreach(v => fields.put("rocksdb_jvm_lock_wait_ms", java.lang.Long.valueOf(v)))
     rocksDbExternalWaitMs.foreach(v => fields.put("rocksdb_external_lock_wait_ms", java.lang.Long.valueOf(v)))
     rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))

@@ -185,8 +185,9 @@ in Chrome tracing or Perfetto to inspect overlap visually.
 
 Independently of the profile gate, the driver now emits a single-line
 `OPENIVM_EXECUTION_SPAN {json}` record for each CREATE / REFRESH lifecycle.
-The JSON fields are stable and intentionally low-cardinality:
-`request_id` (when present from Spark local properties / MDC),
+The JSON field names are stable:
+`request_id` (preserved from caller correlation, otherwise a per-span
+`openivm-span-<UUID>` generated once at command start),
 `dbt_node_id` (from `openivm.node_id`, else `spark.jobGroup.id`, including MDC),
 `materialized_view`, `operation`, `engine_started_at`, `engine_completed_at`,
 `duration_ms`, `driver_thread`, `outcome`, optional
@@ -244,6 +245,14 @@ clause still reports `APPLIED`; see
 `rocksdb_backup_ms` is best-effort only: async state backup may finish after the
 primary span is emitted, and that late completion does NOT trigger a duplicate
 `OPENIVM_EXECUTION_SPAN` line.
+
+When campaign-scoped export is configured, stdout carries the same complete
+`openivm.execution-span` schema-1 payload as the exporter. Otherwise, the minimal
+stdout payload explicitly includes the observed `rocksdb_flush_count` and
+`rocksdb_flush_failed_count`, including zero, without claiming an incomplete
+schema-1 identity. Optional timings remain absent unless recorded. A generated
+request ID identifies the engine span; callers should still supply
+`openivm.request_id` when it must correlate with an external request.
 
 When query logging is enabled, CREATE records the path CTAS as
 `category=initial_load_ctas, stmt_order=0`, the named registration as

@@ -145,7 +145,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.get("rocksdb_write_count").asLong() shouldBe 2L
       payload.get("rocksdb_flush_ms").asLong() shouldBe 11L
       payload.get("rocksdb_flush_count").asLong() shouldBe 1L
-      payload.has("rocksdb_flush_failed_count") shouldBe false
+      payload.get("rocksdb_flush_failed_count").asLong() shouldBe 0L
       payload.get("rocksdb_jvm_lock_wait_ms").asLong() shouldBe 2L
       payload.get("rocksdb_external_lock_wait_ms").asLong() shouldBe 1L
       payload.get("rocksdb_backup_ms").asLong() shouldBe 17L
@@ -156,6 +156,80 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.has("campaign_id") shouldBe false
       payload.has("source_versions") shouldBe false
       payload.has("pending_delta_count") shouldBe false
+    }
+
+    it("emits explicit zero flush health and a stable request ID without inventing optional measurements") {
+      val payloads = withLogCapture { appender =>
+        val span      = OpenIvmExecutionSpan.start("default.stg_date_dim", "create")
+        val reentered = OpenIvmExecutionSpan.start("default.stg_date_dim", "create")
+        (reentered eq span) shouldBe true
+        span.recordRefreshClassification(Some("SIMPLE_PROJECTION"), Some("SIMPLE_PROJECTION"), Some("kept"))
+        span.recordTimeTravelPinStatus(TimeTravelPinStatus.Applied, TimeTravelPinReason.PinsResolved)
+        span.recordCatalogPublicationAdmission(32, 0L)
+        (1 to 4).foreach(_ => span.recordRocksDbWrite(1L))
+        span.complete("create_executed", "driver-create")
+        span.emitIfNeeded("failed_before_end", "unused")
+        span.emitIfNeeded("failed_before_end", "unused")
+
+        val next = OpenIvmExecutionSpan.start("default.stg_date_dim", "create")
+        next.complete("create_already_exists", "driver-create")
+        next.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 2
+      val payload = payloads.head
+      payload.path("request_id").asText() should startWith("openivm-span-")
+      payloads(1).path("request_id").asText() should not be payload.path("request_id").asText()
+      payload.get("rocksdb_flush_count").isIntegralNumber shouldBe true
+      payload.get("rocksdb_flush_count").asLong() shouldBe 0L
+      payload.get("rocksdb_flush_failed_count").isIntegralNumber shouldBe true
+      payload.get("rocksdb_flush_failed_count").asLong() shouldBe 0L
+      payload.path("rocksdb_write_count").asLong() shouldBe 4L
+      payload.path("rocksdb_write_ms").asLong() shouldBe 4L
+      payload.path("catalog_publication_admission_width").asInt() shouldBe 32
+      payload.path("compile_refresh_type").asText() shouldBe "SIMPLE_PROJECTION"
+      payload.path("effective_refresh_type").asText() shouldBe "SIMPLE_PROJECTION"
+      payload.path("time_travel_pin_status").asText() shouldBe "APPLIED"
+      payload.has("rocksdb_flush_ms") shouldBe false
+      payload.has("rocksdb_backup_ms") shouldBe false
+      payload.has("schema_id") shouldBe false
+      payload.has("schema_version") shouldBe false
+      payload.has("campaign_id") shouldBe false
+    }
+
+    it("uses the complete schema-1 export payload for stdout with unchanged request correlation") {
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "stdout-campaign",
+        requestId = "provided-request",
+        correlationId = "provided-correlation",
+        dbtNodeId = "model.stg_date_dim",
+        materializedView = "default.stg_date_dim",
+        operation = "create",
+        phase = "init"
+      )
+      val publisher = new CapturingPublisher()
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.startForTesting(identity, publisher)
+        span.recordRefreshClassification(Some("SIMPLE_PROJECTION"), Some("SIMPLE_PROJECTION"), Some("kept"))
+        span.recordTimeTravelPinStatus(TimeTravelPinStatus.Applied, TimeTravelPinReason.PinsResolved)
+        span.recordSourceVersions(Seq(OpenIvmTelemetryContract.SourceVersion("default.dates", 0L, 0L)))
+        span.complete("create_executed", "driver-create")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      publisher.payloads should have size 1
+      val payload = payloads.head
+      payload shouldBe publisher.payloads.head
+      OpenIvmTelemetryContract.SchemaRequiredFields.foreach(field => payload.has(field) shouldBe true)
+      payload.path("schema_id").asText() shouldBe OpenIvmTelemetryContract.SchemaId
+      payload.path("schema_version").asInt() shouldBe OpenIvmTelemetryContract.SchemaVersion
+      payload.path("request_id").asText() shouldBe identity.requestId
+      payload.path("correlation_id").asText() shouldBe identity.correlationId
+      payload.has("rocksdb_flush_ms") shouldBe false
+      payload.has("rocksdb_flush_failed_count") shouldBe false
     }
 
     it("exports the complete versioned schema with refresh classification and source versions") {
@@ -409,7 +483,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
 
       payloads should have size 1
       val payload = payloads.head
-      payload.has("request_id") shouldBe false
+      payload.path("request_id").asText() should startWith("openivm-span-")
       payload.has("dbt_node_id") shouldBe false
       payload.get("materialized_view").asText() shouldBe "default.fail_mv"
       payload.get("operation").asText() shouldBe "create"
