@@ -54,6 +54,7 @@ final class OpenIvmCliWorker {
 
     private static int run(String[] args)
             throws IOException, InterruptedException, ExecutionException {
+        OpenIvmCliLifecycle lifecycle = new OpenIvmCliLifecycle(Paths.get(args[1]).getParent());
         ProcessBuilder builder = new ProcessBuilder(args[0], ":memory:", "-jsonlines")
                 .redirectInput(Paths.get(args[1]).toFile());
         // Apply the native C++ runtime override to neither JVM.
@@ -62,18 +63,38 @@ final class OpenIvmCliWorker {
             builder.environment().put(
                     "LD_LIBRARY_PATH", inherited.isEmpty() ? args[5] : args[5] + ":" + inherited);
         }
-        Process process = builder.start();
-        ExecutorService readers = Executors.newFixedThreadPool(2, task -> {
-            Thread thread = new Thread(task, "openivm-cli-reader");
-            thread.setDaemon(true);
-            return thread;
-        });
+        if (!lifecycle.beginLaunch()) {
+            return PROCESS_TIMEOUT;
+        }
+        Process process;
         try {
-            Future<?> stdout = readers.submit(() -> copy(process.getInputStream(), Paths.get(args[2])));
-            Future<?> stderr = readers.submit(() -> copy(process.getErrorStream(), Paths.get(args[3])));
-            if (!process.waitFor(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            process = builder.start();
+        } catch (IOException launchFailure) {
+            lifecycle.acknowledgeExit();
+            throw launchFailure;
+        }
+        ExecutorService readers = null;
+        try {
+            lifecycle.acknowledgeNative(process.toHandle());
+            if (lifecycle.cancellationRequested()) {
                 return PROCESS_TIMEOUT;
             }
+            readers = Executors.newFixedThreadPool(2, task -> {
+                Thread thread = new Thread(task, "openivm-cli-reader");
+                thread.setDaemon(true);
+                return thread;
+            });
+            Future<?> stdout = readers.submit(() -> copy(process.getInputStream(), Paths.get(args[2])));
+            Future<?> stderr = readers.submit(() -> copy(process.getErrorStream(), Paths.get(args[3])));
+            long processDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(PROCESS_TIMEOUT_SECONDS);
+            while (process.isAlive()) {
+                long remaining = processDeadline - System.nanoTime();
+                if (lifecycle.cancellationRequested() || remaining <= 0L) {
+                    return PROCESS_TIMEOUT;
+                }
+                process.waitFor(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(50)), TimeUnit.NANOSECONDS);
+            }
+            lifecycle.acknowledgeExit();
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CLEANUP_TIMEOUT_SECONDS);
             try {
                 stdout.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
@@ -83,7 +104,9 @@ final class OpenIvmCliWorker {
             }
             return 0;
         } finally {
-            readers.shutdownNow();
+            if (readers != null) {
+                readers.shutdownNow();
+            }
             if (process.isAlive()) {
                 List<ProcessHandle> descendants;
                 try (Stream<ProcessHandle> children = process.descendants()) {
@@ -99,6 +122,7 @@ final class OpenIvmCliWorker {
                     throw new IOException("DuckDB CLI did not terminate after being killed");
                 }
             }
+            lifecycle.acknowledgeExit();
         }
     }
 

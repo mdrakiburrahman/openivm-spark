@@ -1,9 +1,9 @@
 package org.openivm.spark.compiler
 
-import java.io.File
+import java.io.{File, IOException}
 import java.nio.file.{Files, Path, Paths}
 import java.util.{Comparator, Locale}
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
@@ -67,6 +67,9 @@ final case class CompileRequest(
   * The DuckDB error text is preserved verbatim in `getMessage`.
   */
 final class OpenIvmCompileException(message: String, cause: Throwable) extends RuntimeException(message, cause)
+
+private[compiler] final class OpenIvmCliCleanupException(message: String, cause: Throwable)
+    extends IllegalStateException(message, cause)
 
 /** DuckDB CLI bridge that loads the OpenIVM extension and translates a Spark
   * materialized-view definition into a refresh-SQL program via the
@@ -160,8 +163,9 @@ class OpenIvmCompiler private (
     // right after `runCli` returns, so a failure bundle written from either
     // catch branch reflects the actual CLI output for this attempt even
     // though `stdout`/`stderr` themselves are scoped to the `try` block.
-    var lastStdout = ""
-    var lastStderr = ""
+    var lastStdout    = ""
+    var lastStderr    = ""
+    var retainControl = false
     try {
       val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
       val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
@@ -173,6 +177,9 @@ class OpenIvmCompiler private (
       val initLoad = parseInitialLoadSql(tmpDir, req)
       partial.copy(initialLoadSql = initLoad)
     } catch {
+      case e: OpenIvmCliCleanupException =>
+        retainControl = true
+        throw e
       case e: OpenIvmCompileException =>
         persistFailureBundleIfConfigured(req, normalizedViewSql, lastStdout, lastStderr)
         throw e
@@ -186,7 +193,7 @@ class OpenIvmCompiler private (
     } finally {
       OpenIvmMetrics.updateTimer("compiler.compile", System.nanoTime() - compileStarted)
       OpenIvmMetrics.CompilerInflight.decrementAndGet()
-      deleteDirRecursively(tmpDir)
+      if (!retainControl) deleteDirRecursively(tmpDir)
     }
   }
 
@@ -537,11 +544,13 @@ class OpenIvmCompiler private (
     * process inherits read-only input and pipes, never writable capture files.
     * A stuck pipe reader is confined to the helper JVM, not the Spark driver.
     */
-  private def runCli(script: String, tmpDir: Path): (String, String) = {
+  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) = {
     val stdinPath  = tmpDir.resolve("cli.sql")
     val stdoutPath = tmpDir.resolve("cli.stdout")
     val stderrPath = tmpDir.resolve("cli.stderr")
     val errorPath  = tmpDir.resolve("cli-worker.error")
+    val lifecycle  = new OpenIvmCliLifecycle(tmpDir)
+    lifecycle.initialize()
     Files.write(stdinPath, script.getBytes("UTF-8"))
     val javaBin = Paths.get(System.getProperty("java.home"), "bin")
     val javaPath =
@@ -567,6 +576,7 @@ class OpenIvmCompiler private (
     val process     = pb.start()
     var interrupted = false
     try {
+      lifecycle.acknowledgeHelper(process.toHandle())
       if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
         throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
       }
@@ -587,15 +597,11 @@ class OpenIvmCompiler private (
         throw e
     } finally {
       try {
-        if (process.isAlive) {
-          val descendants = process.descendants()
-          try descendants.iterator().asScala.toVector.reverse.foreach(_.destroyForcibly())
-          finally descendants.close()
-          process.destroyForcibly()
-          if (!process.waitFor(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            throw new OpenIvmCompileException("DuckDB CLI did not terminate within 10 seconds after being killed", null)
-          }
-        }
+        terminateCliProcess(
+          process,
+          lifecycle,
+          System.nanoTime() + TimeUnit.SECONDS.toNanos(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS)
+        )
       } catch {
         case e: InterruptedException =>
           interrupted = true
@@ -603,6 +609,73 @@ class OpenIvmCompiler private (
       } finally {
         if (interrupted) Thread.currentThread().interrupt()
       }
+    }
+  }
+
+  private[compiler] def terminateCliProcess(
+      process: Process,
+      lifecycle: OpenIvmCliLifecycle,
+      deadline: Long
+  ): Unit = {
+    def incomplete(reason: String, cause: Throwable = null): OpenIvmCliCleanupException =
+      new OpenIvmCliCleanupException(
+        s"DuckDB CLI cleanup incomplete: $reason; helper PID ${process.pid()}, control retained at ${lifecycle.directory()}",
+        cause
+      )
+    def remaining: Long = math.max(0L, deadline - System.nanoTime())
+
+    try {
+      // Cancellation and the worker's launch commitment use the same gate.
+      // An empty descendant snapshot alone is never permission to kill it.
+      lifecycle.requestCancellation(deadline)
+      var nativeStopped = !lifecycle.launchCommitted() || lifecycle.nativeExited()
+      while (!nativeStopped) {
+        val identity = lifecycle.nativeIdentity()
+        if (identity.isPresent && identity.get().start.isPresent) {
+          val recorded = identity.get()
+          val current  = ProcessHandle.of(recorded.pid)
+          if (!current.isPresent) nativeStopped = true
+          else {
+            val handle = current.get()
+            val birth  = handle.info().startInstant()
+            if (birth.isPresent) {
+              if (birth.get() == recorded.start.get()) {
+                val descendants = handle.descendants()
+                try descendants.iterator().asScala.toVector.reverse.foreach(_.destroyForcibly())
+                finally descendants.close()
+                handle.destroyForcibly()
+                handle.onExit().get(remaining, TimeUnit.NANOSECONDS)
+              }
+              // A different birth time means the recorded process has exited.
+              // Never signal a process that merely reused its numeric PID.
+              nativeStopped = true
+            } else if (!handle.isAlive) nativeStopped = true
+          }
+        }
+        nativeStopped = nativeStopped || lifecycle.nativeExited()
+        if (!nativeStopped) {
+          if (!process.isAlive)
+            throw incomplete("helper exited without acknowledging native-root termination")
+          if (remaining == 0L)
+            throw incomplete("native launch/termination acknowledgement was not received")
+          TimeUnit.NANOSECONDS.sleep(math.min(remaining, TimeUnit.MILLISECONDS.toNanos(10)))
+        }
+      }
+      // Only a revoked launch permission or a resolved native identity/exit
+      // acknowledgement makes forced helper termination safe.
+      if (process.isAlive) {
+        process.destroyForcibly()
+        if (!process.waitFor(remaining, TimeUnit.NANOSECONDS))
+          throw incomplete("helper did not terminate")
+      }
+    } catch {
+      case e: OpenIvmCliCleanupException => throw e
+      case e: IOException                => throw incomplete("startup coordination failed", e)
+      case e: TimeoutException           => throw incomplete("native-root termination was not confirmed", e)
+      case e: ExecutionException         => throw incomplete("native-root termination observation failed", e)
+      case e: InterruptedException =>
+        Thread.currentThread().interrupt()
+        throw incomplete("interrupted while reconciling native-root ownership", e)
     }
   }
 

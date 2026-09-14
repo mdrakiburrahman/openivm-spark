@@ -2,7 +2,7 @@ package org.openivm.spark.compiler
 
 import java.nio.file.{Files, Path, Paths}
 import java.time.LocalDate
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
@@ -946,6 +946,168 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       ex.getMessage should include("DuckDB CLI I/O helper failed")
       ex.getMessage should include("Cannot run program")
       ex.getMessage should include(compiler.cliPath)
+    }
+  }
+
+  it should "terminate a native root launched after the initial cancellation snapshot" in {
+    val dir       = Files.createTempDirectory(Files.createDirectories(Paths.get("target")), "compiler-startup-")
+    val lifecycle = new OpenIvmCliLifecycle(dir)
+    lifecycle.initialize()
+    lifecycle.beginLaunch() shouldBe true
+    val helper                        = new ProcessBuilder("sleep", "300").start()
+    val nativeProcess                 = new AtomicReference[Process]()
+    val published                     = new CountDownLatch(1)
+    val events                        = new ConcurrentLinkedQueue[String]()
+    val pool                          = Executors.newSingleThreadExecutor()
+    implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+    val launcher = Future {
+      val deadline = 5.seconds.fromNow
+      while (!lifecycle.cancellationRequested() && deadline.hasTimeLeft()) Thread.sleep(10)
+      lifecycle.cancellationRequested() shouldBe true
+      val child = new ProcessBuilder("sleep", "300").start()
+      nativeProcess.set(child)
+      events.add("native launched")
+      lifecycle.acknowledgeNative(child.toHandle())
+      published.countDown()
+    }
+    val racingHelper = new Process {
+      override def getOutputStream                                 = helper.getOutputStream
+      override def getInputStream                                  = helper.getInputStream
+      override def getErrorStream                                  = helper.getErrorStream
+      override def waitFor(): Int                                  = helper.waitFor()
+      override def waitFor(timeout: Long, unit: TimeUnit): Boolean = helper.waitFor(timeout, unit)
+      override def exitValue(): Int                                = helper.exitValue()
+      override def destroy(): Unit                                 = helper.destroy()
+      override def isAlive: Boolean                                = helper.isAlive
+      override def toHandle(): ProcessHandle                       = helper.toHandle()
+      override def descendants(): java.util.stream.Stream[ProcessHandle] = {
+        events.add("empty descendant snapshot")
+        java.util.stream.Stream.empty[ProcessHandle]()
+      }
+      override def destroyForcibly(): Process = {
+        lifecycle.requestCancellation(System.nanoTime() + 5.seconds.toNanos)
+        published.await(5, TimeUnit.SECONDS) shouldBe true
+        helper.destroyForcibly()
+        events.add("helper killed")
+        this
+      }
+    }
+    try {
+      sharedCompiler.terminateCliProcess(racingHelper, lifecycle, System.nanoTime() + 10.seconds.toNanos)
+      Await.result(launcher, 5.seconds)
+      withClue(events.iterator().asScala.mkString(" -> ") + ": ") {
+        nativeProcess.get().isAlive shouldBe false
+      }
+      helper.isAlive shouldBe false
+    } finally {
+      Option(nativeProcess.get()).foreach(_.destroyForcibly())
+      helper.destroyForcibly()
+      pool.shutdownNow()
+      pool.awaitTermination(5, TimeUnit.SECONDS) shouldBe true
+      val files = Files.walk(dir)
+      try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+      finally files.close()
+    }
+  }
+
+  it should "cancel a real worker during native startup before observing its PID" in {
+    withFakeCli("exec sleep 300") { (compiler, dir, context) =>
+      val controlDir = Files.createDirectory(dir.resolve("compile"))
+      val lifecycle  = new OpenIvmCliLifecycle(controlDir)
+      val worker     = new AtomicReference[Thread]()
+      val result = Future {
+        worker.set(Thread.currentThread())
+        try {
+          compiler.runCli("SELECT 1;\n", controlDir)
+          None
+        } catch {
+          case e: InterruptedException => Some(e)
+        }
+      }(context)
+      try {
+        val deadline = 5.seconds.fromNow
+        while (!lifecycle.launchCommitted() && deadline.hasTimeLeft()) Thread.sleep(1)
+        lifecycle.launchCommitted() shouldBe true
+        worker.get().interrupt()
+        Await.result(result, 10.seconds).isDefined shouldBe true
+        val identity = lifecycle.nativeIdentity()
+        identity.isPresent shouldBe true
+        identity.get().start.isPresent shouldBe true
+        val native = ProcessHandle.of(identity.get().pid)
+        if (native.isPresent) {
+          val birth = native.get().info().startInstant()
+          if (birth == identity.get().start) {
+            native.get().onExit().get(5, TimeUnit.SECONDS)
+            native.get().isAlive shouldBe false
+          } else if (!birth.isPresent) native.get().isAlive shouldBe false
+        }
+      } finally {
+        val files = Files.walk(controlDir)
+        try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+        finally files.close()
+      }
+    }
+  }
+
+  it should "prevent native startup when cancellation wins the launch gate" in {
+    val dir       = Files.createTempDirectory(Files.createDirectories(Paths.get("target")), "compiler-startup-cancel-")
+    val lifecycle = new OpenIvmCliLifecycle(dir)
+    lifecycle.initialize()
+    val helper = new ProcessBuilder("sleep", "300").start()
+    try {
+      sharedCompiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 5.seconds.toNanos)
+      lifecycle.beginLaunch() shouldBe false
+      lifecycle.launchCommitted() shouldBe false
+      helper.isAlive shouldBe false
+    } finally {
+      helper.destroyForcibly()
+      val files = Files.walk(dir)
+      try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+      finally files.close()
+    }
+  }
+
+  it should "report incomplete startup cleanup without force-killing an unacknowledged launcher" in {
+    val dir       = Files.createTempDirectory(Files.createDirectories(Paths.get("target")), "compiler-startup-pending-")
+    val lifecycle = new OpenIvmCliLifecycle(dir)
+    lifecycle.initialize()
+    lifecycle.beginLaunch() shouldBe true
+    val helper = new ProcessBuilder("sleep", "300").start()
+    try {
+      val ex = the[OpenIvmCliCleanupException] thrownBy
+        sharedCompiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 250.millis.toNanos)
+      ex.getMessage should include("cleanup incomplete")
+      ex.getMessage should include("acknowledgement was not received")
+      lifecycle.cancellationRequested() shouldBe true
+      helper.isAlive shouldBe true
+      Files.exists(dir.resolve("cli-launch.lock")) shouldBe true
+    } finally {
+      helper.destroyForcibly()
+      val files = Files.walk(dir)
+      try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+      finally files.close()
+    }
+  }
+
+  it should "not signal a PID whose birth time differs from the acknowledged native root" in {
+    val dir = Files.createTempDirectory(Files.createDirectories(Paths.get("target")), "compiler-startup-identity-")
+    val lifecycle = new OpenIvmCliLifecycle(dir)
+    lifecycle.initialize()
+    lifecycle.beginLaunch() shouldBe true
+    val helper = new ProcessBuilder("sleep", "300").start()
+    val decoy  = new ProcessBuilder("sleep", "300").start()
+    try {
+      Files.write(dir.resolve("cli-native.identity"), s"${decoy.pid()}\n1970-01-01T00:00:00Z\n".getBytes("UTF-8"))
+      Files.createFile(dir.resolve("cli-native.ready"))
+      sharedCompiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 5.seconds.toNanos)
+      decoy.isAlive shouldBe true
+      helper.isAlive shouldBe false
+    } finally {
+      decoy.destroyForcibly()
+      helper.destroyForcibly()
+      val files = Files.walk(dir)
+      try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+      finally files.close()
     }
   }
 
