@@ -1101,15 +1101,45 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       val lockKey      = Files.getAttribute(lockPath, "basic:fileKey")
       directoryKey should not be null
       lockKey should not be null
-      val channel         = FileChannel.open(lockPath, StandardOpenOption.WRITE)
-      val gate            = channel.lock()
+      val holderReady     = dir.resolve("gate-held")
+      val releaseGate     = dir.resolve("release-gate")
+      val javaPath        = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+      var holder: Process = null
       var helper: Process = null
+      def assertKernelGateHeld(): Unit = {
+        val probe = FileChannel.open(lockPath, StandardOpenOption.WRITE)
+        try {
+          val acquired = probe.tryLock()
+          if (acquired != null) {
+            acquired.release()
+            fail("The separate-process gate holder no longer owns the kernel lock")
+          }
+        } finally probe.close()
+      }
       try {
+        val holderClass = classOf[OpenIvmCliGateHolderFixture]
+        holder = new ProcessBuilder(
+          javaPath,
+          "-Xmx64m",
+          "-cp",
+          Paths.get(holderClass.getProtectionDomain.getCodeSource.getLocation.toURI).toString,
+          holderClass.getName,
+          lockPath.toString,
+          holderReady.toString,
+          releaseGate.toString
+        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+          .redirectError(ProcessBuilder.Redirect.DISCARD)
+          .start()
+        val readyDeadline = 5.seconds.fromNow
+        while (!Files.exists(holderReady) && readyDeadline.hasTimeLeft()) Thread.sleep(10)
+        Files.exists(holderReady) shouldBe true
+        holder.isAlive shouldBe true
+        assertKernelGateHeld()
         val workerClass = classOf[OpenIvmCliWorker]
         val script      = controlDir.resolve("cli.sql")
         Files.write(script, "SELECT 1;\n".getBytes("UTF-8"))
         helper = new ProcessBuilder(
-          Paths.get(System.getProperty("java.home"), "bin", "java").toString,
+          javaPath,
           "-Xmx64m",
           "-cp",
           Paths.get(workerClass.getProtectionDomain.getCodeSource.getLocation.toURI).toString,
@@ -1131,15 +1161,20 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
           lifecycle.cancellationRequested() shouldBe true
         }
         helper.isAlive shouldBe true
-        gate.isValid shouldBe true
+        holder.isAlive shouldBe true
+        assertKernelGateHeld()
         Files.getAttribute(controlDir, "basic:fileKey") shouldBe directoryKey
         Files.getAttribute(lockPath, "basic:fileKey") shouldBe lockKey
         val cancellationKey = Files.getAttribute(cancelled, "basic:fileKey")
         the[OpenIvmCliCleanupException] thrownBy
           compiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 50.millis.toNanos)
         Files.getAttribute(cancelled, "basic:fileKey") shouldBe cancellationKey
+        holder.isAlive shouldBe true
+        assertKernelGateHeld()
 
-        gate.release()
+        Files.createFile(releaseGate)
+        holder.waitFor(5, TimeUnit.SECONDS) shouldBe true
+        holder.exitValue() shouldBe 0
         helper.waitFor(5, TimeUnit.SECONDS) shouldBe true
         helper.exitValue() shouldBe OpenIvmCliWorker.PROCESS_TIMEOUT
         lifecycle.launchCommitted() shouldBe false
@@ -1157,11 +1192,16 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
             helper.waitFor(5, TimeUnit.SECONDS) shouldBe true
           }
         } finally {
-          if (gate.isValid) gate.release()
-          channel.close()
-          val files = Files.walk(controlDir)
-          try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
-          finally files.close()
+          try {
+            if (holder != null) {
+              holder.destroyForcibly()
+              holder.waitFor(5, TimeUnit.SECONDS) shouldBe true
+            }
+          } finally {
+            val files = Files.walk(controlDir)
+            try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+            finally files.close()
+          }
         }
       }
     }
