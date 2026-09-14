@@ -533,39 +533,52 @@ class OpenIvmCompiler private (
   /** Escapes single-quote characters for embedding a value inside SQL single quotes. */
   private def escapeSql(s: String): String = s.replace("'", "''")
 
-  /** Spawns `duckdb :memory: -jsonlines` and returns (stdout, stderr) after
-    * the process exits. Request-owned files avoid blocking on a child that
-    * stops reading stdin or leaves inherited stdout/stderr handles open.
+  /** Runs the native CLI behind a bounded, Java-only I/O helper. The native
+    * process inherits read-only input and pipes, never writable capture files.
+    * A stuck pipe reader is confined to the helper JVM, not the Spark driver.
     */
   private def runCli(script: String, tmpDir: Path): (String, String) = {
     val stdinPath  = tmpDir.resolve("cli.sql")
     val stdoutPath = tmpDir.resolve("cli.stdout")
     val stderrPath = tmpDir.resolve("cli.stderr")
+    val errorPath  = tmpDir.resolve("cli-worker.error")
     Files.write(stdinPath, script.getBytes("UTF-8"))
-    val pb = new ProcessBuilder(cliPath, ":memory:", "-jsonlines")
+    val javaBin = Paths.get(System.getProperty("java.home"), "bin")
+    val javaPath =
+      if (Files.isRegularFile(javaBin.resolve("java.exe"))) javaBin.resolve("java.exe") else javaBin.resolve("java")
+    val workerClass     = classOf[OpenIvmCliWorker]
+    val workerClasspath = Paths.get(workerClass.getProtectionDomain.getCodeSource.getLocation.toURI).toString
+    val pb = new ProcessBuilder(
+      javaPath.toString,
+      "-Xmx64m",
+      "-cp",
+      workerClasspath,
+      workerClass.getName,
+      cliPath,
+      stdinPath.toString,
+      stdoutPath.toString,
+      stderrPath.toString,
+      errorPath.toString,
+      nativeLibraryPath.getOrElse("")
+    )
       .redirectInput(stdinPath.toFile)
-      .redirectOutput(stdoutPath.toFile)
-      .redirectError(stderrPath.toFile)
-    // The CLI is a separate native binary, so the host's default C++ runtime
-    // may be older than the one it was linked against (a managed Spark image
-    // can ship a libstdc++ without the `GLIBCXX_3.4.3x` symbols the CLI needs,
-    // and the loader then kills it before it reads a single byte of the
-    // script). `nativeLibraryPath` prepends directories that carry a
-    // sufficient runtime FOR THIS SUBPROCESS ONLY — the driver JVM's own
-    // library resolution is deliberately left untouched.
-    nativeLibraryPath.foreach { extra =>
-      val env      = pb.environment()
-      val existing = Option(env.get("LD_LIBRARY_PATH")).getOrElse("")
-      env.put(
-        "LD_LIBRARY_PATH",
-        if (existing.isEmpty) extra else s"$extra:$existing"
-      )
-    }
+      .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+      .redirectError(ProcessBuilder.Redirect.DISCARD)
     val process     = pb.start()
     var interrupted = false
     try {
-      if (!process.waitFor(120, TimeUnit.SECONDS)) {
+      if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
         throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+      }
+      process.exitValue() match {
+        case 0 =>
+        case OpenIvmCliWorker.PROCESS_TIMEOUT =>
+          throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+        case OpenIvmCliWorker.OUTPUT_TIMEOUT =>
+          throw new OpenIvmCompileException("DuckDB CLI output streams remained open after process exit", null)
+        case status =>
+          val detail = if (Files.exists(errorPath)) s": ${readCliOutput(errorPath)}" else ""
+          throw new OpenIvmCompileException(s"DuckDB CLI I/O helper failed (exit $status)$detail", null)
       }
       (readCliOutput(stdoutPath), readCliOutput(stderrPath))
     } catch {
@@ -579,7 +592,7 @@ class OpenIvmCompiler private (
           try descendants.iterator().asScala.toVector.reverse.foreach(_.destroyForcibly())
           finally descendants.close()
           process.destroyForcibly()
-          if (!process.waitFor(10, TimeUnit.SECONDS)) {
+          if (!process.waitFor(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             throw new OpenIvmCompileException("DuckDB CLI did not terminate within 10 seconds after being killed", null)
           }
         }
@@ -594,8 +607,8 @@ class OpenIvmCompiler private (
   }
 
   private def readCliOutput(path: Path): String = {
-    // Snapshot the length: an inherited file handle must not make us chase
-    // output appended by a descendant after the CLI itself has exited.
+    // The helper has exited and owned every writable capture descriptor.
+    // The driver reads completed files, never a native process pipe.
     val length = Math.toIntExact(Files.size(path))
     val stream = Files.newInputStream(path)
     try new String(stream.readNBytes(length), "UTF-8").linesIterator.mkString("\n")

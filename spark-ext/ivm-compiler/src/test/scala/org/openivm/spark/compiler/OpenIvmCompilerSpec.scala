@@ -849,21 +849,51 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     }
   }
 
-  it should "not wait for inherited output handles after the DuckDB CLI exits" in {
+  it should "contain inherited output writers before fixture teardown" in {
     withFakeCli(
       """cat > /dev/null
-        |sleep 300 &
+        |(
+        |  trap '' PIPE
+        |  while [[ ! -e "$fixture_dir/write-after-return" ]]; do sleep 0.05; done
+        |  while :; do
+        |    stdout_writable=0
+        |    stderr_writable=0
+        |    if printf '%s\n' 'orphan stdout'; then stdout_writable=1; fi
+        |    if printf '%s\n' 'orphan stderr' >&2; then stderr_writable=1; fi
+        |    if [[ "$stdout_writable" -eq 0 && "$stderr_writable" -eq 0 ]]; then
+        |      : > "$fixture_dir/writes-rejected"
+        |      exit 0
+        |    fi
+        |    : > "$fixture_dir/wrote-after-return"
+        |    sleep 0.05
+        |  done
+        |) &
         |printf '%s\n' "$!" >> "$fixture_dir/pids"
         |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
         |sleep 0.5
         |""".stripMargin
-    ) { (compiler, _, context) =>
+    ) { (compiler, dir, context) =>
       implicit val ec: ExecutionContext = context
-      val result = awaitCli(15.seconds) {
-        compiler.compile(cliTestRequest)
+      val outcome =
+        try
+          Right(awaitCli(15.seconds) {
+            compiler.compile(cliTestRequest)
+          })
+        catch { case e: OpenIvmCompileException => Left(e) }
+      val writer = ProcessHandle.of(Files.readAllLines(dir.resolve("pids")).get(1).toLong).get()
+      Files.write(dir.resolve("write-after-return"), Array.emptyByteArray)
+      writer.onExit().get(5, TimeUnit.SECONDS)
+      withClue("The inherited writer could still append output after compilation returned") {
+        Files.exists(dir.resolve("wrote-after-return")) shouldBe false
       }
-      result.refreshType shouldBe 2
-      result.sql shouldBe "SELECT 1;"
+      Files.exists(dir.resolve("writes-rejected")) shouldBe true
+      outcome match {
+        case Right(result) =>
+          result.refreshType shouldBe 2
+          result.sql shouldBe "SELECT 1;"
+        case Left(failure) =>
+          failure.getMessage shouldBe "DuckDB CLI output streams remained open after process exit"
+      }
     }
   }
 
@@ -903,6 +933,19 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       ex.getMessage should include("failed during openivm_compile_with_facts")
       ex.getMessage should include("CLI stderr:\nsynthetic CLI failure\nsecond line")
       assertCliStopped(dir)
+    }
+  }
+
+  it should "report a DuckDB CLI launch failure through the bounded I/O helper" in {
+    withFakeCli("") { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      dir.resolve("duckdb").toFile.setExecutable(false) shouldBe true
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(15.seconds) {
+        compiler.compile(cliTestRequest)
+      }
+      ex.getMessage should include("DuckDB CLI I/O helper failed")
+      ex.getMessage should include("Cannot run program")
+      ex.getMessage should include(compiler.cliPath)
     }
   }
 
