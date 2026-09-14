@@ -4,8 +4,8 @@
 #  openivm-spark — multi-stage development image.
 #
 #  Stages:
-#    1. openivm-builder      Builds OpenIVM (with our forked lpts submodule
-#                            substituted in) as a DuckDB extension. Produces
+#    1. openivm-builder      Builds OpenIVM with the explicitly pinned LPTS
+#                            sources as a DuckDB extension. Produces
 #                            /artifacts/openivm.duckdb_extension and the
 #                            statically-linked duckdb CLI.
 #    2. openivm-tester       Inherits stage 1's full build tree so `make test`
@@ -35,7 +35,7 @@ ARG OPENIVM_REPO
 ARG OPENIVM_BRANCH=dev/mdrrahman/add-months-ila
 ARG OPENIVM_COMMIT
 ARG LPTS_REPO
-ARG LPTS_BRANCH=dev/mdrrahman/spark-add-months
+ARG LPTS_BRANCH=main
 ARG LPTS_COMMIT
 ARG DUCKDB_REF=v1.5.2
 ARG DUCKDB_COMMIT=8a5851971fae891f292c2714d86046ee018e9737
@@ -55,9 +55,8 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
 
 WORKDIR /src
 
-# Clone openivm at the pinned commit on the openivm-spark branch, then
-# override the lpts submodule to point at OUR fork so we never need to commit
-# a submodule-URL bump into openivm to pick up new lpts work.
+# Clone OpenIVM at the pinned commit, then apply the explicit LPTS
+# repository and revision selected by pins.env.
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . && \
     git checkout "${OPENIVM_COMMIT}" && \
