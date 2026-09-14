@@ -1,8 +1,9 @@
 package org.openivm.spark.compiler
 
-import java.nio.file.Files
+import java.nio.file.{Files, Path, Paths}
 import java.time.LocalDate
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
@@ -12,6 +13,7 @@ import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import scala.collection.JavaConverters._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.io.Source
@@ -59,6 +61,83 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     */
   private def pinPath(short: String): String =
     s"abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables/$short"
+
+  private val cliTestRequest = CompileRequest(
+    viewName = "mv_cli_liveness",
+    viewSql = "SELECT id FROM cli_source",
+    sources = Map("cli_source" -> tSchema)
+  )
+
+  private def withFakeCli(body: String)(test: (OpenIvmCompiler, Path, ExecutionContext) => Unit): Unit = {
+    val dir = Files.createTempDirectory(Files.createDirectories(Paths.get("target")), "compiler-cli-").toAbsolutePath
+    val wrapper = dir.resolve("duckdb")
+    val pidFile = dir.resolve("pids")
+    Files.write(
+      wrapper,
+      s"""#!/usr/bin/env bash
+         |set -euo pipefail
+         |fixture_dir='${dir.toString.replace("'", "'\\''")}'
+         |printf '%s\n' "$$$$" > "$$fixture_dir/pids"
+         |$body
+         |""".stripMargin.getBytes("UTF-8")
+    )
+    wrapper.toFile.setExecutable(true) shouldBe true
+    val compiler = OpenIvmCompiler.build(extensionPath, cliPath = wrapper.toString)
+    val pool     = Executors.newSingleThreadExecutor()
+    try test(compiler, dir, ExecutionContext.fromExecutorService(pool))
+    finally {
+      val processes =
+        if (Files.exists(pidFile)) {
+          Files
+            .readAllLines(pidFile)
+            .asScala
+            .filter(_.nonEmpty)
+            .flatMap { pid =>
+              val process = ProcessHandle.of(pid.toLong)
+              if (process.isPresent) Some(process.get()) else None
+            }
+            .toVector
+        } else Vector.empty
+      processes.reverse.foreach(_.destroyForcibly())
+      pool.shutdownNow()
+      pool.awaitTermination(10, TimeUnit.SECONDS) shouldBe true
+      processes.filter(_.isAlive).foreach(_.onExit().get(10, TimeUnit.SECONDS))
+      compiler.close()
+      val files = Files.list(dir)
+      try files.forEach(path => Files.deleteIfExists(path))
+      finally files.close()
+      Files.deleteIfExists(dir)
+    }
+  }
+
+  private def awaitCli[A](limit: FiniteDuration)(body: => A)(implicit ec: ExecutionContext): A = {
+    @volatile var worker: Thread = null
+    val result = Future {
+      worker = Thread.currentThread()
+      body
+    }
+    val returned =
+      try {
+        Await.ready(result, limit)
+        true
+      } catch {
+        case _: scala.concurrent.TimeoutException => false
+      }
+    val stack = Option(worker).map(_.getStackTrace.mkString("\n")).getOrElse("worker not started")
+    withClue(s"Compiler did not return within $limit. Worker stack:\n$stack\n") {
+      returned shouldBe true
+    }
+    Await.result(result, Duration.Zero)
+  }
+
+  private def assertCliStopped(dir: Path): Unit =
+    Files.readAllLines(dir.resolve("pids")).asScala.foreach { pid =>
+      val process = ProcessHandle.of(pid.toLong)
+      if (process.isPresent) {
+        process.get().onExit().get(5, TimeUnit.SECONDS)
+        process.get().isAlive shouldBe false
+      }
+    }
 
   // ── Test 1: Boot ─────────────────────────────────────────────────────────────
 
@@ -740,6 +819,114 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     sharedCompiler.declareRelyFkStatements(req) should contain only
       """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
+  }
+
+  it should "terminate a stalled DuckDB CLI within the compilation deadline" in {
+    withFakeCli(
+      """cat > "$fixture_dir/input.sql"
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
+        |sleep 300 &
+        |printf '%s\n' "$!" >> "$fixture_dir/pids"
+        |wait
+        |""".stripMargin
+    ) { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      val baseline                      = OpenIvmMetrics.CompilerInflight.get()
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(135.seconds) {
+        compiler.compile(cliTestRequest)
+      }
+      ex.getMessage shouldBe "DuckDB CLI timed out after 120 seconds"
+      OpenIvmMetrics.CompilerInflight.get() shouldBe baseline
+      assertCliStopped(dir)
+      val input = new String(Files.readAllBytes(dir.resolve("input.sql")), "UTF-8")
+      val scratchPath = input.linesIterator
+        .find(_.startsWith("SET openivm_files_path="))
+        .get
+        .stripPrefix("SET openivm_files_path='")
+        .stripSuffix("';")
+        .replace("''", "'")
+      Files.exists(Paths.get(scratchPath)) shouldBe false
+    }
+  }
+
+  it should "not wait for inherited output handles after the DuckDB CLI exits" in {
+    withFakeCli(
+      """cat > /dev/null
+        |sleep 300 &
+        |printf '%s\n' "$!" >> "$fixture_dir/pids"
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
+        |sleep 0.5
+        |""".stripMargin
+    ) { (compiler, _, context) =>
+      implicit val ec: ExecutionContext = context
+      val result = awaitCli(15.seconds) {
+        compiler.compile(cliTestRequest)
+      }
+      result.refreshType shouldBe 2
+      result.sql shouldBe "SELECT 1;"
+    }
+  }
+
+  it should "collect DuckDB CLI output larger than pipe buffers without losing result rows" in {
+    withFakeCli(
+      """cat > /dev/null
+        |for ((i=0; i<4096; i++)); do
+        |  printf '%s\n' 'synthetic stdout diagnostic padding'
+        |  printf '%s\n' 'synthetic stderr diagnostic padding' >&2
+        |done
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 2;"}'
+        |""".stripMargin
+    ) { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      val result = awaitCli(15.seconds) {
+        compiler.compile(cliTestRequest)
+      }
+      result.refreshType shouldBe 2
+      result.sql shouldBe "SELECT 1;\nSELECT 2;"
+      assertCliStopped(dir)
+    }
+  }
+
+  it should "preserve DuckDB CLI error diagnostics and clean up after a nonzero exit" in {
+    withFakeCli(
+      """cat > /dev/null
+        |printf '%s\n' '{"MATERIALIZED VIEW CREATION":"true"}'
+        |printf 'synthetic CLI failure\r\nsecond line\r\n' >&2
+        |exit 7
+        |""".stripMargin
+    ) { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(15.seconds) {
+        compiler.compile(cliTestRequest)
+      }
+      ex.getMessage should include("failed during openivm_compile_with_facts")
+      ex.getMessage should include("CLI stderr:\nsynthetic CLI failure\nsecond line")
+      assertCliStopped(dir)
+    }
+  }
+
+  it should "interrupt a DuckDB CLI that never reads a large input script without leaking its process" in {
+    withFakeCli("exec sleep 300") { (compiler, dir, context) =>
+      val worker      = new AtomicReference[Thread]()
+      val interrupted = new AtomicBoolean(false)
+      val baseline    = OpenIvmMetrics.CompilerInflight.get()
+      val result = Future {
+        worker.set(Thread.currentThread())
+        try
+          compiler.compile(cliTestRequest.copy(viewSql = cliTestRequest.viewSql + " /*" + ("padding " * 32768) + "*/"))
+        finally interrupted.set(Thread.currentThread().isInterrupted)
+      }(context)
+      val startedDeadline = 5.seconds.fromNow
+      while (!Files.exists(dir.resolve("pids")) && startedDeadline.hasTimeLeft()) Thread.sleep(10)
+      Files.exists(dir.resolve("pids")) shouldBe true
+      worker.get().interrupt()
+      val ex = the[OpenIvmCompileException] thrownBy Await.result(result, 10.seconds)
+      ex.getCause shouldBe a[InterruptedException]
+      interrupted.get() shouldBe true
+      OpenIvmMetrics.CompilerInflight.get() shouldBe baseline
+      assertCliStopped(dir)
+    }
   }
 
   // ── Test 8: Thread safety ─────────────────────────────────────────────────

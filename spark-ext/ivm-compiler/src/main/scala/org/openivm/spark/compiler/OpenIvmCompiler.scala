@@ -1,13 +1,15 @@
 package org.openivm.spark.compiler
 
-import java.io.{BufferedReader, File, InputStreamReader}
+import java.io.File
 import java.nio.file.{Files, Path, Paths}
 import java.util.{Comparator, Locale}
-import java.util.concurrent.{Callable, Executors, TimeUnit}
+import java.util.concurrent.TimeUnit
 
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
+
+import scala.collection.JavaConverters._
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -163,7 +165,7 @@ class OpenIvmCompiler private (
     try {
       val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
       val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-        runCli(script)
+        runCli(script, tmpDir)
       }
       lastStdout = stdout
       lastStderr = stderr
@@ -531,12 +533,19 @@ class OpenIvmCompiler private (
   /** Escapes single-quote characters for embedding a value inside SQL single quotes. */
   private def escapeSql(s: String): String = s.replace("'", "''")
 
-  /** Spawns `duckdb :memory: -jsonlines`, pipes `script` on stdin, and returns
-    * (stdout, stderr) after the process exits.  Stdout and stderr are read in
-    * parallel threads to avoid pipe-buffer deadlocks.
+  /** Spawns `duckdb :memory: -jsonlines` and returns (stdout, stderr) after
+    * the process exits. Request-owned files avoid blocking on a child that
+    * stops reading stdin or leaves inherited stdout/stderr handles open.
     */
-  private def runCli(script: String): (String, String) = {
+  private def runCli(script: String, tmpDir: Path): (String, String) = {
+    val stdinPath  = tmpDir.resolve("cli.sql")
+    val stdoutPath = tmpDir.resolve("cli.stdout")
+    val stderrPath = tmpDir.resolve("cli.stderr")
+    Files.write(stdinPath, script.getBytes("UTF-8"))
     val pb = new ProcessBuilder(cliPath, ":memory:", "-jsonlines")
+      .redirectInput(stdinPath.toFile)
+      .redirectOutput(stdoutPath.toFile)
+      .redirectError(stderrPath.toFile)
     // The CLI is a separate native binary, so the host's default C++ runtime
     // may be older than the one it was linked against (a managed Spark image
     // can ship a libstdc++ without the `GLIBCXX_3.4.3x` symbols the CLI needs,
@@ -552,32 +561,45 @@ class OpenIvmCompiler private (
         if (existing.isEmpty) extra else s"$extra:$existing"
       )
     }
-    val process = pb.start()
-
-    val executor = Executors.newFixedThreadPool(2)
-    val stdoutF = executor.submit(new Callable[String] {
-      def call(): String = {
-        val r = new BufferedReader(new InputStreamReader(process.getInputStream, "UTF-8"))
-        try Iterator.continually(r.readLine()).takeWhile(_ != null).mkString("\n")
-        finally r.close()
+    val process     = pb.start()
+    var interrupted = false
+    try {
+      if (!process.waitFor(120, TimeUnit.SECONDS)) {
+        throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
       }
-    })
-    val stderrF = executor.submit(new Callable[String] {
-      def call(): String = {
-        val r = new BufferedReader(new InputStreamReader(process.getErrorStream, "UTF-8"))
-        try Iterator.continually(r.readLine()).takeWhile(_ != null).mkString("\n")
-        finally r.close()
+      (readCliOutput(stdoutPath), readCliOutput(stderrPath))
+    } catch {
+      case e: InterruptedException =>
+        interrupted = true
+        throw e
+    } finally {
+      try {
+        if (process.isAlive) {
+          val descendants = process.descendants()
+          try descendants.iterator().asScala.toVector.reverse.foreach(_.destroyForcibly())
+          finally descendants.close()
+          process.destroyForcibly()
+          if (!process.waitFor(10, TimeUnit.SECONDS)) {
+            throw new OpenIvmCompileException("DuckDB CLI did not terminate within 10 seconds after being killed", null)
+          }
+        }
+      } catch {
+        case e: InterruptedException =>
+          interrupted = true
+          throw e
+      } finally {
+        if (interrupted) Thread.currentThread().interrupt()
       }
-    })
+    }
+  }
 
-    val stdin = process.getOutputStream
-    stdin.write(script.getBytes("UTF-8"))
-    stdin.close()
-
-    process.waitFor(120, TimeUnit.SECONDS)
-    executor.shutdown()
-    executor.awaitTermination(10, TimeUnit.SECONDS)
-    (stdoutF.get(), stderrF.get())
+  private def readCliOutput(path: Path): String = {
+    // Snapshot the length: an inherited file handle must not make us chase
+    // output appended by a descendant after the CLI itself has exited.
+    val length = Math.toIntExact(Files.size(path))
+    val stream = Files.newInputStream(path)
+    try new String(stream.readNBytes(length), "UTF-8").linesIterator.mkString("\n")
+    finally stream.close()
   }
 
   private def parseCompileResult(stdout: String, viewName: String, stderr: String): CompiledRefresh = {
