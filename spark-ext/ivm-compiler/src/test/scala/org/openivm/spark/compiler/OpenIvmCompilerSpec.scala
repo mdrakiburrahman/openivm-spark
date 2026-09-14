@@ -1,6 +1,7 @@
 package org.openivm.spark.compiler
 
-import java.nio.file.{Files, Path, Paths}
+import java.nio.channels.FileChannel
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.time.LocalDate
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
@@ -1086,6 +1087,83 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       val files = Files.walk(dir)
       try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
       finally files.close()
+    }
+  }
+
+  it should "retain irreversible cancellation when the launch gate cannot be acquired" in {
+    withFakeCli("printf '%s\\n' 'unexpected native capture'") { (compiler, dir, _) =>
+      val controlDir = Files.createDirectory(dir.resolve("compile"))
+      val lifecycle  = new OpenIvmCliLifecycle(controlDir)
+      lifecycle.initialize()
+      val lockPath     = controlDir.resolve("cli-launch.lock")
+      val cancelled    = controlDir.resolve("cli-cancelled")
+      val directoryKey = Files.getAttribute(controlDir, "basic:fileKey")
+      val lockKey      = Files.getAttribute(lockPath, "basic:fileKey")
+      directoryKey should not be null
+      lockKey should not be null
+      val channel         = FileChannel.open(lockPath, StandardOpenOption.WRITE)
+      val gate            = channel.lock()
+      var helper: Process = null
+      try {
+        val workerClass = classOf[OpenIvmCliWorker]
+        val script      = controlDir.resolve("cli.sql")
+        Files.write(script, "SELECT 1;\n".getBytes("UTF-8"))
+        helper = new ProcessBuilder(
+          Paths.get(System.getProperty("java.home"), "bin", "java").toString,
+          "-Xmx64m",
+          "-cp",
+          Paths.get(workerClass.getProtectionDomain.getCodeSource.getLocation.toURI).toString,
+          workerClass.getName,
+          compiler.cliPath,
+          script.toString,
+          controlDir.resolve("cli.stdout").toString,
+          controlDir.resolve("cli.stderr").toString,
+          controlDir.resolve("cli-worker.error").toString,
+          ""
+        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+          .redirectError(ProcessBuilder.Redirect.DISCARD)
+          .start()
+        val ex = the[OpenIvmCliCleanupException] thrownBy
+          compiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 250.millis.toNanos)
+        ex.getMessage should include("cleanup incomplete")
+        ex.getMessage should include("startup coordination failed")
+        withClue("Cancellation must remain observable after gate acquisition times out: ") {
+          lifecycle.cancellationRequested() shouldBe true
+        }
+        helper.isAlive shouldBe true
+        gate.isValid shouldBe true
+        Files.getAttribute(controlDir, "basic:fileKey") shouldBe directoryKey
+        Files.getAttribute(lockPath, "basic:fileKey") shouldBe lockKey
+        val cancellationKey = Files.getAttribute(cancelled, "basic:fileKey")
+        the[OpenIvmCliCleanupException] thrownBy
+          compiler.terminateCliProcess(helper, lifecycle, System.nanoTime() + 50.millis.toNanos)
+        Files.getAttribute(cancelled, "basic:fileKey") shouldBe cancellationKey
+
+        gate.release()
+        helper.waitFor(5, TimeUnit.SECONDS) shouldBe true
+        helper.exitValue() shouldBe OpenIvmCliWorker.PROCESS_TIMEOUT
+        lifecycle.launchCommitted() shouldBe false
+        lifecycle.nativeIdentity().isPresent shouldBe false
+        Seq(dir.resolve("pids"), controlDir.resolve("cli.stdout"), controlDir.resolve("cli.stderr"))
+          .foreach(path => Files.exists(path) shouldBe false)
+        (1 to 2).foreach(_ => lifecycle.requestCancellation(System.nanoTime() + 5.seconds.toNanos))
+        Files.getAttribute(cancelled, "basic:fileKey") shouldBe cancellationKey
+        Files.getAttribute(controlDir, "basic:fileKey") shouldBe directoryKey
+        Files.getAttribute(lockPath, "basic:fileKey") shouldBe lockKey
+      } finally {
+        try {
+          if (helper != null) {
+            helper.destroyForcibly()
+            helper.waitFor(5, TimeUnit.SECONDS) shouldBe true
+          }
+        } finally {
+          if (gate.isValid) gate.release()
+          channel.close()
+          val files = Files.walk(controlDir)
+          try files.sorted(java.util.Comparator.reverseOrder()).forEach(path => Files.deleteIfExists(path))
+          finally files.close()
+        }
+      }
     }
   }
 

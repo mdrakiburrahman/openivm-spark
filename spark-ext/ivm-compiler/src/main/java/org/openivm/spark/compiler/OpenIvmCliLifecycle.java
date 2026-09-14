@@ -5,6 +5,7 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -50,10 +51,14 @@ final class OpenIvmCliLifecycle {
     }
 
     void requestCancellation(long deadline) throws IOException, InterruptedException {
+        // Terminal intent must survive failure to acquire the ownership gate.
+        try {
+            Files.createFile(cancellation);
+        } catch (FileAlreadyExistsException alreadyCancelled) {
+            // Retain the original marker and its inode on repeated cancellation.
+        }
         try (Locked ignored = lockUntil(deadline)) {
-            if (!Files.exists(cancellation)) {
-                Files.createFile(cancellation);
-            }
+            // This barrier orders reconciliation against a committed launch.
         }
     }
 
