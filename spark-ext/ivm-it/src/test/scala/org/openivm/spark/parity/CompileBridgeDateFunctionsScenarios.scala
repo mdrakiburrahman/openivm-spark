@@ -5,8 +5,13 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 import org.openivm.spark.common.MvCatalog
 
 /** Parity coverage for the compile-bridge shims that keep Spark's 1-arg / 2-arg
-  * `to_date`, 1-arg / 2-arg `to_timestamp`, `date_format`, and the Spark-only
-  * `last_value(expr, ignoreNulls)` window form on the incremental path.
+  * `to_date`, 1-arg / 2-arg `to_timestamp`, `date_format`, the Spark-only
+  * `last_value(expr, ignoreNulls)` / `first_value(expr, ignoreNulls)` window
+  * forms, `current_date()` / `current_timestamp()` (incl.
+  * `CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)`), and Spark's backslash-escaped
+  * string-literal convention (e.g. the nested-REPLACE `normalize_os_name`
+  * fragment) working end-to-end through Spark SQL parse -> compile bridge ->
+  * DuckDB compile -> refresh SQL -> Spark execution.
   *
   * All table / MV names are prefixed with `cbdf_` so parallel forked specs do
   * not collide on Delta warehouse paths.
@@ -310,6 +315,129 @@ abstract class CompileBridgeDateFunctionsScenarios extends IvmParitySpecBase("co
           "(4, 10, TIMESTAMP'2024-01-03 09:00:00', 'gold'), " +
           "(5, 20, TIMESTAMP'2024-01-02 12:00:00', 'growth')"
       )
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
+  describe("compile-bridge shim: first_value(expr, ignoreNulls)") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH") {
+      sql(
+        "CREATE TABLE cbdf_first_value_src (id INT, customer_id INT, effective_ts TIMESTAMP, status STRING) USING DELTA"
+      )
+      sql(
+        "INSERT INTO cbdf_first_value_src VALUES " +
+          "(1, 10, TIMESTAMP'2024-01-01 09:00:00', 'bronze'), " +
+          "(2, 10, TIMESTAMP'2024-01-02 09:00:00', 'silver'), " +
+          "(3, 20, TIMESTAMP'2024-01-01 12:00:00', 'starter')"
+      )
+
+      // Mirrors the last_value(expr, ignoreNulls) case above: Spark's
+      // FIRST_VALUE(expr, true) is normalized to DuckDB's native
+      // `IGNORE NULLS` modifier and restored to Spark's 2-arg spelling.
+      val mvName = "cbdf_mv_first_value"
+      val viewBody =
+        "SELECT id, customer_id, effective_ts, " +
+          "first_value(status, true) OVER (PARTITION BY customer_id ORDER BY effective_ts) AS onboarded_status " +
+          "FROM cbdf_first_value_src"
+      sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+
+      sql(
+        "INSERT INTO cbdf_first_value_src VALUES " +
+          "(4, 10, TIMESTAMP'2024-01-03 09:00:00', 'gold'), " +
+          "(5, 20, TIMESTAMP'2024-01-02 12:00:00', 'growth')"
+      )
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
+  describe("compile-bridge shim: current_date()") {
+    it("compiles and refreshes without error, and returns today's date") {
+      sql("CREATE TABLE cbdf_current_date_src (id INT, region STRING) USING DELTA")
+      sql("INSERT INTO cbdf_current_date_src VALUES (1, 'east'), (2, 'west')")
+
+      // Not asserted via assertIncremental: current_date() is a Spark
+      // volatile/non-deterministic-per-refresh expression, so which refresh
+      // classification openivm assigns it is an implementation detail, not
+      // a contract this test should pin down.
+      val mvName   = "cbdf_mv_current_date"
+      val viewBody = "SELECT id, region, current_date() AS loaded_on FROM cbdf_current_date_src"
+      sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertMvCorrect(mvName, viewBody)
+
+      sql("INSERT INTO cbdf_current_date_src VALUES (3, 'north')")
+      refreshMv(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
+  describe("compile-bridge shim: current_timestamp() and CAST(CURRENT_TIMESTAMP() AS TIMESTAMP)") {
+    it("compiles and refreshes without error, producing a fresh non-null timestamp for both spellings") {
+      sql("CREATE TABLE cbdf_current_timestamp_src (id INT, region STRING) USING DELTA")
+      sql("INSERT INTO cbdf_current_timestamp_src VALUES (1, 'east'), (2, 'west')")
+
+      // Both Spark spellings of "now" appear in the benchmark corpus and
+      // must independently survive the compile bridge. Values are not
+      // compared against a freshly re-evaluated `expectedSql` (unlike
+      // assertMvCorrect elsewhere in this file) because two independent
+      // CURRENT_TIMESTAMP evaluations are never bit-identical; instead we
+      // assert non-null and a recent wall-clock value.
+      val mvName = "cbdf_mv_current_timestamp"
+      val viewBody =
+        "SELECT id, region, current_timestamp() AS loaded_at, " +
+          "CAST(CURRENT_TIMESTAMP() AS TIMESTAMP) AS loaded_at_cast FROM cbdf_current_timestamp_src"
+      sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+
+      def assertFreshTimestamps(expectedCount: Long): Unit = {
+        val mv = spark.table(mvName)
+        mv.count() shouldBe expectedCount
+        mv.filter("loaded_at IS NULL OR loaded_at_cast IS NULL").count() shouldBe 0L
+        val stale = mv.filter(
+          "loaded_at < current_timestamp() - INTERVAL 1 HOUR OR loaded_at_cast < current_timestamp() - INTERVAL 1 HOUR"
+        )
+        withClue("materialized loaded_at/loaded_at_cast should reflect a recent CURRENT_TIMESTAMP() evaluation: ") {
+          stale.count() shouldBe 0L
+        }
+      }
+      assertFreshTimestamps(2L)
+
+      sql("INSERT INTO cbdf_current_timestamp_src VALUES (3, 'north')")
+      refreshMv(mvName)
+      assertFreshTimestamps(3L)
+    }
+  }
+
+  describe("compile-bridge shim: Spark backslash-escaped string literals (normalize_os_name)") {
+    it("keeps the MV incremental and correct after INSERT + REFRESH") {
+      sql("CREATE TABLE cbdf_os_name_src (id INT, os_name STRING) USING DELTA")
+      sql(
+        "INSERT INTO cbdf_os_name_src VALUES " +
+          "(1, 'Red Hat Enterprise Linux 8.6 (Ootpa)'), " +
+          "(2, 'Windows Server 2019 - Standard'), " +
+          "(3, 'macOS/Big Sur, v11.6: patch\\'s applied')"
+      )
+
+      // Verbatim (modulo Jinja `{{ expr }}` -> `os_name` substitution) from
+      // dbt-server's codegen/macros/spark/os_helpers.sql normalize_os_name
+      // macro -- the exact fragment named in the task, including the
+      // backslash-escaped '\\' and single-quote-escaped '\'' literals.
+      val mvName = "cbdf_mv_os_name"
+      val viewBody =
+        """SELECT id, TRIM('_' FROM
+          |        REPLACE(REPLACE(REPLACE(REPLACE(
+          |            LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(os_name,
+          |                ' ', '_'), '-', '_'), '.', '_'), '/', '_'), '\\', '_'), '(', '_'), ')', '_'), ',', '_'), ':', '_'), '\'', '_'))
+          |        , '____', '_'), '___', '_'), '__', '_'), '__', '_')
+          |    ) AS normalized_os_name
+          |FROM cbdf_os_name_src""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
       refreshMv(mvName)
       assertIncremental(mvName)
       assertMvCorrect(mvName, viewBody)

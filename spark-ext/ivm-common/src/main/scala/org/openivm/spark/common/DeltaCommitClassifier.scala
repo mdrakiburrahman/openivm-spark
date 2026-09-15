@@ -1,8 +1,6 @@
 package org.openivm.spark.common
 
-import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, RemoveFile}
 
@@ -34,7 +32,7 @@ object DeltaCommitClassifier {
   import BatchVerdict._
 
   def latestVersion(spark: SparkSession, tableNameOrPath: String): Long = {
-    val version = deltaLogFor(spark, tableNameOrPath).update().version
+    val version = DeltaTableVersion.latest(spark, tableNameOrPath)
     require(version >= 0L, s"$tableNameOrPath is not a Delta table")
     version
   }
@@ -62,11 +60,7 @@ object DeltaCommitClassifier {
     }
 
   private def deltaLogFor(spark: SparkSession, tableNameOrPath: String): DeltaLog =
-    if (looksLikePath(tableNameOrPath)) DeltaLog.forTable(spark, new Path(tableNameOrPath))
-    else DeltaLog.forTable(spark, CatalystSqlParser.parseTableIdentifier(tableNameOrPath))
-
-  private def looksLikePath(tableNameOrPath: String): Boolean =
-    tableNameOrPath.startsWith("/") || tableNameOrPath.startsWith("file:") || tableNameOrPath.contains("/")
+    DeltaTableVersion.deltaLogFor(spark, tableNameOrPath)
 
   private def combine(left: BatchVerdict, right: BatchVerdict): BatchVerdict =
     if (rank(left) >= rank(right)) left else right

@@ -90,6 +90,38 @@ Source:
   Source:
 - `MaterializedViewCommands.scala:339-348`
 
+For a backing-table layout, CREATE also rejects an existing public TABLE or VIEW before the data write. Public VIEW publication uses `CREATE VIEW`, never `CREATE OR REPLACE VIEW`, so an object appearing after that preflight cannot be overwritten. Failure cleanup removes a public VIEW only when it matches this operation's captured catalog definition and no MV metadata was published; backing-table cleanup still requires path, Delta identity, and ownership-marker proof.
+
+### 1.4a Existing-handle-only metadata observation
+
+`OpenIvmMetadataSnapshot.captureIfOpenJson` is the supported read-only observer API. Do not retain `liveHandleForTesting` results: they do not carry a lifetime lease. Do not substitute `MvCatalog.lookup`, CDF catalog reads, or ordinary `withSession` calls; those paths may open, restore, or migrate state.
+
+```python
+import base64
+import json
+
+captured = json.loads(
+    spark._jvm.org.openivm.spark.common.rocksdb.OpenIvmMetadataSnapshot.captureIfOpenJson(
+        spark._jsparkSession, db_path, 8192, 8 * 1024 * 1024, 1000
+    )
+)
+if not captured["available"]:
+    raise RuntimeError("Native metadata unavailable: " + captured["reason"])
+families = {
+    family: {
+        base64.b64decode(row["key_base64"]): base64.b64decode(row["value_base64"])
+        for row in rows
+    }
+    for family, rows in captured["column_families"].items()
+}
+```
+
+`db_path` is the already-known absolute local shard path or its equivalent `file:` URI. The API does not discover shards, create directories/slots, open native databases, restore state, migrate keys, flush, or write. It requires an existing cached single-process handle owned by the supplied Spark application. Registry close/delete/eviction and direct DB close cannot invalidate the handle during capture: the per-path registry lease and native session mutex are held until all values and the logical `version` have been copied. Serialization occurs after releasing those leases; only an immutable JSON string leaves the API.
+
+Schema `openivm.metadata-snapshot`, version `1`, returns `available`, canonical `path`, and either `reason` or `version`, `entry_count`, `byte_count`, `column_families`, and `absent_column_families`. Only existing `meta`, `properties`, `cdf_watermarks`, `consumed`, `dependent_mvs`, and `staging` families are included. Base64 preserves exact binary values, including composite `source_tables` and staging metadata and big-endian CDF version longs; no query text is normalized. A missing family is explicitly listed, not fabricated as an empty family. MV, source-dependency, and staging shards are separate: each call is coherent for one shard, not an atomic cross-shard graph snapshot.
+
+The final arguments bound total records, raw key-plus-value bytes, and lock/scan time. Defaults for the two-argument overload are 8192 records, 8 MiB, and 1000 ms; hard maxima are 100000 records, 16 MiB, and 5000 ms. Value lengths are checked before copying oversized values. Time is checked between native reads, not by interrupting an in-flight JNI operation. `absent`, `not_open`, `not_owned`, `application_stopped`, `multi_process`, `write_in_progress`, `busy`, `timeout`, and `limit_exceeded` are unavailable outcomes with **no partial metadata or version**. Invalid arguments and actual native read failures raise errors. Unavailable is not permission to open a handle or infer an empty catalog.
+
 ### 1.5 Discovering source tables
 
 CREATE calls `collectSourceSchemas(spark, originalQueryText)`.
@@ -110,13 +142,33 @@ The helper returns four values:
   Source:
 - `MaterializedViewCommands.scala:127-142`
   The helper also walks `SubqueryExpression` plans. That catches tables referenced inside nested `EXISTS`, `IN`, and scalar subqueries.
+  For an OpenIVM row-local public projection, discovery stops at the persistent VIEW boundary and records its logical alias and public schema, not the sibling maintenance table. This keeps the compiler's source names, dependency tracking, and change-feed schemas consistent with the original query.
+  CDF old-state reads resolve the backing Delta snapshot and reapply the public projection through a command-local temporary view; Spark cannot apply `VERSION AS OF` to the persistent VIEW itself. Explicitly pinned sources continue to use their verified physical Delta paths, never these logical snapshot overrides.
+  In intercept mode, a grouped aggregate's native additive maintenance delta is not a public row delta. A projected aggregate therefore enables CDF on its own backing table and publishes bounded, typed old/new row changes to downstream consumers after successful maintenance. Existing backing state without CDF uses the exact snapshot bag-diff path. Internal counters stay in the maintenance table; no original-source rebuild or source mutation is involved.
   Source:
 - `MaterializedViewCommands.scala:144-160`
   After table names are discovered, CREATE reads schemas with `spark.table(n).schema`.
   Source:
 - `MaterializedViewCommands.scala:165-168`
 
-### 1.6 Additional analyzed-plan metadata
+### 1.5b Source constraint facts and metastore cost
+
+CREATE also discovers per-source constraint facts — foreign keys, unique keys, Delta `CHECK` constraints, and generated columns — through `WorkloadFactsRegistry.discover`. Those facts feed the refresh rewriter, so they are collected for every source of every MV.
+Source:
+
+- `MaterializedViewCommands.scala:1196`
+- `WorkloadFactsRegistry.scala:34-48`
+  Each fact source needs one `CatalogTable`: the Delta metadata is read from the resolved table location and the catalog properties come from the same object. `WorkloadFactsRegistry` therefore issues a single `SessionCatalog.getTableMetadata` per source and threads the result into both `deltaProperties` and `catalogProperties`.
+  Source:
+- `WorkloadFactsRegistry.scala:65-68`
+- `WorkloadFactsRegistry.scala:196-233`
+  This matters because every Hive metastore read runs inside Spark's globally synchronized Hive client (`HiveExternalCatalog.withClient`). A redundant `getTableMetadata` is not local work — it is a serialized section that every concurrent CREATE and REFRESH queues behind. `DeltaLog.forTable(spark, tableIdentifier)` resolves the identifier through `getTableMetadata` and then delegates to `DeltaLog.forTable(spark, catalogTable)`, so passing the already-resolved `CatalogTable` is the identical code path with the round-trip removed.
+  Source:
+- `DeltaLog.scala:770-781` (delta-spark 3.2.0)
+  `WorkloadFactsCatalogBudgetSpec` pins the budget against a real (Derby-backed) Hive metastore by counting `HiveMetaStore.audit` records: one warmed `discover` of a single Delta source must stay within 4 `get_table` and 2 `get_database` calls. Resolving the table twice costs 6 and 3.
+  Source:
+- `WorkloadFactsCatalogBudgetSpec.scala`
+
 
 CREATE analyzes the view body with Spark. It extracts group-by key names. It extracts a `COUNT(*)` alias when the query exposes one. It later extracts a HAVING predicate for `AGGREGATE_HAVING`.
 Source:
@@ -254,39 +306,42 @@ CREATE computes whether this MV emits a downstream-consumable view delta.
 The condition is:
 
 ```scala
-RefreshTypeCode.emitsCascadeViewDelta(effectiveRefreshType) &&
+RefreshTypeCode.mayEmitCascadeViewDelta(effectiveRefreshType) &&
   SparkRefreshRewriter.hasRealDelta(compiled.sql, name.table)
 ```
 
-Source:
+`mayEmitCascadeViewDelta` is a permission set, never a verdict — it adds
+`FULL_REFRESH` on top of `emitsCascadeViewDelta` (which stays the fail-closed
+fallback for legacy metadata) because openivm's
+`refresh_sql.cpp build_split_safe_full_refresh_companion` emits an exact signed
+companion around every Spark-dialect FULL_REFRESH recompute. Capability is
+decided by `hasRealDelta` over the actual compiled program, not by the label.
 
-- `MaterializedViewCommands.scala:626-629`
+Source:
+- `MaterializedViewCommands.scala` (`classifyEffectiveRefreshType`)
 - `RefreshTypeCode.scala:20-76`
 - `SparkRefreshRewriter.scala:1868-1879`
   The classification log line includes `emits_cascade_view_delta='<boolean>'`. That boolean is true only when both conditions are true.
   Source:
 - `MaterializedViewCommands.scala:630-639`
 
-### 1.12 `AGGREGATE_HAVING` special handling
+### 1.12 Public schema and backing-table layouts
 
-`AGGREGATE_HAVING` uses a table/view split. The internal Delta table stores all aggregate groups. The user-facing object is a Spark view that applies HAVING at read time. The internal data table name is `<table>__ivm_data`.
-Source:
+CREATE analyzes both the original SELECT and the physical initial-load SELECT. Compiler-added counts, null-state counters, join keys, or a different output order/type require a sibling Delta table `<mv>__ivm_data` and a persistent public VIEW. The VIEW selects only the original output columns, in order, with their original names and types. Matching uses analyzed columns, never an `openivm_*` prefix blacklist: user-authored columns with that prefix remain public. The physical table retains every maintenance column.
 
-- `MaterializedViewCommands.scala:232-243`
-  CREATE detects incremental `AGGREGATE_HAVING` after effective classification. If true, the Delta target is `dataTableId(name)`. If false, the Delta target is `name`.
-  Source:
-- `MaterializedViewCommands.scala:641-649`
-  After creating the internal Delta table, CREATE creates or replaces the user-facing Spark view. The view selects user output columns from `<mv>__ivm_data`. The view filters with the extracted HAVING predicate.
-  Source:
-- `MaterializedViewCommands.scala:719-743`
-  REFRESH also redirects merge targets to `<mv>__ivm_data` for `AGGREGATE_HAVING`.
-  Source:
-- `MaterializedViewCommands.scala:974-982`
-  DROP removes both the Spark view and the sibling Delta table.
-  Source:
-- `MaterializedViewCommands.scala:1376-1382`
+`AGGREGATE_HAVING` and Top-K also use this split: the backing table retains all groups/rows, and the public VIEW applies the HAVING predicate or ordering/limit. `spark.openivm.catalogPreservesColumnCase=true` suppresses case-only wrappers, not projections needed to hide maintenance state or preserve output types.
+
+The persisted `_ivm_uses_backing_data_table` flag makes `MvMetadata.usesBackingDataTable` authoritative across refresh and restart. `meta.location` always names the physical Delta data; managed-catalog paths use the actual backing identifier. Incremental and replacement writes target that data, and DROP removes both objects. Delta-only inspection/maintenance commands such as DESCRIBE DETAIL and OPTIMIZE must use the physical path or backing-table identifier, not a public VIEW.
+
+Row-local projection VIEWs carry `_ivm_public_projection_v1=true` in their persistent catalog properties. Source discovery preserves that logical boundary. `MvProjectionSource` resolves the same physical Delta log for bounded CDF/snapshot reads, reapplies the public schema, and retains signed multiplicity when consuming intercepted cascade deltas. It does not open OpenIVM state. HAVING/Top-K wrappers are not marked as row-local projections; their existing filtered/snapshot handling remains separate.
 
 ### 1.13 Source watermarks
+
+For a verified `VERSION AS OF N` source, CREATE records `v:N` under the resolved operational source key, even when the live head is newer. This initializes both the MV metadata watermark and the backing Delta table's immutable CREATE-recovery watermark. Unpinned sources retain their change-feed-specific initialization.
+
+An ordinary REFRESH excludes frozen sources from CDF collection and does not advance their numeric cursors. Intercepted staging for a frozen source may still be discarded; it is not the input to ADVANCE. `ADVANCE SOURCE VERSIONS` derives its old endpoint from the verified query/identity pin, reads exactly `(N, M]` (bounded CDF or exact snapshot bag difference), and publishes the new pin, MV metadata watermark, and (in CDF mode) CDF cursor at `M` under the existing operation guard. The backing table's original CREATE-recovery watermark remains `N`. Clean pre-commit rollback retains the old pin/cursor; an idempotent advance does not move them. A failure after publication starts retains the durable repair-required guard.
+
+A persisted VERSION-pin watermark or CDF cursor that disagrees with the verified pin is rejected before REFRESH/ADVANCE, including an otherwise-idempotent advance. Legacy live-head cursors are not silently relabeled: those MVs must be dropped and recreated. Reusing an unpublished CREATE path likewise requires its recovery watermark to match the requested pin.
 
 CREATE captures current source watermarks before the initial materialization.
 The call is:
@@ -405,7 +460,7 @@ sequenceDiagram
         Cmd->>Spark: CREATE OR REPLACE VIEW v AS SELECT user columns WHERE HAVING
     end
     Cmd->>MvCat: upsert(MvMetadata(...))
-    Cmd->>Delta: history(1)
+    Cmd->>Delta: DeltaLog snapshot version (no Spark job)
     Cmd->>MvCat: advance(v, initialVersion)
     Cmd-->>Caller: empty result
 ```
@@ -834,8 +889,8 @@ flowchart TD
     S --> AF[Advance lastVersion]
     AF --> AG[markConsumed input staging]
     AG --> AH[pruneFullyConsumed]
-    AH --> AI{non-cascade upstream has downstream?}
-    AI -- yes --> AJ[Record synthetic trigger row]
+    AH --> AI{upstream snapshot trigger needed?}
+    AI -- yes --> AJ[Record synthetic replacement trigger row]
     AI -- no --> AK[Return]
     AJ --> AK
 ```
@@ -1214,18 +1269,18 @@ Source:
 
 ### 5.4 Delta after CREATE
 
-The Delta table exists at:
+For this grouped SUM, the Delta maintenance table exists at:
 
 ```text
-<warehouse>/_ivm/views/v
+<warehouse>/_ivm/views/v__ivm_data
 ```
 
-It contains the grouped SUM snapshot. It may include hidden OpenIVM bookkeeping columns required by incremental refresh.
+It contains the grouped SUM snapshot and the hidden OpenIVM bookkeeping columns required by incremental refresh.
 Source:
 
 - `OpenIvmCompiler.scala:313-349`
 - `MaterializedViewCommands.scala:696-718`
-  The Spark catalog has a table named `v` registered at that location. For this non-HAVING example, there is no `v__ivm_data` table. For `AGGREGATE_HAVING`, `v` would be a view and `v__ivm_data` would be the Delta table.
+  The Spark catalog registers `v__ivm_data` at that location. `v` is a VIEW exposing only the original SELECT output, even though this example has no HAVING clause.
   Source:
 - `MaterializedViewCommands.scala:641-649`
 - `MaterializedViewCommands.scala:719-743`
@@ -1235,7 +1290,7 @@ Source:
 A kept incremental aggregate view logs a classification line like:
 
 ```text
-[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true'
+[openivm-mv] view='`v`' compiled_refresh_type='AGGREGATE_GROUP' effective_refresh_type='AGGREGATE_GROUP' reason='kept' emits_cascade_view_delta='true' time_travel_pin_status='NOT_APPLICABLE'
 ```
 
 Source:

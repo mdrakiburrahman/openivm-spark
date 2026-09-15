@@ -19,7 +19,7 @@ it through `spark-ext/dev/dev.sh`:
 ./spark-ext/dev/dev.sh test                             # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
 ./spark-ext/dev/dev.sh verify                           # lint + compile + Test/compile + assembly + test
-./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8 # cap forked-test concurrency
+./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8    # cap forked-test concurrency
 PRE_CLEAN=1 ./spark-ext/dev/dev.sh verify               # nuke every running container first, then verify
 ```
 
@@ -36,7 +36,7 @@ Notes:
 - Scala 2.12.17 / JDK 17 / Spark 3.5.1 / Delta 3.2.0 — all pinned in
   `spark-ext/dev/pins.env` and `project/Dependencies.scala`. Bumping any of
   these requires bumping the matching SHA in `pins.env`, which is what cuts a
-  fresh `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}` image.
+  fresh `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` image.
 - The compiler is `-Xfatal-warnings -Ywarn-unused:imports`: any unused import
   fails the whole compile, so strip imports before pushing.
 - `scalafmt` config is at `spark-ext/.scalafmt.conf` (max column 120,
@@ -56,10 +56,11 @@ Read top-to-bottom; each module depends only on the one above it
   (ANTLR4 grammar `IvmSqlBase.g4`), an `IvmDmlInterceptorRule` (resolution
   rule), and an `IvmStrategy` (planner). All behaviour is gated by
   `spark.openivm.enabled` (`FeatureGate.EnabledKey`, default `false`).
-- **Parser**: `IvmSqlBase.g4` only declares `CREATE / REFRESH / DROP
-MATERIALIZED VIEW`. Everything else (including the MV body, captured as raw
+- **Parser**: `IvmSqlBase.g4` declares `CREATE / REFRESH / DROP MATERIALIZED
+VIEW` plus exact-map `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`.
+Everything else (including the MV body, captured as raw
   text `.+?`) is re-parsed via Spark's own `ParserInterface`. No `REFRESH
-EVERY`, no `ALTER MATERIALIZED VIEW`, no double-quoted identifiers.
+EVERY`, no generic ALTER surface, no double-quoted identifiers.
 - **MV-body constraint**: the body must parse in **both** DuckDB (for openivm
   classification) and Spark — use only the intersection of both dialects.
 - **DML interception**: `IvmDmlInterceptorRule` tees every DML on a tracked

@@ -126,13 +126,11 @@ final class CdfChangePropagation extends ChangePropagation {
       case Some(b) =>
         val from = b.startVersionExclusive + 1L
         val to   = b.endVersionInclusive
-        val raw =
-          spark.read
-            .format("delta")
-            .option("readChangeFeed", "true")
-            .option("startingVersion", from)
-            .option("endingVersion", to)
-            .table(sourceTable)
+        val raw = MvProjectionSource.read(
+          spark,
+          sourceTable,
+          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
+        )
 
         val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
         val transformedAlias = s"_openivm_cdf_raw_$short"
@@ -158,7 +156,10 @@ final class CdfChangePropagation extends ChangePropagation {
     CdfWatermarkCatalog.putAll(
       spark,
       viewName,
-      batches.collect { case b: CdfChangeBatch => b.baseTable -> b.endVersionInclusive }.toMap
+      batches.collect {
+        case b: CdfChangeBatch           => b.baseTable -> b.endVersionInclusive
+        case b: SourceVersionChangeBatch => b.baseTable -> b.endVersionInclusive
+      }.toMap
     )
 
   override def pruneConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = ()
@@ -179,9 +180,9 @@ final class CdfChangePropagation extends ChangePropagation {
       sources: Seq[String],
       persisted: Map[String, ChangeWatermark]
   ): Map[String, Long] = {
-    CdfWatermarkCatalog.ensureTables(spark)
+    val liveBySource = CdfWatermarkCatalog.getAll(spark, viewName, sources)
     sources.distinct.flatMap { src =>
-      val live = CdfWatermarkCatalog.get(spark, viewName, src)
+      val live = liveBySource.get(src)
       val seed = persisted.get(src).collect { case ChangeWatermark.DeltaVersion(v) => v }
       (live, seed) match {
         case (Some(l), Some(s)) => Some(src -> math.max(l, s))
@@ -199,11 +200,15 @@ object CdfChangePropagation {
    * `true` when the Delta table identified by `name` has
    * `delta.enableChangeDataFeed` set to `true`.  Names are resolved through
    * Spark's catalog: bare names are looked up in the active database, and
-   * `db.table` is resolved through the Spark catalog. Returns `false` when
+   * `db.table` is resolved against that database.  Returns `false` when
    * the table cannot be resolved (caller handles that as a "missing source"
    * upstream).
    */
   def tableHasCdf(spark: SparkSession, name: String): Boolean = {
+    if (MvProjectionSource.isProjection(spark, name))
+      return DeltaTableVersion.deltaLogOption(spark, name).exists { log =>
+        log.update().metadata.configuration.get("delta.enableChangeDataFeed").exists(_.equalsIgnoreCase("true"))
+      }
     val identifier = CatalystSqlParser.parseTableIdentifier(name)
     val resolved = identifier.database match {
       case Some(_) => name
@@ -223,8 +228,7 @@ object CdfChangePropagation {
 
   /** Current Delta `version` of `name`, or `None` if the table cannot be loaded as Delta. */
   def tableLatestVersion(spark: SparkSession, name: String): Option[Long] =
-    try Some(DeltaCommitClassifier.latestVersion(spark, name))
-    catch { case _: Throwable => None }
+    DeltaTableVersion.latestOption(spark, name)
 
   private def quoteForCatalog(name: String): String =
     name.split("\\.").map(p => s"`${p.replace("`", "``")}`").mkString(".")

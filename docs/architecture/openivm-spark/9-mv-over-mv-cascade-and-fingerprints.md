@@ -147,17 +147,13 @@ The rows stay at `_ivm/view_deltas/...`.
 The RocksDB catalog entry for the source key lives under:
 
 ```text
-<warehouse>/_openivm/tables/<base64url(source-key)>/rocksdb/
+<warehouse>/_openivm/tables/<safePathSegment(source-key)>/rocksdb/
 ```
 
-That base64url encoding is implemented by `RocksDBCodec.safePathSegment`:
-
-```scala
-def safePathSegment(name: String): String =
-  Base64.getUrlEncoder.withoutPadding.encodeToString(utf8(name))
-```
-
-Citation: `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/RocksDBCodec.scala:122-123`.
+`RocksDBCodec.safePathSegment` keeps valid base64url components unchanged
+through 255 encoded bytes and uses `sha256.` plus the full SHA-256 digest of
+the original UTF-8 identity above that limit. Source keys and cascade
+metadata are not shortened or rewritten. See [the storage contract](7-state-storage-rocksdb-and-delta.md#73-safe-path-segment-encoding).
 The base-table RocksDB path is constructed here:
 
 ```scala
@@ -171,7 +167,7 @@ Important implementation note:
 
 - committed code does **not** copy the Delta data to
   `_openivm/tables/<base64url>/staging/MV_VIEW_DELTA/<txnTs>/`;
-- `_openivm/tables/<base64url>/rocksdb` is the catalog database;
+- `_openivm/tables/<safePathSegment>/rocksdb` is the catalog database;
 - the `StagingDelta.stagingPath` points at `_ivm/view_deltas/...`.
 
 ## 9.4 `MV_VIEW_DELTA` is one of the seven staging opTypes
@@ -416,8 +412,7 @@ Citation: `MvCatalog.scala:485-503`.
 `postRefreshCleanup` calls that advance before marking consumed:
 
 ```scala
-val newVersion =
-  DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+val newVersion = DeltaTableVersion.requireLatest(spark, meta.location)
 MvCatalog.advance(spark, name, newVersion)
 ```
 
@@ -607,7 +602,8 @@ Therefore a downstream MV can detect that its upstream MV was dropped and recrea
 At CREATE time the compiler's refresh type is converted to an effective refresh type.
 The effective refresh type can be demoted to `FULL_REFRESH` for reasons such as:
 
-- Top-K view;
+- unsupported Top-K wrapper (for example, `TAIL`; supported ORDER/LIMIT
+  wrappers retain the inner refresh type);
 - simple projection with no data-apply statement;
 - non-cascade-capable upstream;
 - window initial-load mismatch;

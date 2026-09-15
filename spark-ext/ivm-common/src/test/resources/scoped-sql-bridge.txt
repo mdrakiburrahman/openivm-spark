@@ -1,0 +1,56 @@
+Scoped SQL bridge regression
+============================
+
+Run with the existing sbt runner:
+  sbt 'ivmCommon/testOnly org.openivm.spark.common.ScopedSqlBridgeSpec'
+
+The two pooled-gateway integration cases require python3 and the Py4J Python
+package shipped with Spark 3.5 (0.10.9.7). For example, set PYTHONPATH to
+$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip before running sbt. They explicitly
+cancel with a prerequisite message when Python/Py4J is unavailable; the JVM-only
+cases still run. No dependency is downloaded by the suite.
+
+The fixture starts an actual loopback-only py4j.GatewayServer and ordinary
+Python JavaGateway/GatewayClient, not ClientServer or a simulated connection
+pool. A control connection only handles test latches; data RPCs use the shared
+pooled client. Holding its first connection forces one Python request's next
+RPC onto a different JVM thread and loses its request local property. No shared
+Properties object, Python decorator or inherited-thread wrapper is needed.
+
+The bridge regression overlaps 32 commands before allowing any to finish,
+checks independent capture outcomes and scheduler request/group/pool properties,
+and verifies restoration and pooled thread reuse. The disconnect case terminates
+only its owned Python subprocess while SQL is blocked, then checks the JVM
+capture completes independently. This models transport loss, NOT cancellation;
+a separate actual Spark job-group cancellation must produce sql_succeeded=false.
+
+Only a suite-owned tiny local Delta source and synthetic command lifecycles are
+used. This is transport/scoping evidence, not proof of any particular hosted
+incident's root cause, native compiler behavior or full CREATE/REFRESH parity.
+
+Caller contract
+---------------
+Require both org.openivm.spark.common.ScopedSqlBridge.apiVersion() == 1 and
+org.openivm.spark.common.QueryLogExport.apiVersion() == 1. If either method is
+absent or unsupported, fail closed; do not fall back to separate property RPCs.
+
+Invoke once:
+  ScopedSqlBridge.execute(
+      spark._jsparkSession, sql_text, request_id, job_group_id,
+      job_description, scheduler_pool, interrupt_on_cancel)
+
+Return: JVM void / Python None, only after eager materialization and cleanup.
+Throws the SQL/cancellation error, attaching cleanup failures as suppressed.
+Request, group and pool must be nonempty; description may be empty, not null.
+Only the bridge owns begin/end and the request's Spark local-property scope.
+Independent QueryLogExport.snapshotJson(spark, request_id, max_rows, max_bytes)
+and release calls retain their existing contract and limits. A normal return
+does not itself promise capture_complete (e.g. disabled logging or no native
+lifecycle). Export completion must be checked separately.
+
+Do not re-execute SQL on a transport error: inspect the same request ID using a
+healthy connection. sql_succeeded=null means no sealed outcome yet; true means
+the JVM completed the action, even if its reply was lost. JVM/application loss
+still loses in-memory capture metadata. No durable exactly-once guarantee or
+automatic cancellation-on-disconnect is provided. Explicit cancellation uses
+the supplied Spark job group. The API does not serialize concurrent statements.

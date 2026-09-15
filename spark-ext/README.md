@@ -13,7 +13,7 @@ spark-ext/
 ├── .sbtopts, .scalafmt.conf
 ├── ivm-executor/      # executor-side classes (DeltaStagingExec, MergeWriterExec)
 ├── ivm-common/        # library: catalogs, metadata, assemblers, FeatureGate
-├── ivm-compiler/      # OpenIvmCompiler (DuckDB JDBC) + LptsSparkDialect
+├── ivm-compiler/      # OpenIvmCompiler (DuckDB CLI) + LptsSparkDialect
 ├── ivm-extension/     # SparkSessionExtensions entry + ANTLR grammar + commands + rules
 ├── ivm-it/            # integration tests + 100-spec parity suite vs openivm
 └── dev/
@@ -100,11 +100,16 @@ running it on an already-aligned tree is a no-op.
 | Variable                  | Default | Scope    | Effect                                                                                                                                                                |
 | ------------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PRE_CLEAN`               | `0`     | `verify` | When `1`, force-removes every running Docker container on the host before sbt starts. Named cache volumes (`sbt-cache`, `ivy-cache`, `coursier-cache`) are preserved. |
-| `openivm.test.forks` (-D) | `32`    | sbt JVM  | Cap on parallel forked test JVMs. Pass via `./spark-ext/dev/dev.sh verify -- -Dopenivm.test.forks=8` on smaller hosts.                                                |
+| `openivm.test.forks` (-D) | `32`    | sbt JVM  | Cap on parallel forked test JVMs. Pass via `./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8` on smaller hosts.                                                   |
 
-The container image is named `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}` so that bumping
-SHAs in `pins.env` produces a fresh image, leaving any in-progress workspace
-caches intact.
+The container image is named
+`openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` so
+dependency or ABI changes produce a fresh image without replacing workspace
+caches. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env` explicitly select
+DuckDB v1.5.2 for both the CLI and native extension; do not infer the deployed ABI
+from OpenIVM's upstream submodule or CI version. JDBC stays on 1.5.2.1.
+`NATIVE_BUILD_JOBS` bounds native build parallelism (default 8); lower it on
+shared hosts.
 
 ## Activation in spark-shell / spark-submit
 
@@ -118,6 +123,153 @@ spark-shell \
 
 The feature gate (`spark.openivm.enabled`) defaults to false, so the jar is
 opt-in even when on the classpath.
+
+### Completed execution telemetry
+
+Set `spark.openivm.telemetry.uri` to a campaign-scoped Hadoop filesystem URI
+to publish one completed JSON object per CREATE/REFRESH request. The request
+must also supply nonsecret `openivm.campaign_id`, `openivm.request_id`,
+`openivm.correlation_id`, `openivm.node_id`, and `openivm.phase` local
+properties; the campaign, correlation, and phase values may instead use the
+`spark.openivm.telemetry.campaignId`,
+`spark.openivm.telemetry.correlationId`, and
+`spark.openivm.telemetry.phase` configuration keys.
+
+Version 1 objects are atomically renamed from `_temporary/v1/*.partial` to
+`completed/v1/<sha256-execution-identity>.json`. Consumers ingest only the
+completed path. Re-publishing identical content is idempotent; different
+content for the same identity fails. The public constants live in
+`OpenIvmTelemetryContract`, and the packaged schema is
+`openivm-telemetry-span-v1.schema.json`. Export failures fail the SQL operation;
+when the URI is unset, the existing log-only span behavior is unchanged.
+Same-request retries of `CREATE MATERIALIZED VIEW IF NOT EXISTS` and
+already-applied `ADVANCE SOURCE VERSIONS` reuse only a complete, identity-matched
+accepted object; a new request identity publishes a complete explicit
+short-circuit outcome. The schema's
+`x-openivm-w6-required-success-fields` annotation is the ingestion-required
+field set for every accepted outcome. `create_already_exists` is valid only
+when `operation=create`; the schema's operation/outcome map is authoritative.
+Reusable successes require a nonempty `source_versions` array that is unique
+and ascending by lower-cased canonical relation key. The internal duration may
+differ from the timestamp interval by at most 5 ms.
+
+### Request-scoped SQL log export (JVM API v1)
+
+Enable `spark.openivm.queryLog.enabled=true` in **SparkContext startup
+configuration**. `spark.openivm.profile.refresh` can remain false. This exports
+the existing OpenIVM CREATE/REFRESH logger, not universal Spark SQL interception
+or every DataFrame operation.
+
+The public Scala object `org.openivm.spark.common.QueryLogExport` exposes:
+
+```scala
+apiVersion(): Int // 1
+begin(spark: SparkSession, requestId: String): Unit
+end(spark: SparkSession, requestId: String, sqlSucceeded: Boolean): Unit
+snapshotJson(spark: SparkSession, requestId: String, maxRows: Int, maxBytes: Int): String
+release(spark: SparkSession, requestId: String): Unit
+```
+
+Reserve a unique request immediately before the **outer** SQL action. The SQL
+worker must have the matching `openivm.request_id` Spark local property:
+
+```python
+api = spark._jvm.org.openivm.spark.common.QueryLogExport
+request_id = "example-create-unique-request"
+previous = spark.sparkContext.getLocalProperty("openivm.request_id")
+spark.sparkContext.setLocalProperty("openivm.request_id", request_id)
+try:
+    api.begin(spark._jsparkSession, request_id)
+    succeeded = False
+    try:
+        spark.sql(ddl).collect()
+        succeeded = True
+    finally:
+        api.end(spark._jsparkSession, request_id, succeeded)
+finally:
+    spark.sparkContext.setLocalProperty("openivm.request_id", previous)
+```
+
+Return the request descriptor from the model worker immediately; do not poll or
+export there. An independent exporter can call
+`snapshotJson(spark._jsparkSession, request_id, 100000, 67108864)` from another
+Py4J thread/session in the **same application**. `begin`, `end`, and readers do
+not use thread IDs. Only native logger startup reads the worker's local property.
+There is no `SHOW OPENIVM QUERY LOG`, whole-catalog scan, global flush barrier,
+synchronous queue-overflow persistence, or Spark write job in this export path.
+Indexed reads use the existing registry-owned RocksDB handle and can experience
+ordinary storage-lock contention, but never wait for unrelated captures to finish.
+
+The UTF-8 JSON envelope has:
+
+| Field | Meaning |
+| --- | --- |
+| `schema`, `version` | `openivm.query-log-export`, `1` |
+| `application_id`, `request_id` | Exact capture identity |
+| `status` | `running`, `pending_flush`, `complete`, `failed`, or `missing` |
+| `capture_complete` | Outer action ended, native lifecycles finished, and all admitted rows persisted successfully |
+| `sql_succeeded` | Caller-supplied Boolean; `null` before `end` |
+| `record_count`, `pending_flushes` | Admitted row count and this request's unacknowledged flush count |
+| `invocations` | Ordered objects with native `refresh_id`, `view_name`, `mode`, `outcome`, `record_count`, `completed` |
+| `records` | Complete rows in invocation/collector append order; empty while capture is incomplete |
+| `failure` | `null` or `{ "code": "...", "message": "..." }` |
+| `truncated` | Always `false`; partial successful traces are never returned |
+
+Each record preserves `refresh_id`, `view_name`, `profile_timestamp` (UTC ISO
+timestamp), `stmt_order`, `attempt_idx`, `mode`, `category`, `stmt_kind`,
+`duration_ms`, and **full** `sql_text`. Retries and rows sharing the legacy
+timestamp/order/attempt key are retained separately. `representation_kind` is
+conservative: `original_query`, `explain_plan`, `submitted_sql`, or `diagnostic`.
+Only known SQL submission call sites are `submitted_sql` (including failed
+attempts; this label does **not** assert statement success). Source-delta
+reconstructions, synthetic cascade/cleanup representations, and unknown
+categories are `diagnostic`, regardless of their SQL-looking text.
+
+Accept only `status=complete`, `capture_complete=true`, `sql_succeeded=true`,
+and `failure=null`. A successful **zero-row** invocation additionally requires
+a completed native refresh no-op outcome: `no_pending_deltas`, `noop_fast_exit`,
+`source_versions_already_applied`, or `runtime_empty_delta_skip`. Outcomes retain
+their native lowercase spelling. An ended request without a native logger
+lifecycle fails with `NO_LIFECYCLE`; scan emptiness is never no-op evidence.
+A captured SQL failure has `status=failed` / `SQL_FAILED` and may still have
+`capture_complete=true` with its entire diagnostic trace. `failed` can appear
+while that request still has pending flushes: when collecting failed-SQL
+diagnostics, wait for `pending_flushes=0` and every invocation's `completed=true`
+before evaluating `capture_complete` or releasing it. Logging/async failures are
+exposed by this API and do not replace the original SQL error or alter MV state.
+
+Stage a complete JSON snapshot to a run-owned driver file and transfer it using
+the client's file API when stdout is too small. The client can render a readable
+SQL artifact from the raw records, preserving category/order/attempt metadata
+and distinguishing diagnostics from submitted SQL. Call `release` **only after
+both local artifacts are durably stored**. It removes this request's export
+index/metadata, not the cumulative legacy SHOW log. Unfinished/busy releases
+fail explicitly; missing/already-released requests are an idempotent no-op.
+
+All retention settings below use the `spark.openivm.queryLog.export.` prefix
+and are read from SparkContext configuration at the application's first `begin`:
+
+| Suffix | Default | Bound |
+| --- | ---: | --- |
+| `maxCaptures` | 1024 | Unreleased request slots per application |
+| `maxInvocations` | 128 | Native lifecycles per request |
+| `maxRecords` | 100000 | Admitted rows per request |
+| `maxBytes` | 67108864 | UTF-8 row payload plus accounting overhead per request |
+| `maxTotalRecords` | 1000000 | Admitted rows across unreleased requests |
+| `maxTotalBytes` | 536870912 | Admitted row bytes across unreleased requests |
+
+There is no eviction of unexported captures. Invalid IDs/configuration, duplicate
+reservation, or exhausted slots throw from `begin` before SQL starts. Row/byte
+limits, missing records, disabled logging, and asynchronous failures fail capture
+explicitly. Reader `maxRows` and `maxBytes` must be positive; `maxBytes` bounds
+the **entire serialized UTF-8 envelope**. A too-small reader bound returns
+`SNAPSHOT_LIMIT_EXCEEDED` without partial records and can be retried with larger
+bounds. If even its failure envelope cannot fit, the call throws instead.
+
+Completion metadata is application-lifetime, not a crash-recovery protocol.
+An unknown/released request or a different/restarted application returns
+`missing` / `CAPTURE_MISSING`. Export before stopping the application; missing
+capture or transfer failure must prevent downstream acceptance.
 
 ### JVM module-opens block (JDK 17)
 
@@ -156,9 +308,20 @@ CREATE MATERIALIZED VIEW sales_summary AS
 -- Refresh after DML on base tables
 REFRESH MATERIALIZED VIEW sales_summary;
 
+-- Atomically advance every immutable VERSION AS OF source pin
+ALTER MATERIALIZED VIEW historical_sales
+  ADVANCE SOURCE VERSIONS (sales = 43, regions = 17);
+
 -- Drop
 DROP MATERIALIZED VIEW IF EXISTS sales_summary;
 ```
+
+`ADVANCE SOURCE VERSIONS` requires an exact map covering all and only pinned
+sources. It never resolves "latest": each supplied Delta version is validated,
+the old/new snapshot delta is applied through the existing incremental program,
+and the query pins, pin telemetry, source watermarks, and MV version are
+published together only after the data apply succeeds. Repeating the same map is
+a no-op.
 
 DML on a tracked base table (INSERT / DELETE / UPDATE / MERGE) is intercepted
 by `IvmDmlInterceptorRule`, which tees the change set to a per-base-table Delta

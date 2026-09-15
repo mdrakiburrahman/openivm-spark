@@ -5,6 +5,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 import io.delta.tables.DeltaTable
 import org.apache.spark.sql.AnalysisException
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.commands.CommandConcurrencyInjection
 
 /** Port of `openivm/test/sql/ducklake_deltas.test`.
   *
@@ -208,12 +209,16 @@ abstract class DucklakeDeltasScenarios extends IvmParitySpecBase("ducklake-delta
 
       // Pre-existing target collides with the would-be MV name
       sql("CREATE TABLE IF NOT EXISTS dl_blocked_publish_mv(x INT) USING DELTA")
+      sql("INSERT INTO dl_blocked_publish_mv VALUES (42)")
 
-      val ex = intercept[Throwable] {
-        sql(
-          "CREATE MATERIALIZED VIEW dl_blocked_publish_mv AS " +
-            "SELECT grp, SUM(v) AS total FROM dl_publish_src GROUP BY grp"
-        )
+      var dataWrites = 0
+      val ex = CommandConcurrencyInjection.withBeforeCreateDataWrite { dataWrites += 1 } {
+        intercept[Throwable] {
+          sql(
+            "CREATE MATERIALIZED VIEW dl_blocked_publish_mv AS " +
+              "SELECT grp, SUM(v) AS total FROM dl_publish_src GROUP BY grp"
+          )
+        }
       }
       withClue(
         s"Expected creation to fail because dl_blocked_publish_mv is not an empty Delta MV table, got: ${ex.getMessage}"
@@ -225,24 +230,11 @@ abstract class DucklakeDeltasScenarios extends IvmParitySpecBase("ducklake-delta
         )
       }
 
-      // The pre-existing collision target is still its original (empty) shape; the
-      // failed MV creation may have left an empty _delta_log behind because
-      // CreateMaterializedViewCommand initialises the MV-data table before
-      // attempting the openivm compile. Recreate the original empty table shape so
-      // the rest of the test can proceed.
-      try sql("DROP TABLE IF EXISTS dl_blocked_publish_mv").collect()
-      catch { case _: Throwable => () }
-      sql("CREATE TABLE dl_blocked_publish_mv(x INT) USING DELTA")
-      spark.table("dl_blocked_publish_mv").count() shouldBe 0L
-
-      // Known limitation: a partially-failed CREATE MATERIALIZED VIEW may leave an
-      // orphan MvCatalog entry behind because the catalog write currently happens
-      // before the post-CTAS validation step that detects the schema mismatch with
-      // the colliding user table. We clear it explicitly here so the retry on
-      // line below sees a clean state; tracked as a future hardening item in
-      // CreateMaterializedViewCommand.
+      dataWrites shouldBe 0
+      spark.table("dl_blocked_publish_mv").schema.fieldNames.toSeq shouldBe Seq("x")
+      spark.table("dl_blocked_publish_mv").collect().map(_.getInt(0)).toSeq shouldBe Seq(42)
+      spark.catalog.tableExists("dl_blocked_publish_mv__ivm_data") shouldBe false
       val id = spark.sessionState.sqlParser.parseTableIdentifier("dl_blocked_publish_mv")
-      MvCatalog.remove(spark, id)
       MvCatalog.lookup(spark, id) shouldBe None
 
       // Drop the collision target and retry — must succeed
@@ -255,6 +247,36 @@ abstract class DucklakeDeltasScenarios extends IvmParitySpecBase("ducklake-delta
         "dl_blocked_publish_mv",
         "SELECT grp, SUM(v) AS total FROM dl_publish_src GROUP BY grp"
       )
+    }
+
+    it("CREATE MV never replaces a user VIEW, including one published after its namespace preflight") {
+      sql("CREATE TABLE dl_view_collision_src(grp STRING, amount INT) USING DELTA")
+      sql("INSERT INTO dl_view_collision_src VALUES ('a', 10)")
+      val query       = "SELECT grp, SUM(amount) AS total FROM dl_view_collision_src GROUP BY grp"
+      val foreignView = "SELECT CAST('foreign' AS STRING) AS user_column"
+
+      Seq(false, true).foreach { lateCollision =>
+        val name = s"dl_view_collision_$lateCollision"
+        if (!lateCollision) sql(s"CREATE VIEW $name AS $foreignView")
+        var dataWrites = 0
+        val ex = CommandConcurrencyInjection.withBeforeCreateDataWrite {
+          dataWrites += 1
+          if (lateCollision && dataWrites == 1) sql(s"CREATE VIEW $name AS $foreignView")
+        } {
+          intercept[Throwable] {
+            sql(s"CREATE MATERIALIZED VIEW $name AS $query")
+          }
+        }
+        ex.getMessage.toLowerCase should (include("exists") or include("already"))
+        dataWrites shouldBe (if (lateCollision) 1 else 0)
+        spark.table(name).schema.fieldNames.toSeq shouldBe Seq("user_column")
+        spark.table(name).collect().map(_.getString(0)).toSeq shouldBe Seq("foreign")
+        spark.catalog.tableExists(s"${name}__ivm_data") shouldBe false
+        MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(name)) shouldBe None
+        sql(s"DROP VIEW $name")
+        sql(s"CREATE MATERIALIZED VIEW $name AS $query")
+        assertMvCorrect(name, query)
+      }
     }
   }
 

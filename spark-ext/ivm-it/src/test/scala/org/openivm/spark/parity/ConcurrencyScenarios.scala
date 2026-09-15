@@ -1,11 +1,12 @@
 package org.openivm.spark.parity
 
+import org.openivm.spark.commands.{CommandConcurrencyInjection, RefreshFailureInjection}
 import org.openivm.spark.parity.base.IvmParitySpecBase
+import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.{Executors, TimeUnit}
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
 /** Parity port of `openivm/test/sql/concurrency.test`.
   *
@@ -26,22 +27,29 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   *
   * == Spark-side mapping ==
   *
-  *   - One SparkSession is shared across threads (`local[2]` so we actually
-  *     have two executor threads).  Spark SparkSession is documented as
+  *   - One SparkSession is shared across threads (`local[4]` for this spec
+  *     so concurrent CREATE / REFRESH / DROP requests can all make progress).
+  *     Spark SparkSession is documented as
   *     thread-safe.
   *
   *   - Delta Lake provides OCC (optimistic concurrency control) at the
   *     transaction level.  When two threads try to COMMIT writes to the
   *     same Delta table simultaneously, one wins immediately and the other
-  *     gets a `ConcurrentAppendException` / similar; openivm-spark's
-  *     idempotency (the `consumed_by` array set-merge in `StagingCatalog`)
-  *     guarantees that repeated refresh attempts don't double-apply a
-  *     consumed delta even if the first attempt partially failed and was
-  *     retried.
+  *     gets a `ConcurrentAppendException` / similar. Same-MV refreshes are
+  *     serialized by the command mutex, and any retry that matters to
+  *     correctness must rerun the whole command from a fresh staging
+  *     snapshot rather than replaying one rewritten statement in place.
   *
   *   - We use a JDK `ExecutorService` (fixed thread pool) and `Future`s.
   *     Each test bounds total wall time with `Await.result(... , timeout)`
   *     so a deadlock would fail-fast rather than hang the suite.
+  *
+  *   - Where a scenario must hold one command still while another runs, the
+  *     command is parked inside a `CommandConcurrencyInjection` hook through
+  *     [[org.openivm.spark.testkit.ParkedCommandBarrier]].  Never park with an
+  *     ad-hoc latch budget: the parked command is released only after the
+  *     observation completes, so a park budget shorter than the observation
+  *     budget turns a merely slow observation into a phantom locking verdict.
   *
   *   - We do NOT assert that REFRESHes from different threads never fail —
   *     OCC may legitimately surface a transient error.  We DO assert that,
@@ -51,6 +59,8 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   */
 abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def sparkMaster: String = "local[4]"
 
   /** Run a body that may legitimately encounter an OCC conflict / refresh
     * collision.  Captures the error but does not fail the future — the test
@@ -64,15 +74,140 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
     }
 
   /** Run `tasks` on a fixed thread pool of size `parallelism`; wait `timeout`. */
-  protected def runAll(parallelism: Int, timeout: Duration)(tasks: Seq[() => Unit]): Unit = {
-    val pool = Executors.newFixedThreadPool(parallelism)
-    try {
-      implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
-      val futures                       = tasks.map(t => Future(t()))
+  protected def runAll(parallelism: Int, timeout: Duration)(tasks: Seq[() => Unit]): Unit =
+    TestPools.withPool(parallelism) { implicit ec: ExecutionContext =>
+      val futures = tasks.map(t => Future(t()))
       Await.result(Future.sequence(futures), timeout)
-    } finally {
-      pool.shutdown()
-      pool.awaitTermination(30, TimeUnit.SECONDS)
+      ()
+    }
+
+  /** Run `body` with an execution context backed by a fixed pool.  The pool is
+    * always drained — with an interrupt if a worker ignored the polite
+    * shutdown — so a failed assertion cannot leave a parked command holding
+    * the forked test JVM open.  Nest [[ParkedCommandBarrier.use]] INSIDE this
+    * scope so the parked command is released before the drain.
+    */
+  protected def withPool[A](parallelism: Int)(body: ExecutionContext => A): A =
+    TestPools.withPool(parallelism)(body)
+
+  protected def runSqlEventually(sqlText: String, maxAttempts: Int = 10): Unit = {
+    var attempt              = 0
+    var succeeded            = false
+    var lastError: Throwable = null
+    while (!succeeded && attempt < maxAttempts) {
+      try {
+        sql(sqlText).collect()
+        succeeded = true
+      } catch {
+        case t: Throwable =>
+          lastError = t
+          attempt += 1
+          Thread.sleep(50L * attempt)
+      }
+    }
+    if (!succeeded && lastError != null) throw lastError
+  }
+
+  protected def assertSqlBagEqual(actualSql: String, expectedSql: String): Unit = {
+    val actual   = spark.sql(actualSql)
+    val expected = spark.sql(expectedSql)
+    withClue(s"$actualSql EXCEPT ALL $expectedSql: ") {
+      actual.exceptAll(expected).count() shouldBe 0L
+    }
+    withClue(s"$expectedSql EXCEPT ALL $actualSql: ") {
+      expected.exceptAll(actual).count() shouldBe 0L
+    }
+  }
+
+  /** Upper bound on a single unrelated command observed while another command
+    * is parked.  Generous because a full-suite run oversubscribes the box
+    * (32 forked JVMs × `local[4]`); exceeding it means the observed command is
+    * genuinely blocked, not merely slow.
+    */
+  protected val RefreshObservationBudget: FiniteDuration = 300.seconds
+
+  /** Upper bound on the parked command finishing once it has been released. */
+  protected val CreateCompletionBudget: FiniteDuration = 600.seconds
+
+  /** Fail with a self-describing message unless `barrier` still holds the
+    * command inside the injected hook.  Distinguishes "still parked" (the
+    * invariant we assert) from "the park failsafe expired" and from "the
+    * command left the hook and finished", neither of which says anything
+    * about locking.
+    */
+  protected def assertStillParked(
+      barrier: ParkedCommandBarrier,
+      parkedCommand: Future[_]
+  ): Unit =
+    if (!barrier.isParked) {
+      val outcome = parkedCommand.value
+        .map {
+          case scala.util.Failure(t) => s"failed with ${t.getClass.getName}: ${t.getMessage}"
+          case scala.util.Success(_) => "completed successfully"
+        }
+        .getOrElse("still running")
+      fail(
+        s"the parked command left the injected hook before the observation finished " +
+          s"(${barrier.describe}); it $outcome. This observation is void — it does not " +
+          "prove or disprove anything about locking."
+      )
+    }
+
+  // ============================================================================
+  // (0) CREATE on one MV must not block REFRESH on another MV
+  // ============================================================================
+  describe("(0) Unrelated CREATE and REFRESH commands overlap") {
+    it("CREATE on one MV does not take a global lock that blocks REFRESH elsewhere") {
+      sql("CREATE TABLE IF NOT EXISTS create_c0(region STRING, amount INT) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS refresh_c0(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO create_c0 VALUES ('east', 10), ('west', 20), ('north', 30)")
+      sql("INSERT INTO refresh_c0 VALUES ('east', 1), ('west', 2)")
+
+      val createSql  = "SELECT region, SUM(amount) AS total FROM create_c0 GROUP BY region"
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM refresh_c0 GROUP BY region"
+      sql(s"CREATE MATERIALIZED VIEW mv_refresh_c0 AS $refreshSql")
+      sql("INSERT INTO refresh_c0 VALUES ('north', 3)")
+
+      // The parked CREATE is released only after the REFRESH has been
+      // observed, so the barrier's park failsafe must dominate the REFRESH
+      // budget — `forObservation` enforces that ordering at construction.
+      val barrier = ParkedCommandBarrier.forObservation(RefreshObservationBudget)
+
+      CommandConcurrencyInjection.withBeforeCreateBody(barrier.park()) {
+        withPool(2) { implicit ec =>
+          // `use` releases the parked CREATE before the pool is shut down,
+          // including when an assertion below fails.
+          barrier.use {
+            val createFuture = Future(sql(s"CREATE MATERIALIZED VIEW mv_create_c0 AS $createSql").collect())
+            withClue(s"CREATE never reached the before-create hook within $RefreshObservationBudget: ") {
+              barrier.awaitEntered() shouldBe true
+            }
+
+            val refreshFuture = Future(refreshMv("mv_refresh_c0"))
+            try Await.result(refreshFuture, RefreshObservationBudget)
+            catch {
+              case _: TimeoutException =>
+                fail(
+                  s"REFRESH on mv_refresh_c0 did not complete within $RefreshObservationBudget while " +
+                    s"CREATE of mv_create_c0 was parked before its body — CREATE is holding a lock that " +
+                    s"is not scoped to its own view (${barrier.describe})"
+                )
+            }
+
+            // The parked CREATE can only leave the hook when this test
+            // releases it, so these are state assertions, not timing races.
+            assertStillParked(barrier, createFuture)
+            createFuture.isCompleted shouldBe false
+
+            barrier.release()
+            Await.result(createFuture, CreateCompletionBudget)
+            barrier.parkCount shouldBe 1
+          }
+        }
+      }
+
+      assertMvCorrect("mv_refresh_c0", refreshSql)
+      assertMvCorrect("mv_create_c0", createSql)
     }
   }
 
@@ -134,42 +269,51 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
   }
 
   // ============================================================================
-  // (2) Two threads call REFRESH on the SAME view — per-view mutex / Delta OCC
+  // (2) Same-MV refreshes serialize; the queued refresh sees newer deltas
   // ============================================================================
-  describe("(2) Two threads call REFRESH on the SAME MV — Delta OCC + idempotency") {
-    it("after both threads finish, MV is bag-equal to the live view body") {
-      sql("CREATE TABLE IF NOT EXISTS items_c2(id INT, val INT) USING DELTA")
-      val seed = (1 to 100).map(i => s"($i, ${i * 10})").mkString(", ")
-      sql(s"INSERT INTO items_c2 VALUES $seed")
+  describe("(2) Same-MV REFRESH requests serialize and re-read queued deltas") {
+    it("the waiting refresh starts from a fresh staging snapshot and applies the later batch once") {
+      sql("CREATE TABLE IF NOT EXISTS sales_c2(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sales_c2 VALUES ('seed', 1)")
+
+      val refreshSql = "SELECT region, SUM(amount) AS total FROM sales_c2 GROUP BY region"
+      sql(s"CREATE MATERIALIZED VIEW mv_sales_c2 AS $refreshSql")
 
       sql(
-        "CREATE MATERIALIZED VIEW mv_items_c2 AS " +
-          "SELECT val, COUNT(*) AS cnt FROM items_c2 GROUP BY val"
+        "INSERT INTO sales_c2 " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
       )
 
-      // Add a second batch BEFORE the concurrent refresh so both threads have
-      // something real to do.
-      val seed2 = (101 to 200).map(i => s"($i, ${i * 10})").mkString(", ")
-      sql(s"INSERT INTO items_c2 VALUES $seed2")
+      withPool(2) { implicit ec =>
+        val refresh1 = Future(refreshMv("mv_sales_c2"))
+        Thread.sleep(150L)
+        val refresh2 = Future(refreshMv("mv_sales_c2"))
+        Thread.sleep(150L)
+        sql(
+          "INSERT INTO sales_c2 " +
+            "SELECT CASE " +
+            "  WHEN id % 4 = 0 THEN 'east' " +
+            "  WHEN id % 4 = 1 THEN 'west' " +
+            "  WHEN id % 4 = 2 THEN 'north' " +
+            "  ELSE 'south' END AS region, " +
+            "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+        )
 
-      val errSink = new AtomicReference[Throwable](null)
+        Await.result(refresh1, 600.seconds)
+        refresh2.isCompleted shouldBe false
+        Await.result(refresh2, 600.seconds)
+      }
 
-      val r: () => Unit = () => silentlyTry(refreshMv("mv_items_c2"), errSink)
-      runAll(parallelism = 2, timeout = 120.seconds)(Seq(r, r))
+      assertMvCorrect("mv_sales_c2", refreshSql)
 
-      // Final converge
-      refreshMv("mv_items_c2")
-      assertMvCorrect(
-        "mv_items_c2",
-        "SELECT val, COUNT(*) AS cnt FROM items_c2 GROUP BY val"
-      )
-
-      // Idempotency: another REFRESH still leaves the MV correct.
-      refreshMv("mv_items_c2")
-      assertMvCorrect(
-        "mv_items_c2",
-        "SELECT val, COUNT(*) AS cnt FROM items_c2 GROUP BY val"
-      )
+      // A third REFRESH with no intervening DML must now be a no-op.
+      refreshMv("mv_sales_c2")
+      assertMvCorrect("mv_sales_c2", refreshSql)
     }
   }
 
@@ -216,47 +360,51 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
   describe("(4) DROP one MV while refreshing another — both succeed independently") {
     it("after DROP, the target is gone; the kept MV stays correct") {
       // Set up: two unrelated MVs over two unrelated tables.
-      sql("CREATE TABLE IF NOT EXISTS t4a_c4(id INT, val INT) USING DELTA")
-      sql("CREATE TABLE IF NOT EXISTS t4b_c4(id INT, val INT) USING DELTA")
-      sql(s"INSERT INTO t4a_c4 VALUES ${(1 to 100).map(i => s"($i, $i)").mkString(", ")}")
-      sql(s"INSERT INTO t4b_c4 VALUES ${(1 to 100).map(i => s"($i, $i)").mkString(", ")}")
+      sql("CREATE TABLE IF NOT EXISTS t4a_c4(region STRING, amount INT) USING DELTA")
+      sql("CREATE TABLE IF NOT EXISTS t4b_c4(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO t4a_c4 VALUES ('east', 3), ('west', 4)")
+      sql("INSERT INTO t4b_c4 VALUES ('east', 8), ('west', 9)")
 
       sql(
-        "CREATE MATERIALIZED VIEW mv_drop_target_c4 AS SELECT val, COUNT(*) AS cnt FROM t4a_c4 GROUP BY val"
+        "CREATE MATERIALIZED VIEW mv_drop_target_c4 AS SELECT region, SUM(amount) AS total FROM t4a_c4 GROUP BY region"
       )
       sql(
-        "CREATE MATERIALIZED VIEW mv_keep_c4 AS SELECT val, COUNT(*) AS cnt FROM t4b_c4 GROUP BY val"
+        "CREATE MATERIALIZED VIEW mv_keep_c4 AS SELECT region, SUM(amount) AS total FROM t4b_c4 GROUP BY region"
       )
 
       // Add DML so the keeper has something to refresh
       sql(
-        s"INSERT INTO t4b_c4 VALUES ${(101 to 200).map(i => s"($i, $i)").mkString(", ")}"
+        "INSERT INTO t4b_c4 " +
+          "SELECT CASE " +
+          "  WHEN id % 4 = 0 THEN 'east' " +
+          "  WHEN id % 4 = 1 THEN 'west' " +
+          "  WHEN id % 4 = 2 THEN 'north' " +
+          "  ELSE 'south' END AS region, " +
+          "CAST(id AS INT) AS amount FROM range(250000)"
       )
 
-      val errSink = new AtomicReference[Throwable](null)
-
-      val keeperRefresher: () => Unit = () =>
-        for (_ <- 0 until 3) {
-          silentlyTry(refreshMv("mv_keep_c4"), errSink)
-        }
-      val dropper: () => Unit = () => silentlyTry(sql("DROP MATERIALIZED VIEW mv_drop_target_c4"): Unit, errSink)
-
-      runAll(parallelism = 2, timeout = 120.seconds)(Seq(keeperRefresher, dropper))
+      withPool(2) { implicit ec =>
+        val refreshFuture = Future(refreshMv("mv_keep_c4"))
+        Thread.sleep(150L)
+        val dropFuture = Future(sql("DROP MATERIALIZED VIEW mv_drop_target_c4").collect())
+        Await.result(dropFuture, 300.seconds)
+        refreshFuture.isCompleted shouldBe false
+        Await.result(refreshFuture, 600.seconds)
+      }
 
       // The dropped view should be gone.
       val tables = spark.catalog.listTables().collect().map(_.name.toLowerCase).toSet
       tables should not contain "mv_drop_target_c4"
 
       // The keeper MV must still be correct.
-      refreshMv("mv_keep_c4")
-      assertMvCorrect("mv_keep_c4", "SELECT val, COUNT(*) AS cnt FROM t4b_c4 GROUP BY val")
+      assertMvCorrect("mv_keep_c4", "SELECT region, SUM(amount) AS total FROM t4b_c4 GROUP BY region")
     }
   }
 
   // ============================================================================
-  // (5) Stress: 3 threads do conflicting DML on the SAME table → single REFRESH
+  // (5) Stress: mixed conflicting DML on the SAME table → single REFRESH
   // ============================================================================
-  describe("(5) Stress — conflicting INSERTs from 3 threads, single REFRESH after") {
+  describe("(5) Stress — conflicting INSERT / UPDATE / DELETE before one REFRESH") {
     it("after all writers finish and a single REFRESH runs, MV is bag-equal") {
       sql("CREATE TABLE IF NOT EXISTS stress_c5(id INT, grp STRING, val INT) USING DELTA")
       val seed =
@@ -268,32 +416,17 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
           "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress_c5 GROUP BY grp"
       )
 
-      val errSink = new AtomicReference[Throwable](null)
-
-      // Each thread INSERTs 3 rows into ITS OWN group — minimises Delta OCC
-      // conflicts (single base table but disjoint logical groups) while still
-      // exercising concurrent appends.
-      def mkWriter(grp: String, idBase: Int): () => Unit = () =>
-        for (k <- 0 until 3) {
-          val insertSql = s"INSERT INTO stress_c5 VALUES (${idBase + k}, '$grp', ${100 + k})"
-          var attempt   = 0
-          var succeeded = false
-          while (!succeeded && attempt < 10) {
-            try {
-              sql(insertSql)
-              succeeded = true
-            } catch {
-              case _: Throwable =>
-                attempt += 1
-                Thread.sleep(50L * attempt)
-            }
-          }
-          if (!succeeded) silentlyTry(sql(insertSql), errSink)
-        }
-
-      runAll(parallelism = 3, timeout = 600.seconds)(
-        Seq(mkWriter("g0", 1000), mkWriter("g1", 2000), mkWriter("g2", 3000))
-      )
+      withPool(3) { implicit ec =>
+        val deleteF = Future(runSqlEventually("DELETE FROM stress_c5 WHERE id IN (3, 4, 6, 7, 8)"))
+        val updateF = Future(runSqlEventually("UPDATE stress_c5 SET val = val + 7 WHERE id BETWEEN 21 AND 40"))
+        val insertF = Future(
+          runSqlEventually(
+            "INSERT INTO stress_c5 VALUES " +
+              "(1000, 'g0', 101), (1001, 'g1', 102), (1002, 'g2', 103), (1003, 'g3', 104)"
+          )
+        )
+        Await.result(Future.sequence(Seq(deleteF, updateF, insertF)), 600.seconds)
+      }
 
       refreshMv("mv_stress_c5")
       assertMvCorrect(
@@ -337,6 +470,53 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
 
       spark.table("mv_idem_c6").count() shouldBe 70L
       assertMvCorrect("mv_idem_c6", "SELECT id, val FROM idem_c6")
+    }
+  }
+
+  // ============================================================================
+  // (7) Failed refresh can retry from a fresh command state
+  // ============================================================================
+  describe("(7) Failed refresh can retry without replaying a successful batch") {
+    it("compensates the failed WINDOW_PARTITION write and the retry converges exactly once") {
+      sql("CREATE TABLE IF NOT EXISTS retry_c7(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      sql("INSERT INTO retry_c7 SELECT id, 1 AS seq, id AS payload FROM range(1001)")
+
+      val viewSql =
+        "SELECT id, seq, payload, " +
+          "LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload, " +
+          "ROW_NUMBER() OVER (PARTITION BY id ORDER BY seq) AS row_num " +
+          "FROM retry_c7"
+      val downstreamSql = "SELECT id, seq, payload FROM retry_mv_c7"
+
+      sql(s"CREATE MATERIALIZED VIEW retry_mv_c7 AS $viewSql")
+      sql(s"CREATE MATERIALIZED VIEW retry_downstream_c7 AS $downstreamSql")
+      sql(
+        "CREATE TABLE retry_before_failure_c7 USING DELTA AS " +
+          "SELECT id, seq, payload, previous_payload, row_num FROM retry_mv_c7"
+      )
+
+      assertMvCorrect("retry_mv_c7", viewSql)
+      assertMvCorrect("retry_downstream_c7", downstreamSql)
+
+      sql("UPDATE retry_c7 SET payload = payload + 100000 WHERE seq = 1")
+      sql("INSERT INTO retry_c7 SELECT id, 2 AS seq, id + 200000 AS payload FROM range(1001)")
+      sql("DELETE FROM retry_c7 WHERE seq = 1 AND id % 11 = 0")
+
+      RefreshFailureInjection.failNextWindowCascadeInsert(spark)
+      intercept[RuntimeException] {
+        refreshMv("retry_mv_c7")
+      }
+
+      assertSqlBagEqual(
+        "SELECT id, seq, payload, previous_payload, row_num FROM retry_mv_c7",
+        "SELECT id, seq, payload, previous_payload, row_num FROM retry_before_failure_c7"
+      )
+
+      refreshMv("retry_mv_c7")
+      refreshMv("retry_downstream_c7")
+
+      assertMvCorrect("retry_mv_c7", viewSql)
+      assertMvCorrect("retry_downstream_c7", downstreamSql)
     }
   }
 }

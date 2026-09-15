@@ -44,7 +44,7 @@ class ShowMaterializedViewRefreshSqlSpec extends IvmParitySpecBase("show-refresh
       mvExists("srs_mv_agg") shouldBe false
     }
 
-    it("emits an INSERT OVERWRITE program for a FULL_REFRESH (Top-K) view") {
+    it("emits an incremental program targeting the Top-K backing table") {
       sql("CREATE TABLE srs_topk_src (region STRING, amount INT) USING DELTA")
       sql("INSERT INTO srs_topk_src VALUES ('east', 10), ('west', 20), ('north', 30)")
 
@@ -52,8 +52,8 @@ class ShowMaterializedViewRefreshSqlSpec extends IvmParitySpecBase("show-refresh
       val program =
         refreshSql(s"SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW srs_mv_topk AS $q")
 
-      program.toUpperCase should include("INSERT OVERWRITE")
-      program should include("srs_mv_topk")
+      program.toUpperCase should include("MERGE INTO")
+      program should include("srs_mv_topk__ivm_data")
       mvExists("srs_mv_topk") shouldBe false
     }
 
@@ -79,6 +79,29 @@ class ShowMaterializedViewRefreshSqlSpec extends IvmParitySpecBase("show-refresh
       down.trim should not be empty
       down should include("srs_cold_down")
       mvExists("srs_cold_down") shouldBe false
+    }
+
+    // The dry program is the documented way to inspect what a REFRESH will run,
+    // so it has to carry the user's snapshot pins: a REFRESH re-attaches them to
+    // openivm's live-source reads, and a dry program that omits them would
+    // describe a live read of a frozen relation.
+    it("re-applies a user snapshot pin to the dry refresh program") {
+      sql("CREATE TABLE srs_pin_src (region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO srs_pin_src VALUES ('east', 10), ('west', 20)")
+      val pinned = spark.sql("DESCRIBE HISTORY srs_pin_src").selectExpr("max(version)").head().getLong(0)
+      sql("INSERT INTO srs_pin_src VALUES ('north', 30)")
+
+      sql("CREATE TABLE srs_pin_fact (region STRING, qty INT) USING DELTA")
+      sql("INSERT INTO srs_pin_fact VALUES ('east', 1), ('west', 2)")
+
+      val q =
+        s"SELECT d.region, f.qty FROM srs_pin_src VERSION AS OF $pinned AS d " +
+          "INNER JOIN srs_pin_fact AS f ON f.region = d.region"
+      val program = refreshSql(s"SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW srs_mv_pin AS $q")
+
+      program should include(s"VERSION AS OF $pinned")
+      program should not include s"`srs_pin_fact` VERSION AS OF"
+      mvExists("srs_mv_pin") shouldBe false
     }
   }
 }

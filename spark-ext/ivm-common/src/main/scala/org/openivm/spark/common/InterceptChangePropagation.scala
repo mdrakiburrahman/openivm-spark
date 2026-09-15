@@ -58,6 +58,22 @@ final class InterceptChangePropagation extends ChangePropagation {
     StagingDeltaView.buildSourceDeltaViewSql(sourceTable, sourceSchema, deltas)
   }
 
+  override def registerSourceDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch]
+  ): String = {
+    val sql = super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
+    if (MvProjectionSource.isProjection(spark, sourceTable)) {
+      val name = StagingDeltaView.deltaViewName(sourceTable)
+      MvProjectionSource
+        .project(spark.table(name), sourceSchema, Seq("openivm_multiplicity", "openivm_timestamp"))
+        .createOrReplaceTempView(name)
+    }
+    sql
+  }
+
   override def markConsumed(spark: SparkSession, viewName: String, batches: Seq[ChangeBatch]): Unit = {
     val paths = batches.flatMap {
       case StagingChangeBatch(_, ds, _) => ds.map(_.stagingPath)

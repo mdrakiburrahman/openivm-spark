@@ -10,7 +10,8 @@ final case class OpenIvmRocksDBConf(
     walEnabled: Boolean,
     changelogEnabled: Boolean,
     multiProcess: Boolean,
-    lockTimeoutMs: Long
+    lockTimeoutMs: Long,
+    maxWriteBatchBytes: Long
 )
 
 object OpenIvmRocksDBConf {
@@ -19,6 +20,7 @@ object OpenIvmRocksDBConf {
   val CompactionThresholdSstCountKey = "spark.openivm.rocksdb.compactionThresholdSstCount"
   val WalEnabledKey                  = "spark.openivm.rocksdb.wal.enabled"
   val ChangelogEnabledKey            = "spark.openivm.rocksdb.changelog.enabled"
+  val MaxWriteBatchBytesKey          = "spark.openivm.rocksdb.writeBatch.maxBytes"
 
   /** Multi-process mode: when true, every catalog operation acquires a POSIX
     * file lock on `<dbPath>/openivm-jvm.lock`, opens RocksDB, performs the
@@ -43,7 +45,8 @@ object OpenIvmRocksDBConf {
     walEnabled = true,
     changelogEnabled = false,
     multiProcess = false,
-    lockTimeoutMs = JavaUtils.timeStringAsMs("60s")
+    lockTimeoutMs = JavaUtils.timeStringAsMs("60s"),
+    maxWriteBatchBytes = 16L * 1024L * 1024L
   )
 
   def fromSpark(spark: SparkSession): OpenIvmRocksDBConf = {
@@ -59,7 +62,10 @@ object OpenIvmRocksDBConf {
       walEnabled = sparkConf.get(WalEnabledKey, default.walEnabled.toString).toBoolean,
       changelogEnabled = sparkConf.get(ChangelogEnabledKey, default.changelogEnabled.toString).toBoolean,
       multiProcess = sparkConf.get(MultiProcessKey, default.multiProcess.toString).toBoolean,
-      lockTimeoutMs = JavaUtils.timeStringAsMs(sparkConf.get(LockTimeoutKey, s"${default.lockTimeoutMs}ms"))
+      lockTimeoutMs = JavaUtils.timeStringAsMs(sparkConf.get(LockTimeoutKey, s"${default.lockTimeoutMs}ms")),
+      maxWriteBatchBytes = JavaUtils.byteStringAsBytes(
+        sparkConf.get(MaxWriteBatchBytesKey, s"${default.maxWriteBatchBytes}b")
+      )
     )
   }
 }

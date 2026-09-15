@@ -553,8 +553,7 @@ A process crash can leave those systems out of sync.
 The most important source ordering is in `postRefreshCleanup`:
 
 ```scala
-val newVersion =
-  DeltaTable.forPath(spark, meta.location).history(1).collect().head.getAs[Long]("version")
+val newVersion = DeltaTableVersion.requireLatest(spark, meta.location)
 MvCatalog.advance(spark, name, newVersion)
 
 val consumedPaths = stagingDeltas.map(_.stagingPath)

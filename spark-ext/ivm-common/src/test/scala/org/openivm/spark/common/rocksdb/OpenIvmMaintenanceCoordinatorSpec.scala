@@ -103,12 +103,13 @@ class OpenIvmMaintenanceCoordinatorSpec extends AnyFunSpec with BeforeAndAfterEa
 
     it("triggers compaction when the SST count exceeds the configured threshold") {
       val dir = newDbDir("compact")
-      val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
       val conf = OpenIvmRocksDBConf.default.copy(
         minVersionsToRetain = 64,
         maintenanceIntervalMs = 50L,
-        compactionThresholdSstCount = 0
+        compactionThresholdSstCount = 0,
+        walEnabled = false
       )
+      val db = new OpenIvmRocksDB(dir.getAbsolutePath, conf, Seq("meta"))
 
       try {
         db.load()

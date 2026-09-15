@@ -1,5 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.slf4j.LoggerFactory
 
 import scala.collection.mutable
@@ -43,11 +44,29 @@ object OpenIvmMaintenanceCoordinator {
       current
     }
 
+    joinDaemon(threadToJoin)
+  }
+
+  def shutdownIfIdle(): Unit = {
+    val threadToJoin = this.synchronized {
+      if (registrations.nonEmpty) {
+        null
+      } else {
+        running = false
+        val current = daemonThread
+        daemonThread = null
+        current
+      }
+    }
+
+    joinDaemon(threadToJoin)
+  }
+
+  private def joinDaemon(threadToJoin: Thread): Unit =
     if (threadToJoin != null) {
       threadToJoin.interrupt()
       threadToJoin.join(1000L)
     }
-  }
 
   private def startDaemonIfNeededLocked(): Unit =
     if (daemonThread == null || !daemonThread.isAlive) {
@@ -90,14 +109,20 @@ object OpenIvmMaintenanceCoordinator {
       snapshot.foreach { case (db, conf) =>
         try {
           if (!db.isClosed) {
+            val runStarted = System.nanoTime()
+            OpenIvmMetrics.increment("rocksdb.maintenance.run.count")
             db.withWriteLock {
+              val holdStarted = System.nanoTime()
               if (!db.isClosed) {
                 db.cleanup(conf.minVersionsToRetain)
                 if (db.sstFileCount > conf.compactionThresholdSstCount) {
+                  OpenIvmMetrics.increment("rocksdb.maintenance.compaction.count")
                   db.compactRange()
                 }
               }
+              OpenIvmMetrics.updateTimer("rocksdb.maintenance.lock_hold", System.nanoTime() - holdStarted)
             }
+            OpenIvmMetrics.updateTimer("rocksdb.maintenance.run", System.nanoTime() - runStarted)
           }
         } catch {
           case NonFatal(error) =>

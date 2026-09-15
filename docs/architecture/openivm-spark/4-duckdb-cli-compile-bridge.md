@@ -72,7 +72,7 @@ val duckdbV = "1.5.2.1"
 The dev pin file carries the same version contract:
 
 ```text
-# spark-ext/dev/pins.env:27-28
+# spark-ext/dev/pins.env:55-56
 # DuckDB JDBC (must match openivm's bundled DuckDB ABI; openivm CI pins v1.5.2)
 DUCKDB_JDBC_VERSION=1.5.2.1
 ```
@@ -395,7 +395,232 @@ __sparkfn_to_timestamp
 
 ## This design lets the pre-pass choose the right macro from the observed arity. It also gives the post-pass enough structure to recover the original Spark function call.
 
-## 7. Process model and timeout behavior
+## 7. Snapshot pins (Delta time travel)
+
+A view body may pin a source to a Delta snapshot.
+Spark spells that pin `FROM t VERSION AS OF 366` or `FROM t TIMESTAMP AS OF '…'`
+(its `temporalClause`).
+DuckDB rejects that spelling at parse time:
+
+```text
+Parser Error: syntax error at or near "as"
+LINE 1: … FROM billing_meter_dim VERSION AS OF 366 GROUP BY region;
+                                         ^
+```
+
+DuckDB's own DuckLake spelling `AT (VERSION => 366)` parses but then fails to
+bind against the bridge's plain in-memory tables
+(`Binder Error: Catalog type does not support time travel`).
+Neither spelling can work on the DuckDB side, because
+[§5](#5-source-schema-synthesis) registers row-less, schema-only tables.
+A snapshot pin carries no information the classifier can use.
+Before the split, the pin therefore aborted the compile and demoted the whole
+view to `COMPILE_FAILED` → `FULL_REFRESH`, so every refresh — including a
+refresh with an empty delta — re-executed the entire body.
+
+`SparkTimeTravelSql.scala` splits the pin out of the compile-bridge COPY of the
+body only.
+The scanner is Spark-dialect and quote/comment aware.
+It does not re-implement a SQL parser.
+Every split is verified against Spark's own `CatalystSqlParser`, and the
+verification is an IDENTITY check, not a shape check: the de-pinned SQL must
+parse, must contain no residual `RelationTimeTravel` node, must reference
+exactly the same relation identifiers as the original, and every pin the
+scanner lifted must correspond one-for-one — same relation segments, same
+`VERSION`/`TIMESTAMP` kind, same literal value — to a `RelationTimeTravel` node
+Catalyst found in the original body.
+Catalyst is authoritative for what a pin binds to.
+A shape-only check is not enough: in
+
+```sql
+FROM t -- freeze at load time
+VERSION AS OF 4
+```
+
+a scanner that does not skip comment trivia binds `time`, the comment's last
+word, as the relation. The counts still match, so the split is accepted, the
+pin resolves to no tracked source, and the relation the user froze is
+maintained from live rows. The scanner therefore tracks the end of the last
+real token, and the Catalyst cross-check rejects any lifted pin whose identity
+is not present in Catalyst's multiset.
+If any check fails, the original SQL is passed through and the compile fails
+loudly as before.
+
+Nothing Spark executes loses the pin:
+
+| Spark-side artifact                              | Where the pin is re-applied                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------ |
+| `MvMetadata.querySql` (FULL_REFRESH body)         | never stripped — stored verbatim                                    |
+| initial-load CTAS at CREATE                       | `OpenIvmCompiler.parseInitialLoadSql`                               |
+| live source reads in the compiled refresh program | `SparkRefreshRewriter.rewriteMemoryMainPrefix` (`sourceSnapshotPins`) |
+| the dry program `SHOW REFRESH SQL …` prints       | `MvDryCompile.dryRewrite` (same `sourceSnapshotPins`)               |
+
+Both re-application sites go through `MemoryMainRefs` (`ivm-common`), which
+rewrites `memory.main.<ident>` on identifier boundaries.
+That is not a stylistic choice.
+`sql.replace("memory.main.customer", …)` over a source set that also contains
+`customer_address` either injects the clause mid-identifier
+(`customer VERSION AS OF 3_address`) or consumes the longer name so its own pin
+never lands — a silent live read of a relation the user froze, with no error
+anywhere.
+
+A pinned source is a FROZEN relation.
+OpenIVM always emits a live read for every source, so the pin must be
+re-attached at each emitted `memory.main.<source>` reference.
+The refresh path in `MaterializedViewCommands` additionally consumes the staged
+deltas of a pinned source without applying them: post-pin DML is not part of the
+view, and leaving the rows staged would grow staging without bound.
+`rewriteRegularOldStateUnions` skips pinned sources so the user's pin is never
+replaced by the pre-refresh watermark version.
+
+If LPTS later grows a Spark-dialect front-end that accepts (and ignores)
+`temporalClause`, the split stays useful: it keeps the DuckDB-side body free of
+storage semantics that DuckDB cannot bind.
+
+### 7.1 Aliased relations (the dbt shape)
+
+Spark's grammar is `identifierReference temporalClause? tableAlias`, so the pin
+sits BETWEEN the relation and its alias:
+
+```sql
+from `analytics`.`billing_meter_dim` version as of 366 as p
+```
+
+That is the shape dbt emits for every `ref()`, and it is the shape a pin-aware
+compiler front-end gets wrong: LPTS `66bf3ae` re-emits the clause after the
+alias, which is invalid in both dialects.
+The bridge is unaffected because the clause never reaches LPTS/DuckDB — the
+split removes it and leaves `` from `analytics`.`billing_meter_dim` as p `` —
+and every Spark-side re-application inserts the clause immediately after the
+relation identifier, ahead of the alias.
+
+> **Pin bump policy.** `LPTS_COMMIT` is `dbac36de`, the commit that teaches the
+> LPTS front end Spark's `temporalClause` (aliased pinned relations and a source
+> read at two versions included). `66bf3ae`, the first cut of that work, must be
+> skipped: it re-emits the clause after the alias, which is invalid in both
+> dialects. openivm-spark itself needs no LPTS change — the clause never reaches
+> LPTS/DuckDB — so this pin is a compatibility floor, not a feature gate, and
+> the coverage below is deliberately pin-independent:
+> `split — aliased dbt-style relations` in `SparkTimeTravelSqlSpec`, tests 7d/7e
+> of `OpenIvmCompilerSpec` (compiled against a live DuckDB), the pin-ordering
+> cases in `SparkRefreshRewriterSpec`, and `(TTP-5)`/`(TTP-6)` in
+> `TimeTravelPinnedSourceScenarios`.
+
+### 7.2 Pin shapes OpenIVM refuses
+
+The pin is re-applied per SOURCE and has to name the same snapshot on every
+refresh, so these shapes are refused:
+
+| shape                                             | example                                          |
+| ------------------------------------------------- | ------------------------------------------------ |
+| one source read at two different versions          | `t VERSION AS OF 2 a JOIN t VERSION AS OF 5 b`    |
+| one source pinned in one place and live in another | `t VERSION AS OF 2 a JOIN t b`                    |
+| a pin that resolves to no tracked source, or to several | `FROM other_db.t VERSION AS OF 2`           |
+| a moving `TIMESTAMP AS OF` value                   | `t TIMESTAMP AS OF current_timestamp()`, `t TIMESTAMP AS OF date_sub(current_date(), 1)` |
+
+`split` returns the body unchanged for the first two, and
+`SparkTimeTravelSql.unsupportedSnapshotPinReason` reports all of them so
+`compile()` rejects the body itself with an explicit message.
+The refusal is the FIRST thing `compile()` does — ahead of the metric increment
+and the `CompilerInflight` gauge — so a refused body cannot leak an in-flight
+count.
+
+Only literal pin values are maintainable.
+`VERSION AS OF 4` and `TIMESTAMP AS OF '2026-08-24 00:00:00'` name one snapshot
+forever; `TIMESTAMP AS OF date_sub(current_date(), 1)` names a different one
+tomorrow, so no delta program can maintain it and the "frozen" relation would
+silently drift. Those bodies are demoted deliberately, and `FULL_REFRESH`
+re-executes `MvMetadata.querySql` — pin included — so the rows stay exactly what
+the user asked for.
+(`TIMESTAMP AS OF current_date` is rejected by Spark itself, before the bridge
+sees it: "timestamp expression cannot refer to any columns".)
+
+That refusal is not redundant.
+Until now these bodies were stopped by accident: the un-split SQL still carried
+`VERSION AS OF`, so DuckDB's parser aborted the compile.
+An LPTS front-end that ACCEPTS Spark's `temporalClause` removes the accident —
+the compile would succeed, no pin would be registered, and the incremental
+program would maintain a frozen relation from live rows.
+Refusing in the bridge keeps the outcome loud and correct: `COMPILE_FAILED` →
+`FULL_REFRESH` re-executes `MvMetadata.querySql`, which still carries both pins,
+so Spark honors them on every refresh.
+
+### 7.3 `time_travel_pin_status` — the downstream telemetry contract
+
+Downstream consumers (the campaign/source integration's scratch historical MV
+probe and its hydrate guards) must be able to tell — without reading any SQL —
+whether the snapshot the user pinned was actually honored.
+Every CREATE and every REFRESH therefore reports a `time_travel_pin_status` in
+both the `[openivm-mv]` classification line and the
+`OPENIVM_EXECUTION_SPAN` JSON:
+
+| status           | meaning                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `APPLIED`        | the body carries at least one user pin, every pin resolved to exactly one tracked source, and that source is frozen at the pinned snapshot |
+| `NOT_APPLICABLE` | the body carries no user pin at all                                                          |
+| `COMPILE_FAILED` | the body carries a pin from [§7.2](#72-pin-shapes-openivm-refuses); the view is demoted to `FULL_REFRESH` |
+
+The values are `org.openivm.spark.common.TimeTravelPinStatus`; guards must
+compare against `APPLIED` exactly, never infer it from compiled text.
+
+Two properties make that contract safe:
+
+- **Derived from the USER's body.** `SparkTimeTravelSql.pinTelemetry(sql,
+  qualifiedSources)` reads `MvMetadata.querySql` plus the view's tracked
+  sources. It is never derived from the compiled program: openivm's delta
+  statements legitimately carry no temporal clause even though every source
+  read in them is re-pinned by `SparkRefreshRewriter`.
+- **Persisted, then re-proved.** CREATE writes
+  `_ivm_time_travel_pin_status`, `_ivm_time_travel_pin_reason` and
+  `_ivm_time_travel_pins`
+  (`<qualified source>=<clause>`, sorted, `;`-joined) into the MV metadata, so
+  REFRESH reports `APPLIED` from metadata rather than from whatever SQL it is
+  about to execute. REFRESH still re-derives both from the body and fails
+  closed — `IllegalStateException`, no refresh — when the persisted status or
+  pin identity disagrees with it. A view created before this contract existed
+  has no persisted status; REFRESH then uses the derived value.
+
+`FULL_REFRESH` does not weaken `APPLIED`: a view demoted for an unrelated
+reason still re-executes `MvMetadata.querySql`, pin included. Only the refused
+pin shapes of [§7.2](#72-pin-shapes-openivm-refuses) report `COMPILE_FAILED`.
+
+#### `time_travel_pin_reason` — why the status is what it is
+
+The status alone cannot distinguish "the user wrote no pin" from "the pin was
+refused", so every emitter also reports a `time_travel_pin_reason` from
+`org.openivm.spark.common.TimeTravelPinReason`:
+
+| reason                            | paired status    | meaning                                                                   |
+| --------------------------------- | ---------------- | ------------------------------------------------------------------------- |
+| `pins_resolved`                   | `APPLIED`        | every user pin lifted and resolved to exactly one tracked source           |
+| `no_user_pin`                     | `NOT_APPLICABLE` | the body carries no temporal clause                                        |
+| `unsupported_pin_shape`           | `COMPILE_FAILED` | a refused shape from [§7.2](#72-pin-shapes-openivm-refuses)                |
+| `pin_not_resolved_to_single_source` | `COMPILE_FAILED` | a pin binds to zero or several tracked sources                           |
+| `no_tracked_sources`              | `COMPILE_FAILED` | the body pins a source but the view tracks none, so nothing can be frozen  |
+| `unknown_pin_status`              | `COMPILE_FAILED` | a status outside the vocabulary reached telemetry (see fail-closed, below) |
+
+Three further rules keep the pair trustworthy:
+
+- **Operation-invariant derivation.** `SparkTimeTravelSql.pinTelemetry(sql,
+  qualifiedSources)` is the only sanctioned way to produce the pair. CREATE
+  calls it with the user's body and the sources it collected; REFRESH calls it
+  with the SAME two values read back from `MvMetadata`, so one view cannot
+  report one status at CREATE and another at REFRESH.
+- **Fail closed on an unknown status.** A persisted or recorded status outside
+  the vocabulary reads as `COMPILE_FAILED`, never as absent and never as
+  `NOT_APPLICABLE`: softening it would let a corrupt property be silently
+  re-derived, and `NOT_APPLICABLE` is itself an assertion (that the user pinned
+  nothing) that corruption cannot support. A `COMPILE_FAILED` recorded on a
+  span is sticky.
+- **Quote-safe logging.** `[openivm-mv]` lines are `key='value'` text, not
+  JSON, and readers tokenize them with a `(\w+)='([^']*)'` scanner. A
+  `TIMESTAMP AS OF '2024-01-01'` clause therefore goes through
+  `org.openivm.spark.telemetry.KvLogValue` before it is logged (`'` → `"`,
+  control characters → space). The clause persisted in MV metadata is NOT
+  sanitized: the fail-closed CREATE-vs-REFRESH comparison must see exactly what
+  the user wrote.
+
+## 8. Process model and timeout behavior
 
 Each `compile()` call creates a new process.
 The process is launched by `runCli()`.
@@ -435,7 +660,7 @@ CompiledRefresh(
 
 ## That demotion preserves correctness. The MV can still be refreshed by re-running the original Spark SQL with `INSERT OVERWRITE`. The trade-off is performance. The view is no longer incrementally maintained until the compile failure is fixed and the MV is recreated or recompiled. At refresh time, cached compiled SQL is normally reused. A legacy MV without cached SQL can invoke the compiler again. If that compile fails, the refresh path should treat it as a compile failure, not as partial incremental SQL. No partial SQL program is safe to execute after a timeout.
 
-## 8. JSON-lines output parser
+## 9. JSON-lines output parser
 
 DuckDB's `-jsonlines` mode makes parsing simple and robust enough for this
 bridge.
@@ -473,7 +698,7 @@ The decoder handles:
 
 ## That row is status information. It is not the compile result. The compile result row is the one with `refresh_type`.
 
-## 9. Sequence diagram
+## 10. Sequence diagram
 
 ```mermaid
 sequenceDiagram
@@ -512,7 +737,7 @@ sequenceDiagram
 
 ______________________________________________________________________
 
-## 10. Sample input and output
+## 11. Sample input and output
 
 This section shows a minimal aggregate MV.
 The source table has two columns.
@@ -750,7 +975,7 @@ The important details in this output are:
 
 ______________________________________________________________________
 
-## 11. Operational checklist
+## 12. Operational checklist
 
 When debugging the compile bridge, check these items in order.
 
@@ -773,7 +998,7 @@ When debugging the compile bridge, check these items in order.
 
 ______________________________________________________________________
 
-## 12. Key source references
+## 13. Key source references
 
 - `OpenIvmCompiler.scala:11-16` — `CompiledRefresh`.
 - `OpenIvmCompiler.scala:28-33` — `CompileRequest`.
@@ -787,8 +1012,9 @@ ______________________________________________________________________
 - `OpenIvmCompiler.scala:445-467` — `build()` factory.
 - `OpenIvmCompiler.scala:490-523` — Spark function shim macros.
 - `SparkFunctionShimSql.scala:23-50` — arity-aware rename rules.
+- `SparkTimeTravelSql.scala` — snapshot-pin split and Spark-parser cross-check.
 - `Dependencies.scala:7-11` — DuckDB JDBC ABI pin and CLI note.
-- `pins.env:27-28` — DuckDB JDBC version pin.
+- `pins.env:55-56` — DuckDB JDBC version pin.
 - `CompileRefreshSpec.scala:9-55` — parity spec for the compiler bridge.
 - `MaterializedViewCommands.scala:359-392` — CREATE-time demotion to
   `FULL_REFRESH` after `OpenIvmCompileException`.
