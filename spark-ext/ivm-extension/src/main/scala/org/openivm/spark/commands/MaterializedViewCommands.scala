@@ -4931,7 +4931,8 @@ case class RefreshMaterializedViewCommand(
               val qOrder   = qlogOrder.getAndIncrement()
               profile.timeStep(
                 "execute_full_refresh_writer",
-                s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
+                s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind;" +
+                  "writer_metrics=unavailable"
               ) {
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
                   RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
@@ -4943,7 +4944,7 @@ case class RefreshMaterializedViewCommand(
                         .mode("overwrite")
                         .option("replaceWhere", "true")
                         .save(meta.location)
-                      recordPlanMetrics(df, kind)
+                      OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                       val ms = (System.nanoTime() - t0) / 1000000L
                       sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
                       Seq.empty[Row]

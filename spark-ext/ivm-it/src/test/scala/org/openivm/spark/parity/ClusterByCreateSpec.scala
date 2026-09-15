@@ -13,6 +13,7 @@ import org.openivm.spark.common.{
   RefreshTypeCode
 }
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** Integration coverage for `CREATE MATERIALIZED VIEW ... CLUSTER BY (...)` (#24).
   *
@@ -93,6 +94,9 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
     text should include(".option(\"replaceWhere\", \"true\")")
     text should not include "REPLACE WHERE true"
   }
+
+  private def replaceWhereWriterCounter(suffix: String): Long =
+    OpenIvmMetrics.counter(s"refresh.sql_stmt.replace_where_writer.$suffix").getCount
 
   describe("CREATE MATERIALIZED VIEW ... CLUSTER BY") {
     it("clusters the Delta data table and persists the CLUSTER BY columns in metadata") {
@@ -176,11 +180,18 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val beforeId         = deltaMetadataId("cbc_mv_refresh_one")
       val beforeSchemaJson = deltaSchemaJson("cbc_mv_refresh_one")
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_one")
+      val metricsUnavailableBefore =
+        replaceWhereWriterCounter("writer_metrics_unavailable")
+      val rowsReadBefore    = replaceWhereWriterCounter("rows_read")
+      val rowsWrittenBefore = replaceWhereWriterCounter("rows_written")
       deltaClusteringColumns("cbc_mv_refresh_one") shouldBe Seq("region")
 
       clearQueryLog()
       refreshMv("cbc_mv_refresh_one")
 
+      replaceWhereWriterCounter("writer_metrics_unavailable") shouldBe metricsUnavailableBefore + 1L
+      replaceWhereWriterCounter("rows_read") shouldBe rowsReadBefore
+      replaceWhereWriterCounter("rows_written") shouldBe rowsWrittenBefore
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_one"), beforeVersion) shouldBe
         BatchVerdict.Replace
       deltaMetadataId("cbc_mv_refresh_one") shouldBe beforeId

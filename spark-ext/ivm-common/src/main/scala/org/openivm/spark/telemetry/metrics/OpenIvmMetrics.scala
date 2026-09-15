@@ -259,6 +259,12 @@ object OpenIvmMetrics extends Logging {
     }
   }
 
+  def recordWriterMetricsUnavailable(kind: String): Unit = {
+    if (!enabled) return
+    val safeKind = sanitize(kind)
+    increment(s"refresh.sql_stmt.$safeKind.writer_metrics_unavailable")
+  }
+
   def recordCompileCache(hit: Boolean): Unit = increment(
     if (hit) "compiler.classification_cache.hit" else "compiler.classification_cache.miss"
   )
