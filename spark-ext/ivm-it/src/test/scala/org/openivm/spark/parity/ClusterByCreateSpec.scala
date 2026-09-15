@@ -145,20 +145,21 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       assertMvCorrect("cbc_mv_clustered", viewBody)
     }
 
-    it("preserves single-column Delta clustering metadata after an overwrite-style refresh") {
+    it("preserves single-column Delta clustering metadata after an ordinary full-refresh rewrite") {
       sql("CREATE TABLE cbc_refresh_one (region STRING, amount INT) USING DELTA")
       sql("INSERT INTO cbc_refresh_one VALUES ('east', 10), ('west', 20)")
 
-      val viewBody = "SELECT region, SUM(amount) AS total FROM cbc_refresh_one GROUP BY region"
+      val viewBody = "SELECT region, amount, current_timestamp() AS observed_at FROM cbc_refresh_one"
+      val expected = "SELECT region, amount FROM cbc_refresh_one"
       sql(s"CREATE MATERIALIZED VIEW cbc_mv_refresh_one CLUSTER BY (region) AS $viewBody")
 
+      mvRefreshType("cbc_mv_refresh_one") shouldBe RefreshTypeCode.FullRefresh
       val beforeId         = deltaMetadataId("cbc_mv_refresh_one")
       val beforeSchemaJson = deltaSchemaJson("cbc_mv_refresh_one")
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_one")
       deltaClusteringColumns("cbc_mv_refresh_one") shouldBe Seq("region")
 
       RefreshSqlLogCatalog.removeAll(spark)
-      sql("INSERT OVERWRITE TABLE cbc_refresh_one VALUES ('east', 15), ('north', 40)")
       refreshMv("cbc_mv_refresh_one")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_one"), beforeVersion) shouldBe
@@ -168,23 +169,25 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       deltaClusteringColumns("cbc_mv_refresh_one") shouldBe Seq("region")
       deltaClusteringMetadata("cbc_mv_refresh_one") should include("region")
       refreshSqlText should include("REPLACE WHERE true")
-      assertMvCorrect("cbc_mv_refresh_one", viewBody)
+      assertMvCorrect("cbc_mv_refresh_one", expected)
     }
 
-    it("preserves multi-column Delta clustering metadata after an overwrite-style refresh") {
+    it("preserves multi-column Delta clustering metadata after an ordinary full-refresh rewrite") {
       sql("CREATE TABLE cbc_refresh_multi (region STRING, day STRING, amount INT) USING DELTA")
       sql("INSERT INTO cbc_refresh_multi VALUES ('east','d1',10), ('west','d2',20)")
 
-      val viewBody = "SELECT region, day, SUM(amount) AS total FROM cbc_refresh_multi GROUP BY region, day"
+      val viewBody =
+        "SELECT region, day, amount, current_timestamp() AS observed_at FROM cbc_refresh_multi"
+      val expected = "SELECT region, day, amount FROM cbc_refresh_multi"
       sql(s"CREATE MATERIALIZED VIEW cbc_mv_refresh_multi CLUSTER BY (region, day) AS $viewBody")
 
+      mvRefreshType("cbc_mv_refresh_multi") shouldBe RefreshTypeCode.FullRefresh
       val beforeId         = deltaMetadataId("cbc_mv_refresh_multi")
       val beforeSchemaJson = deltaSchemaJson("cbc_mv_refresh_multi")
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_multi")
       deltaClusteringColumns("cbc_mv_refresh_multi") shouldBe Seq("region", "day")
 
       RefreshSqlLogCatalog.removeAll(spark)
-      sql("INSERT OVERWRITE TABLE cbc_refresh_multi VALUES ('east','d1',15), ('north','d3',40)")
       refreshMv("cbc_mv_refresh_multi")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_multi"), beforeVersion) shouldBe
@@ -196,23 +199,24 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       clustering should include("region")
       clustering should include("day")
       refreshSqlText should include("REPLACE WHERE true")
-      assertMvCorrect("cbc_mv_refresh_multi", viewBody)
+      assertMvCorrect("cbc_mv_refresh_multi", expected)
     }
 
-    it("keeps unclustered MV data unclustered after an overwrite-style refresh") {
+    it("keeps unclustered MV data unclustered after an ordinary full-refresh rewrite") {
       sql("CREATE TABLE cbc_refresh_plain (region STRING, amount INT) USING DELTA")
       sql("INSERT INTO cbc_refresh_plain VALUES ('east', 10), ('west', 20)")
 
-      val viewBody = "SELECT region, SUM(amount) AS total FROM cbc_refresh_plain GROUP BY region"
+      val viewBody = "SELECT region, amount, current_timestamp() AS observed_at FROM cbc_refresh_plain"
+      val expected = "SELECT region, amount FROM cbc_refresh_plain"
       sql(s"CREATE MATERIALIZED VIEW cbc_mv_refresh_plain AS $viewBody")
 
+      mvRefreshType("cbc_mv_refresh_plain") shouldBe RefreshTypeCode.FullRefresh
       val beforeId         = deltaMetadataId("cbc_mv_refresh_plain")
       val beforeSchemaJson = deltaSchemaJson("cbc_mv_refresh_plain")
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_plain")
       deltaClusteringColumns("cbc_mv_refresh_plain") shouldBe empty
 
       RefreshSqlLogCatalog.removeAll(spark)
-      sql("INSERT OVERWRITE TABLE cbc_refresh_plain VALUES ('east', 15), ('north', 40)")
       refreshMv("cbc_mv_refresh_plain")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_plain"), beforeVersion) shouldBe
@@ -221,7 +225,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       deltaSchemaJson("cbc_mv_refresh_plain") shouldBe beforeSchemaJson
       deltaClusteringColumns("cbc_mv_refresh_plain") shouldBe empty
       refreshSqlText should include("REPLACE WHERE true")
-      assertMvCorrect("cbc_mv_refresh_plain", viewBody)
+      assertMvCorrect("cbc_mv_refresh_plain", expected)
     }
   }
 }
