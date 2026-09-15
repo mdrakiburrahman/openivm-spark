@@ -521,7 +521,8 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
   def classify(sql: String, viewDeltaPath: String): String = {
     val trimmed = sql.replaceAll("(?s)^\\s*(--[^\\n]*\\n|/\\*.*?\\*/)+", "").trim
     val upper   = trimmed.toUpperCase
-    if (SparkRefreshRewriter.isMergeStatement(trimmed)) "merge"
+    if (upper.startsWith("DATAFRAMEWRITER.FORMAT(\"DELTA\")")) "replace_where_writer"
+    else if (SparkRefreshRewriter.isMergeStatement(trimmed)) "merge"
     else if (upper.startsWith("DELETE")) "delete"
     else if (upper.startsWith("INSERT OVERWRITE")) "insert_overwrite"
     else if (upper.startsWith("INSERT INTO") && upper.contains("REPLACE WHERE")) "replace_where_overwrite"
@@ -1589,12 +1590,12 @@ private[commands] object MvCommandHelper {
     s"CREATE TABLE delta.`${location.replace("`", "``")}` USING DELTA " +
       s"$clusterClause${tablePropertiesClause}AS $querySql"
 
-  def fullRefreshReplaceWhereSql(location: String, querySql: String): String =
-    "-- executed through DataFrameWriter.format(\"delta\").mode(\"overwrite\")" +
-      ".option(\"replaceWhere\", \"true\")\n" +
-      s"INSERT INTO delta.`${location.replace("`", "``")}`\n" +
-      s"REPLACE WHERE true\n" +
-      s"SELECT * FROM ($querySql)"
+  def fullRefreshReplaceWhereWriterLog(location: String, querySql: String): String = {
+    val escapedLocation = location.replace("\\", "\\\\").replace("\"", "\\\"")
+    "DataFrameWriter.format(\"delta\").mode(\"overwrite\").option(\"replaceWhere\", \"true\")" +
+      ".save(\"" + escapedLocation + "\")\n" +
+      s"sourceQuery:\n$querySql"
+  }
 
   def createCatalogRegistrationSql(dataIdent: TableIdentifier, location: String): String =
     s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
@@ -4885,7 +4886,7 @@ case class RefreshMaterializedViewCommand(
           .assemble(input)
           .copy(
             statements = Seq(
-              MvCommandHelper.fullRefreshReplaceWhereSql(meta.location, fullRefreshSql)
+              MvCommandHelper.fullRefreshReplaceWhereWriterLog(meta.location, fullRefreshSql)
             )
           )
         var stmtCounter = 0
@@ -4924,12 +4925,12 @@ case class RefreshMaterializedViewCommand(
           // source-consuming MV write); abort before mutation if it can't be set.
           beginPinnedGuardBeforeMutation()
           CommandLocalState.withDmlBypass {
-            assembled.statements.foreach { sql =>
-              val kind     = RefreshPerf.classify(sql, "")
-              val sqlBytes = sql.length
+            assembled.statements.foreach { writerLog =>
+              val kind     = RefreshPerf.classify(writerLog, "")
+              val sqlBytes = writerLog.length
               val qOrder   = qlogOrder.getAndIncrement()
               profile.timeStep(
-                "execute_refresh_sql_stmt",
+                "execute_full_refresh_writer",
                 s"statement=${stmtCounter + 1}/${assembled.statements.size};bytes=$sqlBytes;stmt_kind=$kind"
               ) {
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
@@ -4944,12 +4945,12 @@ case class RefreshMaterializedViewCommand(
                         .save(meta.location)
                       recordPlanMetrics(df, kind)
                       val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
+                      sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
                       Seq.empty[Row]
                     } catch {
                       case t: Throwable =>
                         val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
+                        sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
                         throw t
                     }
                   }

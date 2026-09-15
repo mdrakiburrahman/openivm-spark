@@ -78,7 +78,8 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
   private def assertDataFrameWriterReplaceWhereLogged(): Unit = {
     val text = refreshSqlText
     text should include("DataFrameWriter.format(\"delta\")")
-    text should include("REPLACE WHERE true")
+    text should include(".option(\"replaceWhere\", \"true\")")
+    text should not include "REPLACE WHERE true"
   }
 
   describe("CREATE MATERIALIZED VIEW ... CLUSTER BY") {

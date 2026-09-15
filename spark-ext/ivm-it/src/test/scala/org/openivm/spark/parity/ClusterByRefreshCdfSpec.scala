@@ -64,7 +64,8 @@ class ClusterByRefreshCdfSpec extends IvmParitySpecBase("cluster-by-refresh-cdf"
       .exists(row =>
         row.category == "full_refresh_stmt" &&
           row.sqlText.contains("DataFrameWriter.format(\"delta\")") &&
-          row.sqlText.contains("REPLACE WHERE true")
+          row.sqlText.contains(".option(\"replaceWhere\", \"true\")") &&
+          !row.sqlText.contains("REPLACE WHERE true")
       )
 
   private def refreshProfileText: String =
@@ -118,7 +119,8 @@ class ClusterByRefreshCdfSpec extends IvmParitySpecBase("cluster-by-refresh-cdf"
     deltaClusteringColumns(mv) shouldBe layout.clusterColumns
     hasReplaceWhereRefreshWriter shouldBe true
     refreshLogText should include("DataFrameWriter.format(\"delta\")")
-    refreshLogText should include("REPLACE WHERE true")
+    refreshLogText should include(".option(\"replaceWhere\", \"true\")")
+    refreshLogText should not include "REPLACE WHERE true"
     refreshProfileText should include("outcome=full_refresh_executed")
     refreshProfileText should include("pending_deltas=1")
     assertMvCorrect(mv, s"SELECT entity_id, day_key, amount FROM $src")
