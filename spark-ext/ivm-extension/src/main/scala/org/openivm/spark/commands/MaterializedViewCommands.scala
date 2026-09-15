@@ -524,6 +524,7 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
     if (SparkRefreshRewriter.isMergeStatement(trimmed)) "merge"
     else if (upper.startsWith("DELETE")) "delete"
     else if (upper.startsWith("INSERT OVERWRITE")) "insert_overwrite"
+    else if (upper.startsWith("INSERT INTO") && upper.contains("REPLACE WHERE")) "replace_where_overwrite"
     else if (upper.startsWith("INSERT INTO")) "insert_into"
     else if (upper.startsWith("UPDATE")) "update"
     else if (
@@ -1589,7 +1590,9 @@ private[commands] object MvCommandHelper {
       s"$clusterClause${tablePropertiesClause}AS $querySql"
 
   def fullRefreshReplaceWhereSql(location: String, querySql: String): String =
-    s"INSERT INTO delta.`${location.replace("`", "``")}`\n" +
+    "-- executed through DataFrameWriter.format(\"delta\").mode(\"overwrite\")" +
+      ".option(\"replaceWhere\", \"true\")\n" +
+      s"INSERT INTO delta.`${location.replace("`", "``")}`\n" +
       s"REPLACE WHERE true\n" +
       s"SELECT * FROM ($querySql)"
 
@@ -4874,9 +4877,10 @@ case class RefreshMaterializedViewCommand(
         // Delta treats a full-table INSERT OVERWRITE as a table replacement for
         // domain metadata, so clustered tables lose their `delta.clustering`
         // binding unless the writer provides a fresh CLUSTER BY spec.  REFRESH
-        // is only replacing rows in the existing MV data table; use a full-table
-        // REPLACE WHERE so Delta preserves the table identity, schema metadata,
-        // and clustering domain while still removing every old file.
+        // is only replacing rows in the existing MV data table; use a
+        // DataFrameWriter replaceWhere option rather than Spark SQL's literal
+        // `REPLACE WHERE true`, which some runtimes lower back to an ordinary
+        // overwrite before Delta sees a predicate-scoped writer.
         val assembled = SparkMergeAssembler
           .assemble(input)
           .copy(
@@ -4932,12 +4936,16 @@ case class RefreshMaterializedViewCommand(
                   RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                     val t0 = System.nanoTime()
                     try {
-                      val df = spark.sql(sql)
-                      val r  = df.collect()
+                      val df = spark.sql(fullRefreshSql)
+                      df.write
+                        .format("delta")
+                        .mode("overwrite")
+                        .option("replaceWhere", "true")
+                        .save(meta.location)
                       recordPlanMetrics(df, kind)
                       val ms = (System.nanoTime() - t0) / 1000000L
                       sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, sql, ms)
-                      r
+                      Seq.empty[Row]
                     } catch {
                       case t: Throwable =>
                         val ms = (System.nanoTime() - t0) / 1000000L

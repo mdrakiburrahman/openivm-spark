@@ -75,6 +75,12 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
   private def refreshSqlText: String =
     sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
 
+  private def assertDataFrameWriterReplaceWhereLogged(): Unit = {
+    val text = refreshSqlText
+    text should include("DataFrameWriter.format(\"delta\")")
+    text should include("REPLACE WHERE true")
+  }
+
   describe("CREATE MATERIALIZED VIEW ... CLUSTER BY") {
     it("clusters the Delta data table and persists the CLUSTER BY columns in metadata") {
       sql("CREATE TABLE cbc_sales (region STRING, day STRING, amount INT) USING DELTA")
@@ -168,7 +174,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       deltaSchemaJson("cbc_mv_refresh_one") shouldBe beforeSchemaJson
       deltaClusteringColumns("cbc_mv_refresh_one") shouldBe Seq("region")
       deltaClusteringMetadata("cbc_mv_refresh_one") should include("region")
-      refreshSqlText should include("REPLACE WHERE true")
+      assertDataFrameWriterReplaceWhereLogged()
       assertMvCorrect("cbc_mv_refresh_one", expected)
     }
 
@@ -198,7 +204,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val clustering = deltaClusteringMetadata("cbc_mv_refresh_multi")
       clustering should include("region")
       clustering should include("day")
-      refreshSqlText should include("REPLACE WHERE true")
+      assertDataFrameWriterReplaceWhereLogged()
       assertMvCorrect("cbc_mv_refresh_multi", expected)
     }
 
@@ -224,7 +230,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       deltaMetadataId("cbc_mv_refresh_plain") shouldBe beforeId
       deltaSchemaJson("cbc_mv_refresh_plain") shouldBe beforeSchemaJson
       deltaClusteringColumns("cbc_mv_refresh_plain") shouldBe empty
-      refreshSqlText should include("REPLACE WHERE true")
+      assertDataFrameWriterReplaceWhereLogged()
       assertMvCorrect("cbc_mv_refresh_plain", expected)
     }
 
@@ -256,7 +262,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       deltaMetadataId("cbc_mv_empty") shouldBe beforeId
       deltaSchemaJson("cbc_mv_empty") shouldBe beforeSchemaJson
       deltaClusteringColumns("cbc_mv_empty") shouldBe Seq("entity_id", "day_key")
-      refreshSqlText should include("REPLACE WHERE true")
+      assertDataFrameWriterReplaceWhereLogged()
       assertMvCorrect("cbc_mv_empty", "SELECT entity_id, day_key, amount FROM cbc_empty_src")
     }
   }

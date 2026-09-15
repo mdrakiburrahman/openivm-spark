@@ -61,7 +61,11 @@ class ClusterByRefreshCdfSpec extends IvmParitySpecBase("cluster-by-refresh-cdf"
   private def hasReplaceWhereRefreshWriter: Boolean =
     RefreshSqlLogCatalog
       .scanAll(spark)
-      .exists(row => row.category == "full_refresh_stmt" && row.sqlText.contains("REPLACE WHERE true"))
+      .exists(row =>
+        row.category == "full_refresh_stmt" &&
+          row.sqlText.contains("DataFrameWriter.format(\"delta\")") &&
+          row.sqlText.contains("REPLACE WHERE true")
+      )
 
   private def refreshProfileText: String =
     RefreshProfileCatalog.scanAll(spark).map(row => s"${row.stepName}:${row.detail}").mkString("\n")
@@ -113,6 +117,7 @@ class ClusterByRefreshCdfSpec extends IvmParitySpecBase("cluster-by-refresh-cdf"
     deltaSchemaJson(mv) shouldBe beforeSchemaJson
     deltaClusteringColumns(mv) shouldBe layout.clusterColumns
     hasReplaceWhereRefreshWriter shouldBe true
+    refreshLogText should include("DataFrameWriter.format(\"delta\")")
     refreshLogText should include("REPLACE WHERE true")
     refreshProfileText should include("outcome=full_refresh_executed")
     refreshProfileText should include("pending_deltas=1")
