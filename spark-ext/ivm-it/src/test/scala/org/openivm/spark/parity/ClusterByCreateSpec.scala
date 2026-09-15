@@ -227,5 +227,37 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       refreshSqlText should include("REPLACE WHERE true")
       assertMvCorrect("cbc_mv_refresh_plain", expected)
     }
+
+    it("replaces a nonempty clustered volatile MV with an empty result without losing layout") {
+      sql("CREATE TABLE cbc_empty_src (entity_id BIGINT, day_key DATE, amount DOUBLE) USING DELTA")
+      sql(
+        "INSERT INTO cbc_empty_src VALUES " +
+          "(1, DATE '2026-01-01', 10.0), (2, DATE '2026-01-02', 20.0)"
+      )
+
+      val viewBody =
+        "SELECT entity_id, day_key, amount, current_timestamp() AS observed_at FROM cbc_empty_src"
+      sql(s"CREATE MATERIALIZED VIEW cbc_mv_empty CLUSTER BY (entity_id, day_key) AS $viewBody")
+
+      spark.table("cbc_mv_empty").count() shouldBe 2L
+      mvRefreshType("cbc_mv_empty") shouldBe RefreshTypeCode.FullRefresh
+      val beforeId         = deltaMetadataId("cbc_mv_empty")
+      val beforeSchemaJson = deltaSchemaJson("cbc_mv_empty")
+      val beforeVersion    = mvDataVersion("cbc_mv_empty")
+      deltaClusteringColumns("cbc_mv_empty") shouldBe Seq("entity_id", "day_key")
+
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql("DELETE FROM cbc_empty_src WHERE entity_id >= 0")
+      refreshMv("cbc_mv_empty")
+
+      spark.table("cbc_mv_empty").count() shouldBe 0L
+      DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_empty"), beforeVersion) shouldBe
+        BatchVerdict.Replace
+      deltaMetadataId("cbc_mv_empty") shouldBe beforeId
+      deltaSchemaJson("cbc_mv_empty") shouldBe beforeSchemaJson
+      deltaClusteringColumns("cbc_mv_empty") shouldBe Seq("entity_id", "day_key")
+      refreshSqlText should include("REPLACE WHERE true")
+      assertMvCorrect("cbc_mv_empty", "SELECT entity_id, day_key, amount FROM cbc_empty_src")
+    }
   }
 }
