@@ -1,7 +1,7 @@
 package org.openivm.spark.compiler
 
 import java.nio.channels.FileChannel
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.nio.file.{Files, NoSuchFileException, Path, Paths, StandardOpenOption}
 import java.time.LocalDate
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
@@ -80,10 +80,12 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
          |fixture_dir='${dir.toString.replace("'", "'\\''")}'
          |record_pid() {
          |  local pid="$$1"
-         |  local start=""
-         |  if [[ -r "/proc/$$pid/stat" ]]; then
-         |    start="$$(awk '{print $$22}' "/proc/$$pid/stat" 2>/dev/null || true)"
+         |  if [[ ! -r "/proc/$$pid/stat" ]]; then
+         |    printf 'Linux /proc identity unavailable for PID %s\n' "$$pid" >&2
+         |    exit 99
          |  fi
+         |  local start
+         |  start="$$(awk '{print $$22}' "/proc/$$pid/stat")"
          |  printf '%s %s\n' "$$pid" "$$start"
          |}
          |record_pid "$$$$" > "$$fixture_dir/pids"
@@ -99,7 +101,11 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       processes.reverse.foreach(destroyRecordedProcess)
       pool.shutdownNow()
       pool.awaitTermination(10, TimeUnit.SECONDS) shouldBe true
-      processes.reverse.foreach(process => waitForRecordedProcessExit(process, 10.seconds))
+      processes.reverse.foreach { process =>
+        withClue(s"Recorded fake DuckDB CLI PID ${process.pid} survived teardown. ") {
+          waitForRecordedProcessExit(process, 10.seconds) shouldBe true
+        }
+      }
       compiler.close()
       val files = Files.list(dir)
       try files.forEach(path => Files.deleteIfExists(path))
@@ -128,7 +134,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     Await.result(result, Duration.Zero)
   }
 
-  private final class RecordedCliProcess(val pid: Long, val startTicks: Option[String])
+  private final class RecordedCliProcess(val pid: Long, val startTicks: String)
 
   private def recordedCliProcesses(pidFile: Path): Vector[RecordedCliProcess] =
     if (Files.exists(pidFile)) {
@@ -138,38 +144,46 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
         .filter(_.nonEmpty)
         .map { line =>
           val fields = line.trim.split("\\s+", 2)
-          new RecordedCliProcess(fields(0).toLong, fields.lift(1).filter(_.nonEmpty))
+          if (fields.length != 2 || fields(1).isEmpty)
+            throw new IllegalStateException(s"Fake CLI PID record lacks Linux /proc start ticks: $line")
+          new RecordedCliProcess(fields(0).toLong, fields(1))
         }
         .toVector
     } else Vector.empty
 
   private def linuxProcessStat(pid: Long): Option[(String, String)] = {
     val stat = Paths.get("/proc", pid.toString, "stat")
-    if (!Files.isRegularFile(stat)) None
-    else {
+    try {
       val content = new String(Files.readAllBytes(stat), "UTF-8")
-      val suffix  = content.drop(content.lastIndexOf(") ") + 2).trim
-      val fields  = suffix.split("\\s+")
-      if (fields.length >= 20) Some(fields(0) -> fields(19)) else None
+      val close   = content.lastIndexOf(") ")
+      if (close < 0) throw new IllegalStateException(s"Malformed /proc stat for PID $pid: missing command close")
+      val fields = content.drop(close + 2).trim.split("\\s+")
+      if (fields.length < 20) throw new IllegalStateException(s"Malformed /proc stat for PID $pid: too few fields")
+      Some(fields(0) -> fields(19))
+    } catch {
+      case _: NoSuchFileException => None
+    }
+  }
+
+  private def liveRecordedProcess(process: RecordedCliProcess): Option[ProcessHandle] = {
+    val current = ProcessHandle.of(process.pid)
+    if (!current.isPresent) return None
+    val stat = linuxProcessStat(process.pid)
+    // Container PID 1 may leave killed grandchildren as zombies briefly; they
+    // are stopped, and start ticks prevent treating PID reuse as a leak.
+    stat match {
+      case Some((state, startTicks)) if state != "Z" && startTicks == process.startTicks && current.get().isAlive =>
+        Some(current.get())
+      case _ => None
     }
   }
 
   private def sameRecordedProcessAlive(process: RecordedCliProcess): Boolean = {
-    val current = ProcessHandle.of(process.pid)
-    val stat    = linuxProcessStat(process.pid)
-    // Container PID 1 may leave killed grandchildren as zombies briefly; they
-    // are stopped, and start ticks prevent treating PID reuse as a leak.
-    current.isPresent &&
-    current.get().isAlive &&
-    !stat.exists { case (state, _) => state == "Z" } &&
-    process.startTicks.forall(expected => stat.exists { case (_, startTicks) => startTicks == expected })
+    liveRecordedProcess(process).isDefined
   }
 
   private def destroyRecordedProcess(process: RecordedCliProcess): Unit =
-    if (sameRecordedProcessAlive(process)) {
-      val current = ProcessHandle.of(process.pid)
-      if (current.isPresent) current.get().destroyForcibly()
-    }
+    liveRecordedProcess(process).foreach(_.destroyForcibly())
 
   private def waitForRecordedProcessExit(process: RecordedCliProcess, limit: FiniteDuration): Boolean = {
     val deadline = System.nanoTime() + limit.toNanos
@@ -886,7 +900,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     ) { (compiler, dir, context) =>
       implicit val ec: ExecutionContext = context
       val baseline                      = OpenIvmMetrics.CompilerInflight.get()
-      val ex = the[OpenIvmCompileException] thrownBy awaitCli(140.seconds) {
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(135.seconds) {
         compiler.compile(cliTestRequest)
       }
       ex.getMessage shouldBe "DuckDB CLI timed out after 120 seconds"
