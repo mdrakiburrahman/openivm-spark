@@ -158,7 +158,11 @@ class QueryLogExportSpec extends QueryLogExportTestBase("query-log-export") {
         row(capture, 0, "explain_formatted", "== Physical Plan ==\nFixture"),
         row(capture, 0, "rewritten_stmt", fullSql, attempt = 1),
         row(capture, 1, "register_source_delta", "CREATE VIEW diagnostic AS SELECT 1"),
-        row(capture, 2, "future_category", "INSERT INTO diagnostic VALUES (1)")
+        row(capture, 2, "future_category", "INSERT INTO diagnostic VALUES (1)"),
+        row(capture, 3, "full_refresh_stmt", "INSERT OVERWRITE TABLE fixture SELECT 1")
+          .copy(stmtKind = "insert_overwrite"),
+        row(capture, 4, "full_refresh_stmt", "DataFrameWriter.format(\"delta\")")
+          .copy(stmtKind = "replace_where_writer")
       )
       append(capture, input: _*)
       finish("text", capture)
@@ -187,6 +191,8 @@ class QueryLogExportSpec extends QueryLogExportTestBase("query-log-export") {
         "explain_plan",
         "submitted_sql",
         "diagnostic",
+        "diagnostic",
+        "submitted_sql",
         "diagnostic"
       )
     }

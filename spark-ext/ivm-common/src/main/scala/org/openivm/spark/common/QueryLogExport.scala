@@ -454,12 +454,14 @@ object QueryLogExport {
   private[common] def rowBytes(row: RefreshSqlLogRow): Long =
     64L + Seq(row.refreshId, row.viewName, row.mode, row.category, row.stmtKind, row.sqlText).map(utf8Size).sum
 
-  private def representationKind(category: String): String = category match {
-    case "original_query"                             => "original_query"
-    case "explain_formatted"                          => "explain_plan"
-    case known if submittedCategories.contains(known) => "submitted_sql"
-    case _                                            => "diagnostic"
-  }
+  private def representationKind(category: String, stmtKind: String): String =
+    (category, stmtKind) match {
+      case ("full_refresh_stmt", "replace_where_writer")     => "diagnostic"
+      case ("original_query", _)                             => "original_query"
+      case ("explain_formatted", _)                          => "explain_plan"
+      case (known, _) if submittedCategories.contains(known) => "submitted_sql"
+      case _                                                 => "diagnostic"
+    }
 
   private final class BoundedOutput(limit: Int) extends ByteArrayOutputStream(math.min(limit, 8192)) {
     override def write(value: Int): Unit = {
@@ -530,7 +532,7 @@ object QueryLogExport {
     json.writeStringField("stmt_kind", row.stmtKind)
     json.writeNumberField("duration_ms", row.durationMs)
     json.writeStringField("sql_text", row.sqlText)
-    json.writeStringField("representation_kind", representationKind(row.category))
+    json.writeStringField("representation_kind", representationKind(row.category, row.stmtKind))
     json.writeEndObject()
   }
 }
