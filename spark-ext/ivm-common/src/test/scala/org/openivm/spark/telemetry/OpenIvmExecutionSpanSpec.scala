@@ -8,6 +8,7 @@ import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.slf4j.MDC
 import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -97,6 +98,34 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
   }
 
   describe("OpenIvmExecutionSpan") {
+    it("attributes MV lock waits to monitor timers rather than barrier preparation") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.lock_metric_mv", "refresh")
+        OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(3L))
+        OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(5L))
+        span.recordProfileStep("acquire_locks", "includes dependency lookup and validation", 10000L)
+        span.complete("refresh_done", "driver-lock")
+        OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(99L))
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.path("same_mv_lock_wait_ms").asLong(-1L) shouldBe 8L
+    }
+
+    it("does not infer a monitor wait from a barrier profile without timer observations") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start("default.unmeasured_lock_mv", "refresh")
+        span.recordProfileStep("acquire_locks", "", 10000L)
+        span.emitIfNeeded("failed_before_end", "driver-lock")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      payloads.head.has("same_mv_lock_wait_ms") shouldBe false
+    }
+
     it("emits a completed span with isolated metrics and optional backup timing") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start(
@@ -110,7 +139,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
           effectiveRefreshType = Some("AGGREGATE_GROUP"),
           refreshReason = Some("kept")
         )
-        span.recordProfileStep("acquire_locks", "thread=driver-1", 3L)
+        OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(3L))
         OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(7L))
         OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(13L))
         OpenIvmExecutionSpan.observeTimer("catalog.mv_catalog.upsert", millis(5L))
@@ -258,7 +287,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
         )
       )
       span.recordPendingDeltaCount(2L)
-      span.recordProfileStep("acquire_locks", "", 3L)
+      OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(3L))
       span.recordProfileStep("create_analyze_query", "", 5L)
       span.recordProfileStep("create_capture_watermarks", "", 7L)
       span.recordProfileStep("create_ctas_total", "", 11L)
@@ -736,7 +765,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
                   requestId = requestId,
                   dbtNodeId = dbtNodeId
                 )
-                span.recordProfileStep("acquire_locks", "thread=refresh-worker", 4L)
+                OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(4L))
                 span.complete("refresh_done", Thread.currentThread().getName)
                 span.emitIfNeeded("failed_before_end", "unused")
               }

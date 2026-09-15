@@ -30,7 +30,11 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
-import org.openivm.spark.telemetry.{OpenIvmTelemetryContract, OpenIvmTelemetryPublicationInjection}
+import org.openivm.spark.telemetry.{
+  OpenIvmExecutionSpan,
+  OpenIvmTelemetryContract,
+  OpenIvmTelemetryPublicationInjection
+}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
@@ -42,7 +46,7 @@ import java.sql.Timestamp
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
@@ -2331,6 +2335,58 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("(14a) Same-MV CREATE execution spans") {
+    it("serializes dependency siblings on their shared upstream monitor and records its wait") {
+      val upstream = "default.lock_source"
+      val left     = "default.lock_child_left"
+      val right    = "default.lock_child_right"
+      val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
+      val owner    = new AtomicReference[Thread]()
+      val worker   = new AtomicReference[Thread]()
+      val started  = new CountDownLatch(1)
+
+      val payloads = withLogCapture { appender =>
+        withPool(2) { implicit ec =>
+          barrier.use {
+            val holder = Future {
+              owner.set(Thread.currentThread())
+              RefreshMutex.withLocks(Seq(left, upstream))(barrier.park())
+            }
+            barrier.awaitEntered() shouldBe true
+            val sibling = Future {
+              val span = OpenIvmExecutionSpan.start(right, "refresh")
+              try {
+                worker.set(Thread.currentThread())
+                started.countDown()
+                RefreshMutex.withLocks(Seq(right, upstream)) {
+                  span.complete("refresh_done", Thread.currentThread().getName)
+                }
+              } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+            }
+            started.await(10L, TimeUnit.SECONDS) shouldBe true
+            def blockedOnHolder: Boolean = {
+              val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
+              info != null && info.getThreadState == Thread.State.BLOCKED &&
+              info.getLockOwnerId == owner.get().getId
+            }
+            val deadline = 10.seconds.fromNow
+            while (!blockedOnHolder && deadline.hasTimeLeft())
+              Thread.sleep(1L)
+            blockedOnHolder shouldBe true
+            sibling.isCompleted shouldBe false
+            assertStillParked(barrier, holder)
+            RefreshMutex.withLock("default.lock_unrelated")(()) shouldBe (())
+            barrier.release()
+            awaitResult(holder, 15.seconds)
+            awaitResult(sibling, 15.seconds)
+          }
+        }
+        executionSpanPayloads(appender.messages, right)
+      }
+
+      payloads should have size 1
+      payloads.head.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+    }
+
     it("emit one primary span per CREATE and capture queued same-MV lock waits") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t14a_create(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t14a_create VALUES ('east', 10), ('west', 20)")

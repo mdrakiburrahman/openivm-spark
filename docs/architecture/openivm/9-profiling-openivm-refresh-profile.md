@@ -205,6 +205,24 @@ capacity. `ctas_data_write_ms` directly times the path-identifier Delta CTAS;
 `CREATE TABLE ... USING DELTA LOCATION` registration. Their sum equals
 `ctas_ms`.
 
+`same_mv_lock_wait_ms` is a legacy field name: it sums the
+`refresh.lock.wait` monitor-entry observations on the active command thread,
+converting each observation from nanoseconds to whole milliseconds. It includes
+all acquired MV keys, not just the target: REFRESH also locks its direct managed
+upstream MVs, and source-version advancement additionally locks downstream
+consumers. These are exclusive, ordered, reentrant JVM monitors, so distinct
+target MVs sharing an upstream can wait on one another.
+
+The span measurement excludes dependency discovery, physical-identity validation,
+driver admission, and the protected refresh body. The legacy REFRESH profile
+step `acquire_locks` is broader: its clock starts before dependency discovery
+and stops after under-lock identity validation. Older execution spans copied
+that entire profile duration into `same_mv_lock_wait_ms`; those historical
+values cannot separate monitor contention from preparation work. Do not add
+the profile duration to the corrected span measurement or interpret parallel
+command sums as elapsed batch time. This attribution correction does not change
+lock ownership or concurrency.
+
 `delta_version_lookup_ms` and `delta_version_lookup_count` report the time and
 number of latest-committed-Delta-version resolutions performed by the span
 (`org.openivm.spark.common.DeltaTableVersion`, metric

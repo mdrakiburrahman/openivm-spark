@@ -190,6 +190,7 @@
       "minimum": 0
     },
     "same_mv_lock_wait_ms": {
+      "description": "Legacy name: sum of per-monitor MV command entry waits, including dependency keys, with each observation truncated to milliseconds. Excludes dependency discovery, identity validation, admission, and the protected body.",
       "type": "integer",
       "minimum": 0
     },

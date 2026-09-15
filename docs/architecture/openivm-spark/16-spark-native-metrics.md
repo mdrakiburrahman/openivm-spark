@@ -92,7 +92,7 @@ unit conventions; duration inputs are nanoseconds.
 | `openivm.rocksdb.maintenance.compaction.count` | counter | compactions | Maintenance compactions. |
 | `openivm.refresh.queued` | gauge | refreshes | Refreshes waiting on the per-MV mutex. |
 | `openivm.refresh.inflight` | gauge | refreshes | Refreshes currently executing. |
-| `openivm.refresh.lock.wait` | timer | ns | Refresh mutex wait time. |
+| `openivm.refresh.lock.wait` | timer | ns | Per-monitor entry wait for MV lifecycle commands, including dependency keys. Excludes dependency discovery, identity validation, admission, and the protected body. |
 | `openivm.refresh.phase.<phase>` | timer | ns | Per-refresh phase latency bridged from `RefreshProfile`. |
 | `openivm.refresh.sql_stmt.<kind>` | timer | ns | Per SQL statement latency by kind (`merge`, `ctas`, `delete`, etc.). |
 | `openivm.refresh.sql_stmt.<kind>.bytes` | histogram | SQL bytes | Statement size by kind. |

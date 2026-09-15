@@ -255,7 +255,6 @@ final class OpenIvmExecutionSpan private[telemetry] (
     if (enabled) {
       if (detail eq null) ()
       stepName match {
-        case "acquire_locks"                   => recordSameMvLockWait(durationMs)
         case "create_catalog_lookup"           => recordCatalog(durationMs)
         case "create_analyze_query"            => recordAnalysis(durationMs)
         case "create_capture_watermarks"       => recordWatermark(durationMs)
@@ -686,6 +685,8 @@ object OpenIvmExecutionSpan extends Logging {
     if (nanos < 0L) return
     val durationMs = TimeUnit.NANOSECONDS.toMillis(nanos)
     metricName match {
+      case "refresh.lock.wait" =>
+        Option(current.get()).foreach(_.recordSameMvLockWait(durationMs))
       case "driver_admission.create.wait" =>
         withCurrentOrPending("create", durationMs)
       case "driver_admission.refresh.wait" =>
