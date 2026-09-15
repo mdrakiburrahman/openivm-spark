@@ -1588,6 +1588,11 @@ private[commands] object MvCommandHelper {
     s"CREATE TABLE delta.`${location.replace("`", "``")}` USING DELTA " +
       s"$clusterClause${tablePropertiesClause}AS $querySql"
 
+  def fullRefreshReplaceWhereSql(location: String, querySql: String): String =
+    s"INSERT INTO delta.`${location.replace("`", "``")}`\n" +
+      s"REPLACE WHERE true\n" +
+      s"SELECT * FROM ($querySql)"
+
   def createCatalogRegistrationSql(dataIdent: TableIdentifier, location: String): String =
     s"CREATE TABLE IF NOT EXISTS ${sqlIdent(dataIdent)} USING DELTA " +
       s"LOCATION '${location.replace("'", "\\'")}'"
@@ -4866,7 +4871,19 @@ case class RefreshMaterializedViewCommand(
           mvName = metaName(fullRefreshTarget),
           mvLocation = meta.location
         )
-        val assembled   = SparkMergeAssembler.assemble(input)
+        // Delta treats a full-table INSERT OVERWRITE as a table replacement for
+        // domain metadata, so clustered tables lose their `delta.clustering`
+        // binding unless the writer provides a fresh CLUSTER BY spec.  REFRESH
+        // is only replacing rows in the existing MV data table; use a full-table
+        // REPLACE WHERE so Delta preserves the table identity, schema metadata,
+        // and clustering domain while still removing every old file.
+        val assembled = SparkMergeAssembler
+          .assemble(input)
+          .copy(
+            statements = Seq(
+              MvCommandHelper.fullRefreshReplaceWhereSql(meta.location, fullRefreshSql)
+            )
+          )
         var stmtCounter = 0
         try {
           // The signed view-delta of this recompute. Produced for THIS view,
