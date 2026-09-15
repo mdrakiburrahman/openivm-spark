@@ -4,7 +4,14 @@ import java.util.Locale
 
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.clustering.ClusteringMetadataDomain
-import org.openivm.spark.common.{BatchVerdict, DeltaCommitClassifier, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{
+  BatchVerdict,
+  DeltaCommitClassifier,
+  MvCatalog,
+  RefreshSqlLogAsyncFlusher,
+  RefreshSqlLogCatalog,
+  RefreshTypeCode
+}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
 /** Integration coverage for `CREATE MATERIALIZED VIEW ... CLUSTER BY (...)` (#24).
@@ -74,6 +81,11 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
 
   private def refreshSqlText: String =
     sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
+
+  private def clearQueryLog(): Unit = {
+    RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
+    RefreshSqlLogCatalog.removeAll(spark)
+  }
 
   private def assertDataFrameWriterReplaceWhereLogged(): Unit = {
     val text = refreshSqlText
@@ -166,7 +178,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_one")
       deltaClusteringColumns("cbc_mv_refresh_one") shouldBe Seq("region")
 
-      RefreshSqlLogCatalog.removeAll(spark)
+      clearQueryLog()
       refreshMv("cbc_mv_refresh_one")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_one"), beforeVersion) shouldBe
@@ -194,7 +206,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_multi")
       deltaClusteringColumns("cbc_mv_refresh_multi") shouldBe Seq("region", "day")
 
-      RefreshSqlLogCatalog.removeAll(spark)
+      clearQueryLog()
       refreshMv("cbc_mv_refresh_multi")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_multi"), beforeVersion) shouldBe
@@ -223,7 +235,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val beforeVersion    = mvDataVersion("cbc_mv_refresh_plain")
       deltaClusteringColumns("cbc_mv_refresh_plain") shouldBe empty
 
-      RefreshSqlLogCatalog.removeAll(spark)
+      clearQueryLog()
       refreshMv("cbc_mv_refresh_plain")
 
       DeltaCommitClassifier.classify(spark, mvDataLocation("cbc_mv_refresh_plain"), beforeVersion) shouldBe
@@ -253,7 +265,7 @@ class ClusterByCreateSpec extends IvmParitySpecBase("cluster-by-create") with In
       val beforeVersion    = mvDataVersion("cbc_mv_empty")
       deltaClusteringColumns("cbc_mv_empty") shouldBe Seq("entity_id", "day_key")
 
-      RefreshSqlLogCatalog.removeAll(spark)
+      clearQueryLog()
       sql("DELETE FROM cbc_empty_src WHERE entity_id >= 0")
       refreshMv("cbc_mv_empty")
 
