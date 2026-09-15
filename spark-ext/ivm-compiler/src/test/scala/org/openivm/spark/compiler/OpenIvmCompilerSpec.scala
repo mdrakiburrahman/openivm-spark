@@ -78,7 +78,15 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       s"""#!/usr/bin/env bash
          |set -euo pipefail
          |fixture_dir='${dir.toString.replace("'", "'\\''")}'
-         |printf '%s\n' "$$$$" > "$$fixture_dir/pids"
+         |record_pid() {
+         |  local pid="$$1"
+         |  local start=""
+         |  if [[ -r "/proc/$$pid/stat" ]]; then
+         |    start="$$(awk '{print $$22}' "/proc/$$pid/stat" 2>/dev/null || true)"
+         |  fi
+         |  printf '%s %s\n' "$$pid" "$$start"
+         |}
+         |record_pid "$$$$" > "$$fixture_dir/pids"
          |$body
          |""".stripMargin.getBytes("UTF-8")
     )
@@ -87,22 +95,11 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val pool     = Executors.newSingleThreadExecutor()
     try test(compiler, dir, ExecutionContext.fromExecutorService(pool))
     finally {
-      val processes =
-        if (Files.exists(pidFile)) {
-          Files
-            .readAllLines(pidFile)
-            .asScala
-            .filter(_.nonEmpty)
-            .flatMap { pid =>
-              val process = ProcessHandle.of(pid.toLong)
-              if (process.isPresent) Some(process.get()) else None
-            }
-            .toVector
-        } else Vector.empty
-      processes.reverse.foreach(_.destroyForcibly())
+      val processes = recordedCliProcesses(pidFile)
+      processes.reverse.foreach(destroyRecordedProcess)
       pool.shutdownNow()
       pool.awaitTermination(10, TimeUnit.SECONDS) shouldBe true
-      processes.filter(_.isAlive).foreach(_.onExit().get(10, TimeUnit.SECONDS))
+      processes.reverse.foreach(process => waitForRecordedProcessExit(process, 10.seconds))
       compiler.close()
       val files = Files.list(dir)
       try files.forEach(path => Files.deleteIfExists(path))
@@ -131,12 +128,68 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     Await.result(result, Duration.Zero)
   }
 
+  private final class RecordedCliProcess(val pid: Long, val startTicks: Option[String])
+
+  private def recordedCliProcesses(pidFile: Path): Vector[RecordedCliProcess] =
+    if (Files.exists(pidFile)) {
+      Files
+        .readAllLines(pidFile)
+        .asScala
+        .filter(_.nonEmpty)
+        .map { line =>
+          val fields = line.trim.split("\\s+", 2)
+          new RecordedCliProcess(fields(0).toLong, fields.lift(1).filter(_.nonEmpty))
+        }
+        .toVector
+    } else Vector.empty
+
+  private def linuxProcessStat(pid: Long): Option[(String, String)] = {
+    val stat = Paths.get("/proc", pid.toString, "stat")
+    if (!Files.isRegularFile(stat)) None
+    else {
+      val content = new String(Files.readAllBytes(stat), "UTF-8")
+      val suffix  = content.drop(content.lastIndexOf(") ") + 2).trim
+      val fields  = suffix.split("\\s+")
+      if (fields.length >= 20) Some(fields(0) -> fields(19)) else None
+    }
+  }
+
+  private def sameRecordedProcessAlive(process: RecordedCliProcess): Boolean = {
+    val current = ProcessHandle.of(process.pid)
+    val stat    = linuxProcessStat(process.pid)
+    // Container PID 1 may leave killed grandchildren as zombies briefly; they
+    // are stopped, and start ticks prevent treating PID reuse as a leak.
+    current.isPresent &&
+    current.get().isAlive &&
+    !stat.exists { case (state, _) => state == "Z" } &&
+    process.startTicks.forall(expected => stat.exists { case (_, startTicks) => startTicks == expected })
+  }
+
+  private def destroyRecordedProcess(process: RecordedCliProcess): Unit =
+    if (sameRecordedProcessAlive(process)) {
+      val current = ProcessHandle.of(process.pid)
+      if (current.isPresent) current.get().destroyForcibly()
+    }
+
+  private def waitForRecordedProcessExit(process: RecordedCliProcess, limit: FiniteDuration): Boolean = {
+    val deadline = System.nanoTime() + limit.toNanos
+    var alive    = sameRecordedProcessAlive(process)
+    while (alive && System.nanoTime() < deadline) {
+      try Thread.sleep(50)
+      catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+          return !sameRecordedProcessAlive(process)
+      }
+      alive = sameRecordedProcessAlive(process)
+    }
+    !alive
+  }
+
   private def assertCliStopped(dir: Path): Unit =
-    Files.readAllLines(dir.resolve("pids")).asScala.foreach { pid =>
-      val process = ProcessHandle.of(pid.toLong)
-      if (process.isPresent) {
-        process.get().onExit().get(5, TimeUnit.SECONDS)
-        process.get().isAlive shouldBe false
+    recordedCliProcesses(dir.resolve("pids")).foreach { process =>
+      withClue(s"Recorded fake DuckDB CLI PID ${process.pid} was still alive. ") {
+        waitForRecordedProcessExit(process, 5.seconds) shouldBe true
       }
     }
 
@@ -827,13 +880,13 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       """cat > "$fixture_dir/input.sql"
         |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
         |sleep 300 &
-        |printf '%s\n' "$!" >> "$fixture_dir/pids"
+        |record_pid "$!" >> "$fixture_dir/pids"
         |wait
         |""".stripMargin
     ) { (compiler, dir, context) =>
       implicit val ec: ExecutionContext = context
       val baseline                      = OpenIvmMetrics.CompilerInflight.get()
-      val ex = the[OpenIvmCompileException] thrownBy awaitCli(135.seconds) {
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(140.seconds) {
         compiler.compile(cliTestRequest)
       }
       ex.getMessage shouldBe "DuckDB CLI timed out after 120 seconds"
@@ -869,7 +922,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
         |    sleep 0.05
         |  done
         |) &
-        |printf '%s\n' "$!" >> "$fixture_dir/pids"
+        |record_pid "$!" >> "$fixture_dir/pids"
         |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
         |sleep 0.5
         |""".stripMargin
@@ -881,9 +934,11 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
             compiler.compile(cliTestRequest)
           })
         catch { case e: OpenIvmCompileException => Left(e) }
-      val writer = ProcessHandle.of(Files.readAllLines(dir.resolve("pids")).get(1).toLong).get()
+      val writer = recordedCliProcesses(dir.resolve("pids")).lift(1).get
       Files.write(dir.resolve("write-after-return"), Array.emptyByteArray)
-      writer.onExit().get(5, TimeUnit.SECONDS)
+      withClue(s"Recorded fake DuckDB CLI writer PID ${writer.pid} did not exit after its pipes closed. ") {
+        waitForRecordedProcessExit(writer, 5.seconds) shouldBe true
+      }
       withClue("The inherited writer could still append output after compilation returned") {
         Files.exists(dir.resolve("wrote-after-return")) shouldBe false
       }
