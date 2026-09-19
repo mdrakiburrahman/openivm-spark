@@ -17,7 +17,7 @@ val openIvmExtensionPath =
 val openIvmCliPath = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
 
 ThisBuild / scalaVersion := "2.12.17"
-ThisBuild / version      := "0.1.0-SNAPSHOT"
+ThisBuild / version      := sys.env.getOrElse("PACKAGE_VERSION", "0.1.0-SNAPSHOT")
 ThisBuild / organization := "org.openivm"
 
 ThisBuild / javacOptions ++= Seq("--release", "11")
@@ -57,6 +57,8 @@ lazy val ivmExtension = (project in file("ivm-extension"))
   .enablePlugins(Antlr4Plugin)
   .settings(commonSettings: _*)
   .settings(assemblySettings: _*)
+  .settings(mavenPublishSettings: _*)
+  .settings(addArtifact(assembly / artifact, assembly))
   .settings(libraryDependencies ++= Dependencies.extension)
   .settings(
     Antlr4 / antlr4PackageName := Some("org.openivm.spark.parser.gen"),

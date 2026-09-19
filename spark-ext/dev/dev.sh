@@ -11,6 +11,8 @@
 #   help                    Print this message.
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
 #   openivm-test            Run upstream openivm sqllogictest suite.
+#   publish                 Build and publish the ivmExtension fat jar to the
+#                            Maven feed configured in root .env.
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
 #                           pinned COMMITs in pins.env, and shallow-clone the
 #                           read-only .temp/{spark,delta} upstream references
@@ -38,6 +40,8 @@
 # Environment variables honoured:
 #   PRE_CLEAN=1   ANY subcommand first force-removes every running Docker
 #                 container on the host (named cache volumes survive).
+#   MAVEN_URL      Maven v1 feed URL, loaded from root .env.
+#   MAVEN_PAT      Packaging PAT, loaded from root .env.
 # ============================================================================
 set -euo pipefail
 
@@ -194,6 +198,39 @@ cmd_assembly()    { pre_clean_if_requested; compose run --rm assembly; }
 cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
+
+cmd_publish() {
+    pre_clean_if_requested
+
+    if [[ ! -f "$REPO_ROOT/.env" ]]; then
+        echo "[publish] FATAL: $REPO_ROOT/.env not found; copy .env.example and configure MAVEN_URL/MAVEN_PAT" >&2
+        exit 1
+    fi
+
+    (
+        set -a
+        # shellcheck disable=SC1091
+        source "$REPO_ROOT/.env"
+        set +a
+
+        if [[ -z "${MAVEN_URL:-}" || -z "${MAVEN_PAT:-}" ]]; then
+            echo "[publish] FATAL: MAVEN_URL and MAVEN_PAT must be set in $REPO_ROOT/.env" >&2
+            exit 1
+        fi
+
+        local hash_hex hash_int
+        hash_hex="$(git -C "$REPO_ROOT" ls-files -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | cut -c1-7)"
+        hash_int=$((16#${hash_hex}))
+        export PACKAGE_VERSION="$(date +%s).${hash_int}.0"
+
+        echo "[publish] Publishing org.openivm:ivmextension_2.12:${PACKAGE_VERSION}"
+        compose run --rm -T \
+            -e MAVEN_URL \
+            -e MAVEN_PAT \
+            -e PACKAGE_VERSION \
+            build sbt "ivmExtension/publish"
+    )
+}
 
 # Returns 0 if a git op (rebase/merge/cherry-pick/bisect) is in progress in $1.
 _pins_sync_git_op_in_progress() {
@@ -1122,7 +1159,7 @@ shift
 # failure). Excludes openivm-test/dev-build/pins-* (no spark-ext bind-mount
 # writes, or pure git ops).
 case "$cmd" in
-    fmt|build|assembly|test|verify|shell)
+    fmt|build|assembly|publish|test|verify|shell)
         trap reclaim_workspace_ownership EXIT
         ;;
 esac
@@ -1131,6 +1168,7 @@ case "$cmd" in
     fmt)          cmd_fmt "$@" ;;
     build)        cmd_build "$@" ;;
     assembly)     cmd_assembly "$@" ;;
+    publish)      cmd_publish "$@" ;;
     test)         cmd_test "$@" ;;
     verify)       cmd_verify "$@" ;;
     shell)        cmd_shell "$@" ;;

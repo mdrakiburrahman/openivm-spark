@@ -56,6 +56,7 @@ following subcommands:
 ./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
+./spark-ext/dev/dev.sh publish                                                    # publish the versioned fat jar to the ADO Maven feed
 ./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.it.ExtensionLoadingSpec'
 ./spark-ext/dev/dev.sh fmt                                                        # scalafmtAll (auto-format)
@@ -65,6 +66,12 @@ following subcommands:
 ./spark-ext/dev/dev.sh image-build                                                # docker compose build (force rebuild)
 ./spark-ext/dev/dev.sh help                                                       # this help text
 ```
+
+`publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
+computes one immutable version as `<epoch>.<tracked-content-hash-int>.0`, and
+uses native sbt publishing to upload the `org.openivm:ivmextension_2.12`
+assembly artifact.
+Copy `.env.example` to `.env` and populate the private-feed values before use.
 
 `verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
 missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and

@@ -7,6 +7,25 @@ import sbtassembly.PathList
 
 object Settings {
 
+  val mavenPublishSettings: Seq[Def.Setting[_]] = Seq(
+    publishMavenStyle := true,
+    publishTo         := sys.env.get("MAVEN_URL").filter(_.nonEmpty).map("Maven feed" at _),
+    credentials ++= {
+      for {
+        feedUrl <- sys.env.get("MAVEN_URL").filter(_.nonEmpty).toSeq
+        token   <- sys.env.get("MAVEN_PAT").filter(_.nonEmpty)
+      } yield Credentials(
+        sys.env.getOrElse("CREDENTIALS_REALM", ""),
+        new java.net.URI(feedUrl).getHost,
+        "msdata",
+        token.trim
+      )
+    },
+    Compile / packageDoc / publishArtifact := false,
+    Compile / packageSrc / publishArtifact := false,
+    assembly / artifact                    := Artifact(name.value, "jar", "jar", "assembly")
+  )
+
   /// Per-class parallel JVM fork for heavy SparkSession tests.
   ///
   /// Each ScalaTest spec runs in its own forked JVM and the JVMs run in
