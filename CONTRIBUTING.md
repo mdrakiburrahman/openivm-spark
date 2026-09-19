@@ -45,6 +45,19 @@
    chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
    ```
 
+1. Open `spark-ext` as the VS Code workspace root so Metals discovers its
+   `build.sbt`, imports the sbt build, and provides Scala/Java IntelliSense:
+
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   source /etc/profile.d/openivm-toolchain.sh
+   code "${GIT_ROOT}/spark-ext"
+   ```
+
+   On the first open, accept the Metals **Import build** prompt. The bootstrap
+   pins and installs Temurin JDK 17, Maven, Coursier, Scala 2.12.17, sbt 1.9.7,
+   the Metals server, and the VS Code Scala/Java extensions on the WSL host.
+
 1. (Optional but recommended) Enable passwordless sudo so `dev.sh` helpers never block on a prompt:
 
    ```bash
