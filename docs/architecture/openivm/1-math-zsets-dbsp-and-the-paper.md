@@ -739,17 +739,18 @@ The enum order for the ten codes is:
 |    4 | `AGGREGATE_HAVING`     | all-groups data table + HAVING view               |
 |    5 | `WINDOW_PARTITION`     | affected partition recompute                      |
 |    6 | `GROUP_RECOMPUTE`      | affected group recompute                          |
-|    7 | `TOP_K`                | legacy enum value in OpenIVM; Spark demotes top-k |
+|    7 | `TOP_K`                | legacy enum; Spark maintains the classified inner query |
 |    8 | `DISTINCT_INCREMENTAL` | auxiliary count-state distinct                    |
 |    9 | `SEMI_ANTI_RECOMPUTE`  | transition-count semi/anti path                   |
 
 Citation for enum:
 
 - `.temp/openivm/src/include/core/openivm_constants.hpp:67-79`
-  Spark has an additional effective-classification layer.
-  For top-k, Spark forces `FULL_REFRESH` because it does not yet mirror OpenIVM's inner-data-table plus user-facing view split for `ORDER BY / LIMIT`:
-- `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:488-507`
-  The final Spark demotion/keep decision is made in a structured branch with reason keys such as `top_k`, `having_pred_empty`, and `no_real_delta`:
+  Spark has an additional effective-classification layer. For top-k, Spark
+  incrementally maintains OpenIVM's unlimited inner result in `<mv>__ivm_data`
+  and applies `ORDER BY / LIMIT / OFFSET` in the user-facing Spark VIEW.
+  The final Spark demotion/keep decision uses structured reason keys such as
+  `top_k_kept`, `top_k_unsupported`, `having_pred_empty`, and `no_real_delta`:
 - `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala:560-619`
 
 ______________________________________________________________________

@@ -1,20 +1,15 @@
 package org.openivm.spark.common
 
-/** Single source of truth for the column families hosted by the shared
-  * `<warehouse>/_openivm/index/rocksdb` instance.
+/** Column families retained in the legacy shared index RocksDB.
   *
-  * The [[org.openivm.spark.common.rocksdb.OpenIvmRocksDBRegistry]] enforces
-  * a no-widening invariant on the requested CF set per DB path, so every
-  * caller that opens this DB MUST declare the full union.  Keep this list
-  * in sync with all `openIndexDb` call sites: [[MvCatalog]],
-  * [[StagingCatalog]], and [[CdfWatermarkCatalog]].
+  * Fresh deployments do not create this database. `cdf_watermarks` remains
+  * declared solely for lazy migration; RocksDB discovers any other old column
+  * families when opening an existing DB.
   */
 private[common] object IndexDbColumnFamilies {
 
-  val MvIndex: String       = "mv_index"
-  val SourceToMvs: String   = "source_to_mvs"
-  val TableIndex: String    = "table_index"
+  /** Legacy-only; remove after all deployed shared watermarks have migrated. */
   val CdfWatermarks: String = "cdf_watermarks"
 
-  val All: Seq[String] = Seq(MvIndex, SourceToMvs, TableIndex, CdfWatermarks)
+  val All: Seq[String] = Seq(CdfWatermarks)
 }

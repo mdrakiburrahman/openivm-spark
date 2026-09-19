@@ -145,7 +145,7 @@ flowchart TD
   J --> JT[no JOIN_INCREMENTAL enum; join feeds projection/aggregate type]
   R --> SJ[SEMI/ANTI JOIN] --> SAR[SEMI_ANTI_RECOMPUTE]
   R --> W[WINDOW] --> WP[WINDOW_PARTITION]
-  R --> T[ORDER BY + LIMIT] --> TK[TOP_K legacy; Spark demotes to FULL_REFRESH]
+  R --> T[ORDER BY + LIMIT] --> TK[Classify inner query; Spark backing table + VIEW]
   R --> O[otherwise] --> FR[FULL_REFRESH]
 ```
 
@@ -160,7 +160,7 @@ flowchart TD
 |       4 | `AGGREGATE_HAVING`     | yes below HAVING                     | all groups stored below wrapper                     | `aggregate.cpp`, `filter.cpp`                    | `CompileAggregateGroups`                                | MERGE + HAVING view/filter           |
 |       5 | `WINDOW_PARTITION`     | partition recompute, not pure linear | partition keys/lineage                              | `window.cpp`                                     | `BuildWindowPartitionRefresh`; `CompileWindowRecompute` | partition DELETE+INSERT              |
 |       6 | `GROUP_RECOMPUTE`      | affected-key recompute               | group keys; optional cascade snapshots              | child rules; no single rule                      | `CompileGroupRecompute`                                 | affected-key DELETE+INSERT           |
-|       7 | `TOP_K`                | no for deletes/updates               | ranking state would be needed                       | `topk.cpp`                                       | legacy; no Spark incremental compiler                   | dead on Spark; FULL_REFRESH demotion |
+|       7 | `TOP_K`                | legacy direct ordinal                | unlimited inner backing state                       | `topk.cpp`                                       | wrapper uses the inner query's compiler                  | dead ordinal; wrapper rides inner type |
 |       8 | `DISTINCT_INCREMENTAL` | yes for transition-count shape       | per-distinct-tuple counts                           | `distinct.cpp`, `aggregate.cpp`                  | `CompileDistinctIncremental`                            | aux MERGE / count monoid             |
 |       9 | `SEMI_ANTI_RECOMPUTE`  | transition-scoped                    | left counts and match counts                        | `join.cpp`                                       | `CompileSemiAntiRecompute`                              | `AuxStateAssembler`                  |
 
@@ -497,24 +497,25 @@ WHERE EXISTS (SELECT 1 FROM openivm_affected_mv_distinct_amounts a WHERE a.custo
 With `openivm_emit_cascade_delta_for_recompute=true`, OpenIVM can also emit a
 signed old/new snapshot delta for downstream MV-over-MV refresh.
 
-## 3.13 Ordinal 7: TOP_K is dead on Spark
+## 3.13 Ordinal 7: TOP_K is a dead direct type on Spark
 
 `TOP_K` is a legacy enum value.
 OpenIVM can detect top-k wrappers and strip them from the stored inner data
 query, then apply ORDER BY/LIMIT in a user-facing DuckDB view.
-Spark does not currently store MVs as an inner table plus a separate view
-wrapper, so openivm-spark explicitly demotes top-level top-k MVs to
-`FULL_REFRESH` at CREATE time.
+OpenIVM-Spark mirrors that layout: it incrementally maintains the inner query
+under `<mv>__ivm_data` using the projection/aggregate refresh type and exposes
+the public MV as a separate Spark VIEW. Only unsupported `TAIL` extraction is
+demoted to `FULL_REFRESH`.
 OpenIVM sources:
 
 - `incremental_checker.cpp:332-380` detects TOP_N/ORDER/LIMIT;
 - `parser.cpp:243-290` strips a top-level top-k wrapper;
 - `openivm_constants.hpp:75` marks `TOP_K` as legacy.
-  Spark demotion sources:
-- `MaterializedViewCommands.scala:183-206` defines `hasTopLevelTopK`;
-- `MaterializedViewCommands.scala:488-507` explains why Spark demotes;
-- `MaterializedViewCommands.scala:597-599` sets effective type to
-  `FullRefresh` with reason `top_k`.
+  Spark integration source:
+- `MaterializedViewCommands.scala` defines `extractTopKViewSpec` and the
+  backing-table CREATE/REFRESH/DROP path;
+- `MaterializedViewCommands.scala` keeps the inner refresh type with reason
+  `top_k_kept`; unsupported wrappers use `top_k_unsupported` and full refresh.
   Representative MV:
 
 ```sql
@@ -528,19 +529,22 @@ LIMIT 10;
 Expected Spark refresh SQL shape:
 
 ```sql
-INSERT OVERWRITE TABLE mv_top_orders
-SELECT * FROM (
-  SELECT order_id, amount FROM orders ORDER BY amount DESC LIMIT 10
-);
+MERGE INTO mv_top_orders__ivm_data AS v
+USING (<incremental delta for the unlimited inner query>) AS d
+ON <inner-query key equality>
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
 ```
 
 Math:
 
 - top-k is non-monotone under deletes and updates;
 - removing the current rank 1 row may require reading rank 11;
-- without ranking boundary state, visible top-k rows are insufficient.
-  Chapter 8 of the openivm-spark docs should treat `TOP_K` as unreachable for
-  incremental Spark refresh.
+- without ranking boundary state, visible top-k rows are insufficient;
+- Spark therefore stores the unlimited inner result and evaluates the
+  user-facing ORDER BY/LIMIT in a VIEW. The direct ordinal `TOP_K` remains
+  unreachable, but Top-K wrappers can still be incrementally maintained under
+  their inner projection or aggregate refresh type.
 
 ## 3.14 Ordinal 8: DISTINCT_INCREMENTAL
 
@@ -757,8 +761,8 @@ For Spark cascade context, see
    been normalized before `IncrementalChecker` sees the plan.
 1. For joins, do not look for `JOIN_INCREMENTAL`.
    Ask whether the root is projection, grouped aggregate, HAVING, or recompute.
-1. For top-k on Spark, expect `FULL_REFRESH` by design.
-   The demotion source is `MaterializedViewCommands.scala:597-599`.
+1. For top-k on Spark, expect the inner projection/aggregate refresh type and
+   `reason='top_k_kept'`; `TAIL` remains `top_k_unsupported` full refresh.
 1. For Duck-side full refresh, inspect `parser.cpp:610-800` and
    `refresh_sql.cpp:401-412`.
 1. For Spark-side full refresh, inspect chapter 11 of openivm-spark docs and the

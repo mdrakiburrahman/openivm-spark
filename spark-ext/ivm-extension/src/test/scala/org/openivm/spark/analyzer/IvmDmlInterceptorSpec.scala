@@ -10,6 +10,9 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 /**
  * Integration tests for [[IvmDmlInterceptorRule]] / [[StagedDmlNode]] /
@@ -412,6 +415,72 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       // Base table must still be empty — the write was aborted.
       val rows = spark.sql(s"SELECT * FROM $tbl").collect()
       rows shouldBe empty
+    }
+
+    it("does not publish a staged delta when the wrapped DML fails") {
+      val tbl         = "txn_failed_dml_base"
+      val qn          = createBaseWithMv(tbl)
+      val stagingPath = s"$warehouseDir/_ivm/staging/failed-dml-${UUID.randomUUID()}"
+      val preReadPlan =
+        spark.sql("SELECT CAST(99 AS INT) AS id, 'should-not-apply' AS value").queryExecution.analyzed
+      val failingPlan =
+        spark.sql("SELECT CAST(raise_error('injected DML failure') AS INT)").queryExecution.analyzed
+
+      an[Exception] should be thrownBy {
+        StagedDmlNode(
+          dml = failingPlan,
+          stagingOps = Seq((preReadPlan, stagingPath, "INSERT")),
+          baseTable = qn
+        ).run(spark)
+      }
+
+      stagingRows(qn) shouldBe empty
+      new File(stagingPath).exists() shouldBe false
+    }
+  }
+
+  describe("Test 12: base-table mutation mutex") {
+    it("serializes one base table without blocking an unrelated table") {
+      val pool                          = Executors.newFixedThreadPool(3)
+      implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(pool)
+      val firstEntered                  = new CountDownLatch(1)
+      val releaseFirst                  = new CountDownLatch(1)
+      val sameStarted                   = new CountDownLatch(1)
+      val sameEntered                   = new CountDownLatch(1)
+      val otherEntered                  = new CountDownLatch(1)
+
+      try {
+        val first = Future {
+          StagedDmlNode.withBaseTableMutationLock("default.shared") {
+            firstEntered.countDown()
+            releaseFirst.await(10, TimeUnit.SECONDS)
+          }
+        }
+        firstEntered.await(10, TimeUnit.SECONDS) shouldBe true
+
+        val same = Future {
+          sameStarted.countDown()
+          StagedDmlNode.withBaseTableMutationLock("DEFAULT.SHARED") {
+            sameEntered.countDown()
+          }
+        }
+        sameStarted.await(10, TimeUnit.SECONDS) shouldBe true
+        sameEntered.await(200, TimeUnit.MILLISECONDS) shouldBe false
+
+        val other = Future {
+          StagedDmlNode.withBaseTableMutationLock("default.other") {
+            otherEntered.countDown()
+          }
+        }
+        otherEntered.await(10, TimeUnit.SECONDS) shouldBe true
+
+        releaseFirst.countDown()
+        Await.result(Future.sequence(Seq(first, same, other)), 10.seconds)
+        sameEntered.getCount shouldBe 0L
+      } finally {
+        releaseFirst.countDown()
+        pool.shutdownNow()
+      }
     }
   }
 }

@@ -12,6 +12,7 @@ import org.apache.spark.sql.types.{IntegerType, LongType, StringType, TimestampT
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
 import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
+import org.openivm.spark.commands.AdvanceMaterializedViewSourceVersionsCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
@@ -197,6 +198,26 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       plan shouldBe a[RefreshMaterializedViewCommand]
       val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("v")
+    }
+  }
+
+  describe("ALTER MATERIALIZED VIEW ADVANCE SOURCE VERSIONS") {
+    it("parses an exact multi-source immutable version map") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "ALTER MATERIALIZED VIEW db.mv ADVANCE SOURCE VERSIONS (db.a = 5, `db`.`b` = 12)"
+      )
+      plan shouldBe a[AdvanceMaterializedViewSourceVersionsCommand]
+      val cmd = plan.asInstanceOf[AdvanceMaterializedViewSourceVersionsCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("db"))
+      cmd.versionsBySource shouldBe Map("db.a" -> 5L, "db.b" -> 12L)
+    }
+
+    it("rejects duplicate source keys before they can collapse into a Map") {
+      an[ParseException] should be thrownBy {
+        spark.sessionState.sqlParser.parsePlan(
+          "ALTER MATERIALIZED VIEW mv ADVANCE SOURCE VERSIONS (db.a = 5, DB.A = 6)"
+        )
+      }
     }
   }
 

@@ -424,7 +424,7 @@ So the current row data path is:
 <warehouse>/_ivm/staging/<db_table>/<opType>/<txnTs>
 ```
 
-The per-base RocksDB catalog path uses `_openivm/tables` and a base64url table
+The per-base RocksDB catalog path uses `_openivm/tables` and a bounded identity
 segment:
 
 ```scala
@@ -436,19 +436,15 @@ private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
 
 Citation: `StagingCatalog.scala:90-93`.
 
-`safePathSegment` is:
-
-```scala
-def safePathSegment(name: String): String =
-  Base64.getUrlEncoder.withoutPadding.encodeToString(utf8(name))
-```
-
-Citation: `RocksDBCodec.scala:122-123`.
+`RocksDBCodec.safePathSegment` preserves base64url without padding through
+255 encoded bytes. Longer names use `sha256.` plus the full SHA-256 digest
+of the original UTF-8 identity. The same codec is used for every RocksDB
+read/write/drop path; see [the storage contract](7-state-storage-rocksdb-and-delta.md#73-safe-path-segment-encoding).
 
 Therefore the per-base catalog namespace is:
 
 ```text
-<warehouse>/_openivm/tables/<base64url(db.table)>/rocksdb
+<warehouse>/_openivm/tables/<safePathSegment(db.table)>/rocksdb
 ```
 
 Some diagrams describe the desired per-base row-staging layout as:
@@ -458,7 +454,7 @@ Some diagrams describe the desired per-base row-staging layout as:
 ```
 
 The code citations above show the current split: RocksDB catalog state lives
-under `_openivm/tables/<base64url>/rocksdb`, while intercepted row Delta files
+under `_openivm/tables/<safePathSegment>/rocksdb`, while intercepted row Delta files
 are still written under `_ivm/staging/<db_table>/<opType>/<txnTs>`.
 
 ______________________________________________________________________

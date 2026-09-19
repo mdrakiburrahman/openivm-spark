@@ -20,3 +20,14 @@ final case class CdfChangeBatch(
 ) extends ChangeBatch {
   override def endWatermark: ChangeWatermark = ChangeWatermark.DeltaVersion(endVersionInclusive)
 }
+
+/** Exact immutable source-snapshot transition requested by ALTER MATERIALIZED
+  * VIEW ... ADVANCE SOURCE VERSIONS.
+  */
+final case class SourceVersionChangeBatch(
+    baseTable: String,
+    startVersionInclusive: Long,
+    endVersionInclusive: Long
+) extends ChangeBatch {
+  override def endWatermark: ChangeWatermark = ChangeWatermark.DeltaVersion(endVersionInclusive)
+}

@@ -4,8 +4,8 @@
 #  openivm-spark — multi-stage development image.
 #
 #  Stages:
-#    1. openivm-builder      Builds OpenIVM (with our forked lpts submodule
-#                            substituted in) as a DuckDB extension. Produces
+#    1. openivm-builder      Builds OpenIVM with the explicitly pinned LPTS
+#                            sources as a DuckDB extension. Produces
 #                            /artifacts/openivm.duckdb_extension and the
 #                            statically-linked duckdb CLI.
 #    2. openivm-tester       Inherits stage 1's full build tree so `make test`
@@ -20,6 +20,7 @@
 #    OPENIVM_REPO, OPENIVM_COMMIT
 #    LPTS_REPO,    LPTS_COMMIT
 #    JDK_VERSION,  SBT_VERSION, SCALA_VERSION
+#    DUCKDB_REF, DUCKDB_COMMIT, NATIVE_BUILD_JOBS
 #    DUCKDB_JDBC_VERSION
 #    UBUNTU_MIRROR (optional)
 # =============================================================================
@@ -31,11 +32,14 @@ FROM ubuntu:24.04 AS openivm-builder
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
-ARG OPENIVM_BRANCH=openivm-spark
+ARG OPENIVM_BRANCH=dev/mdrrahman/add-months-ila
 ARG OPENIVM_COMMIT
 ARG LPTS_REPO
-ARG LPTS_BRANCH=openivm-spark
+ARG LPTS_BRANCH=main
 ARG LPTS_COMMIT
+ARG DUCKDB_REF=v1.5.2
+ARG DUCKDB_COMMIT=8a5851971fae891f292c2714d86046ee018e9737
+ARG NATIVE_BUILD_JOBS=8
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -51,9 +55,8 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
 
 WORKDIR /src
 
-# Clone openivm at the pinned commit on the openivm-spark branch, then
-# override the lpts submodule to point at OUR fork so we never need to commit
-# a submodule-URL bump into openivm to pick up new lpts work.
+# Clone OpenIVM at the pinned commit, then apply the explicit LPTS
+# repository and revision selected by pins.env.
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . && \
     git checkout "${OPENIVM_COMMIT}" && \
@@ -61,6 +64,9 @@ RUN --mount=type=cache,target=/root/.gitcache \
     git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" && \
     git submodule sync --recursive && \
     git submodule update --init --recursive --depth 1 duckdb extension-ci-tools && \
+    git -C duckdb fetch --depth 1 origin tag "${DUCKDB_REF}" && \
+    git -C duckdb checkout --detach "${DUCKDB_COMMIT}" && \
+    test "$(git -C duckdb rev-parse HEAD)" = "${DUCKDB_COMMIT}" && \
     (cd third_party/lpts && \
         git init -q && \
         (git remote add origin "${LPTS_REPO}" 2>/dev/null || git remote set-url origin "${LPTS_REPO}") && \
@@ -72,7 +78,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
 # CLI and the loadable .duckdb_extension binary. We bypass the optional
 # third_party/benchbase + sqlstorm benchmarks (heavyweight, not on the test
 # critical path).
-RUN GEN=ninja make -j"$(nproc)"
+RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
 
 # Collect deliverables into a stable location.
 RUN mkdir -p /artifacts && \
@@ -99,7 +105,7 @@ FROM eclipse-temurin:17-jdk AS spark-ext
 
 ARG SBT_VERSION=1.9.7
 ARG SCALA_VERSION=2.12.17
-ARG DUCKDB_JDBC_VERSION=1.5.2
+ARG DUCKDB_JDBC_VERSION=1.5.2.1
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive

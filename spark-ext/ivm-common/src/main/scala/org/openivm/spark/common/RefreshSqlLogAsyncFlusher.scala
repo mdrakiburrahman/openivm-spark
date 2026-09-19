@@ -12,13 +12,13 @@ import java.util.concurrent.{ArrayBlockingQueue, ThreadFactory, TimeUnit}
   *
   * Design (see plan.md "Timer-neutrality"):
   *
-  *  - Inline `RefreshSqlLog.record(...)` per statement is ~200 ns
+  *  - Unscoped `RefreshSqlLog.record(...)` per statement is ~200 ns
   *    (one `currentTimeMillis` + one `ArrayBuffer.append`). No IO, no
   *    `nanoTime`, no synchronization. The buffer lives on the calling
   *    thread's stack (per-refresh `RefreshSqlLog` instance) so no contention.
   *
-  *  - End-of-refresh `RefreshSqlLog.flush()` enqueues the full buffer as a
-  *    single `FlushBatch` into this singleton's bounded queue and returns
+  *  - Each `RefreshSqlLog.flush()` enqueues the current buffer as a
+  *    `FlushBatch` into this singleton's bounded queue and returns
   *    immediately. The dedicated daemon thread drains the queue and writes
   *    to RocksDB off the hot path.
   *
@@ -34,13 +34,16 @@ import java.util.concurrent.{ArrayBlockingQueue, ThreadFactory, TimeUnit}
   *    the submitting thread falls back to inline-flush so the refresh
   *    NEVER blocks indefinitely on a pathological backlog. The
   *    failure-mode is bounded: at worst we pay the RocksDB write cost
-  *    inline for one batch, then continue normally.
+  *    inline for one batch, then continue normally. Scoped export batches
+  *    instead fail capture explicitly on overflow, without inline persistence.
+  *    Each scoped batch acknowledges its own success/failure, including any
+  *    late cleanup flushes; readers never need the SHOW barrier.
   */
 object RefreshSqlLogAsyncFlusher {
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  /** Queue capacity in batches. Each batch is one CREATE/REFRESH lifecycle.
+  /** Queue capacity in batches. A lifecycle may submit several batches.
     * 1024 is enough for tens of seconds of arrears at typical bench rates,
     * well beyond what a healthy steady-state needs.
     */
@@ -49,7 +52,11 @@ object RefreshSqlLogAsyncFlusher {
   // A flush batch carries everything the worker needs to call
   // RefreshSqlLogCatalog.record. We keep the SparkSession reference so the
   // worker can open the RocksDB on the writer thread (idempotent open).
-  private final case class FlushBatch(spark: SparkSession, rows: Seq[RefreshSqlLogRow])
+  private final case class FlushBatch(
+      spark: SparkSession,
+      rows: Seq[RefreshSqlLogRow],
+      export: Option[QueryLogExport.FlushTicket]
+  )
   private case object Sentinel { // marker for awaitQuiescence
     val ticket: Long = 0L
   }
@@ -72,6 +79,10 @@ object RefreshSqlLogAsyncFlusher {
   private val droppedInlineFallbacks = new AtomicLong(0L)
   private val flushedBatches         = new AtomicLong(0L)
   private val flushFailures          = new AtomicLong(0L)
+  private val rejectedScopedBatches  = new AtomicLong(0L)
+
+  @volatile private[common] var beforeWriteForTesting: Seq[RefreshSqlLogRow] => Unit =
+    (_: Seq[RefreshSqlLogRow]) => ()
 
   private val threadFactory: ThreadFactory = new ThreadFactory {
     override def newThread(r: Runnable): Thread = {
@@ -86,25 +97,30 @@ object RefreshSqlLogAsyncFlusher {
   private val workerStarted = new java.util.concurrent.atomic.AtomicBoolean(false)
 
   private def ensureWorker(): Unit =
-    if (workerStarted.compareAndSet(false, true)) {
-      val worker = threadFactory.newThread(new Runnable {
-        override def run(): Unit = workerLoop()
-      })
-      worker.start()
-      // Best-effort drain on graceful shutdown so we don't lose the last batch.
-      Runtime.getRuntime.addShutdownHook(
-        new Thread(
-          () => {
-            try {
-              // We can't safely call any Spark API here, but the queue is
-              // already empty in the common case where the worker keeps up.
-              // Block up to 30s for the queue to drain.
-              awaitQuiescence(timeoutMs = 30000L)
-            } catch { case _: Throwable => () }
-          },
-          "openivm-querylog-shutdown"
+    if (!workerStarted.get()) synchronized {
+      if (!workerStarted.get()) {
+        val worker = threadFactory.newThread(new Runnable {
+          override def run(): Unit = workerLoop()
+        })
+        // Publish readiness only after start succeeds, so concurrent submits
+        // cannot strand batches behind a failed worker startup.
+        worker.start()
+        workerStarted.set(true)
+        // Best-effort drain on graceful shutdown so we don't lose the last batch.
+        Runtime.getRuntime.addShutdownHook(
+          new Thread(
+            () => {
+              try {
+                // We can't safely call any Spark API here, but the queue is
+                // already empty in the common case where the worker keeps up.
+                // Block up to 30s for the queue to drain.
+                awaitQuiescence(timeoutMs = 30000L)
+              } catch { case _: Throwable => () }
+            },
+            "openivm-querylog-shutdown"
+          )
         )
-      )
+      }
     }
 
   private def workerLoop(): Unit = {
@@ -118,18 +134,7 @@ object RefreshSqlLogAsyncFlusher {
         }
       msg match {
         case b: FlushBatch =>
-          try {
-            RefreshSqlLogCatalog.record(b.spark, b.rows)
-            flushedBatches.incrementAndGet()
-            ()
-          } catch {
-            case t: Throwable =>
-              flushFailures.incrementAndGet()
-              log.warn(
-                s"[openivm-querylog] async flush failed for ${b.rows.size} rows: " +
-                  s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("")}"
-              )
-          }
+          writeBatch(b)
         case Quiesce(ticket) =>
           val latch = quiesceAcks.remove(java.lang.Long.valueOf(ticket))
           if (latch != null) latch.countDown()
@@ -141,28 +146,63 @@ object RefreshSqlLogAsyncFlusher {
 
   /** Submit a batch for async write. Returns immediately when the queue has
     * capacity; falls back to inline write when the queue is full so the
-    * caller (which is on the refresh hot path) is never blocked.
+    * caller (which is on the refresh hot path) is never blocked indefinitely.
+    * Request-scoped exports instead fail capture on overflow; they never do
+    * synchronous persistence on the SQL worker.
     *
     * Idempotent for empty `rows` — no work scheduled.
     */
   def submit(spark: SparkSession, rows: Seq[RefreshSqlLogRow]): Unit = {
+    submit(spark, rows, None)
+  }
+
+  private def failed(batch: FlushBatch, code: String, error: Throwable): Unit = {
+    batch.export.foreach(_.complete(Some(code -> error)))
+    flushFailures.incrementAndGet()
+    log.warn(
+      s"[openivm-querylog] flush failed for ${batch.rows.size} rows: " +
+        s"${error.getClass.getSimpleName}: ${Option(error.getMessage).getOrElse("")}"
+    )
+  }
+
+  private def writeBatch(batch: FlushBatch): Unit =
+    try {
+      beforeWriteForTesting(batch.rows)
+      RefreshSqlLogCatalog.record(batch.spark, batch.rows, batch.export)
+      batch.export.foreach(_.complete(None))
+      flushedBatches.incrementAndGet()
+      ()
+    } catch {
+      case t: Throwable => failed(batch, "ASYNC_WRITE_FAILED", t)
+    }
+
+  private[spark] def submit(
+      spark: SparkSession,
+      rows: Seq[RefreshSqlLogRow],
+      invocation: Option[QueryLogExport.Invocation]
+  ): Unit = {
     if (rows.isEmpty) return
-    ensureWorker()
-    val batch = FlushBatch(spark, rows)
-    if (!queue.offer(batch)) {
-      droppedInlineFallbacks.incrementAndGet()
-      log.warn(
-        s"[openivm-querylog] async queue full (cap=$queueCapacity); falling back to inline flush"
-      )
-      try RefreshSqlLogCatalog.record(spark, rows)
-      catch {
-        case t: Throwable =>
-          flushFailures.incrementAndGet()
-          log.warn(
-            s"[openivm-querylog] inline-fallback flush failed for ${rows.size} rows: " +
-              s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("")}"
+    val batch = FlushBatch(spark, rows, invocation.map(_.beginFlush(rows.size)))
+    try {
+      ensureWorker()
+      if (!queue.offer(batch)) {
+        if (batch.export.nonEmpty) {
+          rejectedScopedBatches.incrementAndGet()
+          failed(
+            batch,
+            "ASYNC_QUEUE_FULL",
+            new IllegalStateException(s"Query-log queue capacity $queueCapacity exceeded")
           )
+        } else {
+          droppedInlineFallbacks.incrementAndGet()
+          log.warn(
+            s"[openivm-querylog] async queue full (cap=$queueCapacity); falling back to inline flush"
+          )
+          writeBatch(batch)
+        }
       }
+    } catch {
+      case t: Throwable => failed(batch, "ASYNC_SUBMIT_FAILED", t)
     }
   }
 
@@ -199,10 +239,11 @@ object RefreshSqlLogAsyncFlusher {
     latch.await(timeoutMs, TimeUnit.MILLISECONDS)
   }
 
-  /** Diagnostics — count of rows lost (none, by design) and stats. */
+  /** Diagnostics. Scoped captures also report their own failures via the export API. */
   def stats: Map[String, Long] = Map(
     "flushedBatches"         -> flushedBatches.get(),
     "flushFailures"          -> flushFailures.get(),
+    "rejectedScopedBatches"  -> rejectedScopedBatches.get(),
     "droppedInlineFallbacks" -> droppedInlineFallbacks.get(),
     "queueSize"              -> queue.size().toLong
   )
@@ -212,5 +253,12 @@ object RefreshSqlLogAsyncFlusher {
     droppedInlineFallbacks.set(0L)
     flushedBatches.set(0L)
     flushFailures.set(0L)
+    rejectedScopedBatches.set(0L)
   }
+
+  /** Requires a parked worker. Markers fill the real queue without writing
+    * thousands of fixture rows when testing the overflow policy.
+    */
+  private[common] def fillQueueWithMarkersForTesting(): Unit =
+    while (queue.offer(Quiesce(-1L))) ()
 }

@@ -2,7 +2,9 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
+import org.openivm.spark.common.{ChangeFeedMode, MvCatalog, RefreshTypeCode, StagingCatalog, StagingDelta}
+
+import org.apache.hadoop.fs.Path
 
 import java.util.UUID
 
@@ -395,6 +397,176 @@ abstract class FullRefreshScenarios extends IvmParitySpecBase("full-refresh") {
           "EXCEPT ALL " +
           "SELECT region, amount FROM sales_fr8 WHERE amount > 1000"
       )
+    }
+  }
+
+  // ── Test 9: downstream MV over a FULL_REFRESH MV ──────────────────────────
+  // A FULL_REFRESH upstream still has to make its recompute visible to
+  // dependent MVs.  Two mechanisms exist, selected by the upstream's recorded
+  // cascade capability (`_ivm_emits_cascade_view_delta`, decided at CREATE by
+  // `SparkRefreshRewriter.hasRealDelta` over the compiled openivm program):
+  //
+  //   capability = true  → the recompute publishes a signed MV_VIEW_DELTA
+  //                        (old rows at -1, new rows at +1), and dependents
+  //                        stay on their own incremental refresh type.
+  //   capability = false → no view delta is emitted, so the recompute leaves an
+  //                        OVERWRITE snapshot trigger behind; the dependent
+  //                        keeps its incremental refresh type and routes only
+  //                        that batch through a recompute.
+  //
+  // Either way the dependent must observe pending work after the upstream
+  // refresh and must end up bag-equal to its defining query.
+  describe("(9) MV over a FULL_REFRESH MV — the recompute stays visible downstream") {
+
+    it("propagates a FULL_REFRESH recompute to a dependent MV") {
+      sql("CREATE TABLE IF NOT EXISTS sales_fr9(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sales_fr9 VALUES ('east', 100), ('west', 50), ('north', 200)")
+      val upstreamSql =
+        "SELECT region, amount FROM sales_fr9 WHERE amount > 80 " +
+          "INTERSECT ALL " +
+          "SELECT region, amount FROM sales_fr9"
+      sql(s"CREATE MATERIALIZED VIEW mv_fr9_up AS $upstreamSql")
+
+      mvRefreshType("mv_fr9_up") shouldBe RefreshTypeCode.FullRefresh
+
+      sql(
+        "CREATE MATERIALIZED VIEW mv_fr9_down AS " +
+          "SELECT region, SUM(amount) AS total FROM mv_fr9_up GROUP BY region"
+      )
+
+      val upstreamMeta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_fr9_up"))
+        .getOrElse(fail("mv_fr9_up not found in catalog"))
+      val downstreamMeta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_fr9_down"))
+        .getOrElse(fail("mv_fr9_down not found in catalog"))
+
+      sql("INSERT INTO sales_fr9 VALUES ('south', 500)")
+      sql("DELETE FROM sales_fr9 WHERE region = 'west'")
+      refreshMv("mv_fr9_up")
+
+      if (changeFeedMode == ChangeFeedMode.Intercept) {
+        val downstreamName = downstreamMeta.name.database
+          .fold(downstreamMeta.name.table)(db => s"$db.${downstreamMeta.name.table}")
+        val pending = StagingCatalog.collectFor(
+          spark,
+          downstreamName,
+          downstreamMeta.sourceTables,
+          downstreamMeta.sourceWatermarks
+        )
+        withClue("upstream FULL_REFRESH left no pending work for the dependent MV: ") {
+          pending should not be empty
+        }
+        if (upstreamMeta.emitsCascadeViewDelta) {
+          val viewDelta = pending
+            .filter(_.opType == StagingDelta.OpTypes.MvViewDelta)
+            .lastOption
+            .getOrElse(fail("cascade-capable FULL_REFRESH published no MV_VIEW_DELTA row"))
+          spark.read
+            .format("delta")
+            .load(viewDelta.stagingPath)
+            .columns should contain("openivm_multiplicity")
+        }
+      }
+
+      refreshMv("mv_fr9_down")
+
+      assertMvCorrect("mv_fr9_up", upstreamSql)
+      assertMvCorrect(
+        "mv_fr9_down",
+        s"SELECT region, SUM(amount) AS total FROM ($upstreamSql) fr9 GROUP BY region"
+      )
+    }
+  }
+
+  // ── Test 10: terminal FULL_REFRESH view — no upstream, no consumer ────────
+  // The `meta_ingestion` shape from the local-spark-openivm canary:
+  //
+  //   SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP) AS ingested_at
+  //
+  // A one-row constant query. No source table, no upstream MV, no downstream
+  // consumer. openivm classifies it FULL_REFRESH (`HasVolatileExpression`), and
+  // because openivm-spark always sets `CompileFacts::force_view_delta_cascade`
+  // — which forces `has_downstream = true` for FULL_REFRESH in
+  // `refresh_sql.cpp` — it STILL emits the split-safe signed companion. So the
+  // refresh publishes an exact `old x -1 / new x +1` delta of itself and is
+  // reported as SIGNED_DELTA_RECOMPUTE, never FULL_REFRESH: the terminal case
+  // is exactly the one the benchmark's refresh-type guard rejects when a view
+  // reports FULL.
+  describe("(10) Terminal FULL_REFRESH view — signed-delta recompute without upstream or consumer") {
+
+    it("recomputes a sourceless constant view and reports a non-FULL signed-delta strategy") {
+      sql("DROP MATERIALIZED VIEW IF EXISTS mv_fr10_meta")
+      sql(
+        "CREATE MATERIALIZED VIEW mv_fr10_meta AS " +
+          "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP) AS ingested_at"
+      )
+
+      val meta = MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_fr10_meta"))
+        .getOrElse(fail("mv_fr10_meta not found in catalog"))
+
+      withClue("terminal constant view unexpectedly has source tables: ") {
+        meta.sourceTables shouldBe empty
+      }
+      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+      withClue("a verified split-safe companion must not report as a full rebuild: ") {
+        meta.refreshTypeName shouldBe RefreshTypeCode.SignedDeltaRecomputeName
+      }
+      meta.refreshTypeName should not be RefreshTypeCode.FullRefreshName
+      meta.emitsCascadeViewDelta shouldBe true
+
+      val before = spark
+        .table("mv_fr10_meta")
+        .collect()
+        .headOption
+        .getOrElse(fail("mv_fr10_meta is empty after CREATE"))
+        .getAs[java.sql.Timestamp]("ingested_at")
+
+      Thread.sleep(20L)
+      refreshMv("mv_fr10_meta")
+
+      val rows = spark.table("mv_fr10_meta").collect()
+      rows.length shouldBe 1
+      val after = rows.head.getAs[java.sql.Timestamp]("ingested_at")
+      withClue(s"recompute did not advance the constant (before=$before after=$after): ") {
+        after.getTime should be >= before.getTime
+      }
+
+      // The classification is backed by execution: the recompute persists the
+      // exact signed pair even though nothing consumes it.
+      if (changeFeedMode == ChangeFeedMode.Intercept) {
+        val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+        val root      = new Path(s"$warehouse/_ivm/view_deltas")
+        val fs        = root.getFileSystem(spark.sparkContext.hadoopConfiguration)
+        val deltaDirs =
+          if (!fs.exists(root)) Seq.empty[String]
+          else
+            fs.listStatus(root)
+              .filter(s => s.isDirectory && s.getPath.getName.endsWith("mv_fr10_meta"))
+              .flatMap(d => fs.listStatus(d.getPath).filter(_.isDirectory).map(_.getPath.toString))
+              .toSeq
+
+        withClue("a terminal signed-delta recompute wrote no view delta: ") {
+          deltaDirs should not be empty
+        }
+
+        val signed = deltaDirs
+          .map(p => spark.read.format("delta").load(p))
+          .reduce((a, b) => a.unionByName(b))
+        signed.columns should contain("openivm_multiplicity")
+
+        val pairs = signed
+          .select("ingested_at", "openivm_multiplicity")
+          .collect()
+          .map(r => (r.getAs[java.sql.Timestamp]("ingested_at").getTime, r.getAs[Int]("openivm_multiplicity")))
+          .toSeq
+        withClue(s"signed delta is not an exact old/new pair: ${pairs.mkString(",")} ") {
+          pairs.map(_._2).sorted shouldBe Seq(-1, 1)
+        }
+        pairs should contain((before.getTime, -1))
+        pairs should contain((after.getTime, 1))
+      }
     }
   }
 }

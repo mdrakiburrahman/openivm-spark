@@ -1043,7 +1043,7 @@ cmd_dev_build() {
         exit 1
     fi
 
-    local base_image="openivm-spark/openivm-tester:${OPENIVM_COMMIT}-${LPTS_COMMIT}"
+    local base_image="openivm-spark/openivm-tester:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}"
     local dev_image="openivm-spark/openivm-dev:local"
 
     # Stage local sources into a build context (omits build/, .git/, large submodules).
@@ -1078,19 +1078,22 @@ EOF
     case "$action" in
         build)
             echo "[dev-build] Compiling openivm + patched lpts..."
-            docker run --rm -w /src "$dev_image" bash -c "GEN=ninja make -j\$(nproc)"
+            docker run --rm -w /src -e CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS:-8}" \
+                "$dev_image" bash -c "GEN=ninja make"
             ;;
         all)
             echo "[dev-build] Compiling + running upstream tests..."
-            docker run --rm -w /src "$dev_image" bash -c "GEN=ninja make -j\$(nproc) && make test $*"
+            docker run --rm -w /src -e CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS:-8}" \
+                "$dev_image" bash -c "GEN=ninja make && make test $*"
             ;;
         test)
             echo "[dev-build] Building + running tests..."
             if [[ "$#" -eq 0 ]]; then
-                docker run --rm -w /src "$dev_image" bash -c "GEN=ninja make -j\$(nproc) && make test"
+                docker run --rm -w /src -e CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS:-8}" \
+                    "$dev_image" bash -c "GEN=ninja make && make test"
             else
-                docker run --rm -w /src "$dev_image" \
-                    bash -c "GEN=ninja make -j\$(nproc) && build/release/test/unittest $*"
+                docker run --rm -w /src -e CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS:-8}" "$dev_image" \
+                    bash -c "GEN=ninja make && build/release/test/unittest $*"
             fi
             ;;
         *)

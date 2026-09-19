@@ -4,6 +4,7 @@ import java.io.File
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Base64
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Try
@@ -119,6 +120,14 @@ object RocksDBCodec {
     }
   }
 
-  def safePathSegment(name: String): String =
-    Base64.getUrlEncoder.withoutPadding.encodeToString(utf8(name))
+  /** Preserve every legacy component valid under POSIX NAME_MAX. Longer UTF-8
+    * identities use a full digest; the dot separates its namespace from
+    * base64url, so a hashed identity cannot alias a legacy encoded identity.
+    */
+  def safePathSegment(name: String): String = {
+    val bytes  = utf8(name)
+    val legacy = Base64.getUrlEncoder.withoutPadding.encodeToString(bytes)
+    if (legacy.length <= 255) legacy
+    else "sha256." + MessageDigest.getInstance("SHA-256").digest(bytes).map(b => f"${b & 0xff}%02x").mkString
+  }
 }

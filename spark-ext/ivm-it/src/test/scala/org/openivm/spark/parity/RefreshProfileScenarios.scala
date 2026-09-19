@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.RefreshProfileCatalog
+import org.openivm.spark.common.{ChangeFeedMode, RefreshProfileCatalog}
 
 /** End-to-end coverage of `RefreshProfile` instrumentation in
   * `MaterializedViewCommands` + the `SHOW OPENIVM REFRESH PROFILE` SQL
@@ -51,9 +51,13 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       names should contain("create_mv_system_tables")
       names should contain("create_compile_classification")
       names should contain("create_mv_initial_load")
-      names should contain("create_view_index")
       names should contain("create_mv_publish_metadata")
       names should contain("create_mv_total")
+      names should contain("query_span")
+      val span = detailsForStep(rows, "query_span").head
+      span should include("start_epoch_ms=")
+      span should include("end_epoch_ms=")
+      span should include("outcome=")
     }
   }
 
@@ -74,12 +78,13 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       val names      = steps(refreshRid).toSet
       names should contain("acquire_locks")
       names should contain("total_refresh")
+      names should contain("query_span")
       names should not contain "execute_refresh_sql_stmt"
     }
   }
 
   describe("RefreshProfile — REFRESH with deltas") {
-    it("emits execute_refresh_sql_stmt rows with stmt_kind in detail") {
+    it("emits statement and RocksDB contention telemetry") {
       clearProfile()
       sql("CREATE TABLE profile_t3 (k INT, v INT) USING DELTA")
       sql("INSERT INTO profile_t3 VALUES (1, 10)")
@@ -98,6 +103,22 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       val dispatchDetails = detailsForStep(rows, "generate_refresh_sql.dispatch")
       dispatchDetails should not be empty
       dispatchDetails.head should include("refresh_type=")
+
+      val rocksdbDetails = detailsForStep(rows, "rocksdb_operation")
+      rocksdbDetails should not be empty
+      rocksdbDetails.exists(_.contains("db_scope=mv")) shouldBe true
+      rocksdbDetails.exists(_.contains("db_scope=index")) shouldBe false
+      rocksdbDetails.exists(_.contains("operation=get")) shouldBe true
+      rocksdbDetails.foreach { detail =>
+        detail should include("operation_count=")
+        detail should include("jvm_lock_wait_ns=")
+        detail should include("max_jvm_lock_wait_ns=")
+        detail should include("external_lock_wait_ns=")
+        detail should include("native_open_ns=")
+        detail should include("native_close_ns=")
+        detail should include("body_ns=")
+        detail should not include spark.conf.get("spark.sql.warehouse.dir")
+      }
     }
   }
 
@@ -126,6 +147,40 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         val orders = rs.map(_.getInt(3)).sorted
         orders.head shouldBe 0
         orders.zip(orders.tail).forall { case (a, b) => b == a + 1 } shouldBe true
+      }
+    }
+  }
+
+  describe("RefreshProfile — scalar cascade") {
+    it("separately times version pinning and snapshot-delta materialization") {
+      clearProfile()
+      sql("CREATE TABLE profile_scalar_src (v INT) USING DELTA")
+      sql("INSERT INTO profile_scalar_src VALUES (10), (20)")
+      sql(
+        "CREATE MATERIALIZED VIEW profile_scalar_up AS " +
+          "SELECT SUM(v) AS total FROM profile_scalar_src"
+      )
+      sql(
+        "CREATE MATERIALIZED VIEW profile_scalar_down AS " +
+          "SELECT total FROM profile_scalar_up"
+      )
+      sql("INSERT INTO profile_scalar_src VALUES (30)")
+      clearProfile()
+
+      sql("REFRESH MATERIALIZED VIEW profile_scalar_up").collect()
+
+      val rows  = showProfile()
+      val names = rows.map(_.getString(4)).toSet
+      if (changeFeedMode == ChangeFeedMode.Intercept) {
+        names should contain("pin_simple_aggregate_version")
+        names should contain("simple_aggregate_cascade_snapshot")
+        detailsForStep(rows, "pin_simple_aggregate_version").head should include("source=delta_history")
+        detailsForStep(rows, "simple_aggregate_cascade_snapshot").head should include("old_version=")
+      } else {
+        // CDF reads the pre/post images from Delta's change feed and does not
+        // materialize the interception-only signed snapshot.
+        names should not contain "pin_simple_aggregate_version"
+        names should not contain "simple_aggregate_cascade_snapshot"
       }
     }
   }

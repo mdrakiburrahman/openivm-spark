@@ -46,6 +46,9 @@ case class ExplainCreateMaterializedViewCommand(
         s""""refresh_type_name":${ExplainCreateMaterializedViewCommand.jsonStr(classification.refreshTypeName)},""" +
         s""""reason":${ExplainCreateMaterializedViewCommand.jsonStr(classification.reason)},""" +
         s""""source_tables":${ExplainCreateMaterializedViewCommand.jsonStrArray(result.sourceTables)},""" +
+        classification.upstreamSnapshotTrigger.fold("")(detail =>
+          s""""upstream_snapshot_trigger":${ExplainCreateMaterializedViewCommand.jsonStr(detail)},"""
+        ) +
         s""""emits_cascade_view_delta":${classification.emitsCascadeViewDelta}}"""
 
     Seq(Row(json))

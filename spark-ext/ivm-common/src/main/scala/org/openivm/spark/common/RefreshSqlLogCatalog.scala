@@ -7,9 +7,8 @@ import java.io.File
 import java.nio.file.{Path, Paths}
 import java.sql.Timestamp
 
-/** One persisted refresh-sql-log row, mirroring DuckDB-OpenIVM's
-  * `openivm_refresh_profile` table shape but carrying the full SQL text
-  * actually executed for one statement of a CREATE / REFRESH MV lifecycle.
+/** One persisted CREATE / REFRESH logger row: full SQL, original query text,
+  * or a related diagnostic/plan representation, distinguished by category.
   *
   * Sibling to [[RefreshProfileRow]] — shares `refreshId` so the two
   * catalogs can be joined to align "what ran" against "how long it took".
@@ -49,11 +48,15 @@ final case class RefreshSqlLogRow(
   * last `removeAll`. The `SHOW OPENIVM QUERY LOG` statement reads via
   * `scanAll`; bench-side exporters tag rows with their batch number at SELECT
   * time, so no on-engine drain is needed.
+  *
+  * Opt-in [[QueryLogExport]] rows are also atomically stored in a separate
+  * request-prefixed column family. Releasing that index leaves SHOW unchanged.
   */
 object RefreshSqlLogCatalog {
 
   private[common] val CfName: String              = "refresh_sql_log"
-  private[common] val ColumnFamilies: Seq[String] = Seq(CfName)
+  private[common] val ExportCfName: String        = "refresh_sql_log_export"
+  private[common] val ColumnFamilies: Seq[String] = Seq(CfName, ExportCfName)
 
   private def warehouseRoot(spark: SparkSession): Path =
     Paths.get(
@@ -136,11 +139,18 @@ object RefreshSqlLogCatalog {
   }
 
   /** Batch-write all sql-log rows for a single refresh / create lifecycle. */
-  def record(spark: SparkSession, rows: Seq[RefreshSqlLogRow]): Unit = {
+  def record(spark: SparkSession, rows: Seq[RefreshSqlLogRow]): Unit =
+    record(spark, rows, None)
+
+  private[common] def record(
+      spark: SparkSession,
+      rows: Seq[RefreshSqlLogRow],
+      export: Option[QueryLogExport.FlushTicket]
+  ): Unit = {
     if (rows.isEmpty) return
     val db = openDb(spark)
     db.withBatch { batch =>
-      rows.foreach { row =>
+      rows.zipWithIndex.foreach { case (row, index) =>
         val key = encodeKey(
           row.refreshId,
           tsToMicros(row.profileTimestamp),
@@ -149,8 +159,99 @@ object RefreshSqlLogCatalog {
         )
         val value = encodeValue(row)
         OpenIvmRocksDBBatchOps.put(db, batch, CfName, key, value)
+        export.foreach { ticket =>
+          val invocation = ticket.invocation
+          val exportKey = RocksDBCodec.compositeKey(
+            Seq(
+              RocksDBCodec.utf8(invocation.applicationId),
+              RocksDBCodec.utf8(invocation.requestId),
+              RocksDBCodec.encodeLongBE(invocation.ordinal.toLong),
+              RocksDBCodec.encodeLongBE(ticket.firstRecord.toLong + index)
+            )
+          )
+          // Self-contained rows, rather than pointers to legacy timestamp keys:
+          // e.g. EXPLAIN and its SQL can share a millisecond/order/attempt.
+          // The export ordinal preserves both without changing the SHOW schema.
+          OpenIvmRocksDBBatchOps.put(
+            db,
+            batch,
+            ExportCfName,
+            exportKey,
+            RocksDBCodec.compositeKey(Seq(key, value))
+          )
+        }
       }
     }
+    ()
+  }
+
+  private def decodeRow(key: Array[Byte], value: Array[Byte]): RefreshSqlLogRow = {
+    val (tsMicros, refreshId, stmtOrder, attemptIdx)              = decodeKey(key)
+    val (viewName, mode, category, stmtKind, durationMs, sqlText) = decodeValue(value)
+    RefreshSqlLogRow(
+      refreshId,
+      viewName,
+      microsToTs(tsMicros),
+      stmtOrder,
+      attemptIdx,
+      mode,
+      category,
+      stmtKind,
+      durationMs,
+      sqlText
+    )
+  }
+
+  private def exportPrefix(applicationId: String, requestId: String): Array[Byte] =
+    RocksDBCodec.compositeKey(
+      Seq(RocksDBCodec.utf8(applicationId), RocksDBCodec.utf8(requestId), Array.emptyByteArray)
+    )
+
+  private[common] final case class ExportRow(invocationOrder: Int, recordOrder: Int, row: RefreshSqlLogRow)
+
+  private[common] def readExport(
+      spark: SparkSession,
+      applicationId: String,
+      requestId: String,
+      maxRows: Int,
+      maxBytes: Long
+  ): Vector[ExportRow] = {
+    val it    = openDb(spark).prefixScan(ExportCfName, exportPrefix(applicationId, requestId))
+    val out   = scala.collection.mutable.ArrayBuffer.empty[ExportRow]
+    var bytes = 0L
+    try {
+      while (it.hasNext) {
+        if (out.size >= maxRows) throw QueryLogExport.SnapshotLimit
+        val (key, value) = it.next()
+        val keyParts     = RocksDBCodec.splitComposite(key, maxParts = 4)
+        val valueParts   = RocksDBCodec.splitComposite(value, maxParts = 2)
+        require(keyParts.length == 4 && valueParts.length == 2, "Malformed query-log export index row")
+        val row = decodeRow(valueParts(0), valueParts(1))
+        bytes += QueryLogExport.rowBytes(row)
+        if (bytes > maxBytes) throw QueryLogExport.SnapshotLimit
+        out += ExportRow(
+          RocksDBCodec.decodeLongBE(keyParts(2)).toInt,
+          RocksDBCodec.decodeLongBE(keyParts(3)).toInt,
+          row
+        )
+      }
+      out.toVector
+    } finally {
+      it match {
+        case closeable: AutoCloseable => closeable.close()
+        case _                        => ()
+      }
+    }
+  }
+
+  private[common] def removeExport(spark: SparkSession, applicationId: String, requestId: String): Unit = {
+    val db     = openDb(spark)
+    val prefix = exportPrefix(applicationId, requestId)
+    // The exact component prefix ends in 00 00; incrementing its final byte
+    // gives the exclusive upper bound without touching neighboring requests.
+    val end = prefix.clone()
+    end(end.length - 1) = 1.toByte
+    db.withBatch { batch => OpenIvmRocksDBBatchOps.deleteRange(db, batch, ExportCfName, prefix, end) }
     ()
   }
 
@@ -164,21 +265,8 @@ object RefreshSqlLogCatalog {
     val out = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
     try {
       while (it.hasNext) {
-        val (k, v)                                                    = it.next()
-        val (tsMicros, refreshId, stmtOrder, attemptIdx)              = decodeKey(k)
-        val (viewName, mode, category, stmtKind, durationMs, sqlText) = decodeValue(v)
-        out += RefreshSqlLogRow(
-          refreshId = refreshId,
-          viewName = viewName,
-          profileTimestamp = microsToTs(tsMicros),
-          stmtOrder = stmtOrder,
-          attemptIdx = attemptIdx,
-          mode = mode,
-          category = category,
-          stmtKind = stmtKind,
-          durationMs = durationMs,
-          sqlText = sqlText
-        )
+        val (key, value) = it.next()
+        out += decodeRow(key, value)
       }
     } finally {
       it match {
@@ -199,13 +287,15 @@ object RefreshSqlLogCatalog {
   def removeAll(spark: SparkSession): Unit = {
     val db = openDb(spark)
     db.withBatch { batch =>
-      OpenIvmRocksDBBatchOps.deleteRange(
-        db,
-        batch,
-        CfName,
-        Array.emptyByteArray,
-        Array.fill(128)(0xff.toByte)
-      )
+      ColumnFamilies.foreach { columnFamily =>
+        OpenIvmRocksDBBatchOps.deleteRange(
+          db,
+          batch,
+          columnFamily,
+          Array.emptyByteArray,
+          Array.fill(128)(0xff.toByte)
+        )
+      }
     }
     ()
   }

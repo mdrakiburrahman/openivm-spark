@@ -203,4 +203,26 @@ abstract class ParserCreateScenarios extends IvmParitySpecBase("parser-create") 
       assertMvCorrect("mv_t_filt", "SELECT id, val FROM t_filt WHERE status = 'active'")
     }
   }
+
+  describe("(5) Case-sensitive output aliases") {
+
+    it("preserves quoted mixed-case aliases through initial load and refresh") {
+      sql("CREATE TABLE IF NOT EXISTS t_case_alias(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO t_case_alias VALUES ('east',10),('east',20),('west',5)")
+      val expected =
+        "SELECT region AS `RegionName`, sum(amount) AS `MetricValue_Daily` " +
+          "FROM t_case_alias GROUP BY region"
+
+      sql(s"CREATE MATERIALIZED VIEW mv_t_case_alias AS $expected")
+      spark.table("mv_t_case_alias").schema.fieldNames.take(2) shouldBe
+        Array("RegionName", "MetricValue_Daily")
+      assertMvCorrect("mv_t_case_alias", expected)
+
+      sql("INSERT INTO t_case_alias VALUES ('east',7)")
+      refreshMv("mv_t_case_alias")
+      spark.table("mv_t_case_alias").schema.fieldNames.take(2) shouldBe
+        Array("RegionName", "MetricValue_Daily")
+      assertMvCorrect("mv_t_case_alias", expected)
+    }
+  }
 }

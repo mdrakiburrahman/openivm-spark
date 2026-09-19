@@ -3,6 +3,8 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 
 /** End-to-end parity tests for Top-K materialized views
   * (`ORDER BY … LIMIT k`).
@@ -86,6 +88,9 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
         "CREATE MATERIALIZED VIEW mv_topk_1 AS " +
           "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
       )
+      spark.catalog.getTable("mv_topk_1").tableType shouldBe "VIEW"
+      spark.catalog.getTable("mv_topk_1__ivm_data").tableType should not be "VIEW"
+      spark.table("mv_topk_1__ivm_data").count() shouldBe 5L
       assertMvCorrect(
         "mv_topk_1",
         "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
@@ -94,6 +99,7 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
       // one that does not.  After REFRESH, the MV should reflect the new top-3.
       sql("INSERT INTO sales_t1 VALUES (6,'south',45),(7,'south',5)")
       refreshMv("mv_topk_1")
+      spark.table("mv_topk_1__ivm_data").count() shouldBe 7L
       assertMvCorrect(
         "mv_topk_1",
         "SELECT * FROM sales_t1 ORDER BY amount DESC LIMIT 3"
@@ -351,6 +357,119 @@ abstract class TopKScenarios extends IvmParitySpecBase("top-k") {
         "mv_topk_9",
         "SELECT id, region, amount FROM sales_t9 ORDER BY amount DESC LIMIT 2"
       )
+    }
+  }
+
+  // ── (10) HAVING + Top-K share one backing-table VIEW ─────────────────────
+
+  describe("(10) HAVING composed with ORDER BY aggregate LIMIT") {
+    it("filters all maintained groups before applying Top-K") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t10(region STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t10 VALUES ('a',10),('b',30),('c',40),('d',50)")
+      val query =
+        "SELECT region, SUM(amount) AS total FROM sales_t10 GROUP BY region " +
+          "HAVING SUM(amount) >= 30 ORDER BY total DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_10 AS $query")
+
+      spark.catalog.getTable("mv_topk_10").tableType shouldBe "VIEW"
+      spark.table("mv_topk_10__ivm_data").count() shouldBe 4L
+      assertMvCorrect("mv_topk_10", query)
+
+      sql("INSERT INTO sales_t10 VALUES ('a',60)")
+      refreshMv("mv_topk_10")
+      assertMvCorrect("mv_topk_10", query)
+    }
+  }
+
+  // ── (11) DROP removes the logical and physical objects ───────────────────
+
+  describe("(11) DROP MATERIALIZED VIEW cleanup") {
+    it("drops both the user VIEW and unlimited backing table") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t11(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t11 VALUES (1,10),(2,20),(3,30)")
+      sql(
+        "CREATE MATERIALIZED VIEW mv_topk_11 AS " +
+          "SELECT id, amount FROM sales_t11 ORDER BY amount DESC LIMIT 2"
+      )
+
+      spark.catalog.tableExists("mv_topk_11") shouldBe true
+      spark.catalog.tableExists("mv_topk_11__ivm_data") shouldBe true
+      sql("DROP MATERIALIZED VIEW mv_topk_11")
+      spark.catalog.tableExists("mv_topk_11") shouldBe false
+      spark.catalog.tableExists("mv_topk_11__ivm_data") shouldBe false
+    }
+  }
+
+  // ── (12) ORDER BY a non-projected column falls back safely ───────────────
+
+  describe("(12) ORDER BY a column absent from the backing-table schema") {
+    it("uses full refresh instead of publishing an invalid Spark VIEW") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t12(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t12 VALUES (1,10),(2,30),(3,20)")
+      val query = "SELECT id FROM sales_t12 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_12 AS $query")
+
+      spark.catalog.getTable("mv_topk_12").tableType should not be "VIEW"
+      spark.catalog.tableExists("mv_topk_12__ivm_data") shouldBe false
+      assertMvCorrect("mv_topk_12", query)
+
+      sql("INSERT INTO sales_t12 VALUES (4,40)")
+      refreshMv("mv_topk_12")
+      assertMvCorrect("mv_topk_12", query)
+    }
+  }
+
+  // ── (13) Top-K as an upstream MV ─────────────────────────────────────────
+
+  describe("(13) downstream MV over a Top-K backing-table view") {
+    it("refreshes the downstream snapshot after the Top-K membership changes") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t13(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t13 VALUES (1,10),(2,20),(3,30),(4,40)")
+      val topKQuery = "SELECT id, amount FROM sales_t13 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_13 AS $topKQuery")
+      sql("CREATE MATERIALIZED VIEW mv_topk_13_down AS SELECT id, amount FROM mv_topk_13")
+
+      sql("INSERT INTO sales_t13 VALUES (5,50)")
+      refreshMv("mv_topk_13")
+      refreshMv("mv_topk_13_down")
+
+      assertMvCorrect("mv_topk_13", topKQuery)
+      assertMvCorrect("mv_topk_13_down", topKQuery)
+    }
+  }
+
+  // ── (14) Source overwrite fallback targets backing state ────────────────
+
+  describe("(14) source overwrite followed by Top-K refresh") {
+    it("recomputes the unlimited backing table instead of overwriting the public view") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t14(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t14 VALUES (1,10),(2,20),(3,30)")
+      val query = "SELECT id, amount FROM sales_t14 ORDER BY amount DESC LIMIT 2"
+      sql(s"CREATE MATERIALIZED VIEW mv_topk_14 AS $query")
+
+      sql("INSERT OVERWRITE TABLE sales_t14 VALUES (4,40),(5,50),(6,60),(7,70)")
+      refreshMv("mv_topk_14")
+
+      spark.catalog.getTable("mv_topk_14").tableType shouldBe "VIEW"
+      spark.table("mv_topk_14__ivm_data").count() shouldBe 4L
+      assertMvCorrect("mv_topk_14", query)
+    }
+  }
+
+  // ── (15) Partition-local sort is not rewritten as global ORDER BY ────────
+
+  describe("(15) SORT BY with LIMIT") {
+    it("falls back instead of changing a partition-local sort into global ordering") {
+      sql("CREATE TABLE IF NOT EXISTS sales_t15(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sales_t15 VALUES (1,10),(2,20),(3,30),(4,40)")
+      sql(
+        "CREATE MATERIALIZED VIEW mv_topk_15 AS " +
+          "SELECT id, amount FROM sales_t15 SORT BY amount DESC LIMIT 2"
+      )
+
+      spark.catalog.getTable("mv_topk_15").tableType should not be "VIEW"
+      spark.catalog.tableExists("mv_topk_15__ivm_data") shouldBe false
+      MvCatalog.lookup(spark, TableIdentifier("mv_topk_15")).get.refreshType shouldBe RefreshTypeCode.FullRefresh
     }
   }
 }

@@ -62,17 +62,17 @@ class ExplainCreateMaterializedViewSpec extends IvmParitySpecBase("explain-creat
       mvLocationDir("expl_mv_agg").exists() shouldBe false
     }
 
-    it("reports an ineligible FULL_REFRESH verdict with reason top_k for a Top-K view") {
+    it("keeps the inner refresh incremental for a Top-K backing-table view") {
       sql("CREATE TABLE expl_topk_src (region STRING, amount INT) USING DELTA")
       sql("INSERT INTO expl_topk_src VALUES ('east', 10), ('west', 20), ('north', 30)")
 
       val q   = "SELECT region, amount FROM expl_topk_src ORDER BY amount DESC LIMIT 2"
       val row = explain(s"EXPLAIN CREATE MATERIALIZED VIEW expl_mv_topk AS $q")
 
-      row.getAs[Boolean]("eligible") shouldBe false
-      row.getAs[Long]("refresh_type") shouldBe RefreshTypeCode.FullRefresh.toLong
-      row.getAs[String]("refresh_type_name") shouldBe "FULL_REFRESH"
-      row.getAs[String]("reason") shouldBe "top_k"
+      row.getAs[Boolean]("eligible") shouldBe true
+      row.getAs[Long]("refresh_type") shouldBe RefreshTypeCode.SimpleProjection.toLong
+      row.getAs[String]("refresh_type_name") shouldBe "SIMPLE_PROJECTION"
+      row.getAs[String]("reason") shouldBe "top_k_kept"
       row.getAs[Boolean]("emits_cascade_view_delta") shouldBe false
       mvExists("expl_mv_topk") shouldBe false
     }
