@@ -18,6 +18,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.types.StructType
+import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.parser.gen.IvmSqlBaseLexer
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
 
@@ -32,7 +33,8 @@ import org.openivm.spark.parser.gen.IvmSqlBaseParser
  *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`,
  *    `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`,
  *    `DROP MATERIALIZED VIEW`, `SHOW OPENIVM REFRESH PROFILE`, or
- *    `SHOW OPENIVM QUERY LOG`
+ *    `SHOW OPENIVM QUERY LOG`, plus the streaming-table lifecycle statements
+ *    while the OpenIVM feature gate is enabled
  *    (case-insensitive) → parsed by [[IvmSqlBaseParser]] / [[IvmAstBuilder]].
  *  - Everything else (including bare `EXPLAIN <query>` and `OPTIMIZE`) → [[delegate]].
  *
@@ -44,9 +46,12 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
   // parsePlan — only method with custom logic
   // -------------------------------------------------------------------------
 
-  override def parsePlan(sqlText: String): LogicalPlan =
-    if (isIvmStatement(sqlText)) parseIvmStatement(sqlText)
+  override def parsePlan(sqlText: String): LogicalPlan = {
+    val streamingStatement = StreamingQuerySql.isStreamingStatement(sqlText)
+    if (streamingStatement && FeatureGate.enabled(session)) parseIvmStatement(sqlText)
+    else if (!streamingStatement && isIvmStatement(sqlText)) parseIvmStatement(sqlText)
     else delegate.parsePlan(sqlText)
+  }
 
   // -------------------------------------------------------------------------
   // All other methods delegate unchanged
@@ -96,15 +101,8 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
   private def parseIvmStatement(sqlText: String): LogicalPlan = {
     val inputStream = CharStreams.fromString(sqlText)
 
-    val lexer = new IvmSqlBaseLexer(inputStream)
-    lexer.removeErrorListeners()
-
-    val tokenStream = new CommonTokenStream(lexer)
-    val parser      = new IvmSqlBaseParser(tokenStream)
-    parser.removeErrorListeners()
-
     var parseError: Option[String] = None
-    parser.addErrorListener(new BaseErrorListener {
+    val errorListener = new BaseErrorListener {
       override def syntaxError(
           recognizer: Recognizer[_, _],
           offendingSymbol: AnyRef,
@@ -115,7 +113,16 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
       ): Unit =
         if (parseError.isEmpty)
           parseError = Some(s"$msg (line $line, pos $charPositionInLine)")
-    })
+    }
+
+    val lexer = new IvmSqlBaseLexer(inputStream)
+    lexer.removeErrorListeners()
+    lexer.addErrorListener(errorListener)
+
+    val tokenStream = new CommonTokenStream(lexer)
+    val parser      = new IvmSqlBaseParser(tokenStream)
+    parser.removeErrorListeners()
+    parser.addErrorListener(errorListener)
 
     val tree = parser.ivmStatement()
     if (parseError.isEmpty && tokenStream.LA(1) != Token.EOF) {
@@ -132,7 +139,7 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
         // message (errorClass defaults to None → Spark uses "PARSE_SYNTAX_ERROR").
         throw new ParseException(Some(sqlText), errorMsg, Origin(), Origin())
       case None =>
-        IvmAstBuilder.buildPlan(session, sqlText, tree)
+        IvmAstBuilder.buildPlan(session, delegate, sqlText, tree)
     }
   }
 }

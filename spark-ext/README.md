@@ -68,9 +68,28 @@ following subcommands:
 ```
 
 `publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
-computes one immutable version as `<epoch>.<tracked-content-hash-int>.0`, and
-uses native sbt publishing to upload the `org.openivm:ivmextension_2.12`
-assembly artifact.
+computes one immutable version as
+`<epoch>.<working-tree-content-hash-int>.0`, and uses native sbt publishing to
+upload the assembly classifier at:
+
+```text
+org.openivm:ivmextension_2.12:jar:assembly:<version>
+ivmextension_2.12-<version>-assembly.jar
+```
+
+The content hash covers every tracked file plus every untracked, non-ignored
+file, so publishing completed but not-yet-committed feature work cannot reuse
+the identity of an older source tree. Ignored credentials, build outputs,
+`.temp/`, and `.research/` remain excluded.
+
+The feed contract is intentionally assembly-only: the thin main jar is not
+published. The generated POM retains only Spark/Delta/SLF4J dependencies marked
+`provided`; internal OpenIVM modules and other compile dependencies are already
+inside the fat jar. Consumers must request the `assembly` classifier rather
+than the unclassified artifact. Local `ivmExtension/assembly` output retains the
+legacy `ivmExtension-<version>-assembly.jar` filename used by existing image
+builds; Maven artifact metadata publishes the same bytes under the lowercase,
+Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
 `verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
@@ -122,7 +141,7 @@ shared hosts.
 
 ```bash
 spark-shell \
-    --jars target/scala-2.12/ivm-extension-0.1.0-SNAPSHOT-assembly.jar \
+    --jars spark-ext/ivm-extension/target/scala-2.12/ivmExtension-0.1.0-SNAPSHOT-assembly.jar \
     --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions \
     --conf spark.openivm.enabled=true \
     --conf spark.driver.extraJavaOptions="$(cat .sbtopts | grep -oE '^-J.*' | sed 's/^-J//' | xargs)"
@@ -303,6 +322,82 @@ The extension and its tests require Spark's standard JDK-17 `--add-opens` /
 These live in `spark-ext/.sbtopts` for sbt-launched JVMs and must be replicated
 in `spark.driver.extraJavaOptions` / `spark.executor.extraJavaOptions` when
 running spark-shell / spark-submit.
+
+## Standalone streaming tables
+
+With the feature gate enabled, the extension adds a declarative SQL surface for
+native Structured Streaming queries in the caller's existing `SparkSession`:
+
+```sql
+CREATE STREAMING TABLE IF NOT EXISTS monitoring.cleaned_events
+USING DELTA
+LOCATION '/tables/cleaned_events'
+PARTITIONED BY (event_date)
+OPTIONS (
+  'outputMode' = 'append',
+  'trigger' = 'processingTime',
+  'triggerInterval' = '10 seconds'
+)
+TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
+AS
+SELECT e.id, e.event_time, e.event_date, e.payload
+FROM STREAM monitoring.raw_events
+WITH (
+  'skipChangeCommits' = 'true',
+  'maxFilesPerTrigger' = '1000'
+)
+WATERMARK e.event_time DELAY OF INTERVAL 10 MINUTES AS e;
+```
+
+`STREAM table` and `STREAM(table)` mark only that relation occurrence as
+streaming. An ordinary occurrence of the same table remains static. Each
+streaming source can carry its own case-insensitive `WITH (...)` reader options;
+duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
+rejected before Spark receives the native options.
+
+`WATERMARK <named-expression> DELAY OF INTERVAL ...` appears before the relation
+alias. It accepts a named input column or an explicitly aliased derived
+timestamp expression:
+
+```sql
+FROM STREAM raw_events
+WATERMARK timestamp_seconds(epoch_seconds) AS event_time
+  DELAY OF INTERVAL 5 MINUTES AS events
+```
+
+The complete `SELECT` is parsed and checked by Spark 3.5. CTEs, nested
+subqueries, stream-static joins, stream-stream joins, functions, and unsupported
+streaming operations retain native Spark semantics. Streaming source providers
+and reader options retain native Spark behavior where supported. The managed
+target sink remains Delta-only: omitting `USING` selects Delta, and an explicit
+non-Delta target provider is rejected.
+
+Lifecycle commands use the same caller session:
+
+```sql
+SHOW STREAMING TABLES;
+SHOW STREAMING TABLES IN monitoring;
+ALTER STREAMING TABLE monitoring.cleaned_events STOP;
+DROP STREAMING TABLE IF EXISTS monitoring.cleaned_events;
+```
+
+`CREATE` starts asynchronously and the query remains visible through
+`spark.streams`. `STOP` retains the target and checkpoint for a matching
+declaration to resume. `DROP STREAMING TABLE` is destructive: it stops the
+owned query and removes its owned registration, target data, and checkpoint.
+
+State-store selection remains ordinary Spark configuration; the extension does
+not clone the session or mutate `SparkConf` / `SQLConf`:
+
+```sql
+SET spark.sql.streaming.stateStore.providerClass =
+  org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider;
+```
+
+The implementation uses native append/complete output modes and native
+processing-time or `AvailableNow` triggers. It does not provide continuous
+processing, an update-mode MERGE sink, arbitrary Scala state callbacks, or a
+pipeline scheduler.
 
 ## IVM DDL
 

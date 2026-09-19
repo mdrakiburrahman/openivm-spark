@@ -4,18 +4,24 @@ import org.antlr.v4.runtime.misc.Interval
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.ParseException
+import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.Origin
+import org.openivm.spark.commands.CreateStreamingTableCommand
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
+import org.openivm.spark.commands.DropStreamingTableCommand
 import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
 import org.openivm.spark.commands.AdvanceMaterializedViewSourceVersionsCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowQueryLogCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
+import org.openivm.spark.commands.ShowStreamingTablesCommand
+import org.openivm.spark.commands.StopStreamingTableCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
+import org.openivm.spark.streaming.StreamingTableSpec
 
 import scala.collection.JavaConverters._
 
@@ -23,14 +29,20 @@ import scala.collection.JavaConverters._
  * Visitor that builds typed LogicalPlan nodes from the ANTLR-generated parse tree
  * produced by [[IvmSqlBaseParser]].
  *
- * The `queryBody` sub-parse is delegated back to the Spark session's own parser so
- * that every SELECT construct Spark 3.5 understands is automatically supported.
+ * The `queryBody` sub-parse is delegated back to the wrapped Spark parser so that
+ * every SELECT construct Spark 3.5 understands is automatically supported.
  */
-private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBaseVisitor[AnyRef] {
+private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInterface, sqlText: String)
+    extends IvmSqlBaseBaseVisitor[AnyRef] {
 
   // -------------------------------------------------------------------------
   // Top-level statements
   // -------------------------------------------------------------------------
+
+  override def visitIvmStatement(
+      ctx: IvmSqlBaseParser.IvmStatementContext
+  ): AnyRef =
+    visit(ctx.getChild(0))
 
   override def visitCreateMaterializedView(
       ctx: IvmSqlBaseParser.CreateMaterializedViewContext
@@ -108,6 +120,77 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
   ): AnyRef =
     ShowQueryLogCommand()
 
+  override def visitCreateStreamingTable(
+      ctx: IvmSqlBaseParser.CreateStreamingTableContext
+  ): AnyRef = {
+    val clauses = ctx.streamingTableClause().asScala.toSeq
+
+    val provider = singleClause(
+      clauses.filter(_.USING() != null).map(clause => identifierText(clause.identifier())),
+      "USING"
+    )
+    val location = singleClause(
+      clauses
+        .filter(_.LOCATION() != null)
+        .map(clause => StreamingQuerySql.parseStringLiteral(clause.STRING().getText, sqlText)),
+      "LOCATION"
+    )
+    val partitionColumns = singleClause(
+      clauses
+        .filter(_.PARTITIONED() != null)
+        .map(_.multipartIdentifier().asScala.map(multipartColumnName).toSeq),
+      "PARTITIONED BY"
+    ).getOrElse(Seq.empty)
+    val tableProperties = singleClause(
+      clauses
+        .filter(_.TBLPROPERTIES() != null)
+        .map(clause => buildUniqueProperties(clause.tableProperties(), "TBLPROPERTIES")),
+      "TBLPROPERTIES"
+    ).getOrElse(Map.empty)
+    val options = singleClause(
+      clauses
+        .filter(_.OPTIONS() != null)
+        .map(clause => buildUniqueProperties(clause.tableProperties(), "OPTIONS")),
+      "OPTIONS"
+    ).getOrElse(Map.empty)
+
+    val queryText = extractQueryBody(ctx.queryBody())
+    val queryPlan = StreamingQuerySql.parse(queryText, delegate)
+    CreateStreamingTableCommand(
+      StreamingTableSpec(
+        name = multipartIdentifierParts(ctx.multipartIdentifier()),
+        queryText = queryText,
+        query = queryPlan,
+        provider = provider,
+        location = location,
+        partitionColumns = partitionColumns,
+        tableProperties = tableProperties,
+        options = options,
+        ifNotExists = ctx.IF() != null
+      )
+    )
+  }
+
+  override def visitShowStreamingTables(
+      ctx: IvmSqlBaseParser.ShowStreamingTablesContext
+  ): AnyRef =
+    ShowStreamingTablesCommand(
+      Option(ctx.multipartIdentifier()).map(multipartIdentifierParts)
+    )
+
+  override def visitStopStreamingTable(
+      ctx: IvmSqlBaseParser.StopStreamingTableContext
+  ): AnyRef =
+    StopStreamingTableCommand(multipartIdentifierParts(ctx.multipartIdentifier()))
+
+  override def visitDropStreamingTable(
+      ctx: IvmSqlBaseParser.DropStreamingTableContext
+  ): AnyRef =
+    DropStreamingTableCommand(
+      multipartIdentifierParts(ctx.multipartIdentifier()),
+      ifExists = ctx.IF() != null
+    )
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
@@ -155,6 +238,11 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       ctx: IvmSqlBaseParser.MultipartIdentifierContext
   ): String =
     ctx.identifier().asScala.map(identifierText).mkString(".")
+
+  private def multipartIdentifierParts(
+      ctx: IvmSqlBaseParser.MultipartIdentifierContext
+  ): Seq[String] =
+    ctx.identifier().asScala.map(identifierText).toSeq
 
   /** Convert a multipart identifier context into a Spark [[TableIdentifier]]. */
   private def toTableIdentifier(
@@ -211,6 +299,47 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       }
       .toMap
 
+  private def buildUniqueProperties(
+      ctx: IvmSqlBaseParser.TablePropertiesContext,
+      clauseName: String
+  ): Map[String, String] = {
+    val entries = ctx
+      .tableProperty()
+      .asScala
+      .map { property =>
+        if (property.EQ() == null) {
+          parseError(s"$clauseName option '${property.key.getText}' requires '='")
+        }
+        val key =
+          if (property.key.STRING() != null)
+            StreamingQuerySql.parseStringLiteral(property.key.getText, sqlText)
+          else
+            property.key.identifier().asScala.map(identifierText).mkString(".")
+        val value =
+          if (property.value.STRING() != null)
+            StreamingQuerySql.parseStringLiteral(property.value.getText, sqlText)
+          else
+            property.value.getText
+        key -> value
+      }
+      .toSeq
+
+    val duplicate = entries
+      .groupBy { case (key, _) => key.toLowerCase(java.util.Locale.ROOT) }
+      .collectFirst { case (_, values) if values.size > 1 => values.head._1 }
+    duplicate.foreach { key =>
+      parseError(s"$clauseName names option '$key' more than once")
+    }
+    entries.toMap
+  }
+
+  private def singleClause[T](values: Seq[T], clauseName: String): Option[T] =
+    values match {
+      case Seq()      => None
+      case Seq(value) => Some(value)
+      case _          => parseError(s"CREATE STREAMING TABLE may specify $clauseName only once")
+    }
+
   /**
    * Unquote a SQL single-quoted string literal.
    * For non-string-literal tokens (INTEGER_VALUE, DECIMAL_VALUE, BOOLEAN_VALUE) the
@@ -221,6 +350,9 @@ private[parser] class IvmAstBuilder(session: SparkSession) extends IvmSqlBaseBas
       s.substring(1, s.length - 1).replace("\\'", "'").replace("''", "'")
     else
       s
+
+  private def parseError(message: String): Nothing =
+    throw new ParseException(Some(sqlText), message, Origin(), Origin())
 }
 
 /** Companion — exposes the entry-point used by [[IvmParser]]. */
@@ -228,10 +360,11 @@ private[parser] object IvmAstBuilder {
 
   def buildPlan(
       session: SparkSession,
+      delegate: ParserInterface,
       sqlText: String,
       tree: IvmSqlBaseParser.IvmStatementContext
   ): LogicalPlan = {
-    val builder = new IvmAstBuilder(session)
+    val builder = new IvmAstBuilder(session, delegate, sqlText)
     builder.visit(tree) match {
       case plan: LogicalPlan => plan
       case other =>

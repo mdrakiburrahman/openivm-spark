@@ -7,6 +7,17 @@ import sbtassembly.PathList
 
 object Settings {
 
+  private def assemblyOnlyPom(pom: scala.xml.Node): scala.xml.Node = {
+    val keepProvidedDependencies = new scala.xml.transform.RewriteRule {
+      override def transform(node: scala.xml.Node): Seq[scala.xml.Node] =
+        if (node.label == "dependency" && (node \ "scope").text.trim != "provided")
+          Seq.empty
+        else
+          Seq(node)
+    }
+    new scala.xml.transform.RuleTransformer(keepProvidedDependencies).transform(pom).head
+  }
+
   val mavenPublishSettings: Seq[Def.Setting[_]] = Seq(
     publishMavenStyle := true,
     publishTo         := sys.env.get("MAVEN_URL").filter(_.nonEmpty).map("Maven feed" at _),
@@ -21,9 +32,15 @@ object Settings {
         token.trim
       )
     },
+    // The supported Maven consumer is the self-contained assembly classifier.
+    // Do not publish a thin main jar whose internal project dependencies are not
+    // independently published. Keep only host-provided dependencies in the POM;
+    // every other compile dependency is already bundled into the assembly.
+    Compile / packageBin / publishArtifact := false,
     Compile / packageDoc / publishArtifact := false,
     Compile / packageSrc / publishArtifact := false,
-    assembly / artifact                    := Artifact(name.value, "jar", "jar", "assembly")
+    pomPostProcess                         := assemblyOnlyPom,
+    assembly / artifact                    := Artifact(moduleName.value, "jar", "jar", "assembly")
   )
 
   /// Per-class parallel JVM fork for heavy SparkSession tests.

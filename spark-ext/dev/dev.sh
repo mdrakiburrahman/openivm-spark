@@ -199,6 +199,23 @@ cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
 
+# Hash the publishable working tree, including untracked feature files while
+# honoring the repository's ignore rules for credentials and build outputs.
+publication_content_hash() {
+    local path file_hash
+    (
+        cd "$REPO_ROOT"
+        git ls-files --cached --others --exclude-standard -z \
+            | LC_ALL=C sort -z \
+            | while IFS= read -r -d '' path; do
+                [[ -f "$path" || -L "$path" ]] || continue
+                file_hash="$(sha256sum -- "$path")"
+                file_hash="${file_hash%% *}"
+                printf '%s\0%s\0' "$path" "$file_hash"
+            done
+    ) | sha256sum | cut -d' ' -f1 | cut -c1-7
+}
+
 cmd_publish() {
     pre_clean_if_requested
 
@@ -219,11 +236,12 @@ cmd_publish() {
         fi
 
         local hash_hex hash_int
-        hash_hex="$(git -C "$REPO_ROOT" ls-files -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | cut -c1-7)"
+        hash_hex="$(publication_content_hash)"
         hash_int=$((16#${hash_hex}))
         export PACKAGE_VERSION="$(date +%s).${hash_int}.0"
 
-        echo "[publish] Publishing org.openivm:ivmextension_2.12:${PACKAGE_VERSION}"
+        echo "[publish] Publishing org.openivm:ivmextension_2.12:jar:assembly:${PACKAGE_VERSION}"
+        echo "[publish] Artifact: ivmextension_2.12-${PACKAGE_VERSION}-assembly.jar"
         compose run --rm -T \
             -e MAVEN_URL \
             -e MAVEN_PAT \

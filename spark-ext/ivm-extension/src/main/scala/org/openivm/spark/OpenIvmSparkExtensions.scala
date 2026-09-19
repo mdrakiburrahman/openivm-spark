@@ -38,6 +38,7 @@ class OpenIvmSparkExtensions extends (SparkSessionExtensions => Unit) {
 
   override def apply(ext: SparkSessionExtensions): Unit = {
     ext.injectParser((session, parent) => new parser.IvmParser(session, parent))
+    ext.injectResolutionRule(session => new analyzer.ResolveStreamingWatermark(session))
     ext.injectResolutionRule { session =>
       if (ChangePropagationFactory.forSession(session).requiresDmlInterception)
         new analyzer.IvmDmlInterceptorRule(session)

@@ -6,8 +6,9 @@
 // Cross-module test inheritance via `compile->compile;test->test`.
 //
 // All Spark / Delta / Hive deps are `% provided` so the assembled jar is
-// runtime-pluggable into a spark-shell (`--jars openivm-spark-assembly.jar
-// --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions`).
+// runtime-pluggable into a spark-shell (`--jars ivmExtension-<version>-assembly.jar
+// --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions`). Maven
+// publishes those bytes as `ivmextension_2.12-<version>-assembly.jar`.
 
 import Dependencies._
 import Settings._
@@ -55,6 +56,7 @@ lazy val ivmCompiler = (project in file("ivm-compiler"))
 lazy val ivmExtension = (project in file("ivm-extension"))
   .dependsOn(ivmCompiler % "compile->compile;test->test")
   .enablePlugins(Antlr4Plugin)
+  .settings(moduleName := "ivmextension")
   .settings(commonSettings: _*)
   .settings(assemblySettings: _*)
   .settings(mavenPublishSettings: _*)
