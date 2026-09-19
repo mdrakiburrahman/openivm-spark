@@ -345,8 +345,7 @@ FROM STREAM monitoring.raw_events
 WITH (
   'skipChangeCommits' = 'true',
   'maxFilesPerTrigger' = '1000'
-)
-WATERMARK e.event_time DELAY OF INTERVAL 10 MINUTES AS e;
+) AS e;
 ```
 
 `STREAM table` and `STREAM(table)` mark only that relation occurrence as
@@ -355,9 +354,9 @@ streaming source can carry its own case-insensitive `WITH (...)` reader options;
 duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
 rejected before Spark receives the native options.
 
-`WATERMARK <named-expression> DELAY OF INTERVAL ...` appears before the relation
-alias. It accepts a named input column or an explicitly aliased derived
-timestamp expression:
+`WATERMARK <named-expression> DELAY OF INTERVAL ...` is optional. When present,
+it appears before the relation alias and accepts a named input column or an
+explicitly aliased derived timestamp expression:
 
 ```sql
 FROM STREAM raw_events
@@ -385,6 +384,26 @@ DROP STREAMING TABLE IF EXISTS monitoring.cleaned_events;
 `spark.streams`. `STOP` retains the target and checkpoint for a matching
 declaration to resume. `DROP STREAMING TABLE` is destructive: it stops the
 owned query and removes its owned registration, target data, and checkpoint.
+
+`AvailableNow` executions terminate naturally after consuming all data currently
+available:
+
+```sql
+CREATE STREAMING TABLE monitoring.snapshot
+OPTIONS ('trigger' = 'availableNow')
+AS SELECT id, value FROM STREAM monitoring.raw_events;
+```
+
+Reissuing the identical declaration after completion resumes the same checkpoint
+and persistent query ID with a new run ID. With no new source commit, the new run
+does no source-row or target-data work. New inserts are consumed exactly once on
+the next run; already committed input is not replayed.
+
+The checkpoint is bound to the persisted semantic definition. A changed query,
+source identity, source semantic option, watermark, output mode, partitioning,
+or target property fails without stopping or mutating the existing table by
+default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
+replacement of the extension-owned target and checkpoint.
 
 State-store selection remains ordinary Spark configuration; the extension does
 not clone the session or mutate `SparkConf` / `SQLConf`:

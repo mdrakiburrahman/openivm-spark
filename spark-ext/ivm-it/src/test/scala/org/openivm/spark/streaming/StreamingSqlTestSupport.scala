@@ -2,12 +2,14 @@ package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{DataFrame, Row}
-import org.apache.spark.sql.streaming.StreamingQuery
+import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryListener, StreamingQueryProgress}
 import org.scalatest.Suite
 
 import java.io.File
 import java.sql.Timestamp
 import java.util.UUID
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, blocking}
@@ -20,6 +22,62 @@ private[streaming] final case class SqlStreamingStatus(
     checkpointLocation: String,
     definitionHash: String
 )
+
+private[streaming] final case class SqlCompletedRun(
+    status: SqlStreamingStatus,
+    progress: Seq[StreamingQueryProgress],
+    exception: Option[String]
+) {
+
+  def inputRows: Long = progress.map(_.numInputRows).sum
+}
+
+private[streaming] final class SqlCompletionListener extends StreamingQueryListener {
+
+  private final class RunEvents {
+    val progress                            = new ConcurrentLinkedQueue[StreamingQueryProgress]()
+    val terminated                          = new CountDownLatch(1)
+    @volatile var started: Boolean          = false
+    @volatile var exception: Option[String] = None
+  }
+
+  private val runs = new ConcurrentHashMap[String, RunEvents]()
+
+  override def onQueryStarted(event: StreamingQueryListener.QueryStartedEvent): Unit =
+    run(event.id.toString, event.runId.toString).started = true
+
+  override def onQueryProgress(event: StreamingQueryListener.QueryProgressEvent): Unit = {
+    val progress = event.progress
+    run(progress.id.toString, progress.runId.toString).progress.add(progress)
+  }
+
+  override def onQueryTerminated(event: StreamingQueryListener.QueryTerminatedEvent): Unit = {
+    val events = run(event.id.toString, event.runId.toString)
+    events.exception = event.exception
+    events.terminated.countDown()
+  }
+
+  def await(status: SqlStreamingStatus, timeout: FiniteDuration): SqlCompletedRun = {
+    val events    = run(status.queryId, status.runId)
+    val completed = events.terminated.await(timeout.toMillis, TimeUnit.MILLISECONDS)
+    if (!completed)
+      throw new java.util.concurrent.TimeoutException(
+        s"Timed out waiting for query ${status.queryId}, run ${status.runId} to terminate"
+      )
+    if (!events.started)
+      throw new IllegalStateException(
+        s"Query ${status.queryId}, run ${status.runId} terminated without a start event"
+      )
+    SqlCompletedRun(status, events.progress.iterator().asScala.toVector, events.exception)
+  }
+
+  private def run(queryId: String, runId: String): RunEvents = {
+    val key       = s"$queryId\n$runId"
+    val candidate = new RunEvents
+    val existing  = runs.putIfAbsent(key, candidate)
+    if (existing == null) candidate else existing
+  }
+}
 
 private[streaming] trait StreamingSqlTestSupport extends StreamingTableTestFixture {
   self: Suite =>
@@ -60,6 +118,33 @@ private[streaming] trait StreamingSqlTestSupport extends StreamingTableTestFixtu
     )
     sqlQueryIds += result.queryId
     result
+  }
+
+  protected def createStreamingSqlToCompletion(
+      sqlText: String,
+      timeout: FiniteDuration = 120.seconds
+  ): SqlCompletedRun = {
+    val listener = new SqlCompletionListener
+    spark.streams.addListener(listener)
+    val startedAt = System.nanoTime()
+    try {
+      val status = createStreamingSql(sqlText)
+      val completed =
+        try listener.await(status, timeout)
+        catch {
+          case error: java.util.concurrent.TimeoutException =>
+            val elapsedMs = (System.nanoTime() - startedAt) / 1000000L
+            fail(s"${error.getMessage} after ${elapsedMs}ms", error)
+        }
+      completed.exception.foreach { message =>
+        fail(
+          s"Query ${status.queryId}, run ${status.runId} terminated with an exception: $message"
+        )
+      }
+      completed
+    } finally {
+      spark.streams.removeListener(listener)
+    }
   }
 
   protected def nativeQuery(status: SqlStreamingStatus): StreamingQuery =
