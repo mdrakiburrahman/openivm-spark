@@ -440,7 +440,13 @@ object StreamingTableManager {
       StreamingTableErrors.invalid(
         "CREATE STREAMING TABLE requires at least one STREAM source; batch SELECTs are not supported"
       )
-    StreamingTableMetadata.validateOutputSchema(frame.schema, spec.partitionColumns, spark)
+    StreamingTableMetadata.validateDestinationLayout(
+      frame.schema,
+      spec.partitionColumns,
+      spec.clusterColumns,
+      spec.tableProperties,
+      spark
+    )
     val deltaOptions = new DeltaOptions(runtime.sinkOptions, spark.sessionState.conf)
     Seq[Any](
       deltaOptions.canMergeSchema,

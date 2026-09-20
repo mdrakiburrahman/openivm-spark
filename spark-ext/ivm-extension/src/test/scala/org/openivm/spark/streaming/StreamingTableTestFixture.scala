@@ -79,6 +79,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
       queryText: String,
       location: Option[String] = None,
       partitions: Seq[String] = Seq.empty,
+      clusters: Seq[Seq[String]] = Seq.empty,
       properties: Map[String, String] = Map.empty,
       options: Map[String, String] = Map.empty
   ): StreamingTableStatus = {
@@ -90,6 +91,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
         query = query.queryExecution.logical,
         location = location,
         partitionColumns = partitions,
+        clusterColumns = clusters,
         tableProperties = properties,
         options = options
       )

@@ -131,6 +131,7 @@ streamingTableClause
     : USING identifier
     | LOCATION STRING
     | PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    | clusterByClause
     | TBLPROPERTIES tableProperties
     | OPTIONS tableProperties
     ;

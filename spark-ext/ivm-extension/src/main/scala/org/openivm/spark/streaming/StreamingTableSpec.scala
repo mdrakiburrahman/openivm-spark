@@ -11,5 +11,6 @@ final case class StreamingTableSpec(
     partitionColumns: Seq[String] = Seq.empty,
     tableProperties: Map[String, String] = Map.empty,
     options: Map[String, String] = Map.empty,
-    ifNotExists: Boolean = false
+    ifNotExists: Boolean = false,
+    clusterColumns: Seq[Seq[String]] = Seq.empty
 )

@@ -354,6 +354,37 @@ streaming source can carry its own case-insensitive `WITH (...)` reader options;
 duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
 rejected before Spark receives the native options.
 
+### Destination layouts
+
+Hive-style partitioning and Delta liquid clustering are separate, mutually
+exclusive destination layouts. Layout columns reference the `SELECT` output
+names, including aliases:
+
+```sql
+-- Hive-partitioned destination
+CREATE STREAMING TABLE monitoring.events_by_day
+PARTITIONED BY (event_date)
+OPTIONS ('trigger' = 'availableNow')
+AS
+SELECT id, source_date AS event_date, region, payload
+FROM STREAM monitoring.raw_events;
+
+-- Liquid-clustered destination
+CREATE STREAMING TABLE monitoring.events_clustered
+CLUSTER BY (region, event_date)
+OPTIONS ('trigger' = 'availableNow')
+AS
+SELECT id, region_code AS region, source_date AS event_date, payload
+FROM STREAM monitoring.raw_events;
+```
+
+`PARTITIONED BY` produces native Delta partition columns and directories.
+`CLUSTER BY` records native Delta clustering-domain and protocol metadata
+without Hive partition columns. Streaming appends preserve the declaration but
+do not automatically recluster existing data. Run native `OPTIMIZE` explicitly
+when physical clustering maintenance is required; Delta 3.2 supports declaring
+a single clustering key, but its Hilbert `OPTIMIZE` path requires multiple keys.
+
 `WATERMARK <named-expression> DELAY OF INTERVAL ...` is optional. When present,
 it appears before the relation alias and accepts a named input column or an
 explicitly aliased derived timestamp expression:

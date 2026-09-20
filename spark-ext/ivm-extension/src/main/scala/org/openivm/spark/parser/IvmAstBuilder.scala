@@ -141,6 +141,18 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
         .map(_.multipartIdentifier().asScala.map(multipartColumnName).toSeq),
       "PARTITIONED BY"
     ).getOrElse(Seq.empty)
+    val clusterColumns = singleClause(
+      clauses
+        .filter(_.clusterByClause() != null)
+        .map(
+          _.clusterByClause()
+            .multipartIdentifier()
+            .asScala
+            .map(multipartIdentifierParts)
+            .toSeq
+        ),
+      "CLUSTER BY"
+    ).getOrElse(Seq.empty)
     val tableProperties = singleClause(
       clauses
         .filter(_.TBLPROPERTIES() != null)
@@ -166,7 +178,8 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
         partitionColumns = partitionColumns,
         tableProperties = tableProperties,
         options = options,
-        ifNotExists = ctx.IF() != null
+        ifNotExists = ctx.IF() != null,
+        clusterColumns = clusterColumns
       )
     )
   }

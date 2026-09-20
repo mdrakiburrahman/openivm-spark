@@ -4,9 +4,15 @@ import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
+import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
+import org.apache.spark.sql.delta.clustering.ClusteringMetadataDomain
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.delta.skipping.clustering.{ClusteredTableUtils, ClusteringColumnInfo}
+import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
+import org.apache.spark.sql.delta.stats.SkippingEligibleDataType
+import org.apache.spark.sql.connector.expressions.Expressions
+import org.apache.spark.sql.types.{DataType, StructType}
 import org.openivm.spark.common.DeltaTableVersion
 
 import java.nio.charset.StandardCharsets
@@ -202,6 +208,52 @@ object StreamingTableMetadata {
     }
   }
 
+  def validateDestinationLayout(
+      schema: StructType,
+      partitions: Seq[String],
+      clusterColumns: Seq[Seq[String]],
+      tableProperties: Map[String, String],
+      spark: SparkSession
+  ): Unit = {
+    validateOutputSchema(schema, partitions, spark)
+    if (tableProperties.keys.exists(_.equalsIgnoreCase(ClusteredTableUtils.PROP_CLUSTERING_COLUMNS)))
+      StreamingTableErrors.invalid(
+        s"TBLPROPERTIES may not set Delta-managed ${ClusteredTableUtils.PROP_CLUSTERING_COLUMNS}"
+      )
+    ClusteredTableUtils.validateExistingTableFeatureProperties(tableProperties)
+    if (partitions.nonEmpty && clusterColumns.nonEmpty)
+      StreamingTableErrors.invalid("PARTITIONED BY and CLUSTER BY cannot be used together on one destination")
+    if (clusterColumns.nonEmpty) {
+      ClusteredTableUtils.validateNumClusteringColumns(clusterColumns)
+      val duplicates = clusterColumns.indices.exists { index =>
+        clusterColumns.take(index).exists(sameColumnReference(_, clusterColumns(index), spark))
+      }
+      if (duplicates)
+        StreamingTableErrors.invalid("CLUSTER BY contains duplicate column references")
+      clusterColumns.foreach { reference =>
+        if (reference.isEmpty || reference.exists(part => Option(part).forall(_.trim.isEmpty)))
+          StreamingTableErrors.invalid("CLUSTER BY contains an empty column reference")
+        val dataType = resolveColumnReference(schema, reference, spark)
+        if (!SkippingEligibleDataType(dataType))
+          StreamingTableErrors.invalid(
+            s"CLUSTER BY column ${renderColumnReference(reference)} has unsupported datatype ${dataType.catalogString}"
+          )
+      }
+      val nativeProperties = tableProperties ++ ClusteredTableUtils.getTableFeatureProperties(tableProperties)
+      val metadata = Metadata(
+        schemaString = schema.json,
+        partitionColumns = partitions,
+        configuration = nativeProperties
+      )
+      val protocol = Protocol.forNewTable(spark, Some(metadata))
+      ClusteredTableUtils.validateClusteringColumnsInStatsSchema(
+        protocol,
+        metadata,
+        ClusterBySpec(clusterColumns.map(parts => Expressions.column(renderColumnReference(parts))))
+      )
+    }
+  }
+
   def validateUserProperties(properties: Map[String, String]): Unit = {
     val normalized = properties.keys.map(_.toLowerCase(Locale.ROOT)).toSeq
     if (normalized.distinct.size != normalized.size)
@@ -212,6 +264,42 @@ object StreamingTableMetadata {
         s"TBLPROPERTIES may not set extension-reserved keys: ${attempted.toSeq.sorted.mkString(", ")}"
       )
   }
+
+  private def resolveColumnReference(
+      schema: StructType,
+      reference: Seq[String],
+      spark: SparkSession
+  ): DataType = {
+    val resolver = spark.sessionState.analyzer.resolver
+    reference.foldLeft[DataType](schema) { case (current, part) =>
+      current match {
+        case struct: StructType =>
+          struct
+            .find(field => resolver(field.name, part))
+            .map(_.dataType)
+            .getOrElse(
+              StreamingTableErrors.invalid(
+                s"CLUSTER BY column ${renderColumnReference(reference)} is not present in the query output"
+              )
+            )
+        case _ =>
+          StreamingTableErrors.invalid(
+            s"CLUSTER BY reference ${renderColumnReference(reference)} descends through a non-struct output column"
+          )
+      }
+    }
+  }
+
+  private def sameColumnReference(
+      left: Seq[String],
+      right: Seq[String],
+      spark: SparkSession
+  ): Boolean =
+    left.size == right.size &&
+      left.zip(right).forall { case (a, b) => spark.sessionState.analyzer.resolver(a, b) }
+
+  def renderColumnReference(reference: Seq[String]): String =
+    reference.map(part => s"`${part.replace("`", "``")}`").mkString(".")
 
   def catalogTableExists(spark: SparkSession, name: Seq[String]): Boolean =
     spark.catalog.tableExists(quoteMultipart(name))
@@ -265,8 +353,14 @@ object StreamingTableMetadata {
       schema: StructType
   ): StreamingTableTarget = {
     validateProvider(spec)
-    validateOutputSchema(schema, spec.partitionColumns, spark)
     validateUserProperties(spec.tableProperties)
+    validateDestinationLayout(
+      schema,
+      spec.partitionColumns,
+      spec.clusterColumns,
+      spec.tableProperties,
+      spark
+    )
     if (catalogTableExists(spark, spec.name))
       StreamingTableErrors.invalid(
         s"Target ${quoteMultipart(spec.name)} already exists and cannot be adopted as a streaming table"
@@ -345,6 +439,7 @@ object StreamingTableMetadata {
       StreamingTableErrors.invalid(
         s"Target ${target.sqlIdentifier} partitioning drifted from its stored streaming-table definition"
       )
+    validateStoredClustering(snapshot, storedClusterColumns(semantic, target.sqlIdentifier), spark, target)
     val properties = requiredNode(semantic, "tableProperties", target.sqlIdentifier)
     if (!properties.isObject)
       StreamingTableErrors.invalid(s"Stored table properties for ${target.sqlIdentifier} are corrupt")
@@ -379,6 +474,61 @@ object StreamingTableMetadata {
           )
       }
     }
+
+  private def storedClusterColumns(semantic: JsonNode, targetName: String): Seq[Seq[String]] =
+    Option(semantic.get("clusterColumns")) match {
+      case None => Seq.empty
+      case Some(node) if !node.isArray =>
+        StreamingTableErrors.invalid(s"Stored clustering definition for $targetName is corrupt")
+      case Some(node) =>
+        node.elements().asScala.toSeq.map { reference =>
+          if (!reference.isArray)
+            StreamingTableErrors.invalid(s"Stored clustering definition for $targetName is corrupt")
+          val parts = reference.elements().asScala.toSeq.map { part =>
+            if (!part.isTextual || part.asText().trim.isEmpty)
+              StreamingTableErrors.invalid(s"Stored clustering definition for $targetName is corrupt")
+            part.asText()
+          }
+          if (parts.isEmpty)
+            StreamingTableErrors.invalid(s"Stored clustering definition for $targetName is corrupt")
+          parts
+        }
+    }
+
+  private def validateStoredClustering(
+      snapshot: Snapshot,
+      expected: Seq[Seq[String]],
+      spark: SparkSession,
+      target: StreamingTableTarget
+  ): Unit = {
+    val actualPhysical = ClusteringMetadataDomain.fromSnapshot(snapshot).map(_.clusteringColumns)
+    val actual = actualPhysical
+      .map { columns =>
+        columns.map { physical =>
+          Expressions.column(ClusteringColumnInfo(snapshot.schema, physical).logicalName).fieldNames.toSeq
+        }
+      }
+      .getOrElse(Seq.empty)
+    val protocolSupportsClustering = ClusteredTableUtils.isSupported(snapshot.protocol)
+    if (expected.isEmpty) {
+      if (actualPhysical.nonEmpty || protocolSupportsClustering)
+        StreamingTableErrors.invalid(
+          s"Target ${target.sqlIdentifier} is clustered but its stored definition is legacy-unclustered"
+        )
+    } else {
+      if (!protocolSupportsClustering || actualPhysical.isEmpty)
+        StreamingTableErrors.invalid(
+          s"Target ${target.sqlIdentifier} is missing Delta clustering protocol or metadata"
+        )
+      val matches =
+        expected.size == actual.size &&
+          expected.zip(actual).forall { case (left, right) => sameColumnReference(left, right, spark) }
+      if (!matches)
+        StreamingTableErrors.invalid(
+          s"Target ${target.sqlIdentifier} clustering drifted from its stored definition"
+        )
+    }
+  }
 
   def definitionPath(target: StreamingTableTarget): Path =
     new Path(new Path(target.checkpointLocation), s"$OpenIvmDirectory/$DefinitionFile")
@@ -690,6 +840,9 @@ object StreamingTableMetadata {
     val partitionClause =
       if (spec.partitionColumns.isEmpty) ""
       else s" PARTITIONED BY (${spec.partitionColumns.map(quoteIdentifier).mkString(", ")})"
+    val clusterClause =
+      if (spec.clusterColumns.isEmpty) ""
+      else s" CLUSTER BY (${spec.clusterColumns.map(renderColumnReference).mkString(", ")})"
     val locationClause = spec.location.map(location => s" LOCATION ${sqlString(location)}").getOrElse("")
     val propertyClause =
       if (properties.isEmpty) ""
@@ -700,7 +853,7 @@ object StreamingTableMetadata {
         s" TBLPROPERTIES (${entries.mkString(", ")})"
       }
     s"CREATE TABLE ${quoteMultipart(spec.name)} (${schema.toDDL}) USING DELTA" +
-      partitionClause + locationClause + propertyClause
+      partitionClause + clusterClause + locationClause + propertyClause
   }
 
   private def pathsOverlap(spark: SparkSession, first: String, second: String): Boolean = {

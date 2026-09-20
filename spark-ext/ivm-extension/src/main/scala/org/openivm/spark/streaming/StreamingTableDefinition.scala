@@ -207,6 +207,13 @@ object StreamingTableDefinition {
 
     val partitions = semantic.putArray("partitionColumns")
     spec.partitionColumns.map(normalizeIdentifier).foreach(partition => partitions.add(partition))
+    if (spec.clusterColumns.nonEmpty) {
+      val clusters = semantic.putArray("clusterColumns")
+      spec.clusterColumns.foreach { reference =>
+        val parts = clusters.addArray()
+        reference.foreach(parts.add)
+      }
+    }
     putMap(semantic, "tableProperties", redactForSemantic(spec.tableProperties))
     putMap(semantic, "sinkOptions", redactForSemantic(runtime.sinkOptions))
     val watermarks = semantic.putArray("watermarks")
@@ -253,6 +260,13 @@ object StreamingTableDefinition {
         .map(location => StreamingTableMetadata.normalizePath(spark, location))
         .getOrElse("<catalog-managed>")
     )
+    if (spec.clusterColumns.nonEmpty) {
+      val clusters = diagnostic.putArray("clusterColumns")
+      spec.clusterColumns.foreach { reference =>
+        val parts = clusters.addArray()
+        reference.foreach(parts.add)
+      }
+    }
     putMap(diagnostic, "sinkOptions", redactForDisplay(runtime.sinkOptions))
     val diagnosticSources = diagnostic.putArray("sources")
     sources.foreach { source =>

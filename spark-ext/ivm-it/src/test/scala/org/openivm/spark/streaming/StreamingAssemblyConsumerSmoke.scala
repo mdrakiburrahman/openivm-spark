@@ -1,6 +1,9 @@
 package org.openivm.spark.streaming
 
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.clustering.ClusteringMetadataDomain
 import org.apache.spark.sql.streaming.StreamingQuery
 
 import java.io.File
@@ -71,6 +74,7 @@ object StreamingAssemblyConsumerSmoke {
       val created = spark
         .sql(
           s"""CREATE STREAMING TABLE `$target`
+             |CLUSTER BY (group_key, window_start)
              |AS
              |SELECT
              |  window(e.event_time, '10 minutes').start AS window_start,
@@ -124,6 +128,19 @@ object StreamingAssemblyConsumerSmoke {
       require(
         query.recentProgress.exists(_.stateOperators.nonEmpty),
         "Stateful watermark query reported no native state operators"
+      )
+      val targetLocation = spark
+        .sql(s"DESCRIBE DETAIL `$target`")
+        .select("location")
+        .head()
+        .getString(0)
+      val clusteringColumns = ClusteringMetadataDomain
+        .fromSnapshot(DeltaLog.forTable(spark, new Path(targetLocation)).update())
+        .map(_.clusteringColumns)
+        .getOrElse(Seq.empty)
+      require(
+        clusteringColumns == Seq(Seq("group_key"), Seq("window_start")),
+        s"Unexpected clustering columns: $clusteringColumns"
       )
       assertBagEqual(
         spark.table(target).where("window_start = TIMESTAMP '2024-01-01 00:00:00'"),
