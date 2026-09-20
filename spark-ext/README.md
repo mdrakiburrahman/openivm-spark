@@ -416,6 +416,20 @@ DROP STREAMING TABLE IF EXISTS monitoring.cleaned_events;
 declaration to resume. `DROP STREAMING TABLE` is destructive: it stops the
 owned query and removes its owned registration, target data, and checkpoint.
 
+For a SQL client or dbt integration, successful `CREATE` statement completion
+means that the declaration was accepted, not that the query finished. Capture
+the returned `table_name`, `query_id`, and `run_id`, then poll `SHOW STREAMING
+TABLES IN <namespace>` on the same owning `SparkContext`/driver until the row
+with that identity is inactive, has status `stopped`, and has an empty
+`last_failure`. Treat failed, missing, disconnected, and timeout states as
+errors.
+
+Release downstream table references and run post-hooks only after that terminal
+check. Repeating an identical `CREATE STREAMING TABLE` resumes its checkpoint;
+there is no separate `REFRESH ST` syntax. Once rows are persisted in Delta,
+ordinary Spark or SQL clients that share the metastore and storage can query
+them.
+
 `AvailableNow` executions terminate naturally after consuming all data currently
 available:
 
