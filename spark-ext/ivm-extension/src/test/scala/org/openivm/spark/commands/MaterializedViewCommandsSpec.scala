@@ -2335,6 +2335,44 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("(14a) Same-MV CREATE execution spans") {
+    it("normalizes materialized graph identities onto the existing MV lifecycle monitor") {
+      val upstream = "default.lock_materialized_identity"
+      val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
+      val owner    = new AtomicReference[Thread]()
+      val worker   = new AtomicReference[Thread]()
+      val started  = new CountDownLatch(1)
+
+      withPool(2) { implicit ec =>
+        barrier.use {
+          val holder = Future {
+            owner.set(Thread.currentThread())
+            RefreshMutex.withLock(upstream)(barrier.park())
+          }
+          barrier.awaitEntered() shouldBe true
+          val cascade = Future {
+            worker.set(Thread.currentThread())
+            started.countDown()
+            RefreshMutex.withLock(s"materialized:$upstream")(())
+          }
+          started.await(10L, TimeUnit.SECONDS) shouldBe true
+          def blockedOnHolder: Boolean = {
+            val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
+            info != null && info.getThreadState == Thread.State.BLOCKED &&
+            info.getLockOwnerId == owner.get().getId
+          }
+          val deadline = 10.seconds.fromNow
+          while (!blockedOnHolder && deadline.hasTimeLeft())
+            Thread.sleep(1L)
+          blockedOnHolder shouldBe true
+          cascade.isCompleted shouldBe false
+          assertStillParked(barrier, holder)
+          barrier.release()
+          awaitResult(holder, 15.seconds)
+          awaitResult(cascade, 15.seconds)
+        }
+      }
+    }
+
     it("serializes dependency siblings on their shared upstream monitor and records its wait") {
       val upstream = "default.lock_source"
       val left     = "default.lock_child_left"

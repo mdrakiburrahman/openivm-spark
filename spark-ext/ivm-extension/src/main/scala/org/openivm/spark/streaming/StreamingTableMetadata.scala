@@ -53,6 +53,19 @@ final case class StreamingTableResetIntent(
     targetPath: String,
     oldDeltaTableId: String,
     replacementDefinitionHash: String,
+    sourcePaths: Seq[String],
+    descendants: Seq[StreamingTableCascadeTarget] = Seq.empty,
+    completedDescendantIdentities: Seq[String] = Seq.empty,
+    upstreamDropped: Boolean = false
+)
+
+final case class StreamingTableCascadeTarget(
+    kind: String = "streaming",
+    name: Seq[String],
+    identity: String,
+    dataPath: String,
+    deltaTableId: String,
+    tableId: String,
     sourcePaths: Seq[String]
 )
 
@@ -624,14 +637,16 @@ object StreamingTableMetadata {
       spark: SparkSession,
       target: StreamingTableTarget,
       replacementDefinitionHash: String,
-      sourcePaths: Seq[String]
+      sourcePaths: Seq[String],
+      descendants: Seq[StreamingTableCascadeTarget] = Seq.empty
   ): StreamingTableResetIntent = {
     val intent = StreamingTableResetIntent(
       targetIdentity = target.identity,
       targetPath = target.dataPath,
       oldDeltaTableId = target.deltaTableId,
       replacementDefinitionHash = replacementDefinitionHash,
-      sourcePaths = sourcePaths.distinct.sorted
+      sourcePaths = sourcePaths.distinct.sorted,
+      descendants = descendants
     )
     val path = resetIntentPath(spark, target)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
@@ -656,6 +671,36 @@ object StreamingTableMetadata {
       writeNewAtomically(indexFs, index, resetIntentJson(intent).getBytes(StandardCharsets.UTF_8))
     }
     intent
+  }
+
+  def updateResetIntent(
+      spark: SparkSession,
+      previous: StreamingTableResetIntent,
+      updated: StreamingTableResetIntent
+  ): Unit = {
+    if (
+      previous.targetIdentity != updated.targetIdentity ||
+      previous.targetPath != updated.targetPath ||
+      previous.oldDeltaTableId != updated.oldDeltaTableId ||
+      previous.replacementDefinitionHash != updated.replacementDefinitionHash ||
+      previous.sourcePaths != updated.sourcePaths ||
+      previous.descendants != updated.descendants
+    )
+      StreamingTableErrors.invalid("Refusing to rewrite immutable reset-journal fields")
+    val bytes = resetIntentJson(updated).getBytes(StandardCharsets.UTF_8)
+    Seq(
+      resetIntentPath(spark, previous.targetIdentity, previous.targetPath),
+      resetIndexPath(spark, previous.targetIdentity)
+    ).foreach { path =>
+      val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
+      if (!fs.exists(path))
+        StreamingTableErrors.invalid(s"Cannot advance missing reset journal $path")
+      val persisted = parseResetIntent(readText(fs, path), path.toString)
+      if (persisted == updated) ()
+      else if (persisted != previous && !isResetProgressPredecessor(persisted, updated))
+        StreamingTableErrors.invalid(s"Reset journal $path changed during recovery")
+      else writeReplacingAtomically(spark, path, bytes)
+    }
   }
 
   def clearResetIntent(spark: SparkSession, intent: StreamingTableResetIntent): Unit = {
@@ -689,7 +734,11 @@ object StreamingTableMetadata {
   ): Option[StreamingTableResetIntent] = {
     val path = resetIntentPath(spark, target)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
-    if (fs.exists(path)) Some(parseResetIntent(readText(fs, path), target.sqlIdentifier)) else None
+    if (!fs.exists(path)) None
+    else {
+      val sibling = parseResetIntent(readText(fs, path), target.sqlIdentifier)
+      Some(reconcileResetCopies(spark, sibling))
+    }
   }
 
   def pendingResetIntent(
@@ -708,11 +757,61 @@ object StreamingTableMetadata {
       if (!siblingFs.exists(sibling))
         StreamingTableErrors.invalid(s"Reset recovery index $index points at a missing sibling journal $sibling")
       val siblingIntent = parseResetIntent(readText(siblingFs, sibling), sibling.toString)
-      if (siblingIntent != intent)
-        StreamingTableErrors.invalid(s"Reset recovery index $index disagrees with sibling journal $sibling")
-      Some(intent)
+      Some(reconcileResetCopies(spark, mergeResetProgress(intent, siblingIntent)))
     }
   }
+
+  private def reconcileResetCopies(
+      spark: SparkSession,
+      candidate: StreamingTableResetIntent
+  ): StreamingTableResetIntent = {
+    val paths = Seq(
+      resetIntentPath(spark, candidate.targetIdentity, candidate.targetPath),
+      resetIndexPath(spark, candidate.targetIdentity)
+    )
+    val existing = paths.map { path =>
+      val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
+      if (!fs.exists(path))
+        StreamingTableErrors.invalid(s"Reset recovery is missing journal copy $path")
+      parseResetIntent(readText(fs, path), path.toString)
+    }
+    val merged = existing.foldLeft(candidate)(mergeResetProgress)
+    val bytes  = resetIntentJson(merged).getBytes(StandardCharsets.UTF_8)
+    paths.zip(existing).foreach { case (path, intent) =>
+      if (intent != merged) writeReplacingAtomically(spark, path, bytes)
+    }
+    merged
+  }
+
+  private def mergeResetProgress(
+      left: StreamingTableResetIntent,
+      right: StreamingTableResetIntent
+  ): StreamingTableResetIntent = {
+    if (!sameResetIdentity(left, right))
+      StreamingTableErrors.invalid("Reset journal copies disagree on immutable recovery state")
+    if (isResetProgressPredecessor(left, right)) right
+    else if (isResetProgressPredecessor(right, left)) left
+    else StreamingTableErrors.invalid("Reset journal copies contain incompatible recovery progress")
+  }
+
+  private def sameResetIdentity(
+      left: StreamingTableResetIntent,
+      right: StreamingTableResetIntent
+  ): Boolean =
+    left.targetIdentity == right.targetIdentity &&
+      left.targetPath == right.targetPath &&
+      left.oldDeltaTableId == right.oldDeltaTableId &&
+      left.replacementDefinitionHash == right.replacementDefinitionHash &&
+      left.sourcePaths == right.sourcePaths &&
+      left.descendants == right.descendants
+
+  private def isResetProgressPredecessor(
+      previous: StreamingTableResetIntent,
+      updated: StreamingTableResetIntent
+  ): Boolean =
+    sameResetIdentity(previous, updated) &&
+      previous.completedDescendantIdentities.toSet.subsetOf(updated.completedDescendantIdentities.toSet) &&
+      (!previous.upstreamDropped || updated.upstreamDropped)
 
   def deleteResetOwnedPath(
       spark: SparkSession,
@@ -734,6 +833,27 @@ object StreamingTableMetadata {
       StreamingTableErrors.invalid(s"Failed to finish reset deletion for owned target '${intent.targetPath}'")
     if (fs.exists(path))
       StreamingTableErrors.invalid(s"Owned reset target '${intent.targetPath}' still exists after deletion")
+  }
+
+  def deleteCascadeOwnedPath(
+      spark: SparkSession,
+      target: StreamingTableCascadeTarget
+  ): Unit = {
+    val owned = StreamingTableTarget(
+      name = target.name,
+      identity = target.identity,
+      sqlIdentifier = quoteMultipart(target.name),
+      dataPath = target.dataPath,
+      deltaTableId = target.deltaTableId,
+      tableId = target.tableId
+    )
+    assertSafeForDeletion(spark, owned, target.sourcePaths)
+    val path = new Path(target.dataPath)
+    val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
+    if (fs.exists(path) && !fs.delete(path, true))
+      StreamingTableErrors.invalid(s"Failed to finish cascade deletion for owned target '${target.dataPath}'")
+    if (fs.exists(path))
+      StreamingTableErrors.invalid(s"Owned cascade target '${target.dataPath}' still exists after deletion")
   }
 
   def assertSafeForDeletion(
@@ -985,6 +1105,22 @@ object StreamingTableMetadata {
     root.put("replacementDefinitionHash", intent.replacementDefinitionHash)
     val paths = root.putArray("sourcePaths")
     intent.sourcePaths.sorted.foreach(path => paths.add(path))
+    val descendants = root.putArray("descendants")
+    intent.descendants.foreach { descendant =>
+      val node = descendants.addObject()
+      node.put("kind", descendant.kind)
+      val name = node.putArray("name")
+      descendant.name.foreach(value => name.add(value))
+      node.put("identity", descendant.identity)
+      node.put("path", descendant.dataPath)
+      node.put("deltaTableId", descendant.deltaTableId)
+      node.put("tableId", descendant.tableId)
+      val sourcePaths = node.putArray("sourcePaths")
+      descendant.sourcePaths.sorted.foreach(sourcePaths.add)
+    }
+    val completed = root.putArray("completedDescendantIdentities")
+    intent.completedDescendantIdentities.foreach(completed.add)
+    root.put("upstreamDropped", intent.upstreamDropped)
     Mapper.writeValueAsString(root)
   }
 
@@ -998,6 +1134,76 @@ object StreamingTableMetadata {
       val sourcePaths = requiredNode(root, "sourcePaths", targetName)
       if (!sourcePaths.isArray)
         StreamingTableErrors.invalid(s"Reset journal sourcePaths is corrupt for $targetName")
+      val descendants = Option(root.get("descendants")).toSeq.flatMap { node =>
+        if (!node.isArray)
+          StreamingTableErrors.invalid(s"Reset journal descendants is corrupt for $targetName")
+        node.elements().asScala.toSeq.map { descendant =>
+          val nameNode = requiredNode(descendant, "name", targetName)
+          if (!nameNode.isArray)
+            StreamingTableErrors.invalid(s"Reset journal descendant name is corrupt for $targetName")
+          val descendantSources = requiredNode(descendant, "sourcePaths", targetName)
+          if (!descendantSources.isArray)
+            StreamingTableErrors.invalid(s"Reset journal descendant sourcePaths is corrupt for $targetName")
+          StreamingTableCascadeTarget(
+            kind = Option(descendant.get("kind")).filter(_.isTextual).map(_.asText()).getOrElse("streaming"),
+            name = nameNode.elements().asScala.toSeq.map { value =>
+              if (!value.isTextual || value.asText().isEmpty)
+                StreamingTableErrors.invalid(s"Reset journal descendant name is corrupt for $targetName")
+              value.asText()
+            },
+            identity = requiredText(descendant, "identity", targetName),
+            dataPath = requiredText(descendant, "path", targetName),
+            deltaTableId = requiredText(descendant, "deltaTableId", targetName),
+            tableId = requiredText(descendant, "tableId", targetName),
+            sourcePaths = descendantSources
+              .elements()
+              .asScala
+              .toSeq
+              .map { value =>
+                if (!value.isTextual)
+                  StreamingTableErrors.invalid(
+                    s"Reset journal descendant sourcePaths is corrupt for $targetName"
+                  )
+                value.asText()
+              }
+              .distinct
+              .sorted
+          )
+        }
+      }
+      val completed = Option(root.get("completedDescendantIdentities")).toSeq.flatMap { node =>
+        if (!node.isArray)
+          StreamingTableErrors.invalid(
+            s"Reset journal completedDescendantIdentities is corrupt for $targetName"
+          )
+        node.elements().asScala.toSeq.map { value =>
+          if (!value.isTextual || value.asText().isEmpty)
+            StreamingTableErrors.invalid(
+              s"Reset journal completedDescendantIdentities is corrupt for $targetName"
+            )
+          value.asText()
+        }
+      }
+      descendants.collectFirst {
+        case descendant if descendant.kind != "streaming" && descendant.kind != "materialized" =>
+          StreamingTableErrors.invalid(
+            s"Reset journal descendant '${descendant.identity}' has unsupported kind '${descendant.kind}'"
+          )
+      }
+      descendants
+        .groupBy(_.identity)
+        .collectFirst { case (identity, entries) if entries.size > 1 => identity }
+        .foreach(identity => StreamingTableErrors.invalid(s"Reset journal contains duplicate descendant '$identity'"))
+      val descendantIdentities = descendants.map(_.identity).toSet
+      if (!completed.toSet.subsetOf(descendantIdentities))
+        StreamingTableErrors.invalid(
+          s"Reset journal completed descendants do not belong to the planned closure for $targetName"
+        )
+      val upstreamDropped = Option(root.get("upstreamDropped")).exists(_.asBoolean(false))
+      if (upstreamDropped && completed.toSet != descendantIdentities)
+        StreamingTableErrors.invalid(
+          s"Reset journal marks the upstream dropped before every descendant completed for $targetName"
+        )
       StreamingTableResetIntent(
         requiredText(root, "targetIdentity", targetName),
         requiredText(root, "targetPath", targetName),
@@ -1013,7 +1219,10 @@ object StreamingTableMetadata {
             value.asText()
           }
           .distinct
-          .sorted
+          .sorted,
+        descendants,
+        completed.distinct,
+        upstreamDropped
       )
     } catch {
       case error: org.apache.spark.sql.AnalysisException => throw error

@@ -32,6 +32,9 @@ private[common] object OpenIvmStatePaths {
 
   def sourcesRoot(spark: SparkSession): Path = openIvmRoot(spark).resolve("sources")
 
+  def streamingDependencyDbPath(spark: SparkSession): String =
+    openIvmRoot(spark).resolve("streaming").resolve("dependencies").resolve("rocksdb").toString
+
   def perMvDbPath(spark: SparkSession, serializedName: String): String =
     mvsRoot(spark).resolve(RocksDBCodec.safePathSegment(serializedName)).resolve("rocksdb").toString
 

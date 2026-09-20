@@ -450,6 +450,24 @@ or target property fails without stopping or mutating the existing table by
 default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
 replacement of the extension-owned target and checkpoint.
 
+Before rebuilding or dropping a managed target, OpenIVM resolves one dependency
+graph spanning both streaming tables and materialized views, then drops every
+transitively downstream managed object in reverse topological order (leaves
+first). This applies to `onQueryChange=rebuild`, `DROP STREAMING TABLE`, and
+`DROP MATERIALIZED VIEW`, including mixed chains such as streaming table →
+materialized view → streaming table. Downstream native queries are stopped
+before their targets and checkpoints are removed. Fan-out and diamond
+dependencies are deduplicated. Missing, corrupt, or generation-mismatched
+dependency metadata aborts the operation before the requested upstream target
+is mutated.
+
+The cascade does not recreate descendants. After an upstream streaming rebuild,
+an orchestrator must resubmit all dropped streaming-table and materialized-view
+declarations in topological order so new checkpoints and definitions bind to
+the replacement source generation. An interrupted streaming rebuild resumes
+from its durable reset journal when the exact replacement declaration is
+retried.
+
 State-store selection remains ordinary Spark configuration; the extension does
 not clone the session or mutate `SparkConf` / `SQLConf`:
 

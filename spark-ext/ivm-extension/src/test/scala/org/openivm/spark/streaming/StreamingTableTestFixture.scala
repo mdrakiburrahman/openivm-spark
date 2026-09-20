@@ -56,6 +56,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
 
   override protected def afterEach(): Unit =
     try {
+      StreamingTableManager.setBeforeCascadeDropHookForTesting((_: StreamingTableCascadeTarget) => ())
       if (spark != null)
         ownedQueryIds.foreach { id =>
           Option(spark.streams.get(id)).filter(_.isActive).foreach(_.stop())

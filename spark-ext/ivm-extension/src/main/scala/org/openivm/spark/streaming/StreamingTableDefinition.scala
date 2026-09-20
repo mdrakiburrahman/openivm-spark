@@ -151,6 +151,7 @@ final case class StreamingTableDefinition(
     diagnosticJson: String,
     operationalJson: String,
     operationalHash: String,
+    sources: Seq[StreamingSourceDefinition],
     sourcePaths: Seq[String],
     sourceIdentities: Seq[String]
 ) {
@@ -291,6 +292,7 @@ object StreamingTableDefinition {
       diagnosticJson = Mapper.writeValueAsString(diagnostic),
       operationalJson = operationalJson,
       operationalHash = sha256(operationalJson),
+      sources = sources,
       sourcePaths = sources.flatMap(_.deltaPath).distinct,
       sourceIdentities = sources.map(_.identity).distinct
     )

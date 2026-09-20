@@ -1,18 +1,29 @@
 package org.openivm.spark.streaming
 
 import org.apache.spark.SparkContext
+import org.apache.hadoop.fs.Path
 import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd}
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.openivm.StreamingDatasetAccess
-import org.apache.spark.sql.delta.DeltaOptions
+import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
 import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryListener}
 import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
+import org.openivm.spark.commands.{MaterializedViewLifecycle, RefreshMutex}
+import org.openivm.spark.common.{
+  MvCatalog,
+  MvMetadata,
+  StreamingDependencyCatalog,
+  StreamingDependencySource,
+  StreamingDependencyTarget
+}
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.{Collections, WeakHashMap}
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 final case class StreamingTableStatus(
     tableName: String,
@@ -28,6 +39,14 @@ final case class StreamingTableStatus(
 
 /** Native Structured Streaming lifecycle for extension-owned Delta targets. */
 object StreamingTableManager {
+
+  @volatile private var beforeCascadeDropHookForTesting: StreamingTableCascadeTarget => Unit =
+    (_: StreamingTableCascadeTarget) => ()
+
+  private[streaming] def setBeforeCascadeDropHookForTesting(
+      hook: StreamingTableCascadeTarget => Unit
+  ): Unit =
+    beforeCascadeDropHookForTesting = hook
 
   def create(spark: SparkSession, spec: StreamingTableSpec): StreamingTableStatus = {
     StreamingTableMetadata.validateProvider(spec)
@@ -52,61 +71,79 @@ object StreamingTableManager {
     val plannedPath = StreamingTableMetadata.plannedTargetPath(spark, spec.name, spec.location)
     plannedPath.foreach(path => StreamingTableMetadata.validateTargetPath(spark, path))
     StreamingTableMetadata.validateNoSourceTargetOverlap(spark, definition.sourcePaths, plannedPath)
-    val lockKey = StreamingTableRegistry.provisionalKey(identity, plannedPath)
+    val dependencySources = resolveManagedDependencySources(spark, definition)
+    val lockKeys = StreamingTableRegistry.provisionalKey(identity, plannedPath) +:
+      dependencySources.map(source => StreamingTableRegistry.lifecycleLockKey(source.parentIdentity))
+    val globalLockKeys = identity +: dependencySources.map(_.parentIdentity)
 
-    StreamingTableRegistry.withTargetLock(spark, lockKey) {
-      if (StreamingTableMetadata.catalogTableExists(spark, spec.name)) {
-        val target   = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
-        val manifest = StreamingTableMetadata.readManifest(spark, target)
-        StreamingTableMetadata.verifyOwned(spark, target, manifest)
-        StreamingTableMetadata.validateNoSourceTargetOverlap(
-          spark,
-          definition.sourcePaths,
-          Some(target.dataPath)
-        )
-        StreamingTableMetadata.validateExistingTargetAgainstManifest(spark, target, manifest)
-        reconcileExisting(spark, frame, spec, runtime, definition, target, manifest)
-      } else {
-        if (plannedPath.isEmpty)
+    RefreshMutex.withLocks(globalLockKeys) {
+      StreamingTableRegistry.withTargetLocks(spark, lockKeys) {
+        val verifiedDependencySources = resolveManagedDependencySources(spark, definition)
+        if (verifiedDependencySources != dependencySources)
           StreamingTableErrors.invalid(
-            "Cannot resolve a catalog-native target path before CREATE; specify LOCATION for this catalog"
+            s"Streaming sources for ${StreamingTableMetadata.quoteMultipart(spec.name)} changed during lifecycle admission"
           )
-        val recovery = StreamingTableMetadata.pendingResetIntent(spark, identity)
-        recovery.foreach { intent =>
-          if (runtime.onQueryChange != "rebuild" || intent.replacementDefinitionHash != definition.fingerprint)
-            StreamingTableErrors.invalid(
-              s"A reset recovery for ${StreamingTableMetadata.quoteMultipart(spec.name)} is pending; " +
-                "resubmit the exact replacement with onQueryChange=rebuild"
-            )
-          spec.location.map(location => StreamingTableMetadata.normalizePath(spark, location)).foreach { location =>
-            if (location != intent.targetPath)
-              StreamingTableErrors.invalid(
-                s"Reset recovery location '$location' differs from journaled target '${intent.targetPath}'"
-              )
-          }
-          if (
-            spec.location.isEmpty &&
-            !StreamingTableMetadata.isWithinWarehouse(spark, intent.targetPath)
-          )
-            StreamingTableErrors.invalid(
-              "Reset recovery for an explicitly located target requires the original LOCATION clause"
-            )
-          StreamingTableMetadata.deleteResetOwnedPath(
+        if (StreamingTableMetadata.catalogTableExists(spark, spec.name)) {
+          val target   = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+          val manifest = StreamingTableMetadata.readManifest(spark, target)
+          StreamingTableMetadata.verifyOwned(spark, target, manifest)
+          StreamingTableMetadata.validateNoSourceTargetOverlap(
             spark,
-            intent,
-            (intent.sourcePaths ++ definition.sourcePaths).distinct
+            definition.sourcePaths,
+            Some(target.dataPath)
           )
+          StreamingTableMetadata.validateExistingTargetAgainstManifest(spark, target, manifest)
+          reconcileExisting(spark, frame, spec, runtime, definition, target, manifest)
+        } else {
+          if (plannedPath.isEmpty)
+            StreamingTableErrors.invalid(
+              "Cannot resolve a catalog-native target path before CREATE; specify LOCATION for this catalog"
+            )
+          val recovery = StreamingTableMetadata.pendingResetIntent(spark, identity)
+          recovery.foreach { intent =>
+            if (runtime.onQueryChange != "rebuild" || intent.replacementDefinitionHash != definition.fingerprint)
+              StreamingTableErrors.invalid(
+                s"A reset recovery for ${StreamingTableMetadata.quoteMultipart(spec.name)} is pending; " +
+                  "resubmit the exact replacement with onQueryChange=rebuild"
+              )
+            spec.location.map(location => StreamingTableMetadata.normalizePath(spark, location)).foreach { location =>
+              if (location != intent.targetPath)
+                StreamingTableErrors.invalid(
+                  s"Reset recovery location '$location' differs from journaled target '${intent.targetPath}'"
+                )
+            }
+            if (
+              spec.location.isEmpty &&
+              !StreamingTableMetadata.isWithinWarehouse(spark, intent.targetPath)
+            )
+              StreamingTableErrors.invalid(
+                "Reset recovery for an explicitly located target requires the original LOCATION clause"
+              )
+            val incompleteDescendants =
+              intent.descendants.map(_.identity).filterNot(intent.completedDescendantIdentities.contains)
+            if (incompleteDescendants.nonEmpty)
+              StreamingTableErrors.invalid(
+                s"Reset recovery for ${StreamingTableMetadata.quoteMultipart(spec.name)} cannot recreate the " +
+                  s"upstream target while downstream cleanup is incomplete: ${incompleteDescendants.mkString(", ")}"
+              )
+            StreamingTableMetadata.deleteResetOwnedPath(
+              spark,
+              intent,
+              (intent.sourcePaths ++ definition.sourcePaths).distinct
+            )
+          }
+          val target = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
+          StreamingTableMetadata.validateNoSourceTargetOverlap(
+            spark,
+            definition.sourcePaths,
+            Some(target.dataPath)
+          )
+          val manifest = StreamingTableMetadata.writeManifest(spark, target, definition)
+          publishDependencyTarget(spark, target, definition, verifiedDependencySources)
+          val status = startNative(spark, frame, runtime, target, manifest, "initializing")
+          recovery.foreach(intent => StreamingTableMetadata.clearResetIntent(spark, intent))
+          status
         }
-        val target = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
-        StreamingTableMetadata.validateNoSourceTargetOverlap(
-          spark,
-          definition.sourcePaths,
-          Some(target.dataPath)
-        )
-        val manifest = StreamingTableMetadata.writeManifest(spark, target, definition)
-        val status   = startNative(spark, frame, runtime, target, manifest, "initializing")
-        recovery.foreach(intent => StreamingTableMetadata.clearResetIntent(spark, intent))
-        status
       }
     }
   }
@@ -117,18 +154,20 @@ object StreamingTableManager {
     StreamingTableMetadata.verifyOwned(spark, target, manifest)
     val registryKey = StreamingTableRegistry.targetKey(target)
     val lockKey     = StreamingTableRegistry.lifecycleLockKey(target)
-    StreamingTableRegistry.withTargetLock(spark, lockKey) {
-      val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
-      if (
-        current.dataPath != target.dataPath ||
-        current.deltaTableId != target.deltaTableId ||
-        current.tableId != target.tableId
-      )
-        StreamingTableErrors.invalid(
-          s"Target ${target.sqlIdentifier} changed before STOP acquired its lifecycle guard"
+    RefreshMutex.withLock(target.identity) {
+      StreamingTableRegistry.withTargetLock(spark, lockKey) {
+        val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
+        if (
+          current.dataPath != target.dataPath ||
+          current.deltaTableId != target.deltaTableId ||
+          current.tableId != target.tableId
         )
-      stopNative(spark, current, registryKey)
-      statusFor(spark, current, manifest, forcedStatus = Some("stopped"))
+          StreamingTableErrors.invalid(
+            s"Target ${target.sqlIdentifier} changed before STOP acquired its lifecycle guard"
+          )
+        stopNative(spark, current, registryKey)
+        statusFor(spark, current, manifest, forcedStatus = Some("stopped"))
+      }
     }
   }
 
@@ -154,32 +193,45 @@ object StreamingTableManager {
     val target   = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
     val manifest = StreamingTableMetadata.readManifest(spark, target)
     StreamingTableMetadata.verifyOwned(spark, target, manifest)
-    val registryKey = StreamingTableRegistry.targetKey(target)
-    val lockKey     = StreamingTableRegistry.lifecycleLockKey(target)
-    StreamingTableRegistry.withTargetLock(spark, lockKey) {
-      stopNative(spark, target, registryKey)
-      val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
-      if (
-        current.dataPath != target.dataPath ||
-        current.deltaTableId != target.deltaTableId ||
-        current.tableId != target.tableId
-      )
-        StreamingTableErrors.invalid(
-          s"Target ${target.sqlIdentifier} changed after its writer stopped; refusing deletion"
+    val descendants = resolveCascadeDescendants(spark, target)
+    val streamingLockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
+      .map(StreamingTableRegistry.lifecycleLockKey)
+    val materializedLockKeys =
+      target.identity +: descendants.map(_.identity)
+    RefreshMutex.withLocks(materializedLockKeys) {
+      StreamingTableRegistry.withTargetLocks(spark, streamingLockKeys) {
+        val verifiedDescendants = resolveCascadeDescendants(spark, target)
+        if (verifiedDescendants != descendants)
+          StreamingTableErrors.invalid(
+            s"Downstream dependencies for ${target.sqlIdentifier} changed during DROP admission"
+          )
+        dropResolvedCascade(spark, descendants)
+        val registryKey = StreamingTableRegistry.targetKey(target)
+        stopNative(spark, target, registryKey)
+        val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
+        if (
+          current.dataPath != target.dataPath ||
+          current.deltaTableId != target.deltaTableId ||
+          current.tableId != target.tableId
         )
-      StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
-      StreamingTableRegistry.forget(spark, registryKey)
-      StreamingTableStatus(
-        tableName = target.sqlIdentifier,
-        queryId = None,
-        runId = None,
-        status = "dropped",
-        checkpointLocation = Some(target.checkpointLocation),
-        definitionHash = Some(manifest.definitionHash),
-        isActive = false,
-        lastProgress = None,
-        lastFailure = None
-      )
+          StreamingTableErrors.invalid(
+            s"Target ${target.sqlIdentifier} changed after its writer stopped; refusing deletion"
+          )
+        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+        StreamingTableRegistry.forget(spark, registryKey)
+        StreamingDependencyCatalog.remove(spark, target.identity)
+        StreamingTableStatus(
+          tableName = target.sqlIdentifier,
+          queryId = None,
+          runId = None,
+          status = "dropped",
+          checkpointLocation = Some(target.checkpointLocation),
+          definitionHash = Some(manifest.definitionHash),
+          isActive = false,
+          lastProgress = None,
+          lastFailure = None
+        )
+      }
     }
   }
 
@@ -262,6 +314,7 @@ object StreamingTableManager {
         )
       rebuild(spark, frame, spec, runtime, definition, target, manifest)
     } else {
+      publishDependencyTarget(spark, target, definition)
       val registryKey   = StreamingTableRegistry.targetKey(target)
       val active        = StreamingTableRegistry.findActive(spark, registryKey, target)
       val changedTuning = manifest.operationalHash != definition.operationalHash
@@ -292,38 +345,471 @@ object StreamingTableManager {
       target: StreamingTableTarget,
       manifest: StreamingTableManifest
   ): StreamingTableStatus = {
-    val registryKey = StreamingTableRegistry.targetKey(target)
-    val intent = StreamingTableMetadata.writeOrVerifyResetIntent(
-      spark,
-      target,
-      definition.fingerprint,
-      manifest.sourcePaths
-    )
-    stopNative(spark, target, registryKey)
+    val pending = StreamingTableMetadata.pendingResetIntent(spark, target)
+    val descendants = pending
+      .map(_.descendants)
+      .getOrElse(resolveCascadeDescendants(spark, target))
+    val lockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
+      .map(StreamingTableRegistry.lifecycleLockKey)
+    val materializedLockKeys = target.identity +: descendants.map(_.identity)
+    RefreshMutex.withLocks(materializedLockKeys) {
+      StreamingTableRegistry.withTargetLocks(spark, lockKeys) {
+        val intent = pending.getOrElse {
+          val verified = resolveCascadeDescendants(spark, target)
+          if (verified != descendants)
+            StreamingTableErrors.invalid(
+              s"Downstream dependencies for ${target.sqlIdentifier} changed during rebuild admission"
+            )
+          val written = StreamingTableMetadata.writeOrVerifyResetIntent(
+            spark,
+            target,
+            definition.fingerprint,
+            manifest.sourcePaths,
+            descendants
+          )
+          StreamingDependencyCatalog.backupNow(spark)
+          written
+        }
+        val afterDescendants = dropCascadeDescendants(spark, intent)
+        val registryKey      = StreamingTableRegistry.targetKey(target)
+        stopNative(spark, target, registryKey)
 
-    val current = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+        val current = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+        if (
+          current.dataPath != target.dataPath ||
+          current.deltaTableId != target.deltaTableId ||
+          current.tableId != target.tableId
+        )
+          StreamingTableErrors.invalid(
+            s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
+          )
+        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+        StreamingTableRegistry.forget(spark, registryKey)
+        StreamingDependencyCatalog.remove(spark, target.identity)
+        val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
+        StreamingTableMetadata.updateResetIntent(spark, afterDescendants, upstreamDropped)
+
+        val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
+        StreamingTableMetadata.validateNoSourceTargetOverlap(
+          spark,
+          definition.sourcePaths,
+          Some(replacement.dataPath)
+        )
+        val replacementManifest = StreamingTableMetadata.writeManifest(spark, replacement, definition)
+        publishDependencyTarget(spark, replacement, definition)
+        val status = startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding")
+        StreamingTableMetadata.clearResetIntent(spark, upstreamDropped)
+        status
+      }
+    }
+  }
+
+  private[spark] def withCascadeLocks[A](
+      spark: SparkSession,
+      descendants: Seq[StreamingTableCascadeTarget]
+  )(body: => A): A = {
+    val streamingKeys = descendants
+      .filter(_.kind == "streaming")
+      .map(target => StreamingTableRegistry.lifecycleLockKey(target.identity))
+    StreamingTableRegistry.withTargetLocks(spark, streamingKeys)(body)
+  }
+
+  private[spark] def dropResolvedCascade(
+      spark: SparkSession,
+      descendants: Seq[StreamingTableCascadeTarget]
+  ): Unit =
+    descendants.foreach(dropCascadeTarget(spark, _))
+
+  private def resolveCascadeDescendants(
+      spark: SparkSession,
+      root: StreamingTableTarget
+  ): Seq[StreamingTableCascadeTarget] = {
+    val rootRecord = StreamingDependencyCatalog
+      .lookup(spark, root.identity)
+      .getOrElse(
+        StreamingTableErrors.invalid(
+          s"Streaming table ${root.sqlIdentifier} is missing durable dependency metadata"
+        )
+      )
+    validateDependencyTarget(rootRecord, root)
+    resolveCascadeDescendants(spark, streamingNode(spark, rootRecord))
+  }
+
+  private[spark] def resolveMaterializedCascadeDescendants(
+      spark: SparkSession,
+      meta: MvMetadata
+  ): Seq[StreamingTableCascadeTarget] =
+    resolveCascadeDescendants(spark, materializedNode(spark, meta))
+
+  private final case class CascadeNode(
+      target: StreamingTableCascadeTarget,
+      formatVersion: Int
+  )
+
+  private def resolveCascadeDescendants(
+      spark: SparkSession,
+      root: CascadeNode
+  ): Seq[StreamingTableCascadeTarget] = {
+    val visiting = mutable.Set.empty[String]
+    val visited  = mutable.Set.empty[String]
+    val ordered  = mutable.ArrayBuffer.empty[StreamingTableCascadeTarget]
+
+    def visit(parent: CascadeNode): Unit = {
+      if (!visiting.add(parent.target.identity))
+        StreamingTableErrors.invalid(s"Managed dependency graph contains a cycle at '${parent.target.identity}'")
+      directCascadeChildren(spark, parent).foreach { child =>
+        if (!visited.contains(child.target.identity)) {
+          visit(child)
+          ordered += child.target
+          visited += child.target.identity
+        }
+      }
+      visiting -= parent.target.identity
+    }
+
+    visit(root)
+    ordered.toSeq
+  }
+
+  private def directCascadeChildren(
+      spark: SparkSession,
+      parent: CascadeNode
+  ): Seq[CascadeNode] = {
+    val streamingChildren = StreamingDependencyCatalog.directChildren(spark, parent.target.identity).map { child =>
+      val source = child.sources
+        .find(_.parentIdentity == parent.target.identity)
+        .getOrElse(
+          StreamingTableErrors.invalid(
+            s"Streaming dependency child '${child.identity}' is missing its parent edge"
+          )
+        )
+      if (
+        source.parentPath != parent.target.dataPath ||
+        source.parentDeltaTableId != parent.target.deltaTableId ||
+        source.parentTableId != parent.target.tableId ||
+        source.formatVersion != parent.formatVersion
+      )
+        StreamingTableErrors.invalid(
+          s"Streaming dependency child '${child.identity}' is bound to a stale generation of " +
+            s"'${parent.target.identity}'"
+        )
+      streamingNode(spark, child)
+    }
+    val materializedChildren = sourceAliases(spark, parent.target)
+      .flatMap(source => MvCatalog.viewsForSource(spark, source))
+      .groupBy(meta => materializedName(meta.name))
+      .map(_._2.head)
+      .toSeq
+      .map(materializedNode(spark, _))
+    (streamingChildren ++ materializedChildren)
+      .groupBy(_.target.identity)
+      .map(_._2.head)
+      .toSeq
+      .sortBy(_.target.identity)
+  }
+
+  private def streamingNode(
+      spark: SparkSession,
+      record: StreamingDependencyTarget
+  ): CascadeNode = {
+    val target = StreamingTableMetadata.resolveDeltaTarget(
+      spark,
+      record.name,
+      requireTableIdMarker = true
+    )
+    validateDependencyTarget(record, target)
+    val manifest = StreamingTableMetadata.readManifest(spark, target)
+    StreamingTableMetadata.verifyOwned(spark, target, manifest)
+    CascadeNode(
+      StreamingTableCascadeTarget(
+        kind = "streaming",
+        name = target.name,
+        identity = target.identity,
+        dataPath = target.dataPath,
+        deltaTableId = target.deltaTableId,
+        tableId = target.tableId,
+        sourcePaths = manifest.sourcePaths
+      ),
+      record.formatVersion
+    )
+  }
+
+  private def materializedNode(spark: SparkSession, expected: MvMetadata): CascadeNode = {
+    val meta = MvCatalog
+      .lookup(spark, expected.name)
+      .getOrElse(
+        StreamingTableErrors.invalid(
+          s"Materialized view '${materializedName(expected.name)}' is missing catalog metadata"
+        )
+      )
+    if (meta != expected)
+      StreamingTableErrors.invalid(
+        s"Materialized view '${materializedName(expected.name)}' changed during cascade resolution"
+      )
+    val snapshot = DeltaLog.forTable(spark, new Path(meta.location)).update()
+    if (snapshot.version < 0L)
+      StreamingTableErrors.invalid(
+        s"Materialized view '${materializedName(meta.name)}' has no readable Delta generation"
+      )
+    CascadeNode(
+      StreamingTableCascadeTarget(
+        kind = "materialized",
+        name = tableNameParts(meta.name),
+        identity = StreamingDependencyCatalog.materializedIdentity(materializedName(meta.name)),
+        dataPath = StreamingTableMetadata.normalizePath(spark, meta.location),
+        deltaTableId = snapshot.metadata.id,
+        tableId = MvCatalog.mvIdentity(meta),
+        sourcePaths = Seq.empty
+      ),
+      formatVersion = 1
+    )
+  }
+
+  private def sourceAliases(spark: SparkSession, target: StreamingTableCascadeTarget): Seq[String] =
+    (Seq(target.name.last) ++
+      (if (target.name.size >= 2) Seq(target.name.takeRight(2).mkString(".")) else Seq.empty) ++
+      (if (target.name.size == 1) Seq(s"${spark.catalog.currentDatabase}.${target.name.last}") else Seq.empty) ++
+      Seq(target.name.mkString("."))).distinct
+
+  private def tableNameParts(name: TableIdentifier): Seq[String] =
+    name.catalog.toSeq ++ name.database.toSeq ++ Seq(name.table)
+
+  private def materializedName(name: TableIdentifier): String =
+    name.database.fold(name.table)(database => s"$database.${name.table}")
+
+  private def validateDependencyTarget(
+      record: StreamingDependencyTarget,
+      target: StreamingTableTarget
+  ): Unit =
     if (
-      current.dataPath != target.dataPath ||
-      current.deltaTableId != target.deltaTableId ||
-      current.tableId != target.tableId
+      record.identity != target.identity ||
+      record.name != target.name ||
+      record.dataPath != target.dataPath ||
+      record.deltaTableId != target.deltaTableId ||
+      record.tableId != target.tableId
     )
       StreamingTableErrors.invalid(
-        s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
+        s"Streaming dependency metadata for ${target.sqlIdentifier} does not match its owned target generation"
       )
-    StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
-    StreamingTableRegistry.forget(spark, registryKey)
 
-    val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
-    StreamingTableMetadata.validateNoSourceTargetOverlap(
+  private def dropCascadeDescendants(
+      spark: SparkSession,
+      initial: StreamingTableResetIntent
+  ): StreamingTableResetIntent =
+    initial.descendants.foldLeft(initial) { (intent, descendant) =>
+      if (intent.completedDescendantIdentities.contains(descendant.identity)) intent
+      else {
+        beforeCascadeDropHookForTesting(descendant)
+        dropCascadeTarget(spark, descendant)
+        val updated = intent.copy(
+          completedDescendantIdentities = intent.completedDescendantIdentities :+ descendant.identity
+        )
+        StreamingTableMetadata.updateResetIntent(spark, intent, updated)
+        updated
+      }
+    }
+
+  private def dropCascadeTarget(
+      spark: SparkSession,
+      descendant: StreamingTableCascadeTarget
+  ): Unit =
+    descendant.kind match {
+      case "streaming" =>
+        val target = StreamingTableTarget(
+          name = descendant.name,
+          identity = descendant.identity,
+          sqlIdentifier = StreamingTableMetadata.quoteMultipart(descendant.name),
+          dataPath = descendant.dataPath,
+          deltaTableId = descendant.deltaTableId,
+          tableId = descendant.tableId
+        )
+        val registryKey = StreamingTableRegistry.targetKey(target)
+        stopNative(spark, target, registryKey)
+        if (StreamingTableMetadata.catalogTableExists(spark, descendant.name)) {
+          val current =
+            StreamingTableMetadata.resolveDeltaTarget(spark, descendant.name, requireTableIdMarker = true)
+          if (
+            current.identity != descendant.identity ||
+            current.dataPath != descendant.dataPath ||
+            current.deltaTableId != descendant.deltaTableId ||
+            current.tableId != descendant.tableId
+          )
+            StreamingTableErrors.invalid(
+              s"Downstream target ${target.sqlIdentifier} changed during cascade cleanup"
+            )
+          val manifest = StreamingTableMetadata.readManifest(spark, current)
+          StreamingTableMetadata.verifyOwned(spark, current, manifest)
+          if (manifest.sourcePaths.distinct.sorted != descendant.sourcePaths.distinct.sorted)
+            StreamingTableErrors.invalid(
+              s"Downstream target ${target.sqlIdentifier} source metadata changed during cascade cleanup"
+            )
+          StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+        } else {
+          StreamingTableMetadata.deleteCascadeOwnedPath(spark, descendant)
+        }
+        StreamingTableRegistry.forget(spark, registryKey)
+        StreamingDependencyCatalog.remove(spark, descendant.identity)
+
+      case "materialized" =>
+        val name = tableIdentifier(descendant.name)
+        val meta = MvCatalog
+          .lookup(spark, name)
+          .getOrElse(
+            StreamingTableErrors.invalid(
+              s"Downstream materialized view '${materializedName(name)}' is missing during cascade cleanup"
+            )
+          )
+        val current = materializedNode(spark, meta).target
+        if (current != descendant)
+          StreamingTableErrors.invalid(
+            s"Downstream materialized view '${materializedName(name)}' changed during cascade cleanup"
+          )
+        MaterializedViewLifecycle.dropOne(spark, name, meta)
+
+      case other =>
+        StreamingTableErrors.invalid(s"Unsupported managed cascade target kind '$other'")
+    }
+
+  private def publishDependencyTarget(
+      spark: SparkSession,
+      target: StreamingTableTarget,
+      definition: StreamingTableDefinition,
+      resolvedSources: Seq[StreamingDependencySource] = Seq.empty
+  ): Unit = {
+    val sources =
+      if (resolvedSources.nonEmpty) resolvedSources else resolveManagedDependencySources(spark, definition)
+
+    StreamingDependencyCatalog.publish(
       spark,
-      definition.sourcePaths,
-      Some(replacement.dataPath)
+      StreamingDependencyTarget(
+        identity = target.identity,
+        name = target.name,
+        dataPath = target.dataPath,
+        deltaTableId = target.deltaTableId,
+        tableId = target.tableId,
+        definitionHash = definition.fingerprint,
+        formatVersion = definition.formatVersion,
+        sources = sources
+      )
     )
-    val replacementManifest = StreamingTableMetadata.writeManifest(spark, replacement, definition)
-    val status              = startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding")
-    StreamingTableMetadata.clearResetIntent(spark, intent)
-    status
   }
+
+  private def resolveManagedDependencySources(
+      spark: SparkSession,
+      definition: StreamingTableDefinition
+  ): Seq[StreamingDependencySource] =
+    definition.sources
+      .flatMap { source =>
+        (source.deltaPath, source.deltaTableId) match {
+          case (Some(path), Some(deltaTableId)) =>
+            val snapshot   = DeltaLog.forTable(spark, new Path(path)).update()
+            val properties = snapshot.metadata.configuration
+            if (
+              !properties.get(StreamingTableMetadata.OwnerMarkerKey).contains(StreamingTableMetadata.OwnerMarkerValue)
+            )
+              resolveMaterializedDependencySource(spark, path, deltaTableId)
+            else {
+              val parentIdentity = properties
+                .get(StreamingTableMetadata.TargetIdentityMarkerKey)
+                .getOrElse(
+                  StreamingTableErrors.invalid(s"Owned streaming source '$path' is missing its target identity")
+                )
+              val parentTableId = properties
+                .get(StreamingTableMetadata.TableIdMarkerKey)
+                .getOrElse(
+                  StreamingTableErrors.invalid(s"Owned streaming source '$path' is missing its table identity")
+                )
+              val parentPath = properties
+                .get(StreamingTableMetadata.TargetPathMarkerKey)
+                .getOrElse(
+                  StreamingTableErrors.invalid(s"Owned streaming source '$path' is missing its target path")
+                )
+              val recordedDeltaId = properties
+                .get(StreamingTableMetadata.DeltaIdMarkerKey)
+                .getOrElse(
+                  StreamingTableErrors.invalid(s"Owned streaming source '$path' is missing its Delta identity")
+                )
+              if (
+                StreamingTableMetadata.normalizePath(spark, parentPath) !=
+                  StreamingTableMetadata.normalizePath(spark, path) ||
+                  snapshot.metadata.id != deltaTableId ||
+                  recordedDeltaId != deltaTableId
+              )
+                StreamingTableErrors.invalid(
+                  s"Owned streaming source '$path' changed generation while dependency metadata was collected"
+                )
+              val parent = StreamingDependencyCatalog
+                .lookup(spark, parentIdentity)
+                .getOrElse(
+                  StreamingTableErrors.invalid(
+                    s"Owned streaming source '$path' is missing durable dependency metadata"
+                  )
+                )
+              if (
+                parent.dataPath != StreamingTableMetadata.normalizePath(spark, path) ||
+                parent.deltaTableId != deltaTableId ||
+                parent.tableId != parentTableId
+              )
+                StreamingTableErrors.invalid(
+                  s"Owned streaming source '$path' does not match its durable dependency metadata"
+                )
+              Some(
+                StreamingDependencySource(
+                  parentIdentity = parentIdentity,
+                  parentPath = parent.dataPath,
+                  parentDeltaTableId = parent.deltaTableId,
+                  parentTableId = parent.tableId,
+                  formatVersion = parent.formatVersion
+                )
+              )
+            }
+          case _ => None
+        }
+      }
+      .groupBy(_.parentIdentity)
+      .map(_._2.head)
+      .toSeq
+      .sortBy(_.parentIdentity)
+
+  private def resolveMaterializedDependencySource(
+      spark: SparkSession,
+      path: String,
+      deltaTableId: String
+  ): Option[StreamingDependencySource] = {
+    val normalized = StreamingTableMetadata.normalizePath(spark, path)
+    val matches = MvCatalog
+      .list(spark)
+      .filter(meta => StreamingTableMetadata.normalizePath(spark, meta.location) == normalized)
+    matches match {
+      case Seq() => None
+      case Seq(meta) =>
+        Some(
+          StreamingDependencySource(
+            parentIdentity = StreamingDependencyCatalog.materializedIdentity(materializedName(meta.name)),
+            parentPath = normalized,
+            parentDeltaTableId = deltaTableId,
+            parentTableId = MvCatalog.mvIdentity(meta),
+            formatVersion = 1
+          )
+        )
+      case many =>
+        StreamingTableErrors.invalid(
+          s"Delta source '$path' matches multiple managed materialized views: " +
+            many.map(meta => materializedName(meta.name)).sorted.mkString(", ")
+        )
+    }
+  }
+
+  private def tableIdentifier(parts: Seq[String]): TableIdentifier =
+    parts match {
+      case Seq(table)                    => TableIdentifier(table)
+      case Seq(database, table)          => TableIdentifier(table, Some(database))
+      case Seq(catalog, database, table) => TableIdentifier(table, Some(database), Some(catalog))
+      case _ =>
+        StreamingTableErrors.invalid(
+          s"Unsupported managed table name '${StreamingTableMetadata.quoteMultipart(parts)}'"
+        )
+    }
 
   private def reconcileResetJournal(
       spark: SparkSession,
@@ -529,12 +1015,22 @@ private[streaming] object StreamingTableRegistry {
 
   def lifecycleLockKey(target: StreamingTableTarget): String = s"identity:${target.identity}"
 
+  def lifecycleLockKey(identity: String): String = s"identity:$identity"
+
   def withTargetLock[A](spark: SparkSession, key: String)(body: => A): A = {
     val registry = context(spark)
     val proposed = new Object
     val existing = registry.locks.putIfAbsent(key, proposed)
     val lock     = if (existing == null) proposed else existing
     lock.synchronized(body)
+  }
+
+  def withTargetLocks[A](spark: SparkSession, keys: Seq[String])(body: => A): A = {
+    val ordered = keys.distinct.sorted
+    def acquire(index: Int): A =
+      if (index == ordered.size) body
+      else withTargetLock(spark, ordered(index))(acquire(index + 1))
+    acquire(0)
   }
 
   def ensureListener(spark: SparkSession): Unit = {
