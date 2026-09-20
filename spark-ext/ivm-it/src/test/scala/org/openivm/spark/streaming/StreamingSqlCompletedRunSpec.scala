@@ -103,6 +103,82 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
       )
     }
 
+    it("runs aligned UNION ALL branches from three streaming children and resumes their offsets") {
+      val sourceA = "strsql_completed_union_source_a"
+      val sourceB = "strsql_completed_union_source_b"
+      val sourceC = "strsql_completed_union_source_c"
+      val target  = "strsql_completed_union_target"
+      Seq(sourceA, sourceB, sourceC).foreach(createDeltaSource(_, "id INT, value STRING"))
+      insertRows(sourceA, "(1, 'a-one')")
+      insertRows(sourceB, "(2, 'b-two')")
+      insertRows(sourceC, "(3, 'c-three')")
+      val declaration =
+        s"""CREATE STREAMING TABLE ${quoteIdentifier(target)}
+           |OPTIONS ('trigger' = 'availableNow')
+           |AS
+           |SELECT id, value, 'a' AS source_name FROM STREAM ${quoteIdentifier(sourceA)}
+           |UNION ALL
+           |SELECT id, value, 'b' AS source_name FROM STREAM ${quoteIdentifier(sourceB)}
+           |UNION ALL
+           |SELECT id, value, 'c' AS source_name FROM STREAM ${quoteIdentifier(sourceC)}""".stripMargin
+      val initialExpected =
+        "SELECT 1 AS id, 'a-one' AS value, 'a' AS source_name UNION ALL " +
+          "SELECT 2, 'b-two', 'b' UNION ALL SELECT 3, 'c-three', 'c'"
+
+      val initial       = createStreamingSqlToCompletion(declaration)
+      val initialTarget = targetState(target)
+      assertBagEqual(target, initialExpected)
+
+      insertRows(sourceA, "(4, 'a-four')")
+      insertRows(sourceC, "(5, 'c-five')")
+      val resumed       = createStreamingSqlToCompletion(declaration)
+      val resumedTarget = targetState(target)
+      assertStableResume(initial, resumed, initialTarget, resumedTarget)
+      assertBagEqual(
+        target,
+        initialExpected + " UNION ALL SELECT 4, 'a-four', 'a' UNION ALL SELECT 5, 'c-five', 'c'"
+      )
+    }
+
+    it("keeps independent target identities and checkpoints for one shared source") {
+      val source  = "strsql_completed_isolation_source"
+      val targetA = "strsql_completed_isolation_target_a"
+      val targetB = "strsql_completed_isolation_target_b"
+      createDeltaSource(source, "id INT, value STRING, part STRING")
+      insertRows(source, "(1, 'initial', 'p')")
+      val declarationA = projectionDeclaration(source, targetA)
+      val declarationB = projectionDeclaration(source, targetB)
+
+      val initialA       = createStreamingSqlToCompletion(declarationA)
+      val initialTargetA = targetState(targetA)
+      val initialB       = createStreamingSqlToCompletion(declarationB)
+      val initialTargetB = targetState(targetB)
+      initialA.status.queryId should not be initialB.status.queryId
+      initialA.status.checkpointLocation should not be initialB.status.checkpointLocation
+      initialA.status.definitionHash should not be initialB.status.definitionHash
+      initialTargetA.path should not be initialTargetB.path
+      initialTargetA.deltaTableId should not be initialTargetB.deltaTableId
+      val initialExpected = "SELECT 1 AS id, 'initial' AS value, 'p' AS part"
+      assertBagEqual(targetA, initialExpected)
+      assertBagEqual(targetB, initialExpected)
+
+      insertRows(source, "(2, 'later', 'p')")
+      val resumedA       = createStreamingSqlToCompletion(declarationA)
+      val resumedTargetA = targetState(targetA)
+      val resumedB       = createStreamingSqlToCompletion(declarationB)
+      val resumedTargetB = targetState(targetB)
+      assertStableResume(initialA, resumedA, initialTargetA, resumedTargetA)
+      assertStableResume(initialB, resumedB, initialTargetB, resumedTargetB)
+      resumedA.status.queryId should not be resumedB.status.queryId
+      resumedA.status.checkpointLocation should not be resumedB.status.checkpointLocation
+      resumedA.inputRows shouldBe 1L
+      resumedB.inputRows shouldBe 1L
+      val resumedExpected =
+        initialExpected + " UNION ALL SELECT 2, 'later', 'p'"
+      assertBagEqual(targetA, resumedExpected)
+      assertBagEqual(targetB, resumedExpected)
+    }
+
     it("consumes a partition DELETE with ignoreChanges and accepts later inserts") {
       val source = "strsql_completed_delete_source"
       val target = "strsql_completed_delete_target"

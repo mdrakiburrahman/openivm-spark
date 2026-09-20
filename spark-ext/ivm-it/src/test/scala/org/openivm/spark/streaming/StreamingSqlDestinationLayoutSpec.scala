@@ -76,6 +76,57 @@ class StreamingSqlDestinationLayoutSpec extends AnyFunSpec with StreamingSqlTest
       assertBagEqual(target, insertedExpected)
     }
 
+    it("resumes an identical destination with three production partition columns") {
+      val source = "strsql_layout_three_partition_source"
+      val target = "strsql_layout_three_partition_target"
+      createDeltaSource(
+        source,
+        "id INT, event_year_month STRING, event_year_date DATE, azure_region STRING, value STRING"
+      )
+      insertRows(
+        source,
+        "(1, '202609', DATE '2026-09-19', 'eastus', 'one'), " +
+          "(2, '202609', DATE '2026-09-20', 'westus', 'two')"
+      )
+      val declaration =
+        s"""CREATE STREAMING TABLE ${quoteIdentifier(target)}
+           |PARTITIONED BY (event_year_month, event_year_date, azure_region)
+           |OPTIONS ('trigger' = 'availableNow')
+           |AS
+           |SELECT id, event_year_month, event_year_date, azure_region, value
+           |FROM STREAM ${quoteIdentifier(source)}""".stripMargin
+      val expected =
+        """SELECT 1 AS id, '202609' AS event_year_month, DATE '2026-09-19' AS event_year_date,
+          |  'eastus' AS azure_region, 'one' AS value
+          |UNION ALL
+          |SELECT 2, '202609', DATE '2026-09-20', 'westus', 'two'""".stripMargin
+
+      val initial       = createStreamingSqlToCompletion(declaration)
+      val initialTarget = targetLayoutState(target)
+      initialTarget.partitionColumns shouldBe Seq(
+        "event_year_month",
+        "event_year_date",
+        "azure_region"
+      )
+      initialTarget.clusteringColumns shouldBe empty
+      assertBagEqual(target, expected)
+
+      val sourceBeforeResume = sourceVersion(source)
+      val resumed            = createStreamingSqlToCompletion(declaration)
+      val resumedTarget      = targetLayoutState(target)
+      assertStableLayoutResume(initial, resumed, initialTarget, resumedTarget)
+      sourceVersion(source) shouldBe sourceBeforeResume
+      resumed.inputRows shouldBe 0L
+      dataFileActions(initialTarget, resumedTarget) shouldBe 0L
+      resumedTarget.activeFiles shouldBe initialTarget.activeFiles
+      resumedTarget.partitionColumns shouldBe Seq(
+        "event_year_month",
+        "event_year_date",
+        "azure_region"
+      )
+      assertBagEqual(target, expected)
+    }
+
     it("maintains a multi-key liquid-clustered destination through OPTIMIZE and resume") {
       val source = "strsql_layout_cluster_source"
       val target = "strsql_layout_cluster_target"

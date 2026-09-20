@@ -14,8 +14,10 @@ import scala.concurrent.{Await, ExecutionContext, Future, blocking}
 import scala.util.control.NonFatal
 
 private[streaming] final case class RestartCreateStatus(
+    tableName: String,
     queryId: String,
     runId: String,
+    status: String,
     checkpointLocation: String,
     definitionHash: String
 )
@@ -163,6 +165,78 @@ class StreamingSqlApplicationRestartSpec extends AnyFunSpec with Matchers {
         }
       }
     }
+
+    it("recovers a completed two-stage streaming chain in a fresh SparkContext") {
+      withRestartRoot("chain") { root =>
+        val source         = "strsql_restart_chain_source"
+        val upstream       = "strsql_restart_chain_upstream"
+        val downstream     = "strsql_restart_chain_downstream"
+        val sourcePath     = new File(root, "source").getCanonicalPath
+        val upstreamPath   = new File(root, "upstream").getCanonicalPath
+        val downstreamPath = new File(root, "downstream").getCanonicalPath
+        val sessions       = mutable.ArrayBuffer.empty[SparkSession]
+        val first          = newSession(root, "chain-first", new File(root, "local-first"), None)
+        sessions += first
+
+        try {
+          createLocatedSource(first, source, sourcePath, "id INT, value STRING, part STRING")
+          first.sql(s"INSERT INTO `$source` VALUES (1, 'before-restart', 'p')").collect()
+          val upstreamDeclaration =
+            s"""CREATE STREAMING TABLE `$upstream`
+               |USING DELTA
+               |LOCATION ${sqlString(upstreamPath)}
+               |OPTIONS ('trigger' = 'availableNow')
+               |AS SELECT id, value, part FROM STREAM `$source`""".stripMargin
+          val downstreamDeclaration =
+            s"""CREATE STREAMING TABLE `$downstream`
+               |USING DELTA
+               |LOCATION ${sqlString(downstreamPath)}
+               |OPTIONS ('trigger' = 'availableNow')
+               |AS SELECT id, value, part FROM STREAM `$upstream`""".stripMargin
+
+          val originalUpstream   = createToCompletion(first, upstreamDeclaration)
+          val originalDownstream = createToCompletion(first, downstreamDeclaration)
+          originalUpstream.queryId should not be originalDownstream.queryId
+          originalUpstream.checkpointLocation should not be originalDownstream.checkpointLocation
+          assertBagEqual(
+            first,
+            downstream,
+            "SELECT 1 AS id, 'before-restart' AS value, 'p' AS part"
+          )
+          val firstContext = first.sparkContext
+          stopSession(first)
+
+          val second = newSession(root, "chain-second", new File(root, "local-second"), None)
+          sessions += second
+          (second.sparkContext eq firstContext) shouldBe false
+          registerLocatedTable(second, source, sourcePath)
+          registerLocatedTable(second, upstream, upstreamPath)
+          registerLocatedTable(second, downstream, downstreamPath)
+          second.sql(s"INSERT INTO `$source` VALUES (2, 'after-restart', 'p')").collect()
+
+          val resumedUpstream = createToCompletion(second, upstreamDeclaration)
+          resumedUpstream.queryId shouldBe originalUpstream.queryId
+          resumedUpstream.runId should not be originalUpstream.runId
+          resumedUpstream.checkpointLocation shouldBe originalUpstream.checkpointLocation
+          resumedUpstream.definitionHash shouldBe originalUpstream.definitionHash
+          val resumedDownstream = createToCompletion(second, downstreamDeclaration)
+          resumedDownstream.queryId shouldBe originalDownstream.queryId
+          resumedDownstream.runId should not be originalDownstream.runId
+          resumedDownstream.checkpointLocation shouldBe originalDownstream.checkpointLocation
+          resumedDownstream.definitionHash shouldBe originalDownstream.definitionHash
+          resumedUpstream.queryId should not be resumedDownstream.queryId
+          resumedUpstream.checkpointLocation should not be resumedDownstream.checkpointLocation
+
+          val expected =
+            "SELECT 1 AS id, 'before-restart' AS value, 'p' AS part UNION ALL " +
+              "SELECT 2, 'after-restart', 'p'"
+          assertBagEqual(second, upstream, expected)
+          assertBagEqual(second, downstream, expected)
+        } finally {
+          sessions.reverseIterator.foreach(stopSession)
+        }
+      }
+    }
   }
 
   private def newSession(
@@ -208,11 +282,40 @@ class StreamingSqlApplicationRestartSpec extends AnyFunSpec with Matchers {
   private def create(spark: SparkSession, declaration: String): RestartCreateStatus = {
     val row = spark.sql(declaration).collect().head
     RestartCreateStatus(
+      tableName = requiredString(row, "table_name"),
       queryId = requiredString(row, "query_id"),
       runId = requiredString(row, "run_id"),
+      status = requiredString(row, "status"),
       checkpointLocation = requiredString(row, "checkpoint_location"),
       definitionHash = requiredString(row, "definition_hash")
     )
+  }
+
+  private def createToCompletion(spark: SparkSession, declaration: String): RestartCreateStatus = {
+    val listener = new SqlCompletionListener
+    spark.streams.addListener(listener)
+    try {
+      val status = create(spark, declaration)
+      val completed = listener.await(
+        SqlStreamingStatus(
+          tableName = status.tableName,
+          queryId = status.queryId,
+          runId = status.runId,
+          status = status.status,
+          checkpointLocation = status.checkpointLocation,
+          definitionHash = status.definitionHash
+        ),
+        120.seconds
+      )
+      completed.exception.foreach { message =>
+        fail(
+          s"Query ${status.queryId}, run ${status.runId} terminated with an exception: $message"
+        )
+      }
+      status
+    } finally {
+      spark.streams.removeListener(listener)
+    }
   }
 
   private def query(spark: SparkSession, queryId: String): StreamingQuery =

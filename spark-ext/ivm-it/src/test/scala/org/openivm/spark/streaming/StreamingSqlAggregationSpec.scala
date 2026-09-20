@@ -46,6 +46,45 @@ class StreamingSqlAggregationSpec extends AnyFunSpec with StreamingSqlTestSuppor
       )
     }
 
+    it("completes a closed daily window with an AvailableNow three-day watermark") {
+      val source        = "strsql_agg_available_daily_source"
+      val target        = "strsql_agg_available_daily_target"
+      val watermarkDays = 3
+      createDeltaSource(source, "id INT, event_time TIMESTAMP, part STRING")
+      insertRows(
+        source,
+        "(1, TIMESTAMP '2026-09-10 01:00:00', 'east'), " +
+          "(2, TIMESTAMP '2026-09-10 23:00:00', 'east'), " +
+          "(100, TIMESTAMP '2026-09-15 00:00:00', 'advance')"
+      )
+
+      val completed = createStreamingSqlToCompletion(
+        s"""CREATE STREAMING TABLE ${quoteIdentifier(target)}
+           |OPTIONS ('trigger' = 'availableNow')
+           |AS
+           |SELECT
+           |  window(e.event_time, '1 day').start AS window_start,
+           |  window(e.event_time, '1 day').end AS window_end,
+           |  e.part,
+           |  COUNT(*) AS event_count
+           |FROM STREAM ${quoteIdentifier(source)}
+           |WATERMARK e.event_time DELAY OF INTERVAL $watermarkDays DAYS AS e
+           |GROUP BY window(e.event_time, '1 day'), e.part""".stripMargin
+      )
+
+      completed.inputRows shouldBe 3L
+      assertFramesBagEqual(
+        spark.table(target),
+        spark.sql(
+          """SELECT
+            |  TIMESTAMP '2026-09-10 00:00:00' AS window_start,
+            |  TIMESTAMP '2026-09-11 00:00:00' AS window_end,
+            |  'east' AS part,
+            |  CAST(2 AS BIGINT) AS event_count""".stripMargin
+        )
+      )
+    }
+
     it("maintains an explicit complete-mode aggregate") {
       val source = "strsql_agg_complete_source"
       val target = "strsql_agg_complete_target"
