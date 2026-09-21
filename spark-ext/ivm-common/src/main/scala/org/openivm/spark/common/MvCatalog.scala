@@ -543,8 +543,17 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
       )
     }
 
-  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
-    openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] = {
+    def read(attemptsRemaining: Int): Option[MvMetadata] =
+      try openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+      catch {
+        case error: IllegalStateException
+            if attemptsRemaining > 1 && Option(error.getMessage).exists(_.contains("already closed")) =>
+          read(attemptsRemaining - 1)
+      }
+
+    read(attemptsRemaining = 3)
+  }
 
   private def dependentViewNames(spark: SparkSession, sourceTable: String): Seq[String] = {
     val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
