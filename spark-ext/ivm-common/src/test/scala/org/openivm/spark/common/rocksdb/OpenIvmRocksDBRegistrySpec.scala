@@ -614,7 +614,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
 
       start.countDown()
-      futures.foreach(f => Await.result(f, 60.seconds))
+      Await.result(Future.sequence(futures), 3.minutes)
 
       val errList = errors.asScala.toList
       withClue(errList.map(e => s"${e.getClass.getName}: ${e.getMessage}").mkString("\n")) {
