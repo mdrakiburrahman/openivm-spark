@@ -555,13 +555,13 @@ spark-ext/dev/pins.env
 Current relevant entries:
 
 ```text
-OPENIVM_REPO=https://github.com/mdrakiburrahman/openivm.git
-OPENIVM_BRANCH=dev/mdrrahman/add-months-ila
-OPENIVM_COMMIT=a11dba42de3b0612578d326251c88e779b53ca42
+OPENIVM_REPO=https://github.com/ila/openivm.git
+OPENIVM_BRANCH=main
+OPENIVM_COMMIT=8c5940a952b19ab13f2d235df9d9e5463576f8be
 
-LPTS_REPO=https://github.com/mdrakiburrahman/lpts.git
-LPTS_BRANCH=dev/mdrrahman/spark-add-months
-LPTS_COMMIT=afd5e1ab63d044387fa82440a3fba4601e398779
+LPTS_REPO=https://github.com/cwida/lpts.git
+LPTS_BRANCH=main
+LPTS_COMMIT=29c606ee18ad8e4d04cab940f361cbf6fbe5b881
 
 DUCKDB_REF=v1.5.2
 DUCKDB_COMMIT=8a5851971fae891f292c2714d86046ee018e9737
