@@ -316,5 +316,31 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       aStatus.queryId.flatMap(id => Option(spark.streams.get(id))).exists(_.isActive) shouldBe true
       bStatus.queryId.flatMap(id => Option(spark.streams.get(id))).exists(_.isActive) shouldBe true
     }
+
+    it("recovers a missing root dependency record while preserving descendant cleanup") {
+      val source = "strt_cascade_missing_root_source"
+      val a      = "strt_cascade_missing_root_a"
+      val b      = "strt_cascade_missing_root_b"
+      createSource(source)
+      val aStatus = createStreaming(a, readStream(source), s"SELECT id, value, part FROM STREAM $source")
+      appendRows(source, "(1, 'one', 'p')")
+      process(aStatus)
+      val bStatus = createStreaming(b, readStream(a), s"SELECT id, value, part FROM STREAM $a")
+      process(bStatus)
+      val aIdentity = StreamingTableMetadata.canonicalIdentity(spark, Seq(a))
+      StreamingDependencyCatalog.removeTargetRecordForTesting(spark, aIdentity)
+
+      val rebuilt = createStreaming(
+        a,
+        readStream(source).where("id = 1"),
+        s"SELECT id, value, part FROM STREAM $source WHERE id = 1",
+        options = Map("onQueryChange" -> "rebuild")
+      )
+      process(rebuilt)
+
+      spark.catalog.tableExists(a) shouldBe true
+      spark.catalog.tableExists(b) shouldBe false
+      StreamingDependencyCatalog.lookup(spark, aIdentity).isDefined shouldBe true
+    }
   }
 }

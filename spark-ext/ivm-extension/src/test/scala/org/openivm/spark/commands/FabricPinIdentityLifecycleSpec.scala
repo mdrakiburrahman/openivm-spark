@@ -621,7 +621,7 @@ class FabricPinIdentityLifecycleSpec extends AnyFunSpec with Matchers with Befor
       ctasAttempts shouldBe 1
       // Owned artifacts cleaned: neither the MV metadata nor a registered table remain.
       MvCatalog.lookup(spark, TableIdentifier("k_pinned_mv")) shouldBe None
-      spark.catalog.tableExists(db, "k_pinned_mv") shouldBe false
+      spark.catalog.tableExists(s"$db.k_pinned_mv") shouldBe false
     }
 
     it(

@@ -348,14 +348,14 @@ object StreamingTableManager {
     val pending = StreamingTableMetadata.pendingResetIntent(spark, target)
     val descendants = pending
       .map(_.descendants)
-      .getOrElse(resolveCascadeDescendants(spark, target))
+      .getOrElse(resolveCascadeDescendantsForRebuild(spark, target, manifest))
     val lockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
       .map(StreamingTableRegistry.lifecycleLockKey)
     val materializedLockKeys = target.identity +: descendants.map(_.identity)
     RefreshMutex.withLocks(materializedLockKeys) {
       StreamingTableRegistry.withTargetLocks(spark, lockKeys) {
         val intent = pending.getOrElse {
-          val verified = resolveCascadeDescendants(spark, target)
+          val verified = resolveCascadeDescendantsForRebuild(spark, target, manifest)
           if (verified != descendants)
             StreamingTableErrors.invalid(
               s"Downstream dependencies for ${target.sqlIdentifier} changed during rebuild admission"
@@ -433,6 +433,32 @@ object StreamingTableManager {
       )
     validateDependencyTarget(rootRecord, root)
     resolveCascadeDescendants(spark, streamingNode(spark, rootRecord))
+  }
+
+  private def resolveCascadeDescendantsForRebuild(
+      spark: SparkSession,
+      root: StreamingTableTarget,
+      manifest: StreamingTableManifest
+  ): Seq[StreamingTableCascadeTarget] = {
+    val rootNode = StreamingDependencyCatalog.lookup(spark, root.identity) match {
+      case Some(rootRecord) =>
+        validateDependencyTarget(rootRecord, root)
+        streamingNode(spark, rootRecord)
+      case None =>
+        CascadeNode(
+          StreamingTableCascadeTarget(
+            kind = "streaming",
+            name = root.name,
+            identity = root.identity,
+            dataPath = root.dataPath,
+            deltaTableId = root.deltaTableId,
+            tableId = root.tableId,
+            sourcePaths = manifest.sourcePaths
+          ),
+          formatVersion = 1
+        )
+    }
+    resolveCascadeDescendants(spark, rootNode)
   }
 
   private[spark] def resolveMaterializedCascadeDescendants(

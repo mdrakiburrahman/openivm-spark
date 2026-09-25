@@ -87,7 +87,7 @@ object StreamingAssemblyConsumerSmoke {
         .collect()
         .head
       val expectedTargetName =
-        Seq(spark.catalog.currentCatalog, spark.catalog.currentDatabase, target)
+        Seq(spark.catalog.currentCatalog(), spark.catalog.currentDatabase, target)
           .map(quoteIdentifier)
           .mkString(".")
       require(created.getAs[String]("table_name") == expectedTargetName)

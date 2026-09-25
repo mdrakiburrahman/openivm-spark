@@ -177,7 +177,12 @@ object StreamingTableMetadata {
           Some(qualified.head)
         )
         Some(normalizePath(spark, new Path(spark.sessionState.catalog.defaultTablePath(identifier))))
-      } else None
+      } else
+        spark.conf
+          .getOption("spark.openivm.managedTablesRoot")
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .map(root => normalizePath(spark, new Path(new Path(root), qualified.takeRight(2).mkString("/"))))
     }
 
   def validateTargetPath(spark: SparkSession, path: String): Unit = {
