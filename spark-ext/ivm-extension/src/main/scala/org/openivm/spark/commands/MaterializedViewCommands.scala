@@ -68,6 +68,12 @@ private[commands] object OpenIvmCompilers {
       val existing2 = cache.get(spark)
       if (existing2 != null) return existing2
       val c = buildForSession(spark)
+      try c.verifyRuntime()
+      catch {
+        case NonFatal(e) =>
+          c.close()
+          throw e
+      }
       cache.put(spark, c)
       Runtime.getRuntime.addShutdownHook(new Thread(() => c.close()))
       c
@@ -113,28 +119,36 @@ private[commands] object OpenIvmCompilers {
         nativeLibraryPath = cliLibraryPath
       )
     else {
-      val (extPath, cliPath) = extractBundledAssets(spark)
+      val (extPath, cliPath, bundledLibraryPath) = extractBundledAssets(spark)
       OpenIvmCompiler.build(
         extensionPath = extPath,
         cliPath = cliPath,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(bundledLibraryPath)
       )
     }
   }
 
   /** Extract the DuckDB CLI + OpenIVM extension baked into the assembly JAR
     * (`/openivm-native/…`) to a per-app local temp dir; chmod +x the CLI. */
-  private def extractBundledAssets(spark: SparkSession): (String, String) = {
-    val localDir = new java.io.File(s"/tmp/openivm-assets-${spark.sparkContext.applicationId}")
+  private def extractBundledAssets(spark: SparkSession): (String, String, Option[String]) =
+    extractBundledAssets(
+      new java.io.File(s"/tmp/openivm-assets-${spark.sparkContext.applicationId}"),
+      getClass.getResourceAsStream
+    )
+
+  private[commands] def extractBundledAssets(
+      localDir: java.io.File,
+      resource: String => java.io.InputStream
+  ): (String, String, Option[String]) = {
     localDir.mkdirs()
     val ext = new java.io.File(localDir, "openivm.duckdb_extension")
     val cli = new java.io.File(localDir, "duckdb")
 
-    def extract(resource: String, dst: java.io.File): Unit =
+    def extract(resourceName: String, dst: java.io.File): Unit =
       if (!dst.exists() || dst.length() == 0L) {
-        val in = Option(getClass.getResourceAsStream(resource)).getOrElse(
+        val in = Option(resource(resourceName)).getOrElse(
           throw new IllegalStateException(
-            s"bundled compile asset $resource not found on the classpath — the " +
+            s"bundled compile asset $resourceName not found on the classpath — the " +
               "openivm-spark assembly JAR must embed it under /openivm-native/ " +
               "(set OPENIVM_NATIVE_DIR at build time), or provide it on disk via " +
               "OPENIVM_CLI_PATH / OPENIVM_EXTENSION_PATH"
@@ -152,7 +166,16 @@ private[commands] object OpenIvmCompilers {
     extract("/openivm-native/openivm.duckdb_extension", ext)
     extract("/openivm-native/duckdb", cli)
     cli.setExecutable(true, /* ownerOnly = */ false)
-    (ext.getAbsolutePath, cli.getAbsolutePath)
+    // Keep the CLI and extension on the same C++ runtime. Do not alter the JVM's loader.
+    val libraryProbe = resource("/openivm-native/libstdc++.so.6")
+    val libraryPath = Option(libraryProbe).map { in =>
+      in.close()
+      Seq("libstdc++.so.6", "libgcc_s.so.1").foreach { name =>
+        extract(s"/openivm-native/$name", new java.io.File(localDir, name))
+      }
+      localDir.getAbsolutePath
+    }
+    (ext.getAbsolutePath, cli.getAbsolutePath, libraryPath)
   }
 }
 
@@ -2998,6 +3021,12 @@ case class CreateMaterializedViewCommand(
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
     val emitsCascadeViewDelta    = classification.emitsCascadeViewDelta
+    profile.appendStep(
+      "create_refresh_classification",
+      s"compiled_refresh_type=${classification.compileRefreshTypeName};" +
+        s"effective_refresh_type=$effectiveRefreshTypeName;reason=$classifyReason",
+      0L
+    )
     OpenIvmExecutionSpan.recordActiveRefreshClassification(
       compileRefreshType = Some(classification.compileRefreshTypeName),
       effectiveRefreshType = Some(effectiveRefreshTypeName),
