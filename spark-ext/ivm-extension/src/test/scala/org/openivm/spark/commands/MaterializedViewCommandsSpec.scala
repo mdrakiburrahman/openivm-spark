@@ -47,7 +47,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 

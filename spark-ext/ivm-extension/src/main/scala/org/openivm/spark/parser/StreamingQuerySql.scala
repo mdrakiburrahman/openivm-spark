@@ -28,12 +28,11 @@ import org.apache.spark.sql.catalyst.analysis.{
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression, SubqueryExpression}
 import org.apache.spark.sql.catalyst.parser.{ParseException, ParserInterface, ParserUtils}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias, UnresolvedWith}
-import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.unsafe.types.CalendarInterval
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
@@ -644,11 +643,7 @@ private[parser] object StreamingQuerySql {
       val withChildren = current.mapChildren(bindPlan)
       val withCtes = withChildren match {
         case unresolved: UnresolvedWith =>
-          val rebound = unresolved.copy(
-            cteRelations = unresolved.cteRelations.map { case (name, alias) =>
-              name -> bindPlan(alias).asInstanceOf[SubqueryAlias]
-            }
-          )
+          val rebound = SparkParserCompat.rebindCtes(unresolved, bindPlan)
           rebound.copyTagsFrom(unresolved)
           rebound
         case other =>
@@ -910,5 +905,5 @@ private[parser] object StreamingQuerySql {
     Character.isLetterOrDigit(ch) || ch == '_' || ch == '$'
 
   private def parseError(sqlText: String, message: String): Nothing =
-    throw new ParseException(Some(sqlText), message, Origin(), Origin())
+    throw SparkParserCompat.parseException(sqlText, message)
 }

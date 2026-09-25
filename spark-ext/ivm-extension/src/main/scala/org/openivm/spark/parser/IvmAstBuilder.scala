@@ -3,10 +3,8 @@ package org.openivm.spark.parser
 import org.antlr.v4.runtime.misc.Interval
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.catalyst.trees.Origin
 import org.openivm.spark.commands.CreateStreamingTableCommand
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
@@ -23,7 +21,7 @@ import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
 import org.openivm.spark.streaming.StreamingTableSpec
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 /**
  * Visitor that builds typed LogicalPlan nodes from the ANTLR-generated parse tree
@@ -89,11 +87,9 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       .groupBy(_._1.toLowerCase(java.util.Locale.ROOT))
       .collectFirst { case (_, values) if values.size > 1 => values.head._1 }
     duplicate.foreach { source =>
-      throw new ParseException(
-        Some(ctx.getText),
-        s"Source version map names '$source' more than once",
-        Origin(),
-        Origin()
+      throw SparkParserCompat.parseException(
+        ctx.getText,
+        s"Source version map names '$source' more than once"
       )
     }
     AdvanceMaterializedViewSourceVersionsCommand(
@@ -267,11 +263,9 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       case db :: t :: Nil        => TableIdentifier(t, Some(db))
       case cat :: db :: t :: Nil => TableIdentifier(t, Some(db), Some(cat))
       case _ =>
-        throw new ParseException(
-          Some(ctx.getText),
-          s"Identifier has too many parts: ${ctx.getText}",
-          Origin(),
-          Origin()
+        throw SparkParserCompat.parseException(
+          ctx.getText,
+          s"Identifier has too many parts: ${ctx.getText}"
         )
     }
   }
@@ -365,7 +359,7 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       s
 
   private def parseError(message: String): Nothing =
-    throw new ParseException(Some(sqlText), message, Origin(), Origin())
+    throw SparkParserCompat.parseException(sqlText, message)
 }
 
 /** Companion — exposes the entry-point used by [[IvmParser]]. */
@@ -381,11 +375,9 @@ private[parser] object IvmAstBuilder {
     builder.visit(tree) match {
       case plan: LogicalPlan => plan
       case other =>
-        throw new ParseException(
-          Some(sqlText),
-          s"Expected a LogicalPlan from IvmAstBuilder but got: ${other.getClass}",
-          Origin(),
-          Origin()
+        throw SparkParserCompat.parseException(
+          sqlText,
+          s"Expected a LogicalPlan from IvmAstBuilder but got: ${other.getClass}"
         )
     }
   }

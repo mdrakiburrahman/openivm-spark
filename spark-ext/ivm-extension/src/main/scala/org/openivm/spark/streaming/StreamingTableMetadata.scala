@@ -7,7 +7,6 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
 import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
 import org.apache.spark.sql.delta.clustering.ClusteringMetadataDomain
-import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.delta.skipping.clustering.{ClusteredTableUtils, ClusteringColumnInfo}
 import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
 import org.apache.spark.sql.delta.stats.SkippingEligibleDataType
@@ -18,7 +17,7 @@ import org.openivm.spark.common.DeltaTableVersion
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 final case class StreamingTableTarget(
@@ -456,7 +455,7 @@ object StreamingTableMetadata {
     val properties = requiredNode(semantic, "tableProperties", target.sqlIdentifier)
     if (!properties.isObject)
       StreamingTableErrors.invalid(s"Stored table properties for ${target.sqlIdentifier} are corrupt")
-    properties.fields().asScala.foreach { field =>
+    properties.properties().asScala.foreach { field =>
       val expected = field.getValue
       if (!expected.isTextual)
         StreamingTableErrors.invalid(s"Stored table property '${field.getKey}' is corrupt")
@@ -1282,14 +1281,14 @@ object StreamingTableMetadata {
     val parent = path.getParent
     if (parent == null)
       StreamingTableErrors.invalid(s"Cannot replace metadata without a parent directory: $path")
-    val manager = CheckpointFileManager.create(path, spark.sessionState.newHadoopConf())
+    val manager = StreamingCheckpointFileManager.create(path, spark.sessionState.newHadoopConf())
     if (!manager.exists(parent))
       StreamingTableErrors.invalid(s"Cannot replace missing metadata directory $parent")
     if (!manager.exists(path))
       StreamingTableErrors.invalid(s"Cannot replace missing metadata file $path")
 
-    var stream: CheckpointFileManager.CancellableFSDataOutputStream = null
-    var closed                                                      = false
+    var stream: StreamingCheckpointFileManager.CancellableOutputStream = null
+    var closed                                                         = false
     try {
       stream = manager.createAtomic(path, overwriteIfPossible = true)
       stream.write(bytes)

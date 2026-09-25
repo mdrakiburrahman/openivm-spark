@@ -15,7 +15,7 @@ import java.net.InetAddress
 import java.nio.file.Files
 import java.util.{Properties, UUID}
 import java.util.concurrent.{Callable, ConcurrentLinkedQueue, CountDownLatch, ExecutionException, Executors, TimeUnit}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 class ScopedSqlBridgeSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll with Eventually {
   private var spark: SparkSession = _

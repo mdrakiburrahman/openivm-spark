@@ -25,12 +25,13 @@ x-spark-ext: &spark-ext
       DUCKDB_REF: ${DUCKDB_REF}
       DUCKDB_COMMIT: ${DUCKDB_COMMIT}
       NATIVE_BUILD_JOBS: ${NATIVE_BUILD_JOBS:-8}
+      OPENIVM_SPARK_TARGET: ${OPENIVM_SPARK_TARGET}
       JDK_VERSION: ${JDK_VERSION}
       SBT_VERSION: ${SBT_VERSION}
       SCALA_VERSION: ${SCALA_VERSION}
       DUCKDB_JDBC_VERSION: ${DUCKDB_JDBC_VERSION}
       UBUNTU_MIRROR: ${UBUNTU_MIRROR}
-  image: openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}
+  image: openivm-spark/spark-ext:${SPARK_EXT_IMAGE_TAG}
   volumes:
     - ..:/work/spark-ext-dev:ro
     - ../..:/work/spark-ext:rw
@@ -39,6 +40,7 @@ x-spark-ext: &spark-ext
     - coursier-cache:/root/.cache/coursier
   working_dir: /work/spark-ext
   environment:
+    OPENIVM_SPARK_TARGET: ${OPENIVM_SPARK_TARGET}
     SBT_OPTS: "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
     # Test-log directory inside the container, mirroring the host's
     # repo-root/.logs/test-<TS>/ layout. `dev.sh` (host) sets this env

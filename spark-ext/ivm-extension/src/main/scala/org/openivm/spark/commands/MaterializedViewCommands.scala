@@ -1088,8 +1088,7 @@ private[commands] object MvCommandHelper {
           SparkTimeTravelSql.readPinnedSourceIdentityProperties(persistedProperties, currentBindings).toOption
         SparkTimeTravelSql
           .validateResolvedSnapshotPins(operation, currentBindings, persistedPins)
-          .left
-          .foreach(detail => throw pinBindingException(viewName, detail))
+          .fold(detail => throw pinBindingException(viewName, detail), _ => ())
         operation match {
           case SparkTimeTravelSql.PinIdentityOperation.Refresh | SparkTimeTravelSql.PinIdentityOperation.Advance |
               SparkTimeTravelSql.PinIdentityOperation.IdempotentCreate =>
@@ -1998,7 +1997,7 @@ private[commands] object MvCommandHelper {
     error match {
       case e: AnalysisException =>
         val message = Option(e.getMessage).getOrElse("")
-        Option(e.getErrorClass).contains("TABLE_OR_VIEW_NOT_FOUND") &&
+        SparkCommandCompat.errorCondition(e).contains("TABLE_OR_VIEW_NOT_FOUND") &&
         targetFragments.exists(message.contains) &&
         message.contains("To tolerate the error on drop")
       case _ => false
@@ -2111,11 +2110,11 @@ private[commands] object MvCommandHelper {
           detected = true
           if (offset.isEmpty) offset = Some(expr.sql)
           peel(child)
-        case Sort(order, global, child) =>
+        case sort: Sort =>
           detected = true
-          if (!global) unsupportedWrapper = true
-          else if (orderBy.isEmpty) orderBy = Some(order.map(_.sql).mkString(", "))
-          peel(child)
+          if (!sort.global) unsupportedWrapper = true
+          else if (orderBy.isEmpty) orderBy = Some(sort.order.map(_.sql).mkString(", "))
+          peel(sort.child)
         case _: Tail =>
           detected = true
           unsupportedWrapper = true

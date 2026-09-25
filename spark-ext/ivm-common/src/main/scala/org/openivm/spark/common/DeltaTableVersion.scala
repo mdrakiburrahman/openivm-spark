@@ -128,8 +128,10 @@ object DeltaTableVersion {
 
   private def deltaLogFromPlan(plan: LogicalPlan): Option[DeltaLog] =
     plan.collectFirst {
-      case LogicalRelation(hfs: HadoopFsRelation, _, _, _) if hfs.location.isInstanceOf[TahoeFileIndex] =>
-        hfs.location.asInstanceOf[TahoeFileIndex].deltaLog
+      case relation: LogicalRelation
+          if relation.relation.isInstanceOf[HadoopFsRelation] &&
+            relation.relation.asInstanceOf[HadoopFsRelation].location.isInstanceOf[TahoeFileIndex] =>
+        relation.relation.asInstanceOf[HadoopFsRelation].location.asInstanceOf[TahoeFileIndex].deltaLog
     }
 
   private def looksLikePath(tableNameOrPath: String): Boolean =

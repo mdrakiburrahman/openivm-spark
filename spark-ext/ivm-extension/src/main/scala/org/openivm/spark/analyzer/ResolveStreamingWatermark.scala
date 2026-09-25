@@ -20,15 +20,14 @@ package org.openivm.spark.analyzer
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAlias
 import org.apache.spark.sql.catalyst.expressions.Alias
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan, Project, SubqueryAlias}
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.parser.UnresolvedStreamingWatermark
 
 /**
- * Resolves the extension-owned watermark node to Spark 3.5's native
- * [[EventTimeWatermark]]. Adapted from Apache Spark 4.1's
- * `ResolveEventTimeWatermark`, without its Spark-4 UUID constructor argument.
+ * Resolves the extension-owned watermark node to Spark's native event-time
+ * watermark node.
  */
 private[spark] final class ResolveStreamingWatermark(session: SparkSession) extends Rule[LogicalPlan] {
 
@@ -63,11 +62,11 @@ private[spark] final class ResolveStreamingWatermark(session: SparkSession) exte
             }
             val attribute = projectedEventTime.toAttribute
             if (unresolved.child.outputSet.contains(attribute)) {
-              EventTimeWatermark(attribute, unresolved.delay, unresolved.child)
+              EventTimeWatermarkCompat(attribute, unresolved.delay, unresolved.child)
             } else {
               val projection =
                 Project(projectedEventTime +: unresolved.child.output, unresolved.child)
-              EventTimeWatermark(attribute, unresolved.delay, projection)
+              EventTimeWatermarkCompat(attribute, unresolved.delay, projection)
             }
 
           case _ =>

@@ -383,9 +383,9 @@ object MvMetadata {
       refreshType: Int,
       refreshTypeName: String
   ): Map[String, String] = {
-    val sql =
+    val sql: Map[String, String] =
       if (compiledSql.nonEmpty) Map(compileCacheSqlKey(sourceSchemaFingerprint, tier) -> compiledSql) else Map.empty
-    val init = if (initialLoadSql.nonEmpty) {
+    val init: Map[String, String] = if (initialLoadSql.nonEmpty) {
       Map(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier) -> initialLoadSql)
     } else Map.empty
     sql ++ init ++ Map(

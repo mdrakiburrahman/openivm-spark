@@ -666,7 +666,8 @@ object SparkTimeTravelSql {
           else None
         }
       }
-      .toStream
+      .take(1)
+      .toList
       .headOption
     mismatch match {
       case None => Right(())

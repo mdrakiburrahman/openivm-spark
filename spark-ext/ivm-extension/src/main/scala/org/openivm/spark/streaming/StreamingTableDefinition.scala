@@ -13,12 +13,12 @@ import org.apache.spark.sql.delta.DeltaOptions
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.delta.openivm.DeltaOptionsAccess
-import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, StreamingDataSourceV2Relation}
+import org.apache.spark.sql.execution.datasources.{DataSource, HadoopFsRelation}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.delta.sources.DeltaSource
-import org.apache.spark.sql.execution.streaming.StreamingRelation
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.sql.types.{DataType, Metadata, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -29,7 +29,40 @@ import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.regex.Pattern
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
+
+private[streaming] sealed trait CompatibleStreamingPlan {
+  def output: Seq[Attribute]
+}
+
+private[streaming] final case class CompatibleV1StreamingRelation(
+    dataSource: DataSource,
+    sourceName: String,
+    output: Seq[Attribute]
+) extends CompatibleStreamingPlan
+
+private[streaming] final case class CompatibleStreamingDataSource(
+    stream: SparkDataStream,
+    output: Seq[Attribute],
+    nameParts: Option[Seq[String]],
+    identifier: Option[Identifier]
+) extends CompatibleStreamingPlan
+
+private[streaming] final case class CompatibleStreamingTable(
+    table: Table,
+    output: Seq[Attribute],
+    options: Seq[(String, String)],
+    identifier: Option[Identifier],
+    catalog: Option[String],
+    sourceName: String
+) extends CompatibleStreamingPlan
+
+private[streaming] final case class CompatibleV1Relation(
+    relation: HadoopFsRelation,
+    output: Seq[Attribute],
+    catalogName: Option[Seq[String]],
+    isStreaming: Boolean
+) extends CompatibleStreamingPlan
 
 /** Parsed extension-owned writer settings. Reader settings remain attached to
   * streaming relations by the parser and are collected into the definition.
@@ -335,48 +368,65 @@ object StreamingTableDefinition {
           )
         )
     }
-    val resolved = allPlans(analyzed).flatMap {
-      case relation: StreamingRelation =>
-        Some(sourceFromStreamingRelation(spark, relation))
-      case relation: StreamingRelationV2 =>
-        Some(
-          sourceFromTable(
-            spark,
-            relation.table,
-            relation.output,
-            isStreaming = true,
-            relation.extraOptions.asCaseSensitiveMap().asScala.toSeq,
-            relation.identifier,
-            relation.catalog.map(_.name()),
-            relation.sourceName
-          )
-        )
-      case relation: DataSourceV2Relation =>
-        Some(
-          sourceFromTable(
-            spark,
-            relation.table,
-            relation.output,
-            isStreaming = false,
-            relation.options.asCaseSensitiveMap().asScala.toSeq,
-            relation.identifier,
-            relation.catalog.map(_.name()),
-            relation.table.name()
-          )
-        )
-      case relation: StreamingDataSourceV2Relation =>
-        Some(
-          sourceFromStreamingDataSource(
-            spark,
-            relation.stream,
-            relation.output,
-            relation.identifier,
-            relation.catalog.map(_.name())
-          )
-        )
-      case relation @ LogicalRelation(hfs: HadoopFsRelation, output, catalogTable, isStreaming) =>
-        Some(sourceFromV1Relation(spark, hfs, output, catalogTable.map(_.identifier.nameParts), isStreaming))
-      case _ => None
+    val resolved = allPlans(analyzed).flatMap { plan =>
+      StreamingPlanCompatibility
+        .extract(plan)
+        .map {
+          case relation: CompatibleV1StreamingRelation =>
+            sourceFromStreamingRelation(spark, relation)
+          case relation: CompatibleStreamingDataSource =>
+            sourceFromStreamingDataSource(spark, relation.stream, relation.output, relation.nameParts)
+          case relation: CompatibleStreamingTable =>
+            sourceFromTable(
+              spark,
+              relation.table,
+              relation.output,
+              isStreaming = true,
+              relation.options,
+              relation.identifier,
+              relation.catalog,
+              relation.sourceName
+            )
+          case relation: CompatibleV1Relation =>
+            sourceFromV1Relation(
+              spark,
+              relation.relation,
+              relation.output,
+              relation.catalogName,
+              relation.isStreaming
+            )
+        }
+        .orElse {
+          plan match {
+            case relation: StreamingRelationV2 =>
+              Some(
+                sourceFromTable(
+                  spark,
+                  relation.table,
+                  relation.output,
+                  isStreaming = true,
+                  relation.extraOptions.asCaseSensitiveMap().asScala.toSeq,
+                  relation.identifier,
+                  relation.catalog.map(_.name()),
+                  relation.sourceName
+                )
+              )
+            case relation: DataSourceV2Relation =>
+              Some(
+                sourceFromTable(
+                  spark,
+                  relation.table,
+                  relation.output,
+                  isStreaming = false,
+                  relation.options.asCaseSensitiveMap().asScala.toSeq,
+                  relation.identifier,
+                  relation.catalog.map(_.name()),
+                  relation.table.name()
+                )
+              )
+            case _ => None
+          }
+        }
     }
     val resolvedStreaming = resolved.filter(_.isStreaming)
     if (analyzed.isStreaming && resolvedStreaming.isEmpty)
@@ -507,7 +557,7 @@ object StreamingTableDefinition {
 
   private def sourceFromStreamingRelation(
       spark: SparkSession,
-      relation: StreamingRelation
+      relation: CompatibleV1StreamingRelation
   ): SourceSeed = {
     val source  = relation.dataSource
     val options = readOptions(source.options.toSeq, s"streaming source ${relation.sourceName}")
@@ -561,19 +611,15 @@ object StreamingTableDefinition {
       spark: SparkSession,
       stream: org.apache.spark.sql.connector.read.streaming.SparkDataStream,
       output: Seq[Attribute],
-      identifier: Option[Identifier],
-      catalog: Option[String]
+      nameParts: Option[Seq[String]]
   ): SourceSeed = stream match {
     case delta: DeltaSource =>
       val snapshot = delta.deltaLog.update()
       if (snapshot.version < 0L)
         StreamingTableErrors.invalid("Resolved Delta streaming source has no committed snapshot")
       val path = StreamingTableMetadata.normalizePath(spark, delta.deltaLog.dataPath)
-      val logicalIdentity = identifier
-        .map(value => {
-          val parts = catalog.toSeq ++ value.namespace().toSeq :+ value.name()
-          StreamingTableMetadata.canonicalIdentity(spark, parts)
-        })
+      val logicalIdentity = nameParts
+        .map(StreamingTableMetadata.canonicalIdentity(spark, _))
         .getOrElse(s"delta-path:$path")
       val options = readOptions(
         DeltaOptionsAccess.rawOptions(delta.options).toSeq,
@@ -590,13 +636,8 @@ object StreamingTableDefinition {
       )
     case other =>
       SourceSeed(
-        identity = identifier
-          .map(value =>
-            StreamingTableMetadata.canonicalIdentity(
-              spark,
-              catalog.toSeq ++ value.namespace().toSeq :+ value.name()
-            )
-          )
+        identity = nameParts
+          .map(StreamingTableMetadata.canonicalIdentity(spark, _))
           .getOrElse(s"stream:${other.getClass.getName}"),
         provider = other.getClass.getName,
         schema = attributesSignature(output),
@@ -712,18 +753,6 @@ object StreamingTableDefinition {
       s"plan:${plan.getClass.getName}(" +
         s"name=${encodeSeq(relation.multipartIdentifier.map(normalizeIdentifier))}," +
         s"streaming=${relation.isStreaming},options=${encodeOptions(semanticReaderOptions(options))})"
-    case relation: StreamingRelation =>
-      s"plan:${plan.getClass.getName}(" +
-        s"source=${jsonString(relation.sourceName)},provider=${jsonString(relation.dataSource.className)}," +
-        s"paths=${encodeSeq(relation.dataSource.paths.map(path => jsonString(path)))}," +
-        s"options=${encodeOptions(
-            semanticReaderOptions(
-              readOptions(
-                relation.dataSource.options.toSeq,
-                relation.sourceName
-              )
-            )
-          )},output=${attributesSignature(relation.output)})"
     case relation: StreamingRelationV2 =>
       s"plan:${plan.getClass.getName}(" +
         s"source=${jsonString(relation.sourceName)},table=${encodeTable(relation.table)}," +
@@ -742,19 +771,44 @@ object StreamingTableDefinition {
         s"table=${encodeTable(relation.table)},streaming=${relation.isStreaming}," +
         s"identifier=${encodeIdentifier(relation.identifier)},output=${attributesSignature(relation.output)}," +
         s"children=${encodeSeq(plan.children.map(encodePlan))})"
-    case relation: StreamingDataSourceV2Relation =>
-      s"plan:${plan.getClass.getName}(" +
-        s"provider=${jsonString(relation.stream.getClass.getName)},streaming=true," +
-        s"identifier=${encodeIdentifier(relation.identifier)},output=${attributesSignature(relation.output)})"
-    case LogicalRelation(hfs: HadoopFsRelation, output, catalogTable, isStreaming) =>
-      s"plan:${plan.getClass.getName}(" +
-        s"provider=${jsonString(hfs.fileFormat.getClass.getName)}," +
-        s"roots=${encodeSeq(hfs.location.rootPaths.map(_.toUri.normalize().toString).sorted)}," +
-        s"streaming=$isStreaming,output=${attributesSignature(output)}," +
-        s"catalog=${catalogTable.map(value => encodeSeq(value.identifier.nameParts)).getOrElse("none")})"
     case _ =>
-      s"plan:${plan.getClass.getName}(${encodeSeq(plan.productIterator.toSeq.map(encodeValue))})"
+      StreamingPlanCompatibility
+        .extract(plan)
+        .map(encodeCompatiblePlan(plan, _))
+        .getOrElse(s"plan:${plan.getClass.getName}(${encodeSeq(plan.productIterator.toSeq.map(encodeValue))})")
   }
+
+  private def encodeCompatiblePlan(plan: LogicalPlan, relation: CompatibleStreamingPlan): String =
+    relation match {
+      case value: CompatibleV1StreamingRelation =>
+        s"plan:${plan.getClass.getName}(" +
+          s"source=${jsonString(value.sourceName)},provider=${jsonString(value.dataSource.className)}," +
+          s"paths=${encodeSeq(value.dataSource.paths.map(path => jsonString(path)))}," +
+          s"options=${encodeOptions(
+              semanticReaderOptions(
+                readOptions(
+                  value.dataSource.options.toSeq,
+                  value.sourceName
+                )
+              )
+            )},output=${attributesSignature(value.output)})"
+      case value: CompatibleStreamingDataSource =>
+        s"plan:${plan.getClass.getName}(" +
+          s"provider=${jsonString(value.stream.getClass.getName)},streaming=true," +
+          s"identifier=${encodeIdentifier(value.identifier)}," +
+          s"output=${attributesSignature(value.output)})"
+      case value: CompatibleStreamingTable =>
+        s"plan:${plan.getClass.getName}(" +
+          s"table=${encodeTable(value.table)},streaming=true," +
+          s"options=${encodeOptions(semanticReaderOptions(readOptions(value.options, value.sourceName)))}," +
+          s"identifier=${encodeIdentifier(value.identifier)},output=${attributesSignature(value.output)})"
+      case value: CompatibleV1Relation =>
+        s"plan:${plan.getClass.getName}(" +
+          s"provider=${jsonString(value.relation.fileFormat.getClass.getName)}," +
+          s"roots=${encodeSeq(value.relation.location.rootPaths.map(_.toUri.normalize().toString).sorted)}," +
+          s"streaming=${value.isStreaming},output=${attributesSignature(value.output)}," +
+          s"catalog=${value.catalogName.map(encodeSeq).getOrElse("none")})"
+    }
 
   private def encodeExpression(expression: Expression): String = expression match {
     case literal: Literal =>

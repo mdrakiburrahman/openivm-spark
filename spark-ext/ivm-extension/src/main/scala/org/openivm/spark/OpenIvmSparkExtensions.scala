@@ -1,6 +1,7 @@
 package org.openivm.spark
 
-import org.apache.spark.sql.{SparkSessionExtensions, Strategy}
+import org.apache.spark.sql.SparkSessionExtensions
+import org.openivm.spark.analyzer.SparkStrategyCompat
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
@@ -65,6 +66,6 @@ private[spark] class NoOpRule extends Rule[LogicalPlan] {
 /** A planner strategy that never emits a physical plan — used when DML
   * interception is disabled.
   */
-private[spark] object NoOpStrategy extends Strategy {
+private[spark] object NoOpStrategy extends SparkStrategyCompat {
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = Nil
 }

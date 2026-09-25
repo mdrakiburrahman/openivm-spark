@@ -22,7 +22,7 @@ import org.openivm.spark.common.{
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.{Collections, WeakHashMap}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 
 final case class StreamingTableStatus(

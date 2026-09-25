@@ -9,7 +9,7 @@ import org.scalatest.concurrent.Eventually
 import org.scalatest.time.{Seconds, Span}
 
 import java.util.concurrent.{Callable, CyclicBarrier, Executors, TimeUnit}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 
 abstract class QueryLogExportScenarios

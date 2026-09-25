@@ -7,6 +7,8 @@ import sbtassembly.PathList
 
 object Settings {
 
+  private val runtimeTarget = RuntimeTarget.current
+
   private def assemblyOnlyPom(pom: scala.xml.Node): scala.xml.Node = {
     val keepProvidedDependencies = new scala.xml.transform.RewriteRule {
       override def transform(node: scala.xml.Node): Seq[scala.xml.Node] =
@@ -86,7 +88,7 @@ object Settings {
     }
   )
 
-  /// JVM module-opens / module-exports block — must match the Spark 3.5 + JDK 17
+  /// JVM module-opens / module-exports block — must match the selected Spark/JDK
   /// startup options. Mirrored from RESEARCH.md §10. Forwarded to:
   ///   * sbt-launched test JVMs (via Test/javaOptions)
   ///   * sbt-launched assembly fat-jar runs
@@ -110,14 +112,17 @@ object Settings {
   )
 
   val commonSettings: Seq[Def.Setting[_]] = Seq(
-    scalacOptions ++= Seq(
-      "-deprecation",
-      "-feature",
-      "-unchecked",
-      "-Xfatal-warnings",
-      "-Ywarn-unused:imports",
-      "-target:jvm-1.8"
-    ),
+    scalacOptions ++= {
+      val common = Seq("-deprecation", "-feature", "-unchecked", "-Xfatal-warnings")
+      if (scalaBinaryVersion.value == "2.13")
+        common ++ Seq("-Wunused:imports", "-release:11")
+      else
+        common ++ Seq("-Ywarn-unused:imports", "-target:jvm-1.8")
+    },
+    Compile / unmanagedSourceDirectories +=
+      (Compile / sourceDirectory).value / s"scala-${runtimeTarget.sourceSuffix}",
+    Test / unmanagedSourceDirectories +=
+      (Test / sourceDirectory).value / s"scala-${runtimeTarget.sourceSuffix}",
     Test / fork              := true,
     Test / parallelExecution := false,
     Test / javaOptions ++= jvmModuleOpts ++ Seq(

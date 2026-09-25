@@ -504,12 +504,12 @@ for the statement-kind dispatch.
 | Component | Current pin / version | Where pinned | Why it matters |
 | --------- | --------------------- | ------------ | -------------- |
 | openivm-spark | Current repository checkout; downstream builds must pin its immutable commit separately | Downstream Dockerfile ARG | Spark extension jar must match the native compiler artifacts it expects. |
-| OpenIVM | `a11dba42de3b0612578d326251c88e779b53ca42` | `spark-ext/dev/pins.env` | Produces `openivm.duckdb_extension` and the matching DuckDB CLI. |
-| LPTS | `afd5e1ab63d044387fa82440a3fba4601e398779` | `spark-ext/dev/pins.env` | OpenIVM builds this LPTS commit as its serializer dependency. |
+| OpenIVM | `8c5940a952b19ab13f2d235df9d9e5463576f8be` | `spark-ext/dev/pins.env` | Produces `openivm.duckdb_extension` and the matching DuckDB CLI. |
+| LPTS | `29c606ee18ad8e4d04cab940f361cbf6fbe5b881` | `spark-ext/dev/pins.env` | OpenIVM builds this LPTS commit as its serializer dependency. |
 | DuckDB CLI / extension ABI | `v1.5.2` / `8a5851971fae891f292c2714d86046ee018e9737` | `DUCKDB_REF` / `DUCKDB_COMMIT` in `spark-ext/dev/pins.env` | The CLI and extension are built together against this exact DuckDB source. |
 | DuckDB JDBC | `1.5.2.1` | `spark-ext/dev/pins.env`, `project/Dependencies.scala` | Not the compile execution path, but kept aligned with the native DuckDB ABI. |
-| Spark | `3.5.1` | `spark-ext/dev/pins.env`, `project/Dependencies.scala` | Determines SQL dialect gaps and Catalyst/Delta behavior. |
-| Delta Lake | `3.2.0` | `spark-ext/dev/pins.env`, `project/Dependencies.scala` | Determines MERGE, UPDATE, Delta path, and warehouse behavior. |
+| Spark | `3.5.1` and `4.1.0` | `spark-ext/dev/targets/*.env`, `project/RuntimeTarget.scala` | Determines SQL dialect gaps and Catalyst/Delta behavior. |
+| Delta Lake | `3.2.0` and `4.2.0` | `spark-ext/dev/targets/*.env`, `project/RuntimeTarget.scala` | Determines MERGE, UPDATE, Delta path, and warehouse behavior. |
 
 The key constraints are:
 
@@ -529,9 +529,9 @@ on v1.5.2, including non-sticky Spark `add_months` month-end parity.
 
 ```mermaid
 flowchart LR
-  OSS["openivm-spark\nSpark 3.5.1 / Delta 3.2.0\nScala 2.12.17"]
-  OIVM["openivm\nOPENIVM_COMMIT\na11dba42de3b0612578d326251c88e779b53ca42"]
-  LPTS["LPTS\nLPTS_COMMIT\nafd5e1ab63d044387fa82440a3fba4601e398779"]
+  OSS["openivm-spark\nSpark 3.5.1 / Delta 3.2.0 / Scala 2.12.17\nSpark 4.1.0 / Delta 4.2.0 / Scala 2.13.17"]
+  OIVM["openivm\nOPENIVM_COMMIT\n8c5940a952b19ab13f2d235df9d9e5463576f8be"]
+  LPTS["LPTS\nLPTS_COMMIT\n29c606ee18ad8e4d04cab940f361cbf6fbe5b881"]
   Duck["DuckDB v1.5.2 ABI\nCLI + extension binary\nJDBC 1.5.2.1"]
 
   OSS -->|"loads matching openivm.duckdb_extension via CLI"| OIVM
@@ -546,10 +546,17 @@ Treat any single-corner bump as a three-corner compatibility review.
 
 ## 8.11 Where pins live
 
-The canonical openivm-spark pin file is:
+Shared native pins live in:
 
 ```text
 spark-ext/dev/pins.env
+```
+
+Spark/Delta runtime pins live in:
+
+```text
+spark-ext/dev/targets/spark-3.5.env
+spark-ext/dev/targets/spark-4.1.env
 ```
 
 Current relevant entries:

@@ -12,10 +12,8 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common.FeatureGate
@@ -40,7 +38,7 @@ import org.openivm.spark.parser.gen.IvmSqlBaseParser
  *
  * All methods other than [[parsePlan]] delegate to [[delegate]] unchanged.
  */
-class IvmParser(session: SparkSession, delegate: ParserInterface) extends ParserInterface {
+class IvmParser(session: SparkSession, override protected val delegate: ParserInterface) extends ParserInterfaceCompat {
 
   // -------------------------------------------------------------------------
   // parsePlan — only method with custom logic
@@ -135,9 +133,7 @@ class IvmParser(session: SparkSession, delegate: ParserInterface) extends Parser
 
     parseError match {
       case Some(errorMsg) =>
-        // Use the 7-arg primary constructor so errorMsg is treated as a free-form
-        // message (errorClass defaults to None → Spark uses "PARSE_SYNTAX_ERROR").
-        throw new ParseException(Some(sqlText), errorMsg, Origin(), Origin())
+        throw SparkParserCompat.parseException(sqlText, errorMsg)
       case None =>
         IvmAstBuilder.buildPlan(session, delegate, sqlText, tree)
     }

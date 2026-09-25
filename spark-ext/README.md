@@ -1,8 +1,17 @@
 # openivm-spark
 
-Spark 3.5 / Delta Lake 3.2 SQL extension delivering **OpenIVM incremental view maintenance** without Delta CDF.
+Spark SQL extension delivering **OpenIVM incremental view maintenance** without Delta CDF.
 
 > Status: under active development
+
+## Runtime support
+
+| Target       | Spark | Delta | Scala  | Java | Maven artifact                     |
+| ------------ | ----- | ----- | ------ | ---- | ---------------------------------- |
+| `spark-3.5`  | 3.5.1 | 3.2.0 | 2.12.17 | 17   | `ivmextension-spark-3.5_2.12`      |
+| `spark-4.1`  | 4.1.0 | 4.2.0 | 2.13.17 | 21   | `ivmextension-spark-4.1_2.13`      |
+
+Spark 3.5 remains the default for every developer command that omits `--target`.
 
 ## Layout
 
@@ -19,7 +28,8 @@ spark-ext/
 └── dev/
     ├── dev            # single entry-point CLI wrapper (build, test, verify, shell, …)
     ├── docker/        # multi-stage Dockerfile + docker-compose.yml
-    └── pins.env       # pinned SHAs of openivm / lpts / ivm-bench forks + spark / delta refs
+    ├── pins.env       # shared OpenIVM / LPTS / DuckDB pins
+    └── targets/       # target-specific Spark / Delta / Scala / JDK pins
 ```
 
 ## Supported RefreshTypes
@@ -52,11 +62,15 @@ following subcommands:
 
 ```bash
 ./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
+./spark-ext/dev/dev.sh --target spark-4.1 verify                                  # same verification on Spark 4.1 / Delta 4.2
+./spark-ext/dev/dev.sh verify-all                                                 # verify both targets and compare test inventories
 ./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench} + shallow .temp/{spark,delta} refs, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
 ./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
 ./spark-ext/dev/dev.sh publish                                                    # publish the versioned fat jar to the ADO Maven feed
+./spark-ext/dev/dev.sh --target spark-4.1 publish                                 # publish the Spark 4.1 assembly
+./spark-ext/dev/dev.sh publish-all                                                # publish both artifacts under one version
 ./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.it.ExtensionLoadingSpec'
 ./spark-ext/dev/dev.sh fmt                                                        # scalafmtAll (auto-format)
@@ -70,11 +84,15 @@ following subcommands:
 `publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
 computes one immutable version as
 `<epoch>.<working-tree-content-hash-int>.0`, and uses native sbt publishing to
-upload the assembly classifier at:
+upload the assembly classifier. `publish` uses the selected target; `publish-all`
+uses one version for both coordinates:
 
 ```text
-org.openivm:ivmextension_2.12:jar:assembly:<version>
-ivmextension_2.12-<version>-assembly.jar
+org.openivm:ivmextension-spark-3.5_2.12:jar:assembly:<version>
+ivmextension-spark-3.5_2.12-<version>-assembly.jar
+
+org.openivm:ivmextension-spark-4.1_2.13:jar:assembly:<version>
+ivmextension-spark-4.1_2.13-<version>-assembly.jar
 ```
 
 The content hash covers every tracked file plus every untracked, non-ignored
@@ -92,13 +110,13 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
-`verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
+`verify` is the canonical one-target command — it first runs `pins-sync` (cloning any
 missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and
 aligning each to its pinned branch, plus shallow-cloning the read-only
 `.temp/{spark,delta}` upstream references at their pinned release tags), then
 lints, compiles, assembles the fat jar, and runs every unit + integration +
-parity suite in a single sbt JVM. Wall-clock on the reference 32-core / 124 GiB
-host is ~40 minutes end-to-end.
+parity suite in a single sbt JVM. `verify-all` runs that same pipeline for both
+targets and fails if they discover different tests.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned

@@ -9,7 +9,7 @@ import org.apache.spark.sql.catalyst.catalog.CatalogColumnStat
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.actions.AddFile
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 
 final case class FileStat(
@@ -263,11 +263,11 @@ object SparkDeltaStatsService {
 
   private def stringFields(node: JsonNode): Map[String, String] =
     if (node == null || node.isNull) Map.empty
-    else node.fields().asScala.map(entry => entry.getKey -> jsonValueToString(entry.getValue)).toMap
+    else node.fieldNames().asScala.map(name => name -> jsonValueToString(node.get(name))).toMap
 
   private def longFields(node: JsonNode): Map[String, Long] =
     if (node == null || node.isNull) Map.empty
-    else node.fields().asScala.flatMap(entry => longNode(entry.getValue).map(entry.getKey -> _)).toMap
+    else node.fieldNames().asScala.flatMap(name => longNode(node.get(name)).map(name -> _)).toMap
 
   private def longField(node: JsonNode, field: String): Option[Long] =
     Option(node).flatMap(root => Option(root.get(field))).flatMap(longNode)
