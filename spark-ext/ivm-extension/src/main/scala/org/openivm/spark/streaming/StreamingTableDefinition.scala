@@ -1,6 +1,6 @@
 package org.openivm.spark.streaming
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedAttribute, UnresolvedRelation, UnresolvedStar}
@@ -195,6 +195,22 @@ final case class StreamingTableDefinition(
   def hasSameOperation(other: StreamingTableDefinition): Boolean = operationalHash == other.operationalHash
 }
 
+final case class StreamingDefinitionChange(
+    path: String,
+    category: String,
+    previous: String,
+    requested: String
+)
+
+final case class StreamingRebuildDecision(
+    code: String,
+    summary: String,
+    previousFingerprint: String,
+    requestedFingerprint: String,
+    normalizedQueryChanged: Boolean,
+    changes: Seq[StreamingDefinitionChange]
+)
+
 /** Deterministic, versioned definition construction.
   *
   * The persisted representation is deliberately a structural description of a
@@ -218,6 +234,7 @@ object StreamingTableDefinition {
   )
   private val CommonExpressionIdClass = "org.apache.spark.sql.catalyst.expressions.CommonExpressionId"
   private val CommonExpressionIdToken = "<common-expression-id>"
+  private val MaxAuditValueLength     = 512
   private val LegacyCommonExpressionIdPattern = Pattern.compile(
     """product:org\.apache\.spark\.sql\.catalyst\.expressions\.CommonExpressionId""" +
       """\(\[value:java\.lang\.Long:"-?\d+",value:java\.lang\.Boolean:"(?:true|false)"\]\)"""
@@ -348,6 +365,32 @@ object StreamingTableDefinition {
   private[streaming] def semanticallyEquivalent(left: String, right: String): Boolean =
     normalizeSemanticJson(left) == normalizeSemanticJson(right)
 
+  private[streaming] def rebuildDecision(
+      previousFingerprint: String,
+      previousSemanticJson: String,
+      previousDiagnosticJson: String,
+      requested: StreamingTableDefinition
+  ): StreamingRebuildDecision = {
+    val previous = Mapper.readTree(normalizeSemanticJson(previousSemanticJson))
+    val next     = Mapper.readTree(normalizeSemanticJson(requested.semanticJson))
+    val changes  = ArrayBuffer.empty[StreamingDefinitionChange]
+    collectDefinitionChanges("", previous, next, changes)
+    val normalizedQueryChanged =
+      diagnosticText(previousDiagnosticJson, "normalizedQuery") !=
+        diagnosticText(requested.diagnosticJson, "normalizedQuery")
+    val categories = changes.map(_.category).distinct
+    StreamingRebuildDecision(
+      code = "SEMANTIC_DEFINITION_CHANGED",
+      summary =
+        if (categories.isEmpty) "Semantic definition fingerprint changed"
+        else categories.map(categorySummary).mkString(", "),
+      previousFingerprint = previousFingerprint,
+      requestedFingerprint = requested.fingerprint,
+      normalizedQueryChanged = normalizedQueryChanged,
+      changes = changes.toSeq
+    )
+  }
+
   private def normalizeSemanticJson(json: String): String = {
     val root = Mapper.readTree(json).deepCopy[ObjectNode]()
     Seq("declarationPlan", "analyzedPlan").foreach { field =>
@@ -357,6 +400,99 @@ object StreamingTableDefinition {
     }
     Mapper.writeValueAsString(root)
   }
+
+  private def collectDefinitionChanges(
+      path: String,
+      previous: JsonNode,
+      requested: JsonNode,
+      changes: ArrayBuffer[StreamingDefinitionChange]
+  ): Unit = {
+    if (previous == requested) ()
+    else if (previous != null && requested != null && previous.isObject && requested.isObject) {
+      val fields = (previous.fieldNames().asScala ++ requested.fieldNames().asScala).toSet.toSeq.sorted
+      fields.foreach { field =>
+        collectDefinitionChanges(
+          appendField(path, field),
+          Option(previous.get(field)).orNull,
+          Option(requested.get(field)).orNull,
+          changes
+        )
+      }
+    } else if (previous != null && requested != null && previous.isArray && requested.isArray) {
+      val size = math.max(previous.size(), requested.size())
+      (0 until size).foreach { index =>
+        collectDefinitionChanges(
+          s"$path[$index]",
+          if (index < previous.size()) previous.get(index) else null,
+          if (index < requested.size()) requested.get(index) else null,
+          changes
+        )
+      }
+    } else {
+      changes += StreamingDefinitionChange(
+        path = path,
+        category = changeCategory(path),
+        previous = auditValue(path, previous),
+        requested = auditValue(path, requested)
+      )
+    }
+  }
+
+  private def appendField(path: String, field: String): String =
+    if (path.isEmpty) field else s"$path.$field"
+
+  private def changeCategory(path: String): String =
+    if (path == "declarationPlan" || path == "analyzedPlan") "query_plan"
+    else if (path == "outputSchema" || path == "targetSchema") "target_schema"
+    else if (path.startsWith("sources") && path.endsWith(".schema")) "source_schema"
+    else if (
+      path.startsWith("sources") &&
+      Seq(".identity", ".provider", ".streaming", ".deltaPath", ".deltaTableId").exists(path.endsWith)
+    ) "source_identity"
+    else if (path == "watermarks" || path.startsWith("watermarks[")) "watermark"
+    else if (
+      path == "targetIdentity" ||
+      path == "declaredLocation" ||
+      path == "partitionColumns" ||
+      path.startsWith("partitionColumns[") ||
+      path == "clusterColumns" ||
+      path.startsWith("clusterColumns[")
+    ) "destination_layout"
+    else if (path == "tableProperties" || path.startsWith("tableProperties.")) "properties"
+    else if (
+      path == "outputMode" ||
+      path == "sinkOptions" ||
+      path.startsWith("sinkOptions.") ||
+      (path.startsWith("sources") && path.contains(".options"))
+    ) "options"
+    else "other"
+
+  private def categorySummary(category: String): String = category match {
+    case "query_plan"         => "query plan changed"
+    case "source_identity"    => "source identity changed"
+    case "source_schema"      => "source schema changed"
+    case "target_schema"      => "target schema changed"
+    case "destination_layout" => "destination layout changed"
+    case "watermark"          => "watermark changed"
+    case "options"            => "semantic options changed"
+    case "properties"         => "table properties changed"
+    case _                    => "semantic metadata changed"
+  }
+
+  private def auditValue(path: String, node: JsonNode): String =
+    if (node == null) "<missing>"
+    else {
+      val value =
+        if (path == "declarationPlan" || path == "analyzedPlan")
+          s"sha256:${sha256(node.asText())}"
+        else if (node.isTextual) redactText(node.asText())
+        else Mapper.writeValueAsString(node)
+      if (value.length <= MaxAuditValueLength) value
+      else s"${value.take(MaxAuditValueLength)}...[sha256:${sha256(value)}]"
+    }
+
+  private def diagnosticText(json: String, field: String): Option[String] =
+    Option(Mapper.readTree(json).get(field)).filter(_.isTextual).map(_.asText())
 
   private def normalizeLegacyPlan(plan: String): String =
     LegacyCommonExpressionIdPattern.matcher(plan).replaceAll(CommonExpressionIdToken)

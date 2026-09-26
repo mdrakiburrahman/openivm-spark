@@ -1,6 +1,7 @@
 package org.openivm.spark.streaming
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -54,9 +55,19 @@ final case class StreamingTableResetIntent(
     oldDeltaTableId: String,
     replacementDefinitionHash: String,
     sourcePaths: Seq[String],
+    operationId: String = "",
+    rebuildDecision: Option[StreamingRebuildDecision] = None,
     descendants: Seq[StreamingTableCascadeTarget] = Seq.empty,
     completedDescendantIdentities: Seq[String] = Seq.empty,
     upstreamDropped: Boolean = false
+)
+
+final case class StreamingArchiveContext(
+    action: String,
+    operationId: String,
+    rootTarget: String,
+    causedBy: Option[String] = None,
+    rebuildDecision: Option[StreamingRebuildDecision] = None
 )
 
 final case class StreamingTableCascadeTarget(
@@ -669,26 +680,31 @@ object StreamingTableMetadata {
       target: StreamingTableTarget,
       replacementDefinitionHash: String,
       sourcePaths: Seq[String],
+      rebuildDecision: StreamingRebuildDecision,
       descendants: Seq[StreamingTableCascadeTarget] = Seq.empty
   ): StreamingTableResetIntent = {
-    val intent = StreamingTableResetIntent(
+    val proposed = StreamingTableResetIntent(
       targetIdentity = target.identity,
       targetPath = target.dataPath,
       oldDeltaTableId = target.deltaTableId,
       replacementDefinitionHash = replacementDefinitionHash,
       sourcePaths = sourcePaths.distinct.sorted,
+      operationId = UUID.randomUUID().toString,
+      rebuildDecision = Some(rebuildDecision),
       descendants = descendants
     )
     val path = resetIntentPath(spark, target)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
-    if (fs.exists(path)) {
+    val intent = if (fs.exists(path)) {
       val existing = parseResetIntent(readText(fs, path), target.sqlIdentifier)
-      if (existing != intent)
+      if (!sameResetRequest(existing, proposed))
         StreamingTableErrors.invalid(
           s"Reset journal $path belongs to a different target or replacement definition; recovery is required"
         )
+      existing
     } else {
-      writeNewAtomically(fs, path, resetIntentJson(intent).getBytes(StandardCharsets.UTF_8))
+      writeNewAtomically(fs, path, resetIntentJson(proposed).getBytes(StandardCharsets.UTF_8))
+      proposed
     }
     val index   = resetIndexPath(spark, target.identity)
     val indexFs = index.getFileSystem(spark.sessionState.newHadoopConf())
@@ -704,6 +720,18 @@ object StreamingTableMetadata {
     intent
   }
 
+  private def sameResetRequest(
+      existing: StreamingTableResetIntent,
+      proposed: StreamingTableResetIntent
+  ): Boolean =
+    existing.targetIdentity == proposed.targetIdentity &&
+      existing.targetPath == proposed.targetPath &&
+      existing.oldDeltaTableId == proposed.oldDeltaTableId &&
+      existing.replacementDefinitionHash == proposed.replacementDefinitionHash &&
+      existing.sourcePaths == proposed.sourcePaths &&
+      existing.descendants == proposed.descendants &&
+      (existing.rebuildDecision.isEmpty || existing.rebuildDecision == proposed.rebuildDecision)
+
   def updateResetIntent(
       spark: SparkSession,
       previous: StreamingTableResetIntent,
@@ -715,6 +743,8 @@ object StreamingTableMetadata {
       previous.oldDeltaTableId != updated.oldDeltaTableId ||
       previous.replacementDefinitionHash != updated.replacementDefinitionHash ||
       previous.sourcePaths != updated.sourcePaths ||
+      previous.operationId != updated.operationId ||
+      previous.rebuildDecision != updated.rebuildDecision ||
       previous.descendants != updated.descendants
     )
       StreamingTableErrors.invalid("Refusing to rewrite immutable reset-journal fields")
@@ -834,6 +864,8 @@ object StreamingTableMetadata {
       left.oldDeltaTableId == right.oldDeltaTableId &&
       left.replacementDefinitionHash == right.replacementDefinitionHash &&
       left.sourcePaths == right.sourcePaths &&
+      left.operationId == right.operationId &&
+      left.rebuildDecision == right.rebuildDecision &&
       left.descendants == right.descendants
 
   private def isResetProgressPredecessor(
@@ -858,7 +890,11 @@ object StreamingTableMetadata {
       tableId = ""
     )
     assertSafeForDeletion(spark, target, sourcePaths)
-    archiveCheckpoint(spark, target, "reset-recovery")
+    archiveCheckpoint(
+      spark,
+      target,
+      archiveContext(intent, "reset-recovery", causedBy = None)
+    )
     val path = new Path(intent.targetPath)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
     if (fs.exists(path) && !fs.delete(path, true))
@@ -869,7 +905,8 @@ object StreamingTableMetadata {
 
   def deleteCascadeOwnedPath(
       spark: SparkSession,
-      target: StreamingTableCascadeTarget
+      target: StreamingTableCascadeTarget,
+      context: StreamingArchiveContext
   ): Unit = {
     val owned = StreamingTableTarget(
       name = target.name,
@@ -880,7 +917,7 @@ object StreamingTableMetadata {
       tableId = target.tableId
     )
     assertSafeForDeletion(spark, owned, target.sourcePaths)
-    archiveCheckpoint(spark, owned, "cascade")
+    archiveCheckpoint(spark, owned, context)
     val path = new Path(target.dataPath)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
     if (fs.exists(path) && !fs.delete(path, true))
@@ -911,10 +948,10 @@ object StreamingTableMetadata {
       spark: SparkSession,
       target: StreamingTableTarget,
       sourcePaths: Seq[String],
-      archiveReason: String
+      archiveContext: StreamingArchiveContext
   ): Unit = {
     assertSafeForDeletion(spark, target, sourcePaths)
-    archiveCheckpoint(spark, target, archiveReason)
+    archiveCheckpoint(spark, target, archiveContext)
     spark.sql(s"DROP TABLE ${target.sqlIdentifier}").collect()
     if (catalogTableExists(spark, target.name))
       StreamingTableErrors.invalid(
@@ -931,7 +968,7 @@ object StreamingTableMetadata {
   def archiveCheckpoint(
       spark: SparkSession,
       target: StreamingTableTarget,
-      reason: String
+      context: StreamingArchiveContext
   ): Option[String] = {
     val checkpoint = new Path(target.checkpointLocation)
     val targetPath = new Path(target.dataPath)
@@ -955,12 +992,20 @@ object StreamingTableMetadata {
         archivedCheckpoint = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
       }
       val event = Mapper.createObjectNode()
-      event.put("reason", reason)
+      event.put("format", "openivm-streaming-checkpoint-archive")
+      event.put("formatVersion", 1)
+      event.put("eventId", UUID.randomUUID().toString)
+      event.put("action", context.action)
+      event.put("operationId", context.operationId)
+      event.put("rootTarget", context.rootTarget)
+      context.causedBy.foreach(event.put("causedBy", _))
       event.put("archivedAtUtcEpochMillis", archivedAt)
-      event.put("targetIdentity", target.identity)
-      event.put("targetPath", target.dataPath)
-      event.put("deltaTableId", target.deltaTableId)
-      event.put("tableId", target.tableId)
+      val targetNode = event.putObject("target")
+      targetNode.put("identity", target.identity)
+      targetNode.put("path", target.dataPath)
+      targetNode.put("deltaTableId", target.deltaTableId)
+      targetNode.put("tableId", target.tableId)
+      context.rebuildDecision.foreach(decision => writeRebuildDecision(event.putObject("decision"), decision))
       val eventPath = new Path(checkpoint, ArchiveEventFile)
       if (!fs.exists(eventPath))
         writeNewAtomically(
@@ -979,6 +1024,19 @@ object StreamingTableMetadata {
       Some(archivedCheckpoint.toString)
     }
   }
+
+  private def archiveContext(
+      intent: StreamingTableResetIntent,
+      action: String,
+      causedBy: Option[String]
+  ): StreamingArchiveContext =
+    StreamingArchiveContext(
+      action = action,
+      operationId = intent.operationId,
+      rootTarget = intent.targetIdentity,
+      causedBy = causedBy,
+      rebuildDecision = intent.rebuildDecision
+    )
 
   private def targetFromLog(
       spark: SparkSession,
@@ -1190,6 +1248,8 @@ object StreamingTableMetadata {
     root.put("targetPath", intent.targetPath)
     root.put("oldDeltaTableId", intent.oldDeltaTableId)
     root.put("replacementDefinitionHash", intent.replacementDefinitionHash)
+    if (intent.operationId.nonEmpty) root.put("operationId", intent.operationId)
+    intent.rebuildDecision.foreach(decision => writeRebuildDecision(root.putObject("rebuildDecision"), decision))
     val paths = root.putArray("sourcePaths")
     intent.sourcePaths.sorted.foreach(path => paths.add(path))
     val descendants = root.putArray("descendants")
@@ -1292,11 +1352,11 @@ object StreamingTableMetadata {
           s"Reset journal marks the upstream dropped before every descendant completed for $targetName"
         )
       StreamingTableResetIntent(
-        requiredText(root, "targetIdentity", targetName),
-        requiredText(root, "targetPath", targetName),
-        requiredText(root, "oldDeltaTableId", targetName),
-        requiredText(root, "replacementDefinitionHash", targetName),
-        sourcePaths
+        targetIdentity = requiredText(root, "targetIdentity", targetName),
+        targetPath = requiredText(root, "targetPath", targetName),
+        oldDeltaTableId = requiredText(root, "oldDeltaTableId", targetName),
+        replacementDefinitionHash = requiredText(root, "replacementDefinitionHash", targetName),
+        sourcePaths = sourcePaths
           .elements()
           .asScala
           .toSeq
@@ -1307,9 +1367,11 @@ object StreamingTableMetadata {
           }
           .distinct
           .sorted,
-        descendants,
-        completed.distinct,
-        upstreamDropped
+        operationId = Option(root.get("operationId")).filter(_.isTextual).map(_.asText()).getOrElse(""),
+        rebuildDecision = Option(root.get("rebuildDecision")).map(parseRebuildDecision(_, targetName)),
+        descendants = descendants,
+        completedDescendantIdentities = completed.distinct,
+        upstreamDropped = upstreamDropped
       )
     } catch {
       case error: org.apache.spark.sql.AnalysisException => throw error
@@ -1318,6 +1380,46 @@ object StreamingTableMetadata {
           s"Cannot parse reset journal for $targetName: ${Option(error.getMessage).getOrElse(error.toString)}"
         )
     }
+
+  private def writeRebuildDecision(node: ObjectNode, decision: StreamingRebuildDecision): Unit = {
+    node.put("code", decision.code)
+    node.put("summary", decision.summary)
+    node.put("previousFingerprint", decision.previousFingerprint)
+    node.put("requestedFingerprint", decision.requestedFingerprint)
+    node.put("normalizedQueryChanged", decision.normalizedQueryChanged)
+    val changes = node.putArray("changes")
+    decision.changes.foreach { change =>
+      val entry = changes.addObject()
+      entry.put("path", change.path)
+      entry.put("category", change.category)
+      entry.put("previous", change.previous)
+      entry.put("requested", change.requested)
+    }
+  }
+
+  private def parseRebuildDecision(node: JsonNode, targetName: String): StreamingRebuildDecision = {
+    if (!node.isObject)
+      StreamingTableErrors.invalid(s"Reset journal rebuildDecision is corrupt for $targetName")
+    val changesNode = requiredNode(node, "changes", targetName)
+    if (!changesNode.isArray)
+      StreamingTableErrors.invalid(s"Reset journal rebuildDecision changes are corrupt for $targetName")
+    val changes = changesNode.elements().asScala.toSeq.map { change =>
+      StreamingDefinitionChange(
+        path = requiredText(change, "path", targetName),
+        category = requiredText(change, "category", targetName),
+        previous = textValue(change, "previous", targetName),
+        requested = textValue(change, "requested", targetName)
+      )
+    }
+    StreamingRebuildDecision(
+      code = requiredText(node, "code", targetName),
+      summary = requiredText(node, "summary", targetName),
+      previousFingerprint = requiredText(node, "previousFingerprint", targetName),
+      requestedFingerprint = requiredText(node, "requestedFingerprint", targetName),
+      normalizedQueryChanged = Option(node.get("normalizedQueryChanged")).exists(_.asBoolean(false)),
+      changes = changes
+    )
+  }
 
   private def requiredNode(node: JsonNode, field: String, targetName: String): JsonNode =
     Option(node.get(field))
@@ -1329,6 +1431,12 @@ object StreamingTableMetadata {
       .filter(_.isTextual)
       .map(_.asText())
       .filter(_.nonEmpty)
+      .getOrElse(StreamingTableErrors.invalid(s"Manifest for $targetName has invalid '$field'"))
+
+  private def textValue(node: JsonNode, field: String, targetName: String): String =
+    Option(node.get(field))
+      .filter(_.isTextual)
+      .map(_.asText())
       .getOrElse(StreamingTableErrors.invalid(s"Manifest for $targetName has invalid '$field'"))
 
   private def requiredInt(node: JsonNode, field: String, targetName: String): Int =

@@ -149,13 +149,16 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
         .toSeq
   }
 
-  protected def checkpointArchiveReason(archivedCheckpoint: Path): String = {
+  protected def checkpointArchiveEvent(archivedCheckpoint: Path): com.fasterxml.jackson.databind.JsonNode = {
     val event = new Path(archivedCheckpoint, StreamingTableMetadata.ArchiveEventFile)
     val fs    = event.getFileSystem(spark.sessionState.newHadoopConf())
     val input = fs.open(event)
-    try new ObjectMapper().readTree(input).get("reason").asText()
+    try new ObjectMapper().readTree(input)
     finally input.close()
   }
+
+  protected def checkpointArchiveReason(archivedCheckpoint: Path): String =
+    checkpointArchiveEvent(archivedCheckpoint).get("action").asText()
 
   private def deleteRecursively(file: File): Unit = {
     if (file.isDirectory) Option(file.listFiles()).foreach(_.foreach(deleteRecursively))

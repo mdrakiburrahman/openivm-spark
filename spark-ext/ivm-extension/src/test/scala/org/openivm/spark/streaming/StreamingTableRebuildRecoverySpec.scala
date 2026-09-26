@@ -6,6 +6,7 @@ import org.openivm.spark.common.StreamingDependencyCatalog
 import org.scalatest.funspec.AnyFunSpec
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTestFixture {
 
@@ -81,6 +82,17 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       archives.head.getName should fullyMatch regex
         s"${StreamingTableMetadata.CheckpointDirectory}-[0-9]+"
       checkpointArchiveReason(archives.head) shouldBe "rebuild"
+      val event    = checkpointArchiveEvent(archives.head)
+      val decision = event.get("decision")
+      decision.get("code").asText() shouldBe "SEMANTIC_DEFINITION_CHANGED"
+      decision.get("normalizedQueryChanged").asBoolean() shouldBe true
+      val categories = decision
+        .get("changes")
+        .elements()
+        .asScala
+        .map(_.get("category").asText())
+        .toSet
+      categories should contain allOf ("query_plan", "target_schema", "destination_layout", "properties")
       assertBagEqual(target, "SELECT 1 AS id, 'east' AS part UNION ALL SELECT 2, 'west'")
     }
 
@@ -117,13 +129,30 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
         targetInfo.identity,
         runtime
       )
-      StreamingTableMetadata.writeOrVerifyResetIntent(
+      val decision = StreamingTableDefinition.rebuildDecision(
+        manifest.definitionHash,
+        manifest.semanticJson,
+        manifest.diagnosticJson,
+        definition
+      )
+      val intent = StreamingTableMetadata.writeOrVerifyResetIntent(
         spark,
         targetInfo,
         definition.fingerprint,
-        manifest.sourcePaths
+        manifest.sourcePaths,
+        decision
       )
-      StreamingTableMetadata.dropOwnedCatalogAndData(spark, targetInfo, manifest.sourcePaths, "rebuild")
+      StreamingTableMetadata.dropOwnedCatalogAndData(
+        spark,
+        targetInfo,
+        manifest.sourcePaths,
+        StreamingArchiveContext(
+          action = "rebuild",
+          operationId = intent.operationId,
+          rootTarget = intent.targetIdentity,
+          rebuildDecision = intent.rebuildDecision
+        )
+      )
 
       an[org.apache.spark.sql.AnalysisException] should be thrownBy {
         createStreaming(
@@ -192,6 +221,11 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       checkpointArchiveReason(archivedA.head) shouldBe "rebuild"
       checkpointArchiveReason(archivedB.head) shouldBe "cascade"
       checkpointArchiveReason(archivedC.head) shouldBe "cascade"
+      val events       = Seq(archivedA.head, archivedB.head, archivedC.head).map(checkpointArchiveEvent)
+      val operationIds = events.map(_.get("operationId").asText()).distinct
+      operationIds should have size 1
+      events.map(_.get("rootTarget").asText()).distinct shouldBe Seq(oldA.identity)
+      events.foreach(_.get("decision").get("code").asText() shouldBe "SEMANTIC_DEFINITION_CHANGED")
 
       val newA = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(a), requireTableIdMarker = true)
       newA.deltaTableId should not be oldA.deltaTableId

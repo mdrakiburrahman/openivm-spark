@@ -21,7 +21,7 @@ import org.openivm.spark.common.{
 }
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.{Collections, WeakHashMap}
+import java.util.{Collections, UUID, WeakHashMap}
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -195,6 +195,7 @@ object StreamingTableManager {
     val manifest = StreamingTableMetadata.readManifest(spark, target)
     StreamingTableMetadata.verifyOwned(spark, target, manifest)
     val descendants = resolveCascadeDescendants(spark, target)
+    val operationId = UUID.randomUUID().toString
     val streamingLockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
       .map(StreamingTableRegistry.lifecycleLockKey)
     val materializedLockKeys =
@@ -206,7 +207,16 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Downstream dependencies for ${target.sqlIdentifier} changed during DROP admission"
           )
-        dropResolvedCascade(spark, descendants)
+        dropResolvedCascade(
+          spark,
+          descendants,
+          StreamingArchiveContext(
+            action = "cascade",
+            operationId = operationId,
+            rootTarget = target.identity,
+            causedBy = Some(target.identity)
+          )
+        )
         val registryKey = StreamingTableRegistry.targetKey(target)
         stopNative(spark, target, registryKey)
         val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
@@ -218,7 +228,16 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Target ${target.sqlIdentifier} changed after its writer stopped; refusing deletion"
           )
-        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "drop")
+        StreamingTableMetadata.dropOwnedCatalogAndData(
+          spark,
+          current,
+          manifest.sourcePaths,
+          StreamingArchiveContext(
+            action = "drop",
+            operationId = operationId,
+            rootTarget = current.identity
+          )
+        )
         StreamingTableRegistry.forget(spark, registryKey)
         StreamingDependencyCatalog.remove(spark, target.identity)
         StreamingTableStatus(
@@ -312,12 +331,18 @@ object StreamingTableManager {
       !exactDefinition &&
         StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
     if (!exactDefinition && !compatibleLegacyDefinition) {
+      val rebuildDecision = StreamingTableDefinition.rebuildDecision(
+        manifest.definitionHash,
+        manifest.semanticJson,
+        manifest.diagnosticJson,
+        definition
+      )
       if (runtime.onQueryChange != "rebuild")
         StreamingTableErrors.invalid(
           s"Streaming table ${target.sqlIdentifier} has a different semantic definition; " +
             "submit OPTIONS ('onQueryChange'='rebuild') to replace this owned target"
         )
-      rebuild(spark, frame, spec, runtime, definition, target, manifest)
+      rebuild(spark, frame, spec, runtime, definition, target, manifest, rebuildDecision)
     } else {
       publishDependencyTarget(spark, target, definition)
       val registryKey   = StreamingTableRegistry.targetKey(target)
@@ -350,7 +375,8 @@ object StreamingTableManager {
       runtime: StreamingRuntimeOptions,
       definition: StreamingTableDefinition,
       target: StreamingTableTarget,
-      manifest: StreamingTableManifest
+      manifest: StreamingTableManifest,
+      rebuildDecision: StreamingRebuildDecision
   ): StreamingTableStatus = {
     val pending = StreamingTableMetadata.pendingResetIntent(spark, target)
     val descendants = pending
@@ -372,6 +398,7 @@ object StreamingTableManager {
             target,
             definition.fingerprint,
             manifest.sourcePaths,
+            rebuildDecision,
             descendants
           )
           StreamingDependencyCatalog.backupNow(spark)
@@ -390,7 +417,17 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
           )
-        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "rebuild")
+        StreamingTableMetadata.dropOwnedCatalogAndData(
+          spark,
+          current,
+          manifest.sourcePaths,
+          StreamingArchiveContext(
+            action = "rebuild",
+            operationId = intent.operationId,
+            rootTarget = intent.targetIdentity,
+            rebuildDecision = intent.rebuildDecision
+          )
+        )
         StreamingTableRegistry.forget(spark, registryKey)
         StreamingDependencyCatalog.remove(spark, target.identity)
         val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
@@ -423,9 +460,10 @@ object StreamingTableManager {
 
   private[spark] def dropResolvedCascade(
       spark: SparkSession,
-      descendants: Seq[StreamingTableCascadeTarget]
+      descendants: Seq[StreamingTableCascadeTarget],
+      context: StreamingArchiveContext
   ): Unit =
-    descendants.foreach(dropCascadeTarget(spark, _))
+    descendants.foreach(dropCascadeTarget(spark, _, context))
 
   private def resolveCascadeDescendants(
       spark: SparkSession,
@@ -633,7 +671,7 @@ object StreamingTableManager {
       if (intent.completedDescendantIdentities.contains(descendant.identity)) intent
       else {
         beforeCascadeDropHookForTesting(descendant)
-        dropCascadeTarget(spark, descendant)
+        dropCascadeTarget(spark, descendant, intent)
         val updated = intent.copy(
           completedDescendantIdentities = intent.completedDescendantIdentities :+ descendant.identity
         )
@@ -644,7 +682,25 @@ object StreamingTableManager {
 
   private def dropCascadeTarget(
       spark: SparkSession,
-      descendant: StreamingTableCascadeTarget
+      descendant: StreamingTableCascadeTarget,
+      intent: StreamingTableResetIntent
+  ): Unit =
+    dropCascadeTarget(
+      spark,
+      descendant,
+      StreamingArchiveContext(
+        action = "cascade",
+        operationId = intent.operationId,
+        rootTarget = intent.targetIdentity,
+        causedBy = Some(intent.targetIdentity),
+        rebuildDecision = intent.rebuildDecision
+      )
+    )
+
+  private def dropCascadeTarget(
+      spark: SparkSession,
+      descendant: StreamingTableCascadeTarget,
+      context: StreamingArchiveContext
   ): Unit =
     descendant.kind match {
       case "streaming" =>
@@ -676,9 +732,14 @@ object StreamingTableManager {
             StreamingTableErrors.invalid(
               s"Downstream target ${target.sqlIdentifier} source metadata changed during cascade cleanup"
             )
-          StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "cascade")
+          StreamingTableMetadata.dropOwnedCatalogAndData(
+            spark,
+            current,
+            manifest.sourcePaths,
+            context
+          )
         } else {
-          StreamingTableMetadata.deleteCascadeOwnedPath(spark, descendant)
+          StreamingTableMetadata.deleteCascadeOwnedPath(spark, descendant, context)
         }
         StreamingTableRegistry.forget(spark, registryKey)
         StreamingDependencyCatalog.remove(spark, descendant.identity)

@@ -7955,7 +7955,17 @@ case class DropMaterializedViewCommand(
                       s"Materialized view '${metaName(name)}' dependencies changed during DROP admission"
                   )
                 )
-              StreamingTableManager.dropResolvedCascade(spark, descendants)
+              val identity = StreamingDependencyCatalog.materializedIdentity(metaName(name))
+              StreamingTableManager.dropResolvedCascade(
+                spark,
+                descendants,
+                org.openivm.spark.streaming.StreamingArchiveContext(
+                  action = "cascade",
+                  operationId = UUID.randomUUID().toString,
+                  rootTarget = identity,
+                  causedBy = Some(identity)
+                )
+              )
               MaterializedViewLifecycle.dropOne(spark, name, meta)
               Seq.empty
             }
