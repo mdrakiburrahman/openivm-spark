@@ -17,6 +17,7 @@ import org.openivm.spark.common.DeltaTableVersion
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
@@ -92,6 +93,12 @@ object StreamingTableMetadata {
   )
   private val Mapper       = new ObjectMapper()
   private val MaxJsonBytes = 1024 * 1024
+  private[streaming] val ManifestReadRetryTimeoutMsKey =
+    "spark.openivm.streaming.manifestReadRetryTimeoutMs"
+  private[streaming] val ManifestReadRetryIntervalMsKey =
+    "spark.openivm.streaming.manifestReadRetryIntervalMs"
+  private val DefaultManifestReadRetryTimeoutMs  = 15000L
+  private val DefaultManifestReadRetryIntervalMs = 250L
 
   def canonicalIdentity(spark: SparkSession, name: Seq[String]): String = {
     if (name.isEmpty || name.exists(part => Option(part).forall(_.trim.isEmpty)))
@@ -551,15 +558,33 @@ object StreamingTableMetadata {
     new Path(new Path(target.checkpointLocation), s"$OpenIvmDirectory/$DefinitionFile")
 
   def readManifest(spark: SparkSession, target: StreamingTableTarget): StreamingTableManifest = {
-    val path = definitionPath(target)
-    val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
-    if (!fs.exists(path))
-      StreamingTableErrors.invalid(
-        s"Owned target ${target.sqlIdentifier} is missing $DefinitionFile; automatic DROP is intentionally " +
-          "blocked because source-overlap safety metadata is unavailable. Restore the manifest or perform a " +
-          "verified manual cleanup."
+    val path       = definitionPath(target)
+    val fs         = path.getFileSystem(spark.sessionState.newHadoopConf())
+    val timeoutMs  = spark.conf.get(ManifestReadRetryTimeoutMsKey, DefaultManifestReadRetryTimeoutMs.toString).toLong
+    val intervalMs = spark.conf.get(ManifestReadRetryIntervalMsKey, DefaultManifestReadRetryIntervalMs.toString).toLong
+    val deadline   = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(math.max(0L, timeoutMs))
+
+    var content: Option[String] = None
+    while (content.isEmpty && System.nanoTime() <= deadline) {
+      try {
+        if (fs.exists(path))
+          content = Some(readText(fs, path))
+      } catch {
+        case _: java.io.FileNotFoundException => ()
+      }
+      if (content.isEmpty && System.nanoTime() < deadline)
+        Thread.sleep(math.max(1L, intervalMs))
+    }
+
+    content
+      .map(parseManifest(_, target.sqlIdentifier))
+      .getOrElse(
+        StreamingTableErrors.invalid(
+          s"Owned target ${target.sqlIdentifier} is missing $DefinitionFile; automatic DROP is intentionally " +
+            "blocked because source-overlap safety metadata is unavailable. Restore the manifest or perform a " +
+            "verified manual cleanup."
+        )
       )
-    parseManifest(readText(fs, path), target.sqlIdentifier)
   }
 
   def writeManifest(

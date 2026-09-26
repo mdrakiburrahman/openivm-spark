@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.{Collections, WeakHashMap}
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 final case class StreamingTableStatus(
     tableName: String,
@@ -260,7 +261,7 @@ object StreamingTableManager {
               StreamingTableMetadata.verifyOwned(spark, owned, manifest)
               statusFor(spark, owned, manifest, forcedStatus = None)
             } catch {
-              case error: org.apache.spark.sql.AnalysisException =>
+              case NonFatal(error) =>
                 StreamingTableStatus(
                   tableName = owned.sqlIdentifier,
                   queryId = None,
