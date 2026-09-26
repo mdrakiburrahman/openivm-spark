@@ -218,7 +218,7 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Target ${target.sqlIdentifier} changed after its writer stopped; refusing deletion"
           )
-        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "drop")
         StreamingTableRegistry.forget(spark, registryKey)
         StreamingDependencyCatalog.remove(spark, target.identity)
         StreamingTableStatus(
@@ -307,7 +307,11 @@ object StreamingTableManager {
       manifest: StreamingTableManifest
   ): StreamingTableStatus = {
     reconcileResetJournal(spark, target, manifest, definition, runtime)
-    if (manifest.definitionHash != definition.fingerprint) {
+    val exactDefinition = manifest.definitionHash == definition.fingerprint
+    val compatibleLegacyDefinition =
+      !exactDefinition &&
+        StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
+    if (!exactDefinition && !compatibleLegacyDefinition) {
       if (runtime.onQueryChange != "rebuild")
         StreamingTableErrors.invalid(
           s"Streaming table ${target.sqlIdentifier} has a different semantic definition; " +
@@ -319,12 +323,14 @@ object StreamingTableManager {
       val registryKey   = StreamingTableRegistry.targetKey(target)
       val active        = StreamingTableRegistry.findActive(spark, registryKey, target)
       val changedTuning = manifest.operationalHash != definition.operationalHash
+      val effectiveManifest =
+        if (compatibleLegacyDefinition || changedTuning)
+          StreamingTableMetadata.replaceManifest(spark, target, definition)
+        else manifest
       if (active.nonEmpty && !changedTuning)
-        statusFor(spark, target, manifest, forcedStatus = Some("active"))
+        statusFor(spark, target, effectiveManifest, forcedStatus = Some("active"))
       else {
         if (active.nonEmpty) stopNative(spark, target, registryKey)
-        val effectiveManifest =
-          if (changedTuning) StreamingTableMetadata.replaceManifest(spark, target, definition) else manifest
         startNative(
           spark,
           frame,
@@ -384,7 +390,7 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
           )
-        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+        StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "rebuild")
         StreamingTableRegistry.forget(spark, registryKey)
         StreamingDependencyCatalog.remove(spark, target.identity)
         val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
@@ -670,7 +676,7 @@ object StreamingTableManager {
             StreamingTableErrors.invalid(
               s"Downstream target ${target.sqlIdentifier} source metadata changed during cascade cleanup"
             )
-          StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths)
+          StreamingTableMetadata.dropOwnedCatalogAndData(spark, current, manifest.sourcePaths, "cascade")
         } else {
           StreamingTableMetadata.deleteCascadeOwnedPath(spark, descendant)
         }

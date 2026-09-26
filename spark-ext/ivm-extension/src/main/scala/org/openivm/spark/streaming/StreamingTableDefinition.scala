@@ -1,6 +1,7 @@
 package org.openivm.spark.streaming
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedAttribute, UnresolvedRelation, UnresolvedStar}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
@@ -215,6 +216,12 @@ object StreamingTableDefinition {
     """(?i)(['"]?(?:password|secret|token|access[_-]?key|credential|""" +
       """private[_-]?key|keytab|oauth|sas)['"]?\s*(?:=|:)\s*['"]?)([^,'"\s)]+)"""
   )
+  private val CommonExpressionIdClass = "org.apache.spark.sql.catalyst.expressions.CommonExpressionId"
+  private val CommonExpressionIdToken = "<common-expression-id>"
+  private val LegacyCommonExpressionIdPattern = Pattern.compile(
+    """product:org\.apache\.spark\.sql\.catalyst\.expressions\.CommonExpressionId""" +
+      """\(\[value:java\.lang\.Long:"-?\d+",value:java\.lang\.Boolean:"(?:true|false)"\]\)"""
+  )
 
   def build(
       spark: SparkSession,
@@ -337,6 +344,22 @@ object StreamingTableDefinition {
       .digest(text.getBytes(StandardCharsets.UTF_8))
       .map("%02x".format(_))
       .mkString
+
+  private[streaming] def semanticallyEquivalent(left: String, right: String): Boolean =
+    normalizeSemanticJson(left) == normalizeSemanticJson(right)
+
+  private def normalizeSemanticJson(json: String): String = {
+    val root = Mapper.readTree(json).deepCopy[ObjectNode]()
+    Seq("declarationPlan", "analyzedPlan").foreach { field =>
+      Option(root.get(field))
+        .filter(_.isTextual)
+        .foreach(node => root.put(field, normalizeLegacyPlan(node.asText())))
+    }
+    Mapper.writeValueAsString(root)
+  }
+
+  private def normalizeLegacyPlan(plan: String): String =
+    LegacyCommonExpressionIdPattern.matcher(plan).replaceAll(CommonExpressionIdToken)
 
   def redactText(text: String): String =
     InlineSecretPattern.matcher(Option(text).getOrElse("")).replaceAll("$1[REDACTED]")
@@ -853,10 +876,11 @@ object StreamingTableDefinition {
         .sortBy(_._1)
         .map { case (key, inner) => s"$key=$inner" }
         .mkString("map[", ",", "]")
-    case values: Iterable[_]                                              => encodeSeq(values.toSeq.map(encodeValue))
-    case values: Array[_]                                                 => encodeSeq(values.toSeq.map(encodeValue))
-    case value: String                                                    => jsonString(value)
-    case value: Product if value.getClass.getName.endsWith(".Statistics") => "<statistics>"
+    case values: Iterable[_]                                                 => encodeSeq(values.toSeq.map(encodeValue))
+    case values: Array[_]                                                    => encodeSeq(values.toSeq.map(encodeValue))
+    case value: String                                                       => jsonString(value)
+    case value: Product if value.getClass.getName == CommonExpressionIdClass => CommonExpressionIdToken
+    case value: Product if value.getClass.getName.endsWith(".Statistics")    => "<statistics>"
     case value: Product =>
       s"product:${value.getClass.getName}(${encodeSeq(value.productIterator.toSeq.map(encodeValue))})"
     case value => s"value:${value.getClass.getName}:${jsonString(value.toString)}"

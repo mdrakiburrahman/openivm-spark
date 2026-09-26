@@ -157,5 +157,29 @@ class StreamingTableFingerprintSpec extends AnyFunSpec with StreamingTableTestFi
       definition.semanticJson should include("source_cte")
       definition.operationalJson should include("maxfilespertrigger")
     }
+
+    it("ignores ephemeral Spark common-expression IDs and migrates legacy fingerprints") {
+      val prefix =
+        """{"formatVersion":1,"declarationPlan":"stable","analyzedPlan":"before:"""
+      val suffix = """:after","outputSchema":"stable"}"""
+      val legacy127 =
+        prefix +
+          """product:org.apache.spark.sql.catalyst.expressions.CommonExpressionId(""" +
+          """[value:java.lang.Long:"127",value:java.lang.Boolean:"false"])""" +
+          suffix
+      val legacy103 =
+        prefix +
+          """product:org.apache.spark.sql.catalyst.expressions.CommonExpressionId(""" +
+          """[value:java.lang.Long:"103",value:java.lang.Boolean:"false"])""" +
+          suffix
+      val normalized = prefix + "<common-expression-id>" + suffix
+
+      StreamingTableDefinition.semanticallyEquivalent(legacy127, legacy103) shouldBe true
+      StreamingTableDefinition.semanticallyEquivalent(legacy127, normalized) shouldBe true
+      StreamingTableDefinition.semanticallyEquivalent(
+        legacy127,
+        normalized.replace("outputSchema\":\"stable", "outputSchema\":\"changed")
+      ) shouldBe false
+    }
   }
 }
