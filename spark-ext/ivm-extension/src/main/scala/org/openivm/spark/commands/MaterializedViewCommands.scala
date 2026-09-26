@@ -1604,12 +1604,15 @@ private[commands] object MvCommandHelper {
 
   val CreateRecoveryWatermarksMarker: String = "_ivm_create_watermarks_v1"
 
-  def createRecoveryTableProperties(watermarkProperties: Map[String, String]): Seq[String] = {
+  def renderTableProperties(properties: Map[String, String]): Seq[String] = {
     def quoted(value: String): String = s"'${value.replace("'", "''")}'"
-    (watermarkProperties + (CreateRecoveryWatermarksMarker -> "true")).toSeq
+    properties.toSeq
       .sortBy(_._1)
       .map { case (key, value) => s"${quoted(key)} = ${quoted(value)}" }
   }
+
+  def createRecoveryTableProperties(watermarkProperties: Map[String, String]): Seq[String] =
+    renderTableProperties(watermarkProperties + (CreateRecoveryWatermarksMarker -> "true"))
 
   def recoverCreateWatermarkProperties(
       spark: SparkSession,
@@ -3227,15 +3230,23 @@ case class CreateMaterializedViewCommand(
         .map(cols => s"CLUSTER BY (${cols.map(c => s"`${c.replace("`", "``")}`").mkString(", ")}) ")
         .getOrElse("")
 
-    val tblProps =
-      FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
+    val requiredDataTableProps =
+      FeatureGate.mvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
         (if (
            effectiveRefreshType == RefreshTypeCode.AggregateGroup &&
            usesBackingDataTable && havingPred.isEmpty && topKViewSuffix.isEmpty &&
            !propagation.requiresMvCdf
-         ) Seq("'delta.enableChangeDataFeed' = 'true'")
-         else Nil) ++
-        createRecoveryTableProperties(watermarkProps)
+         ) Map("delta.enableChangeDataFeed" -> "true")
+         else Map.empty[String, String]) ++
+        watermarkProps +
+        (CreateRecoveryWatermarksMarker -> "true")
+    val requiredDataTablePropKeys =
+      requiredDataTableProps.keySet.map(_.toLowerCase(java.util.Locale.ROOT))
+    val dataTableProps =
+      userProps.filterNot { case (key, _) =>
+        requiredDataTablePropKeys.contains(key.toLowerCase(java.util.Locale.ROOT))
+      } ++ requiredDataTableProps
+    val tblProps = renderTableProperties(dataTableProps)
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val dataWriteSql =
@@ -3441,10 +3452,15 @@ case class CreateMaterializedViewCommand(
             val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
             val projectionProperties =
               if (havingPred.isEmpty && topKViewSuffix.isEmpty)
-                s"TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') "
+                Map(MvProjectionSource.CatalogProperty -> "true")
+              else Map.empty[String, String]
+            val publicViewProperties = userProps ++ projectionProperties
+            val publicViewPropertiesClause =
+              if (publicViewProperties.nonEmpty)
+                s"TBLPROPERTIES (${renderTableProperties(publicViewProperties).mkString(", ")}) "
               else ""
             val viewSql =
-              s"CREATE VIEW ${sqlIdent(name)} ${projectionProperties}AS " +
+              s"CREATE VIEW ${sqlIdent(name)} ${publicViewPropertiesClause}AS " +
                 s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
             val t0 = System.nanoTime()
             try {

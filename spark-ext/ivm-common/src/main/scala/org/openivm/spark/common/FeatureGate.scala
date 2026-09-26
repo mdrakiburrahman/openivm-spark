@@ -809,22 +809,28 @@ object FeatureGate {
   def autoCompactSupported(clusterColumns: Seq[String]): Boolean =
     clusterColumns.size != 1
 
-  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled.
+  /** Build the properties required on an MV data table.
     *
     * `clusterColumns` is the liquid-clustering key the same DDL will emit as
     * `CLUSTER BY (...)`; it gates `delta.autoOptimize.autoCompact` (see
     * [[autoCompactSupported]]).
     */
-  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] = {
-    val props = scala.collection.mutable.ArrayBuffer.empty[String]
-    if (deletionVectorsEnabled(spark)) props += "'delta.enableDeletionVectors' = 'true'"
-    if (optimizeWriteEnabled(spark)) props += "'delta.autoOptimize.optimizeWrite' = 'true'"
+  def mvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Map[String, String] = {
+    val props = scala.collection.mutable.LinkedHashMap.empty[String, String]
+    if (deletionVectorsEnabled(spark)) props += "delta.enableDeletionVectors"    -> "true"
+    if (optimizeWriteEnabled(spark)) props += "delta.autoOptimize.optimizeWrite" -> "true"
     if (autoCompactEnabled(spark) && autoCompactSupported(clusterColumns))
-      props += "'delta.autoOptimize.autoCompact' = 'true'"
+      props += "delta.autoOptimize.autoCompact" -> "true"
     if (ChangePropagationFactory.forSession(spark).requiresMvCdf)
-      props += "'delta.enableChangeDataFeed' = 'true'"
-    props.toSeq
+      props += "delta.enableChangeDataFeed" -> "true"
+    props.toMap
   }
+
+  /** Build the SQL TBLPROPERTIES entries for an MV data table. Empty Seq means none enabled. */
+  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] =
+    mvDataTblProperties(spark, clusterColumns).toSeq.sortBy(_._1).map { case (key, value) =>
+      s"'${key.replace("'", "''")}' = '${value.replace("'", "''")}'"
+    }
 
   def buildMvDataTblProperties(spark: SparkSession): Seq[String] =
     buildMvDataTblProperties(spark, Nil)

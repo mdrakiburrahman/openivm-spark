@@ -1097,6 +1097,34 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       // Catalog metadata must be present
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
     }
+
+    it("persists user properties on the public relation without replacing it on refresh") {
+      val queryHashProperty = "dbt.fabricspark.materialized_view.query_hash"
+      val queryHash         = "0123456789abcdef0123456789abcdef"
+      spark.sql("CREATE TABLE sales_t1_props(id INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t1_props VALUES (1), (2)")
+      spark.sql(
+        s"""CREATE MATERIALIZED VIEW mv_t1_props
+           |USING DELTA
+           |TBLPROPERTIES ('$queryHashProperty' = '$queryHash')
+           |AS SELECT id FROM sales_t1_props""".stripMargin
+      )
+
+      def persistedQueryHash: String =
+        spark
+          .sql(s"SHOW TBLPROPERTIES mv_t1_props ('$queryHashProperty')")
+          .head()
+          .getString(1)
+
+      val location = MvCatalog.lookup(spark, TableIdentifier("mv_t1_props")).get.location
+      val beforeId = MvCommandHelper.deltaIdentityAt(spark, location).flatMap(_._1)
+      persistedQueryHash shouldBe queryHash
+
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t1_props")
+
+      persistedQueryHash shouldBe queryHash
+      MvCommandHelper.deltaIdentityAt(spark, location).flatMap(_._1) shouldBe beforeId
+    }
   }
 
   describe("(1a) CREATE MATERIALIZED VIEW — always-on phase telemetry") {
