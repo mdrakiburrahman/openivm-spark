@@ -73,6 +73,8 @@ final case class StreamingTableCascadeTarget(
 object StreamingTableMetadata {
 
   val CheckpointDirectory: String = "_openivm-checkpoint"
+  val ArchiveDirectory: String    = "_openivm-archive"
+  val ArchiveEventFile: String    = "_openivm-archive-event.json"
   val OpenIvmDirectory: String    = "_openivm"
   val DefinitionFile: String      = "definition-v1.json"
   val ResetIndexDirectory: String = "_openivm-streaming-reset-index"
@@ -856,6 +858,7 @@ object StreamingTableMetadata {
       tableId = ""
     )
     assertSafeForDeletion(spark, target, sourcePaths)
+    archiveCheckpoint(spark, target, "reset-recovery")
     val path = new Path(intent.targetPath)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
     if (fs.exists(path) && !fs.delete(path, true))
@@ -877,6 +880,7 @@ object StreamingTableMetadata {
       tableId = target.tableId
     )
     assertSafeForDeletion(spark, owned, target.sourcePaths)
+    archiveCheckpoint(spark, owned, "cascade")
     val path = new Path(target.dataPath)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
     if (fs.exists(path) && !fs.delete(path, true))
@@ -906,9 +910,11 @@ object StreamingTableMetadata {
   def dropOwnedCatalogAndData(
       spark: SparkSession,
       target: StreamingTableTarget,
-      sourcePaths: Seq[String]
+      sourcePaths: Seq[String],
+      archiveReason: String
   ): Unit = {
     assertSafeForDeletion(spark, target, sourcePaths)
+    archiveCheckpoint(spark, target, archiveReason)
     spark.sql(s"DROP TABLE ${target.sqlIdentifier}").collect()
     if (catalogTableExists(spark, target.name))
       StreamingTableErrors.invalid(
@@ -920,6 +926,58 @@ object StreamingTableMetadata {
       StreamingTableErrors.invalid(s"Failed to delete owned streaming-table target '${target.dataPath}'")
     if (fs.exists(path))
       StreamingTableErrors.invalid(s"Target '${target.dataPath}' still exists after deletion")
+  }
+
+  def archiveCheckpoint(
+      spark: SparkSession,
+      target: StreamingTableTarget,
+      reason: String
+  ): Option[String] = {
+    val checkpoint = new Path(target.checkpointLocation)
+    val targetPath = new Path(target.dataPath)
+    val parent = Option(targetPath.getParent).getOrElse(
+      StreamingTableErrors.invalid(
+        s"Cannot archive the checkpoint for ${target.sqlIdentifier} because its target has no parent path"
+      )
+    )
+    val fs = checkpoint.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(checkpoint)) None
+    else {
+      val tableArchive = new Path(new Path(parent, ArchiveDirectory), targetPath.getName)
+      if (!fs.exists(tableArchive) && !fs.mkdirs(tableArchive))
+        StreamingTableErrors.invalid(
+          s"Failed to create checkpoint archive directory '$tableArchive' for ${target.sqlIdentifier}"
+        )
+      var archivedAt         = System.currentTimeMillis()
+      var archivedCheckpoint = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
+      while (fs.exists(archivedCheckpoint)) {
+        archivedAt += 1L
+        archivedCheckpoint = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
+      }
+      val event = Mapper.createObjectNode()
+      event.put("reason", reason)
+      event.put("archivedAtUtcEpochMillis", archivedAt)
+      event.put("targetIdentity", target.identity)
+      event.put("targetPath", target.dataPath)
+      event.put("deltaTableId", target.deltaTableId)
+      event.put("tableId", target.tableId)
+      val eventPath = new Path(checkpoint, ArchiveEventFile)
+      if (!fs.exists(eventPath))
+        writeNewAtomically(
+          fs,
+          eventPath,
+          Mapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(event)
+        )
+      if (!fs.rename(checkpoint, archivedCheckpoint))
+        StreamingTableErrors.invalid(
+          s"Failed to archive checkpoint '${target.checkpointLocation}' to '$archivedCheckpoint'"
+        )
+      if (fs.exists(checkpoint) || !fs.exists(archivedCheckpoint))
+        StreamingTableErrors.invalid(
+          s"Checkpoint archive move from '${target.checkpointLocation}' to '$archivedCheckpoint' was incomplete"
+        )
+      Some(archivedCheckpoint.toString)
+    }
   }
 
   private def targetFromLog(

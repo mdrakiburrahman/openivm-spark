@@ -1,5 +1,6 @@
 package org.openivm.spark.streaming
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.streaming.StreamingQuery
@@ -130,6 +131,30 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
   protected def pathExists(path: String): Boolean = {
     val hadoopPath = new Path(path)
     hadoopPath.getFileSystem(spark.sessionState.newHadoopConf()).exists(hadoopPath)
+  }
+
+  protected def archivedCheckpoints(dataPath: String): Seq[Path] = {
+    val targetPath = new Path(dataPath)
+    val archive = new Path(
+      new Path(targetPath.getParent, StreamingTableMetadata.ArchiveDirectory),
+      targetPath.getName
+    )
+    val fs = archive.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(archive)) Seq.empty
+    else
+      fs.listStatus(archive)
+        .iterator
+        .map(_.getPath)
+        .filter(_.getName.startsWith(s"${StreamingTableMetadata.CheckpointDirectory}-"))
+        .toSeq
+  }
+
+  protected def checkpointArchiveReason(archivedCheckpoint: Path): String = {
+    val event = new Path(archivedCheckpoint, StreamingTableMetadata.ArchiveEventFile)
+    val fs    = event.getFileSystem(spark.sessionState.newHadoopConf())
+    val input = fs.open(event)
+    try new ObjectMapper().readTree(input).get("reason").asText()
+    finally input.close()
   }
 
   private def deleteRecursively(file: File): Unit = {

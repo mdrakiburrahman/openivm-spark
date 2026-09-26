@@ -208,6 +208,9 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       StreamingTableManager.drop(spark, Seq(target), ifExists = false).status shouldBe "dropped"
       spark.catalog.tableExists(target) shouldBe false
       pathExists(path) shouldBe false
+      val archives = archivedCheckpoints(path)
+      archives should have size 1
+      checkpointArchiveReason(archives.head) shouldBe "drop"
       StreamingTableManager.drop(spark, Seq(target), ifExists = true).status shouldBe "not_found"
     }
 

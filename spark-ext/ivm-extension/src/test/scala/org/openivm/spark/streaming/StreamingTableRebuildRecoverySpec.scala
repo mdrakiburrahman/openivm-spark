@@ -38,6 +38,14 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       )
       appendRows(source, "(1, 'one', 'east'), (2, 'two', 'west')")
       process(first)
+      val originalTarget = StreamingTableMetadata.resolveDeltaTarget(
+        spark,
+        Seq(target),
+        requireTableIdMarker = true
+      )
+      val originalCheckpoint = new Path(originalTarget.checkpointLocation)
+      val fs                 = originalCheckpoint.getFileSystem(spark.sessionState.newHadoopConf())
+      fs.exists(originalCheckpoint) shouldBe true
 
       val replacement = readStream(source).select("id", "part")
       an[org.apache.spark.sql.AnalysisException] should be thrownBy {
@@ -67,6 +75,12 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       val log = DeltaLog.forTable(spark, new Path(targetPath(target))).update()
       log.metadata.partitionColumns shouldBe Seq("part")
       log.metadata.configuration.get("openivm.test.rebuild") shouldBe Some("yes")
+      fs.exists(originalCheckpoint) shouldBe true
+      val archives = archivedCheckpoints(originalTarget.dataPath)
+      archives should have size 1
+      archives.head.getName should fullyMatch regex
+        s"${StreamingTableMetadata.CheckpointDirectory}-[0-9]+"
+      checkpointArchiveReason(archives.head) shouldBe "rebuild"
       assertBagEqual(target, "SELECT 1 AS id, 'east' AS part UNION ALL SELECT 2, 'west'")
     }
 
@@ -109,7 +123,7 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
         definition.fingerprint,
         manifest.sourcePaths
       )
-      StreamingTableMetadata.dropOwnedCatalogAndData(spark, targetInfo, manifest.sourcePaths)
+      StreamingTableMetadata.dropOwnedCatalogAndData(spark, targetInfo, manifest.sourcePaths, "rebuild")
 
       an[org.apache.spark.sql.AnalysisException] should be thrownBy {
         createStreaming(
@@ -149,15 +163,9 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       process(bStatus)
       val cStatus = createStreaming(c, readStream(b), s"SELECT id, value, part FROM STREAM $b")
       process(cStatus)
-      val bCheckpoint = StreamingTableMetadata
-        .resolveDeltaTarget(spark, Seq(b), requireTableIdMarker = true)
-        .checkpointLocation
-      val cCheckpoint = StreamingTableMetadata
-        .resolveDeltaTarget(spark, Seq(c), requireTableIdMarker = true)
-        .checkpointLocation
-      val oldAId = StreamingTableMetadata
-        .resolveDeltaTarget(spark, Seq(a), requireTableIdMarker = true)
-        .deltaTableId
+      val oldA  = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(a), requireTableIdMarker = true)
+      val oldB  = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(b), requireTableIdMarker = true)
+      val oldC  = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(c), requireTableIdMarker = true)
       val order = mutable.ArrayBuffer.empty[String]
       StreamingTableManager.setBeforeCascadeDropHookForTesting(target => order += target.name.last)
 
@@ -172,12 +180,21 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       order.toSeq shouldBe Seq(c, b)
       spark.catalog.tableExists(b) shouldBe false
       spark.catalog.tableExists(c) shouldBe false
-      pathExists(bCheckpoint) shouldBe false
-      pathExists(cCheckpoint) shouldBe false
+      pathExists(oldB.checkpointLocation) shouldBe false
+      pathExists(oldC.checkpointLocation) shouldBe false
       spark.catalog.tableExists(a) shouldBe true
+      val archivedA = archivedCheckpoints(oldA.dataPath)
+      val archivedB = archivedCheckpoints(oldB.dataPath)
+      val archivedC = archivedCheckpoints(oldC.dataPath)
+      archivedA should have size 1
+      archivedB should have size 1
+      archivedC should have size 1
+      checkpointArchiveReason(archivedA.head) shouldBe "rebuild"
+      checkpointArchiveReason(archivedB.head) shouldBe "cascade"
+      checkpointArchiveReason(archivedC.head) shouldBe "cascade"
 
       val newA = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(a), requireTableIdMarker = true)
-      newA.deltaTableId should not be oldAId
+      newA.deltaTableId should not be oldA.deltaTableId
       val recreatedB = createStreaming(b, readStream(a), s"SELECT id, value, part FROM STREAM $a")
       process(recreatedB)
       val bRecord = StreamingDependencyCatalog
