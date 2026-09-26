@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 350  # under GitHub's 6-hour hard limit
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         target: [spark-3.5, spark-4.1]
 
@@ -33,9 +33,9 @@ jobs:
       - name: Reclaim workspace from root-owned Docker artifacts
         # dev.sh verify writes root-owned files that survive on this persistent
         # runner, breaking the next checkout's git clean (EACCES). Cancelled runs
-        # also leave orphan containers still writing such files. So: kill every
-        # container FIRST (one job at a time = all orphans, like dev.sh PRE_CLEAN),
-        # THEN chown the tree back. Best-effort; this step never fails.
+        # also leave orphan containers still writing such files. Kill every
+        # container on the assigned runner first, then chown the tree back.
+        # Best-effort; this step never fails.
         shell: bash
         run: |
           set -uo pipefail
