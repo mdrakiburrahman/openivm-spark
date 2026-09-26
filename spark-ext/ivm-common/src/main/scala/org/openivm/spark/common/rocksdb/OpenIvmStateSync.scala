@@ -7,6 +7,7 @@ import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.slf4j.LoggerFactory
 
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.util.control.NonFatal
@@ -65,6 +66,19 @@ object OpenIvmStateSync {
 
   private def localRoot(spark: SparkSession): File =
     new File(FeatureGate.stateWarehouse(spark).stripSuffix("/") + "/_openivm")
+
+  private def hasLocalStateFiles(root: File): Boolean = {
+    if (!root.exists()) return false
+    val paths = Files.walk(root.toPath)
+    try {
+      val iterator = paths.iterator()
+      var found    = false
+      while (iterator.hasNext && !found) {
+        found = Files.isRegularFile(iterator.next())
+      }
+      found
+    } finally paths.close()
+  }
 
   private def canonicalLocalRoot(spark: SparkSession): String =
     try localRoot(spark).getCanonicalFile.getAbsolutePath
@@ -181,7 +195,7 @@ object OpenIvmStateSync {
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {
     val local = localRoot(spark)
-    if (local.exists() && Option(local.list()).exists(_.nonEmpty)) return
+    if (hasLocalStateFiles(local)) return
 
     val hconf      = spark.sessionState.newHadoopConf()
     val remoteRoot = new Path(uri)

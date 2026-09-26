@@ -865,6 +865,29 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
+    it("restores MV metadata when the local state root contains only empty directories") {
+      val stateRoot  = newDir("state-sync-empty-local")
+      val remoteRoot = newDir("state-sync-empty-remote")
+      val spark = newSpark(
+        "state-sync-empty-local",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val meta = sourceSharingMeta(99, "restored")
+
+      MvCatalog.upsert(spark, meta)
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      new File(stateRoot, "_openivm/mvs").mkdirs() shouldBe true
+      new File(stateRoot, "_openivm/sources").mkdirs() shouldBe true
+      OpenIvmStateSync.resetForTesting()
+
+      MvCatalog.lookup(spark, meta.name) shouldBe Some(meta)
+    }
+
     it("restores a committed batch backed up before deferred transaction cleanup is flushed") {
       val stateRoot  = newDir("state-sync-local")
       val remoteRoot = newDir("state-sync-remote")

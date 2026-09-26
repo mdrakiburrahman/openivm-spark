@@ -4,7 +4,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{
+  OpenIvmRocksDB,
+  OpenIvmRocksDBBatchOps,
+  OpenIvmRocksDBRegistry,
+  OpenIvmStateSync,
+  RocksDBCodec
+}
 import org.slf4j.LoggerFactory
 
 import java.io.File
@@ -633,6 +639,7 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     }
 
   def ensureTables(spark: SparkSession): Unit = {
+    OpenIvmStateSync.maybeRestore(spark)
     Files.createDirectories(OpenIvmStatePaths.mvsRoot(spark))
     Files.createDirectories(OpenIvmStatePaths.sourcesRoot(spark))
     ()
@@ -675,15 +682,18 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
   }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     val serializedName = serializeName(name)
     readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
   def list(spark: SparkSession): Seq[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
   }
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     dependentViewNames(spark, table)
       .flatMap { serializedName =>
         readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
