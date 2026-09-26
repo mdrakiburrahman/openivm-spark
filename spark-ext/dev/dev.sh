@@ -295,7 +295,10 @@ cmd_publish() {
             -e MAVEN_URL \
             -e MAVEN_PAT \
             -e PACKAGE_VERSION \
-            build sbt "ivmExtension/publish"
+            build sbt \
+                "ivmExtension/clean" \
+                "ivmExtension/testOnly org.openivm.spark.parser.AntlrRuntimeCompatibilitySpec" \
+                "ivmExtension/publish"
     )
 }
 
