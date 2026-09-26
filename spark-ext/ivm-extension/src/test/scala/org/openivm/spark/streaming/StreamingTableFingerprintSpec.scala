@@ -165,12 +165,12 @@ class StreamingTableFingerprintSpec extends AnyFunSpec with StreamingTableTestFi
       val legacy127 =
         prefix +
           """product:org.apache.spark.sql.catalyst.expressions.CommonExpressionId(""" +
-          """[value:java.lang.Long:"127",value:java.lang.Boolean:"false"])""" +
+          """[value:java.lang.Long:\"127\",value:java.lang.Boolean:\"false\"])""" +
           suffix
       val legacy103 =
         prefix +
           """product:org.apache.spark.sql.catalyst.expressions.CommonExpressionId(""" +
-          """[value:java.lang.Long:"103",value:java.lang.Boolean:"false"])""" +
+          """[value:java.lang.Long:\"103\",value:java.lang.Boolean:\"false\"])""" +
           suffix
       val normalized = prefix + "<common-expression-id>" + suffix
 
