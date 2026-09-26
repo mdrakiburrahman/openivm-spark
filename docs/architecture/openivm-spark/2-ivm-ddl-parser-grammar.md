@@ -591,9 +591,12 @@ addSbtPlugin("com.simplytyped" % "sbt-antlr4"    % "0.8.3")
 The runtime dependency is pinned in `spark-ext/project/Dependencies.scala`:
 
 ```scala
-val antlrV = "4.9.3"
+val antlrV = target.antlrVersion
 val antlr  = "org.antlr" % "antlr4-runtime" % antlrV
 ```
+
+The generator and runtime versions follow the selected Spark target: Spark 3.5
+uses ANTLR 4.9.3, while Spark 4.1 uses ANTLR 4.13.1.
 
 The generated package is `org.openivm.spark.parser.gen`, which is why the
 parser imports generated classes from that package:

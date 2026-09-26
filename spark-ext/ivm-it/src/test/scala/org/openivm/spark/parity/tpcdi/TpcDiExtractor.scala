@@ -446,7 +446,7 @@ object TpcDiExtractor {
   private def readAndSlice(spark: SparkSession, deltaPath: String, limitN: Int): DataFrame = {
     val raw      = spark.read.format("delta").load(deltaPath)
     val sortCols = raw.columns.map(c => col(s"`$c`").asc_nulls_first)
-    raw.orderBy(sortCols: _*).limit(limitN)
+    raw.orderBy(sortCols.toIndexedSeq: _*).limit(limitN)
   }
 
   /** Emit `data/<batchSub>/<tname>.csv` (a single file, not a directory) and
@@ -469,12 +469,14 @@ object TpcDiExtractor {
     }
 
     // Apply to_json() to every non-CSV-compatible column.
-    val csvDf = df.select(df.schema.fields.map { f =>
-      f.dataType match {
-        case _: StructType | _: ArrayType | _: MapType => to_json(col(s"`${f.name}`")).as(f.name)
-        case _                                         => col(s"`${f.name}`")
-      }
-    }: _*)
+    val csvDf = df.select(
+      df.schema.fields.map { f =>
+        f.dataType match {
+          case _: StructType | _: ArrayType | _: MapType => to_json(col(s"`${f.name}`")).as(f.name)
+          case _                                         => col(s"`${f.name}`")
+        }
+      }.toIndexedSeq: _*
+    )
 
     val dir = new File(outDir, s"data/$batchSub/.__csv_$tname")
     if (dir.exists()) deleteRecursively(dir)

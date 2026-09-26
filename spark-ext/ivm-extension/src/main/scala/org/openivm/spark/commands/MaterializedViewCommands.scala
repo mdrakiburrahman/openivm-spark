@@ -6,7 +6,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   AttributeReference,
@@ -2220,9 +2220,14 @@ private[commands] object MvCommandHelper {
             al.child.canonicalized -> al.name
         }.toMap
 
-        val rewritten = cond.transform {
+        val normalized = SparkExpressionCompat.normalizeHavingCondition(cond)
+        val rewritten = normalized.transform {
           case e: Expression if aliasMap.contains(e.canonicalized) =>
-            UnresolvedAttribute(Seq(aliasMap(e.canonicalized)))
+            AttributeReference(
+              aliasMap(e.canonicalized),
+              e.dataType,
+              nullable = true
+            )()
         }
         rewritten.sql
       }

@@ -130,7 +130,7 @@ object TpcDiFixtureLoader {
           col(s"`${f.name}`")
       }
     }
-    raw.select(select: _*)
+    raw.select(select.toIndexedSeq: _*)
   }
 
   /** Load `<resources>/tpcdi/schemas/<tname>.ddl` and parse to a StructType. */

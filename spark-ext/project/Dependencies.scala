@@ -5,7 +5,7 @@ object Dependencies {
 
   val sparkV = target.sparkVersion
   val deltaV = target.deltaVersion
-  val antlrV = "4.9.3"
+  val antlrV = target.antlrVersion
   // DuckDB JDBC pinned to track openivm's bundled DuckDB v1.5.x.
   // The .duckdb_extension binary is built from openivm@OPENIVM_COMMIT inside
   // the spark-ext Docker image.  The compiler module uses the CLI at

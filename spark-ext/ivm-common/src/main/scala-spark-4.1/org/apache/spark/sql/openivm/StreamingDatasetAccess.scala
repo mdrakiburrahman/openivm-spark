@@ -27,12 +27,11 @@ object StreamingDatasetAccess {
         fabricLakehouseTablesRoot(spark) match {
           case Some(root) =>
             val rebound = plan.transformDown {
-              case relation: UnresolvedRelation
-                  if relation.isStreaming && relation.multipartIdentifier.size == 2 =>
+              case relation: UnresolvedRelation if relation.isStreaming && relation.multipartIdentifier.size == 2 =>
                 val relative =
-                  relation.multipartIdentifier.map(segment => new Path(segment)).reduce((left, right) =>
-                    new Path(left, right)
-                  )
+                  relation.multipartIdentifier
+                    .map(segment => new Path(segment))
+                    .reduce((left, right) => new Path(left, right))
                 spark.readStream
                   .format("delta")
                   .options(relation.options.asCaseSensitiveMap().asScala.toMap)
@@ -51,26 +50,25 @@ object StreamingDatasetAccess {
   private def isMissingRelation(error: AnalysisException): Boolean =
     Option(error.getMessage).exists(_.contains("[TABLE_OR_VIEW_NOT_FOUND]"))
 
-  private def fabricLakehouseTablesRoot(spark: SparkSession): Option[Path] =
-    {
-      val explicit = Seq(
+  private def fabricLakehouseTablesRoot(spark: SparkSession): Option[Path] = {
+    val explicit = Seq(
       spark.conf.getOption("spark.openivm.managedTablesRoot"),
       spark.conf.getOption("spark.sql.warehouse.dir")
-      ).flatten
-      val sqlConf = spark.sessionState.conf.getAllConfs.values
-      val hadoopConf = spark.sparkContext.hadoopConfiguration.iterator().asScala.map(_.getValue)
-      val candidates = (explicit.iterator ++ sqlConf.iterator ++ hadoopConf).map(_.stripSuffix("/")).toSeq
-      candidates.iterator
-        .flatMap(candidate => TablesRoot.findFirstMatchIn(candidate).map(found => new Path(found.group(1))))
-        .toSeq
-        .headOption
-        .orElse(
-          candidates.iterator
-            .flatMap(candidate =>
-              LakehouseRoot.findFirstMatchIn(candidate).map(found => new Path(found.group(1) + "/Tables"))
-            )
-            .toSeq
-            .headOption
-        )
-    }
+    ).flatten
+    val sqlConf    = spark.sessionState.conf.getAllConfs.values
+    val hadoopConf = spark.sparkContext.hadoopConfiguration.iterator().asScala.map(_.getValue)
+    val candidates = (explicit.iterator ++ sqlConf.iterator ++ hadoopConf).map(_.stripSuffix("/")).toSeq
+    candidates.iterator
+      .flatMap(candidate => TablesRoot.findFirstMatchIn(candidate).map(found => new Path(found.group(1))))
+      .toSeq
+      .headOption
+      .orElse(
+        candidates.iterator
+          .flatMap(candidate =>
+            LakehouseRoot.findFirstMatchIn(candidate).map(found => new Path(found.group(1) + "/Tables"))
+          )
+          .toSeq
+          .headOption
+      )
+  }
 }

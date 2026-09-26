@@ -7,7 +7,8 @@ final case class RuntimeTarget(
     deltaArtifact: String,
     moduleName: String,
     javaVersion: String,
-    rocksDbVersion: String
+    rocksDbVersion: String,
+    antlrVersion: String
 )
 
 object RuntimeTarget {
@@ -21,7 +22,8 @@ object RuntimeTarget {
     deltaArtifact = "delta-spark",
     moduleName = "ivmextension-spark-3.5",
     javaVersion = "17",
-    rocksDbVersion = "8.3.2"
+    rocksDbVersion = "8.3.2",
+    antlrVersion = "4.9.3"
   )
 
   private val Spark41 = RuntimeTarget(
@@ -33,7 +35,8 @@ object RuntimeTarget {
     deltaArtifact = "delta-spark_4.1",
     moduleName = "ivmextension-spark-4.1",
     javaVersion = "21",
-    rocksDbVersion = "8.3.2"
+    rocksDbVersion = "8.3.2",
+    antlrVersion = "4.13.1"
   )
 
   private val targets = Seq(Spark35, Spark41).map(target => target.id -> target).toMap

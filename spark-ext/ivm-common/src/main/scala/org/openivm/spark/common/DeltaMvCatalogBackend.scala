@@ -72,7 +72,7 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       refreshType = row.getAs[Int](RefreshType),
       refreshTypeName = row.getAs[String](RefreshTypeName),
       lastVersion = row.getAs[Long](LastVersion),
-      sourceTables = row.getAs[Seq[String]](SourceTables),
+      sourceTables = row.getSeq[String](row.fieldIndex(SourceTables)).toSeq,
       sourceSchemaFingerprint = row.getAs[String](SourceSchemaFingerprint),
       location = row.getAs[String](Location),
       createdAt = row.getAs[java.sql.Timestamp](CreatedAt),

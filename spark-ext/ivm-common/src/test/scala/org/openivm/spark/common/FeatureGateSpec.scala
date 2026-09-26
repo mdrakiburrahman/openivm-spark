@@ -55,6 +55,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       val conf = new SparkConf(false).set(FeatureGate.RuntimeFilterEnabledKey, "false")
       FeatureGate.runtimeFilterConfOverrides(conf) shouldBe empty
     }
+
+    it("omits the semi-join reduction config removed in Spark 4") {
+      val o = FeatureGate.runtimeFilterConfOverrides(new SparkConf(false), sparkMajorVersion = 4)
+      o should contain("spark.sql.optimizer.runtime.bloomFilter.enabled" -> "true")
+      o should contain("spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB")
+      o should not contain key("spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled")
+    }
   }
 
   describe("FeatureGate.selectiveBroadcastEnabled") {
