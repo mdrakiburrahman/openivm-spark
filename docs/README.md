@@ -3,8 +3,8 @@
 > This document was written by AI but verified and proof-read by a human - `@mdrakiburrahman`
 
 A practical, demo-driven walkthrough of how OpenIVM delivers Incremental View
-Maintenance on Spark 3.5 + Delta Lake 3.2 — and the two upstream DuckDB
-extensions it leans on (`openivm` and `lpts`).
+Maintenance on Spark 3.5 + Delta Lake 3.2 and Spark 4.1 + Delta Lake 4.2 — and
+the two upstream DuckDB extensions it leans on (`openivm` and `lpts`).
 
 The docs are organised as **three architectural layers**:
 
@@ -37,7 +37,7 @@ The docs are organised as **three architectural layers**:
 
 ---
 
-## Layer A — `openivm-spark` (Spark 3.5 / Delta 3.2 integration)
+## Layer A — `openivm-spark` (Spark 3.5 and Spark 4.1 integration)
 
 The Scala/sbt SessionExtension that wires OpenIVM into Spark.
 

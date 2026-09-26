@@ -21,6 +21,17 @@
  *
  *   SHOW OPENIVM QUERY LOG
  *
+ *   CREATE STREAMING TABLE [IF NOT EXISTS] <multipart_identifier>
+ *     [USING <provider>] [LOCATION '<path>']
+ *     [PARTITIONED BY (<cols>)] [TBLPROPERTIES (...)] [OPTIONS (...)]
+ *     AS <query>
+ *
+ *   SHOW STREAMING TABLES [IN <namespace>]
+ *
+ *   ALTER STREAMING TABLE <multipart_identifier> STOP
+ *
+ *   DROP STREAMING TABLE [IF EXISTS] <multipart_identifier>
+ *
  * The grammar is invoked only when `IvmParser.parsePlan` sees a statement
  * whose head matches one of the forms above; otherwise the input is
  * delegated to Spark's own parser unchanged.
@@ -44,14 +55,20 @@
 grammar IvmSqlBase;
 
 ivmStatement
-    : explainCreateMaterializedView
-    | showRefreshSql
-    | createMaterializedView
-    | refreshMaterializedView
-    | advanceMaterializedViewSourceVersions
-    | dropMaterializedView
-    | showOpenivmRefreshProfile
-    | showOpenivmQueryLog
+    : ( explainCreateMaterializedView
+      | showRefreshSql
+      | createMaterializedView
+      | refreshMaterializedView
+      | advanceMaterializedViewSourceVersions
+      | dropMaterializedView
+      | showOpenivmRefreshProfile
+      | showOpenivmQueryLog
+      | createStreamingTable
+      | showStreamingTables
+      | stopStreamingTable
+      | dropStreamingTable
+      )
+      SEMICOLON* EOF
     ;
 
 createMaterializedView
@@ -104,6 +121,33 @@ showOpenivmQueryLog
     : SHOW OPENIVM QUERY LOG
     ;
 
+createStreamingTable
+    : CREATE STREAMING TABLE (IF NOT EXISTS)? multipartIdentifier
+      streamingTableClause*
+      AS queryBody
+    ;
+
+streamingTableClause
+    : USING identifier
+    | LOCATION STRING
+    | PARTITIONED BY '(' multipartIdentifier (',' multipartIdentifier)* ')'
+    | clusterByClause
+    | TBLPROPERTIES tableProperties
+    | OPTIONS tableProperties
+    ;
+
+showStreamingTables
+    : SHOW STREAMING TABLES (IN multipartIdentifier)?
+    ;
+
+stopStreamingTable
+    : ALTER STREAMING TABLE multipartIdentifier STOP
+    ;
+
+dropStreamingTable
+    : DROP STREAMING TABLE (IF EXISTS)? multipartIdentifier
+    ;
+
 queryBody
     : .+?
     ;
@@ -142,7 +186,7 @@ nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
     | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
-    | SOURCE | VERSIONS
+    | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -171,8 +215,16 @@ EXPLAIN       : [Ee][Xx][Pp][Ll][Aa][Ii][Nn];
 CLUSTER       : [Cc][Ll][Uu][Ss][Tt][Ee][Rr];
 SQL           : [Ss][Qq][Ll];
 FOR           : [Ff][Oo][Rr];
+STREAMING     : [Ss][Tt][Rr][Ee][Aa][Mm][Ii][Nn][Gg];
+TABLE         : [Tt][Aa][Bb][Ll][Ee];
+TABLES        : [Tt][Aa][Bb][Ll][Ee][Ss];
+LOCATION      : [Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn];
+OPTIONS       : [Oo][Pp][Tt][Ii][Oo][Nn][Ss];
+IN            : [Ii][Nn];
+STOP          : [Ss][Tt][Oo][Pp];
 
 EQ            : '=' | '==';
+SEMICOLON     : ';';
 
 INTEGER_VALUE : DIGIT+;
 DECIMAL_VALUE : DIGIT+ '.' DIGIT* | '.' DIGIT+ | DIGIT+ ('.' DIGIT*)? [eE] [+-]? DIGIT+;
@@ -188,3 +240,4 @@ fragment DIGIT  : [0-9];
 SIMPLE_COMMENT : '--' ~[\r\n]* '\r'? '\n'? -> channel(HIDDEN);
 BRACKETED_COMMENT : '/*' .*? '*/' -> channel(HIDDEN);
 WS : [ \r\n\t]+ -> channel(HIDDEN);
+UNRECOGNIZED : .;

@@ -9,7 +9,7 @@ import org.apache.spark.sql.types._
 import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(

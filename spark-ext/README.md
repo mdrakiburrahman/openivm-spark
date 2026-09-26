@@ -1,8 +1,17 @@
 # openivm-spark
 
-Spark 3.5 / Delta Lake 3.2 SQL extension delivering **OpenIVM incremental view maintenance** without Delta CDF.
+Spark SQL extension delivering **OpenIVM incremental view maintenance** without Delta CDF.
 
 > Status: under active development
+
+## Runtime support
+
+| Target       | Spark | Delta | Scala  | Java | Maven artifact                     |
+| ------------ | ----- | ----- | ------ | ---- | ---------------------------------- |
+| `spark-3.5`  | 3.5.1 | 3.2.0 | 2.12.17 | 17   | `ivmextension-spark-3.5_2.12`      |
+| `spark-4.1`  | 4.1.0 | 4.2.0 | 2.13.17 | 21   | `ivmextension-spark-4.1_2.13`      |
+
+Spark 3.5 remains the default for every developer command that omits `--target`.
 
 ## Layout
 
@@ -19,7 +28,8 @@ spark-ext/
 └── dev/
     ├── dev            # single entry-point CLI wrapper (build, test, verify, shell, …)
     ├── docker/        # multi-stage Dockerfile + docker-compose.yml
-    └── pins.env       # pinned SHAs of openivm / lpts / ivm-bench forks + spark / delta refs
+    ├── pins.env       # shared OpenIVM / LPTS / DuckDB pins
+    └── targets/       # target-specific Spark / Delta / Scala / JDK pins
 ```
 
 ## Supported RefreshTypes
@@ -52,10 +62,15 @@ following subcommands:
 
 ```bash
 ./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
+./spark-ext/dev/dev.sh --target spark-4.1 verify                                  # same verification on Spark 4.1 / Delta 4.2
+./spark-ext/dev/dev.sh verify-all                                                 # verify both targets and compare test inventories
 ./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench} + shallow .temp/{spark,delta} refs, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
 ./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
 ./spark-ext/dev/dev.sh build                                                      # sbt compile
 ./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
+./spark-ext/dev/dev.sh publish                                                    # publish the versioned fat jar to the ADO Maven feed
+./spark-ext/dev/dev.sh --target spark-4.1 publish                                 # publish the Spark 4.1 assembly
+./spark-ext/dev/dev.sh publish-all                                                # publish both artifacts under one version
 ./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
 ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.it.ExtensionLoadingSpec'
 ./spark-ext/dev/dev.sh fmt                                                        # scalafmtAll (auto-format)
@@ -66,13 +81,42 @@ following subcommands:
 ./spark-ext/dev/dev.sh help                                                       # this help text
 ```
 
-`verify` is the canonical one-liner — it first runs `pins-sync` (cloning any
+`publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
+computes one immutable version as
+`<epoch>.<working-tree-content-hash-int>.0`, and uses native sbt publishing to
+upload the assembly classifier. `publish` uses the selected target; `publish-all`
+uses one version for both coordinates:
+
+```text
+org.openivm:ivmextension-spark-3.5_2.12:jar:assembly:<version>
+ivmextension-spark-3.5_2.12-<version>-assembly.jar
+
+org.openivm:ivmextension-spark-4.1_2.13:jar:assembly:<version>
+ivmextension-spark-4.1_2.13-<version>-assembly.jar
+```
+
+The content hash covers every tracked file plus every untracked, non-ignored
+file, so publishing completed but not-yet-committed feature work cannot reuse
+the identity of an older source tree. Ignored credentials, build outputs,
+`.temp/`, and `.research/` remain excluded.
+
+The feed contract is intentionally assembly-only: the thin main jar is not
+published. The generated POM retains only Spark/Delta/SLF4J dependencies marked
+`provided`; internal OpenIVM modules and other compile dependencies are already
+inside the fat jar. Consumers must request the `assembly` classifier rather
+than the unclassified artifact. Local `ivmExtension/assembly` output retains the
+legacy `ivmExtension-<version>-assembly.jar` filename used by existing image
+builds; Maven artifact metadata publishes the same bytes under the lowercase,
+Scala-suffixed filename shown above.
+Copy `.env.example` to `.env` and populate the private-feed values before use.
+
+`verify` is the canonical one-target command — it first runs `pins-sync` (cloning any
 missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and
 aligning each to its pinned branch, plus shallow-cloning the read-only
 `.temp/{spark,delta}` upstream references at their pinned release tags), then
 lints, compiles, assembles the fat jar, and runs every unit + integration +
-parity suite in a single sbt JVM. Wall-clock on the reference 32-core / 124 GiB
-host is ~40 minutes end-to-end.
+parity suite in a single sbt JVM. `verify-all` runs that same pipeline for both
+targets and fails if they discover different tests.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned
@@ -115,7 +159,7 @@ shared hosts.
 
 ```bash
 spark-shell \
-    --jars target/scala-2.12/ivm-extension-0.1.0-SNAPSHOT-assembly.jar \
+    --jars spark-ext/ivm-extension/target/scala-2.12/ivmExtension-0.1.0-SNAPSHOT-assembly.jar \
     --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions \
     --conf spark.openivm.enabled=true \
     --conf spark.driver.extraJavaOptions="$(cat .sbtopts | grep -oE '^-J.*' | sed 's/^-J//' | xargs)"
@@ -296,6 +340,164 @@ The extension and its tests require Spark's standard JDK-17 `--add-opens` /
 These live in `spark-ext/.sbtopts` for sbt-launched JVMs and must be replicated
 in `spark.driver.extraJavaOptions` / `spark.executor.extraJavaOptions` when
 running spark-shell / spark-submit.
+
+## Standalone streaming tables
+
+With the feature gate enabled, the extension adds a declarative SQL surface for
+native Structured Streaming queries in the caller's existing `SparkSession`:
+
+```sql
+CREATE STREAMING TABLE IF NOT EXISTS monitoring.cleaned_events
+USING DELTA
+LOCATION '/tables/cleaned_events'
+PARTITIONED BY (event_date)
+OPTIONS (
+  'outputMode' = 'append',
+  'trigger' = 'processingTime',
+  'triggerInterval' = '10 seconds'
+)
+TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
+AS
+SELECT e.id, e.event_time, e.event_date, e.payload
+FROM STREAM monitoring.raw_events
+WITH (
+  'skipChangeCommits' = 'true',
+  'maxFilesPerTrigger' = '1000'
+) AS e;
+```
+
+`STREAM table` and `STREAM(table)` mark only that relation occurrence as
+streaming. An ordinary occurrence of the same table remains static. Each
+streaming source can carry its own case-insensitive `WITH (...)` reader options;
+duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
+rejected before Spark receives the native options.
+
+### Destination layouts
+
+Hive-style partitioning and Delta liquid clustering are separate, mutually
+exclusive destination layouts. Layout columns reference the `SELECT` output
+names, including aliases:
+
+```sql
+-- Hive-partitioned destination
+CREATE STREAMING TABLE monitoring.events_by_day
+PARTITIONED BY (event_date)
+OPTIONS ('trigger' = 'availableNow')
+AS
+SELECT id, source_date AS event_date, region, payload
+FROM STREAM monitoring.raw_events;
+
+-- Liquid-clustered destination
+CREATE STREAMING TABLE monitoring.events_clustered
+CLUSTER BY (region, event_date)
+OPTIONS ('trigger' = 'availableNow')
+AS
+SELECT id, region_code AS region, source_date AS event_date, payload
+FROM STREAM monitoring.raw_events;
+```
+
+`PARTITIONED BY` produces native Delta partition columns and directories.
+`CLUSTER BY` records native Delta clustering-domain and protocol metadata
+without Hive partition columns. Streaming appends preserve the declaration but
+do not automatically recluster existing data. Run native `OPTIMIZE` explicitly
+when physical clustering maintenance is required; Delta 3.2 supports declaring
+a single clustering key, but its Hilbert `OPTIMIZE` path requires multiple keys.
+
+`WATERMARK <named-expression> DELAY OF INTERVAL ...` is optional. When present,
+it appears before the relation alias and accepts a named input column or an
+explicitly aliased derived timestamp expression:
+
+```sql
+FROM STREAM raw_events
+WATERMARK timestamp_seconds(epoch_seconds) AS event_time
+  DELAY OF INTERVAL 5 MINUTES AS events
+```
+
+The complete `SELECT` is parsed and checked by Spark 3.5. CTEs, nested
+subqueries, stream-static joins, stream-stream joins, functions, and unsupported
+streaming operations retain native Spark semantics. Streaming source providers
+and reader options retain native Spark behavior where supported. The managed
+target sink remains Delta-only: omitting `USING` selects Delta, and an explicit
+non-Delta target provider is rejected.
+
+Lifecycle commands use the same caller session:
+
+```sql
+SHOW STREAMING TABLES;
+SHOW STREAMING TABLES IN monitoring;
+ALTER STREAMING TABLE monitoring.cleaned_events STOP;
+DROP STREAMING TABLE IF EXISTS monitoring.cleaned_events;
+```
+
+`CREATE` starts asynchronously and the query remains visible through
+`spark.streams`. `STOP` retains the target and checkpoint for a matching
+declaration to resume. `DROP STREAMING TABLE` is destructive: it stops the
+owned query and removes its owned registration, target data, and checkpoint.
+
+For a SQL client or dbt integration, successful `CREATE` statement completion
+means that the declaration was accepted, not that the query finished. Capture
+the returned `table_name`, `query_id`, and `run_id`, then poll `SHOW STREAMING
+TABLES IN <namespace>` on the same owning `SparkContext`/driver until the row
+with that identity is inactive, has status `stopped`, and has an empty
+`last_failure`. Treat failed, missing, disconnected, and timeout states as
+errors.
+
+Release downstream table references and run post-hooks only after that terminal
+check. Repeating an identical `CREATE STREAMING TABLE` resumes its checkpoint;
+there is no separate `REFRESH ST` syntax. Once rows are persisted in Delta,
+ordinary Spark or SQL clients that share the metastore and storage can query
+them.
+
+`AvailableNow` executions terminate naturally after consuming all data currently
+available:
+
+```sql
+CREATE STREAMING TABLE monitoring.snapshot
+OPTIONS ('trigger' = 'availableNow')
+AS SELECT id, value FROM STREAM monitoring.raw_events;
+```
+
+Reissuing the identical declaration after completion resumes the same checkpoint
+and persistent query ID with a new run ID. With no new source commit, the new run
+does no source-row or target-data work. New inserts are consumed exactly once on
+the next run; already committed input is not replayed.
+
+The checkpoint is bound to the persisted semantic definition. A changed query,
+source identity, source semantic option, watermark, output mode, partitioning,
+or target property fails without stopping or mutating the existing table by
+default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
+replacement of the extension-owned target and checkpoint.
+
+Before rebuilding or dropping a managed target, OpenIVM resolves one dependency
+graph spanning both streaming tables and materialized views, then drops every
+transitively downstream managed object in reverse topological order (leaves
+first). This applies to `onQueryChange=rebuild`, `DROP STREAMING TABLE`, and
+`DROP MATERIALIZED VIEW`, including mixed chains such as streaming table →
+materialized view → streaming table. Downstream native queries are stopped
+before their targets and checkpoints are removed. Fan-out and diamond
+dependencies are deduplicated. Missing, corrupt, or generation-mismatched
+dependency metadata aborts the operation before the requested upstream target
+is mutated.
+
+The cascade does not recreate descendants. After an upstream streaming rebuild,
+an orchestrator must resubmit all dropped streaming-table and materialized-view
+declarations in topological order so new checkpoints and definitions bind to
+the replacement source generation. An interrupted streaming rebuild resumes
+from its durable reset journal when the exact replacement declaration is
+retried.
+
+State-store selection remains ordinary Spark configuration; the extension does
+not clone the session or mutate `SparkConf` / `SQLConf`:
+
+```sql
+SET spark.sql.streaming.stateStore.providerClass =
+  org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider;
+```
+
+The implementation uses native append/complete output modes and native
+processing-time or `AvailableNow` triggers. It does not provide continuous
+processing, an update-mode MERGE sink, arbitrary Scala state callbacks, or a
+pipeline scheduler.
 
 ## IVM DDL
 

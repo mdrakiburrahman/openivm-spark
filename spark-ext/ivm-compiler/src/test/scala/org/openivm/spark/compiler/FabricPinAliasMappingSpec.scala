@@ -107,7 +107,7 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
       expectedDetail: String,
       resolutionFailures: Seq[SparkTimeTravelSql.PinResolutionFailure] = Seq.empty
   ): Unit = {
-    val failure = validate(operation, sources, pins, persistedPins, resolutionFailures).left.toOption
+    val failure = validate(operation, sources, pins, persistedPins, resolutionFailures).swap.toOption
       .getOrElse(fail(s"$operation unexpectedly accepted pinned source identities"))
     failure.toLowerCase should include(expectedDetail)
     failure.toUpperCase should not include "FULL_REFRESH"
@@ -120,7 +120,7 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
   ): Unit =
     SparkTimeTravelSql
       .readPinnedSourceIdentityProperties(properties, currentBindings)
-      .left
+      .swap
       .toOption
       .getOrElse(fail("malformed pinned source identity property unexpectedly decoded"))
       .toLowerCase should include(expectedDetail)
@@ -165,7 +165,7 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
   ): Unit = {
     val failure = SparkTimeTravelSql
       .verifySnapshotPinBindingsAt(operation, checkpoint, currentBindings, persistedPins)
-      .left
+      .swap
       .toOption
       .getOrElse(fail(s"$operation $checkpoint unexpectedly accepted a TOCTOU source rebind"))
     failure.detail.toLowerCase should include(expectedDetail)
@@ -425,7 +425,7 @@ class FabricPinAliasMappingSpec extends AnyFunSpec with Matchers {
             pins,
             Map(requestedSource -> 8L)
           )
-          .left
+          .swap
           .toOption
           .getOrElse(fail(s"$requestedSource unexpectedly matched the persisted physical source"))
           .toLowerCase should include("advance source identifier")

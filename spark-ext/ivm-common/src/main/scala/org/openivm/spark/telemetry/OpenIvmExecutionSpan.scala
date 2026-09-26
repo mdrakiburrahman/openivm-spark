@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, TimeTravelPinReason, TimeTravelPinStatus}
-import org.slf4j.MDC
+import org.slf4j.{MDC => Slf4jMdc}
 
 import java.time.Instant
 import java.util.{LinkedHashMap, UUID}
@@ -790,7 +790,7 @@ object OpenIvmExecutionSpan extends Logging {
   private def correlationIdsFromSpark(spark: SparkSession): (Option[String], Option[String]) =
     correlationIdsFromLookups(
       localPropertyLookup = key => Option(spark.sparkContext.getLocalProperty(key)),
-      mdcLookup = key => Option(MDC.get(key)),
+      mdcLookup = key => Option(Slf4jMdc.get(key)),
       confLookup = key => spark.conf.getOption(key),
       sysPropLookup = key => sys.props.get(key)
     )

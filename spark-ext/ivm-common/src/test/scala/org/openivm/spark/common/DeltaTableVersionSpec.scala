@@ -262,8 +262,8 @@ class DeltaTableVersionSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       DeltaTableVersion.latest(spark, emptyDir) shouldBe DeltaTableVersion.NoCommits
       DeltaTableVersion.latestOption(spark, emptyDir) shouldBe None
       DeltaTableVersion.latestOption(spark, "default.dtv_does_not_exist") shouldBe None
-      the[IllegalStateException] thrownBy DeltaTableVersion
-        .requireLatest(spark, emptyDir) getMessage () should include("no committed Delta version")
+      (the[IllegalStateException] thrownBy DeltaTableVersion.requireLatest(spark, emptyDir)).getMessage should
+        include("no committed Delta version")
     }
 
     it("records lookup timing on the surrounding execution span") {

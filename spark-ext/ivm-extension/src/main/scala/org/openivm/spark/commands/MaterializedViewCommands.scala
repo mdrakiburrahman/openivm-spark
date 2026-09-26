@@ -6,7 +6,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   AttributeReference,
@@ -39,6 +39,7 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
+import org.openivm.spark.streaming.StreamingTableManager
 import org.openivm.spark.telemetry.{
   KvLogValue,
   OpenIvmExecutionSpan,
@@ -157,17 +158,17 @@ private[commands] object OpenIvmCompilers {
 }
 
 // ---------------------------------------------------------------------------
-// Per-MV command mutex — JVM-wide. openivm itself uses a per-view mutex
+// Managed-object command mutex — JVM-wide. openivm itself uses a per-view mutex
 // (see openivm/test/sql/concurrency.test prologue), and we replicate that
 // invariant here because the Spark-side incremental refresh path is NOT
 // safe under naive Delta OCC + retry: re-executing the same refresh body
 // without re-reading the staging-delta snapshot lets two threads that both
 // observed the same unconsumed delta each apply it once, double-counting
-// count-monoid aggregates. The key is the fully-qualified MV name, so
-// CREATE/REFRESH/DROP on the SAME logical MV serialize while unrelated MVs
-// proceed independently.
+// count-monoid aggregates. Keys normalize graph-prefixed materialized identities
+// to fully-qualified names so MV create/refresh/drop and mixed streaming cascades
+// serialize on the same logical object while unrelated objects proceed independently.
 // ---------------------------------------------------------------------------
-private[commands] object RefreshMutex {
+private[spark] object RefreshMutex {
 
   private val locks: java.util.Map[String, AnyRef] =
     Collections.synchronizedMap(new java.util.HashMap[String, AnyRef]())
@@ -178,16 +179,17 @@ private[commands] object RefreshMutex {
     * originate from different Spark sessions in the same JVM.
     */
   def withLock[A](mvKey: String)(body: => A): A = {
-    val existing = locks.get(mvKey)
+    val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
+    val existing = locks.get(key)
     val lock =
       if (existing != null) existing
       else
         locks.synchronized {
-          val again = locks.get(mvKey)
+          val again = locks.get(key)
           if (again != null) again
           else {
             val l = new Object
-            locks.put(mvKey, l)
+            locks.put(key, l)
             l
           }
         }
@@ -204,7 +206,7 @@ private[commands] object RefreshMutex {
     * lock already held by the current command is safe under JVM monitors.
     */
   def withLocks[A](mvKeys: Seq[String])(body: => A): A = {
-    val ordered = mvKeys.distinct.sorted
+    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
     def acquire(remaining: List[String]): A = remaining match {
       case head :: tail => withLock(head)(acquire(tail))
       case Nil          => body
@@ -1086,8 +1088,7 @@ private[commands] object MvCommandHelper {
           SparkTimeTravelSql.readPinnedSourceIdentityProperties(persistedProperties, currentBindings).toOption
         SparkTimeTravelSql
           .validateResolvedSnapshotPins(operation, currentBindings, persistedPins)
-          .left
-          .foreach(detail => throw pinBindingException(viewName, detail))
+          .fold(detail => throw pinBindingException(viewName, detail), _ => ())
         operation match {
           case SparkTimeTravelSql.PinIdentityOperation.Refresh | SparkTimeTravelSql.PinIdentityOperation.Advance |
               SparkTimeTravelSql.PinIdentityOperation.IdempotentCreate =>
@@ -1996,7 +1997,7 @@ private[commands] object MvCommandHelper {
     error match {
       case e: AnalysisException =>
         val message = Option(e.getMessage).getOrElse("")
-        Option(e.getErrorClass).contains("TABLE_OR_VIEW_NOT_FOUND") &&
+        SparkCommandCompat.errorCondition(e).contains("TABLE_OR_VIEW_NOT_FOUND") &&
         targetFragments.exists(message.contains) &&
         message.contains("To tolerate the error on drop")
       case _ => false
@@ -2109,11 +2110,11 @@ private[commands] object MvCommandHelper {
           detected = true
           if (offset.isEmpty) offset = Some(expr.sql)
           peel(child)
-        case Sort(order, global, child) =>
+        case sort: Sort =>
           detected = true
-          if (!global) unsupportedWrapper = true
-          else if (orderBy.isEmpty) orderBy = Some(order.map(_.sql).mkString(", "))
-          peel(child)
+          if (!sort.global) unsupportedWrapper = true
+          else if (orderBy.isEmpty) orderBy = Some(sort.order.map(_.sql).mkString(", "))
+          peel(sort.child)
         case _: Tail =>
           detected = true
           unsupportedWrapper = true
@@ -2219,9 +2220,14 @@ private[commands] object MvCommandHelper {
             al.child.canonicalized -> al.name
         }.toMap
 
-        val rewritten = cond.transform {
+        val normalized = SparkExpressionCompat.normalizeHavingCondition(cond)
+        val rewritten = normalized.transform {
           case e: Expression if aliasMap.contains(e.canonicalized) =>
-            UnresolvedAttribute(Seq(aliasMap(e.canonicalized)))
+            AttributeReference(
+              aliasMap(e.canonicalized),
+              e.dataType,
+              nullable = true
+            )()
         }
         rewritten.sql
       }
@@ -7881,6 +7887,44 @@ case class RefreshMaterializedViewCommand(
 // DropMaterializedViewCommand
 // ---------------------------------------------------------------------------
 
+private[spark] object MaterializedViewLifecycle {
+
+  def dropOne(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): Unit = {
+    import MvCommandHelper._
+
+    if (meta.usesBackingDataTable) {
+      spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
+      spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
+    } else {
+      spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
+    }
+
+    val hadoopPath = new Path(meta.location)
+    val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+    if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+
+    val mvQual      = metaName(name)
+    val mvShort     = name.identifier
+    val propagation = ChangePropagationFactory.forSession(spark)
+    propagation.removeForBaseTable(spark, mvQual)
+    if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
+    CdfWatermarkCatalog.removeForView(spark, mvQual)
+    if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
+    CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
+    if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
+
+    val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
+    val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
+    try {
+      val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
+      if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
+    } catch { case _: Throwable => () }
+
+    MvCatalog.remove(spark, name)
+  }
+}
+
 case class DropMaterializedViewCommand(
     name: TableIdentifier,
     ifExists: Boolean
@@ -7889,7 +7933,7 @@ case class DropMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    RefreshMutex.withLock(metaName(name)) {
+    RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(metaName(name))) {
       MvCatalog.lookup(spark, name) match {
         case None if ifExists =>
           Seq.empty
@@ -7899,57 +7943,23 @@ case class DropMaterializedViewCommand(
             Map("relationName" -> sqlIdent(name))
           )
         case Some(meta) =>
-          // For AGGREGATE_HAVING the user-facing name is a Spark VIEW and the
-          // data lives in a sibling Delta table. Drop both so no orphan storage
-          // or stale catalog entry survives.
-          if (meta.usesBackingDataTable) {
-            spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
-            spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
-          } else {
-            // Drop the catalog table entry (Delta table registration in Spark)
-            spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
+          val descendants = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+          RefreshMutex.withLocks(descendants.map(_.identity)) {
+            StreamingTableManager.withCascadeLocks(spark, descendants) {
+              val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+              if (verified != descendants)
+                throw new AnalysisException(
+                  "_LEGACY_ERROR_TEMP_2273",
+                  Map(
+                    "message" ->
+                      s"Materialized view '${metaName(name)}' dependencies changed during DROP admission"
+                  )
+                )
+              StreamingTableManager.dropResolvedCascade(spark, descendants)
+              MaterializedViewLifecycle.dropOne(spark, name, meta)
+              Seq.empty
+            }
           }
-
-          // Delete the physical Delta files
-          val hadoopPath = new Path(meta.location)
-          val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
-          if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
-
-          // MV-over-MV cleanup: remove every `StagingCatalog` row whose
-          // `base_table` could reference this MV. Without this, a subsequent
-          // CREATE of the SAME name with a different body could consume stale
-          // view-deltas from the old incarnation. Two forms are pruned:
-          //   - exact match on `metaName(name)` (qualified `db.table`)
-          //   - bare short-name match (downstream MVs created without a db
-          //     prefix store their source as the bare name)
-          //
-          // Also delete the per-MV view-delta namespace on disk so view-delta
-          // Delta paths from previous refreshes are gone.
-          val mvQual      = metaName(name)
-          val mvShort     = name.identifier
-          val propagation = ChangePropagationFactory.forSession(spark)
-          propagation.removeForBaseTable(spark, mvQual)
-          if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
-          // Also evict any CDF watermark rows scoped to this MV instance.  These
-          // are independent of intercept-mode staging rows and are pruned even
-          // if the active mode is `intercept` (defensive cleanup so a later
-          // mode flip never re-uses stale watermarks).
-          CdfWatermarkCatalog.removeForView(spark, mvQual)
-          if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
-          CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
-          if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
-
-          val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-          val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
-          val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
-          try {
-            val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
-            if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
-          } catch { case _: Throwable => () }
-
-          // Remove the tracking row from the MV catalog
-          MvCatalog.remove(spark, name)
-          Seq.empty
       }
     }
   }

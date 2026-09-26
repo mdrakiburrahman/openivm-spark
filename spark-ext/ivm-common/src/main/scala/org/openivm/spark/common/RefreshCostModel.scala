@@ -4,7 +4,7 @@ import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.spark.SparkConf
@@ -198,9 +198,9 @@ object RefreshCostModel {
     val root        = Json.readTree(json)
     val weightsNode = root.path("weights")
     val weights = weightsNode
-      .fields()
+      .fieldNames()
       .asScala
-      .map(entry => entry.getKey -> entry.getValue.asDouble())
+      .map(name => name -> weightsNode.get(name).asDouble())
       .toMap
     RefreshCostModel(
       RefreshCostCoefficients(

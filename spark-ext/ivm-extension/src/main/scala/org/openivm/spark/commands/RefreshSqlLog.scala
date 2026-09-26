@@ -33,7 +33,7 @@ final class RefreshSqlLog private (
     val viewName: String,
     val mode: String, // "create" or "refresh"
     private val active: Boolean,
-    private val export: Option[QueryLogExport.Invocation]
+    private val exportInvocation: Option[QueryLogExport.Invocation]
 ) {
 
   // Per-instance, per-thread buffer. RefreshMutex serialises CREATE /
@@ -87,10 +87,10 @@ final class RefreshSqlLog private (
         durationMs = durationMs,
         sqlText = if (sql == null) "" else sql
       )
-      if (export.forall(_.accept(row))) buffer += row
+      if (exportInvocation.forall(_.accept(row))) buffer += row
     } catch {
       case t: Throwable =>
-        export.foreach(_.failed("COLLECTOR_FAILED", t))
+        exportInvocation.foreach(_.failed("COLLECTOR_FAILED", t))
         RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
     }
   }
@@ -105,10 +105,10 @@ final class RefreshSqlLog private (
     try {
       val rows = buffer.toVector
       buffer.clear()
-      RefreshSqlLogAsyncFlusher.submit(spark, rows, export)
+      RefreshSqlLogAsyncFlusher.submit(spark, rows, exportInvocation)
     } catch {
       case t: Throwable =>
-        export.foreach(_.failed("COLLECTOR_FAILED", t))
+        exportInvocation.foreach(_.failed("COLLECTOR_FAILED", t))
         RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
     }
   }
@@ -119,7 +119,7 @@ final class RefreshSqlLog private (
   def finish(outcome: String): Unit = {
     if (!active) return
     flush()
-    export.foreach(_.finish(outcome))
+    exportInvocation.foreach(_.finish(outcome))
   }
 }
 
@@ -142,7 +142,7 @@ object RefreshSqlLog {
       mode: String
   ): RefreshSqlLog = {
     val active = FeatureGate.queryLogEnabled(spark)
-    val export =
+    val exportInvocation =
       if (!active) None
       else
         try QueryLogExport.startInvocation(spark, refreshId, viewName, mode)
@@ -151,7 +151,7 @@ object RefreshSqlLog {
             RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
             None
         }
-    new RefreshSqlLog(spark, refreshId, viewName, mode, active, export)
+    new RefreshSqlLog(spark, refreshId, viewName, mode, active, exportInvocation)
   }
 
   /** Inactive instance for code paths that never opt into the query log. */

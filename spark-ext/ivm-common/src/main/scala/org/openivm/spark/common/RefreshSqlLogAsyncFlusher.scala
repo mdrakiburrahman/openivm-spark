@@ -55,7 +55,7 @@ object RefreshSqlLogAsyncFlusher {
   private final case class FlushBatch(
       spark: SparkSession,
       rows: Seq[RefreshSqlLogRow],
-      export: Option[QueryLogExport.FlushTicket]
+      exportTicket: Option[QueryLogExport.FlushTicket]
   )
   private case object Sentinel { // marker for awaitQuiescence
     val ticket: Long = 0L
@@ -157,7 +157,7 @@ object RefreshSqlLogAsyncFlusher {
   }
 
   private def failed(batch: FlushBatch, code: String, error: Throwable): Unit = {
-    batch.export.foreach(_.complete(Some(code -> error)))
+    batch.exportTicket.foreach(_.complete(Some(code -> error)))
     flushFailures.incrementAndGet()
     log.warn(
       s"[openivm-querylog] flush failed for ${batch.rows.size} rows: " +
@@ -168,8 +168,8 @@ object RefreshSqlLogAsyncFlusher {
   private def writeBatch(batch: FlushBatch): Unit =
     try {
       beforeWriteForTesting(batch.rows)
-      RefreshSqlLogCatalog.record(batch.spark, batch.rows, batch.export)
-      batch.export.foreach(_.complete(None))
+      RefreshSqlLogCatalog.record(batch.spark, batch.rows, batch.exportTicket)
+      batch.exportTicket.foreach(_.complete(None))
       flushedBatches.incrementAndGet()
       ()
     } catch {
@@ -186,7 +186,7 @@ object RefreshSqlLogAsyncFlusher {
     try {
       ensureWorker()
       if (!queue.offer(batch)) {
-        if (batch.export.nonEmpty) {
+        if (batch.exportTicket.nonEmpty) {
           rejectedScopedBatches.incrementAndGet()
           failed(
             batch,

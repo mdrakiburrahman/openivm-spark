@@ -19,7 +19,7 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
@@ -469,16 +469,16 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   ) extends Iterator[(Array[Byte], Array[Byte])]
       with AutoCloseable {
 
-    private val iterator = localDb.newIterator(handle)
-    private var done     = false
+    private val rocksIterator = localDb.newIterator(handle)
+    private var done          = false
 
-    iterator.seek(prefix)
+    rocksIterator.seek(prefix)
 
     override def hasNext: Boolean = {
       if (done) {
         false
       } else {
-        val valid = iterator.isValid && startsWith(iterator.key(), prefix)
+        val valid = rocksIterator.isValid && startsWith(rocksIterator.key(), prefix)
         if (!valid) {
           close()
         }
@@ -490,11 +490,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       if (!hasNext) {
         throw new NoSuchElementException("prefixScan exhausted")
       }
-      val key   = iterator.key()
-      val value = iterator.value()
+      val key   = rocksIterator.key()
+      val value = rocksIterator.value()
       OpenIvmMetrics.recordColumnFamilyRead(columnFamily, key.length.toLong + value.length.toLong)
-      iterator.next()
-      if (!(iterator.isValid && startsWith(iterator.key(), prefix))) {
+      rocksIterator.next()
+      if (!(rocksIterator.isValid && startsWith(rocksIterator.key(), prefix))) {
         close()
       }
       key -> value
@@ -503,7 +503,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     override def close(): Unit =
       if (!done) {
         done = true
-        iterator.close()
+        rocksIterator.close()
       }
   }
 

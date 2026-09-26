@@ -383,9 +383,9 @@ object MvMetadata {
       refreshType: Int,
       refreshTypeName: String
   ): Map[String, String] = {
-    val sql =
+    val sql: Map[String, String] =
       if (compiledSql.nonEmpty) Map(compileCacheSqlKey(sourceSchemaFingerprint, tier) -> compiledSql) else Map.empty
-    val init = if (initialLoadSql.nonEmpty) {
+    val init: Map[String, String] = if (initialLoadSql.nonEmpty) {
       Map(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier) -> initialLoadSql)
     } else Map.empty
     sql ++ init ++ Map(
@@ -543,8 +543,17 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
       )
     }
 
-  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
-    openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] = {
+    def read(attemptsRemaining: Int): Option[MvMetadata] =
+      try openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+      catch {
+        case error: IllegalStateException
+            if attemptsRemaining > 1 && Option(error.getMessage).exists(_.contains("already closed")) =>
+          read(attemptsRemaining - 1)
+      }
+
+    read(attemptsRemaining = 3)
+  }
 
   private def dependentViewNames(spark: SparkSession, sourceTable: String): Seq[String] = {
     val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)

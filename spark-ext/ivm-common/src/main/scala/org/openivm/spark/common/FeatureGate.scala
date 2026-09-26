@@ -735,16 +735,24 @@ object FeatureGate {
     * (10 MiB) still restricts it to joins whose build side is the tiny delta.
     */
   def runtimeFilterConfOverrides(conf: SparkConf): Map[String, String] =
+    runtimeFilterConfOverrides(conf, sparkMajorVersion = 3)
+
+  private[common] def runtimeFilterConfOverrides(conf: SparkConf, sparkMajorVersion: Int): Map[String, String] =
     if (!runtimeFilterEnabled(conf)) Map.empty
-    else
-      Map(
+    else {
+      val common = Map(
         "spark.sql.optimizer.runtime.bloomFilter.enabled"                          -> "true",
-        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB",
-        "spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled"              -> "true"
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB"
       )
+      if (sparkMajorVersion >= 4) common
+      else common + ("spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled" -> "true")
+    }
 
   def runtimeFilterConfOverrides(spark: SparkSession): Map[String, String] =
-    runtimeFilterConfOverrides(spark.sparkContext.getConf)
+    runtimeFilterConfOverrides(
+      spark.sparkContext.getConf,
+      spark.version.takeWhile(_ != '.').toInt
+    )
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)

@@ -18,7 +18,7 @@ import java.util.UUID
 import java.util.Base64
 
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -614,7 +614,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
 
       start.countDown()
-      futures.foreach(f => Await.result(f, 60.seconds))
+      Await.result(Future.sequence(futures), 3.minutes)
 
       val errList = errors.asScala.toList
       withClue(errList.map(e => s"${e.getClass.getName}: ${e.getMessage}").mkString("\n")) {

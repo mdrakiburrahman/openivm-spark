@@ -25,6 +25,8 @@
 #    UBUNTU_MIRROR (optional)
 # =============================================================================
 
+ARG JDK_VERSION=17
+
 # -----------------------------------------------------------------------------
 # Stage 1: openivm-builder
 # -----------------------------------------------------------------------------
@@ -32,7 +34,7 @@ FROM ubuntu:24.04 AS openivm-builder
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
-ARG OPENIVM_BRANCH=dev/mdrrahman/add-months-ila
+ARG OPENIVM_BRANCH=main
 ARG OPENIVM_COMMIT
 ARG LPTS_REPO
 ARG LPTS_BRANCH=main
@@ -99,16 +101,20 @@ WORKDIR /src
 CMD ["make", "test"]
 
 # -----------------------------------------------------------------------------
-# Stage 3: spark-ext — JDK 17 + sbt 1.9.7 runtime.
+# Stage 3: spark-ext — target-selected JDK + sbt runtime.
 # -----------------------------------------------------------------------------
-FROM eclipse-temurin:17-jdk AS spark-ext
+FROM eclipse-temurin:${JDK_VERSION}-jdk AS spark-ext
 
+ARG OPENIVM_SPARK_TARGET=spark-3.5
+ARG JDK_VERSION
 ARG SBT_VERSION=1.9.7
 ARG SCALA_VERSION=2.12.17
 ARG DUCKDB_JDBC_VERSION=1.5.2.1
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV OPENIVM_SPARK_TARGET=${OPENIVM_SPARK_TARGET}
+ENV JDK_VERSION=${JDK_VERSION}
 ENV SBT_VERSION=${SBT_VERSION}
 ENV SCALA_VERSION=${SCALA_VERSION}
 ENV DUCKDB_JDBC_VERSION=${DUCKDB_JDBC_VERSION}

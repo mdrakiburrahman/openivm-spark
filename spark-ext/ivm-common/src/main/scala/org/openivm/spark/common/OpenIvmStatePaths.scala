@@ -5,7 +5,7 @@ import org.openivm.spark.common.rocksdb.RocksDBCodec
 
 import java.io.File
 import java.nio.file.{Files, Path, Paths}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 /** Deterministic local paths for sharded OpenIVM state. Every identity component
   * uses the same bounded, legacy-compatible codec across readers and writers.
@@ -31,6 +31,9 @@ private[common] object OpenIvmStatePaths {
   def tablesRoot(spark: SparkSession): Path = openIvmRoot(spark).resolve("tables")
 
   def sourcesRoot(spark: SparkSession): Path = openIvmRoot(spark).resolve("sources")
+
+  def streamingDependencyDbPath(spark: SparkSession): String =
+    openIvmRoot(spark).resolve("streaming").resolve("dependencies").resolve("rocksdb").toString
 
   def perMvDbPath(spark: SparkSession, serializedName: String): String =
     mvsRoot(spark).resolve(RocksDBCodec.safePathSegment(serializedName)).resolve("rocksdb").toString
