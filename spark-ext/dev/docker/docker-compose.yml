@@ -41,6 +41,7 @@ x-spark-ext: &spark-ext
   working_dir: /work/spark-ext
   environment:
     OPENIVM_SPARK_TARGET: ${OPENIVM_SPARK_TARGET}
+    OPENIVM_NATIVE_DIR: /opt/openivm
     SBT_OPTS: "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
     # Test-log directory inside the container, mirroring the host's
     # repo-root/.logs/test-<TS>/ layout. `dev.sh` (host) sets this env
