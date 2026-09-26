@@ -2,6 +2,7 @@ package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.DeltaLog
+import org.openivm.spark.common.FeatureGate
 import org.scalatest.funspec.AnyFunSpec
 
 import java.io.File
@@ -200,7 +201,8 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       process(status)
       appendRows(source, "(7, 'seven', 'p')")
       process(status)
-      val path = targetPath(target)
+      val owned = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(target), requireTableIdMarker = true)
+      val path  = owned.dataPath
 
       StreamingTableManager.show(spark, None).map(_.tableName) should contain(status.tableName)
       StreamingTableManager.stop(spark, Seq(target)).status shouldBe "stopped"
@@ -208,10 +210,39 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       StreamingTableManager.drop(spark, Seq(target), ifExists = false).status shouldBe "dropped"
       spark.catalog.tableExists(target) shouldBe false
       pathExists(path) shouldBe false
-      val archives = archivedCheckpoints(path)
+      val archives = archivedCheckpoints(owned)
       archives should have size 1
+      archives.head.getParent.toUri.getPath shouldBe
+        new Path(
+          spark.conf.get(FeatureGate.StreamingCheckpointArchiveUriKey),
+          s"spark_catalog/default/$target"
+        ).toUri.getPath
       checkpointArchiveReason(archives.head) shouldBe "drop"
       StreamingTableManager.drop(spark, Seq(target), ifExists = true).status shouldBe "not_found"
+    }
+
+    it("fails closed without an archive root and preserves the owned checkpoint and target") {
+      val source = "strt_archive_required_source"
+      val target = "strt_archive_required_target"
+      createSource(source)
+      val status = createStreaming(target, readStream(source), s"SELECT id, value, part FROM STREAM $source")
+      appendRows(source, "(9, 'preserved', 'p')")
+      process(status)
+      StreamingTableManager.stop(spark, Seq(target))
+
+      val owned      = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(target), requireTableIdMarker = true)
+      val checkpoint = owned.checkpointLocation
+      val archiveUri = spark.conf.get(FeatureGate.StreamingCheckpointArchiveUriKey)
+      spark.conf.unset(FeatureGate.StreamingCheckpointArchiveUriKey)
+      try {
+        val error = intercept[org.apache.spark.sql.AnalysisException] {
+          StreamingTableManager.drop(spark, Seq(target), ifExists = false)
+        }
+        error.getMessage should include(FeatureGate.StreamingCheckpointArchiveUriKey)
+        spark.catalog.tableExists(target) shouldBe true
+        pathExists(owned.dataPath) shouldBe true
+        pathExists(checkpoint) shouldBe true
+      } finally spark.conf.set(FeatureGate.StreamingCheckpointArchiveUriKey, archiveUri)
     }
 
     it("refuses to adopt an existing unowned Delta target") {

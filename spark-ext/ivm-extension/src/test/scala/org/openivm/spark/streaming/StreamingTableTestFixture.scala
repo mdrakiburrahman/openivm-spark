@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.streaming.StreamingQuery
+import org.openivm.spark.common.FeatureGate
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 import org.scalatest.Suite
 import org.scalatest.matchers.should.Matchers
@@ -17,7 +18,8 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
   private val warehouse = new File(
     s"target/test-warehouse-streaming-${UUID.randomUUID().toString.take(8)}"
   )
-  private val ownedQueryIds = mutable.Set.empty[String]
+  private val checkpointArchive = new File(warehouse, "_openivm-archive")
+  private val ownedQueryIds     = mutable.Set.empty[String]
 
   protected var spark: SparkSession = _
 
@@ -34,6 +36,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
       )
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config("spark.openivm.enabled", "true")
+      .config(FeatureGate.StreamingCheckpointArchiveUriKey, checkpointArchive.getAbsolutePath)
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
       .config("spark.sql.shuffle.partitions", "1")
       .config("spark.ui.enabled", "false")
@@ -133,11 +136,11 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
     hadoopPath.getFileSystem(spark.sessionState.newHadoopConf()).exists(hadoopPath)
   }
 
-  protected def archivedCheckpoints(dataPath: String): Seq[Path] = {
-    val targetPath = new Path(dataPath)
-    val archive = new Path(
-      new Path(targetPath.getParent, StreamingTableMetadata.ArchiveDirectory),
-      targetPath.getName
+  protected def archivedCheckpoints(target: StreamingTableTarget): Seq[Path] = {
+    val archive = StreamingTableMetadata.archivePath(
+      spark,
+      target,
+      spark.conf.get(FeatureGate.StreamingCheckpointArchiveUriKey)
     )
     val fs = archive.getFileSystem(spark.sessionState.newHadoopConf())
     if (!fs.exists(archive)) Seq.empty

@@ -13,7 +13,7 @@ import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
 import org.apache.spark.sql.delta.stats.SkippingEligibleDataType
 import org.apache.spark.sql.connector.expressions.Expressions
 import org.apache.spark.sql.types.{DataType, StructType}
-import org.openivm.spark.common.DeltaTableVersion
+import org.openivm.spark.common.{DeltaTableVersion, FeatureGate}
 
 import java.nio.charset.StandardCharsets
 import java.util.Locale
@@ -971,16 +971,18 @@ object StreamingTableMetadata {
       context: StreamingArchiveContext
   ): Option[String] = {
     val checkpoint = new Path(target.checkpointLocation)
-    val targetPath = new Path(target.dataPath)
-    val parent = Option(targetPath.getParent).getOrElse(
-      StreamingTableErrors.invalid(
-        s"Cannot archive the checkpoint for ${target.sqlIdentifier} because its target has no parent path"
+    val archiveRoot = FeatureGate
+      .streamingCheckpointArchiveUri(spark)
+      .getOrElse(
+        StreamingTableErrors.invalid(
+          s"Cannot archive the checkpoint for ${target.sqlIdentifier}: " +
+            s"${FeatureGate.StreamingCheckpointArchiveUriKey} is not configured"
+        )
       )
-    )
     val fs = checkpoint.getFileSystem(spark.sessionState.newHadoopConf())
     if (!fs.exists(checkpoint)) None
     else {
-      val tableArchive = new Path(new Path(parent, ArchiveDirectory), targetPath.getName)
+      val tableArchive = archivePath(spark, target, archiveRoot)
       if (!fs.exists(tableArchive) && !fs.mkdirs(tableArchive))
         StreamingTableErrors.invalid(
           s"Failed to create checkpoint archive directory '$tableArchive' for ${target.sqlIdentifier}"
@@ -1023,6 +1025,27 @@ object StreamingTableMetadata {
         )
       Some(archivedCheckpoint.toString)
     }
+  }
+
+  private[streaming] def archivePath(
+      spark: SparkSession,
+      target: StreamingTableTarget,
+      archiveRoot: String
+  ): Path = {
+    val name =
+      if (target.name.nonEmpty) qualifiedNameParts(spark, target.name)
+      else Seq(s"unknown-${StreamingTableDefinition.sha256(target.identity).take(16)}")
+    name.foldLeft(new Path(archiveRoot)) { case (parent, part) =>
+      new Path(parent, archivePathSegment(part))
+    }
+  }
+
+  private def archivePathSegment(value: String): String = {
+    val sanitized = value.map { char =>
+      if (char.isLetterOrDigit || char == '.' || char == '-' || char == '_') char else '_'
+    }
+    if (sanitized.nonEmpty && sanitized == value) sanitized
+    else s"${sanitized.take(80)}-${StreamingTableDefinition.sha256(value).take(12)}"
   }
 
   private def archiveContext(

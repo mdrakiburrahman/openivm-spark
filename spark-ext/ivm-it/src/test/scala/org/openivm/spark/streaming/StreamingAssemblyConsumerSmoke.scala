@@ -5,6 +5,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.clustering.ClusteringMetadataDomain
 import org.apache.spark.sql.streaming.StreamingQuery
+import org.openivm.spark.common.FeatureGate
 
 import java.io.File
 import java.util.UUID
@@ -55,6 +56,10 @@ object StreamingAssemblyConsumerSmoke {
         )
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.openivm.enabled", "true")
+        .config(
+          FeatureGate.StreamingCheckpointArchiveUriKey,
+          new File(warehouse, "_openivm-archive").getAbsolutePath
+        )
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "1")
         .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)

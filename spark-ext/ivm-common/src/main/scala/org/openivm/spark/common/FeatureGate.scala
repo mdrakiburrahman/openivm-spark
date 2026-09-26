@@ -49,6 +49,15 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Required Hadoop filesystem root for archived native streaming checkpoints.
+    *
+    * Managed Spark environments should point this at durable file storage outside
+    * the managed table namespace, for example a OneLake
+    * ``Files/_openivm-archive`` directory.
+    */
+  val StreamingCheckpointArchiveUriKey: String =
+    "spark.openivm.streaming.checkpointArchive.uri"
+
   /** Optional campaign-scoped Hadoop filesystem URI for completed execution
     * span objects. Unset preserves the historical log-only behavior.
     */
@@ -452,6 +461,20 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def streamingCheckpointArchiveUri(conf: SparkConf): Option[String] =
+    conf
+      .getOption(StreamingCheckpointArchiveUriKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map(_.stripSuffix("/"))
+
+  def streamingCheckpointArchiveUri(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(StreamingCheckpointArchiveUriKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map(_.stripSuffix("/"))
 
   def telemetryUri(spark: SparkSession): Option[String] =
     spark.conf

@@ -77,7 +77,7 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       log.metadata.partitionColumns shouldBe Seq("part")
       log.metadata.configuration.get("openivm.test.rebuild") shouldBe Some("yes")
       fs.exists(originalCheckpoint) shouldBe true
-      val archives = archivedCheckpoints(originalTarget.dataPath)
+      val archives = archivedCheckpoints(originalTarget)
       archives should have size 1
       archives.head.getName should fullyMatch regex
         s"${StreamingTableMetadata.CheckpointDirectory}-[0-9]+"
@@ -212,9 +212,9 @@ class StreamingTableRebuildRecoverySpec extends AnyFunSpec with StreamingTableTe
       pathExists(oldB.checkpointLocation) shouldBe false
       pathExists(oldC.checkpointLocation) shouldBe false
       spark.catalog.tableExists(a) shouldBe true
-      val archivedA = archivedCheckpoints(oldA.dataPath)
-      val archivedB = archivedCheckpoints(oldB.dataPath)
-      val archivedC = archivedCheckpoints(oldC.dataPath)
+      val archivedA = archivedCheckpoints(oldA)
+      val archivedB = archivedCheckpoints(oldB)
+      val archivedC = archivedCheckpoints(oldC)
       archivedA should have size 1
       archivedB should have size 1
       archivedC should have size 1

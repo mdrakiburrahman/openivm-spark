@@ -431,8 +431,24 @@ DROP STREAMING TABLE IF EXISTS monitoring.cleaned_events;
 
 `CREATE` starts asynchronously and the query remains visible through
 `spark.streams`. `STOP` retains the target and checkpoint for a matching
-declaration to resume. `DROP STREAMING TABLE` is destructive: it stops the
-owned query and removes its owned registration, target data, and checkpoint.
+declaration to resume. `DROP STREAMING TABLE` stops the owned query and removes
+its owned registration and target data after moving its checkpoint to the
+configured archive.
+
+Checkpoint archival requires a durable Hadoop-filesystem root outside managed
+table storage:
+
+```sql
+SET spark.openivm.streaming.checkpointArchive.uri =
+  'abfss://<workspace>@<onelake-endpoint>/<lakehouse>/Files/_openivm-archive';
+```
+
+Each archived checkpoint is written under
+`<archive-root>/<catalog>/<namespace>/<table>/_openivm-checkpoint-<utc-epoch-ms>`.
+Its `_openivm-archive-event-v1.json` records the lifecycle action, operation ID,
+root target, old target identity, and—when a semantic change caused a rebuild—a
+redacted field-level definition diff. OpenIVM fails closed before deleting a
+checkpoint when the archive setting is absent or the move cannot complete.
 
 For a SQL client or dbt integration, successful `CREATE` statement completion
 means that the declaration was accepted, not that the query finished. Capture
@@ -466,7 +482,8 @@ The checkpoint is bound to the persisted semantic definition. A changed query,
 source identity, source semantic option, watermark, output mode, partitioning,
 or target property fails without stopping or mutating the existing table by
 default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
-replacement of the extension-owned target and checkpoint.
+replacement of the extension-owned target. The previous checkpoint remains in
+the archive for diagnosis and audit.
 
 Before rebuilding or dropping a managed target, OpenIVM resolves one dependency
 graph spanning both streaming tables and materialized views, then drops every

@@ -208,6 +208,18 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("FeatureGate.streamingCheckpointArchiveUri") {
+    it("defaults to None and returns the trimmed archive root when set") {
+      FeatureGate.streamingCheckpointArchiveUri(new SparkConf(false)) shouldBe None
+      FeatureGate.streamingCheckpointArchiveUri(
+        new SparkConf(false).set(
+          FeatureGate.StreamingCheckpointArchiveUriKey,
+          "  abfss://ws@onelake/lh/Files/_openivm-archive/  "
+        )
+      ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm-archive")
+    }
+  }
+
   describe("FeatureGate.autoCompactSupported") {
     it("rejects exactly one clustering column (Delta hilbert clustering asserts cols.size > 1)") {
       FeatureGate.autoCompactSupported(Seq("region")) shouldBe false
