@@ -149,6 +149,30 @@ class ManagedTableCascadeSpec extends AnyFunSpec with StreamingSqlTestSupport {
       spark.catalog.tableExists("managed_stream_drop_child") shouldBe false
     }
 
+    it("drops descendants when the streaming parent's durable dependency record is missing") {
+      createDeltaSource("managed_legacy_drop_source", "id INT, value STRING")
+      insertRows("managed_legacy_drop_source", "(1, 'one')")
+      val parent = createStreamingSql(
+        """CREATE STREAMING TABLE managed_legacy_drop_parent
+          |AS SELECT id, value FROM STREAM managed_legacy_drop_source""".stripMargin
+      )
+      process(parent)
+      spark
+        .sql(
+          "CREATE MATERIALIZED VIEW managed_legacy_drop_child AS " +
+            "SELECT id, value FROM managed_legacy_drop_parent"
+        )
+        .collect()
+      val parentIdentity =
+        StreamingTableMetadata.canonicalIdentity(spark, Seq("managed_legacy_drop_parent"))
+      StreamingDependencyCatalog.removeTargetRecordForTesting(spark, parentIdentity)
+
+      spark.sql("DROP STREAMING TABLE managed_legacy_drop_parent").collect()
+
+      spark.catalog.tableExists("managed_legacy_drop_parent") shouldBe false
+      spark.catalog.tableExists("managed_legacy_drop_child") shouldBe false
+    }
+
     it("fails a materialized-view drop before mutation when a streaming child record is corrupt") {
       createDeltaSource("managed_mv_corrupt_source", "id INT, value STRING")
       insertRows("managed_mv_corrupt_source", "(1, 'one')")

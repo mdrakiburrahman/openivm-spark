@@ -194,7 +194,7 @@ object StreamingTableManager {
     val target   = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
     val manifest = StreamingTableMetadata.readManifest(spark, target)
     StreamingTableMetadata.verifyOwned(spark, target, manifest)
-    val descendants = resolveCascadeDescendants(spark, target)
+    val descendants = resolveCascadeDescendantsForRebuild(spark, target, manifest)
     val operationId = UUID.randomUUID().toString
     val streamingLockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
       .map(StreamingTableRegistry.lifecycleLockKey)
@@ -202,7 +202,8 @@ object StreamingTableManager {
       target.identity +: descendants.map(_.identity)
     RefreshMutex.withLocks(materializedLockKeys) {
       StreamingTableRegistry.withTargetLocks(spark, streamingLockKeys) {
-        val verifiedDescendants = resolveCascadeDescendants(spark, target)
+        val verifiedDescendants =
+          resolveCascadeDescendantsForRebuild(spark, target, manifest)
         if (verifiedDescendants != descendants)
           StreamingTableErrors.invalid(
             s"Downstream dependencies for ${target.sqlIdentifier} changed during DROP admission"
