@@ -961,6 +961,104 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
+    it("serializes synchronous backup with an in-flight asynchronous pass") {
+      val spark = newSpark(
+        "state-sync-synchronous-serialization",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val stateSession = newStateSyncSession(spark, "synchronous-serialization")
+      val entered      = new CountDownLatch(1)
+      val release      = new CountDownLatch(1)
+      val passCount    = new AtomicInteger(0)
+      val active       = new AtomicInteger(0)
+      val maxActive    = new AtomicInteger(0)
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        val pass = passCount.incrementAndGet()
+        try {
+          if (pass == 1) {
+            entered.countDown()
+            release.await(10, TimeUnit.SECONDS)
+          }
+        } finally {
+          active.decrementAndGet()
+        }
+      }
+
+      try {
+        OpenIvmStateSync.backupAsync(stateSession)
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+
+        val synchronous = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        Thread.sleep(100L)
+        synchronous.isCompleted shouldBe false
+
+        release.countDown()
+        Await.result(synchronous, RegistryRaceTimeout)
+        waitForStateSyncIdle(stateSession)
+        passCount.get() should be >= 2
+        maxActive.get() shouldBe 1
+      } finally {
+        release.countDown()
+        waitUntil(10.seconds) {
+          OpenIvmStateSync.allBackupStatesIdleForTesting
+        }
+      }
+    }
+
+    it("serializes concurrent synchronous backup passes") {
+      val spark = newSpark(
+        "state-sync-concurrent-synchronous",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val stateSession = newStateSyncSession(spark, "concurrent-synchronous")
+      val firstEntered = new CountDownLatch(1)
+      val releaseFirst = new CountDownLatch(1)
+      val passCount    = new AtomicInteger(0)
+      val active       = new AtomicInteger(0)
+      val maxActive    = new AtomicInteger(0)
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        val pass = passCount.incrementAndGet()
+        try {
+          if (pass == 1) {
+            firstEntered.countDown()
+            releaseFirst.await(10, TimeUnit.SECONDS)
+          }
+        } finally {
+          active.decrementAndGet()
+        }
+      }
+
+      try {
+        val first = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        firstEntered.await(5, TimeUnit.SECONDS) shouldBe true
+
+        val second = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        Thread.sleep(100L)
+        second.isCompleted shouldBe false
+
+        releaseFirst.countDown()
+        Await.result(Future.sequence(Seq(first, second)), RegistryRaceTimeout)
+        passCount.get() shouldBe 2
+        maxActive.get() shouldBe 1
+      } finally {
+        releaseFirst.countDown()
+      }
+    }
+
     it("allows different state-sync keys to overlap and eventually returns both to idle") {
       val spark = newSpark(
         "state-sync-overlap",

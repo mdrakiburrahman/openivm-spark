@@ -178,9 +178,10 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
+    val key     = effectiveStateSyncKey(spark, uri)
     val span    = OpenIvmExecutionSpan.captureCurrent()
     val started = System.nanoTime()
-    try backupNowInternal(spark, uri)
+    try runBackupPass(key, spark, uri)
     finally {
       val durationMs = (System.nanoTime() - started) / 1000000L
       span.foreach(_.recordRocksDbBackup(durationMs))
@@ -188,9 +189,11 @@ object OpenIvmStateSync {
   }
 
   private def runBackupPass(key: String, spark: SparkSession, uri: String): Unit = {
-    val hook = backupPassHookForTesting
-    if (hook == null) backupNowInternal(spark, uri)
-    else hook(key, spark, uri)
+    backupStateFor(key).synchronized {
+      val hook = backupPassHookForTesting
+      if (hook == null) backupNowInternal(spark, uri)
+      else hook(key, spark, uri)
+    }
   }
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {
