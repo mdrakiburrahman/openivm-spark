@@ -685,6 +685,21 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       authoritative.emitsCascadeViewDelta shouldBe false
     }
 
+    it("marks only non-volatile FULL_REFRESH demotions as source-stable") {
+      val classification = MvCommandHelper.authoritativeFullRefreshClassification(
+        compileRefreshTypeName = "COMPILE_FAILED",
+        refreshReason = "compile_failed"
+      )
+      val stableSql  = "SELECT 1 AS id WHERE 1 <=> 1"
+      val stablePlan = spark.sql(stableSql).queryExecution.analyzed
+      val volatileSql =
+        "SELECT current_timestamp() AS observed_at, input_file_name() AS source_file"
+      val volatilePlan = spark.sql(volatileSql).queryExecution.analyzed
+
+      MvCommandHelper.sourceStableFullRefresh(classification, stablePlan, stableSql) shouldBe true
+      MvCommandHelper.sourceStableFullRefresh(classification, volatilePlan, volatileSql) shouldBe false
+    }
+
     it("reports a verified FULL_REFRESH companion as SIGNED_DELTA_RECOMPUTE, never as a full rebuild") {
       val viewShortName = "mv_full_refresh_cascade"
       val classification = MvCommandHelper.classifyEffectiveRefreshType(
@@ -1543,6 +1558,30 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         "mv_t5",
         "SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
       )
+    }
+
+    it("does not rewrite a deterministic compiler-fallback FULL_REFRESH") {
+      spark.sql("CREATE TABLE IF NOT EXISTS src_t5_compile_fallback(id INT, payload STRING) USING DELTA")
+      spark.sql("INSERT INTO src_t5_compile_fallback VALUES (1, 'a'), (2, NULL)")
+      val body =
+        "SELECT id, payload FROM src_t5_compile_fallback WHERE payload <=> payload"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t5_compile_fallback AS $body").collect()
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5_compile_fallback")).get
+      meta.properties(MvMetadata.CompileRefreshTypeKey) shouldBe "COMPILE_FAILED"
+      meta.sourceStableFullRefresh shouldBe true
+      val beforeVersion = DeltaTableVersion.requireLatest(spark, meta.location)
+
+      val payloads = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5_compile_fallback").collect()
+        executionSpanPayloads(appender.messages, "mv_t5_compile_fallback")
+      }
+
+      DeltaTableVersion.requireLatest(spark, meta.location) shouldBe beforeVersion
+      payloads should have size 1
+      payloads.head.path("outcome").asText() shouldBe "no_pending_deltas"
+      payloads.head.path("pending_delta_count").asLong() shouldBe 0L
+      assertBagEqual("mv_t5_compile_fallback", body)
     }
   }
 

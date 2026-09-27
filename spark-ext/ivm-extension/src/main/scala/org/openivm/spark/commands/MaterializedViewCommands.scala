@@ -2320,6 +2320,66 @@ private[commands] object MvCommandHelper {
       emitsCascadeViewDelta = false
     )
 
+  private val SourceIndependentSqlFunction =
+    ("""(?is)\b(?:current_date|current_timestamp|localtimestamp|now|rand|randn|random|uuid|""" +
+      """monotonically_increasing_id|input_file_name|spark_partition_id|current_user|session_user|user|""" +
+      """current_catalog|current_database|current_schema|current_timezone|unix_timestamp)\b""").r
+
+  private val SourceIndependentExpressionNames: Set[String] = Set(
+    "currentdate",
+    "currenttimestamp",
+    "localtimestamp",
+    "now",
+    "rand",
+    "randn",
+    "uuid",
+    "monotonicallyincreasingid",
+    "inputfilename",
+    "sparkpartitionid",
+    "currentuser",
+    "sessionuser",
+    "currentcatalog",
+    "currentdatabase",
+    "currentschema",
+    "currenttimezone"
+  )
+
+  /** True when the analyzed query may produce a different result while every
+    * tracked source remains at the same snapshot. The SQL fallback is
+    * intentionally conservative because analysis can fold current-time/session
+    * expressions into literals before this inspection.
+    */
+  def queryMayChangeWithoutSourceUpdates(analyzed: LogicalPlan, querySql: String): Boolean = {
+    def expressionIsVolatile(expression: Expression): Boolean = {
+      val className =
+        expression.getClass.getSimpleName.stripSuffix("$").toLowerCase(java.util.Locale.ROOT)
+      !expression.deterministic ||
+      SourceIndependentExpressionNames.contains(className) ||
+      expression.children.exists(expressionIsVolatile) ||
+      (expression match {
+        case subquery: SubqueryExpression => planIsVolatile(subquery.plan)
+        case _                            => false
+      })
+    }
+
+    def planIsVolatile(plan: LogicalPlan): Boolean =
+      plan.expressions.exists(expressionIsVolatile) || plan.children.exists(planIsVolatile)
+
+    SourceIndependentSqlFunction.findFirstIn(querySql).nonEmpty || planIsVolatile(analyzed)
+  }
+
+  /** A demoted FULL_REFRESH may skip an empty change batch only when CREATE
+    * proved the query has no source-independent volatility. Native
+    * FULL_REFRESH programs retain their semantic recompute behavior.
+    */
+  def sourceStableFullRefresh(
+      classification: EffectiveClassification,
+      analyzed: LogicalPlan,
+      querySql: String
+  ): Boolean =
+    classification.isDemotionToFullRefresh &&
+      !queryMayChangeWithoutSourceUpdates(analyzed, querySql)
+
   /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
     * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
     * Read-only: `LIMIT 0` triggers no scan/write.
@@ -3098,6 +3158,10 @@ case class CreateMaterializedViewCommand(
         (if (usesBackingDataTable) Map(MvMetadata.BackingDataTableKey -> "true") else Map.empty)
     val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
+    val sourceStableFullRefreshProps =
+      MvMetadata.sourceStableFullRefreshProperties(
+        MvCommandHelper.sourceStableFullRefresh(classification, analyzed, originalQueryText)
+      )
     val classificationProps =
       MvMetadata.refreshClassificationProperties(
         compileRefreshTypeName = classification.compileRefreshTypeName,
@@ -3201,8 +3265,8 @@ case class CreateMaterializedViewCommand(
       }
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++
-        watermarkProps ++ mvDependencyMapProps
+        sourceStableFullRefreshProps ++ queryShapeProps ++ classificationProps ++ timeTravelPinProps ++
+        pinIdentityProps ++ compiledProps ++ watermarkProps ++ mvDependencyMapProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -4557,7 +4621,10 @@ case class RefreshMaterializedViewCommand(
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
-      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+      if (
+        (meta.refreshType != RefreshTypeCode.FullRefresh || meta.sourceStableFullRefresh) &&
+        changeBatches.isEmpty
+      ) {
         // No source-consuming mutation, but the frozen deltas are still consumed
         // here: gate on pinned identity first so a rebound pinned MV never reports
         // a clean no-op or consumes frozen state.
