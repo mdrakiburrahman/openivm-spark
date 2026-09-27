@@ -6557,7 +6557,7 @@ case class RefreshMaterializedViewCommand(
                       RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_single_pass_replace'")
                       logInfo(
                         s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                          "outcome='window_single_pass_replace' reason='small_literal_partition_set'"
+                          "outcome='window_single_pass_replace'"
                       )
                       withPlanTimeBroadcastDisabled {
                         executeSqlAt(plan.directSql, idx)
@@ -6687,7 +6687,7 @@ case class RefreshMaterializedViewCommand(
                     materializedWindowAffectedView = None
                   }
                   if (cacheWindowSinglePassSnapshot) {
-                    executeSqlAt(s"CACHE TABLE `openivm_new_${mergeTargetId.table.replace("`", "``")}`", idx)
+                    executeSqlAt(s"CACHE TABLE `openivm_new_${name.table.replace("`", "``")}`", idx)
                   }
                   // After any CTAS that wrote to the view-delta path, log a diagnostic
                   // (multiplicity-sign counts + small JSON sample). Cheap: bounded to 8

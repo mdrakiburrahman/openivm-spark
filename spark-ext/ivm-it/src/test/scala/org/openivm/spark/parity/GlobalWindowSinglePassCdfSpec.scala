@@ -6,12 +6,15 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 class GlobalWindowSinglePassCdfSpec       extends GlobalWindowSinglePassCdfBase(backing = false)
 class BackedGlobalWindowSinglePassCdfSpec extends GlobalWindowSinglePassCdfBase(backing = true)
 
-abstract class GlobalWindowSinglePassCdfBase(backing: Boolean)
-    extends IvmParitySpecBase(s"global-window-single-pass-$backing")
+class CachedBackedGlobalWindowSinglePassCdfSpec extends GlobalWindowSinglePassCdfBase(backing = true, cache = true)
+
+abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = false)
+    extends IvmParitySpecBase(s"global-window-single-pass-$backing-$cache")
     with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.WindowSinglePassReplaceEnabledKey -> "true",
     FeatureGate.QueryLogEnabledKey                -> "true",
+    FeatureGate.WindowSnapshotCacheEnabledKey     -> cache.toString,
     "spark.openivm.catalogPreservesColumnCase"    -> "false"
   )
 
@@ -38,6 +41,7 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean)
         mvDataVersion("gw_rank") shouldBe before + 1
         statements.count(_.contains("REPLACE WHERE true")) shouldBe 1
       }
+      statements.count(_.trim == "CACHE TABLE `openivm_new_gw_rank`") shouldBe (if (cache) 1 else 0)
       statements.mkString("\n") should not include "/_ivm/view_deltas/"
       statements.exists(_.trim.toUpperCase.startsWith("DELETE FROM")) shouldBe false
     }
@@ -70,9 +74,12 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean)
     restartSpark(extraSparkConf + (FeatureGate.WindowSinglePassReplaceEnabledKey -> "false"))
     sql("CREATE TABLE gw_control_sales(id INT, region STRING, amount INT) USING DELTA")
     sql("INSERT INTO gw_control_sales VALUES (1, 'east', 10), (2, 'west', 20)")
-    val query = "SELECT region, total, DENSE_RANK() OVER (ORDER BY total DESC) AS rank " +
+    val rankAlias = if (backing) "Rank" else "rank"
+    val query = s"SELECT region, total, DENSE_RANK() OVER (ORDER BY total DESC) AS $rankAlias " +
       "FROM (SELECT region, SUM(amount) AS total FROM gw_control_sales GROUP BY region) t"
     sql(s"CREATE MATERIALIZED VIEW gw_control AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("gw_control")
+    MvCatalog.lookup(spark, id).get.usesBackingDataTable shouldBe backing
     sql("INSERT INTO gw_control_sales VALUES (3, 'east', 30)")
     val before = mvDataVersion("gw_control")
     RefreshSqlLogCatalog.removeAll(spark)
