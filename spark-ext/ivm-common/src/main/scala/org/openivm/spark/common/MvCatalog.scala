@@ -101,6 +101,16 @@ final case class MvMetadata(
       }
       .getOrElse(RefreshTypeCode.emitsCascadeViewDelta(refreshType))
 
+  /** Whether this FULL_REFRESH fallback is provably source-stable: its result
+    * cannot change while every tracked source remains at the same watermark.
+    * Missing or malformed metadata is conservative and preserves the legacy
+    * recompute-on-every-refresh behavior.
+    */
+  def sourceStableFullRefresh: Boolean =
+    properties
+      .get(MvMetadata.SourceStableFullRefreshKey)
+      .exists(_.trim.equalsIgnoreCase("true"))
+
   /** User-supplied `CLUSTER BY` columns (declaration order), or empty when the
     * MV was created without an explicit `CLUSTER BY` clause.
     */
@@ -218,6 +228,11 @@ object MvMetadata {
   /** CREATE-time refresh classification reason captured for refresh-span correlation. */
   val RefreshReasonKey: String = "_ivm_refresh_reason"
 
+  /** True only when a demoted FULL_REFRESH query is proven unable to change
+    * unless one of its tracked source watermarks advances.
+    */
+  val SourceStableFullRefreshKey: String = "_ivm_source_stable_full_refresh"
+
   /** Last observable unified refresh-intelligence decision captured during REFRESH. */
   val RefreshDecisionKey: String = "_ivm_refresh_decision"
 
@@ -272,6 +287,12 @@ object MvMetadata {
   /** Build the property entry capturing this MV instance's cascade-delta capability. */
   def cascadeViewDeltaProperties(enabled: Boolean): Map[String, String] =
     Map(EmitsCascadeViewDeltaKey -> enabled.toString)
+
+  /** Persist the source-stability verdict for a FULL_REFRESH fallback. Always
+    * emitted for new views so REFRESH never infers safety from missing metadata.
+    */
+  def sourceStableFullRefreshProperties(enabled: Boolean): Map[String, String] =
+    Map(SourceStableFullRefreshKey -> enabled.toString)
 
   /** Build the property entry recording the user-supplied `CLUSTER BY` columns.
     * Returns an empty map when there are no clustering columns.

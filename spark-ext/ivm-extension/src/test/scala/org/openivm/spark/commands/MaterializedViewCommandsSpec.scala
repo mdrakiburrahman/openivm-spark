@@ -451,6 +451,31 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         registrationSql should not include " AS SELECT "
       }
 
+      it("persists user TBLPROPERTIES on the public materialized-view relation") {
+        val source = "mv_user_properties_source"
+        val view   = "mv_user_properties"
+        val key    = "dbt.fabricspark.materialized_view.query_hash"
+        try {
+          spark.sql(s"DROP MATERIALIZED VIEW IF EXISTS $view")
+          spark.sql(s"DROP TABLE IF EXISTS $source")
+          spark.sql(
+            s"CREATE TABLE $source USING DELTA " +
+              "TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true') AS SELECT 1 AS id"
+          )
+          spark.sql(
+            s"CREATE MATERIALIZED VIEW $view USING DELTA " +
+              s"TBLPROPERTIES ('$key' = 'fixed-query-hash') AS SELECT id FROM $source"
+          )
+
+          val property = spark.sql(s"SHOW TBLPROPERTIES $view ('$key')").head()
+          property.getString(1) shouldBe "fixed-query-hash"
+          spark.table(view).collect().map(_.getInt(0)).toSeq shouldBe Seq(1)
+        } finally {
+          spark.sql(s"DROP MATERIALIZED VIEW IF EXISTS $view")
+          spark.sql(s"DROP TABLE IF EXISTS $source")
+        }
+      }
+
       it("rejects a named relation that points at a different backing table") {
         spark.sql("CREATE TABLE mv_shape_conflict(id INT) USING DELTA")
 
@@ -658,6 +683,21 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       authoritative.isDemotionToFullRefresh shouldBe true
       generic.emitsCascadeViewDelta shouldBe false
       authoritative.emitsCascadeViewDelta shouldBe false
+    }
+
+    it("marks only non-volatile FULL_REFRESH demotions as source-stable") {
+      val classification = MvCommandHelper.authoritativeFullRefreshClassification(
+        compileRefreshTypeName = "COMPILE_FAILED",
+        refreshReason = "compile_failed"
+      )
+      val stableSql  = "SELECT 1 AS id WHERE 1 <=> 1"
+      val stablePlan = spark.sql(stableSql).queryExecution.analyzed
+      val volatileSql =
+        "SELECT current_timestamp() AS observed_at, input_file_name() AS source_file"
+      val volatilePlan = spark.sql(volatileSql).queryExecution.analyzed
+
+      MvCommandHelper.sourceStableFullRefresh(classification, stablePlan, stableSql) shouldBe true
+      MvCommandHelper.sourceStableFullRefresh(classification, volatilePlan, volatileSql) shouldBe false
     }
 
     it("reports a verified FULL_REFRESH companion as SIGNED_DELTA_RECOMPUTE, never as a full rebuild") {
@@ -1518,6 +1558,30 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         "mv_t5",
         "SELECT region, SUM(amount) AS total FROM sales_t5 GROUP BY region"
       )
+    }
+
+    it("does not rewrite a deterministic compiler-fallback FULL_REFRESH") {
+      spark.sql("CREATE TABLE IF NOT EXISTS src_t5_compile_fallback(id INT, payload STRING) USING DELTA")
+      spark.sql("INSERT INTO src_t5_compile_fallback VALUES (1, 'a'), (2, NULL)")
+      val body =
+        "SELECT id, payload FROM src_t5_compile_fallback WHERE payload <=> payload"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t5_compile_fallback AS $body").collect()
+
+      val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t5_compile_fallback")).get
+      meta.properties(MvMetadata.CompileRefreshTypeKey) shouldBe "COMPILE_FAILED"
+      meta.sourceStableFullRefresh shouldBe true
+      val beforeVersion = DeltaTableVersion.requireLatest(spark, meta.location)
+
+      val payloads = withLogCapture { appender =>
+        spark.sql("REFRESH MATERIALIZED VIEW mv_t5_compile_fallback").collect()
+        executionSpanPayloads(appender.messages, "mv_t5_compile_fallback")
+      }
+
+      DeltaTableVersion.requireLatest(spark, meta.location) shouldBe beforeVersion
+      payloads should have size 1
+      payloads.head.path("outcome").asText() shouldBe "no_pending_deltas"
+      payloads.head.path("pending_delta_count").asLong() shouldBe 0L
+      assertBagEqual("mv_t5_compile_fallback", body)
     }
   }
 

@@ -1605,8 +1605,14 @@ private[commands] object MvCommandHelper {
   val CreateRecoveryWatermarksMarker: String = "_ivm_create_watermarks_v1"
 
   def createRecoveryTableProperties(watermarkProperties: Map[String, String]): Seq[String] = {
+    tablePropertyAssignments(
+      watermarkProperties + (CreateRecoveryWatermarksMarker -> "true")
+    )
+  }
+
+  def tablePropertyAssignments(properties: Map[String, String]): Seq[String] = {
     def quoted(value: String): String = s"'${value.replace("'", "''")}'"
-    (watermarkProperties + (CreateRecoveryWatermarksMarker -> "true")).toSeq
+    properties.toSeq
       .sortBy(_._1)
       .map { case (key, value) => s"${quoted(key)} = ${quoted(value)}" }
   }
@@ -2313,6 +2319,66 @@ private[commands] object MvCommandHelper {
       reason = refreshReason,
       emitsCascadeViewDelta = false
     )
+
+  private val SourceIndependentSqlFunction =
+    ("""(?is)\b(?:current_date|current_timestamp|localtimestamp|now|rand|randn|random|uuid|""" +
+      """monotonically_increasing_id|input_file_name|spark_partition_id|current_user|session_user|user|""" +
+      """current_catalog|current_database|current_schema|current_timezone|unix_timestamp)\b""").r
+
+  private val SourceIndependentExpressionNames: Set[String] = Set(
+    "currentdate",
+    "currenttimestamp",
+    "localtimestamp",
+    "now",
+    "rand",
+    "randn",
+    "uuid",
+    "monotonicallyincreasingid",
+    "inputfilename",
+    "sparkpartitionid",
+    "currentuser",
+    "sessionuser",
+    "currentcatalog",
+    "currentdatabase",
+    "currentschema",
+    "currenttimezone"
+  )
+
+  /** True when the analyzed query may produce a different result while every
+    * tracked source remains at the same snapshot. The SQL fallback is
+    * intentionally conservative because analysis can fold current-time/session
+    * expressions into literals before this inspection.
+    */
+  def queryMayChangeWithoutSourceUpdates(analyzed: LogicalPlan, querySql: String): Boolean = {
+    def expressionIsVolatile(expression: Expression): Boolean = {
+      val className =
+        expression.getClass.getSimpleName.stripSuffix("$").toLowerCase(java.util.Locale.ROOT)
+      !expression.deterministic ||
+      SourceIndependentExpressionNames.contains(className) ||
+      expression.children.exists(expressionIsVolatile) ||
+      (expression match {
+        case subquery: SubqueryExpression => planIsVolatile(subquery.plan)
+        case _                            => false
+      })
+    }
+
+    def planIsVolatile(plan: LogicalPlan): Boolean =
+      plan.expressions.exists(expressionIsVolatile) || plan.children.exists(planIsVolatile)
+
+    SourceIndependentSqlFunction.findFirstIn(querySql).nonEmpty || planIsVolatile(analyzed)
+  }
+
+  /** A demoted FULL_REFRESH may skip an empty change batch only when CREATE
+    * proved the query has no source-independent volatility. Native
+    * FULL_REFRESH programs retain their semantic recompute behavior.
+    */
+  def sourceStableFullRefresh(
+      classification: EffectiveClassification,
+      analyzed: LogicalPlan,
+      querySql: String
+  ): Boolean =
+    classification.isDemotionToFullRefresh &&
+      !queryMayChangeWithoutSourceUpdates(analyzed, querySql)
 
   /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
     * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
@@ -3092,6 +3158,10 @@ case class CreateMaterializedViewCommand(
         (if (usesBackingDataTable) Map(MvMetadata.BackingDataTableKey -> "true") else Map.empty)
     val clusterColsProp   = MvMetadata.clusterColumnsProperties(clusterColumns)
     val cascadeDeltaProps = MvMetadata.cascadeViewDeltaProperties(emitsCascadeViewDelta)
+    val sourceStableFullRefreshProps =
+      MvMetadata.sourceStableFullRefreshProperties(
+        MvCommandHelper.sourceStableFullRefresh(classification, analyzed, originalQueryText)
+      )
     val classificationProps =
       MvMetadata.refreshClassificationProperties(
         compileRefreshTypeName = classification.compileRefreshTypeName,
@@ -3195,8 +3265,8 @@ case class CreateMaterializedViewCommand(
       }
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
-        queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++
-        watermarkProps ++ mvDependencyMapProps
+        sourceStableFullRefreshProps ++ queryShapeProps ++ classificationProps ++ timeTravelPinProps ++
+        pinIdentityProps ++ compiledProps ++ watermarkProps ++ mvDependencyMapProps
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -3228,7 +3298,8 @@ case class CreateMaterializedViewCommand(
         .getOrElse("")
 
     val tblProps =
-      FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
+      tablePropertyAssignments(userProps) ++
+        FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
         (if (
            effectiveRefreshType == RefreshTypeCode.AggregateGroup &&
            usesBackingDataTable && havingPred.isEmpty && topKViewSuffix.isEmpty &&
@@ -3439,9 +3510,14 @@ case class CreateMaterializedViewCommand(
               .mkString(", ")
             val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
             val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
+            val publicViewProperties =
+              userProps ++
+                (if (havingPred.isEmpty && topKViewSuffix.isEmpty)
+                   Map(MvProjectionSource.CatalogProperty -> "true")
+                 else Map.empty)
             val projectionProperties =
-              if (havingPred.isEmpty && topKViewSuffix.isEmpty)
-                s"TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') "
+              if (publicViewProperties.nonEmpty)
+                s"TBLPROPERTIES (${tablePropertyAssignments(publicViewProperties).mkString(", ")}) "
               else ""
             val viewSql =
               s"CREATE VIEW ${sqlIdent(name)} ${projectionProperties}AS " +
@@ -4545,7 +4621,10 @@ case class RefreshMaterializedViewCommand(
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
-      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+      if (
+        (meta.refreshType != RefreshTypeCode.FullRefresh || meta.sourceStableFullRefresh) &&
+        changeBatches.isEmpty
+      ) {
         // No source-consuming mutation, but the frozen deltas are still consumed
         // here: gate on pinned identity first so a rebound pinned MV never reports
         // a clean no-op or consumes frozen state.
@@ -6004,7 +6083,7 @@ case class RefreshMaterializedViewCommand(
               val windowSuffixEmitsCascade =
                 windowSuffixSafe && downstreamSourceKeysForThisMv.nonEmpty && meta.emitsCascadeViewDelta
               var windowSuffixCascadeWritten = false
-              val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
+              val rewrittenSql               = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
               val boundedRankEmitsCascade =
                 propagation.requiresDmlInterception && meta.emitsCascadeViewDelta
               val boundedRankCascadeAvailable =
@@ -7509,11 +7588,11 @@ case class RefreshMaterializedViewCommand(
           shape.partitionCols.nonEmpty &&
           (shape.partitionCols ++ shape.orderKeys.map(_.column)).forall(c => sourceCols.exists(_.equalsIgnoreCase(c)))
         ) {
-          val targetRef   = MvCommandHelper.sqlIdent(targetId)
-          val sourceRef   = quoteIdentPath(meta.sourceTables.head)
-          val colList     = mvCols.map(quoteCol).mkString(", ")
-          val sourceList  = sourceCols.map(quoteCol).mkString(", ")
-          val partList    = shape.partitionCols.map(quoteCol).mkString(", ")
+          val targetRef  = MvCommandHelper.sqlIdent(targetId)
+          val sourceRef  = quoteIdentPath(meta.sourceTables.head)
+          val colList    = mvCols.map(quoteCol).mkString(", ")
+          val sourceList = sourceCols.map(quoteCol).mkString(", ")
+          val partList   = shape.partitionCols.map(quoteCol).mkString(", ")
           val orderExpr = shape.orderKeys
             .map(key => s"${quoteCol(key.column)} ${key.direction}${key.nullOrdering.fold("")(n => s" NULLS $n")}")
             .mkString(", ")
@@ -7544,7 +7623,7 @@ case class RefreshMaterializedViewCommand(
                   |WITH $commonCtes
                   |$boundedRows""".stripMargin
             val escapedViewDeltaPath = viewDeltaPath.replace("`", "``")
-            val oldView = quoteCol(s"openivm_old_${targetId.table}")
+            val oldView              = quoteCol(s"openivm_old_${targetId.table}")
             val viewDeltaCtasSql =
               s"""|CREATE OR REPLACE TABLE delta.`$escapedViewDeltaPath` USING DELTA AS
                   |WITH $commonCtes,
@@ -7614,7 +7693,7 @@ case class RefreshMaterializedViewCommand(
       val m = "(?is)\\bPARTITION\\s+BY\\s+(.+?)\\s+ORDER\\s+BY\\s+(.+?)(?:\\bROWS\\b|\\bRANGE\\b|$)".r
         .findFirstMatchIn(spec)
       m.flatMap { specHit =>
-        val parts = splitIdentifierList(specHit.group(1))
+        val parts     = splitIdentifierList(specHit.group(1))
         val orderKeys = parseOrderKeys(specHit.group(2))
         orderKeys.map { keys =>
           (hit.group(1).toUpperCase(java.util.Locale.ROOT), parts, keys, stripSqlIdent(hit.group(3)))
