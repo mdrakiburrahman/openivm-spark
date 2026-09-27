@@ -2662,7 +2662,7 @@ case class CreateMaterializedViewCommand(
               } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
           if (finalizeUnderLock) {
-            OpenIvmStateSync.backupAsync(spark)
+            OpenIvmStateSync.backupNow(spark)
             createOutcome = outcome
           }
           outcome
@@ -2671,7 +2671,7 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        OpenIvmStateSync.backupAsync(spark)
+        OpenIvmStateSync.backupNow(spark)
         createOutcome = outcome
       }
       Seq.empty
@@ -3646,7 +3646,7 @@ case class RefreshMaterializedViewCommand(
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
-      OpenIvmStateSync.backupAsync(spark)
+      OpenIvmStateSync.backupNow(spark)
       rows
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach

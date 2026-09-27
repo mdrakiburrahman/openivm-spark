@@ -30,6 +30,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.{
   OpenIvmExecutionSpan,
   OpenIvmTelemetryContract,
@@ -1096,6 +1097,39 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
       // Catalog metadata must be present
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
+    }
+
+    it("waits for durable state backup before CREATE returns") {
+      spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
+      spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        entered.countDown()
+        release.await(30, TimeUnit.SECONDS)
+      }
+
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val create = Future {
+        spark
+          .sql(
+            "CREATE MATERIALIZED VIEW mv_t1_sync AS " +
+              "SELECT region, SUM(amount) AS total FROM sales_t1_sync GROUP BY region"
+          )
+          .collect()
+      }
+      try {
+        entered.await(60, TimeUnit.SECONDS) shouldBe true
+        Thread.sleep(100L)
+        create.isCompleted shouldBe false
+        release.countDown()
+        Await.result(create, 120.seconds)
+      } finally {
+        release.countDown()
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
     }
 
     it("persists user properties on the public relation without replacing it on refresh") {

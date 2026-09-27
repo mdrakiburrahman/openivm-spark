@@ -58,6 +58,7 @@ object OpenIvmStateSync {
   private val backupStates  = new ConcurrentHashMap[String, BackupState]()
   @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
+  @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -94,6 +95,11 @@ object OpenIvmStateSync {
     if (hook == null) stateSyncKey(spark, uri) else hook(spark, uri)
   }
 
+  private def stateSyncUri(spark: SparkSession): Option[String] = {
+    val hook = stateSyncUriHookForTesting
+    if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
+  }
+
   private def backupStateFor(key: String): BackupState = {
     val fresh    = new BackupState
     val existing = backupStates.putIfAbsent(key, fresh)
@@ -104,8 +110,7 @@ object OpenIvmStateSync {
     * call per Spark application. Best-effort: any failure logs a warning and
     * leaves the local tree empty (openivm then rebuilds state from scratch). */
   def maybeRestore(spark: SparkSession): Unit = {
-    val uri = FeatureGate
-      .stateSyncUri(spark)
+    val uri = stateSyncUri(spark)
       .getOrElse(
         return
       )
@@ -131,8 +136,7 @@ object OpenIvmStateSync {
     * the remote URI. If a backup is already queued this call is folded into that
     * in-flight work and forces one more pass afterwards. */
   def backupAsync(spark: SparkSession): Unit = {
-    val uri = FeatureGate
-      .stateSyncUri(spark)
+    val uri = stateSyncUri(spark)
       .getOrElse(
         return
       )
@@ -173,8 +177,7 @@ object OpenIvmStateSync {
 
   /** Synchronous incremental backup. Public for tests / explicit checkpoints. */
   def backupNow(spark: SparkSession): Unit = {
-    val uri = FeatureGate
-      .stateSyncUri(spark)
+    val uri = stateSyncUri(spark)
       .getOrElse(
         return
       )
@@ -262,15 +265,17 @@ object OpenIvmStateSync {
     if (uploaded > 0) log.info(s"openivm state-sync: backed up $uploaded files to $uri")
   }
 
-  private[rocksdb] def setBackupPassHookForTesting(hook: (String, SparkSession, String) => Unit): Unit =
+  private[openivm] def setBackupPassHookForTesting(hook: (String, SparkSession, String) => Unit): Unit =
     backupPassHookForTesting = hook
 
   private[rocksdb] def setStateSyncKeyHookForTesting(hook: (SparkSession, String) => String): Unit =
     stateSyncKeyHookForTesting = hook
 
+  private[openivm] def setStateSyncUriHookForTesting(hook: SparkSession => Option[String]): Unit =
+    stateSyncUriHookForTesting = hook
+
   private[rocksdb] def backupStateSnapshotForTesting(spark: SparkSession): Option[BackupStateSnapshot] =
-    FeatureGate
-      .stateSyncUri(spark)
+    stateSyncUri(spark)
       .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
       .map(state => BackupStateSnapshot(running = state.running.get(), requested = state.requested.get()))
 
@@ -287,6 +292,7 @@ object OpenIvmStateSync {
   private[rocksdb] def resetForTesting(): Unit = {
     backupPassHookForTesting = null
     stateSyncKeyHookForTesting = null
+    stateSyncUriHookForTesting = null
     restoreStates.clear()
     backupStates.clear()
   }
