@@ -451,6 +451,31 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         registrationSql should not include " AS SELECT "
       }
 
+      it("persists user TBLPROPERTIES on the public materialized-view relation") {
+        val source = "mv_user_properties_source"
+        val view   = "mv_user_properties"
+        val key    = "dbt.fabricspark.materialized_view.query_hash"
+        try {
+          spark.sql(s"DROP MATERIALIZED VIEW IF EXISTS $view")
+          spark.sql(s"DROP TABLE IF EXISTS $source")
+          spark.sql(
+            s"CREATE TABLE $source USING DELTA " +
+              "TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true') AS SELECT 1 AS id"
+          )
+          spark.sql(
+            s"CREATE MATERIALIZED VIEW $view USING DELTA " +
+              s"TBLPROPERTIES ('$key' = 'fixed-query-hash') AS SELECT id FROM $source"
+          )
+
+          val property = spark.sql(s"SHOW TBLPROPERTIES $view ('$key')").head()
+          property.getString(1) shouldBe "fixed-query-hash"
+          spark.table(view).collect().map(_.getInt(0)).toSeq shouldBe Seq(1)
+        } finally {
+          spark.sql(s"DROP MATERIALIZED VIEW IF EXISTS $view")
+          spark.sql(s"DROP TABLE IF EXISTS $source")
+        }
+      }
+
       it("rejects a named relation that points at a different backing table") {
         spark.sql("CREATE TABLE mv_shape_conflict(id INT) USING DELTA")
 

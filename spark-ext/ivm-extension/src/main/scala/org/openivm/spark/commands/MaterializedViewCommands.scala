@@ -1605,8 +1605,14 @@ private[commands] object MvCommandHelper {
   val CreateRecoveryWatermarksMarker: String = "_ivm_create_watermarks_v1"
 
   def createRecoveryTableProperties(watermarkProperties: Map[String, String]): Seq[String] = {
+    tablePropertyAssignments(
+      watermarkProperties + (CreateRecoveryWatermarksMarker -> "true")
+    )
+  }
+
+  def tablePropertyAssignments(properties: Map[String, String]): Seq[String] = {
     def quoted(value: String): String = s"'${value.replace("'", "''")}'"
-    (watermarkProperties + (CreateRecoveryWatermarksMarker -> "true")).toSeq
+    properties.toSeq
       .sortBy(_._1)
       .map { case (key, value) => s"${quoted(key)} = ${quoted(value)}" }
   }
@@ -3228,7 +3234,8 @@ case class CreateMaterializedViewCommand(
         .getOrElse("")
 
     val tblProps =
-      FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
+      tablePropertyAssignments(userProps) ++
+        FeatureGate.buildMvDataTblProperties(spark, effectiveClusterCols.getOrElse(Nil)) ++
         (if (
            effectiveRefreshType == RefreshTypeCode.AggregateGroup &&
            usesBackingDataTable && havingPred.isEmpty && topKViewSuffix.isEmpty &&
@@ -3439,9 +3446,14 @@ case class CreateMaterializedViewCommand(
               .mkString(", ")
             val whereClause  = havingPred.map(pred => s" WHERE ($pred)").getOrElse("")
             val suffixClause = topKViewSuffix.map(sql => s" $sql").getOrElse("")
+            val publicViewProperties =
+              userProps ++
+                (if (havingPred.isEmpty && topKViewSuffix.isEmpty)
+                   Map(MvProjectionSource.CatalogProperty -> "true")
+                 else Map.empty)
             val projectionProperties =
-              if (havingPred.isEmpty && topKViewSuffix.isEmpty)
-                s"TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') "
+              if (publicViewProperties.nonEmpty)
+                s"TBLPROPERTIES (${tablePropertyAssignments(publicViewProperties).mkString(", ")}) "
               else ""
             val viewSql =
               s"CREATE VIEW ${sqlIdent(name)} ${projectionProperties}AS " +
@@ -6004,7 +6016,7 @@ case class RefreshMaterializedViewCommand(
               val windowSuffixEmitsCascade =
                 windowSuffixSafe && downstreamSourceKeysForThisMv.nonEmpty && meta.emitsCascadeViewDelta
               var windowSuffixCascadeWritten = false
-              val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
+              val rewrittenSql               = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
               val boundedRankEmitsCascade =
                 propagation.requiresDmlInterception && meta.emitsCascadeViewDelta
               val boundedRankCascadeAvailable =
@@ -7509,11 +7521,11 @@ case class RefreshMaterializedViewCommand(
           shape.partitionCols.nonEmpty &&
           (shape.partitionCols ++ shape.orderKeys.map(_.column)).forall(c => sourceCols.exists(_.equalsIgnoreCase(c)))
         ) {
-          val targetRef   = MvCommandHelper.sqlIdent(targetId)
-          val sourceRef   = quoteIdentPath(meta.sourceTables.head)
-          val colList     = mvCols.map(quoteCol).mkString(", ")
-          val sourceList  = sourceCols.map(quoteCol).mkString(", ")
-          val partList    = shape.partitionCols.map(quoteCol).mkString(", ")
+          val targetRef  = MvCommandHelper.sqlIdent(targetId)
+          val sourceRef  = quoteIdentPath(meta.sourceTables.head)
+          val colList    = mvCols.map(quoteCol).mkString(", ")
+          val sourceList = sourceCols.map(quoteCol).mkString(", ")
+          val partList   = shape.partitionCols.map(quoteCol).mkString(", ")
           val orderExpr = shape.orderKeys
             .map(key => s"${quoteCol(key.column)} ${key.direction}${key.nullOrdering.fold("")(n => s" NULLS $n")}")
             .mkString(", ")
@@ -7544,7 +7556,7 @@ case class RefreshMaterializedViewCommand(
                   |WITH $commonCtes
                   |$boundedRows""".stripMargin
             val escapedViewDeltaPath = viewDeltaPath.replace("`", "``")
-            val oldView = quoteCol(s"openivm_old_${targetId.table}")
+            val oldView              = quoteCol(s"openivm_old_${targetId.table}")
             val viewDeltaCtasSql =
               s"""|CREATE OR REPLACE TABLE delta.`$escapedViewDeltaPath` USING DELTA AS
                   |WITH $commonCtes,
@@ -7614,7 +7626,7 @@ case class RefreshMaterializedViewCommand(
       val m = "(?is)\\bPARTITION\\s+BY\\s+(.+?)\\s+ORDER\\s+BY\\s+(.+?)(?:\\bROWS\\b|\\bRANGE\\b|$)".r
         .findFirstMatchIn(spec)
       m.flatMap { specHit =>
-        val parts = splitIdentifierList(specHit.group(1))
+        val parts     = splitIdentifierList(specHit.group(1))
         val orderKeys = parseOrderKeys(specHit.group(2))
         orderKeys.map { keys =>
           (hit.group(1).toUpperCase(java.util.Locale.ROOT), parts, keys, stripSqlIdent(hit.group(3)))
