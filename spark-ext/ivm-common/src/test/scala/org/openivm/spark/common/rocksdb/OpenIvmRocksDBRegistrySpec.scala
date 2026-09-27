@@ -916,6 +916,38 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       restored.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
     }
 
+    it("retries a backup pass when a required local RocksDB file is rotated") {
+      val stateRoot  = newDir("state-sync-rotating-local")
+      val remoteRoot = newDir("state-sync-rotating-remote")
+      val spark = newSpark(
+        "state-sync-rotating-file",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val rocksDbDir = new File(stateRoot, "_openivm/mvs/rotating/rocksdb")
+      rocksDbDir.mkdirs() shouldBe true
+      val current = new File(rocksDbDir, "CURRENT")
+      val wal     = new File(rocksDbDir, "000001.log")
+      java.nio.file.Files.write(current.toPath, "MANIFEST-000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      java.nio.file.Files.write(wal.toPath, Array[Byte](1, 2, 3))
+      val removed = new AtomicBoolean(false)
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { file =>
+        if (file.getName == wal.getName && removed.compareAndSet(false, true))
+          java.nio.file.Files.delete(file.toPath)
+      }
+
+      try {
+        OpenIvmStateSync.backupNow(spark)
+        removed.get() shouldBe true
+        new File(remoteRoot, "mvs/rotating/rocksdb/CURRENT").isFile shouldBe true
+        new File(remoteRoot, "mvs/rotating/rocksdb/000001.log").exists() shouldBe false
+      } finally {
+        OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)
+      }
+    }
+
     it("coalesces in-flight requests into one follow-up pass and stays bounded while eventually becoming idle") {
       val spark = newSpark(
         "state-sync-coalesce",

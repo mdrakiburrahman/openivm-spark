@@ -59,6 +59,7 @@ object OpenIvmStateSync {
   @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
+  @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -240,30 +241,70 @@ object OpenIvmStateSync {
     val fs         = remoteRoot.getFileSystem(hconf)
     val localBase  = local.toPath
     var uploaded   = 0
+    var attempts   = 0
+    var stablePass = false
 
-    listLocalFiles(local).foreach { f =>
-      val name = f.getName
-      if (!name.endsWith(".crc")) {
-        val rel    = localBase.relativize(f.toPath).toString
-        val remote = new Path(remoteRoot, rel)
-        val len    = f.length()
-        // Immutable SST files are content-addressed by RocksDB, so a same-length
-        // remote copy is identical and can be skipped. Everything else (mutable
-        // metadata) is always re-uploaded so the remote reflects the newest
-        // committed manifest.
-        val skip =
-          name.endsWith(".sst") && {
-            try fs.exists(remote) && fs.getFileStatus(remote).getLen == len
-            catch { case NonFatal(_) => false }
+    while (!stablePass && attempts < 20) {
+      attempts += 1
+      var localFileVanished = false
+      val files = listLocalFiles(local)
+        .filterNot(file => isTransientRocksDbFile(file.getName))
+        .sortBy(file => if (file.getName == "CURRENT") 1 else 0)
+
+      files.foreach { f =>
+        if (!localFileVanished) {
+          val hook = beforeLocalFileCopyHookForTesting
+          if (hook != null) hook(f)
+          if (!f.isFile) localFileVanished = true
+          else {
+            val name   = f.getName
+            val rel    = localBase.relativize(f.toPath).toString
+            val remote = new Path(remoteRoot, rel)
+            val len    = f.length()
+            // Immutable SST files are content-addressed by RocksDB, so a same-length
+            // remote copy is identical and can be skipped. Everything else (mutable
+            // metadata) is always re-uploaded so the remote reflects the newest
+            // committed manifest.
+            val skip =
+              name.endsWith(".sst") && {
+                try fs.exists(remote) && fs.getFileStatus(remote).getLen == len
+                catch { case NonFatal(_) => false }
+              }
+            if (!skip) {
+              try {
+                fs.copyFromLocalFile(
+                  /* delSrc = */ false,
+                  /* overwrite = */ true,
+                  new Path(f.getAbsolutePath),
+                  remote
+                )
+                uploaded += 1
+              } catch {
+                case NonFatal(_) if !f.isFile =>
+                  localFileVanished = true
+              }
+            }
           }
-        if (!skip) {
-          fs.copyFromLocalFile( /* delSrc = */ false, /* overwrite = */ true, new Path(f.getAbsolutePath), remote)
-          uploaded += 1
         }
       }
+
+      if (localFileVanished) Thread.sleep(50L)
+      else stablePass = true
     }
+    if (!stablePass)
+      throw new java.io.IOException(
+        s"openivm state-sync: local RocksDB files kept changing while backing up '$local' to '$uri'"
+      )
     if (uploaded > 0) log.info(s"openivm state-sync: backed up $uploaded files to $uri")
   }
+
+  private def isTransientRocksDbFile(name: String): Boolean =
+    name.endsWith(".crc") ||
+      name == "LOCK" ||
+      name == "LOG" ||
+      name.startsWith("LOG.old.") ||
+      name.startsWith("OPTIONS-") ||
+      name.endsWith(".dbtmp")
 
   private[openivm] def setBackupPassHookForTesting(hook: (String, SparkSession, String) => Unit): Unit =
     backupPassHookForTesting = hook
@@ -273,6 +314,9 @@ object OpenIvmStateSync {
 
   private[openivm] def setStateSyncUriHookForTesting(hook: SparkSession => Option[String]): Unit =
     stateSyncUriHookForTesting = hook
+
+  private[rocksdb] def setBeforeLocalFileCopyHookForTesting(hook: File => Unit): Unit =
+    beforeLocalFileCopyHookForTesting = hook
 
   private[rocksdb] def backupStateSnapshotForTesting(spark: SparkSession): Option[BackupStateSnapshot] =
     stateSyncUri(spark)
@@ -293,6 +337,7 @@ object OpenIvmStateSync {
     backupPassHookForTesting = null
     stateSyncKeyHookForTesting = null
     stateSyncUriHookForTesting = null
+    beforeLocalFileCopyHookForTesting = null
     restoreStates.clear()
     backupStates.clear()
   }
