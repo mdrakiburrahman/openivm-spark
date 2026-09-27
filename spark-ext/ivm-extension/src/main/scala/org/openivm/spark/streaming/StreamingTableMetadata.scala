@@ -993,21 +993,16 @@ object StreamingTableMetadata {
         archivedAt += 1L
         archivedCheckpoint = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
       }
-      val event = Mapper.createObjectNode()
-      event.put("format", "openivm-streaming-checkpoint-archive")
-      event.put("formatVersion", 1)
-      event.put("eventId", UUID.randomUUID().toString)
-      event.put("action", context.action)
-      event.put("operationId", context.operationId)
-      event.put("rootTarget", context.rootTarget)
-      context.causedBy.foreach(event.put("causedBy", _))
-      event.put("archivedAtUtcEpochMillis", archivedAt)
-      val targetNode = event.putObject("target")
-      targetNode.put("identity", target.identity)
-      targetNode.put("path", target.dataPath)
-      targetNode.put("deltaTableId", target.deltaTableId)
-      targetNode.put("tableId", target.tableId)
-      context.rebuildDecision.foreach(decision => writeRebuildDecision(event.putObject("decision"), decision))
+      val event = archiveEvent(
+        format = "openivm-streaming-checkpoint-archive",
+        targetKind = "streaming",
+        identity = target.identity,
+        dataPath = target.dataPath,
+        deltaTableId = target.deltaTableId,
+        tableId = target.tableId,
+        context = context,
+        archivedAt = archivedAt
+      )
       val eventPath = new Path(checkpoint, ArchiveEventFile)
       if (!fs.exists(eventPath))
         writeNewAtomically(
@@ -1027,17 +1022,117 @@ object StreamingTableMetadata {
     }
   }
 
+  def archiveMaterializedTarget(
+      spark: SparkSession,
+      target: StreamingTableCascadeTarget,
+      context: StreamingArchiveContext
+  ): String = {
+    val archiveRoot = FeatureGate
+      .streamingCheckpointArchiveUri(spark)
+      .getOrElse(
+        StreamingTableErrors.invalid(
+          s"Cannot archive the materialized view '${target.name.mkString(".")}': " +
+            s"${FeatureGate.StreamingCheckpointArchiveUriKey} is not configured"
+        )
+      )
+    val tableArchive = archivePath(spark, target.name, target.identity, archiveRoot)
+    val fs           = tableArchive.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(tableArchive) && !fs.mkdirs(tableArchive))
+      StreamingTableErrors.invalid(
+        s"Failed to create materialized-view archive directory '$tableArchive'"
+      )
+    var archivedAt     = System.currentTimeMillis()
+    var archivedTarget = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
+    while (fs.exists(archivedTarget)) {
+      archivedAt += 1L
+      archivedTarget = new Path(tableArchive, s"$CheckpointDirectory-$archivedAt")
+    }
+    if (!fs.mkdirs(archivedTarget))
+      StreamingTableErrors.invalid(
+        s"Failed to create materialized-view archive '$archivedTarget'"
+      )
+    val event = archiveEvent(
+      format = "openivm-materialized-view-archive",
+      targetKind = "materialized",
+      identity = target.identity,
+      dataPath = target.dataPath,
+      deltaTableId = target.deltaTableId,
+      tableId = target.tableId,
+      context = context,
+      archivedAt = archivedAt
+    )
+    val eventPath = new Path(archivedTarget, ArchiveEventFile)
+    try {
+      writeNewAtomically(
+        fs,
+        eventPath,
+        Mapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(event)
+      )
+      if (!fs.exists(eventPath))
+        StreamingTableErrors.invalid(
+          s"Materialized-view archive event '$eventPath' was not persisted"
+        )
+      archivedTarget.toString
+    } catch {
+      case NonFatal(error) =>
+        if (fs.exists(archivedTarget) && !fs.delete(archivedTarget, true))
+          error.addSuppressed(
+            new IllegalStateException(
+              s"Failed to remove incomplete materialized-view archive '$archivedTarget'"
+            )
+          )
+        throw error
+    }
+  }
+
   private[streaming] def archivePath(
       spark: SparkSession,
       target: StreamingTableTarget,
       archiveRoot: String
+  ): Path =
+    archivePath(spark, target.name, target.identity, archiveRoot)
+
+  private[streaming] def archivePath(
+      spark: SparkSession,
+      nameParts: Seq[String],
+      identity: String,
+      archiveRoot: String
   ): Path = {
     val name =
-      if (target.name.nonEmpty) qualifiedNameParts(spark, target.name)
-      else Seq(s"unknown-${StreamingTableDefinition.sha256(target.identity).take(16)}")
+      if (nameParts.nonEmpty) qualifiedNameParts(spark, nameParts)
+      else Seq(s"unknown-${StreamingTableDefinition.sha256(identity).take(16)}")
     name.foldLeft(new Path(archiveRoot)) { case (parent, part) =>
       new Path(parent, archivePathSegment(part))
     }
+  }
+
+  private def archiveEvent(
+      format: String,
+      targetKind: String,
+      identity: String,
+      dataPath: String,
+      deltaTableId: String,
+      tableId: String,
+      context: StreamingArchiveContext,
+      archivedAt: Long
+  ): ObjectNode = {
+    val event = Mapper.createObjectNode()
+    event.put("format", format)
+    event.put("formatVersion", 1)
+    event.put("eventId", UUID.randomUUID().toString)
+    event.put("action", context.action)
+    event.put("operationId", context.operationId)
+    event.put("rootTarget", context.rootTarget)
+    context.causedBy.foreach(event.put("causedBy", _))
+    event.put("archivedAtUtcEpochMillis", archivedAt)
+    val targetNode = event.putObject("target")
+    targetNode.put("kind", targetKind)
+    targetNode.put("identity", identity)
+    targetNode.put("path", dataPath)
+    targetNode.put("deltaTableId", deltaTableId)
+    targetNode.put("tableId", tableId)
+    context.rebuildDecision.foreach(decision => writeRebuildDecision(event.putObject("decision"), decision))
+    event
   }
 
   private def archivePathSegment(value: String): String = {

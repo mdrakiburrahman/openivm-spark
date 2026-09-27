@@ -94,6 +94,10 @@ class ManagedTableCascadeSpec extends AnyFunSpec with StreamingSqlTestSupport {
           |AS SELECT id, value FROM STREAM managed_mixed_rebuild_b""".stripMargin
       )
       process(leaf)
+      val oldRoot =
+        StreamingTableMetadata.resolveDeltaTarget(spark, Seq("managed_mixed_rebuild_a"), requireTableIdMarker = true)
+      val oldLeaf =
+        StreamingTableMetadata.resolveDeltaTarget(spark, Seq("managed_mixed_rebuild_c"), requireTableIdMarker = true)
 
       val rebuilt = createStreamingSql(
         """CREATE STREAMING TABLE managed_mixed_rebuild_a
@@ -105,6 +109,24 @@ class ManagedTableCascadeSpec extends AnyFunSpec with StreamingSqlTestSupport {
       spark.catalog.tableExists("managed_mixed_rebuild_a") shouldBe true
       spark.catalog.tableExists("managed_mixed_rebuild_b") shouldBe false
       spark.catalog.tableExists("managed_mixed_rebuild_c") shouldBe false
+      val rootArchives = archivedCheckpoints(oldRoot)
+      val viewArchives = archivedManagedTargets(
+        Seq("managed_mixed_rebuild_b"),
+        StreamingDependencyCatalog.materializedIdentity("managed_mixed_rebuild_b")
+      )
+      val leafArchives = archivedCheckpoints(oldLeaf)
+      rootArchives should have size 1
+      viewArchives should have size 1
+      leafArchives should have size 1
+      val events = Seq(rootArchives.head, viewArchives.head, leafArchives.head).map(checkpointArchiveEvent)
+      events.map(_.get("operationId").asText()).distinct should have size 1
+      events.map(_.get("rootTarget").asText()).distinct shouldBe Seq(oldRoot.identity)
+      events.map(_.get("action").asText()) should contain theSameElementsAs Seq("rebuild", "cascade", "cascade")
+      events
+        .find(_.get("target").get("kind").asText() == "materialized")
+        .get
+        .get("causedBy")
+        .asText() shouldBe oldRoot.identity
     }
 
     it("drops a streaming child before its materialized-view parent") {

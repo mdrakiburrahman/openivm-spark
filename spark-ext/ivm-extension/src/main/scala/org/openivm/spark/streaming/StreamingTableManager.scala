@@ -759,6 +759,7 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Downstream materialized view '${materializedName(name)}' changed during cascade cleanup"
           )
+        StreamingTableMetadata.archiveMaterializedTarget(spark, descendant, context)
         MaterializedViewLifecycle.dropOne(spark, name, meta)
 
       case other =>

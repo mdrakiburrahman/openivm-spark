@@ -152,6 +152,23 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
         .toSeq
   }
 
+  protected def archivedManagedTargets(name: Seq[String], identity: String): Seq[Path] = {
+    val archive = StreamingTableMetadata.archivePath(
+      spark,
+      name,
+      identity,
+      spark.conf.get(FeatureGate.StreamingCheckpointArchiveUriKey)
+    )
+    val fs = archive.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(archive)) Seq.empty
+    else
+      fs.listStatus(archive)
+        .iterator
+        .map(_.getPath)
+        .filter(_.getName.startsWith(s"${StreamingTableMetadata.CheckpointDirectory}-"))
+        .toSeq
+  }
+
   protected def checkpointArchiveEvent(archivedCheckpoint: Path): com.fasterxml.jackson.databind.JsonNode = {
     val event = new Path(archivedCheckpoint, StreamingTableMetadata.ArchiveEventFile)
     val fs    = event.getFileSystem(spark.sessionState.newHadoopConf())
