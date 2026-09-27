@@ -567,8 +567,20 @@ object StreamingTableManager {
         )
       streamingNode(spark, child)
     }
-    val materializedChildren = sourceAliases(spark, parent.target)
-      .flatMap(source => MvCatalog.viewsForSource(spark, source))
+    val sourceAliasValues = sourceAliases(spark, parent.target)
+    val caseSensitive     = spark.sessionState.conf.caseSensitiveAnalysis
+    def normalize(value: String): String =
+      if (caseSensitive) value else value.toLowerCase(java.util.Locale.ROOT)
+    val parentShortName = normalize(parent.target.name.last)
+    val materializedChildren = (sourceAliasValues
+      .flatMap(source => MvCatalog.viewsForSource(spark, source)) ++
+      MvCatalog
+        .list(spark)
+        .filter(
+          _.sourceTables.exists { source =>
+            normalize(source.split("\\.").last.stripPrefix("`").stripSuffix("`")) == parentShortName
+          }
+        ))
       .groupBy(meta => materializedName(meta.name))
       .map(_._2.head)
       .toSeq

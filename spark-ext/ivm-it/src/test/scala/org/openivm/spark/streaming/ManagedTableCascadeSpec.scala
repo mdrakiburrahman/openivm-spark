@@ -94,6 +94,12 @@ class ManagedTableCascadeSpec extends AnyFunSpec with StreamingSqlTestSupport {
           |AS SELECT id, value FROM STREAM managed_mixed_rebuild_b""".stripMargin
       )
       process(leaf)
+      val materializedName = org.apache.spark.sql.catalyst.TableIdentifier("managed_mixed_rebuild_b")
+      val materializedMeta = MvCatalog.lookup(spark, materializedName).get
+      MvCatalog.upsert(
+        spark,
+        materializedMeta.copy(sourceTables = Seq("fabric_internal.managed_mixed_rebuild_a"))
+      )
       val oldRoot =
         StreamingTableMetadata.resolveDeltaTarget(spark, Seq("managed_mixed_rebuild_a"), requireTableIdMarker = true)
       val oldLeaf =
