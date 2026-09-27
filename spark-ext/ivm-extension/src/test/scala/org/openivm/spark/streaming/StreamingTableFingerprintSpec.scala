@@ -158,6 +158,41 @@ class StreamingTableFingerprintSpec extends AnyFunSpec with StreamingTableTestFi
       definition.operationalJson should include("maxfilespertrigger")
     }
 
+    it("ignores ephemeral watermark instance IDs across repeated analysis") {
+      val source = "strt_fingerprint_watermark_source"
+      val target = "strt_fingerprint_watermark_target"
+      createSource(source, "id INT, event_time TIMESTAMP, part STRING")
+      val declaration =
+        s"""CREATE STREAMING TABLE $target AS
+           |SELECT
+           |  window(e.event_time, '10 minutes').start AS window_start,
+           |  e.part,
+           |  COUNT(*) AS event_count
+           |FROM STREAM $source
+           |WATERMARK e.event_time DELAY OF INTERVAL 1 MINUTE AS e
+           |GROUP BY window(e.event_time, '10 minutes'), e.part""".stripMargin
+
+      def definition(): StreamingTableDefinition = {
+        val command = spark.sessionState.sqlParser
+          .parsePlan(declaration)
+          .asInstanceOf[CreateStreamingTableCommand]
+        val frame = StreamingDatasetAccess.ofRows(spark, command.spec.query)
+        StreamingTableDefinition.build(
+          spark,
+          command.spec,
+          frame.queryExecution.analyzed,
+          StreamingTableMetadata.canonicalIdentity(spark, command.spec.name),
+          StreamingRuntimeOptions.parse(command.spec.options)
+        )
+      }
+
+      val first  = definition()
+      val second = definition()
+
+      second.fingerprint shouldBe first.fingerprint
+      second.semanticJson shouldBe first.semanticJson
+    }
+
     it("ignores ephemeral Spark common-expression IDs and migrates legacy fingerprints") {
       val prefix =
         """{"formatVersion":1,"declarationPlan":"stable","analyzedPlan":"before:"""

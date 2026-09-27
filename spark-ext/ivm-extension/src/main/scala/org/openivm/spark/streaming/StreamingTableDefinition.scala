@@ -900,6 +900,11 @@ object StreamingTableDefinition {
   private def structuralPlan(plan: LogicalPlan): String = encodePlan(plan)
 
   private def encodePlan(plan: LogicalPlan): String = plan match {
+    case watermark: EventTimeWatermark =>
+      s"plan:${plan.getClass.getName}(" +
+        s"eventTime=${encodeExpression(watermark.eventTime)}," +
+        s"delay=${jsonString(watermark.delay.toString)}," +
+        s"child=${encodePlan(watermark.child)})"
     case relation: CTERelationDef =>
       s"plan:${plan.getClass.getName}(child=${encodePlan(relation.child)},underSubquery=${relation.underSubquery})"
     case relation: CTERelationRef =>
