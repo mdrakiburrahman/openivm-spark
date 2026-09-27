@@ -104,8 +104,8 @@ object StreamingTableMetadata {
     TargetPathMarkerKey,
     DeltaIdMarkerKey
   )
-  private val Mapper       = new ObjectMapper()
-  private val MaxJsonBytes = 1024 * 1024
+  private val Mapper                       = new ObjectMapper()
+  private[streaming] val MaxJsonBytes: Int = 16 * 1024 * 1024
   private[streaming] val ManifestReadRetryTimeoutMsKey =
     "spark.openivm.streaming.manifestReadRetryTimeoutMs"
   private[streaming] val ManifestReadRetryIntervalMsKey =
@@ -1619,7 +1619,7 @@ object StreamingTableMetadata {
     }
   }
 
-  private def readText(fs: FileSystem, path: Path): String = {
+  private[streaming] def readText(fs: FileSystem, path: Path): String = {
     val input  = fs.open(path)
     val buffer = new Array[Byte](8192)
     val output = new java.io.ByteArrayOutputStream()

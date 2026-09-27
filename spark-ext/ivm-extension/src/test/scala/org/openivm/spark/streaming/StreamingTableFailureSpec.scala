@@ -1,6 +1,7 @@
 package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.AnalysisException
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.time.{Millis, Seconds, Span}
@@ -11,6 +12,32 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 class StreamingTableFailureSpec extends AnyFunSpec with StreamingTableTestFixture with Eventually {
 
   describe("native streaming failure propagation") {
+    it("reads wide metadata within the bounded limit and rejects larger files") {
+      val root = new Path(spark.conf.get("spark.sql.warehouse.dir"))
+      val path = new Path(root, "strt_wide_metadata.json")
+      val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
+
+      def write(size: Int): Unit = {
+        val output = fs.create(path, true)
+        try output.write(Array.fill[Byte](size)('x'.toByte))
+        finally output.close()
+      }
+
+      try {
+        val formerlyRejectedSize = 2 * 1024 * 1024
+        write(formerlyRejectedSize)
+        StreamingTableMetadata.readText(fs, path).length shouldBe formerlyRejectedSize
+
+        write(StreamingTableMetadata.MaxJsonBytes + 1)
+        val error = intercept[AnalysisException] {
+          StreamingTableMetadata.readText(fs, path)
+        }
+        error.getMessage should include(s"exceeds ${StreamingTableMetadata.MaxJsonBytes} bytes")
+      } finally {
+        fs.delete(path, false)
+      }
+    }
+
     it("surfaces an asynchronous native query failure through SHOW without a fallback write path") {
       val source = "strt_failure_source"
       val target = "strt_failure_target"
