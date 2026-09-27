@@ -932,6 +932,12 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val wal     = new File(rocksDbDir, "000001.log")
       java.nio.file.Files.write(current.toPath, "MANIFEST-000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8))
       java.nio.file.Files.write(wal.toPath, Array[Byte](1, 2, 3))
+      val staleRemote = new File(remoteRoot, "mvs/stale/rocksdb/CURRENT")
+      staleRemote.getParentFile.mkdirs() shouldBe true
+      java.nio.file.Files.write(
+        staleRemote.toPath,
+        "MANIFEST-STALE\n".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      )
       val removed = new AtomicBoolean(false)
       OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { file =>
         if (file.getName == wal.getName && removed.compareAndSet(false, true))
@@ -943,6 +949,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         removed.get() shouldBe true
         new File(remoteRoot, "mvs/rotating/rocksdb/CURRENT").isFile shouldBe true
         new File(remoteRoot, "mvs/rotating/rocksdb/000001.log").exists() shouldBe false
+        staleRemote.exists() shouldBe false
       } finally {
         OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)
       }

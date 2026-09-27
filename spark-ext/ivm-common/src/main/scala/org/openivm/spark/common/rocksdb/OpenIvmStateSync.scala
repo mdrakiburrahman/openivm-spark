@@ -1,6 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
@@ -236,20 +236,20 @@ object OpenIvmStateSync {
     val local = localRoot(spark)
     if (!local.exists()) return
 
-    val hconf      = spark.sessionState.newHadoopConf()
-    val remoteRoot = new Path(uri)
-    val fs         = remoteRoot.getFileSystem(hconf)
-    val localBase  = local.toPath
-    var uploaded   = 0
-    var attempts   = 0
-    var stablePass = false
+    val hconf       = spark.sessionState.newHadoopConf()
+    val remoteRoot  = new Path(uri)
+    val fs          = remoteRoot.getFileSystem(hconf)
+    val localBase   = local.toPath
+    var uploaded    = 0
+    var attempts    = 0
+    var stablePass  = false
+    var stablePaths = Set.empty[String]
 
     while (!stablePass && attempts < 20) {
       attempts += 1
       var localFileVanished = false
-      val files = listLocalFiles(local)
-        .filterNot(file => isTransientRocksDbFile(file.getName))
-        .sortBy(file => if (file.getName == "CURRENT") 1 else 0)
+      val files             = backupFiles(local)
+      val initialSignature  = backupSignature(localBase, files)
 
       files.foreach { f =>
         if (!localFileVanished) {
@@ -288,14 +288,50 @@ object OpenIvmStateSync {
         }
       }
 
-      if (localFileVanished) Thread.sleep(50L)
-      else stablePass = true
+      val finalSignature = backupSignature(localBase, backupFiles(local))
+      if (localFileVanished || initialSignature != finalSignature) Thread.sleep(50L)
+      else {
+        stablePass = true
+        stablePaths = finalSignature.iterator.map(_._1).toSet
+      }
     }
     if (!stablePass)
       throw new java.io.IOException(
         s"openivm state-sync: local RocksDB files kept changing while backing up '$local' to '$uri'"
       )
-    if (uploaded > 0) log.info(s"openivm state-sync: backed up $uploaded files to $uri")
+    val pruned = pruneRemoteFiles(fs, remoteRoot, stablePaths)
+    if (uploaded > 0 || pruned > 0)
+      log.info(s"openivm state-sync: backed up $uploaded files and pruned $pruned stale files at $uri")
+  }
+
+  private def backupFiles(local: File): Seq[File] =
+    listLocalFiles(local)
+      .filterNot(file => isTransientRocksDbFile(file.getName))
+      .sortBy(file => if (file.getName == "CURRENT") 1 else 0)
+
+  private def backupSignature(localBase: java.nio.file.Path, files: Seq[File]): Seq[(String, Long, Long)] =
+    files.map { file =>
+      (
+        localBase.relativize(file.toPath).toString,
+        file.length(),
+        file.lastModified()
+      )
+    }
+
+  private def pruneRemoteFiles(fs: FileSystem, remoteRoot: Path, localPaths: Set[String]): Int = {
+    if (!fs.exists(remoteRoot)) return 0
+    val remoteFiles = fs.listFiles(remoteRoot, /* recursive = */ true)
+    var pruned      = 0
+    while (remoteFiles.hasNext) {
+      val remote = remoteFiles.next().getPath
+      val rel    = relativize(remoteRoot, remote)
+      if (!localPaths.contains(rel)) {
+        if (!fs.delete(remote, /* recursive = */ false) && fs.exists(remote))
+          throw new java.io.IOException(s"openivm state-sync: failed to prune stale remote file '$remote'")
+        pruned += 1
+      }
+    }
+    pruned
   }
 
   private def isTransientRocksDbFile(name: String): Boolean =
