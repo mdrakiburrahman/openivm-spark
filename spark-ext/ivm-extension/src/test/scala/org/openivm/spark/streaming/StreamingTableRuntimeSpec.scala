@@ -152,7 +152,7 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       firstNative.name shouldBe targetInfo.queryName(Some("model.analytics.events"))
       firstManifest.operationalJson should include("\"displayName\":\"model.analytics.events\"")
       appendRows(source, "(1, 'before-label-change', 'p')")
-      process(firstNative)
+      firstNative.processAllAvailable()
 
       val second = createStreaming(
         target,
@@ -175,7 +175,7 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       archivedCheckpoints(secondTarget) shouldBe empty
 
       appendRows(source, "(2, 'after-label-change', 'p')")
-      process(secondNative)
+      secondNative.processAllAvailable()
       assertBagEqual(
         target,
         "SELECT 1 AS id, 'before-label-change' AS value, 'p' AS part UNION ALL " +
