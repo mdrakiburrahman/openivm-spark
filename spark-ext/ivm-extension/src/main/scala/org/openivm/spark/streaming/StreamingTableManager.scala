@@ -962,7 +962,7 @@ object StreamingTableManager {
       .outputMode(runtime.outputMode)
       .options(runtime.sinkOptions)
       .option("checkpointLocation", target.checkpointLocation)
-      .queryName(target.queryName)
+      .queryName(target.queryName(runtime.displayName))
     writer = writer.trigger(runtime.sparkTrigger)
     val query = writer.toTable(target.sqlIdentifier)
     StreamingTableRegistry.register(spark, key, target, manifest.definitionHash, query)
@@ -1185,7 +1185,7 @@ private[streaming] object StreamingTableRegistry {
       query.filter(_.isActive)
     }
     cached.orElse {
-      spark.streams.active.find(_.name == target.queryName).map { query =>
+      spark.streams.active.find(query => target.matchesQueryName(query.name)).map { query =>
         register(spark, key, target, Option(registry.entries.get(key)).map(_.definitionHash).orNull, query)
         query
       }

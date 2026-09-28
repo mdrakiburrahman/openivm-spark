@@ -34,8 +34,38 @@ final case class StreamingTableTarget(
   def checkpointLocation: String =
     new Path(new Path(dataPath), StreamingTableMetadata.CheckpointDirectory).toString
 
-  def queryName: String =
+  private def legacyQueryName: String =
     s"openivm_streaming_${StreamingTableDefinition.sha256(s"$identity\n$dataPath").take(32)}"
+
+  private def queryNameSuffix: String =
+    StreamingTableDefinition.sha256(identity).take(16)
+
+  def queryName(displayName: Option[String] = None): String = {
+    val requested = displayName.getOrElse(name.lastOption.getOrElse("streaming_table"))
+    val safe = requested
+      .map { character =>
+        if (
+          (character >= 'a' && character <= 'z') ||
+          (character >= 'A' && character <= 'Z') ||
+          (character >= '0' && character <= '9') ||
+          character == '.' ||
+          character == '_' ||
+          character == '-'
+        ) character
+        else '_'
+      }
+      .mkString
+      .replaceAll("_+", "_")
+      .stripPrefix("_")
+      .stripSuffix("_")
+      .take(160)
+    val friendly = if (safe.nonEmpty) safe else "streaming_table"
+    s"openivm_streaming_${friendly}_$queryNameSuffix"
+  }
+
+  def matchesQueryName(candidate: String): Boolean =
+    candidate == legacyQueryName ||
+      (candidate.startsWith("openivm_streaming_") && candidate.endsWith(s"_$queryNameSuffix"))
 }
 
 final case class StreamingTableManifest(

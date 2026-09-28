@@ -352,6 +352,7 @@ USING DELTA
 LOCATION '/tables/cleaned_events'
 PARTITIONED BY (event_date)
 OPTIONS (
+  'displayName' = 'model.analytics.cleaned_events',
   'outputMode' = 'append',
   'trigger' = 'processingTime',
   'triggerInterval' = '10 seconds'
@@ -371,6 +372,13 @@ streaming. An ordinary occurrence of the same table remains static. Each
 streaming source can carry its own case-insensitive `WITH (...)` reader options;
 duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
 rejected before Spark receives the native options.
+
+`displayName` controls the friendly Structured Streaming query label shown in
+the Spark UI and micro-batch job descriptions. OpenIVM sanitizes the label and
+appends a stable target-identity suffix so independently active tables cannot
+collide. When omitted, the target table name is used. Changing only
+`displayName` restarts the native writer on its existing checkpoint without
+rebuilding the target or replaying committed input.
 
 ### Destination layouts
 

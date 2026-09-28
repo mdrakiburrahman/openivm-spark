@@ -133,6 +133,56 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       statuses.flatMap(_.queryId).foreach(id => Option(spark.streams.get(id)).foreach(_.stop()))
     }
 
+    it("uses a friendly display name and restarts without rebuilding when only the label changes") {
+      val source = "strt_display_source"
+      val target = "strt_display_target"
+      createSource(source)
+      val query = readStream(source)
+
+      val first = createStreaming(
+        target,
+        query,
+        s"SELECT id, value, part FROM STREAM $source",
+        options = Map("displayName" -> "model.analytics.events")
+      )
+      val firstNative = process(first)
+      val targetInfo =
+        StreamingTableMetadata.resolveDeltaTarget(spark, Seq(target), requireTableIdMarker = true)
+      val firstManifest = StreamingTableMetadata.readManifest(spark, targetInfo)
+      firstNative.name shouldBe targetInfo.queryName(Some("model.analytics.events"))
+      firstManifest.operationalJson should include("\"displayName\":\"model.analytics.events\"")
+      appendRows(source, "(1, 'before-label-change', 'p')")
+      process(firstNative)
+
+      val second = createStreaming(
+        target,
+        query,
+        s"SELECT id, value, part FROM STREAM $source",
+        options = Map("displayName" -> "model.analytics.renamed")
+      )
+      val secondNative   = process(second)
+      val secondTarget   = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(target), requireTableIdMarker = true)
+      val secondManifest = StreamingTableMetadata.readManifest(spark, secondTarget)
+
+      second.status shouldBe "restarted"
+      second.queryId shouldBe first.queryId
+      second.runId should not be first.runId
+      second.definitionHash shouldBe first.definitionHash
+      secondNative.name shouldBe secondTarget.queryName(Some("model.analytics.renamed"))
+      secondTarget.deltaTableId shouldBe targetInfo.deltaTableId
+      secondManifest.semanticJson shouldBe firstManifest.semanticJson
+      secondManifest.operationalHash should not be firstManifest.operationalHash
+      archivedCheckpoints(secondTarget) shouldBe empty
+
+      appendRows(source, "(2, 'after-label-change', 'p')")
+      process(secondNative)
+      assertBagEqual(
+        target,
+        "SELECT 1 AS id, 'before-label-change' AS value, 'p' AS part UNION ALL " +
+          "SELECT 2, 'after-label-change', 'p'"
+      )
+    }
+
     it("stops and resumes the exact checkpoint without replaying committed input") {
       val source = "strt_resume_source"
       val target = "strt_resume_target"

@@ -73,6 +73,7 @@ final case class StreamingRuntimeOptions(
     trigger: String,
     triggerInterval: Option[String],
     onQueryChange: String,
+    displayName: Option[String],
     sinkOptions: Map[String, String]
 ) {
 
@@ -91,8 +92,10 @@ final case class StreamingRuntimeOptions(
 
 object StreamingRuntimeOptions {
 
-  private val ExtensionOptionKeys = Set("outputmode", "trigger", "triggerinterval", "onquerychange")
-  private val WriterOwnedKeys     = Set("path", "checkpointlocation", "queryname")
+  private val MaxDisplayNameLength = 256
+  private val ExtensionOptionKeys =
+    Set("outputmode", "trigger", "triggerinterval", "onquerychange", "displayname")
+  private val WriterOwnedKeys = Set("path", "checkpointlocation", "queryname")
 
   def parse(rawOptions: Map[String, String]): StreamingRuntimeOptions = {
     val grouped = rawOptions.toSeq.groupBy { case (key, _) => normalizeKey(key) }
@@ -140,6 +143,17 @@ object StreamingRuntimeOptions {
         s"Unsupported onQueryChange '$onQueryChange'; expected fail or rebuild"
       )
 
+    val displayName = options.get("displayname").map { value =>
+      if (value.isEmpty) StreamingTableErrors.invalid("displayName must not be empty")
+      if (value.length > MaxDisplayNameLength)
+        StreamingTableErrors.invalid(
+          s"displayName must not exceed $MaxDisplayNameLength characters"
+        )
+      if (value.exists(character => Character.isISOControl(character)))
+        StreamingTableErrors.invalid("displayName must not contain control characters")
+      value
+    }
+
     trigger match {
       case "processingtime" => Trigger.ProcessingTime(specifiedInterval.getOrElse("0 seconds"))
       case "availablenow"   => Trigger.AvailableNow()
@@ -151,6 +165,7 @@ object StreamingRuntimeOptions {
       trigger = trigger,
       triggerInterval = if (trigger == "processingtime") Some(specifiedInterval.getOrElse("0 seconds")) else None,
       onQueryChange = onQueryChange,
+      displayName = displayName,
       sinkOptions = options.filterNot { case (key, _) => ExtensionOptionKeys.contains(key) }
     )
   }
@@ -297,6 +312,7 @@ object StreamingTableDefinition {
     val operational = Mapper.createObjectNode()
     operational.put("trigger", runtime.trigger)
     runtime.triggerInterval.foreach(interval => operational.put("triggerInterval", interval))
+    runtime.displayName.foreach(displayName => operational.put("displayName", displayName))
     val sourceRates = operational.putArray("sourceRateLimits")
     sources.foreach { source =>
       val node = sourceRates.addObject()

@@ -15,6 +15,7 @@ class StreamingTableDefinitionSpec extends AnyFunSpec with Matchers {
       options.trigger shouldBe "processingtime"
       options.triggerInterval shouldBe Some("0 seconds")
       options.onQueryChange shouldBe "fail"
+      options.displayName shouldBe None
       options.sinkOptions shouldBe empty
     }
 
@@ -25,6 +26,7 @@ class StreamingTableDefinitionSpec extends AnyFunSpec with Matchers {
           "trigger"         -> "processingTime",
           "triggerInterval" -> "5 seconds",
           "onQueryChange"   -> "rebuild",
+          "displayName"     -> "model.analytics.events",
           "mergeSchema"     -> "false"
         )
       )
@@ -32,6 +34,7 @@ class StreamingTableDefinitionSpec extends AnyFunSpec with Matchers {
       options.outputMode shouldBe "complete"
       options.triggerInterval shouldBe Some("5 seconds")
       options.onQueryChange shouldBe "rebuild"
+      options.displayName shouldBe Some("model.analytics.events")
       options.sinkOptions shouldBe Map("mergeschema" -> "false")
     }
 
@@ -53,6 +56,14 @@ class StreamingTableDefinitionSpec extends AnyFunSpec with Matchers {
         StreamingRuntimeOptions.parse(
           Map("trigger" -> "availableNow", "triggerInterval" -> "1 second")
         )
+      }
+    }
+
+    it("rejects unsafe display names") {
+      Seq("", "line\nbreak", "x" * 257).foreach { value =>
+        an[org.apache.spark.sql.AnalysisException] should be thrownBy {
+          StreamingRuntimeOptions.parse(Map("displayName" -> value))
+        }
       }
     }
 
