@@ -18,7 +18,7 @@ import java.util.UUID
 import java.util.Base64
 
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -614,7 +614,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
 
       start.countDown()
-      futures.foreach(f => Await.result(f, 60.seconds))
+      Await.result(Future.sequence(futures), 3.minutes)
 
       val errList = errors.asScala.toList
       withClue(errList.map(e => s"${e.getClass.getName}: ${e.getMessage}").mkString("\n")) {
@@ -865,6 +865,29 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
+    it("restores MV metadata when the local state root contains only empty directories") {
+      val stateRoot  = newDir("state-sync-empty-local")
+      val remoteRoot = newDir("state-sync-empty-remote")
+      val spark = newSpark(
+        "state-sync-empty-local",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val meta = sourceSharingMeta(99, "restored")
+
+      MvCatalog.upsert(spark, meta)
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      new File(stateRoot, "_openivm/mvs").mkdirs() shouldBe true
+      new File(stateRoot, "_openivm/sources").mkdirs() shouldBe true
+      OpenIvmStateSync.resetForTesting()
+
+      MvCatalog.lookup(spark, meta.name) shouldBe Some(meta)
+    }
+
     it("restores a committed batch backed up before deferred transaction cleanup is flushed") {
       val stateRoot  = newDir("state-sync-local")
       val remoteRoot = newDir("state-sync-remote")
@@ -891,6 +914,45 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       restored.currentVersion shouldBe 1L
       restored.get("meta", RocksDBCodec.utf8("delta-key")).map(RocksDBCodec.fromUtf8) shouldBe Some("delta-value")
       restored.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
+    }
+
+    it("retries a backup pass when a required local RocksDB file is rotated") {
+      val stateRoot  = newDir("state-sync-rotating-local")
+      val remoteRoot = newDir("state-sync-rotating-remote")
+      val spark = newSpark(
+        "state-sync-rotating-file",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val rocksDbDir = new File(stateRoot, "_openivm/mvs/rotating/rocksdb")
+      rocksDbDir.mkdirs() shouldBe true
+      val current = new File(rocksDbDir, "CURRENT")
+      val wal     = new File(rocksDbDir, "000001.log")
+      java.nio.file.Files.write(current.toPath, "MANIFEST-000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      java.nio.file.Files.write(wal.toPath, Array[Byte](1, 2, 3))
+      val staleRemote = new File(remoteRoot, "mvs/stale/rocksdb/CURRENT")
+      staleRemote.getParentFile.mkdirs() shouldBe true
+      java.nio.file.Files.write(
+        staleRemote.toPath,
+        "MANIFEST-STALE\n".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      )
+      val removed = new AtomicBoolean(false)
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { file =>
+        if (file.getName == wal.getName && removed.compareAndSet(false, true))
+          java.nio.file.Files.delete(file.toPath)
+      }
+
+      try {
+        OpenIvmStateSync.backupNow(spark)
+        removed.get() shouldBe true
+        new File(remoteRoot, "mvs/rotating/rocksdb/CURRENT").isFile shouldBe true
+        new File(remoteRoot, "mvs/rotating/rocksdb/000001.log").exists() shouldBe false
+        staleRemote.exists() shouldBe false
+      } finally {
+        OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)
+      }
     }
 
     it("coalesces in-flight requests into one follow-up pass and stays bounded while eventually becoming idle") {
@@ -935,6 +997,104 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       } finally {
         release.foreach(_.countDown())
         waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
+      }
+    }
+
+    it("serializes synchronous backup with an in-flight asynchronous pass") {
+      val spark = newSpark(
+        "state-sync-synchronous-serialization",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val stateSession = newStateSyncSession(spark, "synchronous-serialization")
+      val entered      = new CountDownLatch(1)
+      val release      = new CountDownLatch(1)
+      val passCount    = new AtomicInteger(0)
+      val active       = new AtomicInteger(0)
+      val maxActive    = new AtomicInteger(0)
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        val pass = passCount.incrementAndGet()
+        try {
+          if (pass == 1) {
+            entered.countDown()
+            release.await(10, TimeUnit.SECONDS)
+          }
+        } finally {
+          active.decrementAndGet()
+        }
+      }
+
+      try {
+        OpenIvmStateSync.backupAsync(stateSession)
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+
+        val synchronous = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        Thread.sleep(100L)
+        synchronous.isCompleted shouldBe false
+
+        release.countDown()
+        Await.result(synchronous, RegistryRaceTimeout)
+        waitForStateSyncIdle(stateSession)
+        passCount.get() should be >= 2
+        maxActive.get() shouldBe 1
+      } finally {
+        release.countDown()
+        waitUntil(10.seconds) {
+          OpenIvmStateSync.allBackupStatesIdleForTesting
+        }
+      }
+    }
+
+    it("serializes concurrent synchronous backup passes") {
+      val spark = newSpark(
+        "state-sync-concurrent-synchronous",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val stateSession = newStateSyncSession(spark, "concurrent-synchronous")
+      val firstEntered = new CountDownLatch(1)
+      val releaseFirst = new CountDownLatch(1)
+      val passCount    = new AtomicInteger(0)
+      val active       = new AtomicInteger(0)
+      val maxActive    = new AtomicInteger(0)
+
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        val pass = passCount.incrementAndGet()
+        try {
+          if (pass == 1) {
+            firstEntered.countDown()
+            releaseFirst.await(10, TimeUnit.SECONDS)
+          }
+        } finally {
+          active.decrementAndGet()
+        }
+      }
+
+      try {
+        val first = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        firstEntered.await(5, TimeUnit.SECONDS) shouldBe true
+
+        val second = Future {
+          OpenIvmStateSync.backupNow(stateSession)
+        }
+        Thread.sleep(100L)
+        second.isCompleted shouldBe false
+
+        releaseFirst.countDown()
+        Await.result(Future.sequence(Seq(first, second)), RegistryRaceTimeout)
+        passCount.get() shouldBe 2
+        maxActive.get() shouldBe 1
+      } finally {
+        releaseFirst.countDown()
       }
     }
 

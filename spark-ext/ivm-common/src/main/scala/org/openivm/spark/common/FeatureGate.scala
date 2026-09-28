@@ -49,6 +49,15 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Required Hadoop filesystem root for archived native streaming checkpoints.
+    *
+    * Managed Spark environments should point this at durable file storage outside
+    * the managed table namespace, for example a OneLake
+    * ``Files/_openivm-archive`` directory.
+    */
+  val StreamingCheckpointArchiveUriKey: String =
+    "spark.openivm.streaming.checkpointArchive.uri"
+
   /** Optional campaign-scoped Hadoop filesystem URI for completed execution
     * span objects. Unset preserves the historical log-only behavior.
     */
@@ -453,6 +462,20 @@ object FeatureGate {
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
 
+  def streamingCheckpointArchiveUri(conf: SparkConf): Option[String] =
+    conf
+      .getOption(StreamingCheckpointArchiveUriKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map(_.stripSuffix("/"))
+
+  def streamingCheckpointArchiveUri(spark: SparkSession): Option[String] =
+    spark.conf
+      .getOption(StreamingCheckpointArchiveUriKey)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map(_.stripSuffix("/"))
+
   def telemetryUri(spark: SparkSession): Option[String] =
     spark.conf
       .getOption(TelemetryUriKey)
@@ -735,16 +758,24 @@ object FeatureGate {
     * (10 MiB) still restricts it to joins whose build side is the tiny delta.
     */
   def runtimeFilterConfOverrides(conf: SparkConf): Map[String, String] =
+    runtimeFilterConfOverrides(conf, sparkMajorVersion = 3)
+
+  private[common] def runtimeFilterConfOverrides(conf: SparkConf, sparkMajorVersion: Int): Map[String, String] =
     if (!runtimeFilterEnabled(conf)) Map.empty
-    else
-      Map(
+    else {
+      val common = Map(
         "spark.sql.optimizer.runtime.bloomFilter.enabled"                          -> "true",
-        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB",
-        "spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled"              -> "true"
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB"
       )
+      if (sparkMajorVersion >= 4) common
+      else common + ("spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled" -> "true")
+    }
 
   def runtimeFilterConfOverrides(spark: SparkSession): Map[String, String] =
-    runtimeFilterConfOverrides(spark.sparkContext.getConf)
+    runtimeFilterConfOverrides(
+      spark.sparkContext.getConf,
+      spark.version.takeWhile(_ != '.').toInt
+    )
 
   def changeFeedMode(spark: SparkSession): ChangeFeedMode =
     ChangeFeedMode.fromSession(spark)
@@ -778,22 +809,28 @@ object FeatureGate {
   def autoCompactSupported(clusterColumns: Seq[String]): Boolean =
     clusterColumns.size != 1
 
-  /** Build the TBLPROPERTIES list for an MV data table. Empty Seq means none enabled.
+  /** Build the properties required on an MV data table.
     *
     * `clusterColumns` is the liquid-clustering key the same DDL will emit as
     * `CLUSTER BY (...)`; it gates `delta.autoOptimize.autoCompact` (see
     * [[autoCompactSupported]]).
     */
-  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] = {
-    val props = scala.collection.mutable.ArrayBuffer.empty[String]
-    if (deletionVectorsEnabled(spark)) props += "'delta.enableDeletionVectors' = 'true'"
-    if (optimizeWriteEnabled(spark)) props += "'delta.autoOptimize.optimizeWrite' = 'true'"
+  def mvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Map[String, String] = {
+    val props = scala.collection.mutable.LinkedHashMap.empty[String, String]
+    if (deletionVectorsEnabled(spark)) props += "delta.enableDeletionVectors"    -> "true"
+    if (optimizeWriteEnabled(spark)) props += "delta.autoOptimize.optimizeWrite" -> "true"
     if (autoCompactEnabled(spark) && autoCompactSupported(clusterColumns))
-      props += "'delta.autoOptimize.autoCompact' = 'true'"
+      props += "delta.autoOptimize.autoCompact" -> "true"
     if (ChangePropagationFactory.forSession(spark).requiresMvCdf)
-      props += "'delta.enableChangeDataFeed' = 'true'"
-    props.toSeq
+      props += "delta.enableChangeDataFeed" -> "true"
+    props.toMap
   }
+
+  /** Build the SQL TBLPROPERTIES entries for an MV data table. Empty Seq means none enabled. */
+  def buildMvDataTblProperties(spark: SparkSession, clusterColumns: Seq[String]): Seq[String] =
+    mvDataTblProperties(spark, clusterColumns).toSeq.sortBy(_._1).map { case (key, value) =>
+      s"'${key.replace("'", "''")}' = '${value.replace("'", "''")}'"
+    }
 
   def buildMvDataTblProperties(spark: SparkSession): Seq[String] =
     buildMvDataTblProperties(spark, Nil)

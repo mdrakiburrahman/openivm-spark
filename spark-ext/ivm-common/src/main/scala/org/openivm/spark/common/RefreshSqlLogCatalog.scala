@@ -145,7 +145,7 @@ object RefreshSqlLogCatalog {
   private[common] def record(
       spark: SparkSession,
       rows: Seq[RefreshSqlLogRow],
-      export: Option[QueryLogExport.FlushTicket]
+      exportTicket: Option[QueryLogExport.FlushTicket]
   ): Unit = {
     if (rows.isEmpty) return
     val db = openDb(spark)
@@ -159,7 +159,7 @@ object RefreshSqlLogCatalog {
         )
         val value = encodeValue(row)
         OpenIvmRocksDBBatchOps.put(db, batch, CfName, key, value)
-        export.foreach { ticket =>
+        exportTicket.foreach { ticket =>
           val invocation = ticket.invocation
           val exportKey = RocksDBCodec.compositeKey(
             Seq(

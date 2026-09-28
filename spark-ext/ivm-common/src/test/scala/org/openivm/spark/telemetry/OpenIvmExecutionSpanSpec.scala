@@ -16,7 +16,7 @@ import org.scalatest.matchers.should.Matchers
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeUnit}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable.ArrayBuffer
 
 class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAfterEach {

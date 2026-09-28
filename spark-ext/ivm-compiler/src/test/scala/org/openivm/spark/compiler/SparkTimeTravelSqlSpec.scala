@@ -700,7 +700,6 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
 
       val repin = SparkTimeTravelSql
         .repinVersions(sql, Seq("db.a", "db.b"), Map("a" -> 5L, "db.b" -> 12L))
-        .right
         .toOption
         .value
 
@@ -718,7 +717,6 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
           Seq("db.src"),
           Map("db.src" -> 7L)
         )
-        .right
         .toOption
         .value
 
@@ -732,7 +730,7 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
 
       SparkTimeTravelSql
         .repinVersions(multi, Seq("db.a", "db.b"), Map("db.a" -> 5L))
-        .left
+        .swap
         .toOption
         .value should include("missing: db.b")
 
@@ -742,7 +740,7 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
           Seq("db.src"),
           Map("src" -> 5L, "db.src" -> 5L)
         )
-        .left
+        .swap
         .toOption
         .value should include("more than once")
 
@@ -752,7 +750,7 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
           Seq("db.src"),
           Map("db.src" -> 3L)
         )
-        .left
+        .swap
         .toOption
         .value should include("moves backwards")
 
@@ -762,7 +760,7 @@ class SparkTimeTravelSqlSpec extends AnyFunSpec with Matchers with OptionValues 
           Seq("db.src"),
           Map("db.src" -> 5L)
         )
-        .left
+        .swap
         .toOption
         .value should include("only VERSION AS OF")
     }

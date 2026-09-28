@@ -13,7 +13,7 @@ import java.io.{File, IOException}
 import java.sql.Timestamp
 import java.util.UUID
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 
 abstract class QueryLogExportTestBase(slug: String)

@@ -30,6 +30,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.{
   OpenIvmExecutionSpan,
   OpenIvmTelemetryContract,
@@ -47,7 +48,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, TimeoutException}
 
@@ -1096,6 +1097,67 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
       // Catalog metadata must be present
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
+    }
+
+    it("waits for durable state backup before CREATE returns") {
+      spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
+      spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        entered.countDown()
+        release.await(30, TimeUnit.SECONDS)
+      }
+
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val create = Future {
+        spark
+          .sql(
+            "CREATE MATERIALIZED VIEW mv_t1_sync AS " +
+              "SELECT region, SUM(amount) AS total FROM sales_t1_sync GROUP BY region"
+          )
+          .collect()
+      }
+      try {
+        entered.await(60, TimeUnit.SECONDS) shouldBe true
+        Thread.sleep(100L)
+        create.isCompleted shouldBe false
+        release.countDown()
+        Await.result(create, 120.seconds)
+      } finally {
+        release.countDown()
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
+    }
+
+    it("persists user properties on the public relation without replacing it on refresh") {
+      val queryHashProperty = "dbt.fabricspark.materialized_view.query_hash"
+      val queryHash         = "0123456789abcdef0123456789abcdef"
+      spark.sql("CREATE TABLE sales_t1_props(id INT) USING DELTA")
+      spark.sql("INSERT INTO sales_t1_props VALUES (1), (2)")
+      spark.sql(
+        s"""CREATE MATERIALIZED VIEW mv_t1_props
+           |USING DELTA
+           |TBLPROPERTIES ('$queryHashProperty' = '$queryHash')
+           |AS SELECT id FROM sales_t1_props""".stripMargin
+      )
+
+      def persistedQueryHash: String =
+        spark
+          .sql(s"SHOW TBLPROPERTIES mv_t1_props ('$queryHashProperty')")
+          .head()
+          .getString(1)
+
+      val location = MvCatalog.lookup(spark, TableIdentifier("mv_t1_props")).get.location
+      val beforeId = MvCommandHelper.deltaIdentityAt(spark, location).flatMap(_._1)
+      persistedQueryHash shouldBe queryHash
+
+      spark.sql("REFRESH MATERIALIZED VIEW mv_t1_props")
+
+      persistedQueryHash shouldBe queryHash
+      MvCommandHelper.deltaIdentityAt(spark, location).flatMap(_._1) shouldBe beforeId
     }
   }
 
@@ -2335,6 +2397,44 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("(14a) Same-MV CREATE execution spans") {
+    it("normalizes materialized graph identities onto the existing MV lifecycle monitor") {
+      val upstream = "default.lock_materialized_identity"
+      val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
+      val owner    = new AtomicReference[Thread]()
+      val worker   = new AtomicReference[Thread]()
+      val started  = new CountDownLatch(1)
+
+      withPool(2) { implicit ec =>
+        barrier.use {
+          val holder = Future {
+            owner.set(Thread.currentThread())
+            RefreshMutex.withLock(upstream)(barrier.park())
+          }
+          barrier.awaitEntered() shouldBe true
+          val cascade = Future {
+            worker.set(Thread.currentThread())
+            started.countDown()
+            RefreshMutex.withLock(s"materialized:$upstream")(())
+          }
+          started.await(10L, TimeUnit.SECONDS) shouldBe true
+          def blockedOnHolder: Boolean = {
+            val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
+            info != null && info.getThreadState == Thread.State.BLOCKED &&
+            info.getLockOwnerId == owner.get().getId
+          }
+          val deadline = 10.seconds.fromNow
+          while (!blockedOnHolder && deadline.hasTimeLeft())
+            Thread.sleep(1L)
+          blockedOnHolder shouldBe true
+          cascade.isCompleted shouldBe false
+          assertStillParked(barrier, holder)
+          barrier.release()
+          awaitResult(holder, 15.seconds)
+          awaitResult(cascade, 15.seconds)
+        }
+      }
+    }
+
     it("serializes dependency siblings on their shared upstream monitor and records its wait") {
       val upstream = "default.lock_source"
       val left     = "default.lock_child_left"

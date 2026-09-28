@@ -107,14 +107,25 @@ object DeltaCommitClassifier {
       .get("predicate")
       .orElse(parameters.get("replaceWhere"))
       .orElse(parameters.get("partitionPredicate"))
-      .map(_.trim)
+      .map(normalizeParameter)
     predicate.exists(p => p.nonEmpty && p != "[]" && !p.equalsIgnoreCase("true"))
   }
 
   private def isReplace(operation: String, parameters: Map[String, String]): Boolean = {
-    val mode = parameters.get("mode").orElse(parameters.get("Mode")).map(_.trim.toUpperCase)
-    operation.contains("REPLACE") || operation == "TRUNCATE" ||
-    (mode.exists(mode => mode == "OVERWRITE" || mode == "REPLACE") && !isPredicateScopedOverwrite(parameters))
+    val mode = parameters.get("mode").orElse(parameters.get("Mode")).map(normalizeParameter).map(_.toUpperCase)
+    val overwrite =
+      operation.contains("REPLACE") ||
+        operation.contains("OVERWRITE") ||
+        operation == "TRUNCATE" ||
+        mode.exists(mode => mode == "OVERWRITE" || mode == "REPLACE")
+    overwrite && !isPredicateScopedOverwrite(parameters)
+  }
+
+  private def normalizeParameter(value: String): String = {
+    val trimmed = value.trim
+    if (trimmed.length >= 2 && trimmed.head == '"' && trimmed.last == '"')
+      trimmed.substring(1, trimmed.length - 1)
+    else trimmed
   }
 
   private def isMutatingOperation(operation: String): Boolean =

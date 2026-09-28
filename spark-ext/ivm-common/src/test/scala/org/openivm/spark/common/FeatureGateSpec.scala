@@ -55,6 +55,13 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       val conf = new SparkConf(false).set(FeatureGate.RuntimeFilterEnabledKey, "false")
       FeatureGate.runtimeFilterConfOverrides(conf) shouldBe empty
     }
+
+    it("omits the semi-join reduction config removed in Spark 4") {
+      val o = FeatureGate.runtimeFilterConfOverrides(new SparkConf(false), sparkMajorVersion = 4)
+      o should contain("spark.sql.optimizer.runtime.bloomFilter.enabled" -> "true")
+      o should contain("spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "1MB")
+      o should not contain key("spark.sql.optimizer.runtimeFilter.semiJoinReduction.enabled")
+    }
   }
 
   describe("FeatureGate.selectiveBroadcastEnabled") {
@@ -198,6 +205,18 @@ class FeatureGateSpec extends AnyFunSpec with Matchers {
       FeatureGate.stateSyncUri(
         new SparkConf(false).set(FeatureGate.StateSyncUriKey, "  abfss://ws@onelake/lh/Files/_openivm  ")
       ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm")
+    }
+  }
+
+  describe("FeatureGate.streamingCheckpointArchiveUri") {
+    it("defaults to None and returns the trimmed archive root when set") {
+      FeatureGate.streamingCheckpointArchiveUri(new SparkConf(false)) shouldBe None
+      FeatureGate.streamingCheckpointArchiveUri(
+        new SparkConf(false).set(
+          FeatureGate.StreamingCheckpointArchiveUriKey,
+          "  abfss://ws@onelake/lh/Files/_openivm-archive/  "
+        )
+      ) shouldBe Some("abfss://ws@onelake/lh/Files/_openivm-archive")
     }
   }
 

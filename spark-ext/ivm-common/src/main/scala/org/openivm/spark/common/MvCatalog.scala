@@ -4,7 +4,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{
+  OpenIvmRocksDB,
+  OpenIvmRocksDBBatchOps,
+  OpenIvmRocksDBRegistry,
+  OpenIvmStateSync,
+  RocksDBCodec
+}
 import org.slf4j.LoggerFactory
 
 import java.io.File
@@ -383,9 +389,9 @@ object MvMetadata {
       refreshType: Int,
       refreshTypeName: String
   ): Map[String, String] = {
-    val sql =
+    val sql: Map[String, String] =
       if (compiledSql.nonEmpty) Map(compileCacheSqlKey(sourceSchemaFingerprint, tier) -> compiledSql) else Map.empty
-    val init = if (initialLoadSql.nonEmpty) {
+    val init: Map[String, String] = if (initialLoadSql.nonEmpty) {
       Map(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier) -> initialLoadSql)
     } else Map.empty
     sql ++ init ++ Map(
@@ -543,8 +549,17 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
       )
     }
 
-  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] =
-    openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+  private def readMetadataAtPath(spark: SparkSession, path: String): Option[MvMetadata] = {
+    def read(attemptsRemaining: Int): Option[MvMetadata] =
+      try openExistingPerMvDbAt(spark, path).flatMap(readMetadata)
+      catch {
+        case error: IllegalStateException
+            if attemptsRemaining > 1 && Option(error.getMessage).exists(_.contains("already closed")) =>
+          read(attemptsRemaining - 1)
+      }
+
+    read(attemptsRemaining = 3)
+  }
 
   private def dependentViewNames(spark: SparkSession, sourceTable: String): Seq[String] = {
     val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, sourceTable)
@@ -624,6 +639,7 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     }
 
   def ensureTables(spark: SparkSession): Unit = {
+    OpenIvmStateSync.maybeRestore(spark)
     Files.createDirectories(OpenIvmStatePaths.mvsRoot(spark))
     Files.createDirectories(OpenIvmStatePaths.sourcesRoot(spark))
     ()
@@ -666,15 +682,18 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
   }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     val serializedName = serializeName(name)
     readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
   def list(spark: SparkSession): Seq[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
   }
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
     dependentViewNames(spark, table)
       .flatMap { serializedName =>
         readMetadataAtPath(spark, perMvDbPath(spark, serializedName))

@@ -5,8 +5,8 @@ select
     ts.st_name as trade_status,
     tt_name as trade_type,
     case t_is_cash
-        when true then 'Cash'
-        when false then 'Margin'
+        when 1 then 'Cash'
+        when 0 then 'Margin'
     end as transaction_type,
     t_s_symb as symbol,
     t_exec_name as executor_name,

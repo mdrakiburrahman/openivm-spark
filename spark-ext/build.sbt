@@ -6,18 +6,22 @@
 // Cross-module test inheritance via `compile->compile;test->test`.
 //
 // All Spark / Delta / Hive deps are `% provided` so the assembled jar is
-// runtime-pluggable into a spark-shell (`--jars openivm-spark-assembly.jar
-// --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions`).
+// runtime-pluggable into a spark-shell (`--jars ivmExtension-<version>-assembly.jar
+// --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions`). Maven
+// publishes target-specific Maven coordinates selected by OPENIVM_SPARK_TARGET.
 
 import Dependencies._
 import Settings._
 
+lazy val testInventory = taskKey[File]("Write the sorted discovered test inventory for the selected runtime target")
+
 val openIvmExtensionPath =
   sys.env.getOrElse("OPENIVM_EXTENSION_PATH", "/opt/openivm/openivm.duckdb_extension")
 val openIvmCliPath = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
+val runtimeTarget  = RuntimeTarget.current
 
-ThisBuild / scalaVersion := "2.12.17"
-ThisBuild / version      := "0.1.0-SNAPSHOT"
+ThisBuild / scalaVersion := runtimeTarget.scalaVersion
+ThisBuild / version      := sys.env.getOrElse("PACKAGE_VERSION", "0.1.0-SNAPSHOT")
 ThisBuild / organization := "org.openivm"
 
 ThisBuild / javacOptions ++= Seq("--release", "11")
@@ -35,7 +39,20 @@ lazy val root = (project in file("."))
   .aggregate(ivmExecutor, ivmCommon, ivmCompiler, ivmExtension, ivmIt)
   .settings(
     name           := "openivm-spark",
-    publish / skip := true
+    publish / skip := true,
+    testInventory := {
+      val tests = Seq(
+        (ivmExecutor / Test / definedTests).value,
+        (ivmCommon / Test / definedTests).value,
+        (ivmCompiler / Test / definedTests).value,
+        (ivmExtension / Test / definedTests).value,
+        (ivmIt / Test / definedTests).value
+      ).flatten.map(_.name).distinct.sorted
+      val output = target.value / "test-inventory" / s"${runtimeTarget.id}.txt"
+      IO.writeLines(output, tests)
+      streams.value.log.info(s"Wrote ${tests.size} tests to $output")
+      output
+    }
   )
 
 lazy val ivmExecutor = (project in file("ivm-executor"))
@@ -55,8 +72,11 @@ lazy val ivmCompiler = (project in file("ivm-compiler"))
 lazy val ivmExtension = (project in file("ivm-extension"))
   .dependsOn(ivmCompiler % "compile->compile;test->test")
   .enablePlugins(Antlr4Plugin)
+  .settings(moduleName := runtimeTarget.moduleName)
   .settings(commonSettings: _*)
   .settings(assemblySettings: _*)
+  .settings(mavenPublishSettings: _*)
+  .settings(addArtifact(assembly / artifact, assembly))
   .settings(libraryDependencies ++= Dependencies.extension)
   .settings(
     Antlr4 / antlr4PackageName := Some("org.openivm.spark.parser.gen"),

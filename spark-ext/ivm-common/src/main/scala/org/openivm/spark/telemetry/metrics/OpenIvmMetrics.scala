@@ -7,7 +7,7 @@ import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import java.util.HashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.concurrent.TrieMap
 import scala.util.control.NonFatal
 

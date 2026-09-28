@@ -144,7 +144,7 @@ object SourceVersionDelta {
         .as("openivm_multiplicity")
     )
     val viewName = StagingDeltaView.deltaViewName(batch.baseTable)
-    raw.select(outputColumns: _*).createOrReplaceTempView(viewName)
+    raw.select(outputColumns.toIndexedSeq: _*).createOrReplaceTempView(viewName)
     try {
       spark.catalog.cacheTable(viewName, StorageLevel.DISK_ONLY)
       val rows = spark.table(viewName).count()

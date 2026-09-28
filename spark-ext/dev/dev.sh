@@ -2,6 +2,9 @@
 # ============================================================================
 # spark-ext/dev/dev — single-entry dev-loop wrapper.
 #
+# Usage:
+#   dev.sh [--target spark-3.5|spark-4.1] <subcommand> [args...]
+#
 # Subcommands (alphabetical):
 #   assembly                Build the ivmExtension fat jar.
 #   build                   `sbt compile` inside the dev container.
@@ -11,6 +14,9 @@
 #   help                    Print this message.
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
 #   openivm-test            Run upstream openivm sqllogictest suite.
+#   publish                 Build and publish the ivmExtension fat jar to the
+#                            Maven feed configured in root .env.
+#   publish-all             Publish both runtime artifacts under one version.
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
 #                           pinned COMMITs in pins.env, and shallow-clone the
 #                           read-only .temp/{spark,delta} upstream references
@@ -31,6 +37,7 @@
 #                           Extra args are appended to sbt (e.g. `testOnly ...`).
 #   verify                  pins-sync + lint + compile + assembly + test in
 #                           one Docker call.
+#   verify-all              Run verify for Spark 3.5 and Spark 4.1.
 #
 # Environment: only Docker is required on the host.  Pinned image SHAs come
 # from `spark-ext/dev/pins.env`.
@@ -38,6 +45,8 @@
 # Environment variables honoured:
 #   PRE_CLEAN=1   ANY subcommand first force-removes every running Docker
 #                 container on the host (named cache volumes survive).
+#   MAVEN_URL      Maven v1 feed URL, loaded from root .env.
+#   MAVEN_PAT      Packaging PAT, loaded from root .env.
 # ============================================================================
 set -euo pipefail
 
@@ -49,6 +58,7 @@ PROJECT_DIR="$( cd "$DEV_DIR/.." && pwd )"
 REPO_ROOT="$( cd "$PROJECT_DIR/.." && pwd )"
 
 PINS_FILE="$DEV_DIR/pins.env"
+TARGETS_DIR="$DEV_DIR/targets"
 COMPOSE_FILE="$DEV_DIR/docker/docker-compose.yml"
 
 if [[ ! -f "$PINS_FILE" ]]; then
@@ -56,15 +66,44 @@ if [[ ! -f "$PINS_FILE" ]]; then
     exit 1
 fi
 
-# Load pinned SHAs / versions into environment so docker-compose can substitute them.
-# shellcheck disable=SC1090
-set -a
-source "$PINS_FILE"
-set +a
+OPENIVM_SPARK_TARGET="${OPENIVM_SPARK_TARGET:-spark-3.5}"
+if [[ "${1:-}" == "--target" ]]; then
+    if [[ "$#" -lt 2 ]]; then
+        echo "[spark-ext/dev] FATAL: --target requires spark-3.5 or spark-4.1" >&2
+        exit 2
+    fi
+    OPENIVM_SPARK_TARGET="$2"
+    shift 2
+fi
+
+RUNTIME_PINS_FILE="$TARGETS_DIR/$OPENIVM_SPARK_TARGET.env"
+if [[ ! -f "$RUNTIME_PINS_FILE" ]]; then
+    echo "[spark-ext/dev] FATAL: unsupported target '$OPENIVM_SPARK_TARGET'" >&2
+    echo "[spark-ext/dev]        expected spark-3.5 or spark-4.1" >&2
+    exit 2
+fi
+
+load_pin_files() {
+    set -a
+    # shellcheck disable=SC1090
+    source "$PINS_FILE"
+    # shellcheck disable=SC1090
+    source "$RUNTIME_PINS_FILE"
+    export OPENIVM_SPARK_TARGET
+    export SPARK_EXT_IMAGE_TAG="${OPENIVM_SPARK_TARGET//./-}-${SPARK_COMMIT:0:12}-${DELTA_COMMIT:0:12}-${OPENIVM_COMMIT:0:12}-${LPTS_COMMIT:0:12}-${DUCKDB_COMMIT:0:12}"
+    set +a
+}
+
+load_pin_files
 
 # Wrapper around `docker compose` that always points at our compose file.
 compose() {
-    docker compose --env-file "$PINS_FILE" -f "$COMPOSE_FILE" "$@"
+    local project_target="${OPENIVM_SPARK_TARGET//./-}"
+    docker compose \
+        --project-name "openivm-spark-$project_target" \
+        --env-file "$PINS_FILE" \
+        --env-file "$RUNTIME_PINS_FILE" \
+        -f "$COMPOSE_FILE" "$@"
 }
 
 # Standard SBT opts — heap, GC, color, encoding. Applied to every `sbt …` call
@@ -108,7 +147,7 @@ setup_test_log_dir() {
     # The container's /work/spark-ext bind-mounts the HOST's spark-ext/ directory
     # (compose YAML: `../..:/work/spark-ext`). So .logs/ MUST live under
     # spark-ext/.logs/ on the host to be visible from both sides.
-    local parent_dir="$PROJECT_DIR/.logs"
+    local parent_dir="$PROJECT_DIR/.logs/$OPENIVM_SPARK_TARGET"
     local host_dir="$parent_dir/test-$ts"
 
     # Ensure the parent .logs/ exists and is world-writable, so the host user
@@ -195,6 +234,81 @@ cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
 
+# Hash the publishable working tree, including untracked feature files while
+# honoring the repository's ignore rules for credentials and build outputs.
+publication_content_hash() {
+    local path file_hash
+    (
+        cd "$REPO_ROOT"
+        git ls-files --cached --others --exclude-standard -z \
+            | LC_ALL=C sort -z \
+            | while IFS= read -r -d '' path; do
+                [[ -f "$path" || -L "$path" ]] || continue
+                file_hash="$(sha256sum -- "$path")"
+                file_hash="${file_hash%% *}"
+                printf '%s\0%s\0' "$path" "$file_hash"
+            done
+    ) | sha256sum | cut -d' ' -f1 | cut -c1-7
+}
+
+publication_version() {
+    local hash_hex hash_int
+    hash_hex="$(publication_content_hash)"
+    hash_int=$((16#${hash_hex}))
+    printf '%s.%s.0\n' "$(date +%s)" "$hash_int"
+}
+
+publication_artifact_id() {
+    case "$OPENIVM_SPARK_TARGET" in
+        spark-3.5)  printf '%s\n' "ivmextension-spark-3.5_2.12" ;;
+        spark-4.1) printf '%s\n' "ivmextension-spark-4.1_2.13" ;;
+    esac
+}
+
+cmd_publish() {
+    pre_clean_if_requested
+
+    if [[ ! -f "$REPO_ROOT/.env" ]]; then
+        echo "[publish] FATAL: $REPO_ROOT/.env not found; copy .env.example and configure MAVEN_URL/MAVEN_PAT" >&2
+        exit 1
+    fi
+
+    (
+        set -a
+        # shellcheck disable=SC1091
+        source "$REPO_ROOT/.env"
+        set +a
+
+        if [[ -z "${MAVEN_URL:-}" || -z "${MAVEN_PAT:-}" ]]; then
+            echo "[publish] FATAL: MAVEN_URL and MAVEN_PAT must be set in $REPO_ROOT/.env" >&2
+            exit 1
+        fi
+
+        export PACKAGE_VERSION="${PACKAGE_VERSION:-$(publication_version)}"
+        local artifact_id
+        artifact_id="$(publication_artifact_id)"
+
+        echo "[publish] Target: $OPENIVM_SPARK_TARGET"
+        echo "[publish] Publishing org.openivm:${artifact_id}:jar:assembly:${PACKAGE_VERSION}"
+        echo "[publish] Artifact: ${artifact_id}-${PACKAGE_VERSION}-assembly.jar"
+        compose run --rm -T \
+            -e MAVEN_URL \
+            -e MAVEN_PAT \
+            -e PACKAGE_VERSION \
+            build sbt \
+                "ivmExtension/clean" \
+                "ivmExtension/testOnly org.openivm.spark.parser.AntlrRuntimeCompatibilitySpec" \
+                "ivmExtension/publish"
+    )
+}
+
+cmd_publish_all() {
+    local version
+    version="${PACKAGE_VERSION:-$(publication_version)}"
+    PACKAGE_VERSION="$version" "$0" --target spark-3.5 publish
+    PACKAGE_VERSION="$version" "$0" --target spark-4.1 publish
+}
+
 # Returns 0 if a git op (rebase/merge/cherry-pick/bisect) is in progress in $1.
 _pins_sync_git_op_in_progress() {
     local dest="$1"
@@ -276,9 +390,13 @@ cmd_pins_sync() {
             local current_remote
             current_remote="$(git -C "$dest" remote get-url origin 2>/dev/null || echo '')"
             if [[ -n "$current_remote" && "$current_remote" != "$repo" ]]; then
-                echo "[pins-sync]   WARNING: origin remote mismatch"
+                echo "[pins-sync]   reconciling origin remote"
                 echo "[pins-sync]     local  = $current_remote"
                 echo "[pins-sync]     pinned = $repo"
+                if ! git -C "$dest" remote set-url origin "$repo"; then
+                    echo "[pins-sync] FATAL: failed to update origin in .temp/$name" >&2
+                    exit 1
+                fi
             fi
 
             echo "[pins-sync]   fetching origin ..."
@@ -383,8 +501,8 @@ cmd_pins_sync() {
     # ancestry enforcement (a shallow clone has no history). They are also
     # intentionally absent from `pins-fix` — nothing is ever pushed upstream.
     local ref_entries=(
-        "spark|SPARK_REPO|SPARK_REF|SPARK_COMMIT"
-        "delta|DELTA_REPO|DELTA_REF|DELTA_COMMIT"
+        "spark-$SPARK_VERSION|SPARK_REPO|SPARK_REF|SPARK_COMMIT"
+        "delta-$DELTA_VERSION|DELTA_REPO|DELTA_REF|DELTA_COMMIT"
     )
     for entry in "${ref_entries[@]}"; do
         IFS='|' read -r name repo_var ref_var commit_var <<< "$entry"
@@ -423,9 +541,13 @@ cmd_pins_sync() {
             local current_remote
             current_remote="$(git -C "$dest" remote get-url origin 2>/dev/null || echo '')"
             if [[ -n "$current_remote" && "$current_remote" != "$repo" ]]; then
-                echo "[pins-sync]   WARNING: origin remote mismatch"
+                echo "[pins-sync]   reconciling origin remote"
                 echo "[pins-sync]     local  = $current_remote"
                 echo "[pins-sync]     pinned = $repo"
+                if ! git -C "$dest" remote set-url origin "$repo"; then
+                    echo "[pins-sync] FATAL: failed to update origin in .temp/$name" >&2
+                    exit 1
+                fi
             fi
 
             # Release SHAs are immutable, so an existing checkout at the pin
@@ -982,11 +1104,8 @@ cmd_pins_fix() {
         "chore(pins-fix): bump IVM_BENCH_COMMIT to $bench_head" \
         "spark-ext/dev/pins.env"
 
-    # ── Phase 9: re-source pins.env (in-memory vars are stale) and validate ──
-    # shellcheck disable=SC1090
-    set -a
-    source "$PINS_FILE"
-    set +a
+    # ── Phase 9: re-source pins (in-memory vars are stale) and validate ──
+    load_pin_files
 
     echo
     echo "[pins-fix] ── validating with pins-sync ──"
@@ -1025,8 +1144,21 @@ cmd_verify() {
         scalafmtSbtCheck \
         compile \
         Test/compile \
+        testInventory \
         ivmExtension/assembly \
         test
+}
+
+cmd_verify_all() {
+    "$0" --target spark-3.5 verify "$@"
+    "$0" --target spark-4.1 verify "$@"
+    local inventory_dir="$PROJECT_DIR/target/test-inventory"
+    if ! cmp -s "$inventory_dir/spark-3.5.txt" "$inventory_dir/spark-4.1.txt"; then
+        echo "[verify-all] FATAL: Spark 3.5 and Spark 4.1 discovered different tests" >&2
+        diff -u "$inventory_dir/spark-3.5.txt" "$inventory_dir/spark-4.1.txt" >&2 || true
+        exit 1
+    fi
+    echo "[verify-all] ✓ identical test inventory"
 }
 
 # Quick local-source iteration on .temp/openivm + .temp/lpts.  Forwards
@@ -1122,7 +1254,7 @@ shift
 # failure). Excludes openivm-test/dev-build/pins-* (no spark-ext bind-mount
 # writes, or pure git ops).
 case "$cmd" in
-    fmt|build|assembly|test|verify|shell)
+    fmt|build|assembly|publish|publish-all|publish_all|test|verify|verify-all|verify_all|shell)
         trap reclaim_workspace_ownership EXIT
         ;;
 esac
@@ -1131,8 +1263,11 @@ case "$cmd" in
     fmt)          cmd_fmt "$@" ;;
     build)        cmd_build "$@" ;;
     assembly)     cmd_assembly "$@" ;;
+    publish)      cmd_publish "$@" ;;
+    publish-all|publish_all) cmd_publish_all "$@" ;;
     test)         cmd_test "$@" ;;
     verify)       cmd_verify "$@" ;;
+    verify-all|verify_all) cmd_verify_all "$@" ;;
     shell)        cmd_shell "$@" ;;
     image-build|image_build) cmd_image_build "$@" ;;
     openivm-test|openivm_test) cmd_openivm_test "$@" ;;

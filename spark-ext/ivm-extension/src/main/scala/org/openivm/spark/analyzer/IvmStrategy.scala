@@ -1,7 +1,6 @@
 package org.openivm.spark.analyzer
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.Strategy
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.SparkPlan
 import org.openivm.spark.executor.DeltaStagingExec
@@ -12,7 +11,7 @@ import org.openivm.spark.executor.DeltaStagingExec
  *
  * Registered via `injectPlannerStrategy`.
  */
-class IvmStrategy(session: SparkSession) extends Strategy {
+class IvmStrategy(session: SparkSession) extends SparkStrategyCompat {
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case WithDeltaStaging(child, stagingPath, opType, baseTable) =>

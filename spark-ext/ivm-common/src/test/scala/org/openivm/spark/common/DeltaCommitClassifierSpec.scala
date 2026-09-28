@@ -178,6 +178,17 @@ class DeltaCommitClassifierSpec extends AnyFunSpec with BeforeAndAfterAll with M
       classify(table, before) shouldBe Mutating
     }
 
+    it("normalizes JSON-quoted overwrite parameters from Delta 4") {
+      val overwriteInfo = CommitInfo
+        .empty(None)
+        .copy(
+          operation = "WRITE",
+          operationParameters = Map("mode" -> "\"Overwrite\"", "predicate" -> "\"true\"")
+        )
+
+      DeltaCommitClassifier.classifyCommit(Seq(overwriteInfo)) shouldBe Replace
+    }
+
     it("classifies truncate commit metadata as Replace") {
       val truncateInfo = CommitInfo.empty(None).copy(operation = "TRUNCATE", operationParameters = Map.empty)
 

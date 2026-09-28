@@ -14,7 +14,7 @@ import java.time.{Duration, Instant}
 import java.util.Arrays
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 final class OpenIvmTelemetryExportException(message: String) extends IllegalStateException(message)
 
