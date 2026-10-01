@@ -139,8 +139,28 @@ COPY --from=openivm-builder /artifacts/ /opt/openivm/
 
 RUN ln -s /opt/java/openjdk /opt/java/jdk-21 \
     && ln -s /opt/java/jdk-17 /opt/java/openjdk-17 \
-    && groupadd --gid 1000 vscode \
-    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash vscode \
+    && existing_group="$(getent group 1000 | cut -d: -f1)" \
+    && if getent group vscode >/dev/null 2>&1; then \
+      test "$(getent group vscode | cut -d: -f3)" = "1000" \
+        || { echo "Existing vscode group does not use required GID 1000" >&2; exit 1; }; \
+    elif [ -n "${existing_group}" ]; then \
+      groupmod --new-name vscode "${existing_group}"; \
+    else \
+      groupadd --gid 1000 vscode; \
+    fi \
+    && existing_user="$(getent passwd 1000 | cut -d: -f1)" \
+    && if id vscode >/dev/null 2>&1; then \
+      test "$(id -u vscode)" = "1000" \
+        || { echo "Existing vscode user does not use required UID 1000" >&2; exit 1; }; \
+    elif [ -n "${existing_user}" ]; then \
+      usermod --login vscode "${existing_user}"; \
+    else \
+      useradd --uid 1000 --gid vscode --create-home --shell /bin/bash vscode; \
+    fi \
+    && if [ "$(getent passwd vscode | cut -d: -f6)" != "/home/vscode" ]; then \
+      usermod --home /home/vscode --move-home vscode; \
+    fi \
+    && usermod --gid vscode --shell /bin/bash vscode \
     && printf 'vscode ALL=(root) NOPASSWD:ALL\n' > /etc/sudoers.d/vscode \
     && chmod 0440 /etc/sudoers.d/vscode \
     && mkdir -p /opt/downloads /opt/openivm-node-tooling /opt/sbt \

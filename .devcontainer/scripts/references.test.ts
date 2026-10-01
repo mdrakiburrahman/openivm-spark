@@ -114,6 +114,22 @@ test('single image exposes stable JDK 17 and JDK 21 homes with JDK 17 as default
   assert.match(dockerfile, /USER vscode\nWORKDIR \/workspaces\/openivm-spark/u);
 });
 
+test('Dockerfile reuses the required UID and GID 1000 identities for vscode', () => {
+  const dockerfile = readFileSync(join(workspaceRoot, '.devcontainer/Dockerfile'), 'utf8');
+  for (const expected of [
+    'existing_group="$(getent group 1000 | cut -d: -f1)"',
+    'groupmod --new-name vscode "${existing_group}"',
+    'groupadd --gid 1000 vscode',
+    'existing_user="$(getent passwd 1000 | cut -d: -f1)"',
+    'usermod --login vscode "${existing_user}"',
+    'useradd --uid 1000 --gid vscode --create-home --shell /bin/bash vscode',
+    'usermod --home /home/vscode --move-home vscode',
+    'usermod --gid vscode --shell /bin/bash vscode',
+  ]) {
+    assert.equal(dockerfile.includes(expected), true, `missing account reuse logic: ${expected}`);
+  }
+});
+
 test('publish always depends on image build and runtime smoke testing', () => {
   const project = JSON.parse(
     readFileSync(join(workspaceRoot, '.devcontainer/project.json'), 'utf8'),
