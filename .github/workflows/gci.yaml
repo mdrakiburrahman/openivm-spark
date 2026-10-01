@@ -11,7 +11,6 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   verify:
@@ -20,9 +19,6 @@ jobs:
     timeout-minutes: 350
     container:
       image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:6314c87a6da3f303b524e4421b4a21779b6af7224f34911a349141b846f6180f
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -75,9 +71,6 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     container:
       image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:6314c87a6da3f303b524e4421b4a21779b6af7224f34911a349141b846f6180f
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

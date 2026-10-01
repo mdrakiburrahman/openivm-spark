@@ -47,8 +47,9 @@ npx --no-install nx run devcontainer:publish
 The publisher fails before pushing when credentials are absent, never prints
 the token, and skips an image that already exists remotely.
 
-After the first GHCR push, the repository owner must set the package visibility
-to **Public** in GitHub Packages and verify an unauthenticated pull.
+After the first GHCR push, verify an unauthenticated pull. If GitHub created the
+package as private, the repository owner must set its visibility to **Public**
+in GitHub Packages before switching consumers to the new tag.
 
 ## Change the image safely
 
