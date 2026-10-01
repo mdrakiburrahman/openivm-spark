@@ -1,255 +1,128 @@
-#!/bin/bash
-# ============================================================================
-# contrib/common.sh — shared, idempotent bootstrap helpers.
-#
-# Sourced by bootstrap-dev-env.sh (full dev box) and bootstrap-ci.sh
-# (Docker-only on GitHub-hosted runners). Every helper is a no-op when the
-# desired state already holds, so re-running either bootstrap script is safe.
-#
-# Usage:
-#   source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-#   cmn_ensure_jq
-#   cmn_ensure_docker
-#   ...
-#
-# Naming: every public helper is prefixed `cmn_` to avoid colliding with
-# anything a caller already has in scope.
-# ============================================================================
+#!/usr/bin/env bash
+# Shared helpers for the Docker-first host bootstrap.
 
-# Refuse direct execution — this file is meant to be sourced.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     echo "[common.sh] FATAL: source this file, do not execute it" >&2
     exit 1
 fi
 
-# ── pinned versions ─────────────────────────────────────────────────────────
+CMN_NODE_VERSION="24.11.1"
+CMN_NPM_VERSION="11.6.2"
+CMN_NODE_ROOT="${CMN_NODE_ROOT:-/opt/openivm-node}"
 
-CMN_DOCKER_VERSION="${CMN_DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
-CMN_DOCKER_DAEMON_JSON='{"max-concurrent-downloads": 32}'
-CMN_TERRAFORM_VERSION="${CMN_TERRAFORM_VERSION:-1.9.8}"
-
-# ── tiny utilities ──────────────────────────────────────────────────────────
-
-# cmn_log <prefix> <msg...> — pretty `[<prefix>] msg`.
 cmn_log() {
-    local prefix="$1"; shift
+    local prefix="$1"
+    shift
     echo "[$prefix] $*"
 }
 
-# cmn_has <cmd> — true iff $cmd is on PATH and executable.
 cmn_has() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# cmn_apt_install <pkg...> — quiet idempotent apt install.
-cmn_apt_install() {
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null
-}
-
-# ── jq ──────────────────────────────────────────────────────────────────────
-
-cmn_ensure_jq() {
-    if cmn_has jq; then
-        cmn_log common "jq already installed ($(jq --version))"
+cmn_require() {
+    local command="$1"
+    local hint="${2:-Install '${command}' and rerun the bootstrap.}"
+    if cmn_has "${command}"; then
         return 0
     fi
-    cmn_log common "installing jq..."
-    sudo apt-get update -qq
-    cmn_apt_install jq
-    cmn_log common "jq installed ($(jq --version))"
+    cmn_log bootstrap "FATAL: required command '${command}' is missing. ${hint}" >&2
+    return 1
 }
 
-# ── docker ──────────────────────────────────────────────────────────────────
-
-# cmn_ensure_docker — install Docker CE if missing. No-op when `docker` is on
-# PATH (GitHub-hosted ubuntu-latest pre-installs it).
-cmn_ensure_docker() {
-    if cmn_has docker; then
-        cmn_log common "docker already installed ($(docker --version))"
-        return 0
-    fi
-    cmn_log common "installing docker..."
-    sudo apt-get update -qq
-    cmn_apt_install apt-transport-https ca-certificates curl gnupg lsb-release
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-    sudo add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-    sudo apt-get update -qq
-    sudo apt-get install -y --allow-downgrades \
-        docker-ce="${CMN_DOCKER_VERSION}" \
-        docker-ce-cli="${CMN_DOCKER_VERSION}" \
-        containerd.io >/dev/null
-    cmn_log common "docker installed ($(docker --version))"
-}
-
-# cmn_configure_docker_daemon — write /etc/docker/daemon.json with our
-# desired settings. Only restarts dockerd when the file actually changes
-# (avoids needless service bounces on GH runners). Also ensures the docker
-# socket is world-rw so non-root callers can talk to it (matches the WSL dev
-# setup; on GH runners the runner user is already in the `docker` group, so
-# the chmod is harmless either way).
-cmn_configure_docker_daemon() {
-    local target="/etc/docker/daemon.json"
-    local desired="${CMN_DOCKER_DAEMON_JSON}"
-    sudo mkdir -p /etc/docker
-    local current=""
-    if [[ -f "$target" ]]; then
-        current="$(sudo cat "$target" 2>/dev/null || echo '')"
-    fi
-    if [[ "$current" == "$desired" ]]; then
-        cmn_log common "docker daemon.json already up to date"
-    else
-        cmn_log common "writing docker daemon.json..."
-        echo "$desired" | sudo tee "$target" >/dev/null
-        cmn_log common "restarting docker..."
-        # systemctl works on the dev box; on GH runners docker is also a
-        # systemd service. Fall back to `service` if systemctl is missing.
-        if cmn_has systemctl; then
-            sudo systemctl restart docker
-        else
-            sudo service docker restart
-        fi
-    fi
-    # World-rw on the socket: matches existing dev-box behaviour, harmless
-    # on GH runners (the runner user is already in the docker group).
-    if [[ -S /var/run/docker.sock ]]; then
-        sudo chmod 666 /var/run/docker.sock || true
-    fi
-}
-
-# cmn_kill_running_containers — best-effort `docker kill` on every running
-# container. Useful before a dev verify (PRE_CLEAN=1). NOT used on CI
-# (runners are ephemeral).
-cmn_kill_running_containers() {
-    if ! cmn_has docker; then return 0; fi
-    docker container ls >/dev/null 2>&1 || return 0
-    local ids
-    ids="$(docker ps -q || true)"
-    if [[ -z "$ids" ]]; then
-        cmn_log common "no running containers to kill"
-        return 0
-    fi
-    cmn_log common "killing $(echo "$ids" | wc -l | tr -d ' ') running container(s)..."
-    echo "$ids" | xargs -r docker kill >/dev/null
-}
-
-# ── WSL-only helpers ────────────────────────────────────────────────────────
-
-# cmn_strip_windows_paths — remove `/mnt/c/...` entries from PATH so we don't
-# accidentally pick up Windows-side az/gh on a WSL host. Caller must
-# `export PATH=$(cmn_strip_windows_paths)` since shell functions can't modify
-# the parent env.
-cmn_strip_windows_paths() {
-    echo "$PATH" | tr ':' '\n' | grep -v "^/mnt/c" | tr '\n' ':' | sed 's/:$//'
-}
-
-# ── azure cli ───────────────────────────────────────────────────────────────
-
-cmn_ensure_az_cli() {
-    local current
-    current="$(command -v az 2>/dev/null || echo '')"
-    if [[ -n "$current" && "$current" != *"/mnt/c"* ]]; then
-        cmn_log common "az already installed at $current"
-        return 0
-    fi
-    cmn_log common "installing native Linux az cli..."
-    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash >/dev/null
-    export PATH="$HOME/bin:$PATH"
-    cmn_log common "az installed ($(az --version | head -1))"
-}
-
-cmn_ensure_az_login() {
-    if az account get-access-token --query expiresOn -o tsv >/dev/null 2>&1; then
-        cmn_log common "az already logged in"
-        return 0
-    fi
-    cmn_log common "az not logged in — running 'az login'..."
-    az login >/dev/null
-}
-
-# ── terraform ───────────────────────────────────────────────────────────────
-
-cmn_ensure_terraform() {
-    if cmn_has terraform; then
-        cmn_log common "terraform already installed ($(terraform version | head -1))"
-        return 0
-    fi
-    cmn_log common "installing terraform v${CMN_TERRAFORM_VERSION}..."
-    sudo apt-get update -qq
-    cmn_apt_install gnupg software-properties-common curl
-    local key
-    key="$(mktemp)"
-    curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$key"
-    sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg "$key"
-    rm -f "$key"
-    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
-        | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
-    sudo apt-get update -qq
-    sudo apt-get install -y --allow-downgrades "terraform=${CMN_TERRAFORM_VERSION}-*" >/dev/null
-    cmn_log common "terraform installed ($(terraform version | head -1))"
-}
-
-# ── github cli ──────────────────────────────────────────────────────────────
-
-cmn_ensure_gh_cli() {
-    if cmn_has gh; then
-        cmn_log common "gh already installed ($(gh --version | head -1))"
-        return 0
-    fi
-    cmn_log common "installing gh cli..."
-    cmn_has wget || cmn_apt_install wget
-    sudo mkdir -p -m 755 /etc/apt/keyrings
-    local key
-    key="$(mktemp)"
-    wget -nv -O"$key" https://cli.github.com/packages/githubcli-archive-keyring.gpg
-    sudo install -m 0644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
-    rm -f "$key"
-    sudo mkdir -p -m 755 /etc/apt/sources.list.d
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-    sudo apt-get update -qq
-    cmn_apt_install gh
-    cmn_log common "gh installed ($(gh --version | head -1))"
-}
-
-cmn_ensure_gh_login() {
-    if gh auth status >/dev/null 2>&1; then
-        cmn_log common "gh already logged in as $(gh api user --jq .login 2>/dev/null || echo unknown)"
-        return 0
-    fi
-    cmn_log common "gh not logged in — running 'gh auth login'..."
-    gh auth login
-}
-
-# ── passwordless sudo (dev box only) ────────────────────────────────────────
-
-# cmn_ensure_passwordless_sudo — install /etc/sudoers.d/90-<user>-nopasswd so
-# subsequent `sudo` calls never prompt. First invocation may prompt for the
-# password once; idempotent after that.
-cmn_ensure_passwordless_sudo() {
-    local user="${SUDO_USER:-$USER}"
-    if [[ "$user" == "root" ]]; then
-        cmn_log common "running as root — passwordless sudo not applicable"
-        return 0
-    fi
-    if sudo -n true 2>/dev/null; then
-        cmn_log common "passwordless sudo already active for '$user'"
-        return 0
-    fi
-    cmn_log common "configuring passwordless sudo for '$user' (may prompt once)..."
-    local target="/etc/sudoers.d/90-${user}-nopasswd"
-    local tmp
-    tmp="$(mktemp)"
-    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$tmp"
-    if ! sudo visudo -cf "$tmp" >/dev/null; then
-        cmn_log common "FATAL: refused to install malformed sudoers fragment at $target" >&2
-        rm -f "$tmp"
+cmn_require_docker() {
+    cmn_require docker "Install Docker Engine in WSL before running this script."
+    if ! docker info >/dev/null 2>&1; then
+        cmn_log bootstrap "FATAL: Docker is installed, but the daemon is not reachable." >&2
         return 1
     fi
-    sudo install -m 0440 -o root -g root "$tmp" "$target"
-    rm -f "$tmp"
-    if ! sudo -n true 2>/dev/null; then
-        cmn_log common "FATAL: passwordless sudo still not active after installing $target" >&2
+    cmn_log bootstrap "Docker ready ($(docker --version))"
+}
+
+cmn_node_archive() {
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            printf 'node-v%s-linux-x64.tar.xz|%s\n' \
+                "${CMN_NODE_VERSION}" \
+                "60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8"
+            ;;
+        aarch64 | arm64)
+            printf 'node-v%s-linux-arm64.tar.xz|%s\n' \
+                "${CMN_NODE_VERSION}" \
+                "6b0863fb9f627bf4a6c5948dce1de4398174a2e05dbe717503d828e211ca01f0"
+            ;;
+        *)
+            cmn_log bootstrap "FATAL: unsupported host architecture '$(uname -m)'." >&2
+            return 1
+            ;;
+    esac
+}
+
+cmn_ensure_download_tools() {
+    local missing=()
+    local command
+    for command in curl sha256sum tar xz; do
+        cmn_has "${command}" || missing+=("${command}")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        return 0
+    fi
+
+    cmn_require sudo "The bootstrap needs sudo once to install download utilities and Node.js."
+    cmn_require apt-get "Use an Ubuntu/Debian WSL distribution or install ${missing[*]} manually."
+    cmn_log bootstrap "Installing host bootstrap utilities: ${missing[*]}"
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils >/dev/null
+}
+
+cmn_ensure_node() {
+    if cmn_has node &&
+        [[ "$(node --version 2>/dev/null)" == "v${CMN_NODE_VERSION}" ]] &&
+        cmn_has npm &&
+        [[ "$(npm --version 2>/dev/null)" == "${CMN_NPM_VERSION}" ]]; then
+        cmn_log bootstrap "Node ${CMN_NODE_VERSION} and npm ${CMN_NPM_VERSION} already installed"
+        return 0
+    fi
+
+    cmn_ensure_download_tools
+    cmn_require sudo "The bootstrap installs the pinned Node.js runtime under ${CMN_NODE_ROOT}."
+
+    local archive_info archive sha256 extracted tmp
+    archive_info="$(cmn_node_archive)"
+    archive="${archive_info%%|*}"
+    sha256="${archive_info##*|}"
+    extracted="${archive%.tar.xz}"
+    tmp="$(mktemp -d)"
+
+    cmn_log bootstrap "Installing Node ${CMN_NODE_VERSION} and npm ${CMN_NPM_VERSION}"
+    curl -fsSL "https://nodejs.org/dist/v${CMN_NODE_VERSION}/${archive}" -o "${tmp}/${archive}"
+    echo "${sha256}  ${tmp}/${archive}" | sha256sum -c -
+
+    sudo mkdir -p "${CMN_NODE_ROOT}"
+    sudo rm -rf "${CMN_NODE_ROOT:?}/${extracted}"
+    sudo tar -xJf "${tmp}/${archive}" -C "${CMN_NODE_ROOT}"
+    sudo ln -sfn "${CMN_NODE_ROOT}/${extracted}" "${CMN_NODE_ROOT}/current"
+
+    local executable
+    for executable in node npm npx corepack; do
+        sudo ln -sfn "${CMN_NODE_ROOT}/current/bin/${executable}" "/usr/local/bin/${executable}"
+    done
+    rm -rf "${tmp}"
+    hash -r
+
+    if [[ "$(node --version)" != "v${CMN_NODE_VERSION}" ]] ||
+        [[ "$(npm --version)" != "${CMN_NPM_VERSION}" ]]; then
+        cmn_log bootstrap "FATAL: installed Node/npm versions do not match the repository contract." >&2
         return 1
     fi
-    cmn_log common "passwordless sudo configured at $target"
+}
+
+cmn_npm_ci() {
+    local repository_root="$1"
+    cmn_log bootstrap "Installing locked repository tooling"
+    (
+        cd "${repository_root}"
+        npm ci
+    )
 }

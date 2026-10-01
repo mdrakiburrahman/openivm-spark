@@ -5,84 +5,54 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel any in-flight gci run for the same PR when a new commit lands.
 concurrency:
   group: gci-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   verify:
-    name: dev.sh verify (${{ matrix.target }})
+    name: Nx verify (${{ matrix.target }})
     runs-on: [self-hosted, openivm-spark-azure]
-    timeout-minutes: 350  # under GitHub's 6-hour hard limit
+    timeout-minutes: 350
+    container:
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:3c4c01cd16490635f27e0bc43b0b7968a9602974ebb15379dbcfac8f236ae845
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         target: [spark-3.5, spark-4.1]
-
     env:
-      # 48-vCPU self-hosted runner (Standard_E48as_v5) — 1 fork per 2 vCPU
-      # per the published recommendation in spark-ext/dev/dev.sh.
-      OPENIVM_TEST_FORKS: "24"
-
+      NX_DAEMON: 'false'
+      OPENIVM_TEST_FORKS: '24'
     steps:
-      - name: Reclaim workspace from root-owned Docker artifacts
-        # dev.sh verify writes root-owned files that survive on this persistent
-        # runner, breaking the next checkout's git clean (EACCES). Cancelled runs
-        # also leave orphan containers still writing such files. Kill every
-        # container on the assigned runner first, then chown the tree back.
-        # Best-effort; this step never fails.
-        shell: bash
-        run: |
-          set -uo pipefail
-          running="$(docker ps -q 2>/dev/null || true)"
-          if [ -n "$running" ]; then
-            # shellcheck disable=SC2086
-            docker rm -f $running || true
-          fi
-          ws="${GITHUB_WORKSPACE:-$PWD}"
-          [ -d "$ws" ] || exit 0
-          if sudo -n true 2>/dev/null; then
-            sudo chown -R "$(id -u):$(id -g)" "$ws" || true
-          else
-            docker run --rm -v "$ws:/ws" alpine:3 \
-              chown -R "$(id -u):$(id -g)" /ws || true
-          fi
-
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          # pins-sync runs `git merge-base --is-ancestor` against pinned
-          # commits, so we need the full graph (not a shallow clone).
           fetch-depth: 0
 
-      - name: Bootstrap CI host (jq + docker + daemon config)
-        run: ./contrib/bootstrap-ci.sh
+      - name: Install locked tooling from the warmed cache
+        run: npm ci --prefer-offline --no-audit --no-fund
 
-      - name: Show host capacity
-        run: |
-          echo "── cpu ─────────────────────────────"
-          nproc
-          echo "── memory ──────────────────────────"
-          free -h
-          echo "── disk ────────────────────────────"
-          df -h /
-
-      - name: dev.sh verify (lint + compile + assembly + all suites)
-        run: ./spark-ext/dev/dev.sh --target "${{ matrix.target }}" verify -Dopenivm.test.forks=${OPENIVM_TEST_FORKS}
-
-      - name: Window net-zero probe A/B
+      - name: Verify
         run: >-
-          ./spark-ext/dev/dev.sh --target "${{ matrix.target }}" test
-          'ivmIt/testOnly org.openivm.spark.bench.WindowNoopWriteHarness --
-          -n org.openivm.spark.tags.MicroBenchmark'
+          npx --no-install nx run spark-ext:verify
+          --configuration=${{ matrix.target }}
+          -- -Dopenivm.test.forks=${OPENIVM_TEST_FORKS}
+
+      - name: Window net-zero probe
+        run: >-
+          npx --no-install nx run spark-ext:window-benchmark
+          --configuration=${{ matrix.target }}
 
       - name: Upload test inventory
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-inventory-${{ matrix.target }}-${{ github.run_id }}
           path: spark-ext/target/test-inventory/${{ matrix.target }}.txt
@@ -91,29 +61,36 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-logs-${{ matrix.target }}-${{ github.run_id }}
-          path: spark-ext/.logs/${{ matrix.target }}/
+          path: .logs/
           if-no-files-found: ignore
+          include-hidden-files: true
           retention-days: 14
 
   compare-test-inventory:
-    name: identical test inventory
+    name: Identical test inventory
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, openivm-spark-azure]
+    container:
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:3c4c01cd16490635f27e0bc43b0b7968a9602974ebb15379dbcfac8f236ae845
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Download Spark 3.5 inventory
-        uses: actions/download-artifact@v4
-        with:
-          name: test-inventory-spark-3.5-${{ github.run_id }}
-          path: inventory/spark-3.5
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Download Spark 4.1 inventory
-        uses: actions/download-artifact@v4
+      - name: Install locked tooling from the warmed cache
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Download test inventories
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: test-inventory-spark-4.1-${{ github.run_id }}
-          path: inventory/spark-4.1
+          pattern: test-inventory-*-${{ github.run_id }}
+          path: spark-ext/target/test-inventory
+          merge-multiple: true
 
       - name: Compare discovered tests
-        run: diff -u inventory/spark-3.5/spark-3.5.txt inventory/spark-4.1/spark-4.1.txt
+        run: npx --no-install nx run spark-ext:compare-test-inventory

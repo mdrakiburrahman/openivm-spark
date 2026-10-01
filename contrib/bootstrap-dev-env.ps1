@@ -1,75 +1,41 @@
 <#
-
 .SYNOPSIS
-  Bootstraps a Windows DevBox with WSL.
+  Prepares a non-destructive Windows/WSL entry point for the devcontainer.
 
 .NOTES
-
-  - The script uninstalls Docker Desktop as it interferes with WSL2.
-  - Must be run as Administrator in PowerShell 7+.
-
+  Docker must already be installed and reachable inside Ubuntu-24.04.
+  This script never unregisters WSL distributions or removes Docker Desktop.
 #>
 
 #Requires -RunAsAdministrator
+#Requires -Version 7.0
 
-code --install-extension ms-vscode-remote.remote-wsl
-code --install-extension ms-vscode-remote.remote-containers
+$ErrorActionPreference = "Stop"
 
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Error "This script requires PowerShell 7+. You are running PowerShell $($PSVersionTable.PSVersion).`nTo launch PowerShell 7 as Administrator:`n  Start Menu > search 'pwsh' > right-click 'PowerShell 7' > 'Run as administrator'"
-    exit 1
+if (Get-Command code -ErrorAction SilentlyContinue) {
+    code --install-extension ms-vscode-remote.remote-wsl --force
+    code --install-extension ms-vscode-remote.remote-containers --force
 }
 
-$dockerProcesses = @("Docker Desktop")
-foreach ($process in $dockerProcesses) {
-    try {
-        Get-Process -Name $process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    } catch {
+$distribution = "Ubuntu-24.04"
+$installed = wsl --list --quiet |
+    ForEach-Object { $_.Trim().Replace("`0", "") } |
+    Where-Object { $_ }
 
-    }
-}
-
-winget uninstall "Docker Desktop" --silent --force --accept-source-agreements 2>$null
-$pkg = Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty | Where-Object { $_.DisplayName -like "Docker Desktop*" };
-if ($pkg) {
-    $cmd = $pkg.UninstallString
-    Start-Process "cmd.exe" -ArgumentList "/c $cmd /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS" -Wait -ErrorAction SilentlyContinue
-}
-Remove-Item -Path "$env:PROGRAMFILES\Docker", "$env:PROGRAMDATA\Docker*", "$env:LOCALAPPDATA\Docker*", "$env:APPDATA\Docker*" -Recurse -Force -ErrorAction SilentlyContinue
-
-$distros = (wsl -l -q) | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim().Replace("`0", "") } | Where-Object { $_ }
-foreach ($distro in $distros) {
-    Write-Host "Unregistering WSL distro: $distro"
-    wsl --unregister $distro
-}
-
-$RECOMMENDED_CORES = 16
-
-$memGB=[math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)
-$cpu=[Environment]::ProcessorCount
-$swap=[math]::Floor($memGB/4)
-
-if ($cpu -lt $RECOMMENDED_CORES) {
-    Write-Host "WARNING: This machine has $cpu cores, which is below the recommended $RECOMMENDED_CORES cores." -ForegroundColor DarkYellow
-    $requiredResponse = "I am OK with having a subpar development experience"
-    do {
-        $response = Read-Host "Please type '$requiredResponse' **EXACTLY** as is to continue"
-    } while ($response -ne $requiredResponse)
+if ($installed -notcontains $distribution) {
+    Write-Host "Installing $distribution without modifying existing WSL distributions."
+    wsl --install --distribution $distribution --no-launch
 } else {
-    Write-Host "(detected $cpu cores, ${memGB}GB RAM)" -ForegroundColor Green
+    Write-Host "$distribution is already installed."
 }
-@"
-[wsl2]
-memory=${memGB}GB
-processors=$cpu
-swap=${swap}GB
-networkingMode=NAT
-"@ | Set-Content -Path "$env:USERPROFILE\.wslconfig"
 
-Write-Host "Restarting WSL to apply settings"
-wsl --shutdown
+Write-Host @"
 
-winget install -e --id Microsoft.GitCredentialManagerCore
+WSL preparation complete.
 
-Write-Host "Installing Ubuntu"
-wsl --install -d Ubuntu-24.04
+Before cloning the repository, ensure Docker is reachable inside $distribution:
+  wsl -d $distribution -- docker info
+
+Then run from the repository root inside WSL:
+  ./contrib/bootstrap-dev-env.sh
+"@

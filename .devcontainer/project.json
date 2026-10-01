@@ -1,0 +1,93 @@
+{
+  "name": "devcontainer",
+  "$schema": "../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npm run lint"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npm run typecheck"
+      }
+    },
+    "unit": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npm test"
+      }
+    },
+    "tag": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "outputs": ["{workspaceRoot}/.devcontainer/.image-tag"],
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts tag",
+        "forwardAllArgs": true
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["tag"],
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts build",
+        "forwardAllArgs": true
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts test",
+        "forwardAllArgs": true
+      }
+    },
+    "publish": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["test"],
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts publish",
+        "forwardAllArgs": true
+      }
+    },
+    "up": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts up",
+        "forwardAllArgs": true
+      }
+    },
+    "exec": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts exec",
+        "forwardAllArgs": true
+      }
+    },
+    "down": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts down",
+        "forwardAllArgs": true
+      }
+    },
+    "cleanup": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "tsx .devcontainer/scripts/cli.ts cleanup",
+        "forwardAllArgs": true
+      }
+    }
+  }
+}

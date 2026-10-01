@@ -8,11 +8,13 @@
 # Subcommands (alphabetical):
 #   assembly                Build the ivmExtension fat jar.
 #   build                   `sbt compile` inside the dev container.
+#   compare-test-inventory  Compare Spark 3.5 and Spark 4.1 inventories.
 #   dev-build [all|build|test [filter]]
 #                           Quick iteration on local .temp/openivm + .temp/lpts.
 #   fmt                     Auto-format Scala sources with scalafmt.
 #   help                    Print this message.
 #   image-build [args]      `docker compose build` (force rebuild of dev image).
+#   lint                    Check Scala and SBT formatting.
 #   openivm-test            Run upstream openivm sqllogictest suite.
 #   publish                 Build and publish the ivmExtension fat jar to the
 #                            Maven feed configured in root .env.
@@ -35,9 +37,11 @@
 #   shell                   Drop into bash inside the spark-ext container.
 #   test [sbt-args]         `sbt test` (all suites) inside the dev container.
 #                           Extra args are appended to sbt (e.g. `testOnly ...`).
+#   test-inventory          Write the selected target's discovered test list.
 #   verify                  pins-sync + lint + compile + assembly + test in
 #                           one Docker call.
 #   verify-all              Run verify for Spark 3.5 and Spark 4.1.
+#   window-benchmark        Run the WindowNoopWriteHarness micro-benchmark.
 #
 # Environment: only Docker is required on the host.  Pinned image SHAs come
 # from `spark-ext/dev/pins.env`.
@@ -60,6 +64,7 @@ REPO_ROOT="$( cd "$PROJECT_DIR/.." && pwd )"
 PINS_FILE="$DEV_DIR/pins.env"
 TARGETS_DIR="$DEV_DIR/targets"
 COMPOSE_FILE="$DEV_DIR/docker/docker-compose.yml"
+DIRECT_RUNNER="$DEV_DIR/run.sh"
 
 if [[ ! -f "$PINS_FILE" ]]; then
     echo "[spark-ext/dev] FATAL: $PINS_FILE not found" >&2
@@ -106,64 +111,32 @@ compose() {
         -f "$COMPOSE_FILE" "$@"
 }
 
-# Standard SBT opts — heap, GC, color, encoding. Applied to every `sbt …` call
-# routed through this wrapper so the JVM has enough memory to run 24-way forked
-# tests in parallel.
-sbt_opts() {
-    echo "-Xmx10G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
-}
+# Run the direct in-container implementation through the retained Compose
+# compatibility image. The same script is invoked directly by Nx inside the
+# prebuilt devcontainer, so command ordering and exit behavior stay aligned.
+run_direct_container() {
+    [[ -x "$DIRECT_RUNNER" ]] || {
+        echo "[spark-ext/dev] FATAL: $DIRECT_RUNNER is not executable" >&2
+        exit 1
+    }
 
-# Run sbt inside the `build` service with the standard opts and any caller-
-# supplied tasks/arguments.
-#
-# OPENIVM_TEST_LOG_DIR (set by `setup_test_log_dir`) is forwarded both as an
-# env var (via docker-compose's environment block) AND as a -D system
-# property on the sbt JVM (via SBT_OPTS). The sbt JVM in turn propagates
-# -D's to forked test JVMs through `Test/javaOptions`, so log4j2.properties
-# can resolve `${sys:openivm.test.log.dir}` reliably.
-run_sbt() {
-    local extra_sys_props=""
-    if [[ -n "${OPENIVM_TEST_LOG_DIR:-}" ]]; then
-        extra_sys_props=" -Dopenivm.test.log.dir=${OPENIVM_TEST_LOG_DIR}"
-    fi
-    compose run --rm -T -e SBT_OPTS="$(sbt_opts)${extra_sys_props}" build sbt "$@"
-}
+    local -a env_args=()
+    local name java_home_var java_home_value
+    for name in OPENIVM_TEST_FORKS OPENIVM_SBT_OPTS OPENIVM_TEST_LOG_TIMESTAMP; do
+        if [[ -n "${!name+x}" ]]; then
+            env_args+=(-e "$name")
+        fi
+    done
+    case "$OPENIVM_SPARK_TARGET" in
+        spark-3.5) java_home_var="OPENIVM_JAVA_HOME_SPARK_35" ;;
+        spark-4.1) java_home_var="OPENIVM_JAVA_HOME_SPARK_41" ;;
+    esac
+    java_home_value="${!java_home_var:-}"
+    env_args+=(-e "$java_home_var=${java_home_value:-/opt/java/openjdk}")
+    env_args+=(-e "OPENIVM_TEST_LOG_ROOT=${OPENIVM_TEST_LOG_ROOT:-/work/spark-ext/.logs}")
 
-# Provision the per-run test-log directory on the host BEFORE we invoke the
-# docker container, so log4j2's File appender can open files there without
-# racing the test-classes resource copy. Sets OPENIVM_TEST_LOG_DIR to the
-# IN-CONTAINER path (matching the bind mount), which is what log4j2.properties
-# resolves at appender-init time inside each forked test JVM.
-#
-# A separate per-fork file is emitted under that directory:
-#   .logs/test-<sbt-launch-timestamp>/fork-<jvm-startup-millis>-<thread>.log
-#
-# The PARENT timestamp is fixed for the entire sbt invocation; the per-fork
-# filename uses log4j2's ${date:HHmmss-SSS} lookup which resolves at
-# appender-init in each forked JVM, yielding a unique file per fork.
-setup_test_log_dir() {
-    local ts
-    ts="$(date +%Y%m%d-%H%M%S)"
-    # The container's /work/spark-ext bind-mounts the HOST's spark-ext/ directory
-    # (compose YAML: `../..:/work/spark-ext`). So .logs/ MUST live under
-    # spark-ext/.logs/ on the host to be visible from both sides.
-    local parent_dir="$PROJECT_DIR/.logs/$OPENIVM_SPARK_TARGET"
-    local host_dir="$parent_dir/test-$ts"
-
-    # Ensure the parent .logs/ exists and is world-writable, so the host user
-    # (mdrrahman) can mkdir subdirectories even if Docker (running as root)
-    # has previously created the parent. World-writable is fine — these are
-    # disposable per-run debug logs, not secrets.
-    if [[ ! -d "$parent_dir" ]]; then
-        mkdir -p "$parent_dir" 2>/dev/null \
-            || compose run --rm -T build mkdir -p /work/spark-ext/.logs >/dev/null
-    fi
-    if [[ ! -w "$parent_dir" ]]; then
-        compose run --rm -T build chmod 777 /work/spark-ext/.logs >/dev/null
-    fi
-    mkdir -p "$host_dir"
-    export OPENIVM_TEST_LOG_DIR="/work/spark-ext/.logs/test-$ts"
-    echo "[dev] Test logs → spark-ext/.logs/test-$ts/ (DEBUG-level full trace; console keeps WARN+ only)"
+    compose run --rm -T "${env_args[@]}" build \
+        ./dev/run.sh --target "$OPENIVM_SPARK_TARGET" "$@"
 }
 
 # Honoured by every subcommand below. If PRE_CLEAN=1, force-remove every
@@ -227,9 +200,18 @@ dockerfile_arg_default() {
 
 # ── subcommand implementations ─────────────────────────────────────────────
 
-cmd_fmt()         { pre_clean_if_requested; compose run --rm fmt; }
-cmd_build()       { pre_clean_if_requested; compose run --rm build "$@"; }
-cmd_assembly()    { pre_clean_if_requested; compose run --rm assembly; }
+cmd_fmt()         { pre_clean_if_requested; run_direct_container fmt "$@"; }
+cmd_lint()        { pre_clean_if_requested; run_direct_container lint "$@"; }
+cmd_build() {
+    pre_clean_if_requested
+    if [[ "$#" -eq 0 ]]; then
+        run_direct_container build
+    else
+        # Historical behavior: arguments replace the Compose service command.
+        compose run --rm build "$@"
+    fi
+}
+cmd_assembly()    { pre_clean_if_requested; run_direct_container assembly "$@"; }
 cmd_shell()       { pre_clean_if_requested; compose run --rm shell; }
 cmd_image_build() { pre_clean_if_requested; compose build "$@"; }
 cmd_openivm_test(){ pre_clean_if_requested; compose run --rm openivm-test; }
@@ -1114,12 +1096,21 @@ cmd_pins_fix() {
 
 cmd_test() {
     pre_clean_if_requested
-    setup_test_log_dir
-    if [[ "$#" -eq 0 ]]; then
-        compose run --rm test
-    else
-        run_sbt "$@"
-    fi
+    run_direct_container test-suite "$@"
+}
+
+cmd_test_inventory() {
+    pre_clean_if_requested
+    run_direct_container test-inventory "$@"
+}
+
+cmd_compare_test_inventory() {
+    "$DIRECT_RUNNER" compare-test-inventory "$@"
+}
+
+cmd_window_benchmark() {
+    pre_clean_if_requested
+    run_direct_container window-benchmark "$@"
 }
 
 cmd_verify() {
@@ -1137,28 +1128,13 @@ cmd_verify() {
     # repo/branch hard-fails per cmd_pins_sync's contract.
     cmd_pins_sync
     pre_clean_if_requested
-    setup_test_log_dir
-
-    run_sbt "$@" \
-        scalafmtCheckAll \
-        scalafmtSbtCheck \
-        compile \
-        Test/compile \
-        testInventory \
-        ivmExtension/assembly \
-        test
+    run_direct_container --skip-pins-sync verify "$@"
 }
 
 cmd_verify_all() {
     "$0" --target spark-3.5 verify "$@"
     "$0" --target spark-4.1 verify "$@"
-    local inventory_dir="$PROJECT_DIR/target/test-inventory"
-    if ! cmp -s "$inventory_dir/spark-3.5.txt" "$inventory_dir/spark-4.1.txt"; then
-        echo "[verify-all] FATAL: Spark 3.5 and Spark 4.1 discovered different tests" >&2
-        diff -u "$inventory_dir/spark-3.5.txt" "$inventory_dir/spark-4.1.txt" >&2 || true
-        exit 1
-    fi
-    echo "[verify-all] ✓ identical test inventory"
+    cmd_compare_test_inventory
 }
 
 # Quick local-source iteration on .temp/openivm + .temp/lpts.  Forwards
@@ -1254,20 +1230,25 @@ shift
 # failure). Excludes openivm-test/dev-build/pins-* (no spark-ext bind-mount
 # writes, or pure git ops).
 case "$cmd" in
-    fmt|build|assembly|publish|publish-all|publish_all|test|verify|verify-all|verify_all|shell)
+    fmt|lint|build|assembly|publish|publish-all|publish_all|test|test-inventory|test_inventory|\
+        verify|verify-all|verify_all|window-benchmark|window_benchmark|shell)
         trap reclaim_workspace_ownership EXIT
         ;;
 esac
 
 case "$cmd" in
     fmt)          cmd_fmt "$@" ;;
+    lint)         cmd_lint "$@" ;;
     build)        cmd_build "$@" ;;
     assembly)     cmd_assembly "$@" ;;
     publish)      cmd_publish "$@" ;;
     publish-all|publish_all) cmd_publish_all "$@" ;;
     test)         cmd_test "$@" ;;
+    test-inventory|test_inventory) cmd_test_inventory "$@" ;;
+    compare-test-inventory|compare_test_inventory) cmd_compare_test_inventory "$@" ;;
     verify)       cmd_verify "$@" ;;
     verify-all|verify_all) cmd_verify_all "$@" ;;
+    window-benchmark|window_benchmark) cmd_window_benchmark "$@" ;;
     shell)        cmd_shell "$@" ;;
     image-build|image_build) cmd_image_build "$@" ;;
     openivm-test|openivm_test) cmd_openivm_test "$@" ;;

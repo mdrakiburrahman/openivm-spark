@@ -1,72 +1,80 @@
 # Contributing
 
-## How to use, on a Windows machine by installing WSL
+Development, headless automation, and CI use the same prebuilt devcontainer and
+the same Nx targets. The WSL host does not need Java, Scala, sbt, Maven, Metals,
+Azure CLI, Terraform, or GitHub CLI.
 
-1. Windows pre-reqs
+## Windows and WSL prerequisites
 
-   ```powershell
-   winget install -e --id Microsoft.VisualStudioCode
-   ```
+Install Visual Studio Code, WSL with Ubuntu 24.04, Git, and Docker. Docker must
+be reachable from inside WSL. Keep the repository under the Linux filesystem
+(`~/`), not `/mnt/c`, because Spark and Delta workloads are substantially
+slower on Windows-mounted paths.
 
-1. Get a fresh new WSL machine up:
+The optional Windows helper installs the VS Code extensions and Ubuntu
+distribution without deleting existing distributions or Docker:
 
-   > ⚠️ Warning: this removes Docker Desktop if you have it installed
+```powershell
+pwsh -File .\contrib\bootstrap-dev-env.ps1
+```
 
-   ```powershell
-   $GIT_ROOT = git rev-parse --show-toplevel
-   & "$GIT_ROOT\contrib\bootstrap-dev-env.ps1"
-   ```
+Clone the repository from WSL:
 
-1. Clone the repo, and open VSCode in it:
+```bash
+cd ~
+git clone https://github.com/mdrakiburrahman/openivm-spark.git
+cd openivm-spark
+```
 
-    > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is extremely slow for Spark I/O.
-    > You can technically run the Devcontainer using Windows Docker Desktop, but the I/O experience is slow and poor.
+## Bootstrap the minimal host tooling
 
-   ```bash
-   cd ~/
+```bash
+./contrib/bootstrap-dev-env.sh
+```
 
-   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
-   read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
-    
-   git clone https://github.com/mdrakiburrahman/openivm-spark.git
+This validates Docker, installs the exact Node/npm version used by the
+repository, and runs `npm ci`. All build and test toolchains are prebuilt into
+the devcontainer image.
 
-   git config --global user.name "$user_name"
-   git config --global user.email "$user_email"
-   cd openivm-spark/
-   git pull origin
+## Use VS Code
 
-   code .
-   ```
+Open the repository root:
 
-1. Run the bootstrapper script, that installs all tools idempotently:
+```bash
+code .
+```
 
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
-   ```
+Accept **Reopen in Container** when prompted. The checked-in
+`.devcontainer/devcontainer.json` uses the same immutable image as CI.
 
-1. Open `spark-ext` as the VS Code workspace root so Metals discovers its
-   `build.sbt`, imports the sbt build, and provides Scala/Java IntelliSense:
+## Use the devcontainer headlessly
 
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   source /etc/profile.d/openivm-toolchain.sh
-   code "${GIT_ROOT}/spark-ext"
-   ```
+```bash
+npx --no-install nx run devcontainer:up
+npx --no-install nx run devcontainer:exec -- \
+    npx --no-install nx run spark-ext:verify-all
+npx --no-install nx run devcontainer:down
+```
 
-   On the first open, accept the Metals **Import build** prompt. The bootstrap
-   pins and installs Temurin JDK 17, Maven, Coursier, Scala 2.12.17, sbt 1.9.7,
-   the Metals server, and the VS Code Scala/Java extensions on the WSL host.
+See [Headless devcontainer operations](docs/devcontainer/headless-operations.md)
+for robust cleanup, image build, and publication examples.
 
-1. (Optional but recommended) Enable passwordless sudo so `dev.sh` helpers never block on a prompt:
+## Standard commands
 
-   ```bash
-   echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-$USER-nopasswd >/dev/null && sudo chmod 0440 /etc/sudoers.d/90-$USER-nopasswd
-   ```
+Run these inside the devcontainer:
 
-1. Install recommended developer tooling (optional):
+```bash
+npx --no-install nx run spark-ext:lint
+npx --no-install nx run spark-ext:build --configuration=spark-3.5
+npx --no-install nx run spark-ext:test --configuration=spark-3.5
+npx --no-install nx run spark-ext:assembly --configuration=spark-3.5
+npx --no-install nx run spark-ext:verify --configuration=spark-3.5
+npx --no-install nx run spark-ext:verify-all
+```
 
-   ```bash
-   curl -fsSL https://gh.io/copilot-install | bash
-   $HOME/.local/bin/copilot --yolo
-   ```
+Build and test the devcontainer itself from WSL:
+
+```bash
+npx --no-install nx run devcontainer:build
+npx --no-install nx run devcontainer:test
+```
