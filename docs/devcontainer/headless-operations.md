@@ -1,152 +1,56 @@
-# Headless devcontainer operations
+# Headless Devcontainer Operations
 
-The repository can be built, tested, and published from a WSL shell without
-opening VS Code. The host contract is intentionally small: Docker, Git, Bash,
-and the standard Ubuntu/WSL utilities used by the bootstrap.
+Run these commands from the WSL host. They start the repository's pinned
+devcontainer and run commands inside it without opening VS Code.
 
-The published image currently targets `linux/amd64`, matching the supported
-Windows/WSL development hosts and self-hosted CI runner.
+## Prepare the host
 
-## Bootstrap the host
-
-From the repository root:
+Run the bootstrap once from the repository:
 
 ```bash
-./contrib/bootstrap-dev-env.sh
+repo_root="$(git rev-parse --show-toplevel)"
+"$repo_root/contrib/bootstrap-dev-env.sh"
 ```
 
-The bootstrap validates Docker, installs the repository's pinned Node/npm
-runtime, and runs `npm ci`. Java, Scala, sbt, Nx, the Dev Container CLI, native
-build tools, and Spark dependencies belong to the devcontainer rather than the
-WSL host.
-
-## Build the image outside the devcontainer
+## Run a command and keep the devcontainer
 
 ```bash
-npx --no-install nx run devcontainer:build
-npx --no-install nx run devcontainer:test
-```
+(
+  set -euo pipefail
+  repo_root="$(git rev-parse --show-toplevel)"
+  cd "$repo_root"
 
-The image tag is derived from the devcontainer inputs. Re-running the build
-reuses the local image unless `--force` is forwarded to the target.
-
-To publish the immutable tag, copy `.env.example` to the gitignored `.env` and
-set:
-
-```dotenv
-GHCR_USERNAME=mdrakiburrahman
-GHCR_TOKEN=<classic-personal-access-token-with-write-packages>
-```
-
-Then run:
-
-```bash
-npx --no-install nx run devcontainer:publish
-```
-
-The publisher fails before pushing when credentials are absent, never prints
-the token, and skips an image that already exists remotely.
-
-After the first GHCR push, verify an unauthenticated pull. If GitHub created the
-package as private, the repository owner must set its visibility to **Public**
-in GitHub Packages before switching consumers to the new tag.
-
-## Change the image safely
-
-The normal PR workflow never executes PR-controlled image automation on the
-persistent Docker-capable runner. For a maintainer change to Dockerfile,
-toolchain, pin, or npm-lock inputs:
-
-1. Run the local `devcontainer:publish` target, or push the branch and manually
-   dispatch the **devcontainer image** workflow for that trusted branch.
-2. Confirm the immutable tag exists in GHCR.
-3. Commit the updated consumer references.
-4. Open or update the pull request.
-
-This ordering ensures the devcontainer and CI never reference an unpublished
-tag.
-
-## Run a one-shot verification
-
-This pattern always tears down the container and preserves the verification
-exit status:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-ROOT="$(git rev-parse --show-toplevel)"
-cd "${ROOT}"
-
-started=0
-cleanup() {
-    status=$?
-    trap - EXIT
-    if [[ "${started}" == "1" ]]; then
-        npx --no-install nx run devcontainer:down || true
-    fi
-    exit "${status}"
-}
-trap cleanup EXIT
-
-npx --no-install nx run devcontainer:up
-started=1
-npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run devcontainer:up
+  container_id="$(<.devcontainer/.container-id)"
+  npx --no-install nx run devcontainer:exec -- \
+    --container-id "$container_id" \
     npx --no-install nx run spark-ext:verify-all
+)
 ```
 
-Use the same form for a single target:
+`up` starts or reuses the devcontainer and records its exact ID. `exec` uses
+that ID, streams the command output, and returns the command's exit status.
+Replace the final `npx` command with any command that should run inside the
+devcontainer; use `bash` for an interactive shell. The container remains
+running.
+
+## Run a command and remove the devcontainer
 
 ```bash
-npx --no-install nx run devcontainer:exec -- \
-    npx --no-install nx run spark-ext:verify --configuration=spark-3.5
+(
+  set -euo pipefail
+  repo_root="$(git rev-parse --show-toplevel)"
+  cd "$repo_root"
+
+  npx --no-install nx run devcontainer:up
+  container_id="$(<.devcontainer/.container-id)"
+  trap 'npx --no-install nx run devcontainer:down -- --container-id "$container_id"' EXIT
+  npx --no-install nx run devcontainer:exec -- \
+    --container-id "$container_id" \
+    npx --no-install nx run spark-ext:verify-all
+)
 ```
 
-## Keep the container running
-
-```bash
-npx --no-install nx run devcontainer:up
-npx --no-install nx run devcontainer:exec -- bash
-```
-
-Run repository commands from another WSL shell:
-
-```bash
-npx --no-install nx run devcontainer:exec -- \
-    npx --no-install nx run spark-ext:lint
-
-npx --no-install nx run devcontainer:exec -- \
-    npx --no-install nx run spark-ext:test --configuration=spark-4.1
-```
-
-Remove the headless container when finished:
-
-```bash
-npx --no-install nx run devcontainer:down
-```
-
-## Inspect or recover a session
-
-The lifecycle targets use the Dev Container CLI's workspace identity, so they
-address only this repository's container rather than killing unrelated Docker
-workloads.
-
-```bash
-npx --no-install nx run devcontainer:up
-npx --no-install nx run devcontainer:exec -- \
-    git status --short --branch
-```
-
-If a command is interrupted, running `devcontainer:down` is safe and
-idempotent. Build caches and the published image remain available for the next
-session.
-
-## Security notes
-
-- The devcontainer mounts the host Docker socket for image build and publish
-  targets. Code in the container therefore has Docker-host privileges.
-- Keep `GHCR_TOKEN` only in the ignored `.env` or the process environment.
-- The normal development and CI image is pinned by immutable content hash.
-  Do not replace it with a mutable `latest` tag.
-- The public GHCR image can be pulled without credentials. Credentials are
-  required only to publish a new image.
+The `EXIT` trap removes only that container, including when the command fails.
+Every argument after `devcontainer:exec --` is passed to the command inside the
+devcontainer.

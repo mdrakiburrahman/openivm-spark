@@ -1,80 +1,86 @@
 # Contributing
 
-Development, headless automation, and CI use the same prebuilt devcontainer and
-the same Nx targets. The WSL host does not need Java, Scala, sbt, Maven, Metals,
-Azure CLI, Terraform, or GitHub CLI.
+If you're a Windows user, we only use Windows to get into WSL - everything is
+Linux from there.
 
-## Windows and WSL prerequisites
+Spark and Delta workloads are notoriously slow on Windows. Therefore, the
+development environment we support is Linux, using a
+[VS Code Dev Container](https://code.visualstudio.com/docs/devcontainers/containers).
+This repo's CI runs the exact same prebuilt devcontainer and Nx targets.
 
-Install Visual Studio Code, WSL with Ubuntu 24.04, Git, and Docker. Docker must
-be reachable from inside WSL. Keep the repository under the Linux filesystem
-(`~/`), not `/mnt/c`, because Spark and Delta workloads are substantially
-slower on Windows-mounted paths.
+Therefore, if the tests pass locally, they are highly likely to pass in CI as
+well.
 
-The optional Windows helper installs the VS Code extensions and Ubuntu
-distribution without deleting existing distributions or Docker:
+## How to use, on a Linux machine
 
-```powershell
-pwsh -File .\contrib\bootstrap-dev-env.ps1
-```
+1. Windows pre-reqs
 
-Clone the repository from WSL:
+   ```powershell
+   winget install -e --id Microsoft.VisualStudioCode
+   ```
 
-```bash
-cd ~
-git clone https://github.com/mdrakiburrahman/openivm-spark.git
-cd openivm-spark
-```
+1. Get a fresh new WSL machine up:
 
-## Bootstrap the minimal host tooling
+   > ⚠️ Warning: this removes Docker Desktop if you have it installed
 
-```bash
-./contrib/bootstrap-dev-env.sh
-```
+   ```powershell
+   $GIT_ROOT = git rev-parse --show-toplevel
+   & "$GIT_ROOT\contrib\bootstrap-dev-env.ps1"
+   ```
 
-This validates Docker, installs the exact Node/npm version used by the
-repository, and runs `npm ci`. All build and test toolchains are prebuilt into
-the devcontainer image.
+1. Clone the repo, and open VSCode in it:
 
-## Use VS Code
+   > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is extremely slow for Spark I/O.
+   > You can technically run the Devcontainer using Windows Docker Desktop, but the I/O experience is slow and poor.
 
-Open the repository root:
+   ```bash
+   cd ~/
 
-```bash
-code .
-```
+   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
+   read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
 
-Accept **Reopen in Container** when prompted. The checked-in
-`.devcontainer/devcontainer.json` uses the same immutable image as CI.
+   git clone https://github.com/mdrakiburrahman/openivm-spark.git
 
-## Use the devcontainer headlessly
+   git config --global user.name "$user_name"
+   git config --global user.email "$user_email"
+   cd openivm-spark/
+   git pull origin
 
-```bash
-npx --no-install nx run devcontainer:up
-npx --no-install nx run devcontainer:exec -- \
-    npx --no-install nx run spark-ext:verify-all
-npx --no-install nx run devcontainer:down
-```
+   code .
+   ```
 
-See [Headless devcontainer operations](docs/devcontainer/headless-operations.md)
-for robust cleanup, image build, and publication examples.
+1. Run the bootstrapper script, that installs the minimal host tooling idempotently:
 
-## Standard commands
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
+   ```
 
-Run these inside the devcontainer:
+   The bootstrap validates Docker, installs the pinned Node/npm version, and
+   runs `npm ci`. Java, Scala, sbt, and Spark stay inside the devcontainer.
 
-```bash
-npx --no-install nx run spark-ext:lint
-npx --no-install nx run spark-ext:build --configuration=spark-3.5
-npx --no-install nx run spark-ext:test --configuration=spark-3.5
-npx --no-install nx run spark-ext:assembly --configuration=spark-3.5
-npx --no-install nx run spark-ext:verify --configuration=spark-3.5
-npx --no-install nx run spark-ext:verify-all
-```
+1. Launch the devcontainer from the repository root:
 
-Build and test the devcontainer itself from WSL:
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   code "${GIT_ROOT}"
+   ```
 
-```bash
-npx --no-install nx run devcontainer:build
-npx --no-install nx run devcontainer:test
-```
+   Accept **Reopen in Container** when prompted. If the prompt does not appear,
+   run **Dev Containers: Reopen in Container** from the VS Code command palette.
+
+1. All builds and tests should now run green inside the devcontainer:
+
+   ```bash
+   npx --no-install nx run spark-ext:verify-all
+   ```
+
+   See [Headless devcontainer operations](docs/devcontainer/headless-operations.md)
+   to run the same Nx workflow from WSL without opening VS Code.
+
+1. Install recommended developer tooling (optional):
+
+   ```bash
+   curl -fsSL https://gh.io/copilot-install | bash
+   $HOME/.local/bin/copilot --yolo
+   ```
