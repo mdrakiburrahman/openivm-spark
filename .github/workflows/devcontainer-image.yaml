@@ -2,7 +2,7 @@ name: devcontainer image
 
 on:
   push:
-    branches: [main, dev/mdrrahman/headless-devcontainer]
+    branches: [main]
     paths:
       - '.devcontainer/**'
       - 'package.json'
