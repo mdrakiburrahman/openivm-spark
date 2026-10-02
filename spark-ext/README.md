@@ -81,10 +81,12 @@ npx --no-install nx run devcontainer:exec -- \
   npx --no-install nx run spark-ext:verify-all
 ```
 
-Inside an attached VS Code devcontainer, omit the outer
-`devcontainer:exec`. The direct runner is `spark-ext/dev/run.sh`; it never
-launches nested Docker. `spark-ext/dev/dev.sh` remains a Compose-compatible
-legacy wrapper for existing scripts and the Maven publication commands.
+Inside an attached VS Code devcontainer, omit the outer `devcontainer:exec`
+and run the same Nx targets directly. Nx delegates to
+`spark-ext/dev/run.sh`; do not invoke that implementation directly.
+`spark-ext/dev/dev.sh` remains only as a Compose-compatible legacy wrapper and
+for commands without Nx targets, including `publish`, `publish-all`, and
+`pins-fix`.
 
 `publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
 computes one immutable version as

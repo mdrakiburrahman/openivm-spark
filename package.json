@@ -16,7 +16,7 @@
     "check": "npm run lint && npm run typecheck && npm test",
     "format": "prettier --write package.json nx.json \"tsconfig*.json\" prettier.config.mjs \".devcontainer/**/*.{json,md,ts}\"",
     "lint": "prettier --check package.json nx.json \"tsconfig*.json\" prettier.config.mjs \".devcontainer/**/*.{json,md,ts}\" && bash -n .devcontainer/scripts/post-create.sh",
-    "test": "tsx --test .devcontainer/scripts/*.test.ts",
+    "test": "tsx --test \".devcontainer/src/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

@@ -18,7 +18,7 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
     container:
-      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:6314c87a6da3f303b524e4421b4a21779b6af7224f34911a349141b846f6180f
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -70,7 +70,7 @@ jobs:
     needs: verify
     runs-on: [self-hosted, openivm-spark-azure]
     container:
-      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:6314c87a6da3f303b524e4421b4a21779b6af7224f34911a349141b846f6180f
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

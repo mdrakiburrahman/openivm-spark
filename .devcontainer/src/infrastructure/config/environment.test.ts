@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseEnvFile, resolveRegistryCredentials } from './env.js';
+import { resolveRegistryCredentials } from '../../application/services/registry-credentials.js';
+import { parseEnvFile } from './environment.js';
 
 test('environment parsing supports comments, export, and quoted values', () => {
   assert.deepEqual(

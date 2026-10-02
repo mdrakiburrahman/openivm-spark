@@ -33,6 +33,31 @@
     "OPENIVM_SPARK_TARGET": "spark-3.5",
     "SBT_OPTS": "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
   },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "scalameta.metals@1.42.0",
+        "scala-lang.scala@0.5.8",
+        "vscjava.vscode-java-pack@0.29.0"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.formatOnType": true,
+        "extensions.verifySignature": false,
+        "remote.autoForwardPorts": false,
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "terminal.integrated.enablePersistentSessions": false,
+        "terminal.integrated.gpuAcceleration": "off",
+        "terminal.integrated.inheritEnv": true,
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash"
+          }
+        },
+        "terminal.integrated.scrollback": 5000
+      }
+    }
+  },
   "mounts": ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"],
   "overrideCommand": false,
   "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",

@@ -4,28 +4,43 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { workspaceRoot } from './constants.js';
-import { buildImage, checkedFakeRunner, publishImage } from './image.js';
-import { CommandResult, CommandSpec, ProcessFailure } from './process.js';
+import {
+  CommandResult,
+  CommandSpec,
+  ProcessFailure,
+  ProcessRunner,
+} from '../ports/process-runner.js';
+import {
+  imageRepository,
+  sourceRepository,
+  workspaceRoot,
+} from '../../infrastructure/config/devcontainer-config.js';
+import { EnvironmentConfiguration } from '../../infrastructure/config/environment.js';
+import { NodeFileSystem } from '../../infrastructure/filesystem/node-file-system.js';
+import { DockerRegistry } from '../../infrastructure/registry/docker-registry.js';
+import { ContentHashService } from './content-hash.service.js';
+import { ImageAutomationService } from './image-automation.service.js';
+import { ImageReferenceService } from './image-reference.service.js';
 
 const reference = `ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:${'a'.repeat(64)}`;
 
-test('an existing remote manifest skips login, build, and push', () => {
+test('an existing remote manifest skips build and push after authentication', () => {
   const calls: CommandSpec[] = [];
   const root = scratchRoot();
   try {
-    const result = publishImage({
+    const service = createService(
+      root,
+      checkedFakeRunner((spec) => {
+        calls.push(spec);
+        return success('{}');
+      }),
+    );
+    const result = service.publish({
       environment: {
         GHCR_TOKEN: 'super-secret',
         GHCR_USERNAME: 'owner',
       },
-      logger: () => undefined,
       reference,
-      root,
-      runner: checkedFakeRunner((spec) => {
-        calls.push(spec);
-        return success('{}');
-      }),
     });
 
     assert.equal(result, 'skipped');
@@ -41,17 +56,18 @@ test('missing credentials fail before any registry, build, or push subprocess', 
   const calls: CommandSpec[] = [];
   const root = scratchRoot();
   try {
+    const service = createService(
+      root,
+      checkedFakeRunner((spec) => {
+        calls.push(spec);
+        return success();
+      }),
+    );
     assert.throws(
       () =>
-        publishImage({
+        service.publish({
           environment: {},
-          logger: () => undefined,
           reference,
-          root,
-          runner: checkedFakeRunner((spec) => {
-            calls.push(spec);
-            return success();
-          }),
         }),
       /requires GHCR_TOKEN and GHCR_USERNAME/u,
     );
@@ -73,20 +89,22 @@ test('push failures preserve status and never log the token', () => {
   ];
 
   try {
+    const service = createService(
+      root,
+      checkedFakeRunner((spec) => {
+        calls.push(spec);
+        return results.shift() ?? success();
+      }),
+      (message) => logs.push(message),
+    );
     assert.throws(
       () =>
-        publishImage({
+        service.publish({
           environment: {
             GHCR_TOKEN: 'super-secret',
             GHCR_USERNAME: 'owner',
           },
-          logger: (message) => logs.push(message),
           reference,
-          root,
-          runner: checkedFakeRunner((spec) => {
-            calls.push(spec);
-            return results.shift() ?? success();
-          }),
         }),
       (error: unknown) => error instanceof ProcessFailure && error.status === 17,
     );
@@ -104,20 +122,60 @@ test('build failures preserve the Dev Container CLI exit status', () => {
   const root = scratchRoot(true);
   try {
     const results: CommandResult[] = [failure(1), failure(42, 'build failed')];
+    const service = createService(
+      root,
+      checkedFakeRunner(() => results.shift() ?? success()),
+      () => undefined,
+    );
     assert.throws(
-      () =>
-        buildImage({
-          logger: () => undefined,
-          reference,
-          root,
-          runner: checkedFakeRunner(() => results.shift() ?? success()),
-        }),
+      () => service.build({ reference }),
       (error: unknown) => error instanceof ProcessFailure && error.status === 42,
     );
   } finally {
     rmSync(root, { force: true, recursive: true });
   }
 });
+
+function createService(
+  root: string,
+  runner: ProcessRunner,
+  logger: (message: string) => void = () => undefined,
+): ImageAutomationService {
+  const fileSystem = new NodeFileSystem();
+  const environment = new EnvironmentConfiguration(fileSystem);
+  return new ImageAutomationService(
+    {
+      contentHash: new ContentHashService(fileSystem, { list: () => [] }, root),
+      environment,
+      references: new ImageReferenceService(fileSystem, {
+        imageRepository,
+        root,
+        sourceRepository,
+      }),
+      registry: new DockerRegistry(runner),
+      runner,
+      smoke: { testImage: () => undefined },
+    },
+    root,
+    logger,
+  );
+}
+
+function checkedFakeRunner(handler: (spec: CommandSpec) => CommandResult): ProcessRunner {
+  return {
+    run(spec): CommandResult {
+      const result = handler(spec);
+      if (spec.check !== false && result.status !== 0) {
+        throw new ProcessFailure(
+          [spec.command, ...(spec.args ?? [])].join(' '),
+          result.status,
+          result.stderr || result.stdout,
+        );
+      }
+      return result;
+    },
+  };
+}
 
 function scratchRoot(withBuildFiles = false): string {
   const root = join(workspaceRoot, '.nx', 'test-work', randomUUID());

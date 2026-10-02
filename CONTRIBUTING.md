@@ -28,7 +28,7 @@ well.
    & "$GIT_ROOT\contrib\bootstrap-dev-env.ps1"
    ```
 
-1. Clone the repo, and open VSCode in it:
+1. Clone the repo:
 
    > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is extremely slow for Spark I/O.
    > You can technically run the Devcontainer using Windows Docker Desktop, but the I/O experience is slow and poor.
@@ -45,8 +45,6 @@ well.
    git config --global user.email "$user_email"
    cd openivm-spark/
    git pull origin
-
-   code .
    ```
 
 1. Run the bootstrapper script, that installs the minimal host tooling idempotently:
@@ -63,11 +61,13 @@ well.
 
    ```bash
    GIT_ROOT=$(git rev-parse --show-toplevel)
-   code "${GIT_ROOT}"
+   code "${GIT_ROOT}/spark.code-workspace"
    ```
 
-   Accept **Reopen in Container** when prompted. If the prompt does not appear,
-   run **Dev Containers: Reopen in Container** from the VS Code command palette.
+   Accept **Reopen in Container** when prompted. The workspace exposes only
+   `spark-ext` so Metals imports the sbt build without unrelated repository
+   folders. If the prompt does not appear, run **Dev Containers: Reopen in
+   Container** from the VS Code command palette.
 
 1. All builds and tests should now run green inside the devcontainer:
 

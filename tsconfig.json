@@ -3,6 +3,6 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "include": [".devcontainer/**/*.ts", "prettier.config.mjs"],
+  "include": [".devcontainer/src/**/*.ts", "prettier.config.mjs"],
   "exclude": [".nx", "node_modules"]
 }

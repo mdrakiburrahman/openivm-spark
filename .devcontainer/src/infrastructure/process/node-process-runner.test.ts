@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ProcessFailure, runCommand } from './process.js';
+import { ProcessFailure } from '../../application/ports/process-runner.js';
+import { NodeProcessRunner } from './node-process-runner.js';
 
 test('nonzero subprocess exit status is preserved', () => {
+  const runner = new NodeProcessRunner(() => undefined);
   assert.throws(
     () =>
-      runCommand({
+      runner.run({
         args: ['-e', 'process.exit(23)'],
         capture: true,
         command: process.execPath,
@@ -17,7 +19,8 @@ test('nonzero subprocess exit status is preserved', () => {
 });
 
 test('captured subprocess output remains available to callers', () => {
-  const result = runCommand({
+  const runner = new NodeProcessRunner(() => undefined);
+  const result = runner.run({
     args: ['-e', "process.stdout.write('ok')"],
     capture: true,
     command: process.execPath,

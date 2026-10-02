@@ -1,6 +1,6 @@
 {
   "name": "openivm-spark",
-  "image": "ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:6314c87a6da3f303b524e4421b4a21779b6af7224f34911a349141b846f6180f",
+  "image": "ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32",
   "containerUser": "vscode",
   "containerEnv": {
     "NX_DAEMON": "false",
@@ -11,6 +11,31 @@
     "OPENIVM_NATIVE_DIR": "/opt/openivm",
     "OPENIVM_SPARK_TARGET": "spark-3.5",
     "SBT_OPTS": "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "scalameta.metals@1.42.0",
+        "scala-lang.scala@0.5.8",
+        "vscjava.vscode-java-pack@0.29.0"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.formatOnType": true,
+        "extensions.verifySignature": false,
+        "remote.autoForwardPorts": false,
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "terminal.integrated.enablePersistentSessions": false,
+        "terminal.integrated.gpuAcceleration": "off",
+        "terminal.integrated.inheritEnv": true,
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash"
+          }
+        },
+        "terminal.integrated.scrollback": 5000
+      }
+    }
   },
   "mounts": ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"],
   "overrideCommand": false,

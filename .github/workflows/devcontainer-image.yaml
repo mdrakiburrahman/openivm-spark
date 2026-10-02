@@ -2,7 +2,7 @@ name: devcontainer image
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev/mdrrahman/headless-devcontainer]
     paths:
       - '.devcontainer/**'
       - 'package.json'
@@ -50,10 +50,24 @@ jobs:
       - name: Validate Docker
         run: ./contrib/bootstrap-ci.sh
 
+      - name: Synchronize candidate image reference
+        run: npx --no-install nx run devcontainer:tag -- --update-consumer
+
       - name: Build, test, and publish immutable image
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx --no-install nx run devcontainer:publish
+
+      - name: Validate headless Metals import
+        run: |
+          set -euo pipefail
+          npx --no-install nx run devcontainer:up
+          npx --no-install nx run devcontainer:exec -- \
+            bash -lc 'cd spark-ext && rm -rf .bloop .bsp && OPENIVM_SPARK_TARGET=spark-3.5 JAVA_HOME=/opt/java/jdk-17 sbt -batch bloopInstall && test -n "$(find .bloop -maxdepth 1 -name "*.json" -print -quit)"'
+
+      - name: Remove headless devcontainer
+        if: always()
+        run: npx --no-install nx run devcontainer:down
 
       - name: Remove smoke containers
         if: always()

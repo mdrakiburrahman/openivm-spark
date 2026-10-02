@@ -4,26 +4,51 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { smokeContainerLabel, supportedImagePlatform, workspaceRoot } from './constants.js';
-import { computeContentHash } from './hash.js';
 import {
-  assertImageReferencesConsistent,
-  assertOciSourceLabel,
-  expectedImageReference,
-  imageReferenceOccurrences,
-  updateConsumerImageReferences,
-} from './references.js';
-import { runtimeChecks } from './smoke.js';
+  imageRepository,
+  publishedImageTagAliases,
+  smokeContainerLabel,
+  sourceRepository,
+  supportedImagePlatform,
+  workspaceRoot,
+} from '../../infrastructure/config/devcontainer-config.js';
+import { EnvironmentConfiguration } from '../../infrastructure/config/environment.js';
+import { NodeFileSystem } from '../../infrastructure/filesystem/node-file-system.js';
+import { GitImageInputSource } from '../../infrastructure/git/git-image-input-source.js';
+import { NodeProcessRunner } from '../../infrastructure/process/node-process-runner.js';
+import { ContentHashService } from './content-hash.service.js';
+import { ImageReferenceService } from './image-reference.service.js';
+import { SmokeTestService } from './smoke-test.service.js';
+
+const fileSystem = new NodeFileSystem();
+const runner = new NodeProcessRunner(() => undefined);
+const contentHash = new ContentHashService(
+  fileSystem,
+  new GitImageInputSource(runner),
+  workspaceRoot,
+  publishedImageTagAliases,
+);
+const references = new ImageReferenceService(fileSystem, {
+  imageRepository,
+  root: workspaceRoot,
+  sourceRepository,
+});
+const smoke = new SmokeTestService(runner, fileSystem, new EnvironmentConfiguration(fileSystem), {
+  containerLabel: smokeContainerLabel,
+  imagePlatform: supportedImagePlatform,
+  root: workspaceRoot,
+  sourceRepository,
+});
 
 test('consumer and every workflow occurrence use the computed immutable image reference', () => {
-  const expected = expectedImageReference(computeContentHash());
-  assert.doesNotThrow(() => assertImageReferencesConsistent(expected));
-  assert.equal(imageReferenceOccurrences().length >= 1, true);
+  const expected = references.expected(contentHash.compute());
+  assert.doesNotThrow(() => references.assertConsistent(expected));
+  assert.equal(references.occurrences().length >= 1, true);
 });
 
 test('image consistency validation reports a mismatched workflow reference', () => {
   const root = join(workspaceRoot, '.nx', 'test-work', randomUUID());
-  const expected = expectedImageReference('a'.repeat(64));
+  const expected = references.expected('a'.repeat(64));
   mkdirSync(join(root, '.devcontainer'), { recursive: true });
   mkdirSync(join(root, '.github/workflows'), { recursive: true });
   try {
@@ -34,11 +59,11 @@ test('image consistency validation reports a mismatched workflow reference', () 
     );
     writeFileSync(
       join(root, '.github/workflows/test.yaml'),
-      `jobs:\n  test:\n    container:\n      image: ${expectedImageReference('b'.repeat(64))}\n`,
+      `jobs:\n  test:\n    container:\n      image: ${references.expected('b'.repeat(64))}\n`,
       'utf8',
     );
     assert.throws(
-      () => assertImageReferencesConsistent(expected, root),
+      () => references.assertConsistent(expected, root),
       /\.github\/workflows\/test\.yaml/u,
     );
   } finally {
@@ -48,14 +73,14 @@ test('image consistency validation reports a mismatched workflow reference', () 
 
 test('consumer updater rewrites devcontainer and every committed workflow occurrence', () => {
   const root = join(workspaceRoot, '.nx', 'test-work', randomUUID());
-  const expected = expectedImageReference('c'.repeat(64));
+  const expected = references.expected('c'.repeat(64));
   const unrelated = 'ghcr.io/example/unrelated:latest';
   mkdirSync(join(root, '.devcontainer'), { recursive: true });
   mkdirSync(join(root, '.github/workflows/nested'), { recursive: true });
   try {
     writeFileSync(
       join(root, '.devcontainer/devcontainer.json'),
-      `${JSON.stringify({ image: expectedImageReference('a'.repeat(64)) }, null, 2)}\n`,
+      `${JSON.stringify({ image: references.expected('a'.repeat(64)) }, null, 2)}\n`,
       'utf8',
     );
     writeFileSync(
@@ -64,7 +89,7 @@ test('consumer updater rewrites devcontainer and every committed workflow occurr
         'jobs:',
         '  verify:',
         '    container:',
-        `      image: ${expectedImageReference('b'.repeat(64))}`,
+        `      image: ${references.expected('b'.repeat(64))}`,
         `  unrelated: ${unrelated}`,
         '',
       ].join('\n'),
@@ -72,17 +97,17 @@ test('consumer updater rewrites devcontainer and every committed workflow occurr
     );
     writeFileSync(
       join(root, '.github/workflows/nested/image.yml'),
-      `env:\n  DEVCONTAINER_IMAGE: "${expectedImageReference('d'.repeat(64))}"\n`,
+      `env:\n  DEVCONTAINER_IMAGE: "${references.expected('d'.repeat(64))}"\n`,
       'utf8',
     );
 
-    assert.deepEqual(updateConsumerImageReferences(expected, root).sort(), [
+    assert.deepEqual(references.updateConsumerReferences(expected, root).sort(), [
       '.devcontainer/devcontainer.json',
       '.github/workflows/gci.yaml',
       '.github/workflows/nested/image.yml',
     ]);
     assert.deepEqual(
-      imageReferenceOccurrences(root).map((occurrence) => occurrence.reference),
+      references.occurrences(root).map((occurrence) => occurrence.reference),
       [expected, expected, expected],
     );
     assert.equal(
@@ -95,7 +120,7 @@ test('consumer updater rewrites devcontainer and every committed workflow occurr
 });
 
 test('Dockerfile carries the repository OCI source label', () => {
-  assert.doesNotThrow(() => assertOciSourceLabel());
+  assert.doesNotThrow(() => references.assertOciSourceLabel());
 });
 
 test('single image exposes stable JDK 17 and JDK 21 homes with JDK 17 as default', () => {
@@ -180,6 +205,8 @@ test('image build context excludes repository secrets and unrelated files', () =
   assert.equal(dockerfile.includes('GHCR_TOKEN'), false);
   assert.equal(dockerfile.includes('GITHUB_TOKEN'), false);
   assert.equal(/^COPY\s+\.\s/mu.test(dockerfile), false);
+  assert.equal(dockerignore.includes('!.devcontainer/src/'), false);
+  assert.equal(dockerignore.includes('!.devcontainer/scripts/post-create.sh'), true);
 });
 
 test('post-create keeps passwordless-sudo Docker socket group repair', () => {
@@ -202,6 +229,12 @@ test('local and consumer configurations preserve required runtime settings', () 
       };
       containerUser?: string;
       containerEnv?: Record<string, string>;
+      customizations?: {
+        vscode?: {
+          extensions?: string[];
+          settings?: Record<string, unknown>;
+        };
+      };
       mounts?: string[];
       postCreateCommand?: string;
       remoteEnv?: Record<string, string>;
@@ -216,6 +249,16 @@ test('local and consumer configurations preserve required runtime settings', () 
     assert.equal(config.remoteUser, 'vscode');
     assert.equal(config.remoteEnv?.HOME, '/home/vscode');
     assert.equal(config.postCreateCommand, 'bash .devcontainer/scripts/post-create.sh');
+    assert.deepEqual(config.customizations?.vscode?.extensions, [
+      'scalameta.metals@1.42.0',
+      'scala-lang.scala@0.5.8',
+      'vscjava.vscode-java-pack@0.29.0',
+    ]);
+    assert.equal(config.customizations?.vscode?.settings?.['editor.formatOnSave'], true);
+    assert.equal(
+      config.customizations?.vscode?.settings?.['terminal.integrated.defaultProfile.linux'],
+      'bash',
+    );
     assert.equal(
       config.mounts?.some((mount) => mount.includes('/var/run/docker.sock')),
       true,
@@ -233,22 +276,58 @@ test('local and consumer configurations preserve required runtime settings', () 
   }
 });
 
+test('Spark workspace is flattened and pins the IDE JDKs', () => {
+  const workspaceJson = readFileSync(join(workspaceRoot, 'spark.code-workspace'), 'utf8').replace(
+    /,\s*([}\]])/gu,
+    '$1',
+  );
+  const workspace = JSON.parse(workspaceJson) as {
+    folders?: Array<{ name?: string; path?: string }>;
+    settings?: Record<string, unknown>;
+  };
+  assert.deepEqual(workspace.folders, [{ name: 'spark-ext', path: 'spark-ext' }]);
+  assert.equal(workspace.settings?.['metals.javaHome'], '/opt/java/jdk-17');
+  assert.equal(workspace.settings?.['java.jdt.ls.java.home'], '/opt/java/jdk-21');
+  assert.deepEqual(workspace.settings?.['files.watcherExclude'], {
+    '**/.bloop/**': true,
+    '**/.metals/**': true,
+    '**/target/**': true,
+  });
+});
+
 test('cleanup target is typed and smoke uses the stale-container label', () => {
   const project = JSON.parse(
     readFileSync(join(workspaceRoot, '.devcontainer/project.json'), 'utf8'),
   ) as {
     targets?: Record<string, unknown>;
   };
-  const smokeSource = readFileSync(join(workspaceRoot, '.devcontainer/scripts/smoke.ts'), 'utf8');
+  const smokeSource = readFileSync(
+    join(workspaceRoot, '.devcontainer/src/application/services/smoke-test.service.ts'),
+    'utf8',
+  );
   assert.equal('cleanup' in (project.targets ?? {}), true);
-  assert.equal(smokeSource.includes('cleanupSmokeContainers({ logger, runner })'), true);
+  assert.equal(smokeSource.includes('this.cleanup();'), true);
   assert.equal(smokeSource.includes("'--label'"), true);
-  assert.equal(smokeSource.includes('smokeContainerLabel'), true);
+  assert.equal(smokeSource.includes('this.settings.containerLabel'), true);
   assert.equal(smokeContainerLabel, 'org.openivm.spark.devcontainer.smoke=true');
 });
 
+test('every Nx automation target uses the DDD CLI entry point', () => {
+  const project = JSON.parse(
+    readFileSync(join(workspaceRoot, '.devcontainer/project.json'), 'utf8'),
+  ) as {
+    targets?: Record<string, { options?: { command?: string } }>;
+  };
+  for (const target of ['tag', 'build', 'test', 'publish', 'up', 'exec', 'down', 'cleanup']) {
+    assert.match(
+      project.targets?.[target]?.options?.command ?? '',
+      /^tsx \.devcontainer\/src\/interfaces\/cli\/main\.ts /u,
+    );
+  }
+});
+
 test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Docker', () => {
-  const checks = runtimeChecks();
+  const checks = smoke.runtimeChecks();
   const names = checks.map((check) => check.name);
   assert.deepEqual(names, [
     'non-root user and workspace',
@@ -257,6 +336,7 @@ test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Do
     'JDKs, sbt, and native OpenIVM artifacts',
     'lifecycle hook',
     'warmed Spark 3.5 and Spark 4.1 dependency caches',
+    'Metals Bloop import',
     'host Docker socket access',
   ]);
   const scripts = checks.map((check) => check.script).join('\n');
@@ -266,6 +346,8 @@ test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Do
   assert.equal(scripts.includes('2.13.17'), true);
   assert.equal(scripts.includes('gh --version'), true);
   assert.equal(scripts.includes('gh version 2.94.0'), true);
+  assert.equal(scripts.includes('sbt -batch bloopInstall'), true);
+  assert.equal(scripts.includes("find .bloop -maxdepth 1 -name '*.json'"), true);
 });
 
 test('headless README documents the exact Nx lifecycle interface', () => {
