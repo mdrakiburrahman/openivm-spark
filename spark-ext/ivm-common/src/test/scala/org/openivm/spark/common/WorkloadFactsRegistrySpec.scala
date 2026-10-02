@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.types.{LongType, MetadataBuilder, StructField}
+import org.apache.spark.sql.types.{LongType, MetadataBuilder, StructField, StructType}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -102,6 +102,44 @@ class WorkloadFactsRegistrySpec extends AnyFunSpec with BeforeAndAfterAll with M
         StructField("amount_twice", LongType, true, metadata)
       ) should
         contain(GeneratedColumn("generated_table", "amount_twice", "amount * 2"))
+    }
+
+    it("preserves generated and identity-column facts from the supplied source schema") {
+      val generated = new MetadataBuilder().putString("delta.generationExpression", "amount * 2").build()
+      val identity  = new MetadataBuilder().putLong("delta.identity.start", 1L).build()
+      val schema = StructType(
+        Seq(
+          StructField("amount_twice", LongType, true, generated),
+          StructField("id", LongType, false, identity)
+        )
+      )
+      val facts = WorkloadFactsRegistry
+        .forRefresh()
+        .discover(
+          spark,
+          Seq("schema_only_source"),
+          Map("schema_only_source" -> schema)
+        )
+      facts.generatedColumns should contain(GeneratedColumn("schema_only_source", "amount_twice", "amount * 2"))
+      facts.generatedColumns should contain(GeneratedColumn("schema_only_source", "id", "IDENTITY"))
+      facts.uniqueKeys should contain(UniqueKey("schema_only_source", Seq("id")))
+    }
+
+    it("keeps reading changed constraint properties and falls back for unsupplied schemas") {
+      val registry    = WorkloadFactsRegistry.forRefresh()
+      val childSchema = spark.table(childTable).schema
+      val sources     = Seq(childTable, parentTable)
+      spark.sql(s"ALTER TABLE $childTable SET TBLPROPERTIES ('spark.openivm.unique_key' = 'parent_id')")
+      try {
+        val expected = registry.discover(spark, sources)
+        val reused   = registry.discover(spark, sources, Map(childTable -> childSchema))
+        reused shouldBe expected
+        reused.uniqueKeys should contain(UniqueKey(childTable, Seq("parent_id")))
+        reused.uniqueKeys should contain(UniqueKey(parentTable, Seq("id")))
+        reused.deltaConstraints.map(_.name) should contain("positive_child_id")
+      } finally {
+        spark.sql(s"ALTER TABLE $childTable SET TBLPROPERTIES ('spark.openivm.unique_key' = 'id')")
+      }
     }
 
     it("accepts explicit WorkloadFacts config facts alongside discovered declarations") {
