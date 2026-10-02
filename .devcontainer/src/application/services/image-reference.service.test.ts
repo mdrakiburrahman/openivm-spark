@@ -218,6 +218,16 @@ test('post-create keeps passwordless-sudo Docker socket group repair', () => {
   assert.equal(postCreate.includes('sudo usermod'), true);
 });
 
+test('Metals validation runs bloopInstall through the runtime script', () => {
+  const validateMetals = readFileSync(
+    join(workspaceRoot, '.devcontainer/scripts/validate-metals.sh'),
+    'utf8',
+  );
+  assert.equal(validateMetals.includes('JAVA_HOME=/opt/java/jdk-17'), true);
+  assert.equal(validateMetals.includes('sbt -batch bloopInstall'), true);
+  assert.equal(validateMetals.includes("find .bloop -maxdepth 1 -name '*.json'"), true);
+});
+
 test('local and consumer configurations preserve required runtime settings', () => {
   for (const relativeFilename of [
     '.devcontainer/devcontainer.local.json',
@@ -346,8 +356,7 @@ test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Do
   assert.equal(scripts.includes('2.13.17'), true);
   assert.equal(scripts.includes('gh --version'), true);
   assert.equal(scripts.includes('gh version 2.94.0'), true);
-  assert.equal(scripts.includes('sbt -batch bloopInstall'), true);
-  assert.equal(scripts.includes("find .bloop -maxdepth 1 -name '*.json'"), true);
+  assert.equal(scripts.includes('bash .devcontainer/scripts/validate-metals.sh'), true);
 });
 
 test('headless README documents the exact Nx lifecycle interface', () => {

@@ -115,12 +115,7 @@ export class SmokeTestService implements SmokeAutomation {
       },
       {
         name: 'Metals Bloop import',
-        script: [
-          'cd spark-ext',
-          'rm -rf .bloop .bsp',
-          'OPENIVM_SPARK_TARGET=spark-3.5 JAVA_HOME=/opt/java/jdk-17 sbt -batch bloopInstall',
-          `test -n "$(find .bloop -maxdepth 1 -name '*.json' -print -quit)"`,
-        ].join(' && '),
+        script: 'bash .devcontainer/scripts/validate-metals.sh',
       },
       {
         name: 'host Docker socket access',

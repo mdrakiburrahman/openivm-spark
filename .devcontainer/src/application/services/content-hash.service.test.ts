@@ -63,8 +63,9 @@ test('declared image inputs mirror build/runtime assets and exclude host automat
   );
 });
 
-test('scripts contains only the runtime post-create hook', () => {
+test('scripts contains only runtime-executed hooks', () => {
   assert.deepEqual(readdirSync(join(workspaceRoot, '.devcontainer/scripts')).sort(), [
     'post-create.sh',
+    'validate-metals.sh',
   ]);
 });
