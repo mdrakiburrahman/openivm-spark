@@ -1,46 +1,79 @@
 # openivm-spark — Copilot instructions
 
-Spark 3.5 / Delta Lake 3.2 SQL extension that delivers OpenIVM incremental
-materialized-view maintenance **without Delta CDF**. The Scala/sbt project
-lives entirely under `spark-ext/`. The repository root only holds `contrib/`
-(host bootstrap scripts), `CONTRIBUTING.md`, and the `LICENSE`. `.temp/` is
-gitignored scratch space (research, upstream forks) — never reference it from
-committed code.
+Spark SQL extension that delivers OpenIVM incremental materialized-view
+maintenance **without Delta CDF** for Spark 3.5 / Delta 3.2 and Spark 4.1 /
+Delta 4.2. The Scala/sbt project lives under `spark-ext/`; the repository root
+is the Nx workspace and owns the pinned devcontainer. `.temp/` is gitignored
+scratch space (research, upstream forks) — never reference it from committed
+code.
 
-## Build, test, lint
+## Build, test, lint (Nx first)
 
-All work happens inside the dev container — the host only needs Docker. Drive
-it through `spark-ext/dev/dev.sh`:
+Always use the repository's locked Nx CLI (`npx --no-install nx`) as the
+command surface. Java, Scala, sbt, Spark, Delta, and native OpenIVM commands
+must run in the pinned devcontainer, never through host-installed toolchains.
 
-```bash
-./spark-ext/dev/dev.sh fmt                              # scalafmtAll + scalafmtSbt
-./spark-ext/dev/dev.sh build                            # sbt compile
-./spark-ext/dev/dev.sh assembly                         # sbt ivmExtension/assembly (fat jar)
-./spark-ext/dev/dev.sh test                             # sbt test (every suite)
-./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
-./spark-ext/dev/dev.sh verify                           # lint + compile + Test/compile + assembly + test
-./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8    # cap forked-test concurrency
-PRE_CLEAN=1 ./spark-ext/dev/dev.sh verify               # nuke every running container first, then verify
-```
-
-For ad-hoc sbt invocations or running a single spec from inside the container,
-use the docker-compose `build` service directly so output stays unbuffered:
+From a WSL/Linux host, bootstrap once and use only the `devcontainer:*` targets
+on the host. Run every `spark-ext:*` target through `devcontainer:exec`:
 
 ```bash
-cd spark-ext/dev && docker compose --env-file pins.env -f docker/docker-compose.yml \
-    run --rm -T build sbt 'ivmIt/testOnly org.openivm.spark.parity.AggregateSumSpec'
+./contrib/bootstrap-dev-env.sh
+npx --no-install nx run devcontainer:up
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:verify-all
 ```
+
+Inside an attached VS Code devcontainer, omit the outer `devcontainer:exec` and
+run the Nx targets directly:
+
+```bash
+npx --no-install nx run spark-ext:fmt
+npx --no-install nx run spark-ext:lint
+npx --no-install nx run spark-ext:build --configuration=spark-3.5
+npx --no-install nx run spark-ext:assembly --configuration=spark-3.5
+npx --no-install nx run spark-ext:test --configuration=spark-3.5
+npx --no-install nx run spark-ext:verify --configuration=spark-3.5
+npx --no-install nx run spark-ext:verify --configuration=spark-3.5 -- \
+  -Dopenivm.test.forks=8
+npx --no-install nx run spark-ext:verify-all
+```
+
+For Scala/Java IntelliSense, open `spark.code-workspace`. It exposes only
+`spark-ext`, pins Metals to JDK 17, and keeps the Java language server on JDK 21.
+
+Run a single spec through the test target; arguments after `--` are forwarded
+to sbt:
+
+```bash
+npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+  'testOnly org.openivm.spark.parity.AggregateSumSpec'
+```
+
+Spark 3.5 is the default configuration. Use `--configuration=spark-4.1` when
+the task is specific to Spark 4.1, and use `spark-ext:verify-all` before
+finishing changes that can affect both targets.
+
+If no `spark-ext:*` target exists for an ad-hoc command, use
+`devcontainer:exec -- <command...>` from the host, or run the command directly
+when already attached to the devcontainer. Never start a nested devcontainer.
+Do not invoke `spark-ext/dev/run.sh` directly; Nx owns it. Do not invoke
+`spark-ext/dev/dev.sh` for normal development: it is retained only for legacy
+compatibility and commands without an Nx target, such as Maven publication and
+`pins-fix`.
 
 Notes:
 
-- Scala 2.12.17 / JDK 17 / Spark 3.5.1 / Delta 3.2.0 — all pinned in
-  `spark-ext/dev/pins.env` and `project/Dependencies.scala`. Bumping any of
-  these requires bumping the matching SHA in `pins.env`, which is what cuts a
-  fresh `openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` image.
+- Spark 3.5 uses Scala 2.12.17 / JDK 17 / Spark 3.5.1 / Delta 3.2.0; Spark
+  4.1 uses Scala 2.13.17 / JDK 21 / Spark 4.1.0 / Delta 4.2.0. The versions
+  and SHAs are pinned in `spark-ext/dev/pins.env`,
+  `spark-ext/dev/targets/*.env`, and `project/Dependencies.scala`. Use the
+  content-addressed devcontainer image; do not substitute a locally assembled
+  toolchain.
 - The compiler is `-Xfatal-warnings -Ywarn-unused:imports`: any unused import
   fails the whole compile, so strip imports before pushing.
 - `scalafmt` config is at `spark-ext/.scalafmt.conf` (max column 120,
-  `align.preset = more`). `verify` runs `scalafmtCheckAll` + `scalafmtSbtCheck`.
+  `align.preset = more`). `spark-ext:verify` runs `scalafmtCheckAll` +
+  `scalafmtSbtCheck`.
 - JDK-17 `--add-opens` flags live in `spark-ext/.sbtopts` and
   `Settings.jvmModuleOpts`; copy them verbatim when launching Spark outside sbt.
 
@@ -58,7 +91,7 @@ Read top-to-bottom; each module depends only on the one above it
   `spark.openivm.enabled` (`FeatureGate.EnabledKey`, default `false`).
 - **Parser**: `IvmSqlBase.g4` declares `CREATE / REFRESH / DROP MATERIALIZED
 VIEW` plus exact-map `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`.
-Everything else (including the MV body, captured as raw
+  Everything else (including the MV body, captured as raw
   text `.+?`) is re-parsed via Spark's own `ParserInterface`. No `REFRESH
 EVERY`, no generic ALTER surface, no double-quoted identifiers.
 - **MV-body constraint**: the body must parse in **both** DuckDB (for openivm
@@ -155,18 +188,34 @@ the residual gap is the WINDOW MVs.
   `/metrics/diff?model=`, `POST /metrics/query`. **`records_read`/`records_written`
   are deterministic — the decisive signal.** Query the Parquet directly with the
   openivm duckdb CLI.
-- **Iterate openivm-C++ locally (fast, no SF cycle) — the build is NOT broken.**
-  `apt install ninja-build && rm -rf build && GEN=ninja make -j"$(nproc)"` in
-  `.temp/openivm` (or a worktree) builds `duckdb` + `openivm.duckdb_extension` in
-  ~10 min. A stale `Unix Makefiles` `CMakeCache` breaks the Ninja generator, so
-  always `rm -rf build` first; needs the `third_party/lpts` submodules inited
-  (DuckLake headers).
+- **Iterate openivm-C++ in the pinned devcontainer (fast, no SF cycle) — the
+  build is NOT broken.** From the host, use:
+
+  ```bash
+  npx --no-install nx run devcontainer:exec -- \
+    bash -lc 'cd .temp/openivm && rm -rf build && GEN=ninja make -j"$(nproc)"'
+  ```
+
+  Inside an attached devcontainer, run only the quoted command. Ninja is
+  already provisioned.
+  A stale `Unix Makefiles` `CMakeCache` breaks the Ninja generator, so always
+  `rm -rf build` first; the `third_party/lpts` submodules must be initialized
+  for the DuckLake headers.
+
 - **Validate an unpinned openivm build against spark-ext WITHOUT rebuilding the image:**
   stage the fresh `duckdb` + `openivm.duckdb_extension` under
   `spark-ext/target/openivm-<tag>/` (git-ignored, bind-mounted at
-  `/work/spark-ext/target/…`), then run any parity spec with
-  `docker compose … run -e OPENIVM_CLI_PATH=/work/spark-ext/target/openivm-<tag>/duckdb -e OPENIVM_EXTENSION_PATH=/work/spark-ext/target/openivm-<tag>/openivm.duckdb_extension build sbt 'ivmIt/testOnly …'`.
+  `/workspaces/openivm-spark/spark-ext/target/…`), then run the parity spec inside the pinned
+  devcontainer with:
+
+  ```bash
+  OPENIVM_CLI_PATH=/workspaces/openivm-spark/spark-ext/target/openivm-<tag>/duckdb \
+    OPENIVM_EXTENSION_PATH=/workspaces/openivm-spark/spark-ext/target/openivm-<tag>/openivm.duckdb_extension \
+    npx --no-install nx run spark-ext:test -- 'ivmIt/testOnly …'
+  ```
+
   `OpenIvmCompiler` reads both env vars (defaults `/opt/openivm/{duckdb,openivm.duckdb_extension}`).
+
 - **The WINDOW bottleneck (measured via per-MV telemetry).** openivm's
   `WINDOW_PARTITION` recompute is a Delta MERGE that scans the full (often one-file)
   MV **~5×** — ~3 for the partition-scoped DELETE+INSERT recompute + ~2 for the
@@ -183,8 +232,8 @@ the residual gap is the WINDOW MVs.
 - We do NOT tolerate verbose logging in test code. Tests should ONLY emit the test status from the test framework,
   there should be nothing else in the console stdout.
 
-  Verbose logs are written to `.logs/test-<YYYYMMDD-HHMMSS>/` at the repo root on every
-  `./spark-ext/dev/dev.sh test` and `./spark-ext/dev/dev.sh verify` run.
+  Verbose logs are written to `.logs/test-<YYYYMMDD-HHMMSS>/` at the repo root
+  by the `spark-ext:test` and `spark-ext:verify` Nx targets.
 
   Each forked test JVM writes its own `fork-<HHmmss-SSS>.log`.
 
@@ -193,7 +242,7 @@ the residual gap is the WINDOW MVs.
 - Always try to parallelize tasks using subagents and isolated docker containers and delegating
   tasks to agents per container so we can get things done faster.
 
-- Under **NO CIRCUMSTANCE** should an existing queries ability to incrementalize be regressed to a `FULL_REFRESH`, 
+- Under **NO CIRCUMSTANCE** should an existing queries ability to incrementalize be regressed to a `FULL_REFRESH`,
   specially when adding new feature. This is an extremely critical regression and must be avoided.
 
 ## Activation outside tests

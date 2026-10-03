@@ -1,0 +1,19 @@
+{
+  "folders": [
+    {
+      "name": "spark-ext",
+      "path": "spark-ext",
+    },
+  ],
+  "settings": {
+    "files.watcherExclude": {
+      "**/.bloop/**": true,
+      "**/.metals/**": true,
+      "**/target/**": true,
+      "**/target": true
+    },
+    "java.compile.nullAnalysis.mode": "disabled",
+    "java.jdt.ls.java.home": "/opt/java/jdk-21",
+    "metals.javaHome": "/opt/java/jdk-17",
+  },
+}

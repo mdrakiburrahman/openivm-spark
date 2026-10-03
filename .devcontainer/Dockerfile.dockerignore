@@ -1,0 +1,14 @@
+**
+!.devcontainer/
+!.devcontainer/scripts/
+!.devcontainer/scripts/post-create.sh
+!package.json
+!package-lock.json
+!spark-ext/
+!spark-ext/.sbtopts
+!spark-ext/build.sbt
+!spark-ext/dev/
+!spark-ext/dev/docker/
+!spark-ext/dev/docker/entrypoint.sh
+!spark-ext/project/
+!spark-ext/project/**

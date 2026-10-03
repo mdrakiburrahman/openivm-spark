@@ -1,0 +1,207 @@
+{
+  "$schema": "../node_modules/nx/schemas/project-schema.json",
+  "name": "spark-ext",
+  "projectType": "library",
+  "root": "spark-ext",
+  "sourceRoot": "spark-ext",
+  "targets": {
+    "fmt": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh fmt",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 fmt"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 fmt"
+        }
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh lint",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 lint"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 lint"
+        }
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh build",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 build"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 build"
+        }
+      }
+    },
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh clean",
+        "forwardAllArgs": true
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh test",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 test"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 test"
+        }
+      }
+    },
+    "test-inventory": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh test-inventory",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 test-inventory"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 test-inventory"
+        }
+      }
+    },
+    "compare-test-inventory": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh compare-test-inventory",
+        "forwardAllArgs": true
+      }
+    },
+    "assembly": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh assembly",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 assembly"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 assembly"
+        }
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh verify",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 verify"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 verify"
+        }
+      }
+    },
+    "verify-all": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh verify-all",
+        "forwardAllArgs": true
+      }
+    },
+    "window-benchmark": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh window-benchmark",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 window-benchmark"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 window-benchmark"
+        }
+      }
+    },
+    "openivm-test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh openivm-test",
+        "forwardAllArgs": true
+      }
+    },
+    "pins-sync": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh pins-sync",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 pins-sync"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 pins-sync"
+        }
+      }
+    }
+  }
+}

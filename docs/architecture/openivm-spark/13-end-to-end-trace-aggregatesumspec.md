@@ -3,7 +3,8 @@
 This chapter is a live, executed trace of the `org.openivm.spark.parity.AggregateSumSpec` parity suite.
 It follows real data from Spark SQL, through OpenIVM compilation, into Delta staging, RocksDB metadata, rewritten Spark MERGE statements, and the final `assertMvCorrect` oracle.
 
-The run used Spark 3.5.1 / Delta 3.2.0 through `spark-ext/dev/dev.sh`.
+The run used Spark 3.5.1 / Delta 3.2.0 through the then-current legacy
+container wrapper. The current reproduction path uses Nx.
 The observable warehouse for this trace is:
 
 ```text
@@ -14,8 +15,10 @@ The test command was the requested single-spec run, with project-local log/probe
 
 ```bash
 cd /home/mdrrahman/openivm-spark
-./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec' 2>&1 \
-  | tee spark-ext/.logs/aggsum-trace/aggsum-test-rerun.log | tail -50
+npx --no-install nx run devcontainer:exec -- \
+  bash -lc "npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+  'testOnly org.openivm.spark.parity.AggregateSumSpec'" 2>&1 \
+  | tee .logs/aggsum-trace/aggsum-test-rerun.log | tail -50
 ```
 
 The suite passed in one live run:

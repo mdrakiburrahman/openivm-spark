@@ -326,8 +326,9 @@ This matters because a parser that greps for `refresh_step=compile_start` will r
 
 ## 9.9 Where Spark logs land
 
-For test runs driven by `./spark-ext/dev/dev.sh test`, the harness prints the log directory at startup.
-A targeted run in this checkout printed this line.
+For the historical test run below, the then-current legacy wrapper printed the
+log directory at startup. Use the Nx command in the next section for current
+runs.
 
 ```text
 [dev] Test logs → spark-ext/.logs/test-20260524-114303/ (DEBUG-level full trace; console keeps WARN+ only)
@@ -352,7 +353,9 @@ For structured collection, route `org.openivm.spark.commands` to JSON output and
 Command run:
 
 ```bash
-./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+  'testOnly org.openivm.spark.parity.AggregateSumSpec'
 ```
 
 Result: 9 tests passed in 2 minutes, 4 seconds of sbt time.
@@ -479,14 +482,16 @@ Use Spark SQL listener/job metrics externally, or add a dedicated listener if yo
 1. Tail the fork log and grep the actual prefix.
 
    ```bash
-   tail -f spark-ext/.logs/test-<TS>/fork-*.log | grep --line-buffered '\[openivm-mv\]'
+   tail -f .logs/test-<TS>/fork-*.log | grep --line-buffered '\[openivm-mv\]'
    ```
 
-1. Run a targeted test and capture durations from logs plus Spark job metrics.
+1. Inside the pinned devcontainer, run a targeted test and capture durations
+   from logs plus Spark job metrics.
 
    ```bash
-   ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.AggregateSumSpec'
-   grep -n '\[openivm-mv\].*refresh' spark-ext/.logs/test-<TS>/fork-*.log
+   npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+     'testOnly org.openivm.spark.parity.AggregateSumSpec'
+   grep -n '\[openivm-mv\].*refresh' .logs/test-<TS>/fork-*.log
    ```
 
 1. For production, configure log4j/log4j2 to emit `org.openivm.spark.commands` as structured JSON and aggregate downstream.
@@ -596,7 +601,7 @@ if __name__ == '__main__':
     main(sys.argv[1])
 PY
 chmod +x parse-openivm-refresh-log.py
-./parse-openivm-refresh-log.py spark-ext/.logs/test-<TS>/fork-<HHmmss-SSS>.log
+./parse-openivm-refresh-log.py .logs/test-<TS>/fork-<HHmmss-SSS>.log
 ```
 
 Example output for `aggsum_mv_batch` with current logs:
@@ -620,7 +625,7 @@ flowchart LR
   E --> F[postRefreshCleanup: mark consumed + advance version]
   B -. logInfo/logError .-> G[log4j / Spark logging]
   D -. stmt[i] .-> G
-  G --> H[spark-ext/.logs/test-TS/fork-*.log in tests]
+  G --> H[.logs/test-TS/fork-*.log in tests]
   G --> I[production driver/executor logs]
   H --> J[log parser helper]
   I --> K[JSON log pipeline]

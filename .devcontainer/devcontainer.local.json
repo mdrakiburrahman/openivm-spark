@@ -1,0 +1,80 @@
+{
+  "name": "openivm-spark-devcontainer-local",
+  "build": {
+    "context": "..",
+    "dockerfile": "Dockerfile",
+    "options": ["--platform=linux/amd64"],
+    "args": {
+      "DUCKDB_COMMIT": "${localEnv:DUCKDB_COMMIT}",
+      "DUCKDB_REF": "${localEnv:DUCKDB_REF}",
+      "GH_CLI_SHA256": "${localEnv:GH_CLI_SHA256}",
+      "GH_CLI_VERSION": "${localEnv:GH_CLI_VERSION}",
+      "LPTS_BRANCH": "${localEnv:LPTS_BRANCH}",
+      "LPTS_COMMIT": "${localEnv:LPTS_COMMIT}",
+      "LPTS_REPO": "${localEnv:LPTS_REPO}",
+      "NATIVE_BUILD_JOBS": "${localEnv:NATIVE_BUILD_JOBS}",
+      "NODE_VERSION": "${localEnv:OPENIVM_NODE_VERSION}",
+      "NPM_VERSION": "${localEnv:OPENIVM_NPM_VERSION}",
+      "OPENIVM_BRANCH": "${localEnv:OPENIVM_BRANCH}",
+      "OPENIVM_COMMIT": "${localEnv:OPENIVM_COMMIT}",
+      "OPENIVM_REPO": "${localEnv:OPENIVM_REPO}",
+      "SBT_VERSION": "${localEnv:SBT_VERSION}",
+      "UBUNTU_MIRROR": "${localEnv:UBUNTU_MIRROR}"
+    }
+  },
+  "containerUser": "vscode",
+  "containerEnv": {
+    "NX_DAEMON": "false",
+    "OPENIVM_CLI_PATH": "/opt/openivm/duckdb",
+    "OPENIVM_EXTENSION_PATH": "/opt/openivm/openivm.duckdb_extension",
+    "OPENIVM_JAVA_HOME_SPARK_35": "/opt/java/jdk-17",
+    "OPENIVM_JAVA_HOME_SPARK_41": "/opt/java/jdk-21",
+    "OPENIVM_NATIVE_DIR": "/opt/openivm",
+    "OPENIVM_SPARK_TARGET": "spark-3.5",
+    "SBT_OPTS": "-Xmx4G -XX:+UseG1GC -Dsbt.color=always -Dfile.encoding=UTF-8"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "scalameta.metals@1.42.0",
+        "scala-lang.scala@0.5.8",
+        "vscjava.vscode-java-pack@0.29.0"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.formatOnType": true,
+        "extensions.verifySignature": false,
+        "remote.autoForwardPorts": false,
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "terminal.integrated.enablePersistentSessions": false,
+        "terminal.integrated.gpuAcceleration": "off",
+        "terminal.integrated.inheritEnv": true,
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash"
+          }
+        },
+        "terminal.integrated.scrollback": 5000
+      }
+    }
+  },
+  "mounts": ["source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"],
+  "overrideCommand": false,
+  "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
+  "remoteEnv": {
+    "HOME": "/home/vscode"
+  },
+  "remoteUser": "vscode",
+  "runArgs": [
+    "--add-host=host.docker.internal:host-gateway",
+    "--cap-add=SYS_ADMIN",
+    "--device=/dev/fuse",
+    "--init",
+    "--platform=linux/amd64",
+    "--pids-limit=-1",
+    "--security-opt=apparmor:unconfined"
+  ],
+  "updateRemoteUserUID": true,
+  "workspaceFolder": "/workspaces/openivm-spark",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/openivm-spark,type=bind,consistency=cached"
+}

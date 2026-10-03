@@ -39,3 +39,9 @@ out/
 *.tfvars
 *.tfvars.json
 .wt/
+
+# Root Node/Nx and generated devcontainer state.
+node_modules/
+.nx/
+.devcontainer/.container-id
+.devcontainer/.image-tag

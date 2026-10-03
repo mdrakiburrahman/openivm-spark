@@ -95,10 +95,13 @@ Run from repo root:
 
 ```bash
 cd /home/mdrrahman/openivm-spark
-./spark-ext/dev/dev.sh pins-sync 2>&1 | tee /tmp/pins-sync.out
+npx --no-install nx run devcontainer:up
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:pins-sync 2>&1 \
+  | tee .research/pins-sync.out
 ```
 
-Read `/tmp/pins-sync.out`. Pass condition: **no** `⚠` warnings.
+Read `.research/pins-sync.out`. Pass condition: **no** `⚠` warnings.
 
 Drift conditions (any of):
 
@@ -459,7 +462,8 @@ Edit one of:
 
 ```bash
 cd /home/mdrrahman/openivm-spark
-./spark-ext/dev/dev.sh assembly
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:assembly --configuration=spark-3.5
 
 # Stamp the new jar into ivm-bench's mount so the next benchmark
 # uses it. PRESERVE_RAW=1 keeps it across re-runs.
@@ -686,7 +690,7 @@ From `openivm_refresh_profile`:
 
 ## Appendix C — pins-sync state at end of run
 
-Output of `./spark-ext/dev/dev.sh pins-sync`.
+Output of the Phase 0 `spark-ext:pins-sync` Nx target.
 ```
 
 ---

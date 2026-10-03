@@ -1084,7 +1084,7 @@ Use the project's own RocksDB wrapper.  This avoids comparator and column-family
 mismatches from generic Python bindings.
 
 ```scala
-// From spark-ext/dev/dev.sh enter, or from an sbt console with ivm-common on the classpath:
+// From an sbt console in the pinned devcontainer with ivm-common on the classpath:
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBConf, RocksDBCodec}
 
 val db = new OpenIvmRocksDB(

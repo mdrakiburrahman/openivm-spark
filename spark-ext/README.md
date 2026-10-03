@@ -6,10 +6,10 @@ Spark SQL extension delivering **OpenIVM incremental view maintenance** without 
 
 ## Runtime support
 
-| Target       | Spark | Delta | Scala  | Java | Maven artifact                     |
-| ------------ | ----- | ----- | ------ | ---- | ---------------------------------- |
-| `spark-3.5`  | 3.5.1 | 3.2.0 | 2.12.17 | 17   | `ivmextension-spark-3.5_2.12`      |
-| `spark-4.1`  | 4.1.0 | 4.2.0 | 2.13.17 | 21   | `ivmextension-spark-4.1_2.13`      |
+| Target      | Spark | Delta | Scala   | Java | Maven artifact                |
+| ----------- | ----- | ----- | ------- | ---- | ----------------------------- |
+| `spark-3.5` | 3.5.1 | 3.2.0 | 2.12.17 | 17   | `ivmextension-spark-3.5_2.12` |
+| `spark-4.1` | 4.1.0 | 4.2.0 | 2.13.17 | 21   | `ivmextension-spark-4.1_2.13` |
 
 Spark 3.5 remains the default for every developer command that omits `--target`.
 
@@ -55,31 +55,38 @@ MIN/MAX grouped aggregates use the `AGGREGATE_GROUP` affected-groups path
 AGGREGATE_GROUP or SIMPLE_PROJECTION path (`JoinsSpec`). MV-over-MV chains are
 supported at depth ≤ 2 (`ChainedSpec`); depth > 2 is out of scope.
 
-## Dev loop (host needs only Docker)
+## Dev loop (prebuilt devcontainer + Nx)
 
-A single entry-point lives at `spark-ext/dev/dev`. Run it with one of the
-following subcommands:
+The host starts with Docker, Git, and Bash. From the repository root, install
+the pinned Node/npm launcher and locked Nx tooling:
 
 ```bash
-./spark-ext/dev/dev.sh verify                                                     # pins-sync + lint + build + assembly + full test
-./spark-ext/dev/dev.sh --target spark-4.1 verify                                  # same verification on Spark 4.1 / Delta 4.2
-./spark-ext/dev/dev.sh verify-all                                                 # verify both targets and compare test inventories
-./spark-ext/dev/dev.sh pins-sync                                                  # clone .temp/{openivm,lpts,ivm-bench} + shallow .temp/{spark,delta} refs, align branches, validate HEAD + ivm-bench Dockerfile ARGs against pins.env
-./spark-ext/dev/dev.sh pins-fix                                                   # commit + push uncommitted changes (refusing main/master), then rewrite pins.env + ivm-bench Dockerfile so the next pins-sync reports green
-./spark-ext/dev/dev.sh build                                                      # sbt compile
-./spark-ext/dev/dev.sh assembly                                                   # sbt ivmExtension/assembly (fat jar)
-./spark-ext/dev/dev.sh publish                                                    # publish the versioned fat jar to the ADO Maven feed
-./spark-ext/dev/dev.sh --target spark-4.1 publish                                 # publish the Spark 4.1 assembly
-./spark-ext/dev/dev.sh publish-all                                                # publish both artifacts under one version
-./spark-ext/dev/dev.sh test                                                       # sbt test (every suite)
-./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.it.ExtensionLoadingSpec'
-./spark-ext/dev/dev.sh fmt                                                        # scalafmtAll (auto-format)
-./spark-ext/dev/dev.sh shell                                                      # interactive bash inside the dev image
-./spark-ext/dev/dev.sh openivm-test                                               # upstream openivm sqllogictests
-./spark-ext/dev/dev.sh dev-build [build|test|all]                                 # iterate on .temp/openivm + .temp/lpts
-./spark-ext/dev/dev.sh image-build                                                # docker compose build (force rebuild)
-./spark-ext/dev/dev.sh help                                                       # this help text
+./contrib/bootstrap-dev-env.sh
+npx --no-install nx run devcontainer:up
 ```
+
+Run the standard targets inside the devcontainer:
+
+```bash
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:lint
+
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:build --configuration=spark-3.5
+
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:test --configuration=spark-4.1
+
+npx --no-install nx run devcontainer:exec -- \
+  npx --no-install nx run spark-ext:verify-all
+```
+
+Inside an attached VS Code devcontainer, omit the outer `devcontainer:exec`
+and run the same Nx targets directly. Nx delegates to
+`spark-ext/dev/run.sh`; do not invoke that implementation directly.
+`spark-ext/dev/dev.sh` remains only as a Compose-compatible legacy wrapper and
+for commands without Nx targets, including `publish`, `publish-all`, and
+`pins-fix`.
 
 `publish` reads `MAVEN_URL` and `MAVEN_PAT` from the gitignored root `.env`,
 computes one immutable version as
@@ -110,13 +117,13 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
-`verify` is the canonical one-target command — it first runs `pins-sync` (cloning any
-missing `.temp/{openivm,lpts,ivm-bench}` checkouts, fetching origin, and
-aligning each to its pinned branch, plus shallow-cloning the read-only
-`.temp/{spark,delta}` upstream references at their pinned release tags), then
-lints, compiles, assembles the fat jar, and runs every unit + integration +
-parity suite in a single sbt JVM. `verify-all` runs that same pipeline for both
-targets and fails if they discover different tests.
+`spark-ext:verify` is the canonical one-target command. It first runs
+`pins-sync` (cloning any missing `.temp/{openivm,lpts,ivm-bench}` checkouts,
+fetching origin, and aligning each to its pinned branch, plus shallow-cloning
+the read-only `.temp/{spark,delta}` upstream references at their pinned release
+tags), then lints, compiles, assembles the fat jar, and runs every unit,
+integration, and parity suite in one sbt JVM. `spark-ext:verify-all` runs that
+pipeline for both targets and fails if they discover different tests.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned
@@ -141,19 +148,21 @@ running it on an already-aligned tree is a no-op.
 
 ### Environment variables
 
-| Variable                  | Default | Scope    | Effect                                                                                                                                                                |
-| ------------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PRE_CLEAN`               | `0`     | `verify` | When `1`, force-removes every running Docker container on the host before sbt starts. Named cache volumes (`sbt-cache`, `ivy-cache`, `coursier-cache`) are preserved. |
-| `openivm.test.forks` (-D) | `32`    | sbt JVM  | Cap on parallel forked test JVMs. Pass via `./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8` on smaller hosts.                                                   |
+| Variable                    | Default            | Scope   | Effect                                                                                                     |
+| --------------------------- | ------------------ | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `OPENIVM_TEST_FORKS`        | build default      | tests   | Positive fork cap forwarded as `openivm.test.forks`.                                                       |
+| `OPENIVM_TEST_LOG_ROOT`     | repository `.logs` | tests   | Parent for `.logs/test-<timestamp>/` and the per-fork debug logs.                                          |
+| `PRE_CLEAN`                 | `0`                | legacy  | `dev.sh` only: when `1`, removes running Docker containers before the retained Compose-compatible command. |
+| `openivm.test.forks` (`-D`) | `32`               | sbt JVM | Direct system-property override, for example `spark-ext:verify -- -Dopenivm.test.forks=8`.                 |
 
-The container image is named
-`openivm-spark/spark-ext:${OPENIVM_COMMIT}-${LPTS_COMMIT}-${DUCKDB_REF}` so
-dependency or ABI changes produce a fresh image without replacing workspace
-caches. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env` explicitly select
-DuckDB v1.5.2 for both the CLI and native extension; do not infer the deployed ABI
-from OpenIVM's upstream submodule or CI version. JDBC stays on 1.5.2.1.
-`NATIVE_BUILD_JOBS` bounds native build parallelism (default 8); lower it on
-shared hosts.
+The normal development and CI image is
+`ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:<content-hash>`. The tag
+covers the devcontainer definition, npm lockfile, SBT build definitions, native
+pins, and target pins. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env`
+explicitly select DuckDB v1.5.2 for both the CLI and native extension; do not
+infer the deployed ABI from OpenIVM's upstream submodule or CI version. JDBC
+stays on 1.5.2.1. `NATIVE_BUILD_JOBS` bounds native build parallelism (default
+8); lower it on shared builders.
 
 ## Activation in spark-shell / spark-submit
 
@@ -246,18 +255,18 @@ ordinary storage-lock contention, but never wait for unrelated captures to finis
 
 The UTF-8 JSON envelope has:
 
-| Field | Meaning |
-| --- | --- |
-| `schema`, `version` | `openivm.query-log-export`, `1` |
-| `application_id`, `request_id` | Exact capture identity |
-| `status` | `running`, `pending_flush`, `complete`, `failed`, or `missing` |
-| `capture_complete` | Outer action ended, native lifecycles finished, and all admitted rows persisted successfully |
-| `sql_succeeded` | Caller-supplied Boolean; `null` before `end` |
-| `record_count`, `pending_flushes` | Admitted row count and this request's unacknowledged flush count |
-| `invocations` | Ordered objects with native `refresh_id`, `view_name`, `mode`, `outcome`, `record_count`, `completed` |
-| `records` | Complete rows in invocation/collector append order; empty while capture is incomplete |
-| `failure` | `null` or `{ "code": "...", "message": "..." }` |
-| `truncated` | Always `false`; partial successful traces are never returned |
+| Field                             | Meaning                                                                                               |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `schema`, `version`               | `openivm.query-log-export`, `1`                                                                       |
+| `application_id`, `request_id`    | Exact capture identity                                                                                |
+| `status`                          | `running`, `pending_flush`, `complete`, `failed`, or `missing`                                        |
+| `capture_complete`                | Outer action ended, native lifecycles finished, and all admitted rows persisted successfully          |
+| `sql_succeeded`                   | Caller-supplied Boolean; `null` before `end`                                                          |
+| `record_count`, `pending_flushes` | Admitted row count and this request's unacknowledged flush count                                      |
+| `invocations`                     | Ordered objects with native `refresh_id`, `view_name`, `mode`, `outcome`, `record_count`, `completed` |
+| `records`                         | Complete rows in invocation/collector append order; empty while capture is incomplete                 |
+| `failure`                         | `null` or `{ "code": "...", "message": "..." }`                                                       |
+| `truncated`                       | Always `false`; partial successful traces are never returned                                          |
 
 Each record preserves `refresh_id`, `view_name`, `profile_timestamp` (UTC ISO
 timestamp), `stmt_order`, `attempt_idx`, `mode`, `category`, `stmt_kind`,
@@ -293,14 +302,14 @@ fail explicitly; missing/already-released requests are an idempotent no-op.
 All retention settings below use the `spark.openivm.queryLog.export.` prefix
 and are read from SparkContext configuration at the application's first `begin`:
 
-| Suffix | Default | Bound |
-| --- | ---: | --- |
-| `maxCaptures` | 1024 | Unreleased request slots per application |
-| `maxInvocations` | 128 | Native lifecycles per request |
-| `maxRecords` | 100000 | Admitted rows per request |
-| `maxBytes` | 67108864 | UTF-8 row payload plus accounting overhead per request |
-| `maxTotalRecords` | 1000000 | Admitted rows across unreleased requests |
-| `maxTotalBytes` | 536870912 | Admitted row bytes across unreleased requests |
+| Suffix            |   Default | Bound                                                  |
+| ----------------- | --------: | ------------------------------------------------------ |
+| `maxCaptures`     |      1024 | Unreleased request slots per application               |
+| `maxInvocations`  |       128 | Native lifecycles per request                          |
+| `maxRecords`      |    100000 | Admitted rows per request                              |
+| `maxBytes`        |  67108864 | UTF-8 row payload plus accounting overhead per request |
+| `maxTotalRecords` |   1000000 | Admitted rows across unreleased requests               |
+| `maxTotalBytes`   | 536870912 | Admitted row bytes across unreleased requests          |
 
 There is no eviction of unexported captures. Invalid IDs/configuration, duplicate
 reservation, or exhausted slots throw from `begin` before SQL starts. Row/byte

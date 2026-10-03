@@ -521,12 +521,12 @@ The catalog is RocksDB-backed and `MvCatalog.lookup` / `MvCatalog.list` are the
 supported readers; see
 `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala:453-466`.
 
-From inside the dev container:
+From the host, use Nx to run the console inside the pinned devcontainer:
 
 ```bash
-cd spark-ext/dev
-docker compose --env-file pins.env -f docker/docker-compose.yml \
-  run --rm -T build sbt 'ivmCommon/console'
+npx --no-install nx run devcontainer:up
+npx --no-install nx run devcontainer:exec -- \
+  bash -lc "cd spark-ext && sbt 'ivmCommon/console'"
 ```
 
 Then run a small Scala probe, adjusted to your warehouse path and MV name:
@@ -535,7 +535,7 @@ Then run a small Scala probe, adjusted to your warehouse path and MV name:
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{MvCatalog, MvMetadata}
 
-val warehouse = "/work/spark-ext/ivm-it/target/test-warehouse-your-spec"
+val warehouse = "/workspaces/openivm-spark/spark-ext/ivm-it/target/test-warehouse-your-spec"
 val spark = SparkSession.builder()
   .master("local[1]")
   .appName("openivm-demotion-probe")
@@ -592,17 +592,16 @@ so, `INSERT OVERWRITE TABLE` is the smoking gun.
 
 ### Step 3: grep the Spark test logs
 
-When tests are run through `spark-ext/dev/dev.sh`, the wrapper creates a
-per-run directory `spark-ext/.logs/test-<YYYYMMDD-HHMMSS>/` and each forked JVM
-writes a `fork-<HHmmss-SSS>.log`; see
-`spark-ext/dev/dev.sh:81-115` and the fork propagation in
-`spark-ext/project/Settings.scala:117-124`.
+When tests are run through the `spark-ext:test` Nx target, the direct runner
+creates `.logs/test-<YYYYMMDD-HHMMSS>/` at the repository root and each forked
+JVM writes a `fork-<HHmmss-SSS>.log`; see `spark-ext/dev/run.sh` and the fork
+propagation in `spark-ext/project/Settings.scala:117-124`.
 
 Search the newest run:
 
 ```bash
 cd /home/mdrrahman/openivm-spark
-latest=$(ls -td spark-ext/.logs/test-* | head -1)
+latest=$(ls -td .logs/test-* | head -1)
 grep -R "\[openivm-mv\].*effective_refresh_type='FULL_REFRESH'" "$latest" | head -50
 grep -R "reason='" "$latest" | head -50
 ```

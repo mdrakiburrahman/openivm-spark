@@ -1,0 +1,30 @@
+{
+  "name": "openivm-spark-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.6.2",
+  "engines": {
+    "node": "24.11.1",
+    "npm": "11.6.2"
+  },
+  "volta": {
+    "node": "24.11.1",
+    "npm": "11.6.2"
+  },
+  "scripts": {
+    "check": "npm run lint && npm run typecheck && npm test",
+    "format": "prettier --write package.json nx.json \"tsconfig*.json\" prettier.config.mjs \".devcontainer/**/*.{json,md,ts}\"",
+    "lint": "prettier --check package.json nx.json \"tsconfig*.json\" prettier.config.mjs \".devcontainer/**/*.{json,md,ts}\" && bash -n .devcontainer/scripts/post-create.sh",
+    "test": "tsx --test \".devcontainer/src/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@devcontainers/cli": "0.80.3",
+    "@types/node": "24.11.1",
+    "nx": "23.1.2",
+    "prettier": "3.6.2",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}

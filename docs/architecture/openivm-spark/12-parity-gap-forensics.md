@@ -321,10 +321,13 @@ Other common leak patterns are:
 
 When Steps 1 through 5 do not isolate the issue, rerun the minimal spec with
 debug logging enabled.
-Use the dev wrapper so fork logs go under `.logs/`:
+Use the Nx test target inside the pinned devcontainer so fork logs go under
+`.logs/`:
 
 ```bash
-OPENIVM_LOG_LEVEL=DEBUG ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.YourGapSpec'
+OPENIVM_LOG_LEVEL=DEBUG \
+  npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+  'testOnly org.openivm.spark.parity.YourGapSpec'
 ```
 
 Then inspect the newest test log directory:
@@ -733,9 +736,10 @@ Use this workflow for every parity-gap PR.
    Use the same helper style as existing specs.
    Drop hidden `openivm_*` columns before comparing.
 1. Run the targeted spec.
-   Use:
+   From inside the pinned devcontainer, use:
    ```bash
-   ./spark-ext/dev/dev.sh test 'testOnly org.openivm.spark.parity.YourGapSpec'
+   npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
+     'testOnly org.openivm.spark.parity.YourGapSpec'
    ```
    Iterate until the targeted spec passes.
    If the failure is in compile or assembly, inspect `.logs/test-<timestamp>/`.
@@ -743,11 +747,12 @@ Use this workflow for every parity-gap PR.
 1. Run full verification.
    Use:
    ```bash
-   ./spark-ext/dev/dev.sh verify
+   npx --no-install nx run spark-ext:verify --configuration=spark-3.5
    ```
    On smaller hosts, cap forks:
    ```bash
-   ./spark-ext/dev/dev.sh verify -Dopenivm.test.forks=8
+   npx --no-install nx run spark-ext:verify --configuration=spark-3.5 -- \
+     -Dopenivm.test.forks=8
    ```
    Fix regressions before opening the PR.
 
@@ -761,10 +766,10 @@ Include this checklist in the PR description.
 - [ ] Fix is minimally invasive.
 - [ ] No demotion path was widened.
 - [ ] All relevant parity specs pass.
-- [ ] Full `./spark-ext/dev/dev.sh verify` passes, or any infrastructure failure
-  is clearly unrelated and documented.
+- [ ] The full `spark-ext:verify` Nx target passes, or any infrastructure
+      failure is clearly unrelated and documented.
 - [ ] `_ivm_compiled_sql` cache for the new spec is summarized in the PR
-  description.
+      description.
 - [ ] No verbose logging was added to test code.
 - [ ] Any ignored test has an explicit `TODO` and a real engine-gap reason.
 
