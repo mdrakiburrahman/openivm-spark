@@ -31,7 +31,8 @@ import org.openivm.spark.parser.gen.IvmSqlBaseParser
  *    `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`,
  *    `ALTER MATERIALIZED VIEW ... ADVANCE SOURCE VERSIONS`,
  *    `DROP MATERIALIZED VIEW`, `SHOW OPENIVM REFRESH PROFILE`, or
- *    `SHOW OPENIVM QUERY LOG`, plus the streaming-table lifecycle statements
+ *    `SHOW OPENIVM QUERY LOG`, the request-scoped OpenIVM INSIGHTS statements,
+ *    plus the streaming-table lifecycle statements
  *    while the OpenIVM feature gate is enabled
  *    (case-insensitive) → parsed by [[IvmSqlBaseParser]] / [[IvmAstBuilder]].
  *  - Everything else (including bare `EXPLAIN <query>` and `OPTIMIZE`) → [[delegate]].
@@ -161,7 +162,9 @@ private object IvmParser {
       "show\\s+refresh\\s+sql\\s+for\\s+create\\s+materialized\\s+view|" +
       "(?:create|refresh|alter|drop)\\s+materialized\\s+view|" +
       "show\\s+openivm\\s+refresh\\s+profile|" +
-      "show\\s+openivm\\s+query\\s+log" +
+      "show\\s+openivm\\s+query\\s+log|" +
+      "show\\s+openivm\\s+insights|" +
+      "openivm\\s+insights\\s+(?:begin|end|annotate|release)" +
       ")\\b",
     Pattern.CASE_INSENSITIVE
   )

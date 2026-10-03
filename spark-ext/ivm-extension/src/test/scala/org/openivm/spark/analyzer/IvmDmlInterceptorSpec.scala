@@ -1,8 +1,10 @@
 package org.openivm.spark.analyzer
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, StagingCatalog}
+import org.openivm.spark.insights.{OpenIvmInsightsBroker, OpenIvmInsightsContract}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -13,6 +15,7 @@ import java.util.UUID
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.jdk.CollectionConverters._
 
 /**
  * Integration tests for [[IvmDmlInterceptorRule]] / [[StagedDmlNode]] /
@@ -34,6 +37,7 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
   private var spark: SparkSession = _
+  private val mapper              = new ObjectMapper()
 
   private val warehouseDir: String = {
     val d = new File(s"target/test-warehouse-dml-${UUID.randomUUID().toString.take(8)}")
@@ -481,6 +485,122 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
         releaseFirst.countDown()
         pool.shutdownNow()
       }
+    }
+  }
+
+  describe("Test 13: regular Spark insight change capture") {
+    it("emits R2 with signed staging identities and no SQL or raw path leakage") {
+      val tbl = "insights_r2_base"
+      createBaseWithMv(tbl)
+      val requestId = "dml-r2-request"
+      OpenIvmInsightsBroker.begin(
+        spark,
+        requestId,
+        "dml-r2-run",
+        "model.analytics.dml_r2",
+        Some("table"),
+        Some(s"default.$tbl")
+      )
+
+      spark.sql(s"INSERT INTO $tbl VALUES (1, 'sensitive-r2-row')")
+      OpenIvmInsightsBroker.end(spark, requestId, succeeded = true)
+
+      val page = OpenIvmInsightsBroker.page(spark, requestId, 0L, 100)
+      val event = page.events
+        .find(_.code == OpenIvmInsightsContract.Code.RegularSparkChangeCapture)
+        .getOrElse(fail("Missing R2 regular Spark change-capture event"))
+      event.operation shouldBe OpenIvmInsightsContract.Operation.RegularSpark
+      event.materializedView shouldBe None
+      val details = mapper.readTree(event.detailsJson.get)
+      details.path(OpenIvmInsightsContract.DetailField.BranchCode).asText() shouldBe
+        OpenIvmInsightsContract.BranchCode.R2
+      details.path(OpenIvmInsightsContract.DetailField.ExecutionMode).asText() shouldBe
+        OpenIvmInsightsContract.ExecutionMode.RegularSpark
+      details.path(OpenIvmInsightsContract.DetailField.Materialization).asText() shouldBe "table"
+      details.path(OpenIvmInsightsContract.DetailField.TargetRelation).asText() shouldBe s"default.$tbl"
+      details.path(OpenIvmInsightsContract.DetailField.OperationTypes).get(0).asText() shouldBe "INSERT"
+      details
+        .path(OpenIvmInsightsContract.DetailField.DependentMaterializedViewCount)
+        .asInt() shouldBe 1
+      details
+        .path(OpenIvmInsightsContract.DetailField.DependentMaterializedViews)
+        .get(0)
+        .asText() shouldBe s"mv_$tbl"
+      val signed = details.path(OpenIvmInsightsContract.DetailField.SignedChanges).get(0)
+      signed.path("row_image").asText() shouldBe "new"
+      signed.path("multiplicity").asInt() shouldBe 1
+      val staging = details.path(OpenIvmInsightsContract.DetailField.StagingArtifacts).get(0)
+      staging.path("category").asText() shouldBe "source_change_capture"
+      staging.path("op_type").asText() shouldBe "INSERT"
+      staging.path("path_id").asText() should fullyMatch regex "sha256:[0-9a-f]{64}"
+      event.detailsJson.get should not include warehouseDir
+      event.detailsJson.get should not include "sensitive-r2-row"
+      event.detailsJson.get.toLowerCase(java.util.Locale.ROOT) should not include "insert into"
+      val regularCompleted = page.events
+        .find(_.code == OpenIvmInsightsContract.Code.RegularSparkCompleted)
+        .getOrElse(fail("Missing terminal R1 regular Spark event"))
+      regularCompleted.operation shouldBe OpenIvmInsightsContract.Operation.RegularSpark
+      regularCompleted.materializedView shouldBe None
+      val regularDetails = mapper.readTree(regularCompleted.detailsJson.get)
+      regularDetails.path(OpenIvmInsightsContract.DetailField.BranchCode).asText() shouldBe
+        OpenIvmInsightsContract.BranchCode.R1
+      regularDetails.path(OpenIvmInsightsContract.DetailField.ExecutionMode).asText() shouldBe
+        OpenIvmInsightsContract.ExecutionMode.RegularSpark
+      regularDetails.path(OpenIvmInsightsContract.DetailField.Materialization).asText() shouldBe "table"
+      regularDetails.path(OpenIvmInsightsContract.DetailField.TargetRelation).asText() shouldBe
+        s"default.$tbl"
+      page.events.map(_.code) should not contain OpenIvmInsightsContract.Code.RegularSparkFailed
+
+      val requestCompleted = page.events
+        .find(_.eventType == OpenIvmInsightsContract.EventType.RequestCompleted)
+        .getOrElse(fail("Missing request completion event"))
+      mapper
+        .readTree(requestCompleted.detailsJson.get)
+        .path(OpenIvmInsightsContract.DetailField.Metrics)
+        .path(OpenIvmInsightsContract.MetricField.JobCount)
+        .asLong() should be > 0L
+
+      OpenIvmInsightsBroker.release(spark, requestId)
+    }
+
+    it("reports both signed row images for an intercepted UPDATE") {
+      val tbl = "insights_r2_update_base"
+      createBaseWithMv(tbl)
+      spark.sql(s"INSERT INTO $tbl VALUES (1, 'before')")
+      val requestId = "dml-r2-update-request"
+      OpenIvmInsightsBroker.begin(
+        spark,
+        requestId,
+        "dml-r2-update-run",
+        "model.analytics.dml_r2_update",
+        Some("table"),
+        Some(s"default.$tbl")
+      )
+
+      spark.sql(s"UPDATE $tbl SET name = 'after' WHERE id = 1")
+      OpenIvmInsightsBroker.end(spark, requestId, succeeded = true)
+
+      val event = OpenIvmInsightsBroker
+        .page(spark, requestId, 0L, 100)
+        .events
+        .find(_.code == OpenIvmInsightsContract.Code.RegularSparkChangeCapture)
+        .getOrElse(fail("Missing UPDATE R2 event"))
+      val details = mapper.readTree(event.detailsJson.get)
+      details
+        .path(OpenIvmInsightsContract.DetailField.OperationTypes)
+        .elements()
+        .asScala
+        .map(_.asText())
+        .toSet shouldBe Set("UPDATE_BEFORE", "UPDATE_AFTER")
+      val signed = details
+        .path(OpenIvmInsightsContract.DetailField.SignedChanges)
+        .elements()
+        .asScala
+        .map(value => value.path("row_image").asText() -> value.path("multiplicity").asInt())
+        .toMap
+      signed shouldBe Map("old" -> -1, "new" -> 1)
+
+      OpenIvmInsightsBroker.release(spark, requestId)
     }
   }
 }
