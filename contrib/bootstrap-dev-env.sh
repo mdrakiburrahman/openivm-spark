@@ -11,6 +11,7 @@ export PATH="$(cmn_strip_windows_paths)"
 
 cmn_ensure_host_packages
 cmn_ensure_docker
+cmn_pull_devcontainer_image "${REPOSITORY_ROOT}"
 cmn_ensure_node
 cmn_npm_ci "${REPOSITORY_ROOT}"
 

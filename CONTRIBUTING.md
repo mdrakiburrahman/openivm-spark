@@ -55,7 +55,8 @@ well.
    ```
 
    The bootstrap idempotently installs or validates Git, Docker Engine,
-   Buildx, Compose, and the pinned Node/npm version, then runs `npm ci`. Java,
+   Buildx, Compose, and the pinned Node/npm version, configures parallel Docker
+   transfers, pulls the pinned devcontainer image, then runs `npm ci`. Java,
    Scala, sbt, and Spark stay inside the devcontainer.
 
 1. Launch the devcontainer from the repository root:

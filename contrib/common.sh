@@ -11,6 +11,7 @@ CMN_NPM_VERSION="11.6.2"
 CMN_NODE_ROOT="${CMN_NODE_ROOT:-/opt/openivm-node}"
 CMN_DOCKER_VERSION="${CMN_DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
 CMN_DOCKER_MAX_CONCURRENT_DOWNLOADS="${CMN_DOCKER_MAX_CONCURRENT_DOWNLOADS:-32}"
+CMN_DOCKER_MAX_CONCURRENT_UPLOADS="${CMN_DOCKER_MAX_CONCURRENT_UPLOADS:-32}"
 CMN_APT_UPDATED=0
 
 cmn_log() {
@@ -174,8 +175,20 @@ cmn_configure_docker_daemon() {
         }
     desired="$(
         printf '%s\n' "${current}" |
-            jq -S --argjson downloads "${CMN_DOCKER_MAX_CONCURRENT_DOWNLOADS}" \
-                '.["max-concurrent-downloads"] = $downloads'
+            jq -S \
+                --argjson downloads "${CMN_DOCKER_MAX_CONCURRENT_DOWNLOADS}" \
+                --argjson uploads "${CMN_DOCKER_MAX_CONCURRENT_UPLOADS}" \
+                '
+                .["max-concurrent-downloads"] = $downloads
+                | .["max-concurrent-uploads"] = $uploads
+                | .["default-ulimits"].nofile = {"Name": "nofile", "Hard": 1048576, "Soft": 1048576}
+                | .["default-ulimits"].nproc = {"Name": "nproc", "Hard": 1048576, "Soft": 1048576}
+                | .["default-ulimits"].memlock = {"Name": "memlock", "Hard": -1, "Soft": -1}
+                | .features.buildkit = true
+                | .["log-driver"] = "json-file"
+                | .["log-opts"]["max-size"] = "50m"
+                | .["log-opts"]["max-file"] = "3"
+                '
     )"
 
     if [[ "${normalized_current}" != "${desired}" ]]; then
@@ -219,6 +232,26 @@ cmn_ensure_docker() {
     done
     cmn_log bootstrap "FATAL: Docker daemon did not become ready." >&2
     return 1
+}
+
+cmn_pull_devcontainer_image() {
+    local repository_root="$1"
+    local config="${repository_root}/.devcontainer/devcontainer.json"
+    local image
+
+    [[ -f "${config}" ]] ||
+        {
+            cmn_log bootstrap "FATAL: devcontainer configuration not found at ${config}." >&2
+            return 1
+        }
+    image="$(jq -er '.image | select(type == "string" and length > 0)' "${config}")" ||
+        {
+            cmn_log bootstrap "FATAL: ${config} must define a non-empty image." >&2
+            return 1
+        }
+
+    cmn_log bootstrap "Pulling pinned devcontainer image: ${image}"
+    docker pull "${image}"
 }
 
 cmn_node_archive() {
