@@ -60,16 +60,13 @@ well.
 1. Launch the devcontainer from the repository root:
 
    ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   code "${GIT_ROOT}/spark.code-workspace"
+   cd ~/openivm-spark
+   docker ps -aq --filter "label=devcontainer.local_folder=$(wslpath -w .)" | xargs -r docker rm -f
+   HEX=$(printf '%s' "$(wslpath -w .)" | xxd -ps -c 256)
+   code --file-uri "vscode-remote://dev-container+${HEX}/~/openivm-spark/spark.code-workspace"
    ```
 
-   Accept **Reopen in Container** when prompted. The workspace exposes only
-   `spark-ext` so Metals imports the sbt build without unrelated repository
-   folders. If the prompt does not appear, run **Dev Containers: Reopen in
-   Container** from the VS Code command palette.
-
-1. All builds and tests should now run green inside the devcontainer:
+2. All builds and tests should now run green inside the devcontainer:
 
    ```bash
    npx --no-install nx run spark-ext:verify-all
@@ -78,7 +75,7 @@ well.
    See [Headless devcontainer operations](docs/devcontainer/headless-operations.md)
    to run the same Nx workflow from WSL without opening VS Code.
 
-1. Install recommended developer tooling (optional):
+3. Install recommended developer tooling (optional):
 
    ```bash
    curl -fsSL https://gh.io/copilot-install | bash
