@@ -36,27 +36,8 @@ final class WorkloadFactsRegistry {
       sourceTables: Seq[String],
       configuredFkRelations: Seq[ForeignKeyRelation] = Seq.empty,
       configuredUniqueKeys: Seq[UniqueKey] = Seq.empty
-  ): WorkloadConstraintFacts =
-    discover(spark, sourceTables, configuredFkRelations, configuredUniqueKeys, Map.empty)
-
-  /** Reuse schemas resolved by the caller's analysis, while reading constraint
-    * properties afresh. The schemas belong to this operation only.
-    */
-  def discover(
-      spark: SparkSession,
-      sourceTables: Seq[String],
-      sourceSchemas: Map[String, StructType]
-  ): WorkloadConstraintFacts =
-    discover(spark, sourceTables, Seq.empty, Seq.empty, sourceSchemas)
-
-  private def discover(
-      spark: SparkSession,
-      sourceTables: Seq[String],
-      configuredFkRelations: Seq[ForeignKeyRelation],
-      configuredUniqueKeys: Seq[UniqueKey],
-      sourceSchemas: Map[String, StructType]
   ): WorkloadConstraintFacts = {
-    val perTable = sourceTables.distinct.map(table => tableFacts(spark, table, sourceSchemas.get(table)))
+    val perTable = sourceTables.distinct.map(table => tableFacts(spark, table))
     WorkloadConstraintFacts(
       fkRelations =
         distinctFk(configuredFkRelations ++ sessionForeignKeys(spark, sourceTables) ++ perTable.flatMap(_.fkRelations)),
@@ -81,17 +62,10 @@ object WorkloadFactsRegistry {
 
   def forRefresh(): WorkloadFactsRegistry = new WorkloadFactsRegistry
 
-  private[common] def tableFacts(spark: SparkSession, table: String): WorkloadConstraintFacts =
-    tableFacts(spark, table, None)
-
-  private[common] def tableFacts(
-      spark: SparkSession,
-      table: String,
-      sourceSchema: Option[StructType]
-  ): WorkloadConstraintFacts = {
+  private[common] def tableFacts(spark: SparkSession, table: String): WorkloadConstraintFacts = {
     val catalogTable = resolveCatalogTable(spark, table)
     val properties   = tableProperties(spark, table, catalogTable)
-    val schema       = sourceSchema.getOrElse(tableSchema(spark, table))
+    val schema       = tableSchema(spark, table)
     val generated    = schema.toSeq.flatMap(generatedColumn(table, _))
     val identityKeys = generated
       .filter(_.expression == IdentityGeneratedValue)

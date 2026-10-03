@@ -54,7 +54,7 @@ class WorkloadFactsCatalogBudgetSpec extends AnyFunSpec with Matchers with Befor
       val message = event.getMessage.getFormattedMessage
       if (message.contains("cmd=")) {
         commands.synchronized {
-          commands += message.substring(message.indexOf("cmd=") + 4).split("\\s+").head.stripSuffix(":")
+          commands += message.substring(message.indexOf("cmd=") + 4).split("\\s+").head
         }
       }
     }
@@ -125,27 +125,6 @@ class WorkloadFactsCatalogBudgetSpec extends AnyFunSpec with Matchers with Befor
 
       facts.deltaConstraints.map(c => c.name -> c.expression) shouldBe Seq("amount_positive" -> "amount > 0")
       facts.uniqueKeys.map(_.columns) shouldBe Seq(Seq("order_id"))
-    }
-
-    it("avoids schema catalog resolution when CREATE supplies analyzed source schemas") {
-      val schema = spark.table("facts_db.orders").schema
-      val registry = WorkloadFactsRegistry.forRefresh()
-      val (expected, ordinaryCalls) = metastoreCalls {
-        registry.discover(spark, Seq("facts_db.orders"))
-      }
-
-      val (facts, calls) = metastoreCalls {
-        registry.discover(spark, Seq("facts_db.orders"), Map("facts_db.orders" -> schema))
-      }
-
-      withClue(s"metastore calls: ${calls.toSeq.sorted.mkString(", ")}: ") {
-        // SessionCatalog checks existence before fetching the CatalogTable.
-        calls.getOrElse("get_table", 0) shouldBe 2
-        calls.getOrElse("get_table", 0) should be < ordinaryCalls.getOrElse("get_table", 0)
-        calls.getOrElse("get_database", 0) should be <= 1
-      }
-      info(s"get_table calls: ordinary=${ordinaryCalls.getOrElse("get_table", 0)}, reused=${calls.getOrElse("get_table", 0)}")
-      facts shouldBe expected
     }
 
     it("keeps discovering facts for tables that are not resolvable through the catalog") {

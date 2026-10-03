@@ -2808,7 +2808,7 @@ case class CreateMaterializedViewCommand(
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
     val workloadFacts = profile.timeStep("create_collect_workload_facts", s"sources=${qualNames.size}") {
-      val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames, qualSchemas)
+      val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
       // Quantitative Delta statistics are consumed by Spark's refresh-time cost
       // model and rewriter, which collect current table and delta stats for every
       // refresh. OpenIVM's compile-facts parser ignores table/column stats, and
