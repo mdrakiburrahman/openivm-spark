@@ -3,13 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPOSITORY_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-cmn_require bash
-cmn_require git
-cmn_require_docker
+export PATH="$(cmn_strip_windows_paths)"
+
+cmn_ensure_host_packages
+cmn_ensure_docker
 cmn_ensure_node
 cmn_npm_ci "${REPOSITORY_ROOT}"
 
@@ -19,6 +20,8 @@ Host bootstrap complete.
   Node:   $(node --version)
   npm:    $(npm --version)
   Docker: $(docker --version)
+  Buildx: $(docker buildx version | head -1)
+  Compose: $(docker compose version)
 
 Build the prebuilt image:
   npx --no-install nx run devcontainer:build
