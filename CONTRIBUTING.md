@@ -65,7 +65,7 @@ well.
    cd ~/openivm-spark
    docker ps -aq --filter "label=devcontainer.local_folder=$(wslpath -w .)" | xargs -r docker rm -f
    HEX=$(printf '%s' "$(wslpath -w .)" | xxd -ps -c 256)
-   code --file-uri "vscode-remote://dev-container+${HEX}/~/openivm-spark/spark.code-workspace"
+   code --file-uri "vscode-remote://dev-container+${HEX}/workspaces/openivm-spark/spark.code-workspace"
    ```
 
 2. All builds and tests should now run green inside the devcontainer:
