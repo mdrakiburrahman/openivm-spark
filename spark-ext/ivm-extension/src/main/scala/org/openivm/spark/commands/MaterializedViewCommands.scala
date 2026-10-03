@@ -39,6 +39,7 @@ import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
+import org.openivm.spark.insights.OpenIvmInsightsBroker
 import org.openivm.spark.streaming.StreamingTableManager
 import org.openivm.spark.telemetry.{
   KvLogValue,
@@ -2621,7 +2622,9 @@ case class CreateMaterializedViewCommand(
       RefreshSqlLog.start(spark, profile.refreshId, commandName, RefreshSqlLog.ModeCreate)
     var createOutcome               = "create_failed"
     var createFinalizationAttempted = false
-    val finalizeUnderLock           = OpenIvmExecutionSpan.hasActiveExport
+    var createInsightClassification =
+      Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
+    val finalizeUnderLock = OpenIvmExecutionSpan.hasActiveExport
 
     def finalizeCreate(): Unit =
       if (!createFinalizationAttempted) {
@@ -2657,7 +2660,12 @@ case class CreateMaterializedViewCommand(
               try {
                 CommandConcurrencyInjection.maybePauseBeforeCreate()
                 DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                  runCreate(isolated, profile, sqlLog)
+                  runCreate(
+                    isolated,
+                    profile,
+                    sqlLog,
+                    classification => createInsightClassification = Some(classification)
+                  )
                 }
               } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
@@ -2674,6 +2682,15 @@ case class CreateMaterializedViewCommand(
         OpenIvmStateSync.backupNow(spark)
         createOutcome = outcome
       }
+      if (outcome == "create_executed")
+        createInsightClassification.foreach { classification =>
+          OpenIvmMaterializedViewInsightEvents.createCompleted(
+            spark,
+            profile.refreshId,
+            commandName,
+            classification
+          )
+        }
       Seq.empty
     } finally {
       try finalizeCreate()
@@ -2687,7 +2704,8 @@ case class CreateMaterializedViewCommand(
   private def runCreate(
       spark: SparkSession,
       profile: RefreshProfile,
-      sqlLog: RefreshSqlLog
+      sqlLog: RefreshSqlLog,
+      recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit
   ): String = {
     import MvCommandHelper._
 
@@ -2705,8 +2723,12 @@ case class CreateMaterializedViewCommand(
     } match {
       case Some(meta) if ifNotExists =>
         if (OpenIvmExecutionSpan.hasActiveExport) {
-          recordExistingCreateTelemetry(spark, meta)
+          recordExistingCreateTelemetry(spark, meta, profile.refreshId)
           OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
+          return "create_already_exists"
+        }
+        if (OpenIvmInsightsBroker.hasActiveCapture(spark)) {
+          recordExistingCreateInsights(spark, meta, profile.refreshId)
           return "create_already_exists"
         }
         return "create_executed"
@@ -3012,6 +3034,17 @@ case class CreateMaterializedViewCommand(
       effectiveRefreshType = Some(effectiveRefreshTypeName),
       refreshReason = Some(classifyReason)
     )
+    OpenIvmInsightEvents.classification(
+      spark = spark,
+      operationId = profile.refreshId,
+      materializedView = metaName(name),
+      operation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      compileRefreshType = classification.compileRefreshTypeName,
+      effectiveRefreshType = effectiveRefreshTypeName,
+      reason = classifyReason,
+      emitsCascadeViewDelta = emitsCascadeViewDelta,
+      upstreamSnapshotTrigger = classification.upstreamSnapshotTrigger
+    )
     // `sourceIsMv`/`distinctUpstreamMvCount` are computed for logging visibility
     // only; the demotion is driven by the shared classifier above.
     val _ = (sourceIsMv, distinctUpstreamMvCount)
@@ -3176,16 +3209,32 @@ case class CreateMaterializedViewCommand(
           ) ++ pinnedWatermarks
       }
     }
-    OpenIvmExecutionSpan.recordActiveSourceVersions(
-      {
-        val watermarksBySource = watermarkProps.toSeq.flatMap { case (key, value) =>
-          ChangeWatermark
-            .decodeDeltaVersion(value)
-            .map(version => key.stripPrefix(MvMetadata.WatermarkKeyPrefix) -> version.version)
-        }.toMap
+    val watermarksBySource = watermarkProps.toSeq.flatMap { case (key, value) =>
+      ChangeWatermark
+        .decodeDeltaVersion(value)
+        .map(version => key.stripPrefix(MvMetadata.WatermarkKeyPrefix) -> version.version)
+    }.toMap
+    if (OpenIvmExecutionSpan.hasActiveExport) {
+      val sourceVersions = telemetrySourceVersions(spark, qualNames, watermarksBySource)
+      OpenIvmExecutionSpan.recordActiveSourceVersions(sourceVersions)
+      OpenIvmInsightEvents.sourceVersions(
+        spark,
+        profile.refreshId,
+        metaName(name),
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+        "source_versions",
+        sourceVersions
+      )
+    } else {
+      OpenIvmInsightEvents.sourceVersions(
+        spark,
+        profile.refreshId,
+        metaName(name),
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+        "source_versions",
         telemetrySourceVersions(spark, qualNames, watermarksBySource)
-      }
-    )
+      )
+    }
     val userProps = properties - MvMetadata.BackingViewSuffixKey
     // Authoritative direct managed-MV dependency map: resolve which sources are
     // managed MVs by PHYSICAL Delta identity (never lexical name matching) and
@@ -3296,8 +3345,9 @@ case class CreateMaterializedViewCommand(
                 var attempt      = 0
                 var done         = false
                 while (!done) {
-                  val currentAttempt = attempt
-                  val attemptT0      = System.nanoTime()
+                  val currentAttempt   = attempt
+                  val attemptT0        = System.nanoTime()
+                  var attemptSucceeded = false
                   try {
                     CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
                     val dataWriteT0 = System.nanoTime()
@@ -3308,6 +3358,7 @@ case class CreateMaterializedViewCommand(
                     dataWriteOutcome match {
                       case Right(df) =>
                         recordPlanMetrics(df, ctasStmtKind)
+                        attemptSucceeded = true
                         done = true
                       case Left(t)
                           if attempt < 3 &&
@@ -3329,7 +3380,8 @@ case class CreateMaterializedViewCommand(
                       attemptIdx = currentAttempt,
                       stmtKind = ctasStmtKind,
                       sql = dataWriteSql,
-                      durationMs = ms
+                      durationMs = ms,
+                      succeeded = attemptSucceeded
                     )
                   }
                 }
@@ -3372,7 +3424,8 @@ case class CreateMaterializedViewCommand(
               s"data_table=${sqlIdent(dataIdent)}"
             ) {
               CreateCatalogPublicationAdmission.withPermit(spark) {
-                val publicationT0 = System.nanoTime()
+                val publicationT0        = System.nanoTime()
+                var publicationSucceeded = false
                 try {
                   spark.sql(catalogRegistrationSql)
                   // The registration must resolve to the exact Delta table this
@@ -3386,6 +3439,7 @@ case class CreateMaterializedViewCommand(
                     requireExists = true,
                     expectedTableId = writtenDataTableId
                   )
+                  publicationSucceeded = true
                 } finally {
                   catalogPublicationMs = (System.nanoTime() - publicationT0) / 1000000L
                   sqlLog.record(
@@ -3394,7 +3448,8 @@ case class CreateMaterializedViewCommand(
                     attemptIdx = 0,
                     stmtKind = "ddl",
                     sql = catalogRegistrationSql,
-                    durationMs = catalogPublicationMs
+                    durationMs = catalogPublicationMs,
+                    succeeded = publicationSucceeded
                   )
                 }
               }
@@ -3462,12 +3517,14 @@ case class CreateMaterializedViewCommand(
             val viewSql =
               s"CREATE VIEW ${sqlIdent(name)} ${publicViewPropertiesClause}AS " +
                 s"SELECT $colList FROM ${sqlIdent(dataIdent)}$whereClause$suffixClause"
-            val t0 = System.nanoTime()
+            val t0            = System.nanoTime()
+            var viewSucceeded = false
             try {
               spark.sql(viewSql)
               createdPublicView = spark.table(sqlIdent(name)).queryExecution.analyzed.collectFirst { case view: View =>
                 view.desc
               }
+              viewSucceeded = true
             } finally {
               val ms = (System.nanoTime() - t0) / 1000000L
               sqlLog.record(
@@ -3476,7 +3533,8 @@ case class CreateMaterializedViewCommand(
                 attemptIdx = 0,
                 stmtKind = "ddl",
                 sql = viewSql,
-                durationMs = ms
+                durationMs = ms,
+                succeeded = viewSucceeded
               )
             }
           }
@@ -3506,10 +3564,21 @@ case class CreateMaterializedViewCommand(
         throw t
     }
 
+    recordInsightClassification(
+      OpenIvmMaterializedViewInsightEvents.Classification(
+        classification.compileRefreshTypeName,
+        classification.refreshTypeName,
+        classification.reason
+      )
+    )
     "create_executed"
   }
 
-  private def recordExistingCreateTelemetry(spark: SparkSession, meta: MvMetadata): Unit = {
+  private def recordExistingCreateTelemetry(
+      spark: SparkSession,
+      meta: MvMetadata,
+      operationId: String
+  ): Unit = {
     import MvCommandHelper._
 
     val compileRefreshType = meta.properties
@@ -3535,6 +3604,16 @@ case class CreateMaterializedViewCommand(
       effectiveRefreshType = Some(meta.refreshTypeName),
       refreshReason = Some(refreshReason)
     )
+    OpenIvmInsightEvents.classification(
+      spark = spark,
+      operationId = operationId,
+      materializedView = metaName(name),
+      operation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      compileRefreshType = compileRefreshType,
+      effectiveRefreshType = meta.refreshTypeName,
+      reason = refreshReason,
+      emitsCascadeViewDelta = meta.emitsCascadeViewDelta
+    )
 
     val reCreateBinding = requirePinBinding(
       spark,
@@ -3555,15 +3634,67 @@ case class CreateMaterializedViewCommand(
     }
     val pinStatus = meta.timeTravelPinStatus.getOrElse(derivedPin.status)
     OpenIvmExecutionSpan.recordActiveTimeTravelPinStatus(pinStatus, derivedPin.reason)
-    OpenIvmExecutionSpan.recordActiveSourceVersions(
-      {
-        val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-          source -> version
-        }
-        telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
-      }
-    )
+    val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+      source -> version
+    }
+    val sourceVersions = telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+    OpenIvmExecutionSpan.recordActiveSourceVersions(sourceVersions)
+    if (sourceVersions.nonEmpty)
+      OpenIvmInsightEvents.sourceVersions(
+        spark,
+        operationId,
+        metaName(name),
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+        "source_versions",
+        sourceVersions
+      )
     OpenIvmExecutionSpan.recordActivePendingDeltaCount(0L)
+    OpenIvmInsightEvents.pendingDeltas(
+      spark,
+      operationId,
+      metaName(name),
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      0,
+      Map.empty
+    )
+  }
+
+  private def recordExistingCreateInsights(
+      spark: SparkSession,
+      meta: MvMetadata,
+      operationId: String
+  ): Unit = {
+    import MvCommandHelper._
+
+    OpenIvmInsightEvents.classification(
+      spark = spark,
+      operationId = operationId,
+      materializedView = metaName(name),
+      operation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      compileRefreshType = meta.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, meta.refreshTypeName),
+      effectiveRefreshType = meta.refreshTypeName,
+      reason = meta.properties.getOrElse(MvMetadata.RefreshReasonKey, "persisted_classification"),
+      emitsCascadeViewDelta = meta.emitsCascadeViewDelta
+    )
+    val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+      source -> version
+    }
+    OpenIvmInsightEvents.sourceVersions(
+      spark,
+      operationId,
+      metaName(name),
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      "source_versions",
+      telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+    )
+    OpenIvmInsightEvents.pendingDeltas(
+      spark,
+      operationId,
+      metaName(name),
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
+      0,
+      Map.empty
+    )
   }
 }
 
@@ -4125,11 +4256,22 @@ case class RefreshMaterializedViewCommand(
     var refreshTypeForFailure                                       = "UNKNOWN"
     var pendingDeltasForFailure                                     = 0
     var preparedSourceAdvance: Option[PreparedSourceVersionAdvance] = None
+    var refreshInsightClassification =
+      Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
 
     def emitEnd(outcome: String, refreshTypeName: String, pendingDeltas: Int): Unit = {
       if (!endEmitted) {
         endEmitted = true
         queryLogOutcome = outcome
+        refreshInsightClassification.foreach { classification =>
+          OpenIvmMaterializedViewInsightEvents.refreshCompleted(
+            spark,
+            refreshId,
+            viewMeta,
+            outcome,
+            classification
+          )
+        }
         OpenIvmExecutionSpan.recordActivePendingDeltaCount(pendingDeltas.toLong)
         val totalMs = (System.nanoTime() - refreshT0) / 1000000L
         RefreshPerf.emit(
@@ -4161,20 +4303,45 @@ case class RefreshMaterializedViewCommand(
           )
         }
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
+      val compileRefreshType = meta.properties
+        .get(MvMetadata.CompileRefreshTypeKey)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .getOrElse(meta.refreshTypeName)
+      val refreshReason = meta.properties
+        .get(MvMetadata.RefreshReasonKey)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .getOrElse("persisted_classification")
+      refreshInsightClassification = Some(
+        OpenIvmMaterializedViewInsightEvents.Classification(
+          compileRefreshType,
+          meta.refreshTypeName,
+          refreshReason
+        )
+      )
       refreshTypeForFailure = meta.refreshTypeName
       preparedSourceAdvance = sourceVersionAdvance.map(prepareSourceVersionAdvance(spark, meta, _))
       val sourceVersionsAlreadyApplied =
         preparedSourceAdvance.exists(_.changeBatches.isEmpty)
       preparedSourceAdvance.foreach { advance =>
-        OpenIvmExecutionSpan.recordActiveSourceVersions(
-          advance.requestedBatches.map(batch =>
-            OpenIvmTelemetryContract.SourceVersion(
-              batch.baseTable,
-              batch.startVersionInclusive,
-              batch.endVersionInclusive
-            )
+        val sourceVersions = advance.requestedBatches.map(batch =>
+          OpenIvmTelemetryContract.SourceVersion(
+            batch.baseTable,
+            batch.startVersionInclusive,
+            batch.endVersionInclusive
           )
         )
+        OpenIvmExecutionSpan.recordActiveSourceVersions(sourceVersions)
+        if (sourceVersions.nonEmpty)
+          OpenIvmInsightEvents.sourceVersions(
+            spark,
+            refreshId,
+            viewMeta,
+            org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+            "requested_source_versions",
+            sourceVersions
+          )
         if (advance.changeBatches.isEmpty && !OpenIvmExecutionSpan.hasActiveExport) {
           logInfo(
             s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
@@ -4185,26 +4352,49 @@ case class RefreshMaterializedViewCommand(
         }
       }
       OpenIvmExecutionSpan.recordActiveRefreshClassification(
-        compileRefreshType = meta.properties
-          .get(MvMetadata.CompileRefreshTypeKey)
-          .map(_.trim)
-          .filter(_.nonEmpty)
-          .orElse(Option(meta.refreshTypeName).map(_.trim).filter(_.nonEmpty)),
+        compileRefreshType = Some(compileRefreshType),
         effectiveRefreshType = Option(meta.refreshTypeName).map(_.trim).filter(_.nonEmpty),
-        refreshReason = meta.properties.get(MvMetadata.RefreshReasonKey).map(_.trim).filter(_.nonEmpty)
+        refreshReason = Some(refreshReason)
+      )
+      OpenIvmInsightEvents.classification(
+        spark = spark,
+        operationId = refreshId,
+        materializedView = viewMeta,
+        operation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+        compileRefreshType = compileRefreshType,
+        effectiveRefreshType = meta.refreshTypeName,
+        reason = refreshReason,
+        emitsCascadeViewDelta = meta.emitsCascadeViewDelta
       )
 
       val viewNameStr      = metaName(name)
       val propagation      = ChangePropagationFactory.forSession(spark)
       val sourceWatermarks = meta.changeWatermarks
-      OpenIvmExecutionSpan.recordActiveSourceVersions(
-        {
-          val watermarksBySource = sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
-            source -> version
-          }
-          telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+      val watermarksBySource =
+        sourceWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
+          source -> version
         }
-      )
+      if (OpenIvmExecutionSpan.hasActiveExport) {
+        val sourceVersions = telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+        OpenIvmExecutionSpan.recordActiveSourceVersions(sourceVersions)
+        OpenIvmInsightEvents.sourceVersions(
+          spark,
+          refreshId,
+          viewMeta,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+          "source_watermarks",
+          sourceVersions
+        )
+      } else {
+        OpenIvmInsightEvents.sourceVersions(
+          spark,
+          refreshId,
+          viewMeta,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+          "source_watermarks",
+          telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+        )
+      }
 
       // Snapshot-pin telemetry contract.  The status recorded at CREATE is
       // authoritative and is re-proved here against the user's body through the
@@ -4534,30 +4724,49 @@ case class RefreshMaterializedViewCommand(
       }
 
       pendingDeltasForFailure = changeBatches.size
-      OpenIvmExecutionSpan.recordActiveSourceVersions {
-        val versionBatchesBySource =
-          changeBatches.groupBy(_.baseTable.toLowerCase(java.util.Locale.ROOT))
-        meta.sourceTables.flatMap { source =>
-          val versionBatches =
-            versionBatchesBySource.getOrElse(source.toLowerCase(java.util.Locale.ROOT), Seq.empty)
-          val starts = versionBatches.flatMap {
-            case batch: CdfChangeBatch           => Some(batch.startVersionExclusive)
-            case batch: SourceVersionChangeBatch => Some(batch.startVersionInclusive)
-            case _                               => None
-          }
-          val ends = versionBatches.flatMap {
-            case batch: CdfChangeBatch           => Some(batch.endVersionInclusive)
-            case batch: SourceVersionChangeBatch => Some(batch.endVersionInclusive)
-            case _                               => None
-          }
-          if (starts.nonEmpty && ends.nonEmpty)
-            Some(OpenIvmTelemetryContract.SourceVersion(source, starts.min, ends.max))
-          else
-            sourceWatermarks.get(source).collect { case ChangeWatermark.DeltaVersion(version) =>
-              OpenIvmTelemetryContract.SourceVersion(source, version, version)
+      val observedSourceVersions =
+        if (OpenIvmExecutionSpan.hasActiveExport || OpenIvmInsightsBroker.hasActiveCapture(spark)) {
+          val versionBatchesBySource =
+            changeBatches.groupBy(_.baseTable.toLowerCase(java.util.Locale.ROOT))
+          meta.sourceTables.flatMap { source =>
+            val versionBatches =
+              versionBatchesBySource.getOrElse(source.toLowerCase(java.util.Locale.ROOT), Seq.empty)
+            val starts = versionBatches.flatMap {
+              case batch: CdfChangeBatch           => Some(batch.startVersionExclusive)
+              case batch: SourceVersionChangeBatch => Some(batch.startVersionInclusive)
+              case _                               => None
             }
-        }
-      }
+            val ends = versionBatches.flatMap {
+              case batch: CdfChangeBatch           => Some(batch.endVersionInclusive)
+              case batch: SourceVersionChangeBatch => Some(batch.endVersionInclusive)
+              case _                               => None
+            }
+            if (starts.nonEmpty && ends.nonEmpty)
+              Some(OpenIvmTelemetryContract.SourceVersion(source, starts.min, ends.max))
+            else
+              sourceWatermarks.get(source).collect { case ChangeWatermark.DeltaVersion(version) =>
+                OpenIvmTelemetryContract.SourceVersion(source, version, version)
+              }
+          }
+        } else Seq.empty
+      OpenIvmExecutionSpan.recordActiveSourceVersions(observedSourceVersions)
+      if (observedSourceVersions.nonEmpty)
+        OpenIvmInsightEvents.sourceVersions(
+          spark,
+          refreshId,
+          viewMeta,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+          "pending_source_versions",
+          observedSourceVersions
+        )
+      OpenIvmInsightEvents.pendingDeltas(
+        spark,
+        refreshId,
+        viewMeta,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Refresh,
+        changeBatches.size,
+        changeBatches.groupBy(_.baseTable).map { case (source, batches) => source -> batches.size }
+      )
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
@@ -4973,7 +5182,15 @@ case class RefreshMaterializedViewCommand(
                     } catch {
                       case t: Throwable =>
                         val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
+                        sqlLog.record(
+                          "full_refresh_stmt",
+                          qOrder,
+                          attempt - 1,
+                          kind,
+                          writerLog,
+                          ms,
+                          succeeded = false
+                        )
                         throw t
                     }
                   }
@@ -5012,16 +5229,18 @@ case class RefreshMaterializedViewCommand(
               "full_refresh_cascade_snapshot",
               s"pre_version=$preVersion;exact_diff=$exactDiff;consumers=${cascadeKeys.size}"
             ) {
-              val qOrder = qlogOrder.getAndIncrement()
-              val t0     = System.nanoTime()
-              try
+              val qOrder           = qlogOrder.getAndIncrement()
+              val t0               = System.nanoTime()
+              var cascadeSucceeded = false
+              try {
                 spark
                   .sql(cascadeSelect)
                   .write
                   .format("delta")
                   .mode("overwrite")
                   .save(cascadePath)
-              finally
+                cascadeSucceeded = true
+              } finally {
                 sqlLog.record(
                   category = "full_refresh_cascade",
                   stmtOrder = qOrder,
@@ -5029,8 +5248,10 @@ case class RefreshMaterializedViewCommand(
                   stmtKind = "insert_overwrite",
                   sql = "-- synthetic representation of the full-refresh signed view-delta write\n" +
                     s"INSERT OVERWRITE delta.`$cascadePath`\n$cascadeSelect",
-                  durationMs = (System.nanoTime() - t0) / 1000000L
+                  durationMs = (System.nanoTime() - t0) / 1000000L,
+                  succeeded = cascadeSucceeded
                 )
+              }
             }
             profile.timeStep("metadata_post_sql", "phase=record_cascade") {
               RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
@@ -5254,11 +5475,14 @@ case class RefreshMaterializedViewCommand(
                 val diagnosticSql = sourceVersionBatch
                   .map(SourceVersionDelta.buildBagDiffSql(_, schema))
                   .getOrElse(propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches))
+                var registrationSucceeded = false
                 val viewSql =
                   try {
-                    sourceVersionBatch
+                    val registered = sourceVersionBatch
                       .map(SourceVersionDelta.registerSourceDeltaView(spark, _, schema))
                       .getOrElse(propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches))
+                    registrationSucceeded = true
+                    registered
                   } finally {
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record(
@@ -5267,7 +5491,8 @@ case class RefreshMaterializedViewCommand(
                       attemptIdx = 0,
                       stmtKind = "temp_view",
                       sql = diagnosticSql,
-                      durationMs = ms
+                      durationMs = ms,
+                      succeeded = registrationSucceeded
                     )
                   }
                 // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
@@ -5319,6 +5544,7 @@ case class RefreshMaterializedViewCommand(
             val facts    = observedCompileFacts.getOrElse(refreshCompileFacts())
             val estimate = RefreshCostModel.estimate(facts)
             val decision = RefreshIntelligence.decide(facts, estimate, runtimeDeltaSizeForDecision)
+            OpenIvmInsightEvents.refreshDecision(spark, refreshId, viewMeta, decision)
             val intelligenceProps =
               (if (FeatureGate.costModelEnabled(spark)) Map(MvMetadata.LastCostModelHintKey -> estimate.hint)
                else Map.empty[String, String]) ++
@@ -5731,7 +5957,7 @@ case class RefreshMaterializedViewCommand(
                   } catch {
                     case t: Throwable =>
                       val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
+                      sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms, succeeded = false)
                       throw t
                   }
                 }
@@ -5770,7 +5996,7 @@ case class RefreshMaterializedViewCommand(
                   } catch {
                     case t: Throwable =>
                       val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
+                      sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms, succeeded = false)
                       throw t
                   }
                 }
@@ -5837,8 +6063,9 @@ case class RefreshMaterializedViewCommand(
                     )
                     .flatMap { selectBody =>
                       val scratchView = s"openivm_scratch_${java.util.UUID.randomUUID().toString.replace("-", "_")}"
+                      val qOrder      = qlogOrder.getAndIncrement()
+                      val t0          = System.nanoTime()
                       try {
-                        val t0 = System.nanoTime()
                         val rowCount = withPlanTimeBroadcastDisabled {
                           val d = spark.sql(selectBody)
                           d.createOrReplaceGlobalTempView(scratchView)
@@ -5865,7 +6092,7 @@ case class RefreshMaterializedViewCommand(
                         )
                         sqlLog.record(
                           category = "fused_view_delta_select",
-                          stmtOrder = qlogOrder.getAndIncrement(),
+                          stmtOrder = qOrder,
                           attemptIdx = 0,
                           stmtKind = "view_delta_ctas",
                           sql = selectBody,
@@ -5875,6 +6102,15 @@ case class RefreshMaterializedViewCommand(
                         Some(scratchView)
                       } catch {
                         case t: Throwable =>
+                          sqlLog.record(
+                            category = "fused_view_delta_select",
+                            stmtOrder = qOrder,
+                            attemptIdx = 0,
+                            stmtKind = "view_delta_ctas",
+                            sql = selectBody,
+                            durationMs = (System.nanoTime() - t0) / 1000000L,
+                            succeeded = false
+                          )
                           // Best-effort cleanup and fall through to the on-disk path
                           try spark.catalog.uncacheTable(s"global_temp.$scratchView")
                           catch { case _: Throwable => () }
@@ -6426,7 +6662,8 @@ case class RefreshMaterializedViewCommand(
                           attempt - 1,
                           "delete",
                           deleteSql,
-                          ms
+                          ms,
+                          succeeded = false
                         )
                         r
                       } catch {
@@ -6688,14 +6925,17 @@ case class RefreshMaterializedViewCommand(
             catch { case _: Throwable => () }
           }
           tempViewShortNames.foreach { n =>
-            val dropSql = StagingDeltaView.dropSourceDeltaViewSql(n)
-            val t0      = System.nanoTime()
+            val dropSql       = StagingDeltaView.dropSourceDeltaViewSql(n)
+            val t0            = System.nanoTime()
+            var dropSucceeded = true
             try spark.catalog.uncacheTable(s"openivm_delta_$n")
             catch { case _: Throwable => () }
             try {
               spark.sql(dropSql)
-            } catch { case _: Throwable => () }
-            finally {
+            } catch {
+              case _: Throwable =>
+                dropSucceeded = false
+            } finally {
               val ms = (System.nanoTime() - t0) / 1000000L
               sqlLog.record(
                 category = "drop_cleanup",
@@ -6703,7 +6943,8 @@ case class RefreshMaterializedViewCommand(
                 attemptIdx = 0,
                 stmtKind = "drop",
                 sql = dropSql,
-                durationMs = ms
+                durationMs = ms,
+                succeeded = dropSucceeded
               )
             }
           }
@@ -6757,7 +6998,9 @@ case class RefreshMaterializedViewCommand(
             throw t
         }
     } finally {
-      sqlLog.finish(queryLogOutcome)
+      try {
+        if (!endEmitted) profile.flush()
+      } finally sqlLog.finish(queryLogOutcome)
     }
   }
 
@@ -7799,7 +8042,8 @@ case class RefreshMaterializedViewCommand(
             s"-- synthetic representation of postRefreshCleanup trigger write\n" +
               s"INSERT OVERWRITE delta.`$triggerPath`\n" +
               s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0"
-          val t0 = System.nanoTime()
+          val t0               = System.nanoTime()
+          var triggerSucceeded = false
           try {
             spark
               .sql(s"SELECT * FROM ${sqlIdent(name)} WHERE 1 = 0")
@@ -7807,6 +8051,7 @@ case class RefreshMaterializedViewCommand(
               .format("delta")
               .mode("overwrite")
               .save(triggerPath)
+            triggerSucceeded = true
           } finally {
             val ms = (System.nanoTime() - t0) / 1000000L
             sqlLog.record(
@@ -7815,7 +8060,8 @@ case class RefreshMaterializedViewCommand(
               attemptIdx = 0,
               stmtKind = "insert_overwrite",
               sql = syntheticSql,
-              durationMs = ms
+              durationMs = ms,
+              succeeded = triggerSucceeded
             )
           }
 
@@ -7905,39 +8151,154 @@ case class RefreshMaterializedViewCommand(
 
 private[spark] object MaterializedViewLifecycle {
 
-  def dropOne(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): Unit = {
+  def dropOne(
+      spark: SparkSession,
+      name: TableIdentifier,
+      meta: MvMetadata,
+      operationId: String
+  ): Unit = {
     import MvCommandHelper._
 
+    val viewName = metaName(name)
     if (meta.usesBackingDataTable) {
       spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "catalog_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.PublicViewRemoved,
+        message = "Removed the public materialized-view wrapper.",
+        details = Seq("object_kind" -> "view")
+      )
       spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "catalog_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.BackingTableRemoved,
+        message = "Removed the materialized-view backing table.",
+        details = Seq("object_kind" -> "backing_table")
+      )
     } else {
       spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "catalog_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.MaterializedTableRemoved,
+        message = "Removed the materialized-view table.",
+        details = Seq("object_kind" -> "materialized_table")
+      )
     }
 
-    val hadoopPath = new Path(meta.location)
-    val fs         = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
-    if (fs.exists(hadoopPath)) fs.delete(hadoopPath, /* recursive = */ true)
+    val hadoopPath  = new Path(meta.location)
+    val fs          = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
+    val pathExisted = fs.exists(hadoopPath)
+    val pathDeleted = !pathExisted || fs.delete(hadoopPath, /* recursive = */ true)
+    OpenIvmInsightEvents.action(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+      stage = "storage_cleanup",
+      code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StoragePathRemoved,
+      message = "Processed materialized-view storage-path cleanup.",
+      details = Seq(
+        "path"    -> meta.location,
+        "existed" -> pathExisted,
+        "deleted" -> pathDeleted
+      )
+    )
 
     val mvQual      = metaName(name)
     val mvShort     = name.identifier
     val propagation = ChangePropagationFactory.forSession(spark)
     propagation.removeForBaseTable(spark, mvQual)
     if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
+    OpenIvmInsightEvents.action(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+      stage = "change_propagation_cleanup",
+      code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.ChangePropagationRowsRemoved,
+      message = "Removed materialized-view change-propagation rows.",
+      details = Seq(
+        "qualified_identity" -> mvQual,
+        "short_identity"     -> mvShort
+      )
+    )
     CdfWatermarkCatalog.removeForView(spark, mvQual)
     if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
     CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
     if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
+    OpenIvmInsightEvents.action(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+      stage = "cdf_watermark_cleanup",
+      code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.CdfWatermarkStateRemoved,
+      message = "Removed materialized-view CDF watermark state.",
+      details = Seq(
+        "qualified_identity" -> mvQual,
+        "short_identity"     -> mvShort
+      )
+    )
 
     val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
     val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
     val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
     try {
-      val vdFs = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
-      if (vdFs.exists(viewDeltaNsPath)) vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
-    } catch { case _: Throwable => () }
+      val vdFs             = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
+      val namespaceExisted = vdFs.exists(viewDeltaNsPath)
+      val namespaceDeleted = !namespaceExisted || vdFs.delete(viewDeltaNsPath, /* recursive = */ true)
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "view_delta_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.ViewDeltaNamespaceRemoved,
+        message = "Processed materialized-view delta-namespace cleanup.",
+        details = Seq(
+          "path"    -> viewDeltaNsPath.toString,
+          "existed" -> namespaceExisted,
+          "deleted" -> namespaceDeleted
+        )
+      )
+    } catch {
+      case error: Throwable =>
+        OpenIvmInsightEvents.action(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          stage = "view_delta_cleanup",
+          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.ViewDeltaNamespaceCleanupFailed,
+          message = "Materialized-view delta-namespace cleanup could not be completed.",
+          status = "cleanup_warning",
+          level = org.openivm.spark.insights.OpenIvmInsightsContract.Level.Warn,
+          details = Seq("error_class" -> error.getClass.getName)
+        )
+    }
 
     MvCatalog.remove(spark, name)
+    OpenIvmInsightEvents.action(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+      stage = "catalog_metadata_cleanup",
+      code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.CatalogEntryRemoved,
+      message = "Removed the OpenIVM catalog entry."
+    )
   }
 }
 
@@ -7949,44 +8310,104 @@ case class DropMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
-    RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(metaName(name))) {
-      MvCatalog.lookup(spark, name) match {
-        case None if ifExists =>
-          Seq.empty
-        case None =>
-          throw new AnalysisException(
-            "TABLE_OR_VIEW_NOT_FOUND",
-            Map("relationName" -> sqlIdent(name))
-          )
-        case Some(meta) =>
-          val descendants = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
-          RefreshMutex.withLocks(descendants.map(_.identity)) {
-            StreamingTableManager.withCascadeLocks(spark, descendants) {
-              val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
-              if (verified != descendants)
-                throw new AnalysisException(
-                  "_LEGACY_ERROR_TEMP_2273",
+    val operationId = UUID.randomUUID().toString
+    val viewName    = metaName(name)
+    val startedAt   = System.nanoTime()
+    var outcome     = "drop_completed"
+    OpenIvmInsightEvents.operationStarted(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop
+    )
+    try {
+      val rows: Seq[Row] = RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(viewName)) {
+        MvCatalog.lookup(spark, name) match {
+          case None if ifExists =>
+            outcome = "drop_missing_ignored"
+            Seq.empty[Row]
+          case None =>
+            throw new AnalysisException(
+              "TABLE_OR_VIEW_NOT_FOUND",
+              Map("relationName" -> sqlIdent(name))
+            )
+          case Some(meta) =>
+            val descendants   = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+            val cascadeReason = OpenIvmMaterializedViewInsightEvents.dropReason(spark, viewName)
+            val identity      = StreamingDependencyCatalog.materializedIdentity(viewName)
+            OpenIvmInsightEvents.decision(
+              spark,
+              operationId,
+              viewName,
+              org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+              stage = "cascade_plan",
+              code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.DropCascadePlan,
+              message = "Resolved the managed dependent cascade plan.",
+              status = "planned",
+              details = Seq(
+                "reason"          -> cascadeReason,
+                "dependent_count" -> descendants.size,
+                "dependents" -> descendants.zipWithIndex.map { case (target, index) =>
                   Map(
-                    "message" ->
-                      s"Materialized view '${metaName(name)}' dependencies changed during DROP admission"
+                    "order"     -> index,
+                    "kind"      -> target.kind,
+                    "name"      -> target.name.mkString("."),
+                    "identity"  -> target.identity,
+                    "caused_by" -> target.causedBy.getOrElse(identity),
+                    "reason"    -> cascadeReason
+                  )
+                }
+              )
+            )
+            RefreshMutex.withLocks(descendants.map(_.identity)) {
+              StreamingTableManager.withCascadeLocks(spark, descendants) {
+                val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+                if (verified != descendants)
+                  throw new AnalysisException(
+                    "_LEGACY_ERROR_TEMP_2273",
+                    Map(
+                      "message" ->
+                        s"Materialized view '$viewName' dependencies changed during DROP admission"
+                    )
+                  )
+                StreamingTableManager.dropResolvedCascade(
+                  spark,
+                  descendants,
+                  org.openivm.spark.streaming.StreamingArchiveContext(
+                    action = "cascade",
+                    operationId = operationId,
+                    rootTarget = identity,
+                    causedBy = Some(identity)
                   )
                 )
-              val identity = StreamingDependencyCatalog.materializedIdentity(metaName(name))
-              StreamingTableManager.dropResolvedCascade(
-                spark,
-                descendants,
-                org.openivm.spark.streaming.StreamingArchiveContext(
-                  action = "cascade",
-                  operationId = UUID.randomUUID().toString,
-                  rootTarget = identity,
-                  causedBy = Some(identity)
-                )
-              )
-              MaterializedViewLifecycle.dropOne(spark, name, meta)
-              Seq.empty
+                MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
+                Seq.empty[Row]
+              }
             }
-          }
+        }
       }
+      OpenIvmInsightEvents.operationFinished(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        outcome,
+        (System.nanoTime() - startedAt) / 1000000L,
+        failed = false
+      )
+      rows
+    } catch {
+      case error: Throwable =>
+        OpenIvmInsightEvents.operationFinished(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          outcome = "drop_failed",
+          durationMs = (System.nanoTime() - startedAt) / 1000000L,
+          failed = true
+        )
+        throw error
     }
   }
 }

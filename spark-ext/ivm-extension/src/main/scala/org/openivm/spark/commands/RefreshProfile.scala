@@ -3,6 +3,7 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
+import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
@@ -52,14 +53,20 @@ final class RefreshProfile private (
     * path only measures when Spark-native metrics are enabled.
     */
   def timeStep[A](stepName: String, detail: String = "")(body: => A): A = {
-    val needsTiming = active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName)
+    val needsTiming =
+      active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName) ||
+        OpenIvmInsightsBroker.hasActiveCapture(spark)
     if (!needsTiming) return body
-    val t0 = System.nanoTime()
-    try body
-    finally {
+    val t0        = System.nanoTime()
+    var succeeded = false
+    try {
+      val result = body
+      succeeded = true
+      result
+    } finally {
       val elapsedNanos = System.nanoTime() - t0
       val elapsedMs    = elapsedNanos / 1000000L
-      if (active) appendStep(stepName, detail, elapsedMs)
+      if (active) appendStepInternal(stepName, detail, elapsedMs, succeeded)
       else {
         if (OpenIvmExecutionSpan.needsProfileStepTiming(stepName))
           executionSpan.recordProfileStep(stepName, detail, elapsedMs)
@@ -68,6 +75,7 @@ final class RefreshProfile private (
           stepName,
           elapsedNanos
         )
+        emitStepInsight(stepName, detail, elapsedMs, succeeded)
       }
     }
   }
@@ -78,12 +86,22 @@ final class RefreshProfile private (
     * outside the lock body).
     */
   def appendStep(stepName: String, detail: String, durationMs: Long): Unit = {
+    appendStepInternal(stepName, detail, durationMs, succeeded = true)
+  }
+
+  private def appendStepInternal(
+      stepName: String,
+      detail: String,
+      durationMs: Long,
+      succeeded: Boolean
+  ): Unit = {
     executionSpan.recordProfileStep(stepName, detail, durationMs)
     OpenIvmMetrics.recordLifecyclePhase(
       if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
       stepName,
       durationMs * 1000000L
     )
+    emitStepInsight(stepName, detail, durationMs, succeeded)
     if (!active) return
     buffer += RefreshProfileRow(
       refreshId = refreshId,
@@ -100,11 +118,12 @@ final class RefreshProfile private (
   def completeSpan(outcome: String, threadName: String): Unit = synchronized {
     if (spanCompleted) return
     val endEpochMs = System.currentTimeMillis()
+    val durationMs = (System.nanoTime() - spanStartNanos) / 1000000L
     if (active) {
       appendStep(
         "query_span",
         s"start_epoch_ms=$spanStartEpochMs;end_epoch_ms=$endEpochMs;thread=$threadName;outcome=$outcome",
-        (System.nanoTime() - spanStartNanos) / 1000000L
+        durationMs
       )
     }
     executionSpan.complete(outcome, threadName)
@@ -157,6 +176,56 @@ final class RefreshProfile private (
       RefreshProfile.clearActive(this)
     }
   }
+
+  private def operationName: String =
+    mode match {
+      case RefreshProfile.Mode.Create  => OpenIvmInsightsContract.Operation.Create
+      case RefreshProfile.Mode.Refresh => OpenIvmInsightsContract.Operation.Refresh
+    }
+
+  private def emitStepInsight(
+      stepName: String,
+      detail: String,
+      durationMs: Long,
+      succeeded: Boolean
+  ): Unit = {
+    if (spark == null || !OpenIvmInsightsBroker.hasActiveCapture(spark)) return
+    OpenIvmInsightsBroker.emit(spark) {
+      val (safeDetail, redacted) = OpenIvmInsightsBroker.safeDiagnosticDetail(detail)
+      OpenIvmInsightsContract.EventDraft(
+        operation = operationName,
+        stage = stepName,
+        eventType =
+          if (succeeded) OpenIvmInsightsContract.EventType.LifecycleStepCompleted
+          else OpenIvmInsightsContract.EventType.LifecycleStepFailed,
+        level =
+          if (succeeded) OpenIvmInsightsContract.Level.Info
+          else OpenIvmInsightsContract.Level.Error,
+        code =
+          if (succeeded) OpenIvmInsightsContract.Code.LifecycleStepCompleted
+          else OpenIvmInsightsContract.Code.LifecycleStepFailed,
+        message =
+          if (succeeded) s"Completed OpenIVM lifecycle step '$stepName'."
+          else s"OpenIVM lifecycle step '$stepName' failed.",
+        operationId = Some(refreshId),
+        materializedView = Some(viewName),
+        status = Some(if (succeeded) "completed" else "failed"),
+        durationMs = Some(durationMs),
+        detailsJson = Some(
+          OpenIvmInsightJson.obj(
+            "refresh_id"            -> refreshId,
+            "request_id"            -> OpenIvmInsightsBroker.currentRequestId(spark),
+            "step_name"             -> stepName,
+            "detail"                -> safeDetail,
+            "detail_redacted"       -> redacted,
+            "query_logging_enabled" -> FeatureGate.queryLogEnabled(spark)
+          )
+        ),
+        terminal = Some(false)
+      )
+    }
+    ()
+  }
 }
 
 object RefreshProfile {
@@ -186,12 +255,38 @@ object RefreshProfile {
     */
   def start(spark: SparkSession, viewName: String, mode: Mode): RefreshProfile = {
     val active = FeatureGate.profileRefreshEnabled(spark)
-    if (active) RefreshProfileCatalog.ensureTables(spark)
-    val rocksdbTelemetry = if (active) Some(OpenIvmRocksDBTelemetry.start()) else None
     val suffix = mode match {
       case Mode.Refresh => s"_${System.nanoTime()}"
       case Mode.Create  => s"_create_mv_${System.nanoTime()}"
     }
+    val refreshId = viewName + suffix
+    val operation = mode match {
+      case Mode.Create  => OpenIvmInsightsContract.Operation.Create
+      case Mode.Refresh => OpenIvmInsightsContract.Operation.Refresh
+    }
+    OpenIvmInsightsBroker.emit(spark) {
+      OpenIvmInsightsContract.EventDraft(
+        operation = operation,
+        stage = "operation",
+        eventType = OpenIvmInsightsContract.EventType.OperationStarted,
+        level = OpenIvmInsightsContract.Level.Info,
+        code = OpenIvmInsightsContract.Code.OperationStarted,
+        message = s"OpenIVM $operation operation started.",
+        operationId = Some(refreshId),
+        materializedView = Some(viewName),
+        status = Some("running"),
+        detailsJson = Some(
+          OpenIvmInsightJson.obj(
+            "refresh_id"            -> refreshId,
+            "request_id"            -> OpenIvmInsightsBroker.currentRequestId(spark),
+            "query_logging_enabled" -> FeatureGate.queryLogEnabled(spark)
+          )
+        ),
+        terminal = Some(false)
+      )
+    }
+    if (active) RefreshProfileCatalog.ensureTables(spark)
+    val rocksdbTelemetry = if (active) Some(OpenIvmRocksDBTelemetry.start()) else None
     val executionSpan = OpenIvmExecutionSpan.start(
       spark,
       viewName,
@@ -202,7 +297,7 @@ object RefreshProfile {
     )
     val profile = new RefreshProfile(
       spark,
-      viewName + suffix,
+      refreshId,
       viewName,
       mode,
       active,

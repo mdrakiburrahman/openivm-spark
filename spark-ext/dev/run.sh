@@ -319,6 +319,7 @@ cmd_verify() {
     prepare_sbt 1
     setup_test_log_dir
     run_sbt "$@" \
+        ivmExtension/clean \
         scalafmtCheckAll \
         scalafmtSbtCheck \
         compile \
