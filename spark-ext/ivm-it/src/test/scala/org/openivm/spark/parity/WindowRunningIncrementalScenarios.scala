@@ -17,7 +17,10 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    Map(FeatureGate.WindowRunningIncrementalEnabledKey -> "true")
+    Map(
+      FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
+      FeatureGate.QueryLogEnabledKey                 -> "true"
+    )
 
   private def mvRefreshType(name: String): Int = {
     val id = spark.sessionState.sqlParser.parseTableIdentifier(name)
@@ -50,6 +53,8 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       refreshMv("wri_mv")
       assertMvCorrect("wri_mv", viewSql)
       mvRefreshType("wri_mv") shouldBe RefreshTypeCode.WindowPartition
+      val executedSql = sql("SHOW OPENIVM QUERY LOG").select("sql_text").collect().map(_.getString(0))
+      executedSql.exists(_.contains("CACHE TABLE `openivm_run_result_wri_mv`")) shouldBe true
     }
 
     it("falls back to full recompute for a backdated partition and stays correct") {
@@ -163,6 +168,33 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_casc_win", upstreamSql)
       assertMvCorrect("wri_casc_agg", downstreamSql)
       mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
+
+      // The fallback delta and materialised suffix must both reach the child.
+      sql(
+        "INSERT INTO wri_casc_market VALUES " +
+          "(DATE '2024-01-01','AAA',2,50),(DATE '2024-01-04','BBB',12,28)"
+      )
+      refreshMv("wri_casc_win")
+      refreshMv("wri_casc_agg")
+      assertMvCorrect("wri_casc_win", upstreamSql)
+      assertMvCorrect("wri_casc_agg", downstreamSql)
+    }
+
+    it("preserves nullable cumulative SUM and AVG seeds across consecutive suffix batches") {
+      sql("CREATE TABLE wri_avg_source(k STRING, t INT, v DOUBLE) USING DELTA")
+      sql("INSERT INTO wri_avg_source VALUES ('A',1,NULL),('B',1,0.125),('B',2,0.25)")
+      val query =
+        "SELECT k,t,v,SUM(v) OVER (PARTITION BY k ORDER BY t) AS total," +
+          "AVG(v) OVER (PARTITION BY k ORDER BY t) AS mean FROM wri_avg_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_avg_mv AS $query")
+      assertMvCorrect("wri_avg_mv", query)
+      sql("INSERT INTO wri_avg_source VALUES ('A',2,4.0),('B',3,0.375),('C',1,NULL)")
+      refreshMv("wri_avg_mv")
+      assertMvCorrect("wri_avg_mv", query)
+      sql("INSERT INTO wri_avg_source VALUES ('A',3,NULL),('B',4,0.5),('C',2,2.0)")
+      refreshMv("wri_avg_mv")
+      assertMvCorrect("wri_avg_mv", query)
+      mvRefreshType("wri_avg_mv") shouldBe RefreshTypeCode.WindowPartition
     }
   }
 }

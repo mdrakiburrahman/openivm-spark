@@ -770,6 +770,7 @@ object SparkRefreshRewriter {
     val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
     val runTempPrefix     = "OPENIVM_RUN_"
     val runTempViewSuffix = s"_${viewLogicalName.toUpperCase}"
+    val runResultName     = s"OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase}"
     val compactName       = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
@@ -815,15 +816,14 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDrop
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
-      upper.contains("OPENIVM_RUN_FAST_")
+      (upper.contains("OPENIVM_RUN_FAST_") || upper.contains(s"FROM $runResultName"))
     ) {
       // WINDOW running-suffix fast-path cascade delta: an APPEND of the
       // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
-      // SELECT reads the source delta + the run_fast/run_state temp views. The
+      // SELECT reads either the cached run_result or the legacy fast/state views. The
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
-      // statement appends to it. Distinguished from the fallback cascade by the
-      // OPENIVM_RUN_FAST_ reference (the fallback reads openivm_old/openivm_new).
+      // statement appends to it (the fallback reads openivm_old/openivm_new).
       StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
@@ -869,7 +869,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDataInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-      upper.contains(" OPENIVM_RUN_FAST_")
+      (upper.contains(" OPENIVM_RUN_FAST_") || upper.contains(s"FROM $runResultName"))
     ) {
       StatementKind.RunningWindowFastInsert
     } else if (
@@ -3494,11 +3494,8 @@ object SparkRefreshRewriter {
     * openivm emits (for a cascade-source cumulative window):
     * {{{
     *   INSERT INTO openivm_delta_<view>
-    *   SELECT <running-adjusted cols>, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
-    *   FROM   openivm_delta_<src> d
-    *   JOIN   openivm_run_fast_<view>  fk ON …
-    *   LEFT JOIN openivm_run_state_<view> s ON …
-    *   WHERE  d.openivm_multiplicity > 0 AND openivm_timestamp > '…'
+    *   SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
+    *   FROM openivm_run_result_<view>
     * }}}
     *
     * The fallback cascade (`openivm_old`/`openivm_new` signed-multiset, emitted

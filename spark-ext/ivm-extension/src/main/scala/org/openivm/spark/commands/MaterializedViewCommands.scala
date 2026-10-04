@@ -6301,6 +6301,19 @@ case class RefreshMaterializedViewCommand(
                   }
                 }
               }
+            } else if (rewritten.statements.contains(s"CACHE TABLE `openivm_run_result_${name.table}`")) {
+              // The native suffix program splits fallback and append partitions.
+              // Whole-partition Spark shortcuts must not skip its fallback delta
+              // or apply the suffix a second time.
+              rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
+                val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+                if (
+                  SparkRefreshRewriter.isMergeStatement(sql) ||
+                  SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined
+                ) {
+                  withPlanTimeBroadcastDisabled { executeSqlAt(sql, idx) }
+                } else executeSqlAt(sql, idx)
+              }
             } else {
               val windowSuffixSql: Option[WindowSuffixSql] =
                 if (
