@@ -173,9 +173,19 @@ class OpenIvmCompiler private (
       }
       lastStdout = stdout
       lastStderr = stderr
+      val nativeViewName = stdout.linesIterator
+        .find(_.contains("\"openivm_bridge_view_key\""))
+        .map { line =>
+          val key = "\"openivm_bridge_view_key\""
+          decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
+        }
+        .getOrElse(req.viewName)
       val partial  = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad = parseInitialLoadSql(tmpDir, req)
-      partial.copy(initialLoadSql = initLoad)
+      val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
+      partial.copy(
+        sql = normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName),
+        initialLoadSql = initLoad
+      )
     } catch {
       case e: OpenIvmCliCleanupException =>
         retainControl = true
@@ -290,6 +300,8 @@ class OpenIvmCompiler private (
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS $normalizedViewSql;\n"
+    sb ++= "SELECT view_name AS openivm_bridge_view_key FROM openivm_views " +
+      s"WHERE view_sql_name='${escapeSql(req.viewName)}' AND view_catalog=current_database() AND view_schema=current_schema();\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
     // takes the view name plus a JSON CompileFacts payload and returns one
     // row per top-level refresh statement without mutating openivm aux
@@ -722,11 +734,12 @@ class OpenIvmCompiler private (
     * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
     * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
-  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest): String = {
+  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeViewName: String = ""): String = {
     import java.util.regex.Pattern
-    val file = tmpDir.resolve(s"openivm_compiled_queries_${req.viewName}.sql")
+    val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
+    val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
     if (!Files.exists(file)) return ""
-    val content = new String(Files.readAllBytes(file), "UTF-8")
+    val content = normalizeCompiledViewNames(new String(Files.readAllBytes(file), "UTF-8"), nativeName, req.viewName)
 
     val pat = Pattern.compile(
       s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
@@ -743,6 +756,26 @@ class OpenIvmCompiler private (
     if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
     LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
+  }
+
+  /** Spark's rewrite program addresses one logical MV; native catalog keys are
+    * private to the row-less compiler database. Preserve source references and
+    * string literals while removing native qualification from internal tables.
+    */
+  private[compiler] def normalizeCompiledViewNames(sql: String, nativeName: String, viewName: String): String = {
+    val internalOrLiteral =
+      "(?i)'(?:''|[^'])*'|(?<![A-Za-z0-9_])(?:[`\"]?memory[`\"]?\\.[`\"]?main[`\"]?\\.)?[`\"]?(openivm_[A-Za-z0-9_]+)[`\"]?".r
+    internalOrLiteral.replaceAllIn(
+      sql,
+      m => {
+        val table = m.group(1)
+        val replacement =
+          if (table == null) m.matched
+          else if (nativeName != viewName && table.endsWith(nativeName)) table.stripSuffix(nativeName) + viewName
+          else table
+        java.util.regex.Matcher.quoteReplacement(replacement)
+      }
+    )
   }
 
   /** Fully-qualified name of every source the request tracks, the key space a
