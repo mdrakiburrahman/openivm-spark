@@ -443,10 +443,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   // With `target_dialect="spark"` set in the CompileFacts JSON payload,
   // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
   // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
-  // Current output backtick-quotes each identifier segment, so the delta-scan
-  // CTE should reference the staged source as `` `memory`.`main`.`...` ``.
+  // The bridge removes the compiler's private catalog qualification from
+  // internal tables and maps encoded MV keys to the logical Spark view name.
 
-  it should "produce fully-qualified backtick-quoted memory.main table references in SPARK dialect for SIMPLE_PROJECTION" in {
+  it should "normalize SIMPLE_PROJECTION internal references to the Spark bridge's logical names" in {
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
@@ -455,7 +455,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-    result.sql should include("`memory`.`main`.`openivm_delta_sales`")
+    result.sql should include("FROM    openivm_delta_sales")
+    result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+    result.sql should include("FROM openivm_data_mv_sales_proj")
+    result.sql should not include "openivm_data___openivm_mv_"
   }
 
   // ── Test 6: Type mapping ──────────────────────────────────────────────────
