@@ -1578,6 +1578,42 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("materialised running-window suffix results") {
+    it("caches the result once and appends its cascade without replacing the fallback delta") {
+      val input =
+        """CREATE OR REPLACE TEMP TABLE openivm_run_result_mv_r AS
+          |SELECT d.k, d.v, SUM(d.v) OVER (PARTITION BY d.k ORDER BY d.t) AS running_sum
+          |FROM openivm_delta_src d JOIN openivm_run_fast_mv_r fk ON d.k = fk.k
+          |WHERE d.openivm_multiplicity > 0;
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |INSERT INTO openivm_data_mv_r (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r;
+          |INSERT INTO openivm_delta_mv_r SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_mv_r;
+          |DROP TABLE IF EXISTS openivm_run_result_mv_r;
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = TableIdentifier("mv_r", Some("default")),
+          mvLocation = "dbfs:/delta/mv_r",
+          viewLogicalName = "mv_r",
+          sourceTempViews = Map("src" -> "openivm_delta_src"),
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_r_delta",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      rewritten.head should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_result_mv_r AS")
+      rewritten(1) shouldBe "CACHE TABLE `openivm_run_result_mv_r`"
+      rewritten should contain("INSERT INTO `default`.`mv_r` (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r")
+      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/mv_r_delta`")) shouldBe 1
+      rewritten should contain(
+        "INSERT INTO delta.`dbfs:/delta/_tmp/mv_r_delta` SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_mv_r"
+      )
+      rewritten.last shouldBe "DROP VIEW IF EXISTS `openivm_run_result_mv_r`"
+    }
+  }
+
   // ── 11. hasRealDelta detection ───────────────────────────────────────────
   describe("hasRealDelta") {
     it("returns true for a real CTE-prefixed delta (single-source AGGREGATE_GROUP)") {

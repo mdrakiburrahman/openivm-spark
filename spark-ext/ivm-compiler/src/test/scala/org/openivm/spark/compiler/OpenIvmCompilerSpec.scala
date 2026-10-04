@@ -47,6 +47,37 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     super.afterAll()
   }
 
+  "native view identity normalization" should "map internal tables without changing source references or literals" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
+      s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
+      "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
+  }
+
+  it should "read the native-key initial-load file and preserve hidden seed columns" in {
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val dir  = Files.createTempDirectory("native-view-initial-load")
+    val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
+    val req  = CompileRequest("mv", "SELECT id FROM src", Map("src" -> StructType.fromDDL("id INT")))
+    try {
+      Files.write(
+        file,
+        s"create table memory.main.openivm_data_$key as SELECT id, 1 AS openivm_running_input_0 FROM memory.main.src;"
+          .getBytes("UTF-8")
+      )
+      val initial = sharedCompiler.parseInitialLoadSql(dir, req, key)
+      initial should include("openivm_running_input_0")
+      initial should not include "memory.main."
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
+  }
+
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
   private val salesSchema: StructType =
