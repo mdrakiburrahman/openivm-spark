@@ -17,6 +17,11 @@ import org.openivm.spark.commands.ShowQueryLogCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.openivm.spark.commands.ShowStreamingTablesCommand
 import org.openivm.spark.commands.StopStreamingTableCommand
+import org.openivm.spark.commands.BeginOpenIvmInsightsRequestCommand
+import org.openivm.spark.commands.AnnotateOpenIvmMvQueryHashCommand
+import org.openivm.spark.commands.EndOpenIvmInsightsRequestCommand
+import org.openivm.spark.commands.ReleaseOpenIvmInsightsRequestCommand
+import org.openivm.spark.commands.ShowOpenIvmInsightsCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
 import org.openivm.spark.streaming.StreamingTableSpec
@@ -115,6 +120,60 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       ctx: IvmSqlBaseParser.ShowOpenivmQueryLogContext
   ): AnyRef =
     ShowQueryLogCommand()
+
+  override def visitBeginOpenivmInsightsRequest(
+      ctx: IvmSqlBaseParser.BeginOpenivmInsightsRequestContext
+  ): AnyRef =
+    BeginOpenIvmInsightsRequestCommand(
+      StreamingQuerySql.parseStringLiteral(ctx.requestId.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.runId.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.dbtNodeId.getText, sqlText),
+      Option(ctx.materialization).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText)),
+      Option(ctx.targetRelation).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText))
+    )
+
+  override def visitShowOpenivmInsights(
+      ctx: IvmSqlBaseParser.ShowOpenivmInsightsContext
+  ): AnyRef = {
+    val after = parseLong(ctx.afterSequence.getText, "AFTER sequence")
+    val limit = parseLong(ctx.maxEvents.getText, "LIMIT max-events")
+    if (limit <= 0L || limit > Int.MaxValue)
+      parseError(s"LIMIT max-events must be in [1, ${Int.MaxValue}]")
+    ShowOpenIvmInsightsCommand(
+      StreamingQuerySql.parseStringLiteral(ctx.requestId.getText, sqlText),
+      after,
+      limit.toInt
+    )
+  }
+
+  override def visitEndOpenivmInsightsRequest(
+      ctx: IvmSqlBaseParser.EndOpenivmInsightsRequestContext
+  ): AnyRef =
+    EndOpenIvmInsightsRequestCommand(
+      StreamingQuerySql.parseStringLiteral(ctx.requestId.getText, sqlText),
+      succeeded = ctx.SUCCEEDED() != null,
+      Option(ctx.errorClass).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText)),
+      Option(ctx.errorCode).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText))
+    )
+
+  override def visitAnnotateOpenivmMvQueryHash(
+      ctx: IvmSqlBaseParser.AnnotateOpenivmMvQueryHashContext
+  ): AnyRef =
+    AnnotateOpenIvmMvQueryHashCommand(
+      StreamingQuerySql.parseStringLiteral(ctx.targetRelation.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.oldQueryHash.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.newQueryHash.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.policy.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.decision.getText, sqlText),
+      StreamingQuerySql.parseStringLiteral(ctx.reason.getText, sqlText)
+    )
+
+  override def visitReleaseOpenivmInsightsRequest(
+      ctx: IvmSqlBaseParser.ReleaseOpenivmInsightsRequestContext
+  ): AnyRef =
+    ReleaseOpenIvmInsightsRequestCommand(
+      StreamingQuerySql.parseStringLiteral(ctx.requestId.getText, sqlText)
+    )
 
   override def visitCreateStreamingTable(
       ctx: IvmSqlBaseParser.CreateStreamingTableContext
@@ -360,6 +419,11 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
 
   private def parseError(message: String): Nothing =
     throw SparkParserCompat.parseException(sqlText, message)
+
+  private def parseLong(value: String, label: String): Long =
+    scala.util.Try(value.toLong).toOption.getOrElse {
+      parseError(s"$label is outside the supported BIGINT range")
+    }
 }
 
 /** Companion — exposes the entry-point used by [[IvmParser]]. */

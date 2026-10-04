@@ -21,6 +21,21 @@
  *
  *   SHOW OPENIVM QUERY LOG
  *
+ *   OPENIVM INSIGHTS BEGIN REQUEST '<request-id>' RUN '<run-id>' NODE '<dbt-node-id>'
+ *     [MATERIALIZATION '<value>' TARGET '<relation>']
+ *
+ *   SHOW OPENIVM INSIGHTS FOR REQUEST '<request-id>' AFTER <sequence> LIMIT <max-events>
+ *
+ *   OPENIVM INSIGHTS END REQUEST '<request-id>' STATUS SUCCEEDED
+ *   OPENIVM INSIGHTS END REQUEST '<request-id>' STATUS FAILED
+ *     [ERROR_CLASS '<safe-class>' ERROR_CODE '<safe-code>']
+ *
+ *   OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+ *     TARGET '<relation>' OLD '<old-hash>' NEW '<new-hash>'
+ *     POLICY '<policy>' DECISION '<decision>' REASON '<reason>'
+ *
+ *   OPENIVM INSIGHTS RELEASE REQUEST '<request-id>'
+ *
  *   CREATE STREAMING TABLE [IF NOT EXISTS] <multipart_identifier>
  *     [USING <provider>] [LOCATION '<path>']
  *     [PARTITIONED BY (<cols>)] [TBLPROPERTIES (...)] [OPTIONS (...)]
@@ -63,6 +78,11 @@ ivmStatement
       | dropMaterializedView
       | showOpenivmRefreshProfile
       | showOpenivmQueryLog
+      | beginOpenivmInsightsRequest
+      | showOpenivmInsights
+      | endOpenivmInsightsRequest
+      | annotateOpenivmMvQueryHash
+      | releaseOpenivmInsightsRequest
       | createStreamingTable
       | showStreamingTables
       | stopStreamingTable
@@ -119,6 +139,31 @@ showOpenivmRefreshProfile
 
 showOpenivmQueryLog
     : SHOW OPENIVM QUERY LOG
+    ;
+
+beginOpenivmInsightsRequest
+    : OPENIVM INSIGHTS BEGIN REQUEST requestId=STRING RUN runId=STRING NODE dbtNodeId=STRING
+      (MATERIALIZATION materialization=STRING TARGET targetRelation=STRING)?
+    ;
+
+showOpenivmInsights
+    : SHOW OPENIVM INSIGHTS FOR REQUEST requestId=STRING AFTER afterSequence=INTEGER_VALUE
+      LIMIT maxEvents=INTEGER_VALUE
+    ;
+
+endOpenivmInsightsRequest
+    : OPENIVM INSIGHTS END REQUEST requestId=STRING STATUS
+      (SUCCEEDED | FAILED (ERROR_CLASS errorClass=STRING ERROR_CODE errorCode=STRING)?)
+    ;
+
+annotateOpenivmMvQueryHash
+    : OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+      TARGET targetRelation=STRING OLD oldQueryHash=STRING NEW newQueryHash=STRING
+      POLICY policy=STRING DECISION decision=STRING REASON reason=STRING
+    ;
+
+releaseOpenivmInsightsRequest
+    : OPENIVM INSIGHTS RELEASE REQUEST requestId=STRING
     ;
 
 createStreamingTable
@@ -187,6 +232,8 @@ nonReserved
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
     | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
     | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP
+    | INSIGHTS | BEGIN | REQUEST | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
+    | MATERIALIZATION | TARGET | ERROR_CLASS | ERROR_CODE | ANNOTATE | HASH | OLD | NEW | POLICY | DECISION | REASON
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -222,6 +269,29 @@ LOCATION      : [Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn];
 OPTIONS       : [Oo][Pp][Tt][Ii][Oo][Nn][Ss];
 IN            : [Ii][Nn];
 STOP          : [Ss][Tt][Oo][Pp];
+INSIGHTS      : [Ii][Nn][Ss][Ii][Gg][Hh][Tt][Ss];
+BEGIN         : [Bb][Ee][Gg][Ii][Nn];
+REQUEST       : [Rr][Ee][Qq][Uu][Ee][Ss][Tt];
+RUN           : [Rr][Uu][Nn];
+NODE          : [Nn][Oo][Dd][Ee];
+AFTER         : [Aa][Ff][Tt][Ee][Rr];
+LIMIT         : [Ll][Ii][Mm][Ii][Tt];
+END           : [Ee][Nn][Dd];
+STATUS        : [Ss][Tt][Aa][Tt][Uu][Ss];
+SUCCEEDED     : [Ss][Uu][Cc][Cc][Ee][Ee][Dd][Ee][Dd];
+FAILED        : [Ff][Aa][Ii][Ll][Ee][Dd];
+RELEASE       : [Rr][Ee][Ll][Ee][Aa][Ss][Ee];
+MATERIALIZATION : [Mm][Aa][Tt][Ee][Rr][Ii][Aa][Ll][Ii][Zz][Aa][Tt][Ii][Oo][Nn];
+TARGET        : [Tt][Aa][Rr][Gg][Ee][Tt];
+ERROR_CLASS   : [Ee][Rr][Rr][Oo][Rr] '_' [Cc][Ll][Aa][Ss][Ss];
+ERROR_CODE    : [Ee][Rr][Rr][Oo][Rr] '_' [Cc][Oo][Dd][Ee];
+ANNOTATE      : [Aa][Nn][Nn][Oo][Tt][Aa][Tt][Ee];
+HASH          : [Hh][Aa][Ss][Hh];
+OLD           : [Oo][Ll][Dd];
+NEW           : [Nn][Ee][Ww];
+POLICY        : [Pp][Oo][Ll][Ii][Cc][Yy];
+DECISION      : [Dd][Ee][Cc][Ii][Ss][Ii][Oo][Nn];
+REASON        : [Rr][Ee][Aa][Ss][Oo][Nn];
 
 EQ            : '=' | '==';
 SEMICOLON     : ';';

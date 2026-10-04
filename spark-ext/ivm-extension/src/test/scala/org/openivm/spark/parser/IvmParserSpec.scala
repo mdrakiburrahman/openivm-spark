@@ -8,13 +8,18 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.Project
-import org.apache.spark.sql.types.{IntegerType, LongType, StringType, TimestampType}
+import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType, TimestampType}
+import org.openivm.spark.commands.AnnotateOpenIvmMvQueryHashCommand
+import org.openivm.spark.commands.BeginOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.commands.DropMaterializedViewCommand
+import org.openivm.spark.commands.EndOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.ExplainCreateMaterializedViewCommand
 import org.openivm.spark.commands.AdvanceMaterializedViewSourceVersionsCommand
 import org.openivm.spark.commands.RefreshMaterializedViewCommand
+import org.openivm.spark.commands.ReleaseOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
+import org.openivm.spark.commands.ShowOpenIvmInsightsCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -256,6 +261,156 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
         ("duration_ms", LongType, false),
         ("detail", StringType, false)
       )
+    }
+
+    describe("request-scoped OPENIVM INSIGHTS") {
+      it("parses BEGIN, SHOW, END, and RELEASE with existing string-literal conventions") {
+        val begin = spark.sessionState.sqlParser
+          .parsePlan(
+            "oPeNiVm InSiGhTs BeGiN ReQuEsT 'request''one' RUN 'run-1' NODE 'model.pkg.node'"
+          )
+          .asInstanceOf[BeginOpenIvmInsightsRequestCommand]
+        begin.requestId shouldBe "request'one"
+        begin.runId shouldBe "run-1"
+        begin.dbtNodeId shouldBe "model.pkg.node"
+        begin.materialization shouldBe None
+        begin.targetRelation shouldBe None
+
+        val show = spark.sessionState.sqlParser
+          .parsePlan("SHOW OPENIVM INSIGHTS FOR REQUEST 'request''one' AFTER 7 LIMIT 25")
+          .asInstanceOf[ShowOpenIvmInsightsCommand]
+        show.requestId shouldBe "request'one"
+        show.afterSequence shouldBe 7L
+        show.maxEvents shouldBe 25
+
+        val succeeded = spark.sessionState.sqlParser
+          .parsePlan("OPENIVM INSIGHTS END REQUEST 'request''one' STATUS SUCCEEDED")
+          .asInstanceOf[EndOpenIvmInsightsRequestCommand]
+        succeeded.requestId shouldBe "request'one"
+        succeeded.succeeded shouldBe true
+        succeeded.errorClass shouldBe None
+        succeeded.errorCode shouldBe None
+
+        val failed = spark.sessionState.sqlParser
+          .parsePlan("OPENIVM INSIGHTS END REQUEST 'request''one' STATUS FAILED")
+          .asInstanceOf[EndOpenIvmInsightsRequestCommand]
+        failed.succeeded shouldBe false
+        failed.errorClass shouldBe None
+        failed.errorCode shouldBe None
+
+        val release = spark.sessionState.sqlParser
+          .parsePlan("OPENIVM INSIGHTS RELEASE REQUEST 'request''one'")
+          .asInstanceOf[ReleaseOpenIvmInsightsRequestCommand]
+        release.requestId shouldBe "request'one"
+      }
+
+      it("parses optional model context, safe failure identity, and the typed MV annotation") {
+        val begin = spark.sessionState.sqlParser
+          .parsePlan(
+            """OPENIVM INSIGHTS BEGIN REQUEST 'context'
+              |RUN 'run-context'
+              |NODE 'model.pkg.context'
+              |MATERIALIZATION 'materialized_view'
+              |TARGET 'analytics.sales_summary'""".stripMargin
+          )
+          .asInstanceOf[BeginOpenIvmInsightsRequestCommand]
+        begin.materialization shouldBe Some("materialized_view")
+        begin.targetRelation shouldBe Some("analytics.sales_summary")
+
+        val failed = spark.sessionState.sqlParser
+          .parsePlan(
+            """OPENIVM INSIGHTS END REQUEST 'context' STATUS FAILED
+              |ERROR_CLASS 'org.apache.spark.SparkException'
+              |ERROR_CODE 'SPARK_JOB_CANCELLED'""".stripMargin
+          )
+          .asInstanceOf[EndOpenIvmInsightsRequestCommand]
+        failed.errorClass shouldBe Some("org.apache.spark.SparkException")
+        failed.errorCode shouldBe Some("SPARK_JOB_CANCELLED")
+
+        val annotation = spark.sessionState.sqlParser
+          .parsePlan(
+            """OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+              |TARGET 'analytics.sales_summary'
+              |OLD '0123456789abcdef0123456789abcdef'
+              |NEW 'fedcba9876543210fedcba9876543210'
+              |POLICY 'rebuild'
+              |DECISION 'rebuild'
+              |REASON 'query_hash_changed'""".stripMargin
+          )
+          .asInstanceOf[AnnotateOpenIvmMvQueryHashCommand]
+        annotation.targetRelation shouldBe "analytics.sales_summary"
+        annotation.oldQueryHash shouldBe "0123456789abcdef0123456789abcdef"
+        annotation.newQueryHash shouldBe "fedcba9876543210fedcba9876543210"
+        annotation.policy shouldBe "rebuild"
+        annotation.decision shouldBe "rebuild"
+        annotation.reason shouldBe "query_hash_changed"
+      }
+
+      it("rejects partial model/failure context and failure identity on success") {
+        Seq(
+          """OPENIVM INSIGHTS BEGIN REQUEST 'bad' RUN 'run' NODE 'node'
+            |MATERIALIZATION 'materialized_view'""".stripMargin,
+          """OPENIVM INSIGHTS END REQUEST 'bad' STATUS FAILED
+            |ERROR_CLASS 'org.example.Failure'""".stripMargin,
+          """OPENIVM INSIGHTS END REQUEST 'bad' STATUS SUCCEEDED
+            |ERROR_CLASS 'org.example.Failure' ERROR_CODE 'FAILED'""".stripMargin
+        ).foreach { statement =>
+          an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(statement)
+        }
+      }
+
+      it("rejects arbitrary fields appended to the typed MV annotation") {
+        an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(
+          """OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+            |TARGET 'analytics.sales_summary'
+            |OLD '0123456789abcdef0123456789abcdef'
+            |NEW 'fedcba9876543210fedcba9876543210'
+            |POLICY 'rebuild'
+            |DECISION 'rebuild'
+            |REASON 'query_hash_changed'
+            |SQL 'DROP TABLE protected_relation'""".stripMargin
+        )
+      }
+
+      it("exposes the exact ordered SHOW schema") {
+        val plan = spark.sessionState.sqlParser
+          .parsePlan("SHOW OPENIVM INSIGHTS FOR REQUEST 'schema' AFTER 0 LIMIT 1")
+          .asInstanceOf[ShowOpenIvmInsightsCommand]
+        plan.output.map(attribute => (attribute.name, attribute.dataType, attribute.nullable)) shouldBe Seq(
+          ("record_type", StringType, false),
+          ("request_id", StringType, false),
+          ("run_id", StringType, true),
+          ("dbt_node_id", StringType, true),
+          ("capture_status", StringType, false),
+          ("next_sequence", LongType, false),
+          ("has_more", BooleanType, false),
+          ("sequence", LongType, true),
+          ("event_timestamp", TimestampType, true),
+          ("operation_id", StringType, true),
+          ("materialized_view", StringType, true),
+          ("operation", StringType, true),
+          ("stage", StringType, true),
+          ("event_type", StringType, true),
+          ("level", StringType, true),
+          ("code", StringType, true),
+          ("message", StringType, true),
+          ("status", StringType, true),
+          ("duration_ms", LongType, true),
+          ("parent_sequence", LongType, true),
+          ("details_json", StringType, true),
+          ("terminal", BooleanType, true)
+        )
+      }
+
+      it("rejects negative cursors and non-positive or oversized limits") {
+        Seq(
+          "SHOW OPENIVM INSIGHTS FOR REQUEST 'bad' AFTER -1 LIMIT 1",
+          "SHOW OPENIVM INSIGHTS FOR REQUEST 'bad' AFTER 0 LIMIT 0",
+          "SHOW OPENIVM INSIGHTS FOR REQUEST 'bad' AFTER 0 LIMIT 2147483648"
+        ).foreach { statement =>
+          an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(statement)
+        }
+      }
     }
 
     it("rejects optional clauses") {

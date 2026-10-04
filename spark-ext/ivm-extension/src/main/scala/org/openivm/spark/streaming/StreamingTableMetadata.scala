@@ -107,7 +107,8 @@ final case class StreamingTableCascadeTarget(
     dataPath: String,
     deltaTableId: String,
     tableId: String,
-    sourcePaths: Seq[String]
+    sourcePaths: Seq[String],
+    causedBy: Option[String] = None
 )
 
 /** Catalog and Hadoop-filesystem ownership contract for one streaming table. */
@@ -711,7 +712,8 @@ object StreamingTableMetadata {
       replacementDefinitionHash: String,
       sourcePaths: Seq[String],
       rebuildDecision: StreamingRebuildDecision,
-      descendants: Seq[StreamingTableCascadeTarget] = Seq.empty
+      descendants: Seq[StreamingTableCascadeTarget] = Seq.empty,
+      operationId: String = UUID.randomUUID().toString
   ): StreamingTableResetIntent = {
     val proposed = StreamingTableResetIntent(
       targetIdentity = target.identity,
@@ -719,7 +721,7 @@ object StreamingTableMetadata {
       oldDeltaTableId = target.deltaTableId,
       replacementDefinitionHash = replacementDefinitionHash,
       sourcePaths = sourcePaths.distinct.sorted,
-      operationId = UUID.randomUUID().toString,
+      operationId = operationId,
       rebuildDecision = Some(rebuildDecision),
       descendants = descendants
     )
@@ -909,8 +911,9 @@ object StreamingTableMetadata {
   def deleteResetOwnedPath(
       spark: SparkSession,
       intent: StreamingTableResetIntent,
-      sourcePaths: Seq[String]
-  ): Unit = {
+      sourcePaths: Seq[String],
+      operationId: Option[String] = None
+  ): Option[String] = {
     val target = StreamingTableTarget(
       name = Seq.empty,
       identity = intent.targetIdentity,
@@ -920,10 +923,11 @@ object StreamingTableMetadata {
       tableId = ""
     )
     assertSafeForDeletion(spark, target, sourcePaths)
-    archiveCheckpoint(
+    val archived = archiveCheckpoint(
       spark,
       target,
       archiveContext(intent, "reset-recovery", causedBy = None)
+        .copy(operationId = operationId.getOrElse(intent.operationId))
     )
     val path = new Path(intent.targetPath)
     val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
@@ -931,13 +935,14 @@ object StreamingTableMetadata {
       StreamingTableErrors.invalid(s"Failed to finish reset deletion for owned target '${intent.targetPath}'")
     if (fs.exists(path))
       StreamingTableErrors.invalid(s"Owned reset target '${intent.targetPath}' still exists after deletion")
+    archived
   }
 
   def deleteCascadeOwnedPath(
       spark: SparkSession,
       target: StreamingTableCascadeTarget,
       context: StreamingArchiveContext
-  ): Unit = {
+  ): Option[String] = {
     val owned = StreamingTableTarget(
       name = target.name,
       identity = target.identity,
@@ -947,13 +952,14 @@ object StreamingTableMetadata {
       tableId = target.tableId
     )
     assertSafeForDeletion(spark, owned, target.sourcePaths)
-    archiveCheckpoint(spark, owned, context)
-    val path = new Path(target.dataPath)
-    val fs   = path.getFileSystem(spark.sessionState.newHadoopConf())
+    val archived = archiveCheckpoint(spark, owned, context)
+    val path     = new Path(target.dataPath)
+    val fs       = path.getFileSystem(spark.sessionState.newHadoopConf())
     if (fs.exists(path) && !fs.delete(path, true))
       StreamingTableErrors.invalid(s"Failed to finish cascade deletion for owned target '${target.dataPath}'")
     if (fs.exists(path))
       StreamingTableErrors.invalid(s"Owned cascade target '${target.dataPath}' still exists after deletion")
+    archived
   }
 
   def assertSafeForDeletion(
@@ -979,9 +985,9 @@ object StreamingTableMetadata {
       target: StreamingTableTarget,
       sourcePaths: Seq[String],
       archiveContext: StreamingArchiveContext
-  ): Unit = {
+  ): Option[String] = {
     assertSafeForDeletion(spark, target, sourcePaths)
-    archiveCheckpoint(spark, target, archiveContext)
+    val archived = archiveCheckpoint(spark, target, archiveContext)
     spark.sql(s"DROP TABLE ${target.sqlIdentifier}").collect()
     if (catalogTableExists(spark, target.name))
       StreamingTableErrors.invalid(
@@ -993,6 +999,7 @@ object StreamingTableMetadata {
       StreamingTableErrors.invalid(s"Failed to delete owned streaming-table target '${target.dataPath}'")
     if (fs.exists(path))
       StreamingTableErrors.invalid(s"Target '${target.dataPath}' still exists after deletion")
+    archived
   }
 
   def archiveCheckpoint(
@@ -1410,6 +1417,7 @@ object StreamingTableMetadata {
       node.put("path", descendant.dataPath)
       node.put("deltaTableId", descendant.deltaTableId)
       node.put("tableId", descendant.tableId)
+      descendant.causedBy.foreach(node.put("causedBy", _))
       val sourcePaths = node.putArray("sourcePaths")
       descendant.sourcePaths.sorted.foreach(sourcePaths.add)
     }
@@ -1462,7 +1470,8 @@ object StreamingTableMetadata {
                 value.asText()
               }
               .distinct
-              .sorted
+              .sorted,
+            causedBy = Option(descendant.get("causedBy")).filter(_.isTextual).map(_.asText())
           )
         }
       }

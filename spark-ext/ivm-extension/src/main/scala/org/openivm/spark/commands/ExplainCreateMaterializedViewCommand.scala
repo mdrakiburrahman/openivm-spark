@@ -7,6 +7,8 @@ import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.RefreshTypeCode
 
+import java.util.UUID
+
 /**
  * `EXPLAIN CREATE MATERIALIZED VIEW <name> [CLUSTER BY (...)] AS <query>` (#4).
  *
@@ -32,26 +34,78 @@ case class ExplainCreateMaterializedViewCommand(
   )
 
   override def run(spark: SparkSession): Seq[Row] = {
-    val result         = MvDryCompile.dryCompile(spark, name, queryText, clusterColumns)
-    val classification = result.classification
-    val eligible       = classification.refreshType != RefreshTypeCode.FullRefresh
+    val operationId = s"preflight-${UUID.randomUUID()}"
+    val viewName    = MvCommandHelper.metaName(name)
+    val startedAt   = System.nanoTime()
+    OpenIvmInsightEvents.operationStarted(
+      spark,
+      operationId,
+      viewName,
+      org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Preflight
+    )
+    try {
+      val result         = MvDryCompile.dryCompile(spark, name, queryText, clusterColumns)
+      val classification = result.classification
+      val eligible       = classification.refreshType != RefreshTypeCode.FullRefresh
 
-    // Register the empty schema-only stand-in so downstream dry compiles resolve.
-    DryRunMvRegistry.register(spark, name, result.outputSchema)
+      OpenIvmInsightEvents.classification(
+        spark = spark,
+        operationId = operationId,
+        materializedView = viewName,
+        operation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Preflight,
+        compileRefreshType = classification.compileRefreshTypeName,
+        effectiveRefreshType = classification.refreshTypeName,
+        reason = classification.reason,
+        emitsCascadeViewDelta = classification.emitsCascadeViewDelta,
+        upstreamSnapshotTrigger = classification.upstreamSnapshotTrigger
+      )
 
-    val json =
-      s"""{"view":${ExplainCreateMaterializedViewCommand.jsonStr(MvCommandHelper.metaName(name))},""" +
-        s""""eligible":$eligible,""" +
-        s""""refresh_type":${classification.refreshType},""" +
-        s""""refresh_type_name":${ExplainCreateMaterializedViewCommand.jsonStr(classification.refreshTypeName)},""" +
-        s""""reason":${ExplainCreateMaterializedViewCommand.jsonStr(classification.reason)},""" +
-        s""""source_tables":${ExplainCreateMaterializedViewCommand.jsonStrArray(result.sourceTables)},""" +
-        classification.upstreamSnapshotTrigger.fold("")(detail =>
-          s""""upstream_snapshot_trigger":${ExplainCreateMaterializedViewCommand.jsonStr(detail)},"""
-        ) +
-        s""""emits_cascade_view_delta":${classification.emitsCascadeViewDelta}}"""
+      // Register the empty schema-only stand-in so downstream dry compiles resolve.
+      DryRunMvRegistry.register(spark, name, result.outputSchema)
 
-    Seq(Row(json))
+      val json =
+        s"""{"view":${ExplainCreateMaterializedViewCommand.jsonStr(viewName)},""" +
+          s""""eligible":$eligible,""" +
+          s""""refresh_type":${classification.refreshType},""" +
+          s""""refresh_type_name":${ExplainCreateMaterializedViewCommand.jsonStr(classification.refreshTypeName)},""" +
+          s""""reason":${ExplainCreateMaterializedViewCommand.jsonStr(classification.reason)},""" +
+          s""""source_tables":${ExplainCreateMaterializedViewCommand.jsonStrArray(result.sourceTables)},""" +
+          classification.upstreamSnapshotTrigger.fold("")(detail =>
+            s""""upstream_snapshot_trigger":${ExplainCreateMaterializedViewCommand.jsonStr(detail)},"""
+          ) +
+          s""""emits_cascade_view_delta":${classification.emitsCascadeViewDelta},""" +
+          s""""graph_version":1,""" +
+          s""""operation":"preflight",""" +
+          s""""materialized_view":${ExplainCreateMaterializedViewCommand.jsonStr(viewName)},""" +
+          s""""compile_refresh_type_name":${ExplainCreateMaterializedViewCommand
+              .jsonStr(classification.compileRefreshTypeName)},""" +
+          s""""direct_dependencies":${ExplainCreateMaterializedViewCommand.jsonStrArray(result.sourceTables)},""" +
+          s""""cascade_capability":${ExplainCreateMaterializedViewCommand
+              .jsonStr(if (classification.emitsCascadeViewDelta) "view_delta" else "snapshot_or_terminal")}}"""
+
+      OpenIvmInsightEvents.operationFinished(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Preflight,
+        outcome = "preflight_completed",
+        durationMs = (System.nanoTime() - startedAt) / 1000000L,
+        failed = false
+      )
+      Seq(Row(json))
+    } catch {
+      case error: Throwable =>
+        OpenIvmInsightEvents.operationFinished(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Preflight,
+          outcome = "preflight_failed",
+          durationMs = (System.nanoTime() - startedAt) / 1000000L,
+          failed = true
+        )
+        throw error
+    }
   }
 }
 

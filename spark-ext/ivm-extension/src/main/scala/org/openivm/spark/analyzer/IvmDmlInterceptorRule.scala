@@ -49,20 +49,22 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
       // INSERT — pre-read staging: capture incoming rows before write
       // -----------------------------------------------------------------------
       case a: AppendData =>
-        val tableName = extractTableName(a.table)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) a
+        val tableName  = extractTableName(a.table)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) a
         else {
           val sp  = stagingPath(tableName, "INSERT")
           val ops = Seq((a.query, sp, "INSERT"))
-          StagedDmlNode(a, ops, tableName)
+          StagedDmlNode(a, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
       // OVERWRITE — pre-read staging: retract replaced rows and add replacement rows
       // -----------------------------------------------------------------------
       case o: OverwriteByExpression =>
-        val tableName = extractTableName(o.table)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) o
+        val tableName  = extractTableName(o.table)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) o
         else {
           // OverwriteByExpression replaces the rows selected by deleteExpr.  The
           // incoming query alone is not a complete signed delta: treating only
@@ -75,28 +77,30 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
             (replacedPlan, stagingPath(tableName, "DELETE"), "DELETE"),
             (o.query, stagingPath(tableName, "OVERWRITE"), "OVERWRITE")
           )
-          StagedDmlNode(o, ops, tableName)
+          StagedDmlNode(o, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
       // DeltaDelete — Delta's native pre-lowered DELETE node
       // -----------------------------------------------------------------------
       case d: DeltaDelete =>
-        val tableName = extractTableName(d.child)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) d
+        val tableName  = extractTableName(d.child)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) d
         else {
           val cond                     = d.condition.getOrElse(Literal(true))
           val deletedPlan: LogicalPlan = Filter(cond, d.child)
           val ops                      = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
-          StagedDmlNode(d, ops, tableName)
+          StagedDmlNode(d, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
       // DeltaUpdateTable — Delta's native pre-lowered UPDATE node
       // -----------------------------------------------------------------------
       case u: DeltaUpdateTable =>
-        val tableName = extractTableName(u.child)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) u
+        val tableName  = extractTableName(u.child)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) u
         else {
           // Both staging plans must be executed BEFORE the DML so that the
           // WHERE condition still matches the original rows.
@@ -137,18 +141,19 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
           )
-          StagedDmlNode(u, preOps, tableName)
+          StagedDmlNode(u, preOps, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
       // DeltaMergeInto — Delta's native pre-lowered MERGE node
       // -----------------------------------------------------------------------
       case m: DeltaMergeInto =>
-        val tableName = extractTableName(m.target)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) m
+        val tableName  = extractTableName(m.target)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) m
         else {
           val ops = Seq((m.source, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName)
+          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
@@ -156,8 +161,9 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
       // (kept for forward compatibility; may fire if Delta ordering changes)
       // -----------------------------------------------------------------------
       case r: ReplaceData =>
-        val tableName = extractTableName(r.originalTable)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) r
+        val tableName  = extractTableName(r.originalTable)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) r
         else {
           val ops = if (isUpdateReplaceData(r)) {
             val beforePlan: LogicalPlan = Filter(r.condition, r.originalTable)
@@ -170,32 +176,35 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
             val deletedPlan: LogicalPlan = Filter(r.condition, r.originalTable)
             Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
           }
-          StagedDmlNode(r, ops, tableName)
+          StagedDmlNode(r, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       case w: WriteDelta =>
-        val tableName = extractTableName(w.originalTable)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) w
+        val tableName  = extractTableName(w.originalTable)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) w
         else {
           val ops = Seq((w.query, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(w, ops, tableName)
+          StagedDmlNode(w, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       // -----------------------------------------------------------------------
       // Spark-standard fallbacks (fire if Delta's parser is not active)
       // -----------------------------------------------------------------------
       case d: DeleteFromTable =>
-        val tableName = extractTableName(d.table)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) d
+        val tableName  = extractTableName(d.table)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) d
         else {
           val deletedPlan: LogicalPlan = Filter(d.condition, d.table)
           val ops                      = Seq((deletedPlan, stagingPath(tableName, "DELETE"), "DELETE"))
-          StagedDmlNode(d, ops, tableName)
+          StagedDmlNode(d, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       case u: UpdateTable =>
-        val tableName = extractTableName(u.table)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) u
+        val tableName  = extractTableName(u.table)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) u
         else {
           // Both staging plans must be executed BEFORE the DML (same reason as
           // DeltaUpdateTable above).
@@ -221,15 +230,16 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
           )
-          StagedDmlNode(u, preOps, tableName)
+          StagedDmlNode(u, preOps, tableName, dependentMaterializedViews = dependents)
         }
 
       case m: MergeIntoTable =>
-        val tableName = extractTableName(m.targetTable)
-        if (tableName.isEmpty || !hasDependentMvs(tableName)) m
+        val tableName  = extractTableName(m.targetTable)
+        val dependents = dependentMvs(tableName)
+        if (tableName.isEmpty || dependents.isEmpty) m
         else {
           val ops = Seq((m.sourceTable, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName)
+          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
         }
 
       case _ => plan
@@ -254,29 +264,37 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
   private def alreadyWrapped(p: LogicalPlan): Boolean =
     p.find(_.isInstanceOf[StagedDmlNode]).isDefined
 
-  private def hasDependentMvs(tableName: String): Boolean =
-    try {
-      // Allow calling Spark SQL (DataFrame.collect) from within this analysis rule.
-      // Without this, the nested query triggered by MvCatalog re-enters the analyzer,
-      // which may be blocked by Spark's re-entrancy guard.
-      AnalysisHelper.allowInvokingTransformsInAnalyzer {
-        MvCatalog.ensureTables(session)
-        MvCatalog.viewsForSource(session, tableName).nonEmpty
+  private def dependentMvs(tableName: String): Seq[String] =
+    if (tableName.isEmpty) Seq.empty
+    else
+      try {
+        // Allow calling Spark SQL (DataFrame.collect) from within this analysis rule.
+        // Without this, the nested query triggered by MvCatalog re-enters the analyzer,
+        // which may be blocked by Spark's re-entrancy guard.
+        AnalysisHelper.allowInvokingTransformsInAnalyzer {
+          MvCatalog.ensureTables(session)
+          MvCatalog
+            .viewsForSource(session, tableName)
+            .map { metadata =>
+              metadata.name.database.fold(metadata.name.table)(database => s"$database.${metadata.name.table}")
+            }
+            .distinct
+            .sorted
+        }
+      } catch {
+        case e: RocksDBException =>
+          logError(s"[openivm] RocksDB failure resolving dependent MVs for $tableName: ${e.getMessage}", e)
+          throw new IllegalStateException(
+            s"[openivm] cannot determine dependent MVs for $tableName (RocksDB error: ${e.getMessage}); " +
+              "refusing to silently un-tee INSERT. Likely cause: another Spark driver JVM holds the openivm " +
+              "RocksDB LOCK. If running under ivm-bench, ensure all callers share one Livy session " +
+              "(see services/spark_openivm_sources.py).",
+            e
+          )
+        case e: Exception =>
+          logError(s"[openivm] dependentMvs failed for $tableName: ${e.getClass.getName}: ${e.getMessage}", e)
+          Seq.empty
       }
-    } catch {
-      case e: RocksDBException =>
-        logError(s"[openivm] RocksDB failure resolving dependent MVs for $tableName: ${e.getMessage}", e)
-        throw new IllegalStateException(
-          s"[openivm] cannot determine dependent MVs for $tableName (RocksDB error: ${e.getMessage}); " +
-            "refusing to silently un-tee INSERT. Likely cause: another Spark driver JVM holds the openivm " +
-            "RocksDB LOCK. If running under ivm-bench, ensure all callers share one Livy session " +
-            "(see services/spark_openivm_sources.py).",
-          e
-        )
-      case e: Exception =>
-        logError(s"[openivm] hasDependentMvs failed for $tableName: ${e.getClass.getName}: ${e.getMessage}", e)
-        false
-    }
 
   private def extractTableName(relation: LogicalPlan): String = relation match {
     case r: DataSourceV2Relation if r.identifier.isDefined =>

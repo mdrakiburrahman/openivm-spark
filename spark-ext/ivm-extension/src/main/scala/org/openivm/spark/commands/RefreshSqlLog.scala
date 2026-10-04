@@ -2,6 +2,8 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, QueryLogExport, RefreshSqlLogAsyncFlusher, RefreshSqlLogRow}
+import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
+import org.openivm.spark.telemetry.OpenIvmTelemetryContract
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -39,6 +41,10 @@ final class RefreshSqlLog private (
   // Per-instance, per-thread buffer. RefreshMutex serialises CREATE /
   // REFRESH / DROP of the same MV in the same JVM, so no contention here.
   private val buffer = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
+  private val insightActive =
+    spark != null && OpenIvmInsightsBroker.hasActiveCapture(spark)
+  private val startedNanos = System.nanoTime()
+  private var finished     = false
 
   def isActive: Boolean = active
 
@@ -69,10 +75,47 @@ final class RefreshSqlLog private (
       attemptIdx: Int,
       stmtKind: String,
       sql: String,
-      durationMs: Long
+      durationMs: Long,
+      succeeded: Boolean = true
   ): Unit = {
     if (durationMs >= 0L)
       OpenIvmMetrics.recordSqlStatement(stmtKind, durationMs * 1000000L, Option(sql).fold(0)(_.length), attemptIdx)
+    if (insightActive)
+      OpenIvmInsightsBroker.emit(spark) {
+        OpenIvmInsightsContract.EventDraft(
+          operation =
+            if (mode == RefreshSqlLog.ModeCreate) OpenIvmInsightsContract.Operation.Create
+            else OpenIvmInsightsContract.Operation.Refresh,
+          stage = category,
+          eventType =
+            if (succeeded) OpenIvmInsightsContract.EventType.ActionCompleted
+            else OpenIvmInsightsContract.EventType.ActionFailed,
+          level =
+            if (succeeded) OpenIvmInsightsContract.Level.Info
+            else OpenIvmInsightsContract.Level.Error,
+          code = OpenIvmInsightsContract.queryLogCode(category),
+          message =
+            if (succeeded) s"Completed OpenIVM action category '$category'."
+            else s"OpenIVM action category '$category' failed.",
+          operationId = Some(refreshId),
+          materializedView = Some(viewName),
+          status = Some(if (succeeded) "completed" else "failed"),
+          durationMs = if (durationMs >= 0L) Some(durationMs) else None,
+          detailsJson = Some(
+            OpenIvmInsightJson.obj(
+              "refresh_id"            -> refreshId,
+              "request_id"            -> OpenIvmInsightsBroker.currentRequestId(spark),
+              "query_logging_enabled" -> active,
+              "category"              -> category,
+              "statement_kind"        -> stmtKind,
+              "statement_order"       -> stmtOrder,
+              "attempt"               -> attemptIdx,
+              "mode"                  -> mode
+            )
+          ),
+          terminal = Some(false)
+        )
+      }
     if (!active) return
     try {
       val row = RefreshSqlLogRow(
@@ -116,10 +159,38 @@ final class RefreshSqlLog private (
   /** Only the outermost lifecycle finally may finish a capture: an earlier
     * profile/span flush can still be followed by logged cleanup statements.
     */
-  def finish(outcome: String): Unit = {
-    if (!active) return
-    flush()
-    exportInvocation.foreach(_.finish(outcome))
+  def finish(outcome: String): Unit = synchronized {
+    if (finished) return
+    try {
+      if (active) {
+        flush()
+        exportInvocation.foreach(_.finish(outcome))
+      }
+    } finally {
+      emitOperationTerminal(outcome)
+      finished = true
+    }
+  }
+
+  private def emitOperationTerminal(outcome: String): Unit = {
+    if (spark == null || !OpenIvmInsightsBroker.hasActiveCapture(spark)) return
+    val operation =
+      if (mode == RefreshSqlLog.ModeCreate) OpenIvmInsightsContract.Operation.Create
+      else OpenIvmInsightsContract.Operation.Refresh
+    val success =
+      if (mode == RefreshSqlLog.ModeCreate)
+        OpenIvmTelemetryContract.CreateSuccessOutcomes.contains(outcome)
+      else OpenIvmTelemetryContract.RefreshSuccessOutcomes.contains(outcome)
+    OpenIvmInsightEvents.operationFinished(
+      spark = spark,
+      operationId = refreshId,
+      materializedView = viewName,
+      operation = operation,
+      outcome = outcome,
+      durationMs = (System.nanoTime() - startedNanos) / 1000000L,
+      failed = !success,
+      warning = outcome == "committed_with_cleanup_warning"
+    )
   }
 }
 
