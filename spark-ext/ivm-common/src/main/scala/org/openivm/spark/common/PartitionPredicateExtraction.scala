@@ -50,13 +50,17 @@ object PartitionPredicateExtraction extends PredicateHelper {
     val result = new IdentityHashMap[UnresolvedRelation, Seq[Expression]]()
 
     def walk(plan: LogicalPlan, filters: Seq[Expression]): Unit = plan match {
-      case Filter(condition, child)        => walk(child, filters :+ condition)
-      case Project(_, child)               => walk(child, filters)
-      case SubqueryAlias(_, child)         => walk(child, filters)
-      case EventTimeWatermark(_, _, child) => walk(child, filters)
-      case UnresolvedWith(child, cteRelations) =>
-        cteRelations.foreach { case (_, alias) => walk(alias, Seq.empty) }
-        walk(child, filters)
+      case Filter(condition, child) => walk(child, filters :+ condition)
+      case Project(_, child)        => walk(child, filters)
+      case SubqueryAlias(_, child)  => walk(child, filters)
+      // Matched by type + accessor rather than exact-arity extractor: both
+      // `EventTimeWatermark` and `UnresolvedWith` gained extra constructor
+      // fields between Spark 3.5 and 4.1 (`nodeId` / `allowRecursion`), but
+      // `.child()` / `.cteRelations()` accessors are stable across both.
+      case watermark: EventTimeWatermark => walk(watermark.child, filters)
+      case cte: UnresolvedWith =>
+        cte.cteRelations.foreach { tuple => walk(tuple.productElement(1).asInstanceOf[SubqueryAlias], Seq.empty) }
+        walk(cte.child, filters)
       case relation: UnresolvedRelation if relation.isStreaming =>
         result.put(relation, filters)
       case other => other.children.foreach(child => walk(child, Seq.empty))
