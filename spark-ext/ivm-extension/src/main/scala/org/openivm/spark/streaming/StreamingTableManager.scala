@@ -87,9 +87,10 @@ object StreamingTableManager {
 
   private def createInternal(
       spark: SparkSession,
-      spec: StreamingTableSpec,
+      declaredSpec: StreamingTableSpec,
       insight: InsightOperation
   ): StreamingTableStatus = {
+    val spec = StreamingTableDefinition.resolveSymbolicStartingVersions(spark, declaredSpec)
     StreamingTableMetadata.validateProvider(spec)
     StreamingTableMetadata.validateUserProperties(spec.tableProperties)
     spec.location.foreach(location => StreamingTableMetadata.validateRequestedLocation(spark, location, spec.name))

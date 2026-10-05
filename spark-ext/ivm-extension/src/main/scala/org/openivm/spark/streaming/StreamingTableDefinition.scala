@@ -23,6 +23,7 @@ import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.sql.types.{DataType, Metadata, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.openivm.spark.common.{DeltaStreamStartingVersion, DeltaTableVersion}
 
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -189,6 +190,7 @@ final case class StreamingSourceDefinition(
     isStreaming: Boolean,
     semanticOptions: Map[String, String],
     operationalOptions: Map[String, String],
+    rawOptions: Map[String, String],
     deltaPath: Option[String],
     deltaTableId: Option[String]
 )
@@ -254,6 +256,67 @@ object StreamingTableDefinition {
     """product:org\.apache\.spark\.sql\.catalyst\.expressions\.CommonExpressionId""" +
       """\(\[value:java\.lang\.Long:"-?\d+",value:java\.lang\.Boolean:"(?:true|false)"\]\)"""
   )
+
+  /** Reserved option key carrying the user-declared symbolic `startingVersion`
+    * strategy (issue #63) alongside its resolved numeric replacement, so the
+    * semantic fingerprint can keep hashing the declared strategy while Delta
+    * receives a concrete version.
+    */
+  private[streaming] val DeclaredStartingVersionKey = "__openivm_declared_startingversion"
+
+  /** Rewrites each streaming `UnresolvedRelation`'s declared `startingVersion`
+    * from one of the symbolic strategies (`earliest`, `earliestAvailable`,
+    * `latestInclusive`) to the commit version it resolves to right now,
+    * independently per Delta source. Numeric literals and native `latest`
+    * pass through untouched. Resolution happens on every CREATE/REFRESH
+    * invocation; Spark's own checkpoint/offset-log mechanism makes the value
+    * moot once a checkpoint already has committed offsets, so re-resolving on
+    * an already-running or resumed stream is harmless.
+    */
+  def resolveSymbolicStartingVersions(spark: SparkSession, spec: StreamingTableSpec): StreamingTableSpec = {
+    val rewritten = spec.query.transformUp {
+      case relation: UnresolvedRelation if relation.isStreaming =>
+        val options = relation.options.asCaseSensitiveMap().asScala.toMap
+        val symbolic = options.collectFirst {
+          case (key, value) if key.equalsIgnoreCase("startingversion") =>
+            (key, value, DeltaStreamStartingVersion.parse(value))
+        }
+        symbolic match {
+          case Some((key, declaredValue, Some(strategy))) =>
+            val tableRef = quotedMultipart(relation.multipartIdentifier)
+            val deltaLog = DeltaTableVersion.deltaLogOption(spark, tableRef).getOrElse(
+              StreamingTableErrors.invalid(
+                s"Symbolic startingVersion '$declaredValue' is only supported for Delta streaming sources; " +
+                  s"$tableRef did not resolve to a Delta table"
+              )
+            )
+            val resolvedVersion = DeltaStreamStartingVersion.resolve(deltaLog, strategy)
+            val newOptions = (options - key) ++ Map(
+              key                        -> resolvedVersion.toString,
+              DeclaredStartingVersionKey -> declaredValue
+            )
+            val replacement = UnresolvedRelation(
+              relation.multipartIdentifier,
+              new CaseInsensitiveStringMap(newOptions.asJava),
+              isStreaming = true
+            )
+            replacement.copyTagsFrom(relation)
+            replacement
+          case _ => relation
+        }
+    }
+    spec.copy(query = rewritten)
+  }
+
+  /** Restores the declared symbolic `startingVersion` strategy in place of
+    * its resolved numeric replacement, so the semantic fingerprint hashes the
+    * stable declared strategy instead of a transient commit version.
+    */
+  private def normalizeDeclaredStartingVersion(options: Map[String, String]): Map[String, String] =
+    options.get(DeclaredStartingVersionKey) match {
+      case Some(declaredSymbolic) => (options - DeclaredStartingVersionKey) + ("startingversion" -> declaredSymbolic)
+      case None                   => options
+    }
 
   def build(
       spark: SparkSession,
@@ -354,6 +417,7 @@ object StreamingTableDefinition {
       source.deltaTableId.foreach(id => node.put("deltaTableId", id))
       putMap(node, "semanticOptions", redactForDisplay(source.semanticOptions))
       putMap(node, "operationalOptions", redactForDisplay(source.operationalOptions))
+      putMap(node, "rawOptions", redactForDisplay(source.rawOptions))
     }
 
     val semanticJson    = Mapper.writeValueAsString(semantic)
@@ -625,7 +689,8 @@ object StreamingTableDefinition {
         } else Map.empty[String, String]
       val merged = mergeOptions(seed.options, declaredOptions, seed.identity)
       if (seed.provider == "delta") validateDeltaReaderOptions(spark, merged)
-      val (operational, semantic) = merged.partition { case (key, _) =>
+      val semanticMerged = normalizeDeclaredStartingVersion(merged)
+      val (operational, semantic) = semanticMerged.partition { case (key, _) =>
         OperationalReaderOptions.contains(key)
       }
       StreamingSourceDefinition(
@@ -636,6 +701,7 @@ object StreamingTableDefinition {
         isStreaming = seed.isStreaming,
         semanticOptions = redactForSemantic(semantic),
         operationalOptions = redactForSemantic(operational),
+        rawOptions = redactForSemantic(merged),
         deltaPath = seed.deltaPath,
         deltaTableId = seed.deltaTableId
       )
