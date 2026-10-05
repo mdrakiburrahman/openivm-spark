@@ -6236,18 +6236,60 @@ case class RefreshMaterializedViewCommand(
                   }
                 }
               }
-            } else if (rewritten.statements.contains(s"CACHE TABLE `openivm_run_result_${name.table}`")) {
+            } else if (
+              rewritten.statements.exists(stmt =>
+                SparkRefreshRewriter.stripExecutionMarker(stmt) == s"CACHE TABLE `openivm_run_result_${name.table}`"
+              )
+            ) {
               // The native suffix program splits fallback and append partitions.
               // Whole-partition Spark shortcuts must not skip its fallback delta
               // or apply the suffix a second time.
-              rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
-                val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+              def executeRunningWindowSql(sql: String, idx: Int): Unit = {
                 if (
                   SparkRefreshRewriter.isMergeStatement(sql) ||
                   SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined
                 ) {
                   withPlanTimeBroadcastDisabled { executeSqlAt(sql, idx) }
                 } else executeSqlAt(sql, idx)
+              }
+              val boundsName = s"openivm_run_bounds_${name.table}"
+              val boundsIdx  = rewritten.statements.indexOf(s"CACHE TABLE `$boundsName`")
+              require(boundsIdx >= 0, "Running-window suffix program is missing its cached bounds")
+              val indexed = rewritten.statements.zipWithIndex
+              indexed.take(boundsIdx + 1).foreach { case (stmt, idx) =>
+                executeRunningWindowSql(SparkRefreshRewriter.stripExecutionMarker(stmt), idx)
+              }
+              // One small cached-key scan determines both branches before any
+              // target mutation. NULL decisions belong to neither native filter.
+              val branches = profile.timeStep("window_running_branch_probe", s"bounds_view=$boundsName") {
+                RefreshPerf.timePhase(refreshId, viewLabel, "window_running_branch_probe") {
+                  spark
+                    .sql(s"""SELECT
+                    |COALESCE(MAX(CASE WHEN openivm_running_append THEN 1 ELSE 0 END), 0),
+                    |COALESCE(MAX(CASE WHEN NOT openivm_running_append THEN 1 ELSE 0 END), 0)
+                    |FROM `${boundsName.replace("`", "``")}`""".stripMargin)
+                    .head()
+                }
+              }
+              val hasSuffix   = branches.getInt(0) != 0
+              val hasFallback = branches.getInt(1) != 0
+              indexed.drop(boundsIdx + 1).foreach { case (stmt, idx) =>
+                val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+                if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {
+                  logSkippedWindowStmt(idx, "window_running_empty_suffix_skipped")
+                } else if (!hasFallback && stmt.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) {
+                  SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath) match {
+                    case Some(body) =>
+                      // The suffix cascade APPEND still needs an existing Delta
+                      // table with the exact fallback schema. No rows are scanned.
+                      val path = viewDeltaPath.replace("`", "``")
+                      executeRunningWindowSql(
+                        s"CREATE OR REPLACE TABLE delta.`$path` USING DELTA AS SELECT * FROM ($body) openivm_empty_fallback WHERE false",
+                        idx
+                      )
+                    case None => logSkippedWindowStmt(idx, "window_running_empty_fallback_skipped")
+                  }
+                } else executeRunningWindowSql(sql, idx)
               }
             } else {
               val windowSuffixSql: Option[WindowSuffixSql] =
