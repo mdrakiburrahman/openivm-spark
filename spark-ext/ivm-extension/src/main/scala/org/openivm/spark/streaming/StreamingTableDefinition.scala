@@ -284,12 +284,14 @@ object StreamingTableDefinition {
         symbolic match {
           case Some((key, declaredValue, Some(strategy))) =>
             val tableRef = quotedMultipart(relation.multipartIdentifier)
-            val deltaLog = DeltaTableVersion.deltaLogOption(spark, tableRef).getOrElse(
-              StreamingTableErrors.invalid(
-                s"Symbolic startingVersion '$declaredValue' is only supported for Delta streaming sources; " +
-                  s"$tableRef did not resolve to a Delta table"
+            val deltaLog = DeltaTableVersion
+              .deltaLogOption(spark, tableRef)
+              .getOrElse(
+                StreamingTableErrors.invalid(
+                  s"Symbolic startingVersion '$declaredValue' is only supported for Delta streaming sources; " +
+                    s"$tableRef did not resolve to a Delta table"
+                )
               )
-            )
             val resolvedVersion = DeltaStreamStartingVersion.resolve(deltaLog, strategy)
             val newOptions = (options - key) ++ Map(
               key                        -> resolvedVersion.toString,
