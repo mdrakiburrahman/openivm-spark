@@ -31,4 +31,17 @@ private[streaming] object StreamingPlanCompatibility {
         )
     case _ => None
   }
+
+  /** Rewrites a V1 `StreamingRelation`'s `DataSource.options` using `rewrite`,
+    * returning `None` for any other plan node. `StreamingRelation` lives in a
+    * version-specific package, so this reconstruction must stay alongside
+    * [[extract]] rather than in shared, version-agnostic code.
+    */
+  def rewriteV1StreamingRelationOptions(plan: LogicalPlan)(
+      rewrite: Map[String, String] => Map[String, String]
+  ): Option[LogicalPlan] = plan match {
+    case relation: StreamingRelation =>
+      Some(relation.copy(dataSource = relation.dataSource.copy(options = rewrite(relation.dataSource.options))))
+    case _ => None
+  }
 }

@@ -322,6 +322,48 @@ object StreamingTableDefinition {
       case None                   => options
     }
 
+  /** Same restoration as [[normalizeDeclaredStartingVersion]], but
+    * case-insensitively safe for maps that preserve the user's original key
+    * casing (e.g. `UnresolvedRelation.options.asCaseSensitiveMap()` or a V1
+    * `DataSource.options`). Blindly inserting a lowercase `"startingversion"`
+    * key into such a map would leave the original differently-cased key
+    * (e.g. `"startingVersion"`) in place too, creating a case-insensitive
+    * duplicate that `readOptions` rejects.
+    */
+  private def restoreStartingVersionKey(options: Map[String, String]): Map[String, String] =
+    options.get(DeclaredStartingVersionKey) match {
+      case Some(declaredSymbolic) =>
+        val startingVersionKey = options.keys.find(_.equalsIgnoreCase("startingversion")).getOrElse("startingversion")
+        (options - DeclaredStartingVersionKey - startingVersionKey) + (startingVersionKey -> declaredSymbolic)
+      case None => options
+    }
+
+  /** Restores every relation's declared symbolic `startingVersion` in place
+    * of its resolved numeric replacement across an entire plan (including
+    * inside CTEs and subqueries), so plan-structural semantic fingerprints
+    * (`declarationPlan`/`analyzedPlan`) stay stable across CREATE/REFRESH
+    * invocations instead of drifting whenever the resolved commit version
+    * changes. Without this, `resolveSymbolicStartingVersions` baking a fresh
+    * numeric version into relation options on every call would make an
+    * otherwise-identical symbolic declaration look like a semantic edit.
+    */
+  private def restoreDeclaredStartingVersions(plan: LogicalPlan): LogicalPlan =
+    CteAwarePlanRewriter.rewrite(plan) {
+      case relation: UnresolvedRelation if relation.isStreaming =>
+        val options = relation.options.asCaseSensitiveMap().asScala.toMap
+        if (options.contains(DeclaredStartingVersionKey)) {
+          val replacement = UnresolvedRelation(
+            relation.multipartIdentifier,
+            new CaseInsensitiveStringMap(restoreStartingVersionKey(options).asJava),
+            isStreaming = true
+          )
+          replacement.copyTagsFrom(relation)
+          replacement
+        } else relation
+      case other =>
+        StreamingPlanCompatibility.rewriteV1StreamingRelationOptions(other)(restoreStartingVersionKey).getOrElse(other)
+    }
+
   def build(
       spark: SparkSession,
       spec: StreamingTableSpec,
@@ -340,8 +382,8 @@ object StreamingTableDefinition {
         .getOrElse("<catalog-managed>")
     )
     semantic.put("outputMode", runtime.outputMode)
-    semantic.put("declarationPlan", structuralPlan(spec.query))
-    semantic.put("analyzedPlan", structuralPlan(analyzed))
+    semantic.put("declarationPlan", structuralPlan(restoreDeclaredStartingVersions(spec.query)))
+    semantic.put("analyzedPlan", structuralPlan(restoreDeclaredStartingVersions(analyzed)))
     semantic.put("outputSchema", schemaSignature(analyzed.schema))
     semantic.put("targetSchema", targetSchemaSignature(analyzed.schema))
 
