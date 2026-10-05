@@ -91,6 +91,29 @@ class OpenIvmCompiler private (
 
   @volatile private var closed: Boolean = false
 
+  /** Verify the native deployment once before allowing query-specific fallbacks.
+    * The probe uses empty compiler tables; it never reads or writes Spark data.
+    */
+  def verifyRuntime(): Unit = {
+    try {
+      val result = compile(
+        CompileRequest(
+          viewName = "openivm_runtime_probe",
+          viewSql = "SELECT id FROM openivm_runtime_source",
+          sources = Map("openivm_runtime_source" -> StructType(Seq(StructField("id", IntegerType))))
+        )
+      )
+      if (result.refreshTypeName == "FULL_REFRESH" || result.sql.trim.isEmpty)
+        throw new IllegalStateException("Native compiler probe did not produce an incremental projection")
+    } catch {
+      case e: OpenIvmCompileException =>
+        throw new IllegalStateException(
+          s"OpenIVM native compiler is unavailable; refusing full-refresh fallback: ${e.getMessage}",
+          e
+        )
+    }
+  }
+
   /** Translates `req.viewSql` into a [[CompiledRefresh]] by registering empty
     * source tables, creating a temporary materialized view, invoking
     * `openivm_compile_with_facts`, and tearing down the ephemeral DuckDB
