@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           source spark-ext/dev/pins.env
           actual="$("$OPENIVM_CLI_PATH" -init /dev/null -unsigned -noheader -csv -c "LOAD '$OPENIVM_EXTENSION_PATH'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name='openivm';")"
-          if [[ ! "$actual" =~ ^[0-9a-f]{8,40}$ || "$OPENIVM_COMMIT" != "$actual"* ]]; then
+          if [[ ! "$actual" =~ ^[0-9a-f]{7,40}$ || "$OPENIVM_COMMIT" != "$actual"* ]]; then
             echo "Native compiler mismatch: image has $actual; pins.env requires $OPENIVM_COMMIT. Rebuild the devcontainer image."
             exit 1
           fi
