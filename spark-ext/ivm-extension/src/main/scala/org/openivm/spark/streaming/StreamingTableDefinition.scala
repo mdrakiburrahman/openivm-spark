@@ -23,7 +23,7 @@ import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.sql.types.{DataType, Metadata, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
-import org.openivm.spark.common.{DeltaStreamStartingVersion, DeltaTableVersion}
+import org.openivm.spark.common.{DeltaStreamStartingVersion, DeltaTableVersion, PartitionPredicateExtraction}
 import org.openivm.spark.parser.CteAwarePlanRewriter
 
 import java.nio.charset.StandardCharsets
@@ -265,20 +265,39 @@ object StreamingTableDefinition {
     */
   private[streaming] val DeclaredStartingVersionKey = "__openivm_declared_startingversion"
 
+  /** Reserved diagnostic-only option keys carrying the outcome of resolving a
+    * predicate-aware symbolic strategy (issue #63 follow-up:
+    * `latestInclusiveWithPredicate` / `earliestInclusiveWithPredicate`).
+    * Never hashed into the semantic fingerprint — stripped by
+    * [[normalizeDeclaredStartingVersion]] / [[restoreStartingVersionKey]] the
+    * same way [[DeclaredStartingVersionKey]] is restored, but with no
+    * replacement value since they carry no semantic meaning.
+    */
+  private[streaming] val PredicateResolutionKey         = "__openivm_predicate_resolution"
+  private[streaming] val PredicateFallbackReasonKey     = "__openivm_predicate_fallback_reason"
+  private[streaming] val EffectivePartitionPredicateKey = "__openivm_effective_partition_predicate"
+
+  private val ReservedOptionKeys =
+    Set(DeclaredStartingVersionKey, PredicateResolutionKey, PredicateFallbackReasonKey, EffectivePartitionPredicateKey)
+
+  private val PredicateDiagnosticKeys =
+    Set(PredicateResolutionKey, PredicateFallbackReasonKey, EffectivePartitionPredicateKey)
+
   /** Rewrites each streaming `UnresolvedRelation`'s declared `startingVersion`
     * from one of the symbolic strategies (`earliest`, `earliestAvailable`,
-    * `latestInclusive`) to the commit version it resolves to right now,
-    * independently per Delta source. Numeric literals and native `latest`
-    * pass through untouched. Resolution happens on every CREATE/REFRESH
-    * invocation; Spark's own checkpoint/offset-log mechanism makes the value
-    * moot once a checkpoint already has committed offsets, so re-resolving on
-    * an already-running or resumed stream is harmless.
+    * `latestInclusive`, `latestInclusiveWithPredicate`,
+    * `earliestInclusiveWithPredicate`) to the commit version it resolves to
+    * right now, independently per Delta source. Numeric literals and native
+    * `latest` pass through untouched. Resolution happens on every
+    * CREATE/REFRESH invocation; Spark's own checkpoint/offset-log mechanism
+    * makes the value moot once a checkpoint already has committed offsets,
+    * so re-resolving on an already-running or resumed stream is harmless.
     */
   def resolveSymbolicStartingVersions(spark: SparkSession, spec: StreamingTableSpec): StreamingTableSpec = {
     val rewritten = CteAwarePlanRewriter.rewrite(spec.query) {
       case relation: UnresolvedRelation if relation.isStreaming =>
         val options = relation.options.asCaseSensitiveMap().asScala.toMap
-        options.keys.find(_.equalsIgnoreCase(DeclaredStartingVersionKey)).foreach { userSuppliedKey =>
+        options.keys.find(key => ReservedOptionKeys.exists(_.equalsIgnoreCase(key))).foreach { userSuppliedKey =>
           StreamingTableErrors.invalid(
             s"Reader option '$userSuppliedKey' for ${quotedMultipart(relation.multipartIdentifier)} is reserved " +
               "for internal use and cannot be set directly"
@@ -299,11 +318,19 @@ object StreamingTableDefinition {
                     s"$tableRef did not resolve to a Delta table"
                 )
               )
-            val resolvedVersion = DeltaStreamStartingVersion.resolve(deltaLog, strategy)
+            val predicate =
+              if (DeltaStreamStartingVersion.isPredicateAware(strategy)) {
+                val partitionColumns = deltaLog.update().metadata.partitionColumns.toSet
+                PartitionPredicateExtraction.extract(spec.query, relation, partitionColumns)
+              } else None
+            val resolved = DeltaStreamStartingVersion.resolve(spark, deltaLog, strategy, predicate)
+            val diagnostics = Map(PredicateResolutionKey -> resolved.resolution) ++
+              resolved.fallbackReason.map(PredicateFallbackReasonKey -> _) ++
+              resolved.effectivePredicate.map(EffectivePartitionPredicateKey -> _)
             val newOptions = (options - key) ++ Map(
-              key                        -> resolvedVersion.toString,
+              key                        -> resolved.version.toString,
               DeclaredStartingVersionKey -> declaredValue
-            )
+            ) ++ (if (DeltaStreamStartingVersion.isPredicateAware(strategy)) diagnostics else Map.empty)
             val replacement = UnresolvedRelation(
               relation.multipartIdentifier,
               new CaseInsensitiveStringMap(newOptions.asJava),
@@ -321,12 +348,14 @@ object StreamingTableDefinition {
   /** Restores the declared symbolic `startingVersion` strategy in place of
     * its resolved numeric replacement, so the semantic fingerprint hashes the
     * stable declared strategy instead of a transient commit version.
+    * Diagnostic-only predicate-resolution keys are dropped entirely (not
+    * restored to anything) since they carry no semantic meaning.
     */
   private def normalizeDeclaredStartingVersion(options: Map[String, String]): Map[String, String] =
-    options.get(DeclaredStartingVersionKey) match {
+    (options.get(DeclaredStartingVersionKey) match {
       case Some(declaredSymbolic) => (options - DeclaredStartingVersionKey) + ("startingversion" -> declaredSymbolic)
       case None                   => options
-    }
+    }) -- PredicateDiagnosticKeys
 
   /** Same restoration as [[normalizeDeclaredStartingVersion]], but
     * case-insensitively safe for maps that preserve the user's original key
@@ -337,12 +366,12 @@ object StreamingTableDefinition {
     * duplicate that `readOptions` rejects.
     */
   private def restoreStartingVersionKey(options: Map[String, String]): Map[String, String] =
-    options.get(DeclaredStartingVersionKey) match {
+    (options.get(DeclaredStartingVersionKey) match {
       case Some(declaredSymbolic) =>
         val startingVersionKey = options.keys.find(_.equalsIgnoreCase("startingversion")).getOrElse("startingversion")
         (options - DeclaredStartingVersionKey - startingVersionKey) + (startingVersionKey -> declaredSymbolic)
       case None => options
-    }
+    }) -- PredicateDiagnosticKeys
 
   /** Restores every relation's declared symbolic `startingVersion` in place
     * of its resolved numeric replacement across an entire plan (including

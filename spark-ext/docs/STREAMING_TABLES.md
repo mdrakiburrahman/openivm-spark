@@ -37,6 +37,47 @@ collide. When omitted, the target table name is used. Changing only
 `displayName` restarts the native writer on its existing checkpoint without
 rebuilding the target or replaying committed input.
 
+### Symbolic `startingVersion` strategies
+
+A Delta streaming source's `'startingVersion'` reader option accepts, in
+addition to a literal commit version or `'latest'`, one of five
+case-insensitive symbolic strategies that are re-resolved to a concrete
+commit version on every `CREATE`/`REFRESH`:
+
+| Strategy                         | Resolves to                                                                                                                                                                 |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `earliest`                       | The oldest commit still present in the Delta log (fails if any earlier commit was vacuumed/pruned).                                                                         |
+| `earliestAvailable`              | The oldest commit that is still recreatable, tolerating prior log compaction/vacuum.                                                                                        |
+| `latestInclusive`                | The current table-head commit, so the stream starts from "now" inclusive of the latest write.                                                                               |
+| `latestInclusiveWithPredicate`   | The newest retained commit containing a data-changing `AddFile` whose partition values satisfy a safely extracted partition-only predicate from the query's `WHERE` clause. |
+| `earliestInclusiveWithPredicate` | The oldest such commit, by the same partition-predicate matching rule.                                                                                                      |
+
+The two `...WithPredicate` strategies avoid wasted/empty `AvailableNow`
+canary runs when a streaming query filters a partitioned Delta source down to
+a known partition range (e.g. `WHERE event_date = current_date() - 1`):
+instead of starting from the table head or earliest commit and scanning
+every partition change to find the first relevant batch, resolution scans
+only for commits that actually touch the matching partitions.
+
+Predicate extraction is conservative and only uses conjuncts of the query's
+`WHERE` clause that reference solely the source's declared partition columns
+via `=`, `<`, `<=`, `>`, `>=`, `IN`, `IS [NOT] NULL`, combined with `AND`
+(literals/casts only, deterministic). Any `OR`, negation, non-partition
+reference, subquery, UDF, or nondeterministic expression in a conjunct
+causes that conjunct (or the whole predicate, when no partition-only
+conjunct is extractable) to be dropped. If no usable predicate exists, or no
+matching `AddFile` is found in the retained history, resolution safely falls
+back to `earliestAvailable` semantics — a predicate-aware strategy never
+narrows unsafely past what `earliestAvailable` would already have replayed;
+it can only start the stream closer to "now" when correctness can be proven.
+This outcome (`exact` vs. `fallback`, with a reason) is surfaced in the
+table's diagnostic JSON alongside the resolved numeric version.
+
+Multiple streaming sources in the same query, including sources nested
+inside CTEs or used across `JOIN`/`UNION`/subquery boundaries, resolve their
+partition predicates independently — a filter above one source is never
+applied to another.
+
 ## Destination layouts
 
 Hive-style partitioning and Delta liquid clustering are separate, mutually
