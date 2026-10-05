@@ -278,6 +278,12 @@ object StreamingTableDefinition {
     val rewritten = CteAwarePlanRewriter.rewrite(spec.query) {
       case relation: UnresolvedRelation if relation.isStreaming =>
         val options = relation.options.asCaseSensitiveMap().asScala.toMap
+        options.keys.find(_.equalsIgnoreCase(DeclaredStartingVersionKey)).foreach { userSuppliedKey =>
+          StreamingTableErrors.invalid(
+            s"Reader option '$userSuppliedKey' for ${quotedMultipart(relation.multipartIdentifier)} is reserved " +
+              "for internal use and cannot be set directly"
+          )
+        }
         val symbolic = options.collectFirst {
           case (key, value) if key.equalsIgnoreCase("startingversion") =>
             (key, value, DeltaStreamStartingVersion.parse(value))

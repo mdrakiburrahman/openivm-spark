@@ -183,5 +183,22 @@ class SymbolicStartingVersionCteSpec extends AnyFunSpec with StreamingSqlTestSup
         "SELECT 1 AS id, 'one' AS value, 'p' AS part UNION ALL SELECT 2, 'two', 'p'"
       )
     }
+
+    it("rejects a user-supplied reserved marker option instead of trusting it as the declared symbolic value") {
+      val source = "symcte_reserved_source"
+      val target = "symcte_reserved_target"
+      createDeltaSource(source, "id INT, value STRING, part STRING")
+      insertRows(source, "(1, 'one', 'p')")
+
+      val ex = intercept[org.apache.spark.sql.AnalysisException] {
+        createStreamingSql(
+          s"""CREATE STREAMING TABLE ${quoteIdentifier(target)}
+             |AS SELECT id, value, part
+             |FROM STREAM ${quoteIdentifier(source)}
+             |WITH ('startingVersion' = '0', '__openivm_declared_startingversion' = 'latestInclusive')""".stripMargin
+        )
+      }
+      ex.getMessage should include("reserved for internal use")
+    }
   }
 }
