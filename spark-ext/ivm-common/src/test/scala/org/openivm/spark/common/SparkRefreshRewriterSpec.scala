@@ -1463,7 +1463,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
 
-    it("materialises running-window helper CREATEs as version-pinned, eagerly cached temporary views") {
+    it("caches running-window snapshots but keeps bounds filters lazy") {
       val rewritten = rewriteP52()
       val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
       creates should have size 5
@@ -1480,9 +1480,11 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       val stateCreate = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
       boundsCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
       stateCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
-      // Each helper is eagerly CACHEd so the snapshot is frozen before the MV mutates.
+      // Fast/fallback only filter cached bounds; the other snapshots stay frozen.
       val caches = rewritten.filter(_.startsWith("CACHE TABLE `openivm_run_"))
-      caches should have size 5
+      caches should have size 3
+      caches should not contain "CACHE TABLE `openivm_run_fast_wradm_mv`"
+      caches should not contain "CACHE TABLE `openivm_run_fallback_wradm_mv`"
     }
 
     it("rewrites fallback delete and recompute insert while preserving the run_fallback subquery") {
@@ -1588,11 +1590,13 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |INSERT INTO openivm_delta_mv_r
           |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
           |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DELETE FROM openivm_data_mv_r WHERE k IN (SELECT k FROM openivm_run_fallback_mv_r);
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
           |INSERT INTO openivm_data_mv_r (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r;
           |INSERT INTO openivm_delta_mv_r SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_mv_r;
           |DROP TABLE IF EXISTS openivm_run_result_mv_r;
           |""".stripMargin
-      val rewritten = SparkRefreshRewriter
+      val tagged = SparkRefreshRewriter
         .rewrite(
           compiledSql = input,
           mvName = TableIdentifier("mv_r", Some("default")),
@@ -1603,6 +1607,11 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           mvVersionBeforeRefresh = Some(3)
         )
         .statements
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) shouldBe 4
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) shouldBe 3
+      tagged.last should not include SparkRefreshRewriter.RunningWindowSuffixMarker
+      tagged.last should not include SparkRefreshRewriter.RunningWindowFallbackMarker
+      val rewritten = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
       rewritten.head should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_result_mv_r AS")
       rewritten(1) shouldBe "CACHE TABLE `openivm_run_result_mv_r`"
       rewritten should contain("INSERT INTO `default`.`mv_r` (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r")

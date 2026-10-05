@@ -159,8 +159,15 @@ object SparkRefreshRewriter {
   private[spark] def isSimpleProjectionDeleteMerge(sql: String): Boolean =
     sql.contains(SimpleProjectionDeleteMergeMarker)
 
+  private[spark] val RunningWindowFallbackMarker = "/*OPENIVM_RUNNING_WINDOW_FALLBACK*/"
+  private[spark] val RunningWindowSuffixMarker   = "/*OPENIVM_RUNNING_WINDOW_SUFFIX*/"
+
   private[spark] def stripExecutionMarker(sql: String): String =
-    sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
+    sql
+      .replace(SimpleProjectionDeleteMergeMarker, "")
+      .replace(RunningWindowFallbackMarker, "")
+      .replace(RunningWindowSuffixMarker, "")
+      .trim
 
   private[spark] def injectSelectiveBroadcastHints(
       sql: String,
@@ -515,10 +522,16 @@ object SparkRefreshRewriter {
     activePinnedPaths.set(sourceSnapshotPinnedPaths)
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+      val runningSuffix = stmts.exists(
+        _.toUpperCase.startsWith(
+          s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
+        )
+      )
 
       var viewDeltaMaterialized = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
-        classify(stmt, viewLogicalName) match {
+        val kind = classify(stmt, viewLogicalName)
+        val emitted = kind match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
             val rewritten =
@@ -597,6 +610,30 @@ object SparkRefreshRewriter {
             Seq(rewriteSnapshotDrop(stmt, viewLogicalName))
           case StatementKind.Unknown => Nil
         }
+        // Only the materialized suffix protocol has independently skippable
+        // branches. Keep schema-only old/new views and all cleanup unconditional.
+        val marker =
+          if (!runningSuffix) ""
+          else
+            kind match {
+              case StatementKind.RunningWindowFastInsert | StatementKind.RunningWindowCascadeInsert =>
+                RunningWindowSuffixMarker
+              case StatementKind.RunningWindowTempCreate
+                  if stmt.toUpperCase.startsWith(
+                    s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
+                  ) ||
+                    stmt.toUpperCase.startsWith(
+                      s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_SUFFIX_${viewLogicalName.toUpperCase} AS"
+                    ) =>
+                RunningWindowSuffixMarker
+              case StatementKind.ViewDeltaInsert | StatementKind.SnapshotDataInsert |
+                  StatementKind.PartitionScopedDelete | StatementKind.PartitionScopedInsert |
+                  StatementKind.ScalarDeleteMv | StatementKind.ScalarFullRecomputeInsert |
+                  StatementKind.SimpleProjectionDataInsert =>
+                RunningWindowFallbackMarker
+              case _ => ""
+            }
+        emitted.map(s => if (marker.isEmpty) s else s"$marker\n$s")
       }
 
       // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
@@ -3461,8 +3498,9 @@ object SparkRefreshRewriter {
     * lazy Spark `TEMPORARY VIEW` re-evaluates the snapshot AFTER the MV is
     * mutated, so bounds/fallback/state go stale (the backdated partition loses
     * its recomputed rows; the fast cascade reads post-insert state). We
-    * therefore emit the view AND an eager `CACHE TABLE` so the snapshot is
-    * frozen at creation time, matching openivm's materialised-temp-table
+    * therefore eagerly cache snapshots at creation time. The fast/fallback
+    * filters stay lazy over cached bounds and need no separate materialization.
+    * This matches openivm's materialised-temp-table
     * semantics. The trailing `DROP VIEW` (RunningWindowTempDrop) auto-uncaches.
     */
   private def rewriteRunningWindowTempCreate(
@@ -3477,6 +3515,10 @@ object SparkRefreshRewriter {
     val nameRe =
       "(?is)CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?([A-Za-z0-9_]+)`?\\s+AS".r
     nameRe.findFirstMatchIn(s) match {
+      case Some(m)
+          if m.group(1).equalsIgnoreCase(s"openivm_run_fast_$viewLogicalName") ||
+            m.group(1).equalsIgnoreCase(s"openivm_run_fallback_$viewLogicalName") =>
+        Seq(s)
       case Some(m) => Seq(s, s"CACHE TABLE `${m.group(1)}`")
       case None    => Seq(s)
     }

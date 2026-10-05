@@ -33,6 +33,11 @@ materializes suffix results once, and Spark eagerly caches them so the MV write
 and downstream delta append reuse the same rows. This is separate from the
 DuckLake-only compact-diff and publication optimizations.
 
+Fast/fallback key filters reuse cached bounds without separate cache actions.
+One probe over those bounds skips branches with no matching partitions. An
+append-only refresh still creates the empty fallback delta table needed by the
+downstream append; state, suffix positions and results remain materialized.
+
 `WindowRunningIncrementalSpec` and `WindowRunningIncrementalCdfSpec` exercise
 this setting with exact bag comparisons, including mixed fallback/append batches
 and downstream materialized views. Performance must be measured with the setting
