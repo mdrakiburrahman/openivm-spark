@@ -1102,8 +1102,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     it("queues state backup without blocking CREATE on remote persistence") {
       spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
-      val entered = new CountDownLatch(1)
-      val release = new CountDownLatch(1)
+      val entered  = new CountDownLatch(1)
+      val release  = new CountDownLatch(1)
       val finished = new CountDownLatch(1)
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
       OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
