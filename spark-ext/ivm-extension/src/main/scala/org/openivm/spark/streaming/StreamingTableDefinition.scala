@@ -24,6 +24,7 @@ import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.sql.types.{DataType, Metadata, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.openivm.spark.common.{DeltaStreamStartingVersion, DeltaTableVersion}
+import org.openivm.spark.parser.CteAwarePlanRewriter
 
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -274,7 +275,7 @@ object StreamingTableDefinition {
     * an already-running or resumed stream is harmless.
     */
   def resolveSymbolicStartingVersions(spark: SparkSession, spec: StreamingTableSpec): StreamingTableSpec = {
-    val rewritten = spec.query.transformUp {
+    val rewritten = CteAwarePlanRewriter.rewrite(spec.query) {
       case relation: UnresolvedRelation if relation.isStreaming =>
         val options = relation.options.asCaseSensitiveMap().asScala.toMap
         val symbolic = options.collectFirst {
@@ -306,6 +307,7 @@ object StreamingTableDefinition {
             replacement
           case _ => relation
         }
+      case other => other
     }
     spec.copy(query = rewritten)
   }

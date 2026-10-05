@@ -25,9 +25,9 @@ import org.apache.spark.sql.catalyst.analysis.{
   UnresolvedRelation,
   UnresolvedSubqueryColumnAliases
 }
-import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.parser.{ParseException, ParserInterface, ParserUtils}
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias, UnresolvedWith}
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias}
 import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.unsafe.types.CalendarInterval
@@ -639,23 +639,7 @@ private[parser] object StreamingQuerySql {
         other
     }
 
-    def bindPlan(current: LogicalPlan): LogicalPlan = {
-      val withChildren = current.mapChildren(bindPlan)
-      val withCtes = withChildren match {
-        case unresolved: UnresolvedWith =>
-          val rebound = SparkParserCompat.rebindCtes(unresolved, bindPlan)
-          rebound.copyTagsFrom(unresolved)
-          rebound
-        case other =>
-          other
-      }
-      val withSubqueries = withCtes.transformExpressionsUp { case expression: SubqueryExpression =>
-        expression.withNewPlan(bindPlan(expression.plan))
-      }
-      bindCurrent(withSubqueries)
-    }
-
-    val bound = bindPlan(plan)
+    val bound = CteAwarePlanRewriter.rewrite(plan)(bindCurrent)
     verifyBindings(sqlText, "stream relation", sourcesByMarker.keySet, usedSources.toMap)
     verifyBindings(sqlText, "watermark", watermarksByMarker.keySet, usedWatermarks.toMap)
     bound
