@@ -18,7 +18,7 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
     container:
-      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:a9bc450e13285b21bb49e973d954538a0fdbe8987ecf2e35cd7c4b60726348bf
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -35,6 +35,18 @@ jobs:
 
       - name: Install locked tooling from the warmed cache
         run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Verify native compiler matches the source pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          source spark-ext/dev/pins.env
+          actual="$("$OPENIVM_CLI_PATH" -init /dev/null -unsigned -noheader -csv -c "LOAD '$OPENIVM_EXTENSION_PATH'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name='openivm';")"
+          if [[ ! "$actual" =~ ^[0-9a-f]{8,40}$ || "$OPENIVM_COMMIT" != "$actual"* ]]; then
+            echo "Native compiler mismatch: image has $actual; pins.env requires $OPENIVM_COMMIT. Rebuild the devcontainer image."
+            exit 1
+          fi
+          echo "Native compiler matches source pin: $actual"
 
       - name: Verify
         run: >-
@@ -70,7 +82,7 @@ jobs:
     needs: verify
     runs-on: [self-hosted, openivm-spark-azure]
     container:
-      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:a9bc450e13285b21bb49e973d954538a0fdbe8987ecf2e35cd7c4b60726348bf
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
