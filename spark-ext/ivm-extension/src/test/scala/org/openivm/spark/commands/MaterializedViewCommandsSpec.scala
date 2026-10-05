@@ -1099,15 +1099,17 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       MvCatalog.lookup(spark, TableIdentifier("mv_t1")) should not be empty
     }
 
-    it("waits for durable state backup before CREATE returns") {
+    it("queues state backup without blocking CREATE on remote persistence") {
       spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
       val entered = new CountDownLatch(1)
       val release = new CountDownLatch(1)
+      val finished = new CountDownLatch(1)
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
       OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
         entered.countDown()
-        release.await(30, TimeUnit.SECONDS)
+        try release.await(120, TimeUnit.SECONDS)
+        finally finished.countDown()
       }
 
       implicit val executionContext: ExecutionContext = ExecutionContext.global
@@ -1121,12 +1123,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
       try {
         entered.await(60, TimeUnit.SECONDS) shouldBe true
-        Thread.sleep(100L)
-        create.isCompleted shouldBe false
-        release.countDown()
-        Await.result(create, 120.seconds)
+        Await.result(create, 60.seconds)
+        MvCatalog.lookup(spark, TableIdentifier("mv_t1_sync")) should not be empty
+        spark.table("mv_t1_sync").count() shouldBe 1L
       } finally {
         release.countDown()
+        finished.await(60, TimeUnit.SECONDS) shouldBe true
         OpenIvmStateSync.setBackupPassHookForTesting(null)
         OpenIvmStateSync.setStateSyncUriHookForTesting(null)
       }
