@@ -19,6 +19,53 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
+  describe("current native source and outer-join contracts") {
+    it("preserves source-column exclusion in affected-key reconstruction UNIONs") {
+      val input = """CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
+        |SELECT id FROM (SELECT * FROM memory.main.orders UNION ALL
+        |SELECT * EXCLUDE (openivm_multiplicity, openivm_timestamp) FROM openivm_delta_orders) old_rows;""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          sourceSchemas = Map("orders" -> Seq("id", "amount"))
+        )
+        .statements
+        .head
+      rewritten should include("SELECT `id`, `amount` FROM `openivm_delta_orders`")
+      rewritten should not include "EXCLUDE"
+      CatalystSqlParser.parsePlan(rewritten.split("(?i)\\sAS\\s", 2).last)
+    }
+
+    it("moves an alias-free full-outer affected-key CTE into a delete MERGE") {
+      val input = """WITH openivm_affected AS (
+        |SELECT DISTINCT openivm_left_key AS _k FROM openivm_delta_mv_r
+        |)
+        |DELETE FROM openivm_data_mv_r WHERE EXISTS (
+        |SELECT 1 FROM openivm_affected WHERE _k <=> openivm_left_key OR _k <=> openivm_right_key);""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+        .statements
+        .head
+      rewritten should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      rewritten should include("WITH openivm_affected AS")
+      rewritten should include("d._k <=> v.openivm_left_key OR d._k <=> v.openivm_right_key")
+      rewritten should include("WHEN MATCHED THEN DELETE")
+      CatalystSqlParser.parsePlan(rewritten)
+    }
+  }
+
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
     * FROM sales GROUP BY region`, captured verbatim per the spec.
     */
