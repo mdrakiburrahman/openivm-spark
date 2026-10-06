@@ -5708,7 +5708,7 @@ case class RefreshMaterializedViewCommand(
           //
           // "Changes no existing MV row" is proven by THREE conditions, checked at
           // the use site:
-          //   (1) the view-delta has no negative multiplicities (`!hasNegativesHere`)
+          //   (1) the view-delta has only nonnegative, non-NULL multiplicities (`!hasNonAppendRowsHere`)
           //       — an INNER-side DELETE/UPDATE retracts rows ⇒ negatives;
           //   (2) no changed source is on the NULL-producing side of an outer join
           //       (`!batchTouchesOuterNullableSource`) — an insert there re-affects
@@ -5904,7 +5904,7 @@ case class RefreshMaterializedViewCommand(
               rewritten.statements.nonEmpty
 
           try {
-            lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
+            lazy val hasNonAppendRows = hasNonAppendSimpleProjectionRows(spark, viewDeltaPath)
 
             val directAggregateMerge: Option[String] =
               if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
@@ -6153,18 +6153,18 @@ case class RefreshMaterializedViewCommand(
                     }
                 else None
 
-              // The negative-row probe operates against either the cached temp
+              // The non-append-row probe operates against either the cached temp
               // view (fuse) or the on-disk scratch (existing path).
-              lazy val hasNegativesHere: Boolean = fusedView match {
+              lazy val hasNonAppendRowsHere: Boolean = fusedView match {
                 case Some(view) =>
                   spark
                     .sql(
                       s"SELECT 1 FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(view)} " +
-                        "WHERE `openivm_multiplicity` < 0 LIMIT 1"
+                        "WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL LIMIT 1"
                     )
                     .head(1)
                     .nonEmpty
-                case None => hasSimpleProjectionDeletes
+                case None => hasNonAppendRows
               }
 
               if (fusedView.isEmpty) {
@@ -6182,7 +6182,7 @@ case class RefreshMaterializedViewCommand(
               // general program. stmt[0] still runs, so cascade view-deltas are intact.
               val insertOnlyInsertSql: Option[String] =
                 if (
-                  batchHasReplace || batchTouchesOuterNullableSource || hasNegativesHere ||
+                  batchHasReplace || batchTouchesOuterNullableSource || hasNonAppendRowsHere ||
                   // Only the recompute path (openivm_left_key DELETE + recompute) needs
                   // this. Value-equality SIMPLE_PROJECTION MVs already handle insert-only
                   // optimally via their no-negative-rows DELETE-skip + EXPLODE INSERT, so
@@ -6230,7 +6230,7 @@ case class RefreshMaterializedViewCommand(
                   val stmtIdx = 1 + idx
                   val sql     = SparkRefreshRewriter.stripExecutionMarker(stmt)
                   val skipDeleteMerge =
-                    SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNegativesHere
+                    SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRowsHere
 
                   if (skipDeleteMerge) {
                     logInfo(
@@ -6457,7 +6457,7 @@ case class RefreshMaterializedViewCommand(
               rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
                 val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
                 val skipDeleteMerge =
-                  SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+                  SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRows
                 val skipWindowPartitionAux =
                   windowSuffixSafe && isWindowPartitionAuxSql(sql)
                 val skipWindowPartitionDelete =
@@ -7090,13 +7090,15 @@ case class RefreshMaterializedViewCommand(
     }
   }
 
-  private def hasNegativeSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
+  // An unmatched LEFT JOIN delta can carry a NULL weight. It identifies an
+  // affected key for native recomputation, rather than an appendable row.
+  private def hasNonAppendSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
     val escapedPath = viewDeltaPath.replace("`", "``")
     spark
       .sql(
         s"""SELECT 1
            |FROM delta.`$escapedPath`
-           |WHERE `openivm_multiplicity` < 0
+           |WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL
            |LIMIT 1""".stripMargin
       )
       .head(1)
