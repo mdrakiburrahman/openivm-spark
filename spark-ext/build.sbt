@@ -99,7 +99,7 @@ lazy val ivmExtension = (project in file("ivm-extension"))
         case Some(dir) =>
           val outDir = (Compile / resourceManaged).value / "openivm-native"
           IO.createDirectory(outDir)
-          val libraries = Seq("libstdc++.so.6", "libgcc_s.so.1")
+          val libraries        = Seq("libstdc++.so.6", "libgcc_s.so.1")
           val bundledLibraries = libraries.filter(name => (file(dir) / name).exists())
           if (bundledLibraries.nonEmpty && bundledLibraries.size != libraries.size)
             sys.error("OPENIVM_NATIVE_DIR must provide both libstdc++.so.6 and libgcc_s.so.1")
