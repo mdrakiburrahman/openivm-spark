@@ -764,7 +764,7 @@ class OpenIvmCompiler private (
     */
   private[compiler] def normalizeCompiledViewNames(sql: String, nativeName: String, viewName: String): String = {
     val internalOrLiteral =
-      "(?i)'(?:''|[^'])*'|(?<![A-Za-z0-9_])(?:[`\"]?memory[`\"]?\\.[`\"]?main[`\"]?\\.)?[`\"]?(openivm_[A-Za-z0-9_]+)[`\"]?".r
+      "(?i)'(?:''|[^'])*+'|(?<![A-Za-z0-9_])(?:[`\"]?memory[`\"]?\\.[`\"]?main[`\"]?\\.)?[`\"]?(openivm_[A-Za-z0-9_]+)[`\"]?".r
     internalOrLiteral.replaceAllIn(
       sql,
       m => {
