@@ -521,7 +521,13 @@ object SparkRefreshRewriter {
     activeSnapshotPins.set(sourceSnapshotPins)
     activePinnedPaths.set(sourceSnapshotPinnedPaths)
     try {
-      val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+      // Preserve column exclusion before individual rewrites strip DuckDB's
+      // EXCLUDE syntax. Native source-reconstruction UNIONs require both arms
+      // to contain source columns, without the delta's bookkeeping columns.
+      val stmts = splitStatements(compiledSql)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .map(s => expandSelectStarExcept(s, sourceSchemas))
       val runningSuffix = stmts.exists(
         _.toUpperCase.startsWith(
           s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
@@ -3120,6 +3126,7 @@ object SparkRefreshRewriter {
       case None => stmt
       case Some(m) =>
         val tgtAlias    = Option(m.group(1)).getOrElse("v")
+        val ctePrefix   = stmt.substring(0, m.start).trim
         val existsOpen  = m.end - 1
         val existsClose = findMatchingCloseParen(stmt, existsOpen)
         if (existsClose < 0) return stmt
@@ -3163,15 +3170,27 @@ object SparkRefreshRewriter {
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:AS\s+)?(\w+)\s+WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:(?:AS\s+)?(\w+)\s+)?WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>
-                val src      = t.group(1)
-                val affAlias = t.group(2)
-                val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                val src = t.group(1)
+                val onCond = Option(t.group(2)) match {
+                  case Some(affAlias) => normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                  case None if src.equalsIgnoreCase("openivm_affected") =>
+                    // Native FULL OUTER projection deletes use an alias-free
+                    // one-column affected-key CTE. Qualify its key separately
+                    // from the target's two hidden join keys for Delta MERGE.
+                    val keys = "(?i)(?<![A-Za-z0-9_.])(_k|openivm_left_key|openivm_right_key)(?![A-Za-z0-9_])".r
+                    keys.replaceAllIn(
+                      t.group(3),
+                      k => s"${if (k.group(1).equalsIgnoreCase("_k")) "d" else "v"}.${k.group(1)}"
+                    )
+                  case None => return stmt
+                }
+                val usingSql = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v
-                  |USING $src AS d
+                  |USING $usingSql AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -3858,7 +3877,7 @@ object SparkRefreshRewriter {
     // an optional table alias after FROM.  The trailing `)` / token boundary
     // is captured so we can splice cleanly.
     val re =
-      """(?is)SELECT\s+\*\s+EXCEPT\s*\(([^)]+)\)\s+FROM\s+`?(openivm_delta_[A-Za-z0-9_]+)`?""".r
+      """(?is)SELECT\s+\*\s+(?:EXCEPT|EXCLUDE)\s*\(([^)]+)\)\s+FROM\s+`?(openivm_delta_[A-Za-z0-9_]+)`?""".r
     re.replaceAllIn(
       sql,
       mm => {
