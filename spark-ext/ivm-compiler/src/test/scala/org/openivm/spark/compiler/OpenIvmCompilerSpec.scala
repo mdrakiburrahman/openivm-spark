@@ -58,6 +58,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
   }
 
+  it should "preserve long escaped literals without overflowing the regex stack" in {
+    val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val literal = "escaped''" * 10000 + s"openivm_data_$key"
+    val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT '$literal' FROM openivm_data_mv"
+  }
+
   it should "read the native-key initial-load file and preserve hidden seed columns" in {
     val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
     val dir  = Files.createTempDirectory("native-view-initial-load")
