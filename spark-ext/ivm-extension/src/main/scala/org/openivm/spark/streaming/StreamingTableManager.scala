@@ -1780,8 +1780,8 @@ object StreamingTableManager {
     val active = query.exists(_.isActive)
     val derived =
       if (active) "active"
-      else if (snapshot.terminationUnconfirmed) "stopping"
       else if (failure.nonEmpty) "failed"
+      else if (snapshot.terminationUnconfirmed) "stopping"
       else "stopped"
     val reportedStatus =
       snapshot.diagnosticStatus
@@ -2142,7 +2142,7 @@ private[streaming] object StreamingTableRegistry {
         stopFailure = None
         startupFailure = None
         diagnosticFailure = None
-        lastFailure = failure.map(value => StreamingTableDefinition.redactText(value).take(2048)).orNull
+        lastFailure = failure.map(StreamingTableDefinition.redactText).orNull
         cancelStartup()
       }
     }

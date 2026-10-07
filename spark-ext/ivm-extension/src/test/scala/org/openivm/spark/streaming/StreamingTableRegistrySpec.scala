@@ -149,7 +149,9 @@ package org.openivm.spark.streaming {
         current.bind(query, "definition") shouldBe None
         current.snapshot.lastProgress shouldBe Some(json)
         current.snapshot.progressObserved shouldBe true
-        current.finish(query.runId.toString, None)
+        val failure = ("native stack frame " * 512) + "expected streaming failure"
+        current.finish(query.runId.toString, Some(failure))
+        current.snapshot.lastFailure.get should endWith("expected streaming failure")
         val replacement = new StreamingQueryTestDouble(() => (), id = query.id)
         current.bind(replacement, "definition").isDefined shouldBe true
         current.snapshot.lastProgress shouldBe None
