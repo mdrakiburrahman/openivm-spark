@@ -43,6 +43,23 @@ package org.openivm.spark.streaming {
     }
 
     describe("termination-aware streaming registry") {
+      it("confirms an inactive run through bounded stop before admitting a resume") {
+        val query   = new StreamingQueryTestDouble(() => (), new AtomicBoolean(false))
+        val current = entry(query)
+        val stopper = new StreamingQueryStopper(1)
+        try {
+          current.snapshot.terminationUnconfirmed shouldBe true
+          StreamingTableRegistry
+            .stopEntry(current, query, stopper, LifecycleDeadline.start(5.seconds), () => ())
+            .terminationConfirmed shouldBe true
+          query.stopCalls.get() shouldBe 1
+          val resumed = new StreamingQueryTestDouble(() => (), id = query.id)
+          current.bind(resumed, "definition").isDefined shouldBe true
+          current.currentQuery shouldBe Some(resumed)
+          current.snapshot.runId shouldBe Some(resumed.runId.toString)
+        } finally stopper.shutdown()
+      }
+
       it("retains an inactive timed-out writer until a matching termination listener event") {
         val active  = new AtomicBoolean(true)
         val entered = new CountDownLatch(1)

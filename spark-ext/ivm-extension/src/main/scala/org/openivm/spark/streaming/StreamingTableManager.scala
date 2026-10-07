@@ -679,6 +679,9 @@ object StreamingTableManager {
       rebuild(spark, frame, spec, runtime, definition, target, manifest, rebuildDecision, insight)
     } else {
       val registryKey   = StreamingTableRegistry.targetKey(target)
+      val observedQuery = StreamingTableRegistry.findActive(spark, registryKey, target)
+      if (observedQuery.exists(query => !query.isActive))
+        stopNative(spark, target, registryKey, insight.deadline, insight.operationId)
       val active        = StreamingTableRegistry.findActive(spark, registryKey, target)
       val changedTuning = manifest.operationalHash != definition.operationalHash
       val before        = statusFor(spark, target, manifest, forcedStatus = None)
