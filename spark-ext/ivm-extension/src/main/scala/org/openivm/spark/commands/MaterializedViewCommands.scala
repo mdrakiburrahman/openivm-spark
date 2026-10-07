@@ -7709,8 +7709,13 @@ case class RefreshMaterializedViewCommand(
       try {
         val mvCols     = spark.table(MvCommandHelper.sqlIdent(targetId)).columns.toSeq
         val sourceCols = spark.table(meta.sourceTables.head).columns.toSeq
+        // This shortcut evaluates the user query, which cannot synthesize
+        // native hidden ROWS positions. Keep the native refresh program when
+        // the backing table has columns absent from the public result.
+        val publicCols = spark.table(MvCommandHelper.sqlIdent(name)).columns.toSeq
         if (
           mvCols.nonEmpty &&
+          mvCols.forall(c => publicCols.exists(_.equalsIgnoreCase(c))) &&
           sourceCols.nonEmpty &&
           (shape.partitionCols :+ shape.orderCol).forall(c => mvCols.exists(_.equalsIgnoreCase(c))) &&
           sourceCols.forall(c => mvCols.exists(_.equalsIgnoreCase(c)))
