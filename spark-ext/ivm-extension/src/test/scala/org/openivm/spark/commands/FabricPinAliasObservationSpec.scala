@@ -333,6 +333,9 @@ class FabricPinAliasObservationSpec extends AnyFunSpec with Matchers with Before
            |JOIN `$friendlyDatabase`.`fpa_recompile_live` AS live ON p.id = live.id""".stripMargin
 
       withSparkConf(FeatureGate.CompileClassificationCacheEnabledKey, "false") {
+        // Session initialization verifies the native runtime with its own
+        // compile. Measure only the subsequent CREATE/REFRESH recompiles.
+        OpenIvmCompilers.forSession(spark)
         val compilerCount = OpenIvmMetrics.counter("compiler.compile.count")
         val beforeCreate  = compilerCount.getCount
         spark.sql(s"CREATE MATERIALIZED VIEW $materialized AS $query")

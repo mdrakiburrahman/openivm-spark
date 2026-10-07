@@ -57,6 +57,9 @@ import scala.util.control.NonFatal
 abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
+  override protected def extraSparkConf: Map[String, String] =
+    Map(FeatureGate.QueryLogEnabledKey -> "true")
+
   // Warehouse on the container's local /tmp (NOT the bind-mounted `target/`)
   // so Delta commit-log file writes hit the container's overlayfs/tmpfs
   // rather than a slow bind-mounted host filesystem. This matters
@@ -125,7 +128,6 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
       )
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config("spark.openivm.enabled", "true")
-      .config(FeatureGate.QueryLogEnabledKey, "true")
       .config("spark.sql.warehouse.dir", warehouseDir)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "1")
@@ -145,6 +147,7 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
     // initialisation overrode the levels we set above.
     quietLoggers()
     spark.sparkContext.setLogLevel("ERROR")
+    FeatureGate.queryLogEnabled(spark) shouldBe true
     MvCatalog.ensureTables(spark)
     StagingCatalog.ensureTables(spark)
 
