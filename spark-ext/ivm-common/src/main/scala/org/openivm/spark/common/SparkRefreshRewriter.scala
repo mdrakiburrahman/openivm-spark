@@ -1045,8 +1045,10 @@ object SparkRefreshRewriter {
     def terminalScan(cteName: String, seen: Set[String] = Set.empty): Option[(String, String)] = {
       if (seen(cteName)) return None
       byName.get(cteName).flatMap { cte =>
+        // The native compiler normalizes internal delta references to bare
+        // names. The source/delta identity check below still guards the fold.
         val scan =
-          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?(openivm_delta_[A-Za-z0-9_]+)`?\\s*$".r
         cte.body match {
           case scan(columns, table) => Some(table -> columns.trim)
           case _                    => singleDependency(cte.body).flatMap(terminalScan(_, seen + cteName))
