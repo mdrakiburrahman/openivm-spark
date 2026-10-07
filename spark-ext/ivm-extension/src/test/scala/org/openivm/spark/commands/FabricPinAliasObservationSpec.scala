@@ -333,30 +333,36 @@ class FabricPinAliasObservationSpec extends AnyFunSpec with Matchers with Before
            |JOIN `$friendlyDatabase`.`fpa_recompile_live` AS live ON p.id = live.id""".stripMargin
 
       withSparkConf(FeatureGate.CompileClassificationCacheEnabledKey, "false") {
-        // Session initialization verifies the native runtime with its own
-        // compile. Measure only the subsequent CREATE/REFRESH recompiles.
-        OpenIvmCompilers.forSession(spark)
         val compilerCount = OpenIvmMetrics.counter("compiler.compile.count")
         val beforeCreate  = compilerCount.getCount
         spark.sql(s"CREATE MATERIALIZED VIEW $materialized AS $query")
         val afterCreate = compilerCount.getCount
-        afterCreate shouldBe beforeCreate + 1L
+        // Commands can run in cloned sessions whose first compiler access
+        // performs a runtime-probe compile too. Require a real compile without
+        // conflating that deployment check with the MV's compile count.
+        afterCreate should be > beforeCreate
 
-        def assertRecompiled(expectedCompilerCount: Long): Unit = {
-          compilerCount.getCount shouldBe expectedCompilerCount
+        def assertRecompiled(previousCompilerCount: Long): Long = {
+          val currentCompilerCount = compilerCount.getCount
+          currentCompilerCount should be > previousCompilerCount
           val metadata = MvCatalog.lookup(spark, TableIdentifier(materialized)).getOrElse(fail("missing MV metadata"))
           metadata.timeTravelPinStatus shouldBe Some(TimeTravelPinStatus.Applied)
           metadata.properties.getOrElse(MvMetadata.CompileRefreshTypeKey, "") should not be "COMPILE_FAILED"
           metadata.querySql should include(s"`$friendlyDatabase`.`fpa_recompile_pinned` VERSION AS OF $pinnedVersion")
+          val actual   = spark.table(materialized)
+          val expected = spark.sql(query)
+          actual.exceptAll(expected).count() shouldBe 0L
+          expected.exceptAll(actual).count() shouldBe 0L
+          currentCompilerCount
         }
 
         spark.sql(s"INSERT INTO $liveSource VALUES (1, 11)")
         spark.sql(s"REFRESH MATERIALIZED VIEW $materialized")
-        assertRecompiled(afterCreate + 1L)
+        val afterFirstRefresh = assertRecompiled(afterCreate)
 
         spark.sql(s"INSERT INTO $liveSource VALUES (1, 12)")
         spark.sql(s"REFRESH MATERIALIZED VIEW $materialized")
-        assertRecompiled(afterCreate + 2L)
+        assertRecompiled(afterFirstRefresh)
       }
     }
   }
