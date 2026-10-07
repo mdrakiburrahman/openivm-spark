@@ -2005,6 +2005,32 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
     }
 
+    it("collapses old-state reconstruction after native delta identity normalization") {
+      for (deltaReference <- Seq("openivm_delta_accounts", "`openivm_delta_accounts`")) {
+        val normalized = canonical.replace("`memory`.`main`.`openivm_delta_accounts`", deltaReference)
+        val rewritten  = SparkRefreshRewriter.rewriteRegularOldStateUnions(normalized, Map("db.accounts" -> 17L))
+
+        rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
+        rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+      }
+    }
+
+    it("does not collapse a normalized delta belonging to a different source") {
+      val differentSource = canonical.replace("`memory`.`main`.`openivm_delta_accounts`", "openivm_delta_orders")
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(
+        differentSource,
+        Map("db.accounts" -> 17L)
+      ) shouldBe differentSource
+    }
+
+    it("does not collapse a filtered normalized delta scan") {
+      val filtered = canonical.replace(
+        "FROM `memory`.`main`.`openivm_delta_accounts`",
+        "FROM openivm_delta_accounts WHERE id > 0"
+      )
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(filtered, Map("db.accounts" -> 17L)) shouldBe filtered
+    }
+
     it("reads a public projection's already-pinned snapshot without time-travelling through a VIEW") {
       val rewritten = SparkRefreshRewriter.rewriteRegularOldStateUnions(
         canonical,
