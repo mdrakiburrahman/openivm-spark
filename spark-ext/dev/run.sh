@@ -35,6 +35,10 @@ Commands:
   test-inventory [sbt-args] Write the selected target's discovered tests.
   compare-test-inventory    Compare Spark 3.5 and Spark 4.1 inventories.
   assembly [sbt-args]       Build the ivmExtension assembly JAR.
+  publish [sbt-args]        Publish the ivmExtension assembly JAR to the Maven
+                            feed (MAVEN_URL/MAVEN_PAT from env or root .env).
+                            No lint, tests, or pins-sync.
+  publish-all [sbt-args]    Publish both targets under one PACKAGE_VERSION.
   verify [sbt-args]         pins-sync, lint, compile, inventory, assembly, test.
   verify-all [sbt-args]     Verify both targets and compare inventories.
   window-benchmark          Run the WindowNoopWriteHarness micro-benchmark.
@@ -43,6 +47,7 @@ Commands:
   help                      Print this message.
 
 Environment:
+  PACKAGE_VERSION            Publish version (default <epoch>.<git-sha-int>.0).
   OPENIVM_SPARK_TARGET       Target alias for --target (default spark-3.5).
   TARGET                     Secondary target alias used by Nx/CI callers.
   OPENIVM_JAVA_HOME_SPARK_35 Spark 3.5 JDK home (default /opt/java/jdk-17).
@@ -314,6 +319,39 @@ cmd_assembly() {
     run_sbt "$@" ivmExtension/assembly
 }
 
+cmd_publish() {
+    if [[ -f "$REPO_ROOT/.env" ]]; then
+        set -a
+        # shellcheck disable=SC1091
+        source "$REPO_ROOT/.env"
+        set +a
+    fi
+    [[ -n "${MAVEN_URL:-}" && -n "${MAVEN_PAT:-}" ]] \
+        || die "MAVEN_URL and MAVEN_PAT must be set in the environment or $REPO_ROOT/.env"
+
+    if [[ -z "${PACKAGE_VERSION:-}" ]]; then
+        local sha
+        sha="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)" || die "cannot derive version; set PACKAGE_VERSION"
+        PACKAGE_VERSION="$(date +%s).$((16#$sha)).0"
+    fi
+    export MAVEN_URL MAVEN_PAT PACKAGE_VERSION
+
+    echo "[spark-ext/run] Publishing $OPENIVM_SPARK_TARGET assembly version $PACKAGE_VERSION"
+    prepare_sbt 1
+    run_sbt "$@" ivmExtension/publish
+}
+
+cmd_publish_all() {
+    if [[ -z "${PACKAGE_VERSION:-}" ]]; then
+        local sha
+        sha="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)" || die "cannot derive version; set PACKAGE_VERSION"
+        PACKAGE_VERSION="$(date +%s).$((16#$sha)).0"
+    fi
+    export PACKAGE_VERSION
+    "$0" --target spark-3.5 publish "$@"
+    "$0" --target spark-4.1 publish "$@"
+}
+
 cmd_verify() {
     cmd_pins_sync
     prepare_sbt 1
@@ -388,6 +426,8 @@ case "$COMMAND" in
     compare-test-inventory|compare_test_inventory)
                                     cmd_compare_test_inventory "$@" ;;
     assembly)                       cmd_assembly "$@" ;;
+    publish)                        cmd_publish "$@" ;;
+    publish-all|publish_all)        cmd_publish_all "$@" ;;
     verify)                         cmd_verify "$@" ;;
     verify-all|verify_all)          cmd_verify_all "$@" ;;
     window-benchmark|window_benchmark)

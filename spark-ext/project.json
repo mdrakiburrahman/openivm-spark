@@ -131,6 +131,23 @@
         }
       }
     },
+    "publish": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh publish-all",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 publish"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 publish"
+        }
+      }
+    },
     "verify": {
       "executor": "nx:run-commands",
       "cache": false,
