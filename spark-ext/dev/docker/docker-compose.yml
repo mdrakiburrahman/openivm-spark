@@ -33,8 +33,13 @@ x-spark-ext: &spark-ext
       UBUNTU_MIRROR: ${UBUNTU_MIRROR}
   image: openivm-spark/spark-ext:${SPARK_EXT_IMAGE_TAG}
   volumes:
-    - ..:/work/spark-ext-dev:ro
-    - ../..:/work/spark-ext:rw
+    # ${SPARK_EXT_DEV_HOST_DIR} / ${SPARK_EXT_HOST_DIR} are exported by
+    # dev.sh (see resolve_host_repo_root) so these resolve correctly whether
+    # the Docker daemon is local (bare host) or reached via a devcontainer's
+    # forwarded socket, where the plain relative paths would otherwise be
+    # resolved against the daemon's own unrelated filesystem.
+    - ${SPARK_EXT_DEV_HOST_DIR:-..}:/work/spark-ext-dev:ro
+    - ${SPARK_EXT_HOST_DIR:-../..}:/work/spark-ext:rw
     - sbt-cache:/root/.sbt
     - ivy-cache:/root/.ivy2
     - coursier-cache:/root/.cache/coursier
