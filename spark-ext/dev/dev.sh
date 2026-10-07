@@ -18,7 +18,12 @@
 #   openivm-test            Run upstream openivm sqllogictest suite.
 #   publish                 Build and publish the ivmExtension fat jar to the
 #                            Maven feed configured in root .env.
-#   publish-all             Publish both runtime artifacts under one version.
+#   publish-all             Publish both runtime artifacts under one shared
+#                           version, sequentially (spark-3.5 then spark-4.1;
+#                           PRE_CLEAN runs once, up front). Not run in
+#                           parallel: both targets bind-mount the same host
+#                           spark-ext/ tree, so concurrent builds corrupt
+#                           each other's sbt meta-build state.
 #   pins-sync               Clone/align .temp/{openivm,lpts,ivm-bench} to the
 #                           pinned COMMITs in pins.env, and shallow-clone the
 #                           read-only .temp/{spark,delta} upstream references
@@ -100,6 +105,27 @@ load_pin_files() {
 }
 
 load_pin_files
+
+resolve_host_repo_root() {
+    local self_id source dest
+    self_id="$(hostname 2>/dev/null || true)"
+    [[ -n "$self_id" ]] || { printf '%s\n' "$REPO_ROOT"; return; }
+
+    while IFS=$'\t' read -r source dest; do
+        if [[ "$dest" == "$REPO_ROOT" ]]; then
+            printf '%s\n' "$source"
+            return
+        fi
+    done < <(docker inspect "$self_id" \
+        --format '{{ range .Mounts }}{{ .Source }}{{ "\t" }}{{ .Destination }}{{ "\n" }}{{ end }}' \
+        2>/dev/null)
+
+    printf '%s\n' "$REPO_ROOT"
+}
+
+HOST_REPO_ROOT="$(resolve_host_repo_root)"
+export SPARK_EXT_HOST_DIR="$HOST_REPO_ROOT/spark-ext"
+export SPARK_EXT_DEV_HOST_DIR="$HOST_REPO_ROOT/spark-ext/dev"
 
 # Wrapper around `docker compose` that always points at our compose file.
 compose() {
@@ -247,12 +273,15 @@ publication_artifact_id() {
     esac
 }
 
-cmd_publish() {
-    pre_clean_if_requested
-
+# Core publish logic, deliberately WITHOUT pre_clean_if_requested: callers
+# that fan this out across targets (cmd_publish_all) must run pre-clean
+# exactly once, up front, before either target's container starts — otherwise
+# one target's mid-flight `docker rm -f $(docker ps -q)` would nuke the
+# sibling target's running container out from under it.
+_publish_target() {
     if [[ ! -f "$REPO_ROOT/.env" ]]; then
         echo "[publish] FATAL: $REPO_ROOT/.env not found; copy .env.example and configure MAVEN_URL/MAVEN_PAT" >&2
-        exit 1
+        return 1
     fi
 
     (
@@ -284,11 +313,42 @@ cmd_publish() {
     )
 }
 
+cmd_publish() {
+    pre_clean_if_requested
+    _publish_target
+}
+
+# Internal, undocumented entry point used only by cmd_publish_all's child
+# processes: publishes the already-resolved $OPENIVM_SPARK_TARGET without
+# re-running pre-clean (see _publish_target's comment above).
+cmd__publish_child() { _publish_target; }
+
+# Publishes both targets, sequentially, under one shared PACKAGE_VERSION.
+#
+# NOT run concurrently: both targets' containers bind-mount the SAME host
+# spark-ext/ directory (`../..:/work/spark-ext:rw` in docker-compose.yml is a
+# literal host path, unaffected by `--project-name`), including the shared
+# sbt meta-build dir `project/target/`. A concurrent `ivmExtension/clean` +
+# compile from one target can and does corrupt the sibling's in-flight build
+# (observed: sbt losing track of the `ivmExtension` project mid-run). Only
+# the three named caches (sbt/ivy/coursier) are actually project-name-scoped
+# and safe to share concurrently — the writable source/target tree is not.
+#   - PRE_CLEAN=1 force-removes EVERY running container on the host, so it
+#     runs exactly once, up front, before either target starts.
+#   - PACKAGE_VERSION is computed once and shared across both targets (the
+#     version embeds `date +%s`, so two independent computations could
+#     otherwise disagree across a second boundary and publish mismatched
+#     versions for the two artifacts).
 cmd_publish_all() {
+    pre_clean_if_requested
+
     local version
     version="${PACKAGE_VERSION:-$(publication_version)}"
-    PACKAGE_VERSION="$version" "$0" --target spark-3.5 publish
-    PACKAGE_VERSION="$version" "$0" --target spark-4.1 publish
+
+    local target
+    for target in spark-3.5 spark-4.1; do
+        PACKAGE_VERSION="$version" "$0" --target "$target" _publish-child
+    done
 }
 
 # Returns 0 if a git op (rebase/merge/cherry-pick/bisect) is in progress in $1.
@@ -1230,7 +1290,7 @@ shift
 # failure). Excludes openivm-test/dev-build/pins-* (no spark-ext bind-mount
 # writes, or pure git ops).
 case "$cmd" in
-    fmt|lint|build|assembly|publish|publish-all|publish_all|test|test-inventory|test_inventory|\
+    fmt|lint|build|assembly|publish|publish-all|publish_all|_publish-child|test|test-inventory|test_inventory|\
         verify|verify-all|verify_all|window-benchmark|window_benchmark|shell)
         trap reclaim_workspace_ownership EXIT
         ;;
@@ -1243,6 +1303,7 @@ case "$cmd" in
     assembly)     cmd_assembly "$@" ;;
     publish)      cmd_publish "$@" ;;
     publish-all|publish_all) cmd_publish_all "$@" ;;
+    _publish-child) cmd__publish_child "$@" ;;
     test)         cmd_test "$@" ;;
     test-inventory|test_inventory) cmd_test_inventory "$@" ;;
     compare-test-inventory|compare_test_inventory) cmd_compare_test_inventory "$@" ;;
