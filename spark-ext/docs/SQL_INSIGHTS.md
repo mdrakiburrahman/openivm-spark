@@ -114,6 +114,24 @@ statement kind/order/attempt, duration, `refresh_id`, `request_id`, and whether
 query logging is enabled. They never carry SQL. Raw SQL remains exclusively in
 the existing `QueryLogExport` / `SHOW OPENIVM QUERY LOG` surfaces.
 
+Native stop failures close the owning operation with `stage=query`,
+`event_type=operation.failed`, `status=failed`, and `terminal=true`.
+`streaming_query_stop_timeout`, `streaming_query_stop_failed`,
+`streaming_query_stop_rejected`, and `streaming_query_stop_interrupted`
+distinguish deadline expiry, native exceptions, bounded-pool rejection, and
+caller interruption. Lock admission uses `streaming_lifecycle_lock_timeout`.
+The terminal record includes bounded root/native-target identities, query/run
+IDs, timeout/remaining budget, observed activity/progress, last batch ID,
+termination confirmation, and scoped-cancellation evidence, never raw
+exception messages or plans. Native inactivity does not prove termination.
+The outer orchestrator should end its request as FAILED and retain storage
+until the writer is known to have terminated.
+
+Startup stalls remain visible in SHOW as `unhealthy`; a subsequent lifecycle
+observation can emit `streaming_query_first_progress_timeout`. Background
+watchdogs and stop workers do not append late events to ended captures or
+borrow another request's thread-local identity.
+
 `details_json` carries stable `branch_code`, `execution_mode`,
 `materialization`, and `target_relation` fields where applicable. Public
 branch codes are `S1`–`S8` for streaming, `M1`–`M8` for materialized views,

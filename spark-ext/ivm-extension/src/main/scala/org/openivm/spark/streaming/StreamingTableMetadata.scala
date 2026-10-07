@@ -34,9 +34,6 @@ final case class StreamingTableTarget(
   def checkpointLocation: String =
     new Path(new Path(dataPath), StreamingTableMetadata.CheckpointDirectory).toString
 
-  private def legacyQueryName: String =
-    s"openivm_streaming_${StreamingTableDefinition.sha256(s"$identity\n$dataPath").take(32)}"
-
   private def queryNameSuffix: String =
     StreamingTableDefinition.sha256(identity).take(16)
 
@@ -64,8 +61,16 @@ final case class StreamingTableTarget(
   }
 
   def matchesQueryName(candidate: String): Boolean =
-    candidate == legacyQueryName ||
-      (candidate.startsWith("openivm_streaming_") && candidate.endsWith(s"_$queryNameSuffix"))
+    StreamingTableTarget.matchesQueryName(identity, dataPath, candidate)
+}
+
+object StreamingTableTarget {
+
+  private[streaming] def matchesQueryName(identity: String, path: String, candidate: String): Boolean = {
+    val legacy = s"openivm_streaming_${StreamingTableDefinition.sha256(s"$identity\n$path").take(32)}"
+    val suffix = StreamingTableDefinition.sha256(identity).take(16)
+    candidate == legacy || (candidate.startsWith("openivm_streaming_") && candidate.endsWith(s"_$suffix"))
+  }
 }
 
 final case class StreamingTableManifest(
