@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -929,6 +929,101 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     sharedCompiler.declareRelyFkStatements(req) should contain only
       """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
+  }
+
+  it should "translate registered delta-shape identities into compiler table names" in {
+    val req = CompileRequest(
+      viewName = "mv_shapes",
+      viewSql = "SELECT id FROM catalog.fact",
+      sources = Map("fact" -> StructType.fromDDL("id INT"), "dim" -> StructType.fromDDL("id INT")),
+      sourceQualifiedNames = Map("fact" -> "catalog.fact", "dim" -> "`catalog.with.dot`.`dim`"),
+      facts = WorkloadFacts(deltaShape =
+        Map("CATALOG.FACT" -> DeltaShape.InsertOnly, "`catalog.with.dot`.`DIM`" -> DeltaShape.Unchanged)
+      )
+    )
+    sharedCompiler.compilerFacts(req) shouldBe req.facts.copy(
+      deltaShape = Map("fact" -> DeltaShape.InsertOnly, "dim" -> DeltaShape.Unchanged)
+    )
+    sharedCompiler
+      .compilerFacts(
+        req.copy(facts =
+          WorkloadFacts(
+            deltaShape = Map("memory.main.dim" -> DeltaShape.Unchanged, "fact" -> DeltaShape.General)
+          )
+        )
+      )
+      .deltaShape shouldBe Map("dim" -> DeltaShape.Unchanged, "fact" -> DeltaShape.General)
+  }
+
+  it should "ignore unknown or ambiguous delta-shape identities and conservatively merge conflicting aliases" in {
+    val req = CompileRequest(
+      viewName = "mv_shape_conflicts",
+      viewSql = "SELECT id FROM tracked.dim",
+      sources = Map("dim" -> StructType.fromDDL("id INT")),
+      sourceQualifiedNames = Map("dim" -> "tracked.dim"),
+      facts = WorkloadFacts(deltaShape = Map("untracked.dim" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerFacts(req).deltaShape shouldBe empty
+    sharedCompiler
+      .compilerFacts(
+        req.copy(facts =
+          WorkloadFacts(
+            deltaShape = Map("tracked.dim" -> DeltaShape.Unchanged, "dim" -> DeltaShape.InsertOnly)
+          )
+        )
+      )
+      .deltaShape shouldBe Map("dim" -> DeltaShape.General)
+    val ambiguous = req.copy(
+      sources = Map("left_dim" -> StructType.fromDDL("id INT"), "right_dim" -> StructType.fromDDL("id INT")),
+      sourceQualifiedNames = Map("left_dim" -> "tracked.dim", "right_dim" -> "tracked.dim"),
+      facts = WorkloadFacts(deltaShape = Map("tracked.dim" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerFacts(ambiguous).deltaShape shouldBe empty
+    val distinct = ambiguous.copy(
+      sourceQualifiedNames = Map("left_dim" -> "left.dim", "right_dim" -> "right.dim"),
+      facts = WorkloadFacts(deltaShape = Map("left.dim" -> DeltaShape.Unchanged, "right.dim" -> DeltaShape.General))
+    )
+    sharedCompiler.compilerFacts(distinct).deltaShape shouldBe Map(
+      "left_dim"  -> DeltaShape.Unchanged,
+      "right_dim" -> DeltaShape.General
+    )
+  }
+
+  it should "restore unchanged-source join pruning for qualified delta-shape facts" in {
+    val req = CompileRequest(
+      viewName = "mv_pruned_join",
+      viewSql = "SELECT s.id, d.label FROM fabric_db.sales s JOIN fabric_db.dimension d ON s.dimension_id = d.id",
+      sources = Map(
+        "sales"     -> StructType.fromDDL("id INT, dimension_id INT"),
+        "dimension" -> StructType.fromDDL("id INT, label STRING")
+      ),
+      sourceQualifiedNames = Map("sales" -> "fabric_db.sales", "dimension" -> "fabric_db.dimension")
+    )
+    val general = sharedCompiler.compile(req)
+    val bare =
+      sharedCompiler.compile(req.copy(facts = WorkloadFacts(deltaShape = Map("dimension" -> DeltaShape.Unchanged))))
+    val qualified = sharedCompiler.compile(
+      req.copy(facts = WorkloadFacts(deltaShape = Map("fabric_db.dimension" -> DeltaShape.Unchanged)))
+    )
+    // Compare the join derivative, excluding the per-CREATE watermark and
+    // unrelated metadata cleanup statements whose order is not deterministic.
+    def derivative(result: CompiledRefresh): String =
+      result.sql
+        .split(';')
+        .find(_.contains("INSERT INTO openivm_delta_mv_pruned_join"))
+        .get
+        .trim
+        .replaceAll("""\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?""", "WATERMARK")
+    qualified.refreshTypeName shouldBe bare.refreshTypeName
+    qualified.refreshTypeName should not be "FULL_REFRESH"
+    derivative(qualified) shouldBe derivative(bare)
+    derivative(qualified) should not be derivative(general)
+    qualified.initialLoadSql shouldBe general.initialLoadSql
+    derivative(
+      sharedCompiler.compile(
+        req.copy(facts = WorkloadFacts(deltaShape = Map("other_db.dimension" -> DeltaShape.Unchanged)))
+      )
+    ) shouldBe derivative(general)
   }
 
   it should "terminate a stalled DuckDB CLI within the compilation deadline" in {
