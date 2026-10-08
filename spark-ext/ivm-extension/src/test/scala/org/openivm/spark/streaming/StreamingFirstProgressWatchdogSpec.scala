@@ -22,7 +22,7 @@ import scala.concurrent.duration._
 class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
 
   describe("first-progress diagnostic watchdog") {
-    it("uses the remaining startup budget and diagnoses exactly at, never before, the deadline") {
+    it("uses the remaining startup budget before starting the zero-work grace") {
       val fixture = new Fixture
       fixture.clock.advance(2.seconds)
       val future = fixture.watch()
@@ -33,19 +33,37 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.observations shouldBe 0
       fixture.unhealthyDeliveries shouldBe 0
 
-      // Force an early wake-up to exercise the monotonic deadline check as well as the initial delay.
+      // Force early wake-ups to exercise both monotonic deadlines as well as the scheduled delays.
       fixture.scheduler.runNextNow()
       fixture.unhealthyDeliveries shouldBe 0
-      fixture.scheduler.pendingCount shouldBe 1
       fixture.clock.advance(1.nanosecond)
       fixture.scheduler.runNextNow()
 
+      fixture.observations shouldBe 2
+      fixture.unhealthyAttempts shouldBe 0
+      future.isDone shouldBe false
+      fixture.scheduler.pendingCount shouldBe 1
+    }
+
+    it("diagnoses continuous confirmed zero work after the grace exactly once") {
+      val fixture = new Fixture
+      val future  = fixture.watch()
+      fixture.atDeadline()
+
+      fixture.unhealthyAttempts shouldBe 0
+      future.isDone shouldBe false
+      fixture.clock.advance(fixture.zeroWorkGrace - 1.nanosecond)
+      fixture.scheduler.runNextNow()
+      fixture.unhealthyAttempts shouldBe 0
+
+      fixture.clock.advance(1.nanosecond)
+      fixture.scheduler.runNextNow()
       fixture.unhealthyAttempts shouldBe 1
       fixture.unhealthyDeliveries shouldBe 1
       future.isCancelled shouldBe true
       fixture.scheduler.pendingCount shouldBe 0
       fixture.tick()
-      fixture.observations shouldBe 2
+      fixture.observations shouldBe 3
       fixture.unhealthyAttempts shouldBe 1
     }
 
@@ -77,34 +95,54 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.observations shouldBe 1
     }
 
-    it("keeps polling active and unknown work after the deadline until confirmed work disappears") {
+    it("resets the zero-work grace when work becomes active or unknown") {
       val fixture = new Fixture
-      fixture.observation =
-        StreamingStartupObservation(active = true, progressObserved = false, workActive = Some(true))
-      val future = fixture.watch()
+      val future  = fixture.watch()
       fixture.atDeadline()
 
-      future.isDone shouldBe false
+      fixture.clock.advance(2.seconds)
+      fixture.observation = fixture.observation.copy(workActive = Some(true))
+      fixture.scheduler.runDue()
       fixture.unhealthyAttempts shouldBe 0
-      fixture.scheduler.pendingCount shouldBe 1
-      future.getDelay(TimeUnit.NANOSECONDS) shouldBe 1.second.toNanos
-
-      fixture.observation = fixture.observation.copy(workActive = None)
-      fixture.tick()
-      fixture.tick()
-      fixture.observations shouldBe 3
-      future.isDone shouldBe false
-      fixture.unhealthyAttempts shouldBe 0
-      fixture.scheduler.pendingCount shouldBe 1
 
       fixture.observation = fixture.observation.copy(workActive = Some(false))
       fixture.tick()
+      fixture.clock.advance(2.seconds)
+      fixture.observation = fixture.observation.copy(workActive = None)
+      fixture.scheduler.runDue()
+      fixture.unhealthyAttempts shouldBe 0
+
+      fixture.observation = fixture.observation.copy(workActive = Some(false))
+      fixture.tick()
+      fixture.elapseGrace()
       fixture.unhealthyDeliveries shouldBe 1
       future.isCancelled shouldBe true
       fixture.scheduler.pendingCount shouldBe 0
       fixture.tick()
-      fixture.observations shouldBe 4
+      fixture.observations shouldBe 6
       fixture.unhealthyAttempts shouldBe 1
+    }
+
+    it("does not diagnose a brief zero-work interval while progress or idle delivery lags") {
+      Seq(
+        StreamingStartupObservation(active = true, progressObserved = true, workActive = Some(false)),
+        StreamingStartupObservation(active = false, progressObserved = false, workActive = Some(false))
+      ).foreach { terminal =>
+        val fixture = new Fixture
+        val future  = fixture.watch()
+        fixture.atDeadline()
+
+        future.isDone shouldBe false
+        fixture.unhealthyAttempts shouldBe 0
+        fixture.observation = terminal
+        fixture.tick()
+
+        future.isCancelled shouldBe true
+        fixture.scheduler.pendingCount shouldBe 0
+        fixture.unhealthyAttempts shouldBe 0
+        fixture.elapseGrace()
+        fixture.observations shouldBe 2
+      }
     }
 
     it("ends continued unknown-work polling on subsequent progress or termination without a diagnosis") {
@@ -149,6 +187,8 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
 
       fixture.observation = fixture.observation.copy(workActive = Some(false))
       fixture.tick()
+      fixture.unhealthyDeliveries shouldBe 0
+      fixture.elapseGrace()
       fixture.unhealthyDeliveries shouldBe 1
       future.isCancelled shouldBe true
       fixture.reported.toVector shouldBe Vector(failure)
@@ -160,6 +200,7 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.deliveryFailure = Some(failure)
       val future = fixture.watch()
       fixture.atDeadline()
+      fixture.elapseGrace()
 
       fixture.reported.toVector shouldBe Vector(failure)
       fixture.unhealthyAttempts shouldBe 1
@@ -229,11 +270,10 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       }
     }
 
-    it("does not leak periodic tasks when first-execution completion or shutdown precedes handle attachment") {
+    it("does not leak periodic tasks when completion or shutdown races with registration and delivery") {
       Seq(
         StreamingStartupObservation(active = true, progressObserved = true, workActive = Some(false)),
-        StreamingStartupObservation(active = false, progressObserved = false, workActive = Some(false)),
-        StreamingStartupObservation(active = true, progressObserved = false, workActive = Some(false))
+        StreamingStartupObservation(active = false, progressObserved = false, workActive = Some(false))
       ).foreach { observation =>
         val fixture = new Fixture
         fixture.observation = observation
@@ -243,36 +283,45 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
 
         future.isCancelled shouldBe true
         fixture.scheduler.pendingCount shouldBe 0
-        val deliveries = if (observation.active && !observation.progressObserved) 1 else 0
-        fixture.unhealthyDeliveries shouldBe deliveries
-        fixture.tick()
-        fixture.observations shouldBe 1
-        fixture.unhealthyDeliveries shouldBe deliveries
-      }
-
-      Seq(true, false).foreach { duringObservation =>
-        val fixture = new Fixture
-        if (duringObservation) fixture.afterObserve = () => fixture.watchdog.shutdown()
-        else fixture.afterDelivery = () => fixture.watchdog.shutdown()
-        fixture.clock.advance(5.seconds)
-        fixture.scheduler.executeDuringRegistration = true
-        val future = fixture.watch()
-
-        future.isCancelled shouldBe true
-        fixture.scheduler.isShutdown shouldBe true
-        fixture.scheduler.pendingCount shouldBe 0
-        fixture.unhealthyDeliveries shouldBe (if (duringObservation) 0 else 1)
+        fixture.unhealthyDeliveries shouldBe 0
         fixture.tick()
         fixture.observations shouldBe 1
       }
+
+      val observationFixture = new Fixture
+      observationFixture.afterObserve = () => observationFixture.watchdog.shutdown()
+      observationFixture.clock.advance(5.seconds)
+      observationFixture.scheduler.executeDuringRegistration = true
+      val observationFuture = observationFixture.watch()
+
+      observationFuture.isCancelled shouldBe true
+      observationFixture.scheduler.isShutdown shouldBe true
+      observationFixture.scheduler.pendingCount shouldBe 0
+      observationFixture.unhealthyDeliveries shouldBe 0
+      observationFixture.tick()
+      observationFixture.observations shouldBe 1
+
+      val deliveryFixture = new Fixture
+      val deliveryFuture  = deliveryFixture.watch()
+      deliveryFixture.atDeadline()
+      deliveryFixture.afterDelivery = () => deliveryFixture.watchdog.shutdown()
+      deliveryFixture.elapseGrace()
+
+      deliveryFuture.isCancelled shouldBe true
+      deliveryFixture.scheduler.isShutdown shouldBe true
+      deliveryFixture.scheduler.pendingCount shouldBe 0
+      deliveryFixture.unhealthyDeliveries shouldBe 1
+      deliveryFixture.tick()
+      deliveryFixture.observations shouldBe 2
     }
   }
 
   private final class Fixture {
-    val clock     = new ManualClock
-    val deadline  = LifecycleDeadline.start(5.seconds, () => clock.nanoTime())
-    val scheduler = new ManualScheduler(() => clock.nanoTime())
-    val reported  = ArrayBuffer.empty[Throwable]
+    val zeroWorkGrace = 30.seconds
+    val clock         = new ManualClock
+    val deadline      = LifecycleDeadline.start(5.seconds, () => clock.nanoTime())
+    val scheduler     = new ManualScheduler(() => clock.nanoTime())
+    val reported      = ArrayBuffer.empty[Throwable]
 
     var observation =
       StreamingStartupObservation(active = true, progressObserved = false, workActive = Some(false))
@@ -290,7 +339,8 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
         reported += error
         reporterFailure.foreach(failure => throw failure)
       },
-      scheduler = scheduler
+      scheduler = scheduler,
+      nanoTime = () => clock.nanoTime()
     )
 
     def watch(): ScheduledFuture[_] =
@@ -317,6 +367,11 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
 
     def tick(): Unit = {
       clock.advance(1.second)
+      scheduler.runDue()
+    }
+
+    def elapseGrace(): Unit = {
+      clock.advance(zeroWorkGrace)
       scheduler.runDue()
     }
   }
