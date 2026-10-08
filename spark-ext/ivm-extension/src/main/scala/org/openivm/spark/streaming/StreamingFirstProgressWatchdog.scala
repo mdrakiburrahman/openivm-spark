@@ -13,6 +13,7 @@ import java.util.concurrent.{
   TimeUnit
 }
 import scala.collection.mutable
+import scala.concurrent.duration.FiniteDuration
 import scala.util.control.NonFatal
 
 /** Work evidence is run-scoped: Some(false) means confirmed zero work, not an unavailable snapshot. */
@@ -24,14 +25,19 @@ private[streaming] final case class StreamingStartupObservation(
 
 /** Diagnoses startup without stopping a query. This watchdog owns its supplied scheduler.
   *
+  * Confirmed zero work must remain continuous for the configured grace after the startup deadline.
   * Non-fatal observation/delivery failures are reported and retried; delivery must be idempotent.
   * Fatal failures or a throwing reporter fail the returned future, never count as a successful diagnosis.
   * Cancellation never interrupts an in-flight observation/delivery. The default daemon starts on registration.
   */
 private[streaming] final class StreamingFirstProgressWatchdog(
     reportError: Throwable => Unit,
-    scheduler: ScheduledExecutorService = StreamingFirstProgressWatchdog.newScheduler()
+    scheduler: ScheduledExecutorService = StreamingFirstProgressWatchdog.newScheduler(),
+    zeroWorkGrace: FiniteDuration = FiniteDuration(30L, TimeUnit.SECONDS),
+    nanoTime: () => Long = () => System.nanoTime()
 ) {
+
+  require(zeroWorkGrace.toNanos > 0L, "Streaming zero-work grace must be positive and representable in nanoseconds")
 
   private val lock             = new AnyRef
   private val registrations    = mutable.Set.empty[Registration]
@@ -93,9 +99,10 @@ private[streaming] final class StreamingFirstProgressWatchdog(
   ) extends Runnable
       with ScheduledFuture[Unit] {
 
-    private val finished  = new AtomicBoolean(false)
-    private val cancelled = new AtomicBoolean(false)
-    private val scheduled = new AtomicReference[ScheduledFuture[_]]()
+    private val finished              = new AtomicBoolean(false)
+    private val cancelled             = new AtomicBoolean(false)
+    private val scheduled             = new AtomicReference[ScheduledFuture[_]]()
+    private var zeroWorkGraceDeadline = Option.empty[LifecycleDeadline]
 
     def attach(task: ScheduledFuture[_]): Unit = {
       scheduled.set(task)
@@ -106,13 +113,29 @@ private[streaming] final class StreamingFirstProgressWatchdog(
     override def run(): Unit =
       if (!finished.get() && !closed) {
         try {
-          val observation = observe()
+          val observation =
+            try observe()
+            catch {
+              case error: Throwable =>
+                zeroWorkGraceDeadline = None
+                throw error
+            }
           if (!finished.get() && !closed) {
             if (observation.progressObserved || !observation.active) cancel(false)
-            else if (deadline.remainingNanos == 0L && observation.workActive.contains(false)) {
-              onUnhealthy()
-              cancel(false)
-            }
+            else if (deadline.remainingNanos > 0L) zeroWorkGraceDeadline = None
+            else
+              observation.workActive match {
+                case Some(false) =>
+                  zeroWorkGraceDeadline match {
+                    case Some(graceDeadline) if graceDeadline.remainingNanos == 0L =>
+                      onUnhealthy()
+                      cancel(false)
+                    case Some(_) => ()
+                    case None =>
+                      zeroWorkGraceDeadline = Some(LifecycleDeadline.start(zeroWorkGrace, nanoTime))
+                  }
+                case _ => zeroWorkGraceDeadline = None
+              }
           }
         } catch {
           case error: Throwable => reportFailure(error)
