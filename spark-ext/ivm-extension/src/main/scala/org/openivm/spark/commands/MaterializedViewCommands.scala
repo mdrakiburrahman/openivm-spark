@@ -40,7 +40,12 @@ import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
 import org.openivm.spark.insights.OpenIvmInsightsBroker
-import org.openivm.spark.streaming.StreamingTableManager
+import org.openivm.spark.streaming.{
+  StreamingInsightEvents,
+  StreamingLifecycleSettings,
+  StreamingQueryStopException,
+  StreamingTableManager
+}
 import org.openivm.spark.telemetry.{
   KvLogValue,
   OpenIvmExecutionSpan,
@@ -51,6 +56,7 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
+import java.util.concurrent.locks.ReentrantLock
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
@@ -171,15 +177,21 @@ private[commands] object OpenIvmCompilers {
 // ---------------------------------------------------------------------------
 private[spark] object RefreshMutex {
 
-  private val locks: java.util.Map[String, AnyRef] =
-    Collections.synchronizedMap(new java.util.HashMap[String, AnyRef]())
+  private val locks: java.util.Map[String, ReentrantLock] =
+    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantLock]())
 
-  /** Acquire (creating if absent) and synchronize on the lock object that
-    * keys this MV. The lock identity is the fully-qualified MV name so two
+  /** Acquire (creating if absent) the reentrant lock that keys this MV.
+    * The lock identity is the fully-qualified MV name so two
     * refreshes targeting the SAME logical MV serialise, even if they
     * originate from different Spark sessions in the same JVM.
     */
-  def withLock[A](mvKey: String)(body: => A): A = {
+  def withLock[A](mvKey: String)(body: => A): A =
+    withGuard(mvKey, None)(body)
+
+  def withLock[A](mvKey: String, deadline: LifecycleDeadline)(body: => A): A =
+    withGuard(mvKey, Some(deadline))(body)
+
+  private def withGuard[A](mvKey: String, deadline: Option[LifecycleDeadline])(body: => A): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
     val lock =
@@ -189,27 +201,51 @@ private[spark] object RefreshMutex {
           val again = locks.get(key)
           if (again != null) again
           else {
-            val l = new Object
+            val l = new ReentrantLock()
             locks.put(key, l)
             l
           }
         }
     OpenIvmMetrics.RefreshQueued.incrementAndGet()
     val waitStarted = System.nanoTime()
-    lock.synchronized {
+    var admitted    = false
+    def entered: A = {
+      admitted = true
       OpenIvmMetrics.RefreshQueued.decrementAndGet()
       OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
       body
     }
+    try
+      deadline match {
+        case Some(budget) => budget.withLock(lock, key)(entered)
+        case None =>
+          lock.lock()
+          try entered
+          finally lock.unlock()
+      }
+    finally
+      if (!admitted) {
+        OpenIvmMetrics.RefreshQueued.decrementAndGet()
+        OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
+      }
   }
 
   /** Acquire several MV locks in canonical order. Re-entrant acquisition of a
-    * lock already held by the current command is safe under JVM monitors.
+    * lock already held by the current command is safe.
     */
   def withLocks[A](mvKeys: Seq[String])(body: => A): A = {
     val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
     def acquire(remaining: List[String]): A = remaining match {
       case head :: tail => withLock(head)(acquire(tail))
+      case Nil          => body
+    }
+    acquire(ordered.toList)
+  }
+
+  def withLocks[A](mvKeys: Seq[String], deadline: LifecycleDeadline)(body: => A): A = {
+    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
+    def acquire(remaining: List[String]): A = remaining match {
+      case head :: tail => withLock(head, deadline)(acquire(tail))
       case Nil          => body
     }
     acquire(ordered.toList)
@@ -8321,7 +8357,8 @@ case class DropMaterializedViewCommand(
       org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop
     )
     try {
-      val rows: Seq[Row] = RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(viewName)) {
+      val deadline = LifecycleDeadline.start(StreamingLifecycleSettings.fromSpark(spark).stopTimeout)
+      val rows: Seq[Row] = RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(viewName), deadline) {
         MvCatalog.lookup(spark, name) match {
           case None if ifExists =>
             outcome = "drop_missing_ignored"
@@ -8359,8 +8396,8 @@ case class DropMaterializedViewCommand(
                 }
               )
             )
-            RefreshMutex.withLocks(descendants.map(_.identity)) {
-              StreamingTableManager.withCascadeLocks(spark, descendants) {
+            RefreshMutex.withLocks(descendants.map(_.identity), deadline) {
+              StreamingTableManager.withCascadeLocks(spark, descendants, deadline) {
                 val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
                 if (verified != descendants)
                   throw new AnalysisException(
@@ -8378,7 +8415,8 @@ case class DropMaterializedViewCommand(
                     operationId = operationId,
                     rootTarget = identity,
                     causedBy = Some(identity)
-                  )
+                  ),
+                  deadline
                 )
                 MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
                 Seq.empty[Row]
@@ -8397,6 +8435,29 @@ case class DropMaterializedViewCommand(
       )
       rows
     } catch {
+      case error: StreamingQueryStopException =>
+        StreamingInsightEvents.stopFailed(
+          spark,
+          operationId,
+          viewName,
+          "drop",
+          (System.nanoTime() - startedAt) / 1000000L,
+          None,
+          error,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop
+        )
+        throw error
+      case error: LifecycleLockTimeoutException =>
+        StreamingInsightEvents.admissionFailed(
+          spark,
+          operationId,
+          viewName,
+          "drop",
+          (System.nanoTime() - startedAt) / 1000000L,
+          error,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop
+        )
+        throw error
       case error: Throwable =>
         OpenIvmInsightEvents.operationFinished(
           spark,

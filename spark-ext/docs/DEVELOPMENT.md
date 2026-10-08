@@ -82,6 +82,26 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
+For an explicitly requested pre-test publication, the legacy publisher is not
+appropriate: it runs an ANTLR compatibility test before upload. Inside the
+pinned devcontainer, export the private-feed values from the gitignored root
+`.env`, compute one immutable version using the content-hash convention above,
+and use the test-free assembly task through Nx:
+
+```bash
+PACKAGE_VERSION="$VERSION" npx --no-install nx run spark-ext:assembly --configuration=spark-3.5 -- \
+  'ivmExtension/publish'
+PACKAGE_VERSION="$VERSION" npx --no-install nx run spark-ext:assembly --configuration=spark-4.1 -- \
+  'ivmExtension/publish'
+```
+
+Run these sequentially because the runtimes share the SBT meta-build tree.
+Verify both feed coordinates and report the shared version as **unverified**
+before executing tests. Formatting and test-source compilation do not execute
+tests. After publication run the normal validation; if source changes, publish
+a new version rather than overwriting the old one. This opt-in administrative
+sequence does not replace the normal compatibility-gated publisher.
+
 `spark-ext:verify` is the canonical one-target command. It first runs
 `pins-sync` (cloning any missing `.temp/{openivm,lpts,ivm-bench}` checkouts,
 fetching origin, and aligning each to its pinned branch, plus shallow-cloning

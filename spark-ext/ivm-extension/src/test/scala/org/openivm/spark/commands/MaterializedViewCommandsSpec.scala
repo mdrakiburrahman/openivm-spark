@@ -2397,7 +2397,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("(14a) Same-MV CREATE execution spans") {
-    it("normalizes materialized graph identities onto the existing MV lifecycle monitor") {
+    it("normalizes materialized graph identities onto the existing MV lifecycle guard") {
       val upstream = "default.lock_materialized_identity"
       val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
       val owner    = new AtomicReference[Thread]()
@@ -2419,7 +2419,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           started.await(10L, TimeUnit.SECONDS) shouldBe true
           def blockedOnHolder: Boolean = {
             val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
-            info != null && info.getThreadState == Thread.State.BLOCKED &&
+            info != null && info.getThreadState == Thread.State.WAITING &&
             info.getLockOwnerId == owner.get().getId
           }
           val deadline = 10.seconds.fromNow
@@ -2435,7 +2435,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
-    it("serializes dependency siblings on their shared upstream monitor and records its wait") {
+    it("serializes dependency siblings on their shared upstream guard and records its wait") {
       val upstream = "default.lock_source"
       val left     = "default.lock_child_left"
       val right    = "default.lock_child_right"
@@ -2465,7 +2465,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             started.await(10L, TimeUnit.SECONDS) shouldBe true
             def blockedOnHolder: Boolean = {
               val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
-              info != null && info.getThreadState == Thread.State.BLOCKED &&
+              info != null && info.getThreadState == Thread.State.WAITING &&
               info.getLockOwnerId == owner.get().getId
             }
             val deadline = 10.seconds.fromNow

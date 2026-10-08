@@ -2,7 +2,7 @@ package org.openivm.spark.streaming
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{FeatureGate, LifecycleLockTimeoutException}
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
 
 import scala.util.control.NonFatal
@@ -80,6 +80,122 @@ private[spark] object StreamingInsightEvents {
       ) ++
         runtime.toSeq.flatMap(runtimeDetails) ++
         error.toSeq.flatMap(value => Seq("error_class" -> value.getClass.getName))
+    )
+
+  def stopFailed(
+      spark: SparkSession,
+      operationId: String,
+      targetRelation: String,
+      command: String,
+      durationMs: Long,
+      branchCode: Option[String],
+      error: StreamingQueryStopException,
+      operation: String = OpenIvmInsightsContract.Operation.Streaming
+  ): Unit = {
+    OpenIvmInsightsBroker.emit(spark) {
+      stopFailureDraft(
+        operationId,
+        targetRelation,
+        command,
+        durationMs,
+        branchCode,
+        error,
+        operation,
+        OpenIvmInsightsBroker.currentRequestId(spark),
+        FeatureGate.queryLogEnabled(spark)
+      )
+    }
+    ()
+  }
+
+  private[streaming] def stopFailureDraft(
+      operationId: String,
+      targetRelation: String,
+      command: String,
+      durationMs: Long,
+      branchCode: Option[String],
+      error: StreamingQueryStopException,
+      operation: String = OpenIvmInsightsContract.Operation.Streaming,
+      requestId: Option[String] = None,
+      queryLoggingEnabled: Boolean = false
+  ): OpenIvmInsightsContract.EventDraft = {
+    val observation = error.observation
+    val code = error match {
+      case _: StreamingQueryStopTimeoutException     => OpenIvmInsightsContract.Code.StreamingQueryStopTimeout
+      case _: StreamingQueryStopRejectedException    => OpenIvmInsightsContract.Code.StreamingQueryStopRejected
+      case _: StreamingQueryStopInterruptedException => OpenIvmInsightsContract.Code.StreamingQueryStopInterrupted
+      case _                                         => OpenIvmInsightsContract.Code.StreamingQueryStopFailed
+    }
+    OpenIvmInsightsContract.EventDraft(
+      operation = operation,
+      stage = "query",
+      eventType = OpenIvmInsightsContract.EventType.OperationFailed,
+      level = OpenIvmInsightsContract.Level.Error,
+      code = code,
+      message =
+        "Native writer termination was not confirmed; retain targets/checkpoints and inspect or recycle the session.",
+      operationId = Some(operationId),
+      materializedView = Some(targetRelation),
+      status = Some("failed"),
+      durationMs = Some(durationMs),
+      terminal = Some(true),
+      detailsJson = Some(
+        OpenIvmInsightJson.obj(
+          "operation_id"   -> operationId,
+          "request_id"     -> requestId,
+          "command"        -> command,
+          "branch_code"    -> branchCode,
+          "execution_mode" -> executionMode(operation),
+          "materialization" -> materialization(
+            if (operation == OpenIvmInsightsContract.Operation.Streaming) "streaming" else "materialized"
+          ),
+          "target_relation"            -> targetRelation,
+          "native_target_relation"     -> error.target.take(256),
+          "query_logging_enabled"      -> queryLoggingEnabled,
+          "query_id"                   -> observation.queryId.take(64),
+          "run_id"                     -> observation.runId.take(64),
+          "timeout_ms"                 -> observation.timeoutMs,
+          "remaining_budget_ms"        -> observation.remainingBudgetMs,
+          "active"                     -> observation.active,
+          "termination_confirmed"      -> observation.terminationConfirmed,
+          "progress_observed"          -> observation.progressObserved,
+          "last_batch_id"              -> observation.lastBatchId,
+          "job_cancellation_attempted" -> observation.cancellationAttempted,
+          "cancellation_error_class"   -> observation.cancellationErrorClass.map(_.take(160)),
+          "error_class"                -> error.getClass.getName,
+          "native_error_class"         -> Option(error.getCause).map(_.getClass.getName.take(160))
+        )
+      )
+    )
+  }
+
+  def admissionFailed(
+      spark: SparkSession,
+      operationId: String,
+      targetRelation: String,
+      command: String,
+      durationMs: Long,
+      error: LifecycleLockTimeoutException,
+      operation: String = OpenIvmInsightsContract.Operation.Streaming
+  ): Unit =
+    emit(
+      spark,
+      operationId,
+      targetRelation,
+      operation,
+      stage = "admission",
+      eventType = OpenIvmInsightsContract.EventType.OperationFailed,
+      level = OpenIvmInsightsContract.Level.Error,
+      code = OpenIvmInsightsContract.Code.StreamingLifecycleLockTimeout,
+      message = "Lifecycle admission exceeded the shared stop deadline; no cleanup was authorized.",
+      status = "failed",
+      terminal = true,
+      durationMs = Some(durationMs),
+      details = baseDetails(spark, operationId, targetRelation, "streaming", Some(command)) ++ Seq(
+        "lock_target" -> error.target.take(256),
+        "timeout_ms"  -> error.timeout.toMillis,
+        "error_class" -> error.getClass.getName
+      )
     )
 
   def branch(

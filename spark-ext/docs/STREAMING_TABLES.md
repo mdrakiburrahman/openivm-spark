@@ -100,6 +100,51 @@ declaration to resume. `DROP STREAMING TABLE` stops the owned query and removes
 its owned registration and target data after moving its checkpoint to the
 configured archive.
 
+### Bounded stop and startup health
+
+Native stops and lifecycle/target-lock admission share one finite budget per
+command, including all writers in a cascade:
+
+```sql
+SET spark.openivm.streaming.stopTimeout = '60s';
+SET spark.openivm.streaming.firstProgressTimeout = '5m';
+```
+
+These are the defaults. Both settings require positive finite durations;
+invalid, infinite, or overflowing values fail before lifecycle mutation.
+The stop budget bounds native stopping and lock admission, not unrelated
+catalog/filesystem I/O or arbitrary Spark execution. Cancellation is limited
+to the native run-ID job group; unrelated jobs and Spark's own stop setting
+are not changed.
+
+A `StreamingQueryStopTimeoutException` means termination is unconfirmed.
+SHOW retains query/run IDs and reports `stop_timed_out`; rejection, native
+failure, and interruption have distinct stop statuses. Spark can report
+`is_active=false` before its stop call actually finishes, so inactivity alone
+never authorizes deletion or a replacement writer. A successful stop or the
+matching termination listener event resolves the entry. Late old-run events
+cannot clear a replacement run.
+
+Before destructive DROP/rebuild/cascade work, every required writer must be
+quiescent and target generations must be revalidated. A stop failure preserves
+targets, checkpoints, manifests, and dependency/reset-completion metadata.
+Already stopped writers may remain stopped. Resolve the stuck writer or let
+the outer orchestrator recycle the Spark session before retrying.
+
+Stops run on a bounded pool of at most 32 daemon workers per SparkContext.
+Repeated stops of the same stuck run reuse its invocation; saturation fails
+explicitly. Application shutdown interrupts workers without joining them.
+An uncooperative native call may survive until driver-process termination;
+daemonization is not proof of query termination.
+
+The diagnostic-only startup watchdog reports `unhealthy` when a run exceeds
+its first-progress deadline without progress/idle completion or reliably
+observed stream-scoped Spark work. Checks poll at one-second intervals after
+the deadline; active or unknown work delays diagnosis. Completed empty batches
+and native idle events count as startup progress. New progress clears a
+startup-only unhealthy state. The watchdog never stops queries, deletes
+storage, or terminates the session; SHOW exposes its bounded failure details.
+
 Checkpoint archival requires a durable Hadoop-filesystem root outside managed
 table storage:
 
@@ -155,8 +200,9 @@ graph spanning both streaming tables and materialized views, then drops every
 transitively downstream managed object in reverse topological order (leaves
 first). This applies to `onQueryChange=rebuild`, `DROP STREAMING TABLE`, and
 `DROP MATERIALIZED VIEW`, including mixed chains such as streaming table →
-materialized view → streaming table. Downstream native queries are stopped
-before their targets and checkpoints are removed. Fan-out and diamond
+materialized view → streaming table. All required native queries, including
+the root writer, are stopped before any target or checkpoint is removed.
+Fan-out and diamond
 dependencies are deduplicated. Missing, corrupt, or generation-mismatched
 dependency metadata aborts the operation before the requested upstream target
 is mutated.

@@ -58,6 +58,11 @@ object FeatureGate {
   val StreamingCheckpointArchiveUriKey: String =
     "spark.openivm.streaming.checkpointArchive.uri"
 
+  val StreamingStopTimeoutKey: String              = "spark.openivm.streaming.stopTimeout"
+  val StreamingFirstProgressTimeoutKey: String     = "spark.openivm.streaming.firstProgressTimeout"
+  val StreamingStopTimeoutDefault: String          = "60s"
+  val StreamingFirstProgressTimeoutDefault: String = "5m"
+
   /** Optional campaign-scoped Hadoop filesystem URI for completed execution
     * span objects. Unset preserves the historical log-only behavior.
     */
