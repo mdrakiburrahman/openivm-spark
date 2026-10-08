@@ -8357,8 +8357,29 @@ case class DropMaterializedViewCommand(
       org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop
     )
     try {
-      val deadline = LifecycleDeadline.start(StreamingLifecycleSettings.fromSpark(spark).stopTimeout)
-      val rows: Seq[Row] = RefreshMutex.withLock(StreamingDependencyCatalog.materializedIdentity(viewName), deadline) {
+      val lifecycleSettings = StreamingLifecycleSettings.fromSpark(spark)
+      val admissionDeadline = LifecycleDeadline.start(
+        lifecycleSettings.lifecycleAdmissionTimeout,
+        context = LifecycleDeadlineContext(
+          phase = "lifecycle_admission",
+          operationId = Some(operationId),
+          command = Some("drop"),
+          targetRelation = Some(viewName)
+        )
+      )
+      lazy val stopDeadline = LifecycleDeadline.start(
+        lifecycleSettings.stopTimeout,
+        context = LifecycleDeadlineContext(
+          phase = "stream_stop",
+          operationId = Some(operationId),
+          command = Some("drop"),
+          targetRelation = Some(viewName)
+        )
+      )
+      val rows: Seq[Row] = RefreshMutex.withLock(
+        StreamingDependencyCatalog.materializedIdentity(viewName),
+        admissionDeadline
+      ) {
         MvCatalog.lookup(spark, name) match {
           case None if ifExists =>
             outcome = "drop_missing_ignored"
@@ -8396,8 +8417,8 @@ case class DropMaterializedViewCommand(
                 }
               )
             )
-            RefreshMutex.withLocks(descendants.map(_.identity), deadline) {
-              StreamingTableManager.withCascadeLocks(spark, descendants, deadline) {
+            RefreshMutex.withLocks(descendants.map(_.identity), admissionDeadline) {
+              StreamingTableManager.withCascadeLocks(spark, descendants, admissionDeadline) {
                 val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
                 if (verified != descendants)
                   throw new AnalysisException(
@@ -8416,7 +8437,7 @@ case class DropMaterializedViewCommand(
                     rootTarget = identity,
                     causedBy = Some(identity)
                   ),
-                  deadline
+                  stopDeadline
                 )
                 MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
                 Seq.empty[Row]

@@ -100,22 +100,27 @@ declaration to resume. `DROP STREAMING TABLE` stops the owned query and removes
 its owned registration and target data after moving its checkpoint to the
 configured archive.
 
-### Bounded stop and startup health
+### Bounded admission, stop, and startup health
 
-Native stops and lifecycle/target-lock admission share one finite budget per
-command, including all writers in a cascade:
+Lifecycle admission and native stream cancellation use independent finite
+budgets. Admission begins immediately before canonical target and managed-parent
+guards are acquired, so definition/query analysis does not consume lock-wait
+time. One admission deadline covers every guard in the command. A separate stop
+deadline begins with the first native cancellation and covers every writer in a
+cascade:
 
 ```sql
+SET spark.openivm.streaming.lifecycleAdmissionTimeout = '60s';
 SET spark.openivm.streaming.stopTimeout = '60s';
 SET spark.openivm.streaming.firstProgressTimeout = '5m';
 ```
 
-These are the defaults. Both settings require positive finite durations;
+These are the defaults. All settings require positive finite durations;
 invalid, infinite, or overflowing values fail before lifecycle mutation.
-The stop budget bounds native stopping and lock admission, not unrelated
-catalog/filesystem I/O or arbitrary Spark execution. Cancellation is limited
-to the native run-ID job group; unrelated jobs and Spark's own stop setting
-are not changed.
+Cancellation is limited to the native run-ID job group; unrelated jobs and
+Spark's own stop setting are not changed. Admission timeouts report the phase,
+waiter operation, observed owner thread when available, and phase-specific
+wait duration while preserving fail-closed no-cleanup behavior.
 
 A `StreamingQueryStopTimeoutException` means termination is unconfirmed.
 SHOW retains query/run IDs and reports `stop_timed_out`; rejection, native

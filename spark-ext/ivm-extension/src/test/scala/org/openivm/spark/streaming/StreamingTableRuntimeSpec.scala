@@ -2,14 +2,47 @@ package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.DeltaLog
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{FeatureGate, LifecycleLockTimeoutException, StreamingDependencyCatalog}
 import org.scalatest.funspec.AnyFunSpec
 
 import java.io.File
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
 class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixture {
+
+  private def withLifecycleTimeouts[A](admission: String, stop: String)(body: => A): A = {
+    val values = Seq(
+      FeatureGate.StreamingLifecycleAdmissionTimeoutKey -> admission,
+      FeatureGate.StreamingStopTimeoutKey               -> stop
+    )
+    val previous = values.map { case (key, _) => key -> spark.conf.getOption(key) }
+    try {
+      values.foreach { case (key, value) => spark.conf.set(key, value) }
+      body
+    } finally
+      previous.foreach {
+        case (key, Some(value)) => spark.conf.set(key, value)
+        case (key, None)        => spark.conf.unset(key)
+      }
+  }
+
+  private def streamingSpec(source: String, target: String): StreamingTableSpec = {
+    val query = readStream(source)
+    StreamingTableSpec(
+      Seq(target),
+      s"SELECT id, value, part FROM STREAM $source",
+      query.queryExecution.logical
+    )
+  }
+
+  private def cleanupStreamingTarget(target: String): Unit = {
+    spark.streams.active.filter(_.name.startsWith("openivm_streaming_")).foreach(_.stop())
+    if (spark.catalog.tableExists(target))
+      StreamingTableManager.drop(spark, Seq(target), ifExists = false)
+  }
 
   describe("native streaming-table runtime") {
     it("writes a Delta projection/filter in the caller session without changing caller configuration") {
@@ -131,6 +164,88 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
       statuses.last.queryId should not be empty
       spark.streams.active.map(_.name).count(_.startsWith("openivm_streaming_")) should be >= 2
       statuses.flatMap(_.queryId).foreach(id => Option(spark.streams.get(id)).foreach(_.stop()))
+    }
+
+    it("admits healthy concurrent creates after pre-lock analysis outlives the stop budget") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val source                                      = "strt_issue71_concurrent_source"
+      val target                                      = "strt_issue71_concurrent_target"
+      createSource(source)
+      val definition = streamingSpec(source, target)
+      val ready      = new CountDownLatch(2)
+      val start      = new CountDownLatch(1)
+
+      def submit(): Future[StreamingTableStatus] = Future {
+        ready.countDown()
+        start.await()
+        StreamingTableManager.create(spark, definition)
+      }
+
+      try {
+        val statuses = withLifecycleTimeouts(admission = "30s", stop = "1ns") {
+          val first  = submit()
+          val second = submit()
+          ready.await(5, TimeUnit.SECONDS) shouldBe true
+          start.countDown()
+          Await.result(Future.sequence(Seq(first, second)), 120.seconds)
+        }
+
+        statuses.flatMap(_.queryId).distinct should have size 1
+        statuses.foreach(_.queryId should not be empty)
+        spark.catalog.tableExists(target) shouldBe true
+      } finally cleanupStreamingTarget(target)
+    }
+
+    it("times out a genuinely held target guard without target or checkpoint mutation") {
+      val source = "strt_issue71_held_source"
+      val target = "strt_issue71_held_target"
+      createSource(source)
+      val definition  = streamingSpec(source, target)
+      val identity    = StreamingTableMetadata.canonicalIdentity(spark, Seq(target))
+      val plannedPath = StreamingTableMetadata.plannedTargetPath(spark, Seq(target), None)
+      val lockKey     = StreamingTableRegistry.provisionalKey(identity, plannedPath)
+      val entered     = new CountDownLatch(1)
+      val release     = new CountDownLatch(1)
+      val ownerError  = new AtomicReference[Throwable]()
+      val owner = new Thread(
+        () =>
+          try
+            StreamingTableRegistry.withTargetLock(spark, lockKey) {
+              entered.countDown()
+              release.await()
+            }
+          catch {
+            case error: Throwable => ownerError.set(error)
+          },
+        "issue71-held-lifecycle-owner"
+      )
+      owner.setDaemon(true)
+      owner.start()
+
+      try {
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        val error = withLifecycleTimeouts(admission = "50ms", stop = "5s") {
+          intercept[LifecycleLockTimeoutException] {
+            StreamingTableManager.create(spark, definition)
+          }
+        }
+
+        error.phase shouldBe "lifecycle_admission"
+        error.waiterCommand shouldBe Some("create")
+        error.waiterTarget shouldBe Some(target)
+        error.ownerThread shouldBe Some("issue71-held-lifecycle-owner")
+        error.target shouldBe lockKey
+        spark.catalog.tableExists(target) shouldBe false
+        plannedPath.foreach(path => pathExists(path) shouldBe false)
+        StreamingDependencyCatalog.lookup(spark, identity) shouldBe None
+        spark.streams.active.exists(_.name.startsWith("openivm_streaming_")) shouldBe false
+      } finally {
+        release.countDown()
+        owner.join(5000L)
+      }
+
+      owner.isAlive shouldBe false
+      ownerError.get() shouldBe null
     }
 
     it("uses a friendly display name and restarts without rebuilding when only the label changes") {

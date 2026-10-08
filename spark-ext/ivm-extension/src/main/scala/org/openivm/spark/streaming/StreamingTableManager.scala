@@ -14,6 +14,7 @@ import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
 import org.openivm.spark.commands.{MaterializedViewLifecycle, RefreshMutex}
 import org.openivm.spark.common.{
   LifecycleDeadline,
+  LifecycleDeadlineContext,
   LifecycleLockTimeoutException,
   MvCatalog,
   MvMetadata,
@@ -51,15 +52,53 @@ object StreamingTableManager {
       val targetRelation: String,
       val command: String
   ) {
-    var branchCode: Option[String]                     = None
-    private var observed: Option[StreamingTableStatus] = None
-    private var budget: Option[LifecycleDeadline]      = None
+    var branchCode: Option[String]                           = None
+    private var observed: Option[StreamingTableStatus]       = None
+    private var settings: Option[StreamingLifecycleSettings] = None
+    private var admissionBudget: Option[LifecycleDeadline]   = None
+    private var stopBudget: Option[LifecycleDeadline]        = None
 
-    def initialize(settings: StreamingLifecycleSettings): Unit =
-      budget = Some(LifecycleDeadline.start(settings.stopTimeout))
+    def initialize(configured: StreamingLifecycleSettings): Unit =
+      settings = Some(configured)
 
-    def deadline: LifecycleDeadline =
-      budget.getOrElse(throw new IllegalStateException("Streaming lifecycle deadline was not initialized"))
+    def startAdmission(): LifecycleDeadline =
+      admissionBudget.getOrElse {
+        val configured = lifecycleSettings
+        val started = LifecycleDeadline.start(
+          configured.lifecycleAdmissionTimeout,
+          context = LifecycleDeadlineContext(
+            phase = "lifecycle_admission",
+            operationId = Some(operationId),
+            command = Some(command),
+            targetRelation = Some(targetRelation)
+          )
+        )
+        admissionBudget = Some(started)
+        started
+      }
+
+    def admissionDeadline: LifecycleDeadline =
+      admissionBudget.getOrElse(
+        throw new IllegalStateException("Streaming lifecycle admission deadline was not initialized")
+      )
+
+    def stopDeadline: LifecycleDeadline =
+      stopBudget.getOrElse {
+        val started = LifecycleDeadline.start(
+          lifecycleSettings.stopTimeout,
+          context = LifecycleDeadlineContext(
+            phase = "stream_stop",
+            operationId = Some(operationId),
+            command = Some(command),
+            targetRelation = Some(targetRelation)
+          )
+        )
+        stopBudget = Some(started)
+        started
+      }
+
+    private def lifecycleSettings: StreamingLifecycleSettings =
+      settings.getOrElse(throw new IllegalStateException("Streaming lifecycle settings were not initialized"))
 
     def selectBranch(code: String): Unit =
       branchCode = Some(code)
@@ -127,10 +166,11 @@ object StreamingTableManager {
     val dependencySources = resolveManagedDependencySources(spark, definition)
     val lockKeys = StreamingTableRegistry.provisionalKey(identity, plannedPath) +:
       dependencySources.map(source => StreamingTableRegistry.lifecycleLockKey(source.parentIdentity))
-    val globalLockKeys = identity +: dependencySources.map(_.parentIdentity)
+    val globalLockKeys    = identity +: dependencySources.map(_.parentIdentity)
+    val admissionDeadline = insight.startAdmission()
 
-    RefreshMutex.withLocks(globalLockKeys, insight.deadline) {
-      StreamingTableRegistry.withTargetLocks(spark, lockKeys, insight.deadline) {
+    RefreshMutex.withLocks(globalLockKeys, admissionDeadline) {
+      StreamingTableRegistry.withTargetLocks(spark, lockKeys, admissionDeadline) {
         val verifiedDependencySources = resolveManagedDependencySources(spark, definition)
         if (verifiedDependencySources != dependencySources)
           StreamingTableErrors.invalid(
@@ -223,7 +263,7 @@ object StreamingTableManager {
                 phase = "resuming"
               )
               emitAlreadyCompletedDescendants(spark, insight, intent)
-              stopRecoveryWriter(spark, spec.name, intent, insight.deadline)
+              stopRecoveryWriter(spark, spec.name, intent, insight.stopDeadline)
               val archived = StreamingTableMetadata.deleteResetOwnedPath(
                 spark,
                 intent,
@@ -345,10 +385,11 @@ object StreamingTableManager {
     val target   = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
     val manifest = StreamingTableMetadata.readManifest(spark, target)
     StreamingTableMetadata.verifyOwned(spark, target, manifest)
-    val registryKey = StreamingTableRegistry.targetKey(target)
-    val lockKey     = StreamingTableRegistry.lifecycleLockKey(target)
-    RefreshMutex.withLock(target.identity, insight.deadline) {
-      StreamingTableRegistry.withTargetLock(spark, lockKey, insight.deadline) {
+    val registryKey       = StreamingTableRegistry.targetKey(target)
+    val lockKey           = StreamingTableRegistry.lifecycleLockKey(target)
+    val admissionDeadline = insight.startAdmission()
+    RefreshMutex.withLock(target.identity, admissionDeadline) {
+      StreamingTableRegistry.withTargetLock(spark, lockKey, admissionDeadline) {
         val current = StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true)
         if (
           current.dataPath != target.dataPath ||
@@ -360,7 +401,7 @@ object StreamingTableManager {
           )
         val before = statusFor(spark, current, manifest, forcedStatus = None)
         insight.observe(before)
-        stopNative(spark, current, registryKey, insight.deadline, insight.operationId)
+        stopNative(spark, current, registryKey, insight.stopDeadline, insight.operationId)
         val status = statusFor(spark, current, manifest, forcedStatus = Some("stopped"))
         insight.observe(status)
         StreamingInsightEvents.action(
@@ -466,8 +507,9 @@ object StreamingTableManager {
       .map(StreamingTableRegistry.lifecycleLockKey)
     val materializedLockKeys =
       target.identity +: descendants.map(_.identity)
-    RefreshMutex.withLocks(materializedLockKeys, insight.deadline) {
-      StreamingTableRegistry.withTargetLocks(spark, streamingLockKeys, insight.deadline) {
+    val admissionDeadline = insight.startAdmission()
+    RefreshMutex.withLocks(materializedLockKeys, admissionDeadline) {
+      StreamingTableRegistry.withTargetLocks(spark, streamingLockKeys, admissionDeadline) {
         val verifiedDescendants =
           resolveCascadeDescendantsForRebuild(spark, target, manifest)
         if (verifiedDescendants != descendants)
@@ -479,8 +521,8 @@ object StreamingTableManager {
         insight.observe(before)
         StreamingTableStopLifecycle.afterStops(
           Seq(
-            () => stopCascadeWriters(spark, descendants, insight.deadline, insight.operationId),
-            () => stopNative(spark, target, registryKey, insight.deadline, insight.operationId)
+            () => stopCascadeWriters(spark, descendants, insight.stopDeadline, insight.operationId),
+            () => stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
           )
         ) {
           dropResolvedCascade(
@@ -492,7 +534,7 @@ object StreamingTableManager {
               rootTarget = target.identity,
               causedBy = Some(target.identity)
             ),
-            deadline = insight.deadline,
+            deadline = insight.stopDeadline,
             insightOperation = org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Streaming
           )
           val stopped = before.copy(status = "stopped", isActive = false)
@@ -681,7 +723,7 @@ object StreamingTableManager {
       val registryKey   = StreamingTableRegistry.targetKey(target)
       val observedQuery = StreamingTableRegistry.findActive(spark, registryKey, target)
       if (observedQuery.exists(query => !query.isActive))
-        stopNative(spark, target, registryKey, insight.deadline, insight.operationId)
+        stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
       val active        = StreamingTableRegistry.findActive(spark, registryKey, target)
       val changedTuning = manifest.operationalHash != definition.operationalHash
       val before        = statusFor(spark, target, manifest, forcedStatus = None)
@@ -743,7 +785,7 @@ object StreamingTableManager {
             )
         )
         if (active.nonEmpty) {
-          stopNative(spark, target, registryKey, insight.deadline, insight.operationId)
+          stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
           StreamingInsightEvents.action(
             spark,
             insight.operationId,
@@ -809,8 +851,9 @@ object StreamingTableManager {
     val lockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
       .map(StreamingTableRegistry.lifecycleLockKey)
     val materializedLockKeys = target.identity +: descendants.map(_.identity)
-    RefreshMutex.withLocks(materializedLockKeys, insight.deadline) {
-      StreamingTableRegistry.withTargetLocks(spark, lockKeys, insight.deadline) {
+    val admissionDeadline    = insight.admissionDeadline
+    RefreshMutex.withLocks(materializedLockKeys, admissionDeadline) {
+      StreamingTableRegistry.withTargetLocks(spark, lockKeys, admissionDeadline) {
         val branchCode =
           if (pending.nonEmpty) org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S7
           else org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S5
@@ -859,10 +902,10 @@ object StreamingTableManager {
               stopCascadeWriters(
                 spark,
                 descendants.filterNot(descendant => completed.contains(descendant.identity)),
-                insight.deadline,
+                insight.stopDeadline,
                 insight.operationId
               ),
-            () => stopNative(spark, target, registryKey, insight.deadline, insight.operationId)
+            () => stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
           )
         ) {
           val intent = pending.getOrElse {
@@ -1389,7 +1432,7 @@ object StreamingTableManager {
               causedBy = causedBy,
               rebuildDecision = intent.rebuildDecision
             ),
-            insight.deadline,
+            insight.stopDeadline,
             org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Streaming
           )
           val updated = intent.copy(

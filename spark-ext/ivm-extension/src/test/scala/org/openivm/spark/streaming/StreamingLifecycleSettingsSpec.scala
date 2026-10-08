@@ -8,7 +8,11 @@ import org.scalatest.matchers.should.Matchers
 
 class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
 
-  private val keys = Seq(FeatureGate.StreamingStopTimeoutKey, FeatureGate.StreamingFirstProgressTimeoutKey)
+  private val keys = Seq(
+    FeatureGate.StreamingLifecycleAdmissionTimeoutKey,
+    FeatureGate.StreamingStopTimeoutKey,
+    FeatureGate.StreamingFirstProgressTimeoutKey
+  )
 
   private def assertInvalid(value: String): Unit =
     keys.foreach { key =>
@@ -28,38 +32,49 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
       }
 
       requested.toSeq shouldBe keys
+      settings.lifecycleAdmissionTimeout shouldBe 60.seconds
       settings.stopTimeout shouldBe 60.seconds
       settings.firstProgressTimeout shouldBe 5.minutes
+      settings.lifecycleAdmissionTimeout shouldBe Duration(FeatureGate.StreamingLifecycleAdmissionTimeoutDefault)
       settings.stopTimeout shouldBe Duration(FeatureGate.StreamingStopTimeoutDefault)
       settings.firstProgressTimeout shouldBe Duration(FeatureGate.StreamingFirstProgressTimeoutDefault)
     }
 
     it("parses independent supplied settings without replacing the absent setting") {
       val configured = Map(
-        FeatureGate.StreamingStopTimeoutKey          -> "0.25 seconds",
-        FeatureGate.StreamingFirstProgressTimeoutKey -> "750 ms"
+        FeatureGate.StreamingLifecycleAdmissionTimeoutKey -> "125 ms",
+        FeatureGate.StreamingStopTimeoutKey               -> "0.25 seconds",
+        FeatureGate.StreamingFirstProgressTimeoutKey      -> "750 ms"
       )
       val settings = StreamingLifecycleSettings.parse(configured.get)
 
+      settings.lifecycleAdmissionTimeout shouldBe 125.millis
       settings.stopTimeout shouldBe 250.millis
       settings.firstProgressTimeout shouldBe 750.millis
-      StreamingLifecycleSettings
-        .parse(Map(FeatureGate.StreamingStopTimeoutKey -> "2s").get)
-        .firstProgressTimeout shouldBe 5.minutes
+      val stopOnly = StreamingLifecycleSettings.parse(Map(FeatureGate.StreamingStopTimeoutKey -> "2s").get)
+      stopOnly.lifecycleAdmissionTimeout shouldBe 60.seconds
+      stopOnly.firstProgressTimeout shouldBe 5.minutes
     }
 
     it("reads the current values on every invocation rather than caching runtime settings") {
-      var configured                        = Map(FeatureGate.StreamingStopTimeoutKey -> "1s")
+      var configured = Map(
+        FeatureGate.StreamingLifecycleAdmissionTimeoutKey -> "1s",
+        FeatureGate.StreamingStopTimeoutKey               -> "2s"
+      )
       def read(key: String): Option[String] = configured.get(key)
 
-      StreamingLifecycleSettings.parse(read).stopTimeout shouldBe 1.second
+      val initial = StreamingLifecycleSettings.parse(read)
+      initial.lifecycleAdmissionTimeout shouldBe 1.second
+      initial.stopTimeout shouldBe 2.seconds
       configured = Map(
-        FeatureGate.StreamingStopTimeoutKey          -> "3s",
-        FeatureGate.StreamingFirstProgressTimeoutKey -> "4s"
+        FeatureGate.StreamingLifecycleAdmissionTimeoutKey -> "3s",
+        FeatureGate.StreamingStopTimeoutKey               -> "4s",
+        FeatureGate.StreamingFirstProgressTimeoutKey      -> "5s"
       )
       val changed = StreamingLifecycleSettings.parse(read)
-      changed.stopTimeout shouldBe 3.seconds
-      changed.firstProgressTimeout shouldBe 4.seconds
+      changed.lifecycleAdmissionTimeout shouldBe 3.seconds
+      changed.stopTimeout shouldBe 4.seconds
+      changed.firstProgressTimeout shouldBe 5.seconds
     }
 
     it("accepts standard units and decimals only when they are exact nanoseconds") {
@@ -117,6 +132,7 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
     it("accepts the largest exactly representable finite nanosecond budget") {
       val settings = StreamingLifecycleSettings.parse(_ => Some(s"${Long.MaxValue}ns"))
 
+      settings.lifecycleAdmissionTimeout.toNanos shouldBe Long.MaxValue
       settings.stopTimeout.toNanos shouldBe Long.MaxValue
       settings.firstProgressTimeout.toNanos shouldBe Long.MaxValue
     }
