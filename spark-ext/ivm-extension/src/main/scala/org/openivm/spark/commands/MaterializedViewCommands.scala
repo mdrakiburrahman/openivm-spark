@@ -5491,7 +5491,15 @@ case class RefreshMaterializedViewCommand(
         freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
       )
       val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
-      val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+      // Pinned and source-advance schemas can describe a historical snapshot;
+      // discover their current constraint metadata through the existing path.
+      val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
+        refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
+        preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
+      }
+      val constraintFacts = WorkloadFactsRegistry
+        .forRefresh()
+        .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
       val cacheTierFacts = WorkloadFacts(
         forceViewDeltaCascade = !terminalInsertOnlyAggregate,
         runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
@@ -5943,7 +5951,9 @@ case class RefreshMaterializedViewCommand(
           val fkTermPruneEnabled        = FeatureGate.fkTermPruneEnabled(spark)
           val rewriteConstraintFacts =
             if (uniqueJoinSimplifyEnabled || fkTermPruneEnabled)
-              WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+              WorkloadFactsRegistry
+                .forRefresh()
+                .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
             else WorkloadConstraintFacts()
 
           val rewrittenBase = profile.timeStep(
