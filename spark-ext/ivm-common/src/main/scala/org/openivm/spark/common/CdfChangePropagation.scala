@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
-import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.View
 import org.apache.spark.sql.types.StructType
 import org.slf4j.LoggerFactory
 
@@ -205,24 +205,15 @@ object CdfChangePropagation {
    * upstream).
    */
   def tableHasCdf(spark: SparkSession, name: String): Boolean = {
-    if (MvProjectionSource.isProjection(spark, name))
-      return DeltaTableVersion.deltaLogOption(spark, name).exists { log =>
-        log.update().metadata.configuration.get("delta.enableChangeDataFeed").exists(_.equalsIgnoreCase("true"))
-      }
-    val identifier = CatalystSqlParser.parseTableIdentifier(name)
-    val resolved = identifier.database match {
-      case Some(_) => name
-      case None    => name
-    }
-    val df =
-      try spark.sql(s"SHOW TBLPROPERTIES ${quoteForCatalog(resolved)}")
-      catch { case _: Throwable => return false }
-    val rows = df.collect()
-    rows.exists { row =>
-      val k = row.getAs[String]("key")
-      val v = row.getAs[String]("value")
-      k != null && k.equalsIgnoreCase("delta.enableChangeDataFeed") &&
-      v != null && v.trim.equalsIgnoreCase("true")
+    val plan =
+      try spark.table(name).queryExecution.analyzed
+      catch { case _: AnalysisException => return false }
+    // Only the persisted row-local MV projection contract allows CDF through a
+    // VIEW. Other views may filter/join rows and cannot expose the backing feed.
+    if (plan.exists(_.isInstanceOf[View]) && MvProjectionSource.projection(plan).isEmpty)
+      return false
+    DeltaTableVersion.deltaLogFromPlan(plan).exists { log =>
+      log.update().metadata.configuration.get("delta.enableChangeDataFeed").exists(_.trim.equalsIgnoreCase("true"))
     }
   }
 
@@ -230,6 +221,4 @@ object CdfChangePropagation {
   def tableLatestVersion(spark: SparkSession, name: String): Option[Long] =
     DeltaTableVersion.latestOption(spark, name)
 
-  private def quoteForCatalog(name: String): String =
-    name.split("\\.").map(p => s"`${p.replace("`", "``")}`").mkString(".")
 }
