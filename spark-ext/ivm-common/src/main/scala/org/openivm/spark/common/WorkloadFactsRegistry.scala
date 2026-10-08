@@ -35,9 +35,10 @@ final class WorkloadFactsRegistry {
       spark: SparkSession,
       sourceTables: Seq[String],
       configuredFkRelations: Seq[ForeignKeyRelation] = Seq.empty,
-      configuredUniqueKeys: Seq[UniqueKey] = Seq.empty
+      configuredUniqueKeys: Seq[UniqueKey] = Seq.empty,
+      resolvedSourceSchemas: Map[String, StructType] = Map.empty
   ): WorkloadConstraintFacts = {
-    val perTable = sourceTables.distinct.map(table => tableFacts(spark, table))
+    val perTable = sourceTables.distinct.map(table => tableFacts(spark, table, resolvedSourceSchemas.get(table)))
     WorkloadConstraintFacts(
       fkRelations =
         distinctFk(configuredFkRelations ++ sessionForeignKeys(spark, sourceTables) ++ perTable.flatMap(_.fkRelations)),
@@ -62,11 +63,17 @@ object WorkloadFactsRegistry {
 
   def forRefresh(): WorkloadFactsRegistry = new WorkloadFactsRegistry
 
-  private[common] def tableFacts(spark: SparkSession, table: String): WorkloadConstraintFacts = {
+  private[common] def tableFacts(
+      spark: SparkSession,
+      table: String,
+      resolvedSchema: Option[StructType]
+  ): WorkloadConstraintFacts = {
     val catalogTable = resolveCatalogTable(spark, table)
     val properties   = tableProperties(spark, table, catalogTable)
-    val schema       = tableSchema(spark, table)
-    val generated    = schema.toSeq.flatMap(generatedColumn(table, _))
+    // Reuse Spark's analyzed public schema, including generated/identity metadata.
+    // Properties still come from fresh catalog/Delta reads on every discovery.
+    val schema    = resolvedSchema.getOrElse(tableSchema(spark, table))
+    val generated = schema.toSeq.flatMap(generatedColumn(table, _))
     val identityKeys = generated
       .filter(_.expression == IdentityGeneratedValue)
       .map(col => UniqueKey(table, Seq(col.column)))
