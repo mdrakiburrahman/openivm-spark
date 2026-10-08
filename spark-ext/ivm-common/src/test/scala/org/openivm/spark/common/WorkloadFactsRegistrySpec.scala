@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.types.{LongType, MetadataBuilder, StructField}
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.types.{LongType, MetadataBuilder, StructField, StructType}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -102,6 +102,59 @@ class WorkloadFactsRegistrySpec extends AnyFunSpec with BeforeAndAfterAll with M
         StructField("amount_twice", LongType, true, metadata)
       ) should
         contain(GeneratedColumn("generated_table", "amount_twice", "amount * 2"))
+    }
+
+    it("preserves identity and generated-column facts from an analyzed public schema") {
+      val source = s"wf_generated_$suffix"
+      val schema = StructType(
+        Seq(
+          StructField("id", LongType, false, new MetadataBuilder().putLong("delta.identity.start", 1L).build()),
+          StructField(
+            "amount_twice",
+            LongType,
+            true,
+            new MetadataBuilder().putString("delta.generationExpression", "id * 2").build()
+          )
+        )
+      )
+      spark.createDataFrame(spark.sparkContext.parallelize(Seq(Row(1L, 2L))), schema).createOrReplaceTempView(source)
+      try {
+        val resolved = spark.table(source).schema
+        val expected = WorkloadFactsRegistry.forRefresh().discover(spark, Seq(source))
+        val facts = WorkloadFactsRegistry
+          .forRefresh()
+          .discover(spark, Seq(source), resolvedSourceSchemas = Map(source -> resolved))
+
+        facts shouldBe expected
+        facts.uniqueKeys shouldBe Seq(UniqueKey(source, Seq("id")))
+        facts.generatedColumns should contain allOf (
+          GeneratedColumn(source, "id", "IDENTITY"),
+          GeneratedColumn(source, "amount_twice", "id * 2")
+        )
+      } finally spark.catalog.dropTempView(source)
+    }
+
+    it("reads fresh properties and falls back for sources without a supplied schema") {
+      val source = s"wf_schema_reuse_$suffix"
+      spark.sql(s"CREATE TABLE $source (id BIGINT, amount BIGINT) USING delta")
+      try {
+        val schema  = spark.table(source).schema
+        val missing = s"wf_missing_$suffix"
+        val schemas = Map(source -> schema)
+        val before = WorkloadFactsRegistry
+          .forRefresh()
+          .discover(spark, Seq(source, missing), resolvedSourceSchemas = schemas)
+        before.uniqueKeys shouldBe empty
+
+        spark.sql(s"ALTER TABLE $source SET TBLPROPERTIES ('spark.openivm.unique_key' = 'id')")
+        spark.sql(s"ALTER TABLE $source ADD CONSTRAINT positive_amount CHECK (amount > 0)")
+        val after = WorkloadFactsRegistry
+          .forRefresh()
+          .discover(spark, Seq(source, missing), resolvedSourceSchemas = schemas)
+        after shouldBe WorkloadFactsRegistry.forRefresh().discover(spark, Seq(source, missing))
+        after.uniqueKeys shouldBe Seq(UniqueKey(source, Seq("id")))
+        after.deltaConstraints.map(c => c.name -> c.expression) shouldBe Seq("positive_amount" -> "amount > 0")
+      } finally spark.sql(s"DROP TABLE $source")
     }
 
     it("accepts explicit WorkloadFacts config facts alongside discovered declarations") {
