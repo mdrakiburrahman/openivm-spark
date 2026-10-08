@@ -2839,7 +2839,13 @@ case class CreateMaterializedViewCommand(
     // query while the user retains source-of-truth control over the SQL
     // they wrote.
     val workloadFacts = profile.timeStep("create_collect_workload_facts", s"sources=${qualNames.size}") {
-      val constraintFacts = WorkloadFactsRegistry.forRefresh().discover(spark, qualNames)
+      // A pinned relation's analyzed schema may be historical; preserve current
+      // fact discovery for those sources rather than mixing old schema metadata
+      // with current table properties. Other schemas are already Spark-resolved.
+      val currentSourceSchemas = qualSchemas -- pinBinding.resolvedPins.map(_.operationalSource.alias)
+      val constraintFacts = WorkloadFactsRegistry
+        .forRefresh()
+        .discover(spark, qualNames, resolvedSourceSchemas = currentSourceSchemas)
       // Quantitative Delta statistics are consumed by Spark's refresh-time cost
       // model and rewriter, which collect current table and delta stats for every
       // refresh. OpenIVM's compile-facts parser ignores table/column stats, and
