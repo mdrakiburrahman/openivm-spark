@@ -126,7 +126,7 @@ object DeltaTableVersion {
     try deltaLogFromPlan(spark.table(tableRef).queryExecution.analyzed)
     catch { case NonFatal(_) => None }
 
-  private def deltaLogFromPlan(plan: LogicalPlan): Option[DeltaLog] =
+  private[spark] def deltaLogFromPlan(plan: LogicalPlan): Option[DeltaLog] =
     plan.collectFirst {
       case relation: LogicalRelation
           if relation.relation.isInstanceOf[HadoopFsRelation] &&

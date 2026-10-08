@@ -1242,19 +1242,34 @@ private[commands] object MvCommandHelper {
     * cannot mask the physical table. `None` when the location is not a readable
     * committed Delta table. */
   private[commands] def mvBackingIdentity(spark: SparkSession, mv: MvMetadata): Option[(String, String)] =
-    try {
-      val log      = DeltaLog.forTable(spark, new Path(mv.location))
-      val snapshot = log.update()
-      if (snapshot.version < 0L) None
-      else Some((normalizeDeltaPath(log.dataPath), snapshot.metadata.id))
-    } catch { case NonFatal(_) => None }
+    OpenIvmMetrics.time("catalog.mv_backing_identity.lookup") {
+      try {
+        val log      = DeltaLog.forTable(spark, new Path(mv.location))
+        val snapshot = log.update()
+        if (snapshot.version < 0L) None
+        else Some((normalizeDeltaPath(log.dataPath), snapshot.metadata.id))
+      } catch { case NonFatal(_) => None }
+    }
+
+  /** Paths already resolved by Spark, including backing relations beneath public
+    * MV views and subqueries. These are pruning hints, never dependency proof. */
+  private def analyzedDeltaPaths(plan: LogicalPlan): Set[String] = {
+    val local = plan match {
+      case relation: LogicalRelation =>
+        DeltaTableVersion.deltaLogFromPlan(relation).map(log => normalizeDeltaPath(log.dataPath)).toSet
+      case _ => Set.empty[String]
+    }
+    val subqueries = plan.expressions.flatMap(_.collect { case s: SubqueryExpression => s.plan })
+    local ++ (plan.children ++ subqueries).flatMap(analyzedDeltaPaths)
+  }
 
   /** Resolve, at CREATE, the DIRECT managed-MV dependencies of the view being
     * created, AUTHORITATIVELY by physical Delta identity.
     *
-    * Every existing managed MV is enumerated ONCE (CREATE is not the refresh hot
-    * path) and indexed by the physical identity of its backing table. Each
-    * analyzed/resolved downstream source is resolved to its own physical Delta
+    * Every existing managed MV is enumerated ONCE. When an analyzed plan is
+    * available, only candidates at source paths need their backing logs read;
+    * unqualified locations are qualified like DeltaLog, without opening a log.
+    * Each analyzed/resolved downstream source is resolved to its own physical Delta
     * identity ([[deltaPhysicalIdentity]] — the same `DeltaLog` resolution the
     * snapshot-pin binding uses, so Fabric encoded/friendly aliases, quoted dots,
     * catalog/schema qualifiers and case are all canonicalised away) and matched
@@ -1268,7 +1283,8 @@ private[commands] object MvCommandHelper {
   private[commands] def resolveDirectMvDependencies(
       spark: SparkSession,
       self: TableIdentifier,
-      qualNames: Seq[String]
+      qualNames: Seq[String],
+      analyzed: Option[LogicalPlan] = None
   ): Seq[DirectMvDependency] = {
     val selfMeta = metaName(self)
     val managed: Seq[MvMetadata] =
@@ -1281,14 +1297,35 @@ private[commands] object MvCommandHelper {
               "create a materialized view whose managed-vs-base source classification cannot be proven"
           )
       }
-    val byIdentity: Map[(String, String), Seq[MvMetadata]] =
-      managed
-        .filter(candidate => metaName(candidate.name) != selfMeta)
+    val candidates  = managed.filter(candidate => metaName(candidate.name) != selfMeta)
+    val sourcePaths = analyzed.map(analyzedDeltaPaths)
+    lazy val hconf  = spark.sessionState.newHadoopConf()
+    val relevant = candidates.filter { candidate =>
+      sourcePaths.forall { paths =>
+        try {
+          val path = new Path(candidate.location)
+          paths.contains(normalizeDeltaPath(path.getFileSystem(hconf).makeQualified(path)))
+        } catch { case NonFatal(_) => true } // An unproved path must not be pruned.
+      }
+    }
+    def index(mvs: Seq[MvMetadata]): Map[(String, String), Seq[MvMetadata]] =
+      mvs
         .flatMap(candidate => mvBackingIdentity(spark, candidate).map(identity => identity -> candidate))
         .groupBy(_._1)
         .map { case (identity, entries) => identity -> entries.map(_._2) }
-    val deps = qualNames.distinct.flatMap { qn =>
-      deltaPhysicalIdentity(spark, qn).flatMap { identity =>
+    def sources        = qualNames.distinct.map(qn => qn -> deltaPhysicalIdentity(spark, qn))
+    val prunedIndex    = index(relevant)
+    val currentSources = sources
+    val (byIdentity, resolvedSources) =
+      if (sourcePaths.exists(paths => currentSources.exists(_._2.exists(identity => !paths.contains(identity._1))))) {
+        // An alias was rebound, or its relation was not understood by the hint
+        // collector. Restore the full scan and read sources AFTER candidate logs,
+        // preserving the original identity-check ordering.
+        val fullIndex = index(candidates)
+        (fullIndex, sources)
+      } else (prunedIndex, currentSources)
+    val deps = resolvedSources.flatMap { case (qn, sourceIdentity) =>
+      sourceIdentity.flatMap { identity =>
         byIdentity.get(identity) match {
           case None => None
           case Some(Seq(single)) =>
@@ -3314,7 +3351,7 @@ case class CreateMaterializedViewCommand(
     // empty map is persisted explicitly to positively prove a base-only view.
     val mvDependencyMapProps =
       profile.timeStep("create_resolve_direct_mv_dependency_map", s"sources=${qualNames.size}") {
-        mvDependencyMapProperties(resolveDirectMvDependencies(spark, name, qualNames))
+        mvDependencyMapProperties(resolveDirectMvDependencies(spark, name, qualNames, Some(analyzed)))
       }
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
