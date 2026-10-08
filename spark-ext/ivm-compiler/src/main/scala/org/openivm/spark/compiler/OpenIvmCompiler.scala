@@ -6,10 +6,18 @@ import java.util.{Comparator, Locale}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.openivm.spark.common.{
+  DeltaShape,
+  ForeignKeyRelation,
+  MemoryMainRefs,
+  PinnedSourcePathMissingException,
+  WorkloadFacts
+}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -338,8 +346,37 @@ class OpenIvmCompiler private (
     //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
     //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
     //                                   MV-over-MV chains never fall back to FULL_REFRESH.
-    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(req.facts.toJson)}');\n"
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(compilerFacts(req).toJson)}');\n"
     sb.toString
+  }
+
+  /** Delta shapes must use the same identities as the bare compiler tables,
+    * not the external Spark catalog. Match only registered identities: stripping
+    * an arbitrary qualifier could apply another schema's UNCHANGED proof.
+    */
+  private[compiler] def compilerFacts(req: CompileRequest): WorkloadFacts = {
+    if (req.facts.deltaShape.isEmpty) return req.facts
+    def identity(name: String): Option[Seq[String]] =
+      Try(CatalystSqlParser.parseMultipartIdentifier(name).map(_.toLowerCase(Locale.ROOT))).toOption
+
+    val aliases = req.sources.keys.toSeq
+      .flatMap { short =>
+        val local = Seq(Seq(short), Seq("main", short), Seq("memory", "main", short))
+          .map(_.map(_.toLowerCase(Locale.ROOT)))
+        (local ++ req.sourceQualifiedNames.get(short).flatMap(identity)).map(_ -> short)
+      }
+      .groupBy(_._1)
+      .map { case (name, entries) => name -> entries.map(_._2).distinct }
+    val shapes = req.facts.deltaShape.toSeq
+      .flatMap { case (name, shape) =>
+        identity(name).flatMap(aliases.get).filter(_.size == 1).map(_.head -> shape)
+      }
+      .groupBy(_._1)
+      .map { case (short, entries) =>
+        val values = entries.map(_._2).distinct
+        short -> (if (values.size == 1) values.head else DeltaShape.General)
+      }
+    req.facts.copy(deltaShape = shapes)
   }
 
   /** Rewrites occurrences of a tracked qualified source name (`<db>.<table>`)
