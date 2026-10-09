@@ -4,7 +4,7 @@
 
 ```bash
 spark-shell \
-    --jars spark-ext/ivm-extension/target/scala-2.12/ivmExtension-0.1.0-SNAPSHOT-assembly.jar \
+    --jars spark-ext/ivm-extension/target/spark-3.5-antlr-4.9.3/scala-2.12/ivmExtension-0.1.0-SNAPSHOT-assembly.jar \
     --conf spark.sql.extensions=org.openivm.spark.OpenIvmSparkExtensions \
     --conf spark.openivm.enabled=true \
     --conf spark.driver.extraJavaOptions="$(cat .sbtopts | grep -oE '^-J.*' | sed 's/^-J//' | xargs)"

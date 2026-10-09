@@ -231,6 +231,9 @@ run_sbt() {
 
 prepare_sbt() {
     local needs_native="$1"
+    rm -rf -- \
+        "$PROJECT_DIR/ivm-extension/target/scala-2.12" \
+        "$PROJECT_DIR/ivm-extension/target/scala-2.13"
     select_java_runtime
     configure_native_artifacts
     if [[ "$needs_native" == "1" ]]; then
@@ -326,6 +329,7 @@ cmd_verify() {
         Test/compile \
         testInventory \
         ivmExtension/assembly \
+        ivmExtension/testPackagedAssemblyGuard \
         test
 }
 

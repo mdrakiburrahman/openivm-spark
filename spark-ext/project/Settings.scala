@@ -1,6 +1,7 @@
 import sbt._
 import sbt.Keys._
 import sbt.Tests.{Group, SubProcess}
+import sbt.complete.DefaultParsers.spaceDelimited
 import sbtassembly.AssemblyPlugin.autoImport._
 import sbtassembly.MergeStrategy
 import sbtassembly.PathList
@@ -8,6 +9,21 @@ import sbtassembly.PathList
 object Settings {
 
   private val runtimeTarget = RuntimeTarget.current
+
+  val validatePackagedAssembly =
+    taskKey[File]("Initialize the generated SQL lexer from the final shaded assembly")
+  val validatePackagedAssemblyFile =
+    inputKey[Unit]("Initialize the generated SQL lexer from a specified shaded assembly")
+  val testPackagedAssemblyGuard =
+    taskKey[Unit]("Prove the packaged assembly guard rejects an incompatible serialized ATN")
+
+  private def verifyPackagedAssembly(assembly: File, log: Logger): Unit =
+    try PackagedAssemblyGuard.verify(assembly)
+    catch {
+      case error: PackagedAssemblyValidationException =>
+        log.error(error.getMessage)
+        throw error
+    }
 
   private def assemblyOnlyPom(pom: scala.xml.Node): scala.xml.Node = {
     val keepProvidedDependencies = new scala.xml.transform.RewriteRule {
@@ -190,5 +206,38 @@ object Settings {
       ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
     ),
     assembly / test := {}
+  )
+
+  val packagedAssemblyGuardSettings: Seq[Def.Setting[_]] = Seq(
+    target := baseDirectory.value / "target" / s"${runtimeTarget.id}-antlr-${runtimeTarget.antlrVersion}",
+    validatePackagedAssembly := {
+      val packagedAssembly = (assembly).value
+      verifyPackagedAssembly(packagedAssembly, streams.value.log)
+      streams.value.log.info(
+        s"Initialized ${PackagedAssemblyGuard.LexerClassName} from final shaded assembly $packagedAssembly"
+      )
+      packagedAssembly
+    },
+    validatePackagedAssemblyFile := {
+      val arguments = spaceDelimited("<assembly.jar>").parsed
+      if (arguments.size != 1)
+        sys.error("validatePackagedAssemblyFile requires exactly one assembly JAR path")
+      val packagedAssembly = file(arguments.head)
+      verifyPackagedAssembly(packagedAssembly, streams.value.log)
+      streams.value.log.info(
+        s"Initialized ${PackagedAssemblyGuard.LexerClassName} from specified shaded assembly $packagedAssembly"
+      )
+    },
+    testPackagedAssemblyGuard := {
+      val packagedAssembly = validatePackagedAssembly.value
+      PackagedAssemblyGuardRegression.verifyRejectsIncompatibleLexer(
+        packagedAssembly,
+        target.value / "packaged-assembly-guard"
+      )
+      streams.value.log.info("Packaged assembly guard rejected an incompatible serialized ATN")
+    },
+    publish      := (publish dependsOn validatePackagedAssembly).value,
+    publishLocal := (publishLocal dependsOn validatePackagedAssembly).value,
+    publishM2    := (publishM2 dependsOn validatePackagedAssembly).value
   )
 }
