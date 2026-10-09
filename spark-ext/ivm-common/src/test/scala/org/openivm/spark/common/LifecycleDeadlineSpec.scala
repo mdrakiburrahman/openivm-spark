@@ -3,7 +3,8 @@ package org.openivm.spark.common
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 import java.util.concurrent.locks.ReentrantLock
 import scala.concurrent.duration._
 
@@ -64,6 +65,57 @@ class LifecycleDeadlineSpec extends AnyFunSpec with Matchers {
       }.target shouldBe "issue67_second"
       first.isLocked shouldBe false
       second.isLocked shouldBe false
+    }
+
+    it("reports the admission phase, owner, waiter, and elapsed timings") {
+      val lock         = new ReentrantLock()
+      val entered      = new CountDownLatch(1)
+      val release      = new CountDownLatch(1)
+      val ownerFailure = new AtomicReference[Throwable]()
+      val owner = new Thread(
+        () =>
+          try {
+            lock.lock()
+            try {
+              entered.countDown()
+              release.await()
+            } finally lock.unlock()
+          } catch {
+            case error: Throwable => ownerFailure.set(error)
+          },
+        "issue71-lifecycle-owner"
+      )
+      owner.setDaemon(true)
+      owner.start()
+      try {
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        val error = intercept[LifecycleLockTimeoutException] {
+          LifecycleDeadline
+            .start(
+              50.millis,
+              context = LifecycleDeadlineContext(
+                phase = "lifecycle_admission",
+                operationId = Some("issue71-operation"),
+                command = Some("create"),
+                targetRelation = Some("issue71_target")
+              )
+            )
+            .withLock(lock, "issue71_guard")(fail("Contended admission must not enter its body"))
+        }
+        error.phase shouldBe "lifecycle_admission"
+        error.waiterOperationId shouldBe Some("issue71-operation")
+        error.waiterCommand shouldBe Some("create")
+        error.waiterTarget shouldBe Some("issue71_target")
+        error.ownerThread shouldBe Some("issue71-lifecycle-owner")
+        error.waitDuration.toNanos should be > 0L
+        error.deadlineElapsed.toNanos should be >= error.waitDuration.toNanos
+        error.getMessage should include("no cleanup was authorized")
+      } finally {
+        release.countDown()
+        owner.join(5000L)
+      }
+      owner.isAlive shouldBe false
+      ownerFailure.get() shouldBe null
     }
 
     it("preserves caller interruption and acquires no lock") {

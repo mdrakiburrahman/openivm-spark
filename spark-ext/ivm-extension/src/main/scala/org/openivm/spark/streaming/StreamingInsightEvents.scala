@@ -187,14 +187,21 @@ private[spark] object StreamingInsightEvents {
       eventType = OpenIvmInsightsContract.EventType.OperationFailed,
       level = OpenIvmInsightsContract.Level.Error,
       code = OpenIvmInsightsContract.Code.StreamingLifecycleLockTimeout,
-      message = "Lifecycle admission exceeded the shared stop deadline; no cleanup was authorized.",
+      message = "Lifecycle admission exceeded its dedicated deadline; no cleanup was authorized.",
       status = "failed",
       terminal = true,
       durationMs = Some(durationMs),
       details = baseDetails(spark, operationId, targetRelation, "streaming", Some(command)) ++ Seq(
-        "lock_target" -> error.target.take(256),
-        "timeout_ms"  -> error.timeout.toMillis,
-        "error_class" -> error.getClass.getName
+        "phase"               -> error.phase,
+        "lock_target"         -> error.target.take(256),
+        "timeout_ms"          -> error.timeout.toMillis,
+        "waiter_operation_id" -> error.waiterOperationId.map(_.take(160)),
+        "waiter_command"      -> error.waiterCommand.map(_.take(80)),
+        "waiter_target"       -> error.waiterTarget.map(_.take(256)),
+        "wait_duration_ms"    -> error.waitDuration.toMillis,
+        "deadline_elapsed_ms" -> error.deadlineElapsed.toMillis,
+        "owner_thread"        -> error.ownerThread.map(_.take(160)),
+        "error_class"         -> error.getClass.getName
       )
     )
 

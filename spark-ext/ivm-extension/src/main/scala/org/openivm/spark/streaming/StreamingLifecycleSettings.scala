@@ -8,6 +8,7 @@ import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
 
 private[spark] final case class StreamingLifecycleSettings(
+    lifecycleAdmissionTimeout: FiniteDuration,
     stopTimeout: FiniteDuration,
     firstProgressTimeout: FiniteDuration
 )
@@ -23,6 +24,11 @@ private[spark] object StreamingLifecycleSettings {
 
   def parse(read: String => Option[String]): StreamingLifecycleSettings =
     StreamingLifecycleSettings(
+      lifecycleAdmissionTimeout = duration(
+        FeatureGate.StreamingLifecycleAdmissionTimeoutKey,
+        read(FeatureGate.StreamingLifecycleAdmissionTimeoutKey)
+          .getOrElse(FeatureGate.StreamingLifecycleAdmissionTimeoutDefault)
+      ),
       stopTimeout = duration(
         FeatureGate.StreamingStopTimeoutKey,
         read(FeatureGate.StreamingStopTimeoutKey).getOrElse(FeatureGate.StreamingStopTimeoutDefault)
