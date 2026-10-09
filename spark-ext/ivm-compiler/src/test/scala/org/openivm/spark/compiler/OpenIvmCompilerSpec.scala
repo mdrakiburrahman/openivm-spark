@@ -47,6 +47,45 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     super.afterAll()
   }
 
+  "native view identity normalization" should "map internal tables without changing source references or literals" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
+      s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
+      "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
+  }
+
+  it should "preserve long escaped literals without overflowing the regex stack" in {
+    val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val literal = "escaped''" * 10000 + s"openivm_data_$key"
+    val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT '$literal' FROM openivm_data_mv"
+  }
+
+  it should "read the native-key initial-load file and preserve hidden seed columns" in {
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val dir  = Files.createTempDirectory("native-view-initial-load")
+    val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
+    val req  = CompileRequest("mv", "SELECT id FROM src", Map("src" -> StructType.fromDDL("id INT")))
+    try {
+      Files.write(
+        file,
+        s"create table memory.main.openivm_data_$key as SELECT id, 1 AS openivm_running_input_0 FROM memory.main.src;"
+          .getBytes("UTF-8")
+      )
+      val initial = sharedCompiler.parseInitialLoadSql(dir, req, key)
+      initial should include("openivm_running_input_0")
+      initial should not include "memory.main."
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
+  }
+
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
   private val salesSchema: StructType =
@@ -412,10 +451,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   // With `target_dialect="spark"` set in the CompileFacts JSON payload,
   // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
   // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
-  // Current output backtick-quotes each identifier segment, so the delta-scan
-  // CTE should reference the staged source as `` `memory`.`main`.`...` ``.
+  // The bridge removes the compiler's private catalog qualification from
+  // internal tables and maps encoded MV keys to the logical Spark view name.
 
-  it should "produce fully-qualified backtick-quoted memory.main table references in SPARK dialect for SIMPLE_PROJECTION" in {
+  it should "normalize SIMPLE_PROJECTION internal references to the Spark bridge's logical names" in {
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
@@ -424,7 +463,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-    result.sql should include("`memory`.`main`.`openivm_delta_sales`")
+    result.sql should include("FROM    openivm_delta_sales")
+    result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+    result.sql should include("FROM openivm_data_mv_sales_proj")
+    result.sql should not include "openivm_data___openivm_mv_"
   }
 
   // ── Test 6: Type mapping ──────────────────────────────────────────────────

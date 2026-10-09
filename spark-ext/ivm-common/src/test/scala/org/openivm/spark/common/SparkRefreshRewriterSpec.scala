@@ -19,6 +19,53 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
+  describe("current native source and outer-join contracts") {
+    it("preserves source-column exclusion in affected-key reconstruction UNIONs") {
+      val input = """CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
+        |SELECT id FROM (SELECT * FROM memory.main.orders UNION ALL
+        |SELECT * EXCLUDE (openivm_multiplicity, openivm_timestamp) FROM openivm_delta_orders) old_rows;""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          sourceSchemas = Map("orders" -> Seq("id", "amount"))
+        )
+        .statements
+        .head
+      rewritten should include("SELECT `id`, `amount` FROM `openivm_delta_orders`")
+      rewritten should not include "EXCLUDE"
+      CatalystSqlParser.parsePlan(rewritten.split("(?i)\\sAS\\s", 2).last)
+    }
+
+    it("moves an alias-free full-outer affected-key CTE into a delete MERGE") {
+      val input = """WITH openivm_affected AS (
+        |SELECT DISTINCT openivm_left_key AS _k FROM openivm_delta_mv_r
+        |)
+        |DELETE FROM openivm_data_mv_r WHERE EXISTS (
+        |SELECT 1 FROM openivm_affected WHERE _k <=> openivm_left_key OR _k <=> openivm_right_key);""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+        .statements
+        .head
+      rewritten should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      rewritten should include("WITH openivm_affected AS")
+      rewritten should include("d._k <=> v.openivm_left_key OR d._k <=> v.openivm_right_key")
+      rewritten should include("WHEN MATCHED THEN DELETE")
+      CatalystSqlParser.parsePlan(rewritten)
+    }
+  }
+
   /** Empirical openivm output for `mv_r AS SELECT region, SUM(amount) AS total
     * FROM sales GROUP BY region`, captured verbatim per the spec.
     */
@@ -1463,7 +1510,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
 
-    it("materialises running-window helper CREATEs as version-pinned, eagerly cached temporary views") {
+    it("caches running-window snapshots but keeps bounds filters lazy") {
       val rewritten = rewriteP52()
       val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
       creates should have size 5
@@ -1480,9 +1527,11 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       val stateCreate = creates.find(_.contains("openivm_run_state_wradm_mv")).getOrElse(fail("state create missing"))
       boundsCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
       stateCreate should include("delta.`dbfs:/delta/wradm_mv` VERSION AS OF 3")
-      // Each helper is eagerly CACHEd so the snapshot is frozen before the MV mutates.
+      // Fast/fallback only filter cached bounds; the other snapshots stay frozen.
       val caches = rewritten.filter(_.startsWith("CACHE TABLE `openivm_run_"))
-      caches should have size 5
+      caches should have size 3
+      caches should not contain "CACHE TABLE `openivm_run_fast_wradm_mv`"
+      caches should not contain "CACHE TABLE `openivm_run_fallback_wradm_mv`"
     }
 
     it("rewrites fallback delete and recompute insert while preserving the run_fallback subquery") {
@@ -1575,6 +1624,49 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       append should not include "openivm_timestamp"
       // Exactly one CTAS create of the view-delta path (the second is an append).
       rewritten.count(_.contains("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
+    }
+  }
+
+  describe("materialised running-window suffix results") {
+    it("caches the result once and appends its cascade without replacing the fallback delta") {
+      val input =
+        """CREATE OR REPLACE TEMP TABLE openivm_run_result_mv_r AS
+          |SELECT d.k, d.v, SUM(d.v) OVER (PARTITION BY d.k ORDER BY d.t) AS running_sum
+          |FROM openivm_delta_src d JOIN openivm_run_fast_mv_r fk ON d.k = fk.k
+          |WHERE d.openivm_multiplicity > 0;
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DELETE FROM openivm_data_mv_r WHERE k IN (SELECT k FROM openivm_run_fallback_mv_r);
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
+          |INSERT INTO openivm_data_mv_r (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r;
+          |INSERT INTO openivm_delta_mv_r SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_mv_r;
+          |DROP TABLE IF EXISTS openivm_run_result_mv_r;
+          |""".stripMargin
+      val tagged = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = input,
+          mvName = TableIdentifier("mv_r", Some("default")),
+          mvLocation = "dbfs:/delta/mv_r",
+          viewLogicalName = "mv_r",
+          sourceTempViews = Map("src" -> "openivm_delta_src"),
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_r_delta",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) shouldBe 4
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) shouldBe 3
+      tagged.last should not include SparkRefreshRewriter.RunningWindowSuffixMarker
+      tagged.last should not include SparkRefreshRewriter.RunningWindowFallbackMarker
+      val rewritten = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
+      rewritten.head should startWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_result_mv_r AS")
+      rewritten(1) shouldBe "CACHE TABLE `openivm_run_result_mv_r`"
+      rewritten should contain("INSERT INTO `default`.`mv_r` (k, v, running_sum) SELECT * FROM openivm_run_result_mv_r")
+      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/mv_r_delta`")) shouldBe 1
+      rewritten should contain(
+        "INSERT INTO delta.`dbfs:/delta/_tmp/mv_r_delta` SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_mv_r"
+      )
+      rewritten.last shouldBe "DROP VIEW IF EXISTS `openivm_run_result_mv_r`"
     }
   }
 
@@ -1911,6 +2003,32 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
       rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
       rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+    }
+
+    it("collapses old-state reconstruction after native delta identity normalization") {
+      for (deltaReference <- Seq("openivm_delta_accounts", "`openivm_delta_accounts`")) {
+        val normalized = canonical.replace("`memory`.`main`.`openivm_delta_accounts`", deltaReference)
+        val rewritten  = SparkRefreshRewriter.rewriteRegularOldStateUnions(normalized, Map("db.accounts" -> 17L))
+
+        rewritten should include("SELECT `id`, `value`, CAST(1 AS INT) FROM `accounts` VERSION AS OF 17")
+        rewritten should not include "SELECT * FROM t1_projection UNION ALL SELECT * FROM t6_projection"
+      }
+    }
+
+    it("does not collapse a normalized delta belonging to a different source") {
+      val differentSource = canonical.replace("`memory`.`main`.`openivm_delta_accounts`", "openivm_delta_orders")
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(
+        differentSource,
+        Map("db.accounts" -> 17L)
+      ) shouldBe differentSource
+    }
+
+    it("does not collapse a filtered normalized delta scan") {
+      val filtered = canonical.replace(
+        "FROM `memory`.`main`.`openivm_delta_accounts`",
+        "FROM openivm_delta_accounts WHERE id > 0"
+      )
+      SparkRefreshRewriter.rewriteRegularOldStateUnions(filtered, Map("db.accounts" -> 17L)) shouldBe filtered
     }
 
     it("reads a public projection's already-pinned snapshot without time-travelling through a VIEW") {

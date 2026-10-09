@@ -17,12 +17,23 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    Map(FeatureGate.WindowRunningIncrementalEnabledKey -> "true")
+    Map(
+      FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
+      FeatureGate.QueryLogEnabledKey                 -> "true"
+    )
 
   private def mvRefreshType(name: String): Int = {
     val id = spark.sessionState.sqlParser.parseTableIdentifier(name)
     MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType
   }
+
+  private def executedRefreshSql: Seq[String] =
+    sql("SHOW OPENIVM QUERY LOG")
+      .where("category = 'rewritten_stmt'")
+      .select("sql_text")
+      .collect()
+      .map(_.getString(0))
+      .toSeq
 
   private val viewSql =
     "SELECT dm_date, dm_s_symb, " +
@@ -50,6 +61,12 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       refreshMv("wri_mv")
       assertMvCorrect("wri_mv", viewSql)
       mvRefreshType("wri_mv") shouldBe RefreshTypeCode.WindowPartition
+      val executedSql = executedRefreshSql
+      executedSql.exists(_.contains("CACHE TABLE `openivm_run_result_wri_mv`")) shouldBe true
+      executedSql should not contain "CACHE TABLE `openivm_run_fast_wri_mv`"
+      executedSql should not contain "CACHE TABLE `openivm_run_fallback_wri_mv`"
+      executedSql.exists(s => s.startsWith("MERGE INTO") && s.contains("wri_mv")) shouldBe false
+      executedSql.exists(s => s.startsWith("INSERT INTO") && s.contains("FROM openivm_new_wri_mv")) shouldBe false
     }
 
     it("falls back to full recompute for a backdated partition and stays correct") {
@@ -75,6 +92,11 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       refreshMv("wri_bd_mv")
       assertMvCorrect("wri_bd_mv", bdSql)
       mvRefreshType("wri_bd_mv") shouldBe RefreshTypeCode.WindowPartition
+      executedRefreshSql should not contain "CACHE TABLE `openivm_run_result_wri_bd_mv`"
+      executedRefreshSql.exists(s =>
+        s.startsWith("INSERT INTO") && s.contains("FROM openivm_run_result_wri_bd_mv")
+      ) shouldBe false
+      executedRefreshSql.exists(s => s.startsWith("MERGE INTO") && s.contains("wri_bd_mv")) shouldBe true
     }
 
     it("stays correct across two consecutive suffix-append batches") {
@@ -163,6 +185,53 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_casc_win", upstreamSql)
       assertMvCorrect("wri_casc_agg", downstreamSql)
       mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
+      executedRefreshSql.exists(_.contains("openivm_empty_fallback WHERE false")) shouldBe true
+
+      // The fallback delta and materialised suffix must both reach the child.
+      sql(
+        "INSERT INTO wri_casc_market VALUES " +
+          "(DATE '2024-01-01','AAA',2,50),(DATE '2024-01-04','BBB',12,28)"
+      )
+      refreshMv("wri_casc_win")
+      refreshMv("wri_casc_agg")
+      assertMvCorrect("wri_casc_win", upstreamSql)
+      assertMvCorrect("wri_casc_agg", downstreamSql)
+    }
+
+    it("preserves ROWS positions while skipping empty fallback and suffix branches") {
+      sql("CREATE TABLE wri_rows_source(k STRING, t INT, v INT) USING DELTA")
+      sql("INSERT INTO wri_rows_source VALUES ('A',1,5),('A',3,7),('B',1,NULL)")
+      val query = "SELECT k,t,v,SUM(v) OVER (PARTITION BY k ORDER BY t " +
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS total FROM wri_rows_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_rows_mv AS $query")
+      sql("INSERT INTO wri_rows_source VALUES ('A',4,2),('B',2,6),('C',1,NULL)")
+      refreshMv("wri_rows_mv")
+      assertMvCorrect("wri_rows_mv", query)
+      executedRefreshSql.count(_ == "CACHE TABLE `openivm_run_suffix_wri_rows_mv`") shouldBe 1
+      sql("INSERT INTO wri_rows_source VALUES ('A',2,4)")
+      refreshMv("wri_rows_mv")
+      assertMvCorrect("wri_rows_mv", query)
+      // The second batch is entirely backdated: peer-position and result caches
+      // must not be populated again, while the persisted positions stay correct.
+      executedRefreshSql.count(_ == "CACHE TABLE `openivm_run_suffix_wri_rows_mv`") shouldBe 1
+      executedRefreshSql.count(_ == "CACHE TABLE `openivm_run_result_wri_rows_mv`") shouldBe 1
+    }
+
+    it("preserves nullable cumulative SUM and AVG seeds across consecutive suffix batches") {
+      sql("CREATE TABLE wri_avg_source(k STRING, t INT, v DOUBLE) USING DELTA")
+      sql("INSERT INTO wri_avg_source VALUES ('A',1,NULL),('B',1,0.125),('B',2,0.25)")
+      val query =
+        "SELECT k,t,v,SUM(v) OVER (PARTITION BY k ORDER BY t) AS total," +
+          "AVG(v) OVER (PARTITION BY k ORDER BY t) AS mean FROM wri_avg_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_avg_mv AS $query")
+      assertMvCorrect("wri_avg_mv", query)
+      sql("INSERT INTO wri_avg_source VALUES ('A',2,4.0),('B',3,0.375),('C',1,NULL)")
+      refreshMv("wri_avg_mv")
+      assertMvCorrect("wri_avg_mv", query)
+      sql("INSERT INTO wri_avg_source VALUES ('A',3,NULL),('B',4,0.5),('C',2,2.0)")
+      refreshMv("wri_avg_mv")
+      assertMvCorrect("wri_avg_mv", query)
+      mvRefreshType("wri_avg_mv") shouldBe RefreshTypeCode.WindowPartition
     }
   }
 }

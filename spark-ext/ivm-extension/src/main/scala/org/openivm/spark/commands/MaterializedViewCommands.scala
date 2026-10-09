@@ -5715,7 +5715,7 @@ case class RefreshMaterializedViewCommand(
           //
           // "Changes no existing MV row" is proven by THREE conditions, checked at
           // the use site:
-          //   (1) the view-delta has no negative multiplicities (`!hasNegativesHere`)
+          //   (1) the view-delta has only nonnegative, non-NULL multiplicities (`!hasNonAppendRowsHere`)
           //       — an INNER-side DELETE/UPDATE retracts rows ⇒ negatives;
           //   (2) no changed source is on the NULL-producing side of an outer join
           //       (`!batchTouchesOuterNullableSource`) — an insert there re-affects
@@ -5911,7 +5911,7 @@ case class RefreshMaterializedViewCommand(
               rewritten.statements.nonEmpty
 
           try {
-            lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
+            lazy val hasNonAppendRows = hasNonAppendSimpleProjectionRows(spark, viewDeltaPath)
 
             val directAggregateMerge: Option[String] =
               if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
@@ -6160,18 +6160,18 @@ case class RefreshMaterializedViewCommand(
                     }
                 else None
 
-              // The negative-row probe operates against either the cached temp
+              // The non-append-row probe operates against either the cached temp
               // view (fuse) or the on-disk scratch (existing path).
-              lazy val hasNegativesHere: Boolean = fusedView match {
+              lazy val hasNonAppendRowsHere: Boolean = fusedView match {
                 case Some(view) =>
                   spark
                     .sql(
                       s"SELECT 1 FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(view)} " +
-                        "WHERE `openivm_multiplicity` < 0 LIMIT 1"
+                        "WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL LIMIT 1"
                     )
                     .head(1)
                     .nonEmpty
-                case None => hasSimpleProjectionDeletes
+                case None => hasNonAppendRows
               }
 
               if (fusedView.isEmpty) {
@@ -6189,7 +6189,7 @@ case class RefreshMaterializedViewCommand(
               // general program. stmt[0] still runs, so cascade view-deltas are intact.
               val insertOnlyInsertSql: Option[String] =
                 if (
-                  batchHasReplace || batchTouchesOuterNullableSource || hasNegativesHere ||
+                  batchHasReplace || batchTouchesOuterNullableSource || hasNonAppendRowsHere ||
                   // Only the recompute path (openivm_left_key DELETE + recompute) needs
                   // this. Value-equality SIMPLE_PROJECTION MVs already handle insert-only
                   // optimally via their no-negative-rows DELETE-skip + EXPLODE INSERT, so
@@ -6237,7 +6237,7 @@ case class RefreshMaterializedViewCommand(
                   val stmtIdx = 1 + idx
                   val sql     = SparkRefreshRewriter.stripExecutionMarker(stmt)
                   val skipDeleteMerge =
-                    SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNegativesHere
+                    SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRowsHere
 
                   if (skipDeleteMerge) {
                     logInfo(
@@ -6271,6 +6271,61 @@ case class RefreshMaterializedViewCommand(
                     }
                   }
                 }
+              }
+            } else if (
+              rewritten.statements.exists(stmt =>
+                SparkRefreshRewriter.stripExecutionMarker(stmt) == s"CACHE TABLE `openivm_run_result_${name.table}`"
+              )
+            ) {
+              // The native suffix program splits fallback and append partitions.
+              // Whole-partition Spark shortcuts must not skip its fallback delta
+              // or apply the suffix a second time.
+              def executeRunningWindowSql(sql: String, idx: Int): Unit = {
+                if (
+                  SparkRefreshRewriter.isMergeStatement(sql) ||
+                  SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined
+                ) {
+                  withPlanTimeBroadcastDisabled { executeSqlAt(sql, idx) }
+                } else executeSqlAt(sql, idx)
+              }
+              val boundsName = s"openivm_run_bounds_${name.table}"
+              val boundsIdx  = rewritten.statements.indexOf(s"CACHE TABLE `$boundsName`")
+              require(boundsIdx >= 0, "Running-window suffix program is missing its cached bounds")
+              val indexed = rewritten.statements.zipWithIndex
+              indexed.take(boundsIdx + 1).foreach { case (stmt, idx) =>
+                executeRunningWindowSql(SparkRefreshRewriter.stripExecutionMarker(stmt), idx)
+              }
+              // One small cached-key scan determines both branches before any
+              // target mutation. NULL decisions belong to neither native filter.
+              val branches = profile.timeStep("window_running_branch_probe", s"bounds_view=$boundsName") {
+                RefreshPerf.timePhase(refreshId, viewLabel, "window_running_branch_probe") {
+                  spark
+                    .sql(s"""SELECT
+                    |COALESCE(MAX(CASE WHEN openivm_running_append THEN 1 ELSE 0 END), 0),
+                    |COALESCE(MAX(CASE WHEN NOT openivm_running_append THEN 1 ELSE 0 END), 0)
+                    |FROM `${boundsName.replace("`", "``")}`""".stripMargin)
+                    .head()
+                }
+              }
+              val hasSuffix   = branches.getInt(0) != 0
+              val hasFallback = branches.getInt(1) != 0
+              indexed.drop(boundsIdx + 1).foreach { case (stmt, idx) =>
+                val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
+                if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {
+                  logSkippedWindowStmt(idx, "window_running_empty_suffix_skipped")
+                } else if (!hasFallback && stmt.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) {
+                  SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath) match {
+                    case Some(body) =>
+                      // The suffix cascade APPEND still needs an existing Delta
+                      // table with the exact fallback schema. No rows are scanned.
+                      val path = viewDeltaPath.replace("`", "``")
+                      executeRunningWindowSql(
+                        s"CREATE OR REPLACE TABLE delta.`$path` USING DELTA AS SELECT * FROM ($body) openivm_empty_fallback WHERE false",
+                        idx
+                      )
+                    case None => logSkippedWindowStmt(idx, "window_running_empty_fallback_skipped")
+                  }
+                } else executeRunningWindowSql(sql, idx)
               }
             } else {
               val windowSuffixSql: Option[WindowSuffixSql] =
@@ -6408,7 +6463,7 @@ case class RefreshMaterializedViewCommand(
               rewritten.statements.zipWithIndex.foreach { case (stmt, idx) =>
                 val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
                 val skipDeleteMerge =
-                  SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasSimpleProjectionDeletes
+                  SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRows
                 val skipWindowPartitionAux =
                   windowSuffixSafe && isWindowPartitionAuxSql(sql, mergeTargetId)
                 val skipWindowPartitionDelete =
@@ -7040,13 +7095,15 @@ case class RefreshMaterializedViewCommand(
     }
   }
 
-  private def hasNegativeSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
+  // An unmatched LEFT JOIN delta can carry a NULL weight. It identifies an
+  // affected key for native recomputation, rather than an appendable row.
+  private def hasNonAppendSimpleProjectionRows(spark: SparkSession, viewDeltaPath: String): Boolean = {
     val escapedPath = viewDeltaPath.replace("`", "``")
     spark
       .sql(
         s"""SELECT 1
            |FROM delta.`$escapedPath`
-           |WHERE `openivm_multiplicity` < 0
+           |WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL
            |LIMIT 1""".stripMargin
       )
       .head(1)
@@ -7636,8 +7693,13 @@ case class RefreshMaterializedViewCommand(
       try {
         val mvCols     = spark.table(MvCommandHelper.sqlIdent(targetId)).columns.toSeq
         val sourceCols = spark.table(meta.sourceTables.head).columns.toSeq
+        // This shortcut evaluates the user query, which cannot synthesize
+        // native hidden ROWS positions. Keep the native refresh program when
+        // the backing table has columns absent from the public result.
+        val publicCols = spark.table(MvCommandHelper.sqlIdent(name)).columns.toSeq
         if (
           mvCols.nonEmpty &&
+          mvCols.forall(c => publicCols.exists(_.equalsIgnoreCase(c))) &&
           sourceCols.nonEmpty &&
           (shape.partitionCols :+ shape.orderCol).forall(c => mvCols.exists(_.equalsIgnoreCase(c))) &&
           sourceCols.forall(c => mvCols.exists(_.equalsIgnoreCase(c)))

@@ -52,6 +52,9 @@ object LptsSparkDialect {
   private val CastRe =
     """(?<![a-zA-Z0-9_.])((?:[a-zA-Z_][a-zA-Z0-9_.]*|[0-9]+(?:\.[0-9]+)?|__STRLIT_[0-9]+__))::([A-Z]+(?:\([0-9]+(?:,\s*[0-9]+)?\))?)""".r
 
+  // DuckDB's parsed fallback query renders the DATE type as a quoted name.
+  private val QuotedNullCastRe = """(?i)\bCAST\s*\(\s*NULL\s+AS\s+["`]([A-Z]+)["`]\s*\)""".r
+
   /** Matches a closing paren immediately followed by `::TYPE`.
     *
     * Used by [[rewriteParenthesisedCasts]] to find function-call postfix-cast
@@ -455,7 +458,10 @@ object LptsSparkDialect {
     //   COALESCE(v.sum + d.sum, v.sum, d.sum)::DOUBLE
     // which CastRe above cannot match because the expression before '::' ends
     // with ')' rather than a simple identifier or number literal.
-    val rewrittenWithParens = rewriteParenthesisedCasts(rewritten)
+    val rewrittenWithParens = QuotedNullCastRe.replaceAllIn(
+      rewriteParenthesisedCasts(rewritten),
+      m => s"CAST(NULL AS ${normalizeSparkTypeName(m.group(1))})"
+    )
 
     // ── Step 3: restore string literal placeholders ──────────────────────────
     literals.zipWithIndex.foldLeft(rewrittenWithParens) { case (s, (literal, idx)) =>
