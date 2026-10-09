@@ -307,7 +307,6 @@ _publish_target() {
             -e MAVEN_PAT \
             -e PACKAGE_VERSION \
             build sbt \
-                "ivmExtension/clean" \
                 "ivmExtension/testOnly org.openivm.spark.parser.AntlrRuntimeCompatibilitySpec" \
                 "ivmExtension/publish"
     )

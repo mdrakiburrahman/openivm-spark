@@ -82,11 +82,21 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
-For an explicitly requested pre-test publication, the legacy publisher is not
-appropriate: it runs an ANTLR compatibility test before upload. Inside the
-pinned devcontainer, export the private-feed values from the gitignored root
-`.env`, compute one immutable version using the content-hash convention above,
-and use the test-free assembly task through Nx:
+Every SBT publication entrypoint (`publish`, `publishLocal`, and `publishM2`)
+first builds the final shaded assembly and initializes
+`org.openivm.spark.parser.gen.IvmSqlBaseLexer` in an isolated classloader whose
+only application artifact is that JAR. This forces serialized-ATN
+deserialization before any upload or local publication. Target-dependent ANTLR
+outputs and task caches live under runtime-and-ANTLR-version-specific target
+directories, so switching runtimes cannot reuse generated sources.
+The runner removes the obsolete `target/scala-2.12` and `target/scala-2.13`
+extension directories before starting SBT so stale pre-isolation assemblies
+cannot be selected by downstream JAR discovery.
+
+For an explicitly requested pre-test publication, export the private-feed
+values from the gitignored root `.env`, compute one immutable version using the
+content-hash convention above, and invoke the guarded SBT publication through
+Nx:
 
 ```bash
 PACKAGE_VERSION="$VERSION" npx --no-install nx run spark-ext:assembly --configuration=spark-3.5 -- \
@@ -96,19 +106,20 @@ PACKAGE_VERSION="$VERSION" npx --no-install nx run spark-ext:assembly --configur
 ```
 
 Run these sequentially because the runtimes share the SBT meta-build tree.
+The packaged-assembly guard still runs even when ordinary tests are skipped.
 Verify both feed coordinates and report the shared version as **unverified**
-before executing tests. Formatting and test-source compilation do not execute
-tests. After publication run the normal validation; if source changes, publish
-a new version rather than overwriting the old one. This opt-in administrative
-sequence does not replace the normal compatibility-gated publisher.
+before executing tests. After publication run the normal validation; if source
+changes, publish a new version rather than overwriting the old one. This opt-in
+administrative sequence does not replace the canonical publisher.
 
 `spark-ext:verify` is the canonical one-target command. It first runs
 `pins-sync` (cloning any missing `.temp/{openivm,lpts,ivm-bench}` checkouts,
 fetching origin, and aligning each to its pinned branch, plus shallow-cloning
 the read-only `.temp/{spark,delta}` upstream references at their pinned release
-tags), then lints, compiles, assembles the fat jar, and runs every unit,
-integration, and parity suite in one sbt JVM. `spark-ext:verify-all` runs that
-pipeline for both targets and fails if they discover different tests.
+tags), then lints, compiles, assembles the fat jar, runs the packaged-assembly
+guard plus its incompatible-ATN regression, and runs every unit, integration,
+and parity suite in one sbt JVM. `spark-ext:verify-all` runs that pipeline for
+both targets and fails if they discover different tests.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned

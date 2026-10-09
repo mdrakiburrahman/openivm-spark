@@ -9,15 +9,20 @@ RUNNER="$DEV_DIR/run.sh"
 WORK_DIR="$SCRIPT_DIR/.work-$$"
 DEFAULT_LOG_TIMESTAMP="focused-runner-$$"
 DEFAULT_LOG_DIR="$REPO_ROOT/.logs/test-$DEFAULT_LOG_TIMESTAMP"
+LEGACY_TARGET_212="$PROJECT_DIR/ivm-extension/target/scala-2.12"
+LEGACY_TARGET_213="$PROJECT_DIR/ivm-extension/target/scala-2.13"
 
 cleanup() {
     rm -rf -- "$WORK_DIR"
     rm -rf -- "$DEFAULT_LOG_DIR"
+    rm -rf -- "$LEGACY_TARGET_212" "$LEGACY_TARGET_213"
 }
 trap cleanup EXIT
 
 mkdir -p "$WORK_DIR/jdk/bin" "$WORK_DIR/jdk21/bin" "$WORK_DIR/bin" "$WORK_DIR/native" \
     "$WORK_DIR/logs" "$WORK_DIR/inventory" "$WORK_DIR/openivm-source"
+mkdir -p "$LEGACY_TARGET_212" "$LEGACY_TARGET_213"
+touch "$LEGACY_TARGET_212/stale.jar" "$LEGACY_TARGET_213/stale.jar"
 
 cat >"$WORK_DIR/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
@@ -76,14 +81,19 @@ DIRECT_RUNNER_CAPTURE="$CAPTURE" \
     "$RUNNER" --target spark-3.5 --skip-pins-sync verify -Dprobe=true \
     >"$WORK_DIR/verify.stdout"
 
+[[ ! -e "$LEGACY_TARGET_212" ]]
+[[ ! -e "$LEGACY_TARGET_213" ]]
+
 cat >"$WORK_DIR/expected.args" <<'EOF'
 -Dprobe=true
+ivmExtension/clean
 scalafmtCheckAll
 scalafmtSbtCheck
 compile
 Test/compile
 testInventory
 ivmExtension/assembly
+ivmExtension/testPackagedAssemblyGuard
 test
 EOF
 cmp "$WORK_DIR/expected.args" "$CAPTURE.args"
