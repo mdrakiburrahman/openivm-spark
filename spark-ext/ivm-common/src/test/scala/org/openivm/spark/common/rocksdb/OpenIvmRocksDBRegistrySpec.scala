@@ -900,103 +900,242 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
-    it("bounds parallel snapshot copies at sixteen and publishes CURRENT last") {
-      val stateRoot  = newDir("state-sync-parallel-local")
-      val remoteRoot = newDir("state-sync-parallel-remote")
+    it("uploads one packed data object for many RocksDB roots and waits for remote completion") {
+      val stateRoot  = newDir("state-sync-packed-local")
+      val remoteRoot = newDir("state-sync-packed-remote")
       val spark = newSpark(
-        "state-sync-parallel",
+        "state-sync-packed",
         Seq(
           FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
           FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
         )
       )
-      val directory = new File(stateRoot, "_openivm/mvs/parallel/rocksdb")
-      directory.mkdirs()
-      (1 to 48).foreach(index => java.nio.file.Files.write(new File(directory, s"$index.sst").toPath, Array[Byte](1)))
-      java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
-      val entered   = new CountDownLatch(16)
-      val release   = new CountDownLatch(1)
-      val active    = new AtomicInteger(0)
-      val maxActive = new AtomicInteger(0)
-      val finished  = new AtomicInteger(0)
+      (1 to 100).foreach { index =>
+        val directory = new File(stateRoot, s"_openivm/mvs/root-$index/rocksdb")
+        directory.mkdirs()
+        java.nio.file.Files.write(new File(directory, "1.sst").toPath, Array[Byte](1))
+        java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      }
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val uploads = new AtomicInteger(0)
       OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
-        if (file.getName == "CURRENT") finished.get() shouldBe 48
-        else {
-          val current = active.incrementAndGet()
-          maxActive.updateAndGet(existing => math.max(existing, current))
-          entered.countDown()
-          try {
-            release.await(10, TimeUnit.SECONDS) shouldBe true
-            fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
-            finished.incrementAndGet()
-          } finally active.decrementAndGet()
-        }
-        if (file.getName == "CURRENT")
-          fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+        uploads.incrementAndGet()
+        remote.getName shouldBe "snapshot.zip"
+        entered.countDown()
+        release.await(10, TimeUnit.SECONDS) shouldBe true
+        fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
       }
       try {
         val backup = Future(OpenIvmStateSync.backupNow(spark))
         entered.await(5, TimeUnit.SECONDS) shouldBe true
-        maxActive.get() shouldBe 16
         backup.isCompleted shouldBe false
         release.countDown()
         Await.result(backup, RegistryRaceTimeout)
-        finished.get() shouldBe 48
-        maxActive.get() shouldBe 16
+        uploads.get() shouldBe 1
         val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
         val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
         val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
-        fs.listStatus(new org.apache.hadoop.fs.Path(snapshot, "mvs/parallel/rocksdb")).length shouldBe 49
+        fs.listStatus(snapshot).map(_.getPath.getName).toSeq shouldBe Seq("snapshot.zip")
+        val zip = new java.util.zip.ZipFile(new File(new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip").toUri))
+        try zip.size() shouldBe 200
+        finally zip.close()
       } finally release.countDown()
     }
 
-    it("waits for parallel copies before reporting failure and never commits a failed batch") {
-      val stateRoot  = newDir("state-sync-parallel-failure-local")
-      val remoteRoot = newDir("state-sync-parallel-failure-remote")
+    it("propagates packed upload failure without committing and permits explicit retry") {
+      val stateRoot  = newDir("state-sync-packed-failure-local")
+      val remoteRoot = newDir("state-sync-packed-failure-remote")
       val spark = newSpark(
-        "state-sync-parallel-failure",
+        "state-sync-packed-failure",
         Seq(
           FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
           FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
         )
       )
-      val directory = new File(stateRoot, "_openivm/mvs/parallel/rocksdb")
+      val directory = new File(stateRoot, "_openivm/mvs/failure/rocksdb")
       directory.mkdirs()
-      (1 to 16).foreach(index => java.nio.file.Files.write(new File(directory, s"$index.sst").toPath, Array[Byte](1)))
       java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
-      val entered       = new CountDownLatch(16)
-      val release       = new CountDownLatch(1)
-      val failed        = new CountDownLatch(1)
-      val currentCopied = new AtomicBoolean(false)
-      val finished      = new AtomicInteger(0)
-      OpenIvmStateSync.setCopyLocalFileHookForTesting { (_, file, _) =>
-        if (file.getName == "CURRENT") currentCopied.set(true)
-        else {
-          entered.countDown()
-          if (file.getName == "1.sst") {
-            failed.countDown()
-            throw new java.io.IOException("parallel upload failed")
-          }
-          release.await(10, TimeUnit.SECONDS) shouldBe true
-          finished.incrementAndGet()
-        }
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (_, _, _) =>
+        throw new java.io.IOException("packed upload failed")
       }
+      intercept[java.io.IOException](OpenIvmStateSync.backupNow(spark)).getMessage shouldBe "packed upload failed"
+      val root = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+      OpenIvmStateSync.latestCommittedSnapshot(fs, root) shouldBe None
+      OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmStateSync.latestCommittedSnapshot(fs, root) should not be empty
+      stateRoot.listFiles().exists(_.getName.startsWith(".openivm-state-snapshot")) shouldBe false
+    }
+
+    it("reads V1 committed generation trees before publishing V2 archives") {
+      val stateRoot  = newDir("state-sync-v1-local")
+      val remoteRoot = newDir("state-sync-v1-remote")
+      val spark = newSpark(
+        "state-sync-v1",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val dbPath = new File(stateRoot, "_openivm/mvs/v1/rocksdb").getAbsolutePath
+      val db     = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("v1")))
+      OpenIvmStateSync.backupNow(spark)
+      val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
+      val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+      val archive  = new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip")
+      OpenIvmSnapshotArchive.extract(new File(archive.toUri), new File(snapshot.toUri))
+      fs.delete(archive, false) shouldBe true
+      val commit = new org.apache.hadoop.fs.Path(root, s".openivm-state-sync/commits/${snapshot.getName}.commit")
+      val output = fs.create(commit, true)
+      try output.write(s"OPENIVM_STATE_SNAPSHOT_V1\n${snapshot.getName}\n".getBytes("UTF-8"))
+      finally output.close()
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      OpenIvmStateSync.resetForTesting()
+      val restored = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      restored.get("meta", RocksDBCodec.utf8("key")).map(RocksDBCodec.fromUtf8) shouldBe Some("v1")
+      restored.withBatch(batch => restored.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("v2")))
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      OpenIvmStateSync.resetForTesting()
+      OpenIvmRocksDBRegistry
+        .getOrOpen(spark, dbPath, Seq("meta"))
+        .get("meta", RocksDBCodec.utf8("key"))
+        .map(RocksDBCodec.fromUtf8) shouldBe Some("v2")
+    }
+
+    it("fails closed on same-length archive corruption instead of restoring older state") {
+      val stateRoot  = newDir("state-sync-corrupt-archive-local")
+      val remoteRoot = newDir("state-sync-corrupt-archive-remote")
+      val spark = newSpark(
+        "state-sync-corrupt-archive",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val dbPath = new File(stateRoot, "_openivm/mvs/corrupt/rocksdb").getAbsolutePath
+      val db     = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("before")))
+      OpenIvmStateSync.backupNow(spark)
+      db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("after")))
+      OpenIvmStateSync.backupNow(spark)
+      val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
+      val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+      val archive  = new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip")
+      val bytes    = java.nio.file.Files.readAllBytes(new File(archive.toUri).toPath)
+      bytes(bytes.length / 2) = (bytes(bytes.length / 2) ^ 1).toByte
+      val output = fs.create(archive, true)
+      try output.write(bytes)
+      finally output.close()
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      OpenIvmStateSync.resetForTesting()
+      intercept[java.io.IOException] {
+        OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      }.getMessage should include("checksum mismatch")
+      new File(dbPath, "CURRENT").exists() shouldBe false
+      stateRoot.listFiles().exists(_.getName.startsWith(".openivm-state-restore")) shouldBe false
+      val truncated = fs.create(archive, true)
+      try truncated.write(bytes.take(8))
+      finally truncated.close()
+      OpenIvmStateSync.resetForTesting()
+      intercept[java.io.IOException] {
+        OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      }.getMessage should include("length mismatch")
+    }
+
+    it("retries the packed generation when local state changes during remote upload") {
+      val stateRoot  = newDir("state-sync-packed-mutation-local")
+      val remoteRoot = newDir("state-sync-packed-mutation-remote")
+      val spark = newSpark(
+        "state-sync-packed-mutation",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val directory = new File(stateRoot, "_openivm/mvs/mutation/rocksdb")
+      directory.mkdirs()
+      val current = new File(directory, "CURRENT")
+      java.nio.file.Files.write(current.toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      val copies = new AtomicInteger(0)
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
+        fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+        if (copies.incrementAndGet() == 1)
+          java.nio.file.Files.write(current.toPath, "MANIFEST-100\n".getBytes("UTF-8"))
+      }
+      OpenIvmStateSync.backupNow(spark)
+      copies.get() shouldBe 2
+      val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
+      val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+      val zip      = new java.util.zip.ZipFile(new File(new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip").toUri))
       try {
-        val backup = Future(scala.util.Try(OpenIvmStateSync.backupNow(spark)))
-        entered.await(5, TimeUnit.SECONDS) shouldBe true
-        failed.await(5, TimeUnit.SECONDS) shouldBe true
-        backup.isCompleted shouldBe false
-        release.countDown()
-        Await.result(backup, RegistryRaceTimeout).failed.get.getMessage shouldBe "parallel upload failed"
-        finished.get() shouldBe 15
-        currentCopied.get() shouldBe false
-        val root = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
-        val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
-        OpenIvmStateSync.latestCommittedSnapshot(fs, root) shouldBe None
-        OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
-        OpenIvmStateSync.backupNow(spark)
-        OpenIvmStateSync.latestCommittedSnapshot(fs, root) should not be empty
-      } finally release.countDown()
+        val input = zip.getInputStream(zip.getEntry("mvs/mutation/rocksdb/CURRENT"))
+        try scala.io.Source.fromInputStream(input).mkString shouldBe "MANIFEST-100\n"
+        finally input.close()
+      } finally zip.close()
+    }
+
+    it("refuses to publish interrupted packed generation and permits a later request") {
+      val stateRoot  = newDir("state-sync-packed-interrupt-local")
+      val remoteRoot = newDir("state-sync-packed-interrupt-remote")
+      val spark = newSpark(
+        "state-sync-packed-interrupt",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val directory = new File(stateRoot, "_openivm/mvs/interrupt/rocksdb")
+      directory.mkdirs()
+      java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => Thread.currentThread().interrupt())
+      try {
+        intercept[java.io.InterruptedIOException](OpenIvmStateSync.backupNow(spark))
+        Thread.currentThread().isInterrupted shouldBe true
+      } finally Thread.interrupted()
+      val root = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+      OpenIvmStateSync.latestCommittedSnapshot(fs, root) shouldBe None
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmStateSync.latestCommittedSnapshot(fs, root) should not be empty
+    }
+
+    it("fails bounded unstable packing without uploading or publishing") {
+      val stateRoot  = newDir("state-sync-packed-unstable-local")
+      val remoteRoot = newDir("state-sync-packed-unstable-remote")
+      val spark = newSpark(
+        "state-sync-packed-unstable",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val directory = new File(stateRoot, "_openivm/mvs/unstable/rocksdb")
+      directory.mkdirs()
+      val current = new File(directory, "CURRENT")
+      java.nio.file.Files.write(current.toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      val passes  = new AtomicInteger(0)
+      val uploads = new AtomicInteger(0)
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { file =>
+        java.nio.file.Files.write(file.toPath, ("x" * passes.incrementAndGet()).getBytes("UTF-8"))
+      }
+      OpenIvmStateSync.setCopyLocalFileHookForTesting((_, _, _) => { uploads.incrementAndGet(); () })
+      intercept[java.io.IOException](OpenIvmStateSync.backupNow(spark)).getMessage should include("kept changing")
+      passes.get() shouldBe 20
+      uploads.get() shouldBe 0
+      val root = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+      val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+      OpenIvmStateSync.latestCommittedSnapshot(fs, root) shouldBe None
     }
 
     it("reads legacy flat snapshots without rewriting or repairing them") {
@@ -1016,14 +1155,10 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
       val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
       val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
-      val files    = fs.listFiles(snapshot, true)
-      while (files.hasNext) {
-        val file        = files.next().getPath
-        val relative    = snapshot.toUri.getPath.stripSuffix("/") + "/"
-        val destination = new File(remoteRoot, file.toUri.getPath.stripPrefix(relative))
-        destination.getParentFile.mkdirs()
-        fs.copyToLocalFile(false, file, new org.apache.hadoop.fs.Path(destination.getAbsolutePath), true)
-      }
+      OpenIvmSnapshotArchive.extract(
+        new File(new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip").toUri),
+        remoteRoot
+      )
       fs.delete(new org.apache.hadoop.fs.Path(root, ".openivm-state-sync"), true) shouldBe true
       OpenIvmRocksDBRegistry.closeAll()
       deleteRecursively(new File(stateRoot, "_openivm"))
@@ -1223,7 +1358,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         .map(RocksDBCodec.fromUtf8) shouldBe Some("retry")
     }
 
-    it("preserves the previous committed snapshot after interrupted CURRENT upload") {
+    it("preserves the previous committed snapshot after interrupted packed upload") {
       val stateRoot  = newDir("state-sync-interrupted-local")
       val remoteRoot = newDir("state-sync-interrupted-remote")
       val spark = newSpark(
@@ -1238,17 +1373,13 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("generation"), RocksDBCodec.utf8("before")))
       OpenIvmStateSync.backupNow(spark)
       db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("generation"), RocksDBCodec.utf8("after")))
-      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
-        if (file.getName == "CURRENT") {
-          val out = fs.create(remote, true)
-          out.close()
-          throw new java.io.IOException("interrupted CURRENT upload")
-        }
-        fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, _, remote) =>
+        fs.create(remote, true).close()
+        throw new java.io.IOException("interrupted packed upload")
       }
       intercept[java.io.IOException] {
         OpenIvmStateSync.backupNow(spark)
-      }.getMessage shouldBe "interrupted CURRENT upload"
+      }.getMessage shouldBe "interrupted packed upload"
       OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
       OpenIvmRocksDBRegistry.closeAll()
       deleteRecursively(new File(stateRoot, "_openivm"))
@@ -1382,8 +1513,11 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         removed.get() shouldBe true
         val fs       = new org.apache.hadoop.fs.Path(remoteRoot.toURI).getFileSystem(spark.sessionState.newHadoopConf())
         val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, new org.apache.hadoop.fs.Path(remoteRoot.toURI)).get
-        fs.exists(new org.apache.hadoop.fs.Path(snapshot, "mvs/rotating/rocksdb/CURRENT")) shouldBe true
-        fs.exists(new org.apache.hadoop.fs.Path(snapshot, "mvs/rotating/rocksdb/000001.log")) shouldBe false
+        val zip = new java.util.zip.ZipFile(new File(new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip").toUri))
+        try {
+          zip.getEntry("mvs/rotating/rocksdb/CURRENT") should not be null
+          zip.getEntry("mvs/rotating/rocksdb/000001.log") shouldBe null
+        } finally zip.close()
         staleRemote.exists() shouldBe true
       } finally {
         OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)

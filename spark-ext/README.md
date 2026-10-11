@@ -1,23 +1,31 @@
-# openivm-spark
+# Spark extension
 
 ## Crash-safe state-sync snapshots
 
-CREATE/REFRESH still wait synchronously for remote state durability. Concurrent
-post-commit backup requests share a full pass only when queued before that pass's
-request barrier; later arrivals need another pass. A failed batch fails its
-waiters, and a later explicit request can retry.
+Synchronous backups retain per-namespace request barriers: only requests captured
+before a pass receive its outcome. Later requests require a follow-up pass;
+covered failures propagate and a later explicit request can retry. Fair pass
+admission prevents asynchronous work overtaking waiting synchronous requests.
 
-State-sync now writes complete immutable generations under
-`.openivm-state-sync/snapshots/` and publishes a small, closed completion record
-via same-filesystem rename under `.openivm-state-sync/commits/`. The filesystem
-must provide atomic file rename (for example HDFS or hierarchical-namespace ABFS).
-Only committed generations are restored. Interrupted uploads cannot truncate
-the previous generation's CURRENT/manifest files. Flat legacy snapshots remain
-readable but are not overwritten; existing legacy corruption is not repaired.
-Restore failures fail closed instead of being treated as empty state.
-Old and incomplete generations are intentionally retained; this change does not
-introduce automatic remote retention or shared-file garbage collection. Every
-generation copies the complete state tree, including immutable SST files. Copies\nuse at most 16 daemon workers JVM-wide, with bounded batches; all non-CURRENT\nfiles finish before CURRENT files, and every task finishes before validation\nand commit. Copy errors fail the pass without publishing the generation.\nA fair namespace pass lock prevents an asynchronous follow-up from overtaking\na synchronous request that is already waiting.
+New generations pack the complete state tree into one immutable `snapshot.zip`
+under `.openivm-state-sync/snapshots/<generation>/`. Packing is local; a stable
+generation requires identical path/size/mtime signatures before packing, after
+packing, and after remote upload. Rotation or mutation retries up to 20 passes.
+Each stable generation uses one data-object upload regardless of file count.
+No request succeeds before upload/close, validation and atomic commit publication.
+
+The closed `OPENIVM_STATE_SNAPSHOT_V2` completion record contains generation,
+archive length and SHA256; same-filesystem rename publishes it under
+`.openivm-state-sync/commits/`. Restore verifies archive length/checksum and bounded
+safe ZIP entries/CRC in an isolated local staging directory before atomically
+publishing local state. Corrupt committed snapshots fail closed, without falling
+back to older or empty state. Incomplete generations are ignored.
+
+V1 committed tree snapshots and legacy flat snapshots remain readable. Older
+readers cannot read V2: downgrades must not silently reuse V2 state. Generations
+are retained; this change adds no garbage collection. Archives are bounded to
+100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
+rejected.
 
 ## Native streaming status lookup diagnostics
 
