@@ -30,7 +30,7 @@ V2 catalogs and multipart namespaces when their cloned state differs.
 
 `SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.
 LIKE uses Spark SHOW patterns (case-insensitive, `*` wildcard and `|` alternatives) on the unqualified table name, not the backtick-qualified `table_name` result. For a result identity `` `catalog`.`schema`.`table_name` ``, use `IN catalog.schema LIKE 'table_name'`; retain the fully qualified identity when validating the returned row.
-Candidates are filtered before Delta target resolution, manifest reads and ownership validation; unmatched targets incur no per-target status reads.
+Simple literal LIKE names (`[A-Za-z0-9_]+`) resolve the one qualified target\ndirectly without `SHOW TABLES`/namespace enumeration. Wildcard/regex patterns\nand unfiltered SHOW retain catalog enumeration. Selected targets still undergo\nDelta resolution, manifest reads and ownership validation; registered missing\ntargets still report metadata errors.
 Poll a specific table with `SHOW STREAMING TABLES IN catalog.schema LIKE 'table_name'`; keep checking identity fields, failures, and `is_active` until the query has actually stopped.
 Omitting LIKE retains namespace enumeration and validation. Filtering does not cache ownership metadata or bypass completion waiting.
 

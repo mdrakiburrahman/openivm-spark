@@ -5,6 +5,37 @@ import org.scalatest.funspec.AnyFunSpec
 
 class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
   describe("filtered streaming status") {
+    it("avoids catalog enumeration for exact names before direct metadata resolution") {
+      var listings = 0
+      def list(): Seq[Seq[String]] = {
+        listings += 1
+        Seq(Seq("catalog", "schema", "listed"))
+      }
+      StreamingTableManager.directOrListedCatalogNames(Some(Seq("catalog", "schema")), Some("target_42"))(
+        list()
+      ) shouldBe
+        Seq(Seq("catalog", "schema", "target_42"))
+      listings shouldBe 0
+      StreamingTableManager.directOrListedCatalogNames(None, Some("target_42"))(list()) shouldBe Seq(Seq("target_42"))
+      listings shouldBe 0
+      Seq(Some("target*"), Some("target|other"), Some("target.42"), None).foreach { pattern =>
+        StreamingTableManager.directOrListedCatalogNames(Some(Seq("catalog", "schema")), pattern)(list())
+      }
+      listings shouldBe 4
+    }
+
+    it("loads an exact V2 target without calling listTables") {
+      val session = spark.newSession()
+      session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
+      DirectStatusCatalog.listings.set(0)
+      DirectStatusCatalog.loads.set(0)
+      StreamingTableManager.show(session, Some(Seq("direct_status", "schema")), Some("missing_target")) shouldBe empty
+      DirectStatusCatalog.listings.get() shouldBe 0
+      DirectStatusCatalog.loads.get() shouldBe 1
+      StreamingTableManager.show(session, Some(Seq("direct_status", "schema")), Some("missing*")) shouldBe empty
+      DirectStatusCatalog.listings.get() shouldBe 1
+    }
+
     it("retains registered active rows and failures without querying unrelated targets") {
       createSource("show_active_source")
       val status = createStreaming(
@@ -113,4 +144,37 @@ class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
       invalid.getAs[String]("last_failure") should not be null
     }
   }
+}
+
+object DirectStatusCatalog {
+  val listings = new java.util.concurrent.atomic.AtomicInteger()
+  val loads    = new java.util.concurrent.atomic.AtomicInteger()
+}
+
+/** Native-style catalog proving exact status does not enumerate a namespace. */
+class DirectStatusCatalog extends org.apache.spark.sql.connector.catalog.TableCatalog {
+  import org.apache.spark.sql.connector.catalog._
+  private var catalogName = ""
+  override def initialize(name: String, options: org.apache.spark.sql.util.CaseInsensitiveStringMap): Unit =
+    catalogName = name
+  override def name(): String = catalogName
+  override def listTables(namespace: Array[String]): Array[Identifier] = {
+    DirectStatusCatalog.listings.incrementAndGet()
+    Array.empty
+  }
+  override def loadTable(identifier: Identifier): Table = {
+    DirectStatusCatalog.loads.incrementAndGet()
+    throw new org.apache.spark.sql.catalyst.analysis.NoSuchTableException(identifier)
+  }
+  override def createTable(
+      identifier: Identifier,
+      schema: org.apache.spark.sql.types.StructType,
+      partitions: Array[org.apache.spark.sql.connector.expressions.Transform],
+      properties: java.util.Map[String, String]
+  ): Table = throw new UnsupportedOperationException()
+  override def alterTable(identifier: Identifier, changes: TableChange*): Table =
+    throw new UnsupportedOperationException()
+  override def dropTable(identifier: Identifier): Boolean = throw new UnsupportedOperationException()
+  override def renameTable(oldIdentifier: Identifier, newIdentifier: Identifier): Unit =
+    throw new UnsupportedOperationException()
 }

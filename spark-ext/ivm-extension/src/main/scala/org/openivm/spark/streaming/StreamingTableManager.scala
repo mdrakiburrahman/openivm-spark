@@ -2079,24 +2079,36 @@ object StreamingTableManager {
       pattern: Option[String]
   ): Seq[Seq[String]] = {
     val filter = pattern.map(value => " LIKE '" + value.replace("'", "\\'") + "'").getOrElse("")
-    namespace match {
-      case Some(parts) =>
-        val qualified = StreamingTableMetadata.quoteMultipart(parts)
-        spark
-          .sql(s"SHOW TABLES IN $qualified$filter")
-          .collect()
-          .toSeq
-          .filterNot(_.getAs[Boolean]("isTemporary"))
-          .map(row => parts :+ row.getAs[String]("tableName"))
-      case None =>
-        spark
-          .sql(s"SHOW TABLES$filter")
-          .collect()
-          .toSeq
-          .filterNot(_.getAs[Boolean]("isTemporary"))
-          .map(row => Seq(row.getAs[String]("tableName")))
+    directOrListedCatalogNames(namespace, pattern) {
+      namespace match {
+        case Some(parts) =>
+          val qualified = StreamingTableMetadata.quoteMultipart(parts)
+          spark
+            .sql(s"SHOW TABLES IN $qualified$filter")
+            .collect()
+            .toSeq
+            .filterNot(_.getAs[Boolean]("isTemporary"))
+            .map(row => parts :+ row.getAs[String]("tableName"))
+        case None =>
+          spark
+            .sql(s"SHOW TABLES$filter")
+            .collect()
+            .toSeq
+            .filterNot(_.getAs[Boolean]("isTemporary"))
+            .map(row => Seq(row.getAs[String]("tableName")))
+      }
     }
   }
+
+  private[streaming] def directOrListedCatalogNames(
+      namespace: Option[Seq[String]],
+      pattern: Option[String]
+  )(list: => Seq[Seq[String]]): Seq[Seq[String]] =
+    pattern.map(_.trim) match {
+      case Some(name) if name.matches("[A-Za-z0-9_]+") =>
+        Seq(namespace.getOrElse(Seq.empty) :+ name)
+      case _ => list
+    }
 
   private def matchesNamespace(spark: SparkSession, name: Seq[String], namespace: Seq[String]): Boolean = {
     name.size > namespace.size &&
