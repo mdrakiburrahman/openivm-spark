@@ -31,12 +31,15 @@ case class DropStreamingTableCommand(name: Seq[String], ifExists: Boolean) exten
     Seq(StreamingTableCommands.lifecycleRow(StreamingTableManager.drop(spark, name, ifExists)))
 }
 
-case class ShowStreamingTablesCommand(namespace: Option[Seq[String]] = None) extends LeafRunnableCommand {
+case class ShowStreamingTablesCommand(
+    namespace: Option[Seq[String]] = None,
+    pattern: Option[String] = None
+) extends LeafRunnableCommand {
 
   override val output: Seq[Attribute] = StreamingTableCommands.showOutput
 
   override def run(spark: SparkSession): Seq[Row] =
-    StreamingTableManager.show(spark, namespace).map(StreamingTableCommands.showRow)
+    StreamingTableManager.show(spark, namespace, pattern).map(StreamingTableCommands.showRow)
 }
 
 object StreamingTableCommands {

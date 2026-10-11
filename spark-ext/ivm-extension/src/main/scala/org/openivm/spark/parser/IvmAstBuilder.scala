@@ -243,7 +243,8 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       ctx: IvmSqlBaseParser.ShowStreamingTablesContext
   ): AnyRef =
     ShowStreamingTablesCommand(
-      Option(ctx.multipartIdentifier()).map(multipartIdentifierParts)
+      Option(ctx.multipartIdentifier()).map(multipartIdentifierParts),
+      Option(ctx.STRING()).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText))
     )
 
   override def visitStopStreamingTable(

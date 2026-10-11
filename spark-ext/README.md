@@ -1,5 +1,13 @@
 # openivm-spark
 
+### Targeted streaming status polling
+
+`SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.
+LIKE uses Spark SHOW patterns (case-insensitive, `*` wildcard and `|` alternatives) on the unqualified table name.
+Candidates are filtered before Delta target resolution, manifest reads and ownership validation; unmatched targets incur no per-target status reads.
+Poll a specific table with `SHOW STREAMING TABLES IN catalog.schema LIKE 'table_name'`; keep checking identity fields, failures, and `is_active` until the query has actually stopped.
+Omitting LIKE retains namespace enumeration and validation. Filtering does not cache ownership metadata or bypass completion waiting.
+
 Spark SQL extension delivering **OpenIVM incremental view maintenance** without Delta CDF.
 
 > Status: under active development

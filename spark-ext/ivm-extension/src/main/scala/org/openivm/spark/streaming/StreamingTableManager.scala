@@ -7,6 +7,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
+import org.apache.spark.sql.catalyst.util.StringUtils
 import org.apache.spark.sql.openivm.StreamingDatasetAccess
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
 import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryListener}
@@ -614,46 +615,59 @@ object StreamingTableManager {
     }
   }
 
-  def show(spark: SparkSession, namespace: Option[Seq[String]]): Seq[StreamingTableStatus] = {
+  def show(
+      spark: SparkSession,
+      namespace: Option[Seq[String]],
+      pattern: Option[String] = None
+  ): Seq[StreamingTableStatus] = {
     val catalogNames = candidateCatalogNames(spark, namespace)
     val knownTargets = StreamingTableRegistry
       .registeredTargets(spark)
       .filter(target => namespace.forall(matchesNamespace(spark, target.name, _)))
     val registryNames = knownTargets.map(_.name)
-    (catalogNames ++ registryNames)
+    val candidates = (catalogNames ++ registryNames)
       .groupBy(name => StreamingTableMetadata.canonicalIdentity(spark, name))
       .toSeq
       .sortBy(_._1)
-      .flatMap { case (identity, names) =>
-        val name  = names.head
-        val known = knownTargets.find(_.identity == identity)
-        val target =
-          try Some(StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true))
-          catch {
-            case _: org.apache.spark.sql.AnalysisException => None
+      .map { case (_, names) => names.head }
+    resolveShowCandidates(candidates, pattern) { name =>
+      val identity = StreamingTableMetadata.canonicalIdentity(spark, name)
+      val known    = knownTargets.find(_.identity == identity)
+      val target =
+        try Some(StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true))
+        catch {
+          case _: org.apache.spark.sql.AnalysisException => None
+        }
+      target
+        .map { owned =>
+          try {
+            val manifest = StreamingTableMetadata.readManifest(spark, owned)
+            StreamingTableMetadata.verifyOwned(spark, owned, manifest)
+            statusFor(spark, owned, manifest, forcedStatus = None)
+          } catch {
+            case NonFatal(error) =>
+              metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
           }
-        target
-          .map { owned =>
-            try {
-              val manifest = StreamingTableMetadata.readManifest(spark, owned)
-              StreamingTableMetadata.verifyOwned(spark, owned, manifest)
-              statusFor(spark, owned, manifest, forcedStatus = None)
-            } catch {
-              case NonFatal(error) =>
-                metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
-            }
+        }
+        .orElse {
+          known.map { target =>
+            metadataErrorStatus(
+              spark,
+              target,
+              "The known owned target can no longer be resolved; it may have been moved, replaced, or deleted"
+            )
           }
-          .orElse {
-            known.map { target =>
-              metadataErrorStatus(
-                spark,
-                target,
-                "The known owned target can no longer be resolved; it may have been moved, replaced, or deleted"
-              )
-            }
-          }
-      }
+        }
+    }
   }
+
+  private[streaming] def resolveShowCandidates[A](
+      names: Seq[Seq[String]],
+      pattern: Option[String]
+  )(resolve: Seq[String] => Option[A]): Seq[A] =
+    names
+      .filter(name => pattern.forall(value => StringUtils.filterPattern(Seq(name.last), value).nonEmpty))
+      .flatMap(name => resolve(name).toSeq)
 
   private def metadataErrorStatus(
       spark: SparkSession,

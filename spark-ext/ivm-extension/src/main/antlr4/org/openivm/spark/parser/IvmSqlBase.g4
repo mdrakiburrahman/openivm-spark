@@ -182,7 +182,7 @@ streamingTableClause
     ;
 
 showStreamingTables
-    : SHOW STREAMING TABLES (IN multipartIdentifier)?
+    : SHOW STREAMING TABLES (IN multipartIdentifier)? (LIKE STRING)?
     ;
 
 stopStreamingTable
@@ -231,7 +231,7 @@ nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
     | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
-    | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP
+    | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP | LIKE
     | INSIGHTS | BEGIN | REQUEST | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
     | MATERIALIZATION | TARGET | ERROR_CLASS | ERROR_CODE | ANNOTATE | HASH | OLD | NEW | POLICY | DECISION | REASON
     ;
@@ -254,6 +254,7 @@ BY            : [Bb][Yy];
 PARTITIONED   : [Pp][Aa][Rr][Tt][Ii][Tt][Ii][Oo][Nn][Ee][Dd];
 TBLPROPERTIES : [Tt][Bb][Ll][Pp][Rr][Oo][Pp][Ee][Rr][Tt][Ii][Ee][Ss];
 SHOW          : [Ss][Hh][Oo][Ww];
+LIKE          : [Ll][Ii][Kk][Ee];
 OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
 PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
 QUERY         : [Qq][Uu][Ee][Rr][Yy];
