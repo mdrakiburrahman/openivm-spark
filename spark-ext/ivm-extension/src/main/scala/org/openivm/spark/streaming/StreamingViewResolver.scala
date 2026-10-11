@@ -8,7 +8,6 @@ import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.delta.files.{TahoeFileIndex, TahoeLogFileIndex}
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.openivm.StreamingDatasetAccess
 
 import scala.jdk.CollectionConverters._
 
@@ -28,13 +27,22 @@ private[streaming] object StreamingViewResolver {
 
   private def resolveBoundary(spark: SparkSession, relation: UnresolvedRelation): LogicalPlan = {
     val batch =
-      try StreamingDatasetAccess.ofRows(spark, relation.copy(isStreaming = false)).queryExecution.analyzed
+      try
+        spark
+          .sql(s"SELECT * FROM ${StreamingTableMetadata.quoteMultipart(relation.multipartIdentifier)}")
+          .queryExecution
+          .analyzed
       catch {
         // Missing physical tables retain the existing catalog/Fabric resolution path.
         case error: AnalysisException if Option(error.getMessage).exists(_.contains("[TABLE_OR_VIEW_NOT_FOUND]")) =>
           return relation
       }
-    if (!batch.exists(_.isInstanceOf[View])) return relation
+    val containsView = batch.exists(_.isInstanceOf[View])
+    val catalogView = spark.catalog
+      .getTable(StreamingTableMetadata.quoteMultipart(relation.multipartIdentifier))
+      .tableType
+      .equalsIgnoreCase("VIEW")
+    if (!containsView && !catalogView) return relation
 
     val name = relation.multipartIdentifier.mkString(".")
     if (batch.exists(_.expressions.exists(SubqueryExpression.hasSubquery)))
