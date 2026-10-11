@@ -19,6 +19,14 @@ Old and incomplete generations are intentionally retained; this change does not
 introduce automatic remote retention or shared-file garbage collection. Every
 generation copies the complete state tree, including immutable SST files. Copies\nuse at most 16 daemon workers JVM-wide, with bounded batches; all non-CURRENT\nfiles finish before CURRENT files, and every task finishes before validation\nand commit. Copy errors fail the pass without publishing the generation.\nA fair namespace pass lock prevents an asynchronous follow-up from overtaking\na synchronous request that is already waiting.
 
+## Managed initial CTAS namespaces
+
+When `spark.openivm.managedTablesRoot` is set, initial CREATE data writes use the
+logical qualified target identifier plus LOCATION, not a `delta.<path>` CTAS
+identifier. This keeps Fabric auto-discovery in the target's real namespace.
+Non-managed deployments retain concurrent path CTAS. Ownership, table identity,
+precommit cleanup, committed-path reuse and subsequent registration are unchanged.
+
 ## Native namespace session isolation
 
 CREATE/REFRESH session clones retain inherited current-catalog/database state
