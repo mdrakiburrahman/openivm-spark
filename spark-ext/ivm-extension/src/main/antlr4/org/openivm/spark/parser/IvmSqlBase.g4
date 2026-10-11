@@ -160,6 +160,7 @@ annotateOpenivmMvQueryHash
     : OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
       TARGET targetRelation=STRING OLD oldQueryHash=STRING NEW newQueryHash=STRING
       POLICY policy=STRING DECISION decision=STRING REASON reason=STRING
+      (FOR REQUEST requestId=STRING)?
     ;
 
 releaseOpenivmInsightsRequest

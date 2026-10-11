@@ -169,6 +169,102 @@ class OpenIvmInsightsCommandsSpec extends AnyFunSpec with Matchers with BeforeAn
       }
     }
 
+    it("routes explicit annotations across Java threads into the existing capture without rebinding") {
+      val requestId = s"cross-thread-${UUID.randomUUID()}"
+      val target    = "analytics.cross_thread_mv"
+      OpenIvmInsightsBroker.begin(
+        spark,
+        requestId,
+        "run-cross",
+        "model.analytics.cross",
+        Some("materialized_view"),
+        Some(target)
+      )
+      val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+      try {
+        executor
+          .submit(new java.util.concurrent.Callable[Unit] {
+            override def call(): Unit = {
+              spark.sparkContext.setLocalProperty(OpenIvmInsightsContract.RequestIdProperty, null)
+              spark.sparkContext.setLocalProperty(OpenIvmInsightsContract.RunIdProperty, null)
+              spark.sparkContext.setLocalProperty(OpenIvmInsightsContract.DbtNodeIdProperty, null)
+              spark
+                .sql(s"""OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+              |TARGET '$target' OLD '0123456789abcdef0123456789abcdef'
+              |NEW 'fedcba9876543210fedcba9876543210' POLICY 'rebuild'
+              |DECISION 'rebuild' REASON 'query_hash_changed' FOR REQUEST '$requestId'""".stripMargin)
+                .collect()
+              spark.sparkContext.getLocalProperty(OpenIvmInsightsContract.RequestIdProperty) shouldBe null
+            }
+          })
+          .get(10, java.util.concurrent.TimeUnit.SECONDS)
+        val events = OpenIvmInsightsBroker.page(spark, requestId, 0L, 100).events
+        events.count(_.eventType == OpenIvmInsightsContract.EventType.RequestStarted) shouldBe 1
+        events.count(_.code == OpenIvmInsightsContract.Code.MvQueryHashDecisionAnnotated) shouldBe 1
+        OpenIvmInsightsBroker.currentMvQueryHashDecision(spark).get.targetRelation shouldBe target
+      } finally {
+        executor.shutdownNow()
+        OpenIvmInsightsBroker.end(spark, requestId, succeeded = true)
+        OpenIvmInsightsBroker.release(spark, requestId)
+      }
+    }
+
+    it("rejects explicit annotations for missing terminal mismatched or conflicting captures") {
+      val target    = "analytics.explicit_guard_mv"
+      val requestId = s"explicit-guard-${UUID.randomUUID()}"
+      val other     = s"explicit-other-${UUID.randomUUID()}"
+      def sql(id: String, relation: String = target): String =
+        s"""OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW QUERY HASH
+           |TARGET '$relation' OLD '0123456789abcdef0123456789abcdef'
+           |NEW 'fedcba9876543210fedcba9876543210' POLICY 'rebuild'
+           |DECISION 'rebuild' REASON 'query_hash_changed' FOR REQUEST '$id'""".stripMargin
+      spark.sparkContext.setLocalProperty(OpenIvmInsightsContract.RequestIdProperty, null)
+      intercept[IllegalArgumentException](spark.sql(sql("missing-capture")).collect()).getMessage should include(
+        OpenIvmInsightsContract.FailureCode.ActiveCaptureRequired
+      )
+      OpenIvmInsightsBroker.begin(
+        spark,
+        requestId,
+        "run-guard",
+        "model.analytics.guard",
+        Some("materialized_view"),
+        Some(target)
+      )
+      try {
+        intercept[IllegalArgumentException](
+          spark.sql(sql(requestId, "analytics.other_mv")).collect()
+        ).getMessage should include(OpenIvmInsightsContract.FailureCode.AnnotationContextMismatch)
+        OpenIvmInsightsBroker.begin(
+          spark,
+          other,
+          "run-other",
+          "model.analytics.other",
+          Some("materialized_view"),
+          Some(target)
+        )
+        try {
+          intercept[IllegalArgumentException](spark.sql(sql(requestId)).collect()).getMessage should include(
+            OpenIvmInsightsContract.FailureCode.AnnotationContextMismatch
+          )
+        } finally {
+          OpenIvmInsightsBroker.end(spark, other, succeeded = false)
+          OpenIvmInsightsBroker.release(spark, other)
+        }
+        OpenIvmInsightsBroker.end(spark, requestId, succeeded = true)
+        intercept[IllegalArgumentException](spark.sql(sql(requestId)).collect()).getMessage should include(
+          OpenIvmInsightsContract.FailureCode.ActiveCaptureRequired
+        )
+        OpenIvmInsightsBroker
+          .page(spark, requestId, 0L, 100)
+          .events
+          .count(_.code == OpenIvmInsightsContract.Code.MvQueryHashDecisionAnnotated) shouldBe 0
+      } finally {
+        if (!OpenIvmInsightsBroker.page(spark, requestId, 0L, 100).status.terminal)
+          OpenIvmInsightsBroker.end(spark, requestId, succeeded = false)
+        OpenIvmInsightsBroker.release(spark, requestId)
+      }
+    }
+
     it("rejects unsafe query-hash annotation values before emitting an event") {
       val requestId = s"unsafe-annotation-${UUID.randomUUID()}"
       spark
