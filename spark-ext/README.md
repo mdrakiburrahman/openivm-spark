@@ -27,6 +27,12 @@ are retained; this change adds no garbage collection. Archives are bounded to
 100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
 rejected.
 
+## Generated pattern-match dialect
+
+The Spark SQL generation boundary translates DuckDB pattern operators `~~`,
+`!~~`, `~~*` and `!~~*` to LIKE, NOT LIKE, ILIKE and NOT ILIKE. String literals,
+quoted identifiers and comments are protected; source business SQL is unchanged.
+
 ## Native streaming status lookup diagnostics
 
 Targeted SHOW analyzes the exact target without suppressing native catalog/storage

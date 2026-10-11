@@ -324,6 +324,22 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     SparkRefreshRewriter.hasRealDelta(result.sql, "mv_wp_cascade") shouldBe true
   }
 
+  it should "normalize LIKE operators in generated CASE grouping initial loads" in {
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_like_case_group",
+        viewSql = "SELECT CASE WHEN user_agent LIKE '%Portal%' THEN 'Portal' ELSE 'Other' END AS source, " +
+          "COUNT(*) AS events FROM agents GROUP BY " +
+          "CASE WHEN user_agent LIKE '%Portal%' THEN 'Portal' ELSE 'Other' END",
+        sources = Map("agents" -> StructType.fromDDL("user_agent STRING"))
+      )
+    )
+    result.initialLoadSql should not include "~~"
+    result.initialLoadSql.toUpperCase should include("LIKE")
+    val parsed = org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(result.initialLoadSql)
+    parsed should not be null
+  }
+
   it should "emit signed cascade-delta SQL for GROUP_RECOMPUTE recomputes" in {
     val salesGrSchema = StructType.fromDDL("id INT, region STRING, amount INT")
     val req = CompileRequest(
