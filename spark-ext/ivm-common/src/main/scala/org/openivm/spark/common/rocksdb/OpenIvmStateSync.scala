@@ -8,6 +8,8 @@ import org.slf4j.LoggerFactory
 
 import java.io.File
 import java.nio.file.Files
+import java.nio.charset.StandardCharsets
+import java.util.UUID
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.util.control.NonFatal
@@ -23,12 +25,11 @@ import scala.util.control.NonFatal
  *
  *   - [[maybeRestore]] runs once per Spark application, before any RocksDB opens,
  *     and downloads the remote tree if the local tree is absent/empty.
- *   - [[backupAsync]] is fired after each CREATE / REFRESH MATERIALIZED VIEW and
- *     incrementally uploads the local tree. Immutable `*.sst` files are skipped
- *     when a same-length copy already exists remotely; the (small, mutable)
- *     RocksDB metadata files — `CURRENT`, `MANIFEST-*`, `OPTIONS-*`, `*.log`, and
- *     OpenIVM's own manifests under `openivm-manifests` — are always re-uploaded
- *     so a restore reflects the latest committed version.
+ *   - [[backupNow]] synchronously publishes a complete immutable generation.
+ *     Concurrent requests share a pass only if they arrived before its request
+ *     barrier. Failed or interrupted uploads never overwrite earlier snapshots.
+ *   - [[backupAsync]] coalesces background requests through the same serialized
+ *     generation publisher. Legacy flat-layout snapshots remain readable.
  */
 object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
@@ -36,9 +37,62 @@ object OpenIvmStateSync {
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
   private final class BackupState {
-    val requested     = new AtomicBoolean(false)
-    val running       = new AtomicBoolean(false)
-    private val spans = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
+    val requested                   = new AtomicBoolean(false)
+    val running                     = new AtomicBoolean(false)
+    private val spans               = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
+    private val synchronousMonitor  = new Object
+    private val synchronousRequests = scala.collection.mutable.ArrayBuffer.empty[CompletableFuture[Unit]]
+    private var synchronousRunning  = false
+    private var submittedRequests   = 0L
+
+    def synchronousRequestCount: Long = synchronousMonitor.synchronized(submittedRequests)
+
+    def backupSynchronous(pass: () => Unit): Unit = {
+      val request = new CompletableFuture[Unit]()
+      synchronousMonitor.synchronized {
+        submittedRequests += 1L
+        synchronousRequests += request
+      }
+      try {
+        while (!request.isDone) {
+          val batch = synchronousMonitor.synchronized {
+            if (request.isDone) Vector.empty[CompletableFuture[Unit]]
+            else if (!synchronousRunning) {
+              synchronousRunning = true
+              val captured = synchronousRequests.toVector
+              synchronousRequests.clear()
+              captured
+            } else {
+              synchronousMonitor.wait()
+              Vector.empty[CompletableFuture[Unit]]
+            }
+          }
+          if (batch.nonEmpty) {
+            var failure: Throwable = null
+            try pass()
+            catch { case error: Throwable => failure = error }
+            finally
+              synchronousMonitor.synchronized {
+                batch.foreach { waiting =>
+                  if (failure == null) waiting.complete(())
+                  else waiting.completeExceptionally(failure)
+                }
+                synchronousRunning = false
+                synchronousMonitor.notifyAll()
+              }
+          }
+        }
+        try request.get()
+        catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
+      } catch {
+        case interrupted: InterruptedException =>
+          synchronousMonitor.synchronized {
+            synchronousRequests -= request
+          }
+          Thread.currentThread().interrupt()
+          throw interrupted
+      }
+    }
 
     def capture(span: Option[OpenIvmExecutionSpan]): Unit =
       span.foreach(spans.add)
@@ -60,6 +114,8 @@ object OpenIvmStateSync {
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
+  @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
+  @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -108,8 +164,7 @@ object OpenIvmStateSync {
   }
 
   /** Download the remote state tree into the local `_openivm` dir on the first
-    * call per Spark application. Best-effort: any failure logs a warning and
-    * leaves the local tree empty (openivm then rebuilds state from scratch). */
+    * call per Spark application. Restore failures fail all callers closed. */
   def maybeRestore(spark: SparkSession): Unit = {
     val uri = stateSyncUri(spark)
       .getOrElse(
@@ -119,17 +174,18 @@ object OpenIvmStateSync {
     val waiter = new CompletableFuture[Unit]()
     val prior  = restoreStates.putIfAbsent(key, waiter)
     if (prior != null) {
-      prior.join()
+      try prior.join()
+      catch { case error: java.util.concurrent.CompletionException => throw error.getCause }
       return
     }
 
     try {
       restoreNow(spark, uri)
-    } catch {
-      case NonFatal(e) =>
-        log.warn(s"openivm state-sync: restore from $uri failed, continuing with empty state: $e")
-    } finally {
       waiter.complete(())
+    } catch {
+      case error: Throwable =>
+        waiter.completeExceptionally(error)
+        throw error
     }
   }
 
@@ -176,7 +232,7 @@ object OpenIvmStateSync {
       }
     }
 
-  /** Synchronous incremental backup. Public for tests / explicit checkpoints. */
+  /** Synchronously publish a snapshot covering this request's committed state. */
   def backupNow(spark: SparkSession): Unit = {
     val uri = stateSyncUri(spark)
       .getOrElse(
@@ -185,7 +241,7 @@ object OpenIvmStateSync {
     val key     = effectiveStateSyncKey(spark, uri)
     val span    = OpenIvmExecutionSpan.captureCurrent()
     val started = System.nanoTime()
-    try runBackupPass(key, spark, uri)
+    try backupStateFor(key).backupSynchronous(() => runBackupPass(key, spark, uri))
     finally {
       val durationMs = (System.nanoTime() - started) / 1000000L
       span.foreach(_.recordRocksDbBackup(durationMs))
@@ -212,23 +268,28 @@ object OpenIvmStateSync {
       return
     }
 
+    val snapshotRoot = latestCommittedSnapshot(fs, remoteRoot).getOrElse(remoteRoot)
     local.mkdirs()
     var restored = 0
-    val it       = fs.listFiles(remoteRoot, /* recursive = */ true)
+    val it       = fs.listFiles(snapshotRoot, /* recursive = */ true)
     while (it.hasNext) {
       val remotePath = it.next().getPath
-      val rel        = relativize(remoteRoot, remotePath)
-      val dst        = new File(local, rel)
-      Option(dst.getParentFile).foreach(_.mkdirs())
-      // useRawLocalFileSystem=true so Hadoop does NOT drop .crc sidecars into
-      // the RocksDB directory (RocksDB would choke on the extra files).
-      fs.copyToLocalFile(
-        /* delSrc = */ false,
-        remotePath,
-        new Path(dst.getAbsolutePath), /* useRawLocalFileSystem = */ true
-      )
-      restored += 1
+      val rel        = relativize(snapshotRoot, remotePath)
+      if (!rel.startsWith(".openivm-state-sync/")) {
+        val dst = new File(local, rel)
+        Option(dst.getParentFile).foreach(_.mkdirs())
+        // useRawLocalFileSystem=true so Hadoop does NOT drop .crc sidecars into
+        // the RocksDB directory (RocksDB would choke on the extra files).
+        fs.copyToLocalFile(
+          /* delSrc = */ false,
+          remotePath,
+          new Path(dst.getAbsolutePath), /* useRawLocalFileSystem = */ true
+        )
+        restored += 1
+      }
     }
+    if (restored == 0 && snapshotRoot == remoteRoot && fs.exists(new Path(remoteRoot, ".openivm-state-sync")))
+      throw new java.io.IOException(s"openivm state-sync: no committed snapshot or legacy state at $uri")
     log.info(s"openivm state-sync: restored $restored files from $uri to $local")
   }
 
@@ -236,9 +297,24 @@ object OpenIvmStateSync {
     val local = localRoot(spark)
     if (!local.exists()) return
 
-    val hconf       = spark.sessionState.newHadoopConf()
-    val remoteRoot  = new Path(uri)
-    val fs          = remoteRoot.getFileSystem(hconf)
+    val hconf         = spark.sessionState.newHadoopConf()
+    val namespaceRoot = new Path(uri)
+    val fs            = namespaceRoot.getFileSystem(hconf)
+    val controlRoot   = new Path(namespaceRoot, ".openivm-state-sync")
+    val commitRoot    = new Path(controlRoot, "commits")
+    if (!fs.mkdirs(commitRoot))
+      throw new java.io.IOException(s"openivm state-sync: cannot create commit directory $commitRoot")
+    val previous = fs
+      .listStatus(commitRoot)
+      .iterator
+      .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
+      .map(_.getPath.getName.takeWhile(_ != '-').toLong)
+      .foldLeft(0L)(math.max)
+    val stamp      = math.max(System.currentTimeMillis(), previous + 1L)
+    val generation = f"$stamp%019d-${UUID.randomUUID()}"
+    val remoteRoot = new Path(new Path(controlRoot, "snapshots"), generation)
+    if (!fs.mkdirs(remoteRoot))
+      throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
     val localBase   = local.toPath
     var uploaded    = 0
     var attempts    = 0
@@ -257,32 +333,22 @@ object OpenIvmStateSync {
           if (hook != null) hook(f)
           if (!f.isFile) localFileVanished = true
           else {
-            val name   = f.getName
             val rel    = localBase.relativize(f.toPath).toString
             val remote = new Path(remoteRoot, rel)
-            val len    = f.length()
-            // Immutable SST files are content-addressed by RocksDB, so a same-length
-            // remote copy is identical and can be skipped. Everything else (mutable
-            // metadata) is always re-uploaded so the remote reflects the newest
-            // committed manifest.
-            val skip =
-              name.endsWith(".sst") && {
-                try fs.exists(remote) && fs.getFileStatus(remote).getLen == len
-                catch { case NonFatal(_) => false }
-              }
-            if (!skip) {
-              try {
+            try {
+              val copyHook = copyLocalFileHookForTesting
+              if (copyHook != null) copyHook(fs, f, remote)
+              else
                 fs.copyFromLocalFile(
                   /* delSrc = */ false,
                   /* overwrite = */ true,
                   new Path(f.getAbsolutePath),
                   remote
                 )
-                uploaded += 1
-              } catch {
-                case NonFatal(_) if !f.isFile =>
-                  localFileVanished = true
-              }
+              uploaded += 1
+            } catch {
+              case NonFatal(_) if !f.isFile =>
+                localFileVanished = true
             }
           }
         }
@@ -299,7 +365,16 @@ object OpenIvmStateSync {
       throw new java.io.IOException(
         s"openivm state-sync: local RocksDB files kept changing while backing up '$local' to '$uri'"
       )
-    val pruned = pruneRemoteFiles(fs, remoteRoot, stablePaths)
+    val pruned        = pruneRemoteFiles(fs, remoteRoot, stablePaths)
+    val pendingCommit = new Path(commitRoot, s".$generation.pending")
+    val committed     = new Path(commitRoot, s"$generation.commit")
+    val output        = fs.create(pendingCommit, false)
+    try output.write(s"OPENIVM_STATE_SNAPSHOT_V1\n$generation\n".getBytes(StandardCharsets.UTF_8))
+    finally output.close()
+    val commitHook = beforeSnapshotCommitHookForTesting
+    if (commitHook != null) commitHook()
+    if (!fs.rename(pendingCommit, committed))
+      throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
     if (uploaded > 0 || pruned > 0)
       log.info(s"openivm state-sync: backed up $uploaded files and pruned $pruned stale files at $uri")
   }
@@ -354,6 +429,46 @@ object OpenIvmStateSync {
   private[rocksdb] def setBeforeLocalFileCopyHookForTesting(hook: File => Unit): Unit =
     beforeLocalFileCopyHookForTesting = hook
 
+  private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
+    beforeSnapshotCommitHookForTesting = hook
+
+  private[rocksdb] def setCopyLocalFileHookForTesting(hook: (FileSystem, File, Path) => Unit): Unit =
+    copyLocalFileHookForTesting = hook
+
+  private[rocksdb] def latestCommittedSnapshot(fs: FileSystem, namespaceRoot: Path): Option[Path] = {
+    val controlRoot = new Path(namespaceRoot, ".openivm-state-sync")
+    val commitRoot  = new Path(controlRoot, "commits")
+    if (!fs.exists(commitRoot)) return None
+    val latest = fs
+      .listStatus(commitRoot)
+      .toSeq
+      .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
+      .sortBy(_.getPath.getName)
+      .lastOption
+    latest.map { commit =>
+      val input = fs.open(commit.getPath)
+      val record =
+        try scala.io.Source.fromInputStream(input, "UTF-8").mkString
+        finally input.close()
+      val generation = commit.getPath.getName.stripSuffix(".commit")
+      if (
+        !generation.matches("[0-9]{19}-[0-9a-f-]{36}") ||
+        record != s"OPENIVM_STATE_SNAPSHOT_V1\n$generation\n"
+      )
+        throw new java.io.IOException(s"openivm state-sync: invalid snapshot commit ${commit.getPath}")
+      val snapshot = new Path(new Path(controlRoot, "snapshots"), generation)
+      if (!fs.exists(snapshot))
+        throw new java.io.IOException(s"openivm state-sync: missing committed snapshot $snapshot")
+      snapshot
+    }
+  }
+
+  private[rocksdb] def synchronousRequestCountForTesting(spark: SparkSession): Long =
+    stateSyncUri(spark)
+      .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
+      .map(_.synchronousRequestCount)
+      .getOrElse(0L)
+
   private[rocksdb] def backupStateSnapshotForTesting(spark: SparkSession): Option[BackupStateSnapshot] =
     stateSyncUri(spark)
       .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
@@ -374,6 +489,8 @@ object OpenIvmStateSync {
     stateSyncKeyHookForTesting = null
     stateSyncUriHookForTesting = null
     beforeLocalFileCopyHookForTesting = null
+    copyLocalFileHookForTesting = null
+    beforeSnapshotCommitHookForTesting = null
     restoreStates.clear()
     backupStates.clear()
   }

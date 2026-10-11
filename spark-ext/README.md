@@ -1,6 +1,25 @@
 # openivm-spark
 
-### Targeted streaming status polling
+## Crash-safe state-sync snapshots
+
+CREATE/REFRESH still wait synchronously for remote state durability. Concurrent
+post-commit backup requests share a full pass only when queued before that pass's
+request barrier; later arrivals need another pass. A failed batch fails its
+waiters, and a later explicit request can retry.
+
+State-sync now writes complete immutable generations under
+`.openivm-state-sync/snapshots/` and publishes a small, closed completion record
+via same-filesystem rename under `.openivm-state-sync/commits/`. The filesystem
+must provide atomic file rename (for example HDFS or hierarchical-namespace ABFS).
+Only committed generations are restored. Interrupted uploads cannot truncate
+the previous generation's CURRENT/manifest files. Flat legacy snapshots remain
+readable but are not overwritten; existing legacy corruption is not repaired.
+Restore failures fail closed instead of being treated as empty state.
+Old and incomplete generations are intentionally retained; this change does not
+introduce automatic remote retention or shared-file garbage collection. Every
+generation copies the complete state tree, including immutable SST files.
+
+## Targeted streaming status polling
 
 `SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.
 LIKE uses Spark SHOW patterns (case-insensitive, `*` wildcard and `|` alternatives) on the unqualified table name, not the backtick-qualified `table_name` result. For a result identity `` `catalog`.`schema`.`table_name` ``, use `IN catalog.schema LIKE 'table_name'`; retain the fully qualified identity when validating the returned row.
