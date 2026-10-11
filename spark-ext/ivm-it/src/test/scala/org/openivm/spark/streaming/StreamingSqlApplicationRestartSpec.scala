@@ -86,6 +86,62 @@ class StreamingSqlApplicationRestartSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("retains nested UNION ALL view source ordering across a fresh SparkContext") {
+      withRestartRoot("views") { root =>
+        val left       = "strsql_restart_views_left"
+        val right      = "strsql_restart_views_right"
+        val view       = "strsql_restart_views_nested"
+        val target     = "strsql_restart_views_target"
+        val leftPath   = new File(root, "left").getCanonicalPath
+        val rightPath  = new File(root, "right").getCanonicalPath
+        val targetPath = new File(root, "target").getCanonicalPath
+        val sessions   = mutable.ArrayBuffer.empty[SparkSession]
+        def views(session: SparkSession): Unit = {
+          session
+            .sql(
+              s"""CREATE VIEW strsql_restart_views_branches AS
+               |SELECT CAST(id AS BIGINT) AS id, value FROM $left WHERE id > 0
+               |UNION ALL SELECT CAST(id AS BIGINT), value FROM $right WHERE id > 0
+               |UNION ALL SELECT CAST(id AS BIGINT), upper(value) FROM $left WHERE id > 0""".stripMargin
+            )
+            .collect()
+          session.sql(s"CREATE VIEW $view AS SELECT id, value FROM strsql_restart_views_branches").collect()
+        }
+        val declaration =
+          s"""CREATE STREAMING TABLE $target USING DELTA LOCATION ${sqlString(targetPath)}
+             |AS SELECT * FROM STREAM($view) WITH ('maxFilesPerTrigger' = '1')""".stripMargin
+        val first = newSession(root, "views-first", new File(root, "local-first"), None)
+        sessions += first
+        try {
+          createLocatedSource(first, left, leftPath, "id INT, value STRING")
+          createLocatedSource(first, right, rightPath, "id INT, value STRING")
+          first.sql(s"INSERT INTO $left VALUES (1, 'left')").collect()
+          first.sql(s"INSERT INTO $right VALUES (2, 'right')").collect()
+          views(first)
+          val original = create(first, declaration)
+          process(query(first, original.queryId))
+          first.sql(s"ALTER STREAMING TABLE $target STOP").collect()
+          val firstContext = first.sparkContext
+          stopSession(first)
+          val second = newSession(root, "views-second", new File(root, "local-second"), None)
+          sessions += second
+          (second.sparkContext eq firstContext) shouldBe false
+          registerLocatedTable(second, left, leftPath)
+          registerLocatedTable(second, right, rightPath)
+          registerLocatedTable(second, target, targetPath)
+          views(second)
+          val resumed = create(second, declaration)
+          resumed.queryId shouldBe original.queryId
+          resumed.checkpointLocation shouldBe original.checkpointLocation
+          resumed.definitionHash shouldBe original.definitionHash
+          second.sql(s"INSERT INTO $right VALUES (3, 'later-right')").collect()
+          second.sql(s"INSERT INTO $left VALUES (4, 'later-left')").collect()
+          process(query(second, resumed.queryId))
+          assertBagEqual(second, target, s"SELECT * FROM $view")
+        } finally sessions.reverseIterator.foreach(stopSession)
+      }
+    }
+
     it("restores RocksDB-backed aggregate state with a fresh local directory") {
       withRestartRoot("rocksdb") { root =>
         val source      = "strsql_restart_rocks_source"

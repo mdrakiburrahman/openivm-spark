@@ -144,8 +144,9 @@ object StreamingTableManager {
     StreamingTableMetadata.validateProvider(spec)
     StreamingTableMetadata.validateUserProperties(spec.tableProperties)
     spec.location.foreach(location => StreamingTableMetadata.validateRequestedLocation(spark, location, spec.name))
-    val runtime = StreamingRuntimeOptions.parse(spec.options)
-    val frame   = StreamingDatasetAccess.ofRows(spark, spec.query)
+    val runtime       = StreamingRuntimeOptions.parse(spec.options)
+    val expandedQuery = StreamingViewResolver.expand(spark, spec.query)
+    val frame         = StreamingDatasetAccess.ofRows(spark, expandedQuery)
     validateStreamingQuery(spark, frame, spec, runtime)
 
     val identity = StreamingTableMetadata.canonicalIdentity(spark, spec.name)
@@ -154,7 +155,8 @@ object StreamingTableManager {
       spec,
       frame.queryExecution.analyzed,
       identity,
-      runtime
+      runtime,
+      sourceDeclaration = if (expandedQuery eq spec.query) None else Some(frame.queryExecution.analyzed)
     )
     if (definition.sourceIdentities.exists(source => source == identity || source.startsWith(identity + "|")))
       StreamingTableErrors.invalid(
