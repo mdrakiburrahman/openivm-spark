@@ -13,7 +13,7 @@ private[parser] trait ParserInterfaceCompat extends ParserInterface {
     delegate.parseRoutineParam(sqlText)
 }
 
-private[parser] object SparkParserCompat {
+private[spark] object SparkParserCompat {
 
   def parseException(sqlText: String, message: String): ParseException =
     new ParseException(

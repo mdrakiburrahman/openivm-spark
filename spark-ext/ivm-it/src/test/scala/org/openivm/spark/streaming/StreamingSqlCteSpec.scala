@@ -34,6 +34,45 @@ class StreamingSqlCteSpec extends AnyFunSpec with StreamingSqlTestSupport {
       )
     }
 
+    it("expands streaming views inside two CTE branches and nested WITH definitions") {
+      val left      = "strsql_cte_view_left"
+      val right     = "strsql_cte_view_right"
+      val leftView  = "strsql_cte_view_left_view"
+      val rightView = "strsql_cte_view_right_view"
+      val target    = "strsql_cte_view_union_target"
+      createDeltaSource(left, "id INT, value STRING")
+      createDeltaSource(right, "id INT, value STRING")
+      insertRows(left, "(1, 'left')")
+      insertRows(right, "(2, 'right')")
+      spark.sql(s"CREATE VIEW $leftView AS SELECT CAST(id AS BIGINT) AS id, value FROM $left WHERE id > 0").collect()
+      spark
+        .sql(
+          s"CREATE VIEW $rightView AS SELECT CAST(id AS BIGINT) AS id, upper(value) AS value FROM $right WHERE id > 0"
+        )
+        .collect()
+      val declaration =
+        s"""CREATE STREAMING TABLE $target AS
+           |WITH left_events AS (
+           | WITH nested AS (SELECT * FROM STREAM($leftView) WITH ('maxFilesPerTrigger' = '1'))
+           | SELECT id, value FROM nested WHERE id >= 1
+           |), right_events AS (
+           | SELECT * FROM STREAM($rightView) WITH ('maxFilesPerTrigger' = '2') WHERE id >= 2
+           |)
+           |SELECT * FROM left_events UNION ALL SELECT * FROM right_events""".stripMargin
+      val original = createStreamingSql(declaration)
+      process(original)
+      assertBagEqual(target, s"SELECT * FROM $leftView UNION ALL SELECT * FROM $rightView")
+      spark.sql(s"ALTER STREAMING TABLE $target STOP").collect()
+      val resumed = createStreamingSql(declaration)
+      resumed.queryId shouldBe original.queryId
+      resumed.checkpointLocation shouldBe original.checkpointLocation
+      resumed.definitionHash shouldBe original.definitionHash
+      insertRows(left, "(3, 'later-left')")
+      insertRows(right, "(4, 'later-right')")
+      process(resumed)
+      assertBagEqual(target, s"SELECT * FROM $leftView UNION ALL SELECT * FROM $rightView")
+    }
+
     it("does not rebuild when new source commits arrive under the same SQL definition") {
       val source = "strsql_cte_commits_source"
       val target = "strsql_cte_commits_target"

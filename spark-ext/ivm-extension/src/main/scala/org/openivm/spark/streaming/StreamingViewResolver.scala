@@ -3,7 +3,7 @@ package org.openivm.spark.streaming
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.expressions.{Alias, SubqueryExpression}
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, View}
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, UnresolvedWith, View}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.delta.files.{TahoeFileIndex, TahoeLogFileIndex}
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
@@ -20,10 +20,28 @@ private[streaming] object StreamingViewResolver {
     * @param plan parsed query, including relation-local reader options
     */
   def expand(spark: SparkSession, plan: LogicalPlan): LogicalPlan =
-    plan.transformDown {
-      case relation: UnresolvedRelation if relation.isStreaming =>
-        resolveBoundary(spark, relation)
+    expandPlan(spark, plan)
+
+  private def expandPlan(spark: SparkSession, plan: LogicalPlan): LogicalPlan = {
+    val children = plan.mapChildren(child => expandPlan(spark, child))
+    val withCtes = children match {
+      case unresolved: UnresolvedWith =>
+        val rebound = org.openivm.spark.parser.SparkParserCompat.rebindCtes(
+          unresolved,
+          child => expandPlan(spark, child)
+        )
+        rebound.copyTagsFrom(unresolved)
+        rebound
+      case other => other
     }
+    val withSubqueries = withCtes.transformExpressionsUp { case expression: SubqueryExpression =>
+      expression.withNewPlan(expandPlan(spark, expression.plan))
+    }
+    withSubqueries match {
+      case relation: UnresolvedRelation if relation.isStreaming => resolveBoundary(spark, relation)
+      case other                                                => other
+    }
+  }
 
   private def resolveBoundary(spark: SparkSession, relation: UnresolvedRelation): LogicalPlan = {
     val batch =
