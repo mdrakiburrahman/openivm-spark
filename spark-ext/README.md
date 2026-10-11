@@ -19,6 +19,13 @@ Old and incomplete generations are intentionally retained; this change does not
 introduce automatic remote retention or shared-file garbage collection. Every
 generation copies the complete state tree, including immutable SST files. Copies\nuse at most 16 daemon workers JVM-wide, with bounded batches; all non-CURRENT\nfiles finish before CURRENT files, and every task finishes before validation\nand commit. Copy errors fail the pass without publishing the generation.\nA fair namespace pass lock prevents an asynchronous follow-up from overtaking\na synchronous request that is already waiting.
 
+## Native namespace session isolation
+
+CREATE/REFRESH session clones retain inherited current-catalog/database state
+without revalidating unchanged namespaces through public catalog setters. This
+preserves Fabric internal database names while still propagating non-default
+V2 catalogs and multipart namespaces when their cloned state differs.
+
 ## Targeted streaming status polling
 
 `SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.
