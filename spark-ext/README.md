@@ -19,6 +19,14 @@ Old and incomplete generations are intentionally retained; this change does not
 introduce automatic remote retention or shared-file garbage collection. Every
 generation copies the complete state tree, including immutable SST files. Copies\nuse at most 16 daemon workers JVM-wide, with bounded batches; all non-CURRENT\nfiles finish before CURRENT files, and every task finishes before validation\nand commit. Copy errors fail the pass without publishing the generation.\nA fair namespace pass lock prevents an asynchronous follow-up from overtaking\na synchronous request that is already waiting.
 
+## Native streaming status lookup diagnostics
+
+Targeted SHOW analyzes the exact target without suppressing native catalog/storage
+exceptions. A known-owned target whose lookup fails remains a failure row:
+`last_failure` includes the bounded, redacted exception/cause chain. Ownership is
+not assumed from registry state; no path fallback, retry or successful-completion
+substitution is performed.
+
 ## Managed initial CTAS namespaces
 
 When `spark.openivm.managedTablesRoot` is set, initial CREATE data writes use the

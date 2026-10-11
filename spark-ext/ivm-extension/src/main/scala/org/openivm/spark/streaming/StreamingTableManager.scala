@@ -632,11 +632,23 @@ object StreamingTableManager {
       .sortBy(_._1)
       .map { case (_, names) => names.head }
     resolveShowCandidates(candidates, pattern) { name =>
-      val identity = StreamingTableMetadata.canonicalIdentity(spark, name)
-      val known    = knownByIdentity.get(identity)
+      val identity                             = StreamingTableMetadata.canonicalIdentity(spark, name)
+      val known                                = knownByIdentity.get(identity)
+      var resolutionFailure: Option[Throwable] = None
       val target =
-        try Some(StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true))
+        try
+          Some(
+            StreamingTableMetadata.resolveDeltaTarget(
+              spark,
+              name,
+              requireTableIdMarker = true,
+              preserveResolutionFailure = true
+            )
+          )
         catch {
+          case NonFatal(error) if known.nonEmpty =>
+            resolutionFailure = Some(error)
+            None
           case _: org.apache.spark.sql.AnalysisException => None
         }
       target
@@ -655,7 +667,8 @@ object StreamingTableManager {
             metadataErrorStatus(
               spark,
               target,
-              "The known owned target can no longer be resolved; it may have been moved, replaced, or deleted"
+              "The known owned target could not be resolved; ownership could not be verified. " +
+                resolutionFailure.map(resolutionFailureDetails).getOrElse("No readable Delta relation was returned")
             )
           }
         }
@@ -669,6 +682,17 @@ object StreamingTableManager {
     names
       .filter(name => pattern.forall(value => StringUtils.filterPattern(Seq(name.last), value).nonEmpty))
       .flatMap(name => resolve(name).toSeq)
+
+  private[streaming] def resolutionFailureDetails(error: Throwable): String =
+    Iterator
+      .iterate(error)(_.getCause)
+      .takeWhile(_ != null)
+      .take(8)
+      .map { cause =>
+        val message = StreamingTableDefinition.redactText(Option(cause.getMessage).getOrElse("")).take(120)
+        s"${cause.getClass.getName.take(80)}: $message"
+      }
+      .mkString(" caused by ")
 
   private def metadataErrorStatus(
       spark: SparkSession,

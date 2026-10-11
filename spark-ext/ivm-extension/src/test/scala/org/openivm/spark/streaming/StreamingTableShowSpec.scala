@@ -24,6 +24,90 @@ class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
       listings shouldBe 4
     }
 
+    it("preserves native lookup cause chains without reporting successful completion") {
+      val session = spark.newSession()
+      session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
+      val name = Seq("direct_status", "schema", "known_native_target")
+      val target = StreamingTableTarget(
+        name,
+        StreamingTableMetadata.canonicalIdentity(session, name),
+        StreamingTableMetadata.quoteMultipart(name),
+        "/warehouse/known_native_target",
+        "delta-id",
+        "table-id"
+      )
+      val entry = StreamingTableRegistry.entry(session, StreamingTableRegistry.targetKey(target), target)
+      entry.definitionHash = "known-definition"
+      entry.queryId = "known-query"
+      entry.runId = "known-run"
+      try {
+        val analysis = new org.apache.spark.sql.AnalysisException(
+          "_LEGACY_ERROR_TEMP_2273",
+          Map("message" -> "native catalog lookup timed out"),
+          Some(new java.io.IOException("OneLake listPaths timeout"))
+        )
+        Seq[Throwable](
+          analysis,
+          new IllegalStateException("native load failed", new java.io.IOException("storage timeout"))
+        ).foreach { failure =>
+          DirectStatusCatalog.failure = Some(failure)
+          DirectStatusCatalog.loads.set(0)
+          DirectStatusCatalog.listings.set(0)
+          val status = StreamingTableManager.show(session, Some(name.dropRight(1)), Some(name.last)).head
+          status.status shouldBe "metadata_error"
+          status.isActive shouldBe false
+          status.queryId shouldBe Some("known-query")
+          status.runId shouldBe Some("known-run")
+          status.definitionHash shouldBe Some("known-definition")
+          status.lastFailure.get should include(failure.getMessage)
+          status.lastFailure.get should include("java.io.IOException")
+          status.lastFailure.get should not include "may have been moved"
+          DirectStatusCatalog.loads.get() shouldBe 1
+          DirectStatusCatalog.listings.get() shouldBe 0
+        }
+      } finally {
+        DirectStatusCatalog.failure = None
+        StreamingTableRegistry.forget(session, StreamingTableRegistry.targetKey(target))
+      }
+    }
+
+    it("bounds and redacts native resolution diagnostics") {
+      val error =
+        new IllegalStateException("storage failure " + ("x" * 4000), new java.io.IOException("root storage failure"))
+      val name = Seq("diagnostic_bound_target")
+      val target = StreamingTableTarget(
+        name,
+        StreamingTableMetadata.canonicalIdentity(spark, name),
+        StreamingTableMetadata.quoteMultipart(name),
+        "/warehouse/diagnostic_bound_target",
+        "delta-id",
+        "table-id"
+      )
+      StreamingTableManager.resolutionFailureDetails(error) should include("java.lang.IllegalStateException")
+      val session = spark.newSession()
+      session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
+      val nativeName = Seq("direct_status", "schema", "bounded_native_target")
+      val native = target.copy(
+        name = nativeName,
+        identity = StreamingTableMetadata.canonicalIdentity(session, nativeName),
+        sqlIdentifier = StreamingTableMetadata.quoteMultipart(nativeName)
+      )
+      StreamingTableRegistry.entry(session, StreamingTableRegistry.targetKey(native), native)
+      try {
+        DirectStatusCatalog.failure = Some(error)
+        val status = StreamingTableManager.show(session, Some(nativeName.dropRight(1)), Some(nativeName.last)).head
+        status.status shouldBe "metadata_error"
+        status.lastFailure.get.length should be <= 2048
+        status.lastFailure.get should include("root storage failure")
+        StreamingTableManager.resolutionFailureDetails(
+          new IllegalStateException("token=private-marker")
+        ) should not include "private-marker"
+      } finally {
+        DirectStatusCatalog.failure = None
+        StreamingTableRegistry.forget(session, StreamingTableRegistry.targetKey(native))
+      }
+    }
+
     it("loads an exact V2 target without calling listTables") {
       val session = spark.newSession()
       session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
@@ -147,8 +231,9 @@ class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
 }
 
 object DirectStatusCatalog {
-  val listings = new java.util.concurrent.atomic.AtomicInteger()
-  val loads    = new java.util.concurrent.atomic.AtomicInteger()
+  @volatile var failure: Option[Throwable] = None
+  val listings                             = new java.util.concurrent.atomic.AtomicInteger()
+  val loads                                = new java.util.concurrent.atomic.AtomicInteger()
 }
 
 /** Native-style catalog proving exact status does not enumerate a namespace. */
@@ -164,6 +249,7 @@ class DirectStatusCatalog extends org.apache.spark.sql.connector.catalog.TableCa
   }
   override def loadTable(identifier: Identifier): Table = {
     DirectStatusCatalog.loads.incrementAndGet()
+    DirectStatusCatalog.failure.foreach(throw _)
     throw new org.apache.spark.sql.catalyst.analysis.NoSuchTableException(identifier)
   }
   override def createTable(
