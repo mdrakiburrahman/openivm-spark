@@ -865,6 +865,140 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
+    it("admits a waiting synchronous barrier before an asynchronous follow-up pass") {
+      val spark = newSpark(
+        "state-sync-fair-admission",
+        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+      )
+      val session = newStateSyncSession(spark, "fair-admission")
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val passes  = new AtomicInteger(0)
+      val order   = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((current, _) => current.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        val background = Thread.currentThread().getName == "openivm-state-sync"
+        order.add(if (background) "async" else "sync")
+        if (passes.incrementAndGet() == 1) {
+          entered.countDown()
+          release.await(10, TimeUnit.SECONDS) shouldBe true
+        }
+      }
+      try {
+        OpenIvmStateSync.backupAsync(session)
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        val synchronous = Future(OpenIvmStateSync.backupNow(session))
+        waitUntil(5.seconds) { OpenIvmStateSync.queuedPassCountForTesting(session) == 1 }
+        (1 to 64).foreach(_ => OpenIvmStateSync.backupAsync(session))
+        release.countDown()
+        Await.result(synchronous, RegistryRaceTimeout)
+        waitForStateSyncIdle(session)
+        order.iterator().asScala.toSeq shouldBe Seq("async", "sync", "async")
+      } finally {
+        release.countDown()
+        waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
+      }
+    }
+
+    it("bounds parallel snapshot copies at sixteen and publishes CURRENT last") {
+      val stateRoot  = newDir("state-sync-parallel-local")
+      val remoteRoot = newDir("state-sync-parallel-remote")
+      val spark = newSpark(
+        "state-sync-parallel",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val directory = new File(stateRoot, "_openivm/mvs/parallel/rocksdb")
+      directory.mkdirs()
+      (1 to 48).foreach(index => java.nio.file.Files.write(new File(directory, s"$index.sst").toPath, Array[Byte](1)))
+      java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      val entered   = new CountDownLatch(16)
+      val release   = new CountDownLatch(1)
+      val active    = new AtomicInteger(0)
+      val maxActive = new AtomicInteger(0)
+      val finished  = new AtomicInteger(0)
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
+        if (file.getName == "CURRENT") finished.get() shouldBe 48
+        else {
+          val current = active.incrementAndGet()
+          maxActive.updateAndGet(existing => math.max(existing, current))
+          entered.countDown()
+          try {
+            release.await(10, TimeUnit.SECONDS) shouldBe true
+            fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+            finished.incrementAndGet()
+          } finally active.decrementAndGet()
+        }
+        if (file.getName == "CURRENT")
+          fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+      }
+      try {
+        val backup = Future(OpenIvmStateSync.backupNow(spark))
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        maxActive.get() shouldBe 16
+        backup.isCompleted shouldBe false
+        release.countDown()
+        Await.result(backup, RegistryRaceTimeout)
+        finished.get() shouldBe 48
+        maxActive.get() shouldBe 16
+        val root     = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+        val fs       = root.getFileSystem(spark.sessionState.newHadoopConf())
+        val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+        fs.listStatus(new org.apache.hadoop.fs.Path(snapshot, "mvs/parallel/rocksdb")).length shouldBe 49
+      } finally release.countDown()
+    }
+
+    it("waits for parallel copies before reporting failure and never commits a failed batch") {
+      val stateRoot  = newDir("state-sync-parallel-failure-local")
+      val remoteRoot = newDir("state-sync-parallel-failure-remote")
+      val spark = newSpark(
+        "state-sync-parallel-failure",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val directory = new File(stateRoot, "_openivm/mvs/parallel/rocksdb")
+      directory.mkdirs()
+      (1 to 16).foreach(index => java.nio.file.Files.write(new File(directory, s"$index.sst").toPath, Array[Byte](1)))
+      java.nio.file.Files.write(new File(directory, "CURRENT").toPath, "MANIFEST-1\n".getBytes("UTF-8"))
+      val entered       = new CountDownLatch(16)
+      val release       = new CountDownLatch(1)
+      val failed        = new CountDownLatch(1)
+      val currentCopied = new AtomicBoolean(false)
+      val finished      = new AtomicInteger(0)
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (_, file, _) =>
+        if (file.getName == "CURRENT") currentCopied.set(true)
+        else {
+          entered.countDown()
+          if (file.getName == "1.sst") {
+            failed.countDown()
+            throw new java.io.IOException("parallel upload failed")
+          }
+          release.await(10, TimeUnit.SECONDS) shouldBe true
+          finished.incrementAndGet()
+        }
+      }
+      try {
+        val backup = Future(scala.util.Try(OpenIvmStateSync.backupNow(spark)))
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        failed.await(5, TimeUnit.SECONDS) shouldBe true
+        backup.isCompleted shouldBe false
+        release.countDown()
+        Await.result(backup, RegistryRaceTimeout).failed.get.getMessage shouldBe "parallel upload failed"
+        finished.get() shouldBe 15
+        currentCopied.get() shouldBe false
+        val root = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+        val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+        OpenIvmStateSync.latestCommittedSnapshot(fs, root) shouldBe None
+        OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
+        OpenIvmStateSync.backupNow(spark)
+        OpenIvmStateSync.latestCommittedSnapshot(fs, root) should not be empty
+      } finally release.countDown()
+    }
+
     it("reads legacy flat snapshots without rewriting or repairing them") {
       val stateRoot  = newDir("state-sync-legacy-local")
       val remoteRoot = newDir("state-sync-legacy-remote")

@@ -17,7 +17,7 @@ readable but are not overwritten; existing legacy corruption is not repaired.
 Restore failures fail closed instead of being treated as empty state.
 Old and incomplete generations are intentionally retained; this change does not
 introduce automatic remote retention or shared-file garbage collection. Every
-generation copies the complete state tree, including immutable SST files.
+generation copies the complete state tree, including immutable SST files. Copies\nuse at most 16 daemon workers JVM-wide, with bounded batches; all non-CURRENT\nfiles finish before CURRENT files, and every task finishes before validation\nand commit. Copy errors fail the pass without publishing the generation.\nA fair namespace pass lock prevents an asynchronous follow-up from overtaking\na synchronous request that is already waiting.
 
 ## Targeted streaming status polling
 

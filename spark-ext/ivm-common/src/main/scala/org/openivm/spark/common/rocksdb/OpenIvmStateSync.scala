@@ -12,6 +12,9 @@ import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Callable
+import java.util.concurrent.locks.ReentrantLock
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 /**
@@ -37,6 +40,7 @@ object OpenIvmStateSync {
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
   private final class BackupState {
+    val passLock                    = new ReentrantLock(true)
     val requested                   = new AtomicBoolean(false)
     val running                     = new AtomicBoolean(false)
     private val spans               = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
@@ -116,6 +120,14 @@ object OpenIvmStateSync {
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
+  private val copyExecutor = Executors.newFixedThreadPool(
+    16,
+    (r: Runnable) => {
+      val thread = new Thread(r, "openivm-state-sync-copy")
+      thread.setDaemon(true)
+      thread
+    }
+  )
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -249,11 +261,13 @@ object OpenIvmStateSync {
   }
 
   private def runBackupPass(key: String, spark: SparkSession, uri: String): Unit = {
-    backupStateFor(key).synchronized {
+    val lock = backupStateFor(key).passLock
+    lock.lockInterruptibly()
+    try {
       val hook = backupPassHookForTesting
       if (hook == null) backupNowInternal(spark, uri)
       else hook(key, spark, uri)
-    }
+    } finally lock.unlock()
   }
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {
@@ -327,32 +341,43 @@ object OpenIvmStateSync {
       val files             = backupFiles(local)
       val initialSignature  = backupSignature(localBase, files)
 
-      files.foreach { f =>
-        if (!localFileVanished) {
-          val hook = beforeLocalFileCopyHookForTesting
-          if (hook != null) hook(f)
-          if (!f.isFile) localFileVanished = true
-          else {
-            val rel    = localBase.relativize(f.toPath).toString
-            val remote = new Path(remoteRoot, rel)
-            try {
-              val copyHook = copyLocalFileHookForTesting
-              if (copyHook != null) copyHook(fs, f, remote)
-              else
-                fs.copyFromLocalFile(
-                  /* delSrc = */ false,
-                  /* overwrite = */ true,
-                  new Path(f.getAbsolutePath),
-                  remote
-                )
-              uploaded += 1
-            } catch {
-              case NonFatal(_) if !f.isFile =>
-                localFileVanished = true
+      def copyFiles(selected: Seq[File]): Unit =
+        selected.grouped(16).foreach { group =>
+          val tasks = group.map { file =>
+            new Callable[Boolean] {
+              override def call(): Boolean = {
+                val hook = beforeLocalFileCopyHookForTesting
+                if (hook != null) hook(file)
+                if (!file.isFile) false
+                else {
+                  val remote = new Path(remoteRoot, localBase.relativize(file.toPath).toString)
+                  try {
+                    val copyHook = copyLocalFileHookForTesting
+                    if (copyHook != null) copyHook(fs, file, remote)
+                    else fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath), remote)
+                    true
+                  } catch {
+                    case NonFatal(_) if !file.isFile => false
+                  }
+                }
+              }
             }
           }
+          val completed          = copyExecutor.invokeAll(tasks.asJava)
+          var failure: Throwable = null
+          completed.asScala.foreach { result =>
+            try {
+              if (result.get()) uploaded += 1
+              else localFileVanished = true
+            } catch {
+              case error: java.util.concurrent.ExecutionException =>
+                if (failure == null) failure = error.getCause
+            }
+          }
+          if (failure != null) throw failure
         }
-      }
+      copyFiles(files.filterNot(_.getName == "CURRENT"))
+      copyFiles(files.filter(_.getName == "CURRENT"))
 
       val finalSignature = backupSignature(localBase, backupFiles(local))
       if (localFileVanished || initialSignature != finalSignature) Thread.sleep(50L)
@@ -462,6 +487,12 @@ object OpenIvmStateSync {
       snapshot
     }
   }
+
+  private[rocksdb] def queuedPassCountForTesting(spark: SparkSession): Int =
+    stateSyncUri(spark)
+      .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
+      .map(_.passLock.getQueueLength)
+      .getOrElse(0)
 
   private[rocksdb] def synchronousRequestCountForTesting(spark: SparkSession): Long =
     stateSyncUri(spark)
