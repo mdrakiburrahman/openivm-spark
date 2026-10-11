@@ -620,11 +620,12 @@ object StreamingTableManager {
       namespace: Option[Seq[String]],
       pattern: Option[String] = None
   ): Seq[StreamingTableStatus] = {
-    val catalogNames = candidateCatalogNames(spark, namespace)
+    val catalogNames = candidateCatalogNames(spark, namespace, pattern)
     val knownTargets = StreamingTableRegistry
       .registeredTargets(spark)
       .filter(target => namespace.forall(matchesNamespace(spark, target.name, _)))
-    val registryNames = knownTargets.map(_.name)
+    val knownByIdentity = knownTargets.map(target => target.identity -> target).toMap
+    val registryNames   = knownTargets.map(_.name)
     val candidates = (catalogNames ++ registryNames)
       .groupBy(name => StreamingTableMetadata.canonicalIdentity(spark, name))
       .toSeq
@@ -632,7 +633,7 @@ object StreamingTableManager {
       .map { case (_, names) => names.head }
     resolveShowCandidates(candidates, pattern) { name =>
       val identity = StreamingTableMetadata.canonicalIdentity(spark, name)
-      val known    = knownTargets.find(_.identity == identity)
+      val known    = knownByIdentity.get(identity)
       val target =
         try Some(StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true))
         catch {
@@ -2072,24 +2073,30 @@ object StreamingTableManager {
     )
   }
 
-  private def candidateCatalogNames(spark: SparkSession, namespace: Option[Seq[String]]): Seq[Seq[String]] =
+  private def candidateCatalogNames(
+      spark: SparkSession,
+      namespace: Option[Seq[String]],
+      pattern: Option[String]
+  ): Seq[Seq[String]] = {
+    val filter = pattern.map(value => " LIKE '" + value.replace("'", "\\'") + "'").getOrElse("")
     namespace match {
       case Some(parts) =>
         val qualified = StreamingTableMetadata.quoteMultipart(parts)
         spark
-          .sql(s"SHOW TABLES IN $qualified")
+          .sql(s"SHOW TABLES IN $qualified$filter")
           .collect()
           .toSeq
           .filterNot(_.getAs[Boolean]("isTemporary"))
           .map(row => parts :+ row.getAs[String]("tableName"))
       case None =>
         spark
-          .sql("SHOW TABLES")
+          .sql(s"SHOW TABLES$filter")
           .collect()
           .toSeq
           .filterNot(_.getAs[Boolean]("isTemporary"))
           .map(row => Seq(row.getAs[String]("tableName")))
     }
+  }
 
   private def matchesNamespace(spark: SparkSession, name: Seq[String], namespace: Seq[String]): Boolean = {
     name.size > namespace.size &&
