@@ -19,7 +19,8 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
-      FeatureGate.QueryLogEnabledKey                 -> "true"
+      FeatureGate.QueryLogEnabledKey                 -> "true",
+      FeatureGate.ProfileRefreshKey                  -> "true"
     )
 
   private def mvRefreshType(name: String): Int = {
@@ -40,6 +41,14 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       "MIN(dm_low) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_low, " +
       "MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high " +
       "FROM wri_daily_market"
+
+  private def stateKeyDetails(view: String): Seq[String] =
+    sql("SHOW OPENIVM REFRESH PROFILE")
+      .where(s"view_name IN ('$view', 'default.$view') AND step_name = 'window_running_state_keys'")
+      .select("detail")
+      .collect()
+      .map(_.getString(0))
+      .toSeq
 
   describe("WINDOW_PARTITION running-aggregate suffix extension") {
     it("extends the running MIN/MAX from persisted state on a strictly-later insert-only batch") {
@@ -99,7 +108,7 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       executedRefreshSql.exists(s => s.startsWith("MERGE INTO") && s.contains("wri_bd_mv")) shouldBe true
     }
 
-    it("stays correct across two consecutive suffix-append batches") {
+    it("reuses versioned state across suffix batches and rejects it after a backdated recompute") {
       sql("CREATE TABLE wri_seq_daily_market(dm_date DATE, dm_s_symb STRING, dm_low INT, dm_high INT) USING DELTA")
       sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-01','AAA',10,20)")
       val seqSql =
@@ -112,11 +121,61 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-02','AAA',6,25)")
       refreshMv("wri_seq_mv")
       assertMvCorrect("wri_seq_mv", seqSql)
+      stateKeyDetails("wri_seq_mv").last shouldBe "hits=0;requested=1"
 
       sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-03','AAA',12,18)")
       refreshMv("wri_seq_mv")
       assertMvCorrect("wri_seq_mv", seqSql)
       mvRefreshType("wri_seq_mv") shouldBe RefreshTypeCode.WindowPartition
+      stateKeyDetails("wri_seq_mv").last shouldBe "hits=1;requested=1"
+
+      // Partial hit: an already cached partition and one unseen key. The new
+      // partition must still be seeded by the authoritative historical scan.
+      sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-04','AAA',5,26),(DATE '2024-03-01','BBB',7,19)")
+      refreshMv("wri_seq_mv")
+      assertMvCorrect("wri_seq_mv", seqSql)
+      stateKeyDetails("wri_seq_mv").last shouldBe "hits=1;requested=2"
+      sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-05','AAA',4,27),(DATE '2024-03-02','BBB',6,20)")
+      refreshMv("wri_seq_mv")
+      assertMvCorrect("wri_seq_mv", seqSql)
+      stateKeyDetails("wri_seq_mv").last shouldBe "hits=2;requested=2"
+
+      // A non-suffix refresh advances Delta without advancing this cache. The
+      // next suffix must miss rather than reusing the pre-recompute tail.
+      sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-02-01','AAA',1,40)")
+      refreshMv("wri_seq_mv")
+      assertMvCorrect("wri_seq_mv", seqSql)
+      sql("INSERT INTO wri_seq_daily_market VALUES (DATE '2024-03-06','AAA',9,21)")
+      refreshMv("wri_seq_mv")
+      assertMvCorrect("wri_seq_mv", seqSql)
+      stateKeyDetails("wri_seq_mv").last shouldBe "hits=0;requested=1"
+    }
+
+    it("preserves nullable keys, exact decimal seeds and microsecond timestamp bounds in cached state") {
+      sql("CREATE TABLE wri_typed_source(k STRING, p INT, t TIMESTAMP, v DECIMAL(30,12)) USING DELTA")
+      sql(
+        "INSERT INTO wri_typed_source VALUES (NULL,1,TIMESTAMP '2024-01-01 00:00:00.123456',123456789012.123456789012)"
+      )
+      val query = "SELECT k,p,t,v,MIN(v) OVER (PARTITION BY k ORDER BY t) AS lo," +
+        "MAX(v) OVER (PARTITION BY k ORDER BY t) AS hi FROM wri_typed_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_typed_mv AS $query")
+      sql(
+        "INSERT INTO wri_typed_source VALUES (NULL,1,TIMESTAMP '2024-01-01 00:00:00.123457',123456789011.123456789011)"
+      )
+      refreshMv("wri_typed_mv")
+      assertMvCorrect("wri_typed_mv", query)
+      sql(
+        "INSERT INTO wri_typed_source VALUES (NULL,1,TIMESTAMP '2024-01-01 00:00:00.123458',123456789010.123456789010)"
+      )
+      refreshMv("wri_typed_mv")
+      assertMvCorrect("wri_typed_mv", query)
+      stateKeyDetails("wri_typed_mv").last shouldBe "hits=1;requested=1"
+      // A sub-millisecond backdated row must not be mistaken for a suffix.
+      sql(
+        "INSERT INTO wri_typed_source VALUES (NULL,1,TIMESTAMP '2024-01-01 00:00:00.123455',123456789009.123456789009)"
+      )
+      refreshMv("wri_typed_mv")
+      assertMvCorrect("wri_typed_mv", query)
     }
 
     it("handles the real daily_market window-over-window shape (cumulative MIN/MAX -> flag CASE -> cumulative MAX)") {
@@ -153,6 +212,13 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       refreshMv("wri_wow_mv")
       assertMvCorrect("wri_wow_mv", wowSql)
       mvRefreshType("wri_wow_mv") shouldBe RefreshTypeCode.WindowPartition
+      sql(
+        "INSERT INTO wri_wow_market VALUES " +
+          "(DATE '2024-01-04','AAA',9,23,4,130),(DATE '2024-01-04','BBB',33,42,14,230)"
+      )
+      refreshMv("wri_wow_mv")
+      assertMvCorrect("wri_wow_mv", wowSql)
+      stateKeyDetails("wri_wow_mv").last shouldBe "hits=2;requested=2"
     }
 
     it("keeps a downstream MV correct via the window fast path's cascade view-delta") {

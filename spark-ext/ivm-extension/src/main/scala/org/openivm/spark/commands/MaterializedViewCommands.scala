@@ -4915,6 +4915,8 @@ case class RefreshMaterializedViewCommand(
         return Seq.empty
       }
 
+      var runningWindowStateUpdate = Option.empty[RunningWindowStateCache.Update]
+
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
         // The authoritative pinned-identity gate has already run at the boundary
         // immediately after the final source-consuming MV data mutation (before
@@ -4925,7 +4927,10 @@ case class RefreshMaterializedViewCommand(
         // in-process advance rollback can no longer prove a clean revert.
         preparedSourceAdvance.foreach(_.markFinalizeStarted())
         consumeFrozenSourceDeltas()
-        val dataVersion     = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        val dataVersion = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        runningWindowStateUpdate.foreach { update =>
+          profile.timeStep("window_running_state_commit", s"version=$dataVersion") { update.commit(dataVersion) }
+        }
         val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
         val consumedBatches = preparedSourceAdvance.map(_.consumedBatches).getOrElse(changeBatches)
         postRefreshCleanup(
@@ -6323,6 +6328,7 @@ case class RefreshMaterializedViewCommand(
               // The native suffix program splits fallback and append partitions.
               // Whole-partition Spark shortcuts must not skip its fallback delta
               // or apply the suffix a second time.
+              var runningState = Option.empty[RunningWindowStateCache.State]
               def executeRunningWindowSql(sql: String, idx: Int): Unit = {
                 if (
                   SparkRefreshRewriter.isMergeStatement(sql) ||
@@ -6330,6 +6336,22 @@ case class RefreshMaterializedViewCommand(
                 ) {
                   withPlanTimeBroadcastDisabled { executeSqlAt(sql, idx) }
                 } else executeSqlAt(sql, idx)
+                if (sql.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW openivm_run_state_${name.table} AS")) {
+                  runningState = profile.timeStep("window_running_state_load", "backend=rocksdb") {
+                    RunningWindowStateCache.load(spark, meta, sql)
+                  }
+                  runningState.foreach { state =>
+                    profile.appendStep(
+                      "window_running_state_keys",
+                      s"hits=${state.hits};requested=${state.requested}",
+                      0L
+                    )
+                  }
+                } else if (sql == s"CACHE TABLE `openivm_run_result_${name.table}`") {
+                  runningWindowStateUpdate = runningState.map { state =>
+                    profile.timeStep("window_running_state_prepare", "source=cached_suffix") { state.prepareUpdate() }
+                  }
+                }
               }
               val boundsName = s"openivm_run_bounds_${name.table}"
               val boundsIdx  = rewritten.statements.indexOf(s"CACHE TABLE `$boundsName`")
@@ -6352,6 +6374,7 @@ case class RefreshMaterializedViewCommand(
               }
               val hasSuffix   = branches.getInt(0) != 0
               val hasFallback = branches.getInt(1) != 0
+              if (hasFallback) runningState = None
               indexed.drop(boundsIdx + 1).foreach { case (stmt, idx) =>
                 val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
                 if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {

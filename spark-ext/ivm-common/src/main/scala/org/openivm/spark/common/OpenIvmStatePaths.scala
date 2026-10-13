@@ -11,8 +11,8 @@ import scala.jdk.CollectionConverters._
   * uses the same bounded, legacy-compatible codec across readers and writers.
   */
 private[common] object OpenIvmStatePaths {
-  val PerMvColumnFamilies: Seq[String]            = Seq("meta", "properties", "consumed", "cdf_watermarks")
-  val BaseTableColumnFamilies: Seq[String]        = Seq("staging")
+  val PerMvColumnFamilies: Seq[String]     = Seq("meta", "properties", "consumed", "cdf_watermarks", "window_state")
+  val BaseTableColumnFamilies: Seq[String] = Seq("staging")
   val SourceDependencyColumnFamilies: Seq[String] = Seq("dependent_mvs")
 
   private def canonicalLocalPath(path: String): String =
