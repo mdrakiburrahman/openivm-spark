@@ -2,14 +2,20 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.rocksdb.RocksDB
 
 /** Versioned adaptation of the rocksdb-perf-tuning WindowStateCatalog prototype.
   * Delta remains authoritative: the stamp and partition rows are one durable
   * RocksDB batch, and readers only accept an exact table/program/version match.
   */
 object WindowStateCatalog {
-  private val Cf       = "window_state"
-  private val StampKey = RocksDBCodec.utf8("stamp")
+  // The default family already exists in every MV shard. Its owned namespace
+  // avoids creating/syncing an unused family at CREATE, and remains outside
+  // metadata-only snapshots. Old window_state-family caches simply miss here.
+  private val Cf       = RocksDBCodec.fromUtf8(RocksDB.DEFAULT_COLUMN_FAMILY)
+  private val StampKey = RocksDBCodec.utf8("window_state:stamp")
+  private val RowStart = RocksDBCodec.utf8("window_state:row:")
+  private val RowEnd   = RocksDBCodec.utf8("window_state:row;")
 
   private def openDb(spark: SparkSession, view: String): OpenIvmRocksDB =
     OpenIvmRocksDBRegistry.getOrOpen(
@@ -18,7 +24,7 @@ object WindowStateCatalog {
       OpenIvmStatePaths.PerMvColumnFamilies
     )
 
-  private def key(partitionKey: String): Array[Byte]         = RocksDBCodec.utf8(s"row:$partitionKey")
+  private def key(partitionKey: String): Array[Byte]         = RocksDBCodec.utf8(s"window_state:row:$partitionKey")
   private def stamp(identity: String, version: Long): String = s"$version\n$identity"
 
   def getMany(
@@ -57,7 +63,7 @@ object WindowStateCatalog {
     val db = openDb(spark, view)
     db.withBatch { batch =>
       if (!db.get(Cf, StampKey).map(RocksDBCodec.fromUtf8).contains(stamp(identity, previousVersion)))
-        OpenIvmRocksDBBatchOps.deleteRange(db, batch, Cf, RocksDBCodec.utf8("row:"), RocksDBCodec.utf8("row;"))
+        OpenIvmRocksDBBatchOps.deleteRange(db, batch, Cf, RowStart, RowEnd)
       affectedKeys.foreach { partitionKey =>
         entries.get(partitionKey) match {
           case Some(payload) => OpenIvmRocksDBBatchOps.put(db, batch, Cf, key(partitionKey), RocksDBCodec.utf8(payload))
