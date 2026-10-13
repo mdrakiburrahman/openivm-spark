@@ -108,7 +108,7 @@ private[commands] object RunningWindowStateCache {
       def field(alias: String, name: String): Column = col(s"$alias.${quoted(name)}")
       val joined =
         suffix.join(old, keys.map(k => field("suffix", k).eqNullSafe(field("old", k))).reduce(_ && _), "left")
-      val updated = joined.select(schema.fields.map { f =>
+      val updated = joined.select(schema.fields.toIndexedSeq.map { f =>
         val value = f.name match {
           case Count | Nulls => field("suffix", f.name) + coalesce(field("old", f.name), lit(0L))
           case Max           => greatest(field("suffix", f.name), field("old", f.name))
