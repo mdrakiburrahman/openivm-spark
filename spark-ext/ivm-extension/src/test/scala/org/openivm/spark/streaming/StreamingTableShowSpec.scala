@@ -1,9 +1,11 @@
 package org.openivm.spark.streaming
 
 import org.openivm.spark.commands.ShowStreamingTablesCommand
+import org.scalatest.concurrent.Eventually
 import org.scalatest.funspec.AnyFunSpec
+import org.scalatest.time.{Millis, Seconds, Span}
 
-class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
+class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture with Eventually {
   describe("filtered streaming status") {
     it("avoids catalog enumeration for exact names before direct metadata resolution") {
       var listings = 0
@@ -144,6 +146,64 @@ class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture {
       val missing = spark.sql("SHOW STREAMING TABLES LIKE 'show_active_target'").collect().head
       missing.getAs[String]("status") shouldBe "metadata_error"
       missing.getAs[String]("last_failure") should not be null
+    }
+
+    it("reconciles a completed native run when its termination callback is unavailable") {
+      createSource("show_listener_gap_source")
+      appendRows("show_listener_gap_source", "(1, 'one', 'p')")
+      val status = createStreaming(
+        "show_listener_gap_target",
+        readStream("show_listener_gap_source"),
+        "SELECT id, value, part FROM STREAM show_listener_gap_source",
+        options = Map("trigger" -> "availableNow")
+      )
+      val query = spark.streams.get(status.queryId.get)
+      query.awaitTermination(30000L) shouldBe true
+      val target =
+        StreamingTableMetadata.resolveDeltaTarget(spark, Seq("show_listener_gap_target"), requireTableIdMarker = true)
+      val key = StreamingTableRegistry.targetKey(target)
+      eventually(timeout(Span(30, Seconds)), interval(Span(10, Millis))) {
+        StreamingTableRegistry.entry(spark, key, target).snapshot.terminationUnconfirmed shouldBe false
+      }
+      StreamingTableRegistry.forget(spark, key)
+      StreamingTableRegistry.register(spark, key, target, status.definitionHash.get, query)
+
+      val row = spark.sql("SHOW STREAMING TABLES LIKE 'show_listener_gap_target'").collect().head
+      row.getAs[String]("status") shouldBe "stopped"
+      row.getAs[Boolean]("is_active") shouldBe false
+      row.getAs[String]("query_id") shouldBe status.queryId.get
+      row.getAs[String]("run_id") shouldBe status.runId.get
+      row.getAs[String]("last_progress") should not be null
+      row.getAs[String]("last_failure") shouldBe null
+      StreamingTableRegistry.entry(spark, key, target).snapshot.terminationUnconfirmed shouldBe false
+    }
+
+    it("does not reconcile an explicit stop before its own termination confirmation") {
+      createSource("show_pending_stop_source")
+      val status = createStreaming(
+        "show_pending_stop_target",
+        readStream("show_pending_stop_source"),
+        "SELECT id, value, part FROM STREAM show_pending_stop_source",
+        options = Map("trigger" -> "availableNow")
+      )
+      val query = spark.streams.get(status.queryId.get)
+      query.awaitTermination(30000L) shouldBe true
+      val target =
+        StreamingTableMetadata.resolveDeltaTarget(spark, Seq("show_pending_stop_target"), requireTableIdMarker = true)
+      val key = StreamingTableRegistry.targetKey(target)
+      eventually(timeout(Span(30, Seconds)), interval(Span(10, Millis))) {
+        StreamingTableRegistry.entry(spark, key, target).snapshot.terminationUnconfirmed shouldBe false
+      }
+      StreamingTableRegistry.forget(spark, key)
+      StreamingTableRegistry.register(spark, key, target, status.definitionHash.get, query)
+      val entry = StreamingTableRegistry.entry(spark, key, target)
+      entry.beginStop(status.runId.get)
+      try {
+        val row = spark.sql("SHOW STREAMING TABLES LIKE 'show_pending_stop_target'").collect().head
+        row.getAs[String]("status") shouldBe "stopping"
+        row.getAs[Boolean]("is_active") shouldBe false
+        entry.snapshot.terminationUnconfirmed shouldBe true
+      } finally entry.finish(status.runId.get, None)
     }
 
     it("parses quoted namespaces and optional Spark SHOW patterns") {

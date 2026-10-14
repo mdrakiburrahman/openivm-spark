@@ -10,7 +10,7 @@ import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.util.StringUtils
 import org.apache.spark.sql.openivm.StreamingDatasetAccess
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
-import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryListener}
+import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryException, StreamingQueryListener}
 import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
 import org.openivm.spark.commands.{MaterializedViewLifecycle, RefreshMutex}
 import org.openivm.spark.common.{
@@ -1847,9 +1847,15 @@ object StreamingTableManager {
       manifest: StreamingTableManifest,
       forcedStatus: Option[String]
   ): StreamingTableStatus = {
-    val key      = StreamingTableRegistry.targetKey(target)
-    val query    = StreamingTableRegistry.findActive(spark, key, target)
-    val entry    = StreamingTableRegistry.entry(spark, key, target)
+    val key   = StreamingTableRegistry.targetKey(target)
+    val query = StreamingTableRegistry.findActive(spark, key, target)
+    val entry = StreamingTableRegistry.entry(spark, key, target)
+    query.filterNot(_.isActive).foreach { current =>
+      entry.reconcileNaturalTermination(
+        current,
+        math.max(1L, StreamingLifecycleSettings.fromSpark(spark).stopTimeout.toMillis)
+      )
+    }
     val snapshot = entry.snapshot
     val nativeProgress = query.flatMap { current =>
       Option(current.lastProgress).map(value =>
@@ -2199,6 +2205,37 @@ private[streaming] object StreamingTableRegistry {
 
     def currentQuery: Option[StreamingQuery] = synchronized {
       if (terminated) None else Option(query)
+    }
+
+    /** Confirm natural completion without depending on termination-listener delivery.
+      *
+      * @param current Native query for the registered run.
+      * @param timeoutMs Existing lifecycle budget for native termination confirmation.
+      */
+    def reconcileNaturalTermination(current: StreamingQuery, timeoutMs: Long): Unit = {
+      val run = current.runId.toString
+      val pending = synchronized {
+        runId == run && !terminated && !stopRequested && stopFailure.isEmpty
+      }
+      if (pending && !current.isActive) {
+        try {
+          if (current.awaitTermination(timeoutMs)) {
+            val progress = Option(current.lastProgress).map(value => StreamingTableDefinition.redactText(value.json))
+            synchronized {
+              if (runId == run && !terminated && !stopRequested && stopFailure.isEmpty) {
+                progress.foreach(value => lastProgress = value)
+                finish(run, Option(lastFailure))
+              }
+            }
+          }
+        } catch {
+          case error: StreamingQueryException =>
+            synchronized {
+              if (runId == run && !terminated)
+                lastFailure = StreamingTableDefinition.redactText(error.getMessage)
+            }
+        }
+      }
     }
 
     def beginStop(run: String): Unit = synchronized {
