@@ -3413,6 +3413,11 @@ case class CreateMaterializedViewCommand(
     if (createPinnedIdentities.nonEmpty)
       verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
     try {
+      // Open empty metadata shards before CTAS fills the disk write backlog.
+      // Publication remains after the data and catalog identity checks.
+      profile.timeStep("create_prepare_metadata", s"sources=${meta.sourceTables.size}") {
+        MvCatalog.prepareCreate(spark, name, meta.sourceTables)
+      }
       CommandLocalState.withDmlBypass {
         try {
           try {
@@ -7231,12 +7236,36 @@ case class RefreshMaterializedViewCommand(
           case org.apache.spark.sql.types.ByteType | org.apache.spark.sql.types.ShortType |
               org.apache.spark.sql.types.IntegerType | org.apache.spark.sql.types.LongType =>
             true
+          case stringType: org.apache.spark.sql.types.StringType =>
+            // Leave non-binary collations on the unpruned path.
+            stringType == org.apache.spark.sql.types.StringType
           case _ => false
         }
       }
       .take(4)
-    val net    = quoteCol(s"openivm_sp_net_${name.table}")
-    val select = if (fields.isEmpty) "1" else fields.map(f => quoteCol(f.name)).mkString(", ")
+    val net = quoteCol(s"openivm_sp_net_${name.table}")
+    // Bound driver memory before collecting string keys, including a single
+    // oversized value. Masked rows force the unpruned fallback, never a partial set.
+    val stringFields = fields.filter(_.dataType.isInstanceOf[org.apache.spark.sql.types.StringType])
+    val cellBytes =
+      WindowReplaceMaxPredicateBytes / (2 * (WindowReplaceMaxLiteralKeys + 1) * math.max(1, fields.length))
+    val withinBudget = stringFields
+      .map(f => s"COALESCE(LENGTH(CAST(${quoteCol(f.name)} AS BINARY)), 0) <= $cellBytes")
+      .mkString(" AND ") match {
+      case "" => "true"
+      case p  => p
+    }
+    val values =
+      if (fields.isEmpty) Seq("1")
+      else
+        fields.toSeq.map { f =>
+          val value =
+            if (f.dataType.isInstanceOf[org.apache.spark.sql.types.StringType])
+              s"CAST(${quoteCol(f.name)} AS BINARY)"
+            else quoteCol(f.name)
+          s"CASE WHEN $withinBudget THEN $value END"
+        }
+    val select = (values :+ s"NOT ($withinBudget)").mkString(", ")
     val limit  = if (fields.isEmpty) 1 else WindowReplaceMaxLiteralKeys + 1
     val rows = spark
       .sql(
@@ -7247,9 +7276,20 @@ case class RefreshMaterializedViewCommand(
     // predicate makes a positive-only net batch avoid every target scan.
     if (rows.isEmpty) return Some("false")
     if (fields.isEmpty || rows.length > WindowReplaceMaxLiteralKeys) return None
+    if (rows.exists(_.getBoolean(fields.length))) return None
     val predicates = fields.zipWithIndex.map { case (field, i) =>
       val target = s"v.${quoteCol(field.name)}"
-      val values = rows.filterNot(_.isNullAt(i)).map(r => literalSql(r.get(i)).get).distinct
+      val values = rows
+        .filterNot(_.isNullAt(i))
+        .map { r =>
+          r.get(i) match {
+            // Keep valid UTF-8 bytes exact under either string-literal parser
+            // setting; unsafe encodings abandon the entire static predicate.
+            case bytes: Array[Byte] => SparkRefreshRewriter.stringTargetKeyLiteral(bytes).getOrElse(return None)
+            case value              => literalSql(value).get
+          }
+        }
+        .distinct
       val arms = (if (values.nonEmpty) Seq(s"$target IN (${values.mkString(", ")})") else Seq.empty) ++
         (if (rows.exists(_.isNullAt(i))) Seq(s"$target IS NULL") else Seq.empty)
       arms.mkString("(", " OR ", ")")
@@ -7430,6 +7470,7 @@ case class RefreshMaterializedViewCommand(
   )
 
   private val WindowReplaceMaxLiteralKeys    = 1000
+  private val CdfWindowReplaceMaxLiteralKeys = 10000
   private val RegularNtermMaxLiteralKeys     = 10000
   private val WindowReplaceMaxPredicateBytes = 1024 * 1024
 
@@ -7545,9 +7586,20 @@ case class RefreshMaterializedViewCommand(
       viewDeltaPath: String
   ): Option[WindowSinglePassPlan] = {
     val affectedRef = quoteCol(affectedViewName)
+    val keyRows     = spark.sql(s"SELECT $affectedCol FROM $affectedRef")
+    val integralKey = keyRows.schema.fields.exists { field =>
+      field.dataType match {
+        case org.apache.spark.sql.types.ByteType | org.apache.spark.sql.types.ShortType |
+            org.apache.spark.sql.types.IntegerType | org.apache.spark.sql.types.LongType =>
+          true
+        case _ => false
+      }
+    }
     val keys = collectWindowReplaceKeySet(
-      spark.sql(s"SELECT $affectedCol FROM $affectedRef"),
-      targetCol
+      keyRows,
+      targetCol,
+      if (integralKey && FeatureGate.changeFeedMode(spark) == ChangeFeedMode.Cdf) CdfWindowReplaceMaxLiteralKeys
+      else WindowReplaceMaxLiteralKeys
     ).getOrElse(return None)
     buildWindowSinglePassPlanFromKeySets(spark, meta, targetId, Seq(keys), viewDeltaPath)
   }

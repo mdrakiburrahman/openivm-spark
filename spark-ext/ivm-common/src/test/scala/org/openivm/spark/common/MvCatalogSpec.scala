@@ -88,6 +88,19 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       properties = Map("owner" -> "alice", "tier" -> "gold")
     )
 
+  it("prepares metadata shards without publishing a view or dependency") {
+    val meta = sampleMeta("prepared", Seq("prepared_orders"))
+    MvCatalog.prepareCreate(spark, meta.name, meta.sourceTables)
+    MvCatalog.lookup(spark, meta.name) shouldBe None
+    MvCatalog.list(spark) shouldBe empty
+    MvCatalog.viewsForSource(spark, "prepared_orders") shouldBe empty
+
+    MvCatalog.upsert(spark, meta)
+    MvCatalog.prepareCreate(spark, meta.name, meta.sourceTables)
+    MvCatalog.lookup(spark, meta.name) shouldBe Some(meta)
+    MvCatalog.viewsForSource(spark, "prepared_orders").map(_.name) should contain(meta.name)
+  }
+
   // ---------------------------------------------------------------------------
   // Test 1: ensureTables is idempotent
   // ---------------------------------------------------------------------------

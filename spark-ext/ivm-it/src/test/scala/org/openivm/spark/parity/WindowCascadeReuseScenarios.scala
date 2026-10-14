@@ -133,6 +133,19 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   }
 
   describe("joined WINDOW_PARTITION cascade reuse") {
+    itCdf("retains atomic MERGE above the expanded bounded-key limit") {
+      sql("CREATE TABLE wcl_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      sql("INSERT INTO wcl_events SELECT id, 1, id FROM range(10001)")
+      val query =
+        "SELECT id, seq, payload, LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload FROM wcl_events"
+      sql(s"CREATE MATERIALIZED VIEW wcl_mv AS $query")
+      sql("UPDATE wcl_events SET payload = payload + 1")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wcl_mv")
+      assertMvCorrect("wcl_mv", query)
+      assertAtomicCdfTargetWrite("wcl_mv")
+    }
+
     it("refreshes existing and new partitions and preserves the downstream feed") {
       sql(
         "CREATE TABLE wcr_trade(" +
@@ -204,7 +217,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       else assertCascadeFirstTargetWrite("wcr_mv")
     }
 
-    it("replaces more than 1,000 partitions with atomic CDF or persisted intercept cascade") {
+    it("replaces more than 1,000 partitions with bounded CDF or persisted intercept cascade") {
       sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql(
         "INSERT INTO wcm_events " +
@@ -251,7 +264,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertMvCorrect("wcm_mv", viewSql)
       assertMvCorrect("wcm_downstream", downstreamSql)
       if (changeFeedMode == ChangeFeedMode.Cdf) {
-        assertAtomicCdfTargetWrite("wcm_mv")
+        assertDirectCdfTargetWrite("wcm_mv")
         mvDataVersion("wcm_mv") shouldBe preRefreshVersion + 1L
       } else assertCascadeMergeTargetWrite("wcm_mv")
 
@@ -315,7 +328,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       refreshMv("wca_mv")
       refreshMv("wca_downstream")
       mvDataVersion("wca_mv") shouldBe beforeVersion + 1L
-      assertAtomicCdfTargetWrite("wca_mv")
+      assertDirectCdfTargetWrite("wca_mv")
       assertMvCorrect("wca_mv", viewSql)
       assertMvCorrect("wca_downstream", downstreamSql)
     }

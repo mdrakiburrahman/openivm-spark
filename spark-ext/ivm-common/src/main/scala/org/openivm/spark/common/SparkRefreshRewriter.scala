@@ -63,6 +63,14 @@ final class PinnedSourcePathMissingException(message: String) extends IllegalSta
   * back from that path and updates the user-visible MV.
   */
 object SparkRefreshRewriter {
+  private[spark] def stringTargetKeyLiteral(bytes: Array[Byte]): Option[String] = {
+    try {
+      java.nio.charset.StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes))
+      Some(s"CAST(${org.apache.spark.sql.catalyst.expressions.Literal(bytes).sql} AS STRING)")
+    } catch {
+      case _: java.nio.charset.CharacterCodingException => None
+    }
+  }
 
   final case class SelectiveBroadcastTable(shortName: String, qualifiedName: String, sizeBytes: Long)
   final case class SkewFanoutDeltaBroadcast(

@@ -13,6 +13,18 @@ import org.scalatest.matchers.should.Matchers
   * and assert each rewrite invariant in isolation.
   */
 class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
+  it("encodes target string keys as exact binary literals and refuses invalid UTF-8") {
+    for (key <- Seq("", "quote'key", "back\\slash\\n", "München☃")) {
+      val bytes   = key.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      val literal = SparkRefreshRewriter.stringTargetKeyLiteral(bytes).get
+      val value = CatalystSqlParser
+        .parseExpression(literal)
+        .eval()
+        .asInstanceOf[org.apache.spark.unsafe.types.UTF8String]
+      value.getBytes.toSeq shouldBe bytes.toSeq
+    }
+    SparkRefreshRewriter.stringTargetKeyLiteral(Array(0x80.toByte, 0xff.toByte)) shouldBe None
+  }
 
   private val viewLogicalName = "mv_r"
   private val mvName          = TableIdentifier("mv_r", Some("mydb"))
