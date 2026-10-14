@@ -90,15 +90,28 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
 
   it("prepares metadata shards without publishing a view or dependency") {
     val meta = sampleMeta("prepared", Seq("prepared_orders"))
-    MvCatalog.prepareCreate(spark, meta.name, meta.sourceTables)
+    MvCatalog.prepareCreate(spark, meta.name)
     MvCatalog.lookup(spark, meta.name) shouldBe None
     MvCatalog.list(spark) shouldBe empty
     MvCatalog.viewsForSource(spark, "prepared_orders") shouldBe empty
 
     MvCatalog.upsert(spark, meta)
-    MvCatalog.prepareCreate(spark, meta.name, meta.sourceTables)
+    MvCatalog.prepareCreate(spark, meta.name)
     MvCatalog.lookup(spark, meta.name) shouldBe Some(meta)
     MvCatalog.viewsForSource(spark, "prepared_orders").map(_.name) should contain(meta.name)
+  }
+
+  it("keeps legacy reverse-dependency discovery available during preparation") {
+    val source = "prepared_legacy_orders"
+    val legacy = sampleMeta("prepared_legacy", Seq(source))
+    MvCatalog.upsert(spark, legacy)
+    val path = OpenIvmStatePaths.sourceDependencyDbPath(spark, source)
+    OpenIvmRocksDBRegistry.closeAndDelete(path)(p => deleteDir(new File(p)))
+    val pending = sampleMeta("prepared_pending", Seq(source))
+    MvCatalog.prepareCreate(spark, pending.name)
+    Files.exists(Paths.get(path).resolve("CURRENT")) shouldBe false
+    MvCatalog.viewsForSource(spark, source).map(_.name) shouldBe Seq(legacy.name)
+    MvCatalog.lookup(spark, pending.name) shouldBe None
   }
 
   // ---------------------------------------------------------------------------

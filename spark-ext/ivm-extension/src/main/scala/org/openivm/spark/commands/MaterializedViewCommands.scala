@@ -3413,10 +3413,10 @@ case class CreateMaterializedViewCommand(
     if (createPinnedIdentities.nonEmpty)
       verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
     try {
-      // Open empty metadata shards before CTAS fills the disk write backlog.
+      // Open the empty MV shard before CTAS fills the disk write backlog.
       // Publication remains after the data and catalog identity checks.
       profile.timeStep("create_prepare_metadata", s"sources=${meta.sourceTables.size}") {
-        MvCatalog.prepareCreate(spark, name, meta.sourceTables)
+        MvCatalog.prepareCreate(spark, name)
       }
       CommandLocalState.withDmlBypass {
         try {

@@ -645,9 +645,9 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     ()
   }
 
-  override def prepareCreate(spark: SparkSession, name: TableIdentifier, sources: Seq[String]): Unit = {
+  override def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = {
     openPerMvDb(spark, serializeName(name))
-    sources.distinct.sorted.foreach(source => openSourceDependencyDb(spark, source))
+    ()
   }
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit = {
@@ -834,8 +834,8 @@ object MvCatalog {
 
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
-  def prepareCreate(spark: SparkSession, name: TableIdentifier, sources: Seq[String]): Unit =
-    backend(spark).prepareCreate(spark, name, sources)
+  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
+    backend(spark).prepareCreate(spark, name)
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit = backend(spark).upsert(spark, meta)
 
