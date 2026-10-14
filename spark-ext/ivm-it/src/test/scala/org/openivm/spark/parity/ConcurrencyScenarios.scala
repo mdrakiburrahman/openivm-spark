@@ -1,6 +1,7 @@
 package org.openivm.spark.parity
 
 import org.openivm.spark.commands.{CommandConcurrencyInjection, RefreshFailureInjection}
+import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.parity.base.IvmParitySpecBase
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 
@@ -478,6 +479,9 @@ abstract class ConcurrencyScenarios extends IvmParitySpecBase("concurrency") {
   // ============================================================================
   describe("(7) Failed refresh can retry without replaying a successful batch") {
     it("compensates the failed WINDOW_PARTITION write and the retry converges exactly once") {
+      // Exercise compensation between the legacy DELETE and INSERT. Atomic
+      // replacement has no intermediate target write; the gate reads SparkConf.
+      restartSpark(extraSparkConf + (FeatureGate.WindowSinglePassReplaceEnabledKey -> "false"))
       sql("CREATE TABLE IF NOT EXISTS retry_c7(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql("INSERT INTO retry_c7 SELECT id, 1 AS seq, id AS payload FROM range(1001)")
 
