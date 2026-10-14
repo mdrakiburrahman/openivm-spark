@@ -1083,6 +1083,50 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements.exists(_.contains("openivm_delete_rows")) shouldBe false
       rewritten.statements.exists(_.contains("rowid")) shouldBe false
     }
+
+    it("fuses the bag program while retaining the pinned count and target pruning") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = currentSimpleProjectionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(42L)
+      )
+      val fused = SparkRefreshRewriter
+        .fuseSimpleProjectionApply(
+          rewritten.statements(2),
+          rewritten.statements(3),
+          mvName,
+          Seq("name", "age"),
+          Some("v.`age` IN (30, 31)")
+        )
+        .getOrElse(fail("generated bag program was not recognized"))
+      fused should include(s"VERSION AS OF 42")
+      fused should include("ON (v.`age` IN (30, 31)) AND n2.__openivm_net < 0")
+      fused should include("WHEN NOT MATCHED AND NOT d.__openivm_apply_delete")
+    }
+
+    it("rejects an unmarked or changed apply program instead of guessing its semantics") {
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = simpleProjectionInput,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(42L)
+      )
+      val delete = rewritten.statements(2)
+      val insert = rewritten.statements(3)
+      def fuse(d: String, i: String) =
+        SparkRefreshRewriter.fuseSimpleProjectionApply(d, i, mvName, Seq("name", "age"), None)
+      fuse(SparkRefreshRewriter.stripExecutionMarker(delete), insert) shouldBe None
+      fuse(delete.replace("WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE SET age = 0"), insert) shouldBe None
+      fuse(delete, insert.replace("ON n2.__openivm_net < 0 AND ", "ON true AND ")) shouldBe None
+      fuse(delete, "INSERT INTO `other` SELECT name, age FROM users") shouldBe None
+    }
   }
 
   describe("outer-join projection partial recompute rewrites") {

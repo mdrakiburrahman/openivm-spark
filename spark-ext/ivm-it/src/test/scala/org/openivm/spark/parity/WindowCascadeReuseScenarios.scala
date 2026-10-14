@@ -113,6 +113,18 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
     text should not include "WHEN MATCHED THEN DELETE"
   }
 
+  private def assertAtomicCdfTargetWrite(viewName: String): Unit = {
+    val rows   = rewrittenRows(viewName)
+    val merges = rows.filter(_.getString(ColSqlText).startsWith("MERGE INTO"))
+    merges should have size 1
+    val text = rows.map(_.getString(ColSqlText)).mkString("\n")
+    text should include("__openivm_replace_delete")
+    text should include("WHEN MATCHED THEN DELETE")
+    text should include("WHEN NOT MATCHED AND NOT d.__openivm_replace_delete")
+    text should include(s"openivm_new_$viewName")
+    text should not include "/_ivm/view_deltas/"
+  }
+
   private def assertBagEqual(leftSql: String, rightSql: String): Unit = {
     sql(s"SELECT * FROM ($leftSql) openivm_left EXCEPT ALL SELECT * FROM ($rightSql) openivm_right")
       .count() shouldBe 0L
@@ -192,7 +204,7 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       else assertCascadeFirstTargetWrite("wcr_mv")
     }
 
-    it("uses the persisted cascade when more than 1,000 partitions change") {
+    it("replaces more than 1,000 partitions with atomic CDF or persisted intercept cascade") {
       sql("CREATE TABLE wcm_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql(
         "INSERT INTO wcm_events " +
@@ -220,20 +232,28 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
           "UNION ALL SELECT CAST(NULL AS BIGINT), 2, -2"
       )
       sql("DELETE FROM wcm_events WHERE seq = 1 AND id % 11 = 0")
+      // An affected partition with no new rows must be deleted, too.
+      sql("DELETE FROM wcm_events WHERE id = 500")
       RefreshSqlLogCatalog.removeAll(spark)
-      RefreshFailureInjection.failNextWindowCascadeInsert(spark)
-      intercept[RuntimeException] {
-        refreshMv("wcm_mv")
+      if (changeFeedMode != ChangeFeedMode.Cdf) {
+        RefreshFailureInjection.failNextWindowCascadeInsert(spark)
+        intercept[RuntimeException] {
+          refreshMv("wcm_mv")
+        }
+        assertBagEqual("SELECT * FROM wcm_mv", "SELECT * FROM wcm_before_failure")
       }
-      assertBagEqual("SELECT * FROM wcm_mv", "SELECT * FROM wcm_before_failure")
 
+      val preRefreshVersion = mvDataVersion("wcm_mv")
       RefreshSqlLogCatalog.removeAll(spark)
       refreshMv("wcm_mv")
       refreshMv("wcm_downstream")
 
       assertMvCorrect("wcm_mv", viewSql)
       assertMvCorrect("wcm_downstream", downstreamSql)
-      assertCascadeMergeTargetWrite("wcm_mv")
+      if (changeFeedMode == ChangeFeedMode.Cdf) {
+        assertAtomicCdfTargetWrite("wcm_mv")
+        mvDataVersion("wcm_mv") shouldBe preRefreshVersion + 1L
+      } else assertCascadeMergeTargetWrite("wcm_mv")
 
       val upstreamVersion   = mvDataVersion("wcm_mv")
       val downstreamVersion = mvDataVersion("wcm_downstream")
@@ -256,11 +276,12 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
 
       val noOpRows = rewrittenRows("wcm_mv")
       withClue(noOpRows.map(_.getString(ColSqlText)).mkString("\n---\n")) {
-        noOpRows.exists { row =>
-          val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
-          upper.startsWith("SELECT 1") &&
-          upper.contains("HAVING SUM(CAST(`OPENIVM_MULTIPLICITY` AS BIGINT)) <> 0")
-        } shouldBe true
+        if (changeFeedMode != ChangeFeedMode.Cdf)
+          noOpRows.exists { row =>
+            val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
+            upper.startsWith("SELECT 1") &&
+            upper.contains("HAVING SUM(CAST(`OPENIVM_MULTIPLICITY` AS BIGINT)) <> 0")
+          } shouldBe true
         noOpRows.exists { row =>
           val upper = row.getString(ColSqlText).toUpperCase(java.util.Locale.ROOT)
           upper.startsWith("MERGE INTO") && upper.contains("WHEN MATCHED THEN DELETE")
@@ -270,6 +291,33 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       refreshMv("wcm_downstream")
       assertMvCorrect("wcm_downstream", downstreamSql)
       mvDataVersion("wcm_downstream") shouldBe downstreamVersion
+    }
+
+    itCdf("keeps duplicate rows and the old target intact when atomic replacement fails a constraint") {
+      sql("CREATE TABLE wca_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      sql("INSERT INTO wca_events SELECT id, 1, id + 1 FROM range(1001)")
+      sql("INSERT INTO wca_events SELECT id, seq, payload FROM wca_events")
+      val viewSql =
+        "SELECT id, seq, payload, MIN(payload) OVER (PARTITION BY id) AS lo FROM wca_events"
+      sql(s"CREATE MATERIALIZED VIEW wca_mv AS $viewSql")
+      val downstreamSql = "SELECT id, COUNT(*) AS copies FROM wca_mv GROUP BY id"
+      sql(s"CREATE MATERIALIZED VIEW wca_downstream AS $downstreamSql")
+      val path = mvDataLocation("wca_mv").replace("`", "``")
+      sql(s"ALTER TABLE delta.`$path` ADD CONSTRAINT wca_positive CHECK (payload > 0)")
+      sql("CREATE TABLE wca_before USING DELTA AS SELECT * FROM wca_mv")
+      val beforeVersion = mvDataVersion("wca_mv")
+      sql("UPDATE wca_events SET payload = -1")
+      intercept[Exception] { refreshMv("wca_mv") }
+      mvDataVersion("wca_mv") shouldBe beforeVersion
+      assertBagEqual("SELECT * FROM wca_mv", "SELECT * FROM wca_before")
+      sql("UPDATE wca_events SET payload = id + 2")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wca_mv")
+      refreshMv("wca_downstream")
+      mvDataVersion("wca_mv") shouldBe beforeVersion + 1L
+      assertAtomicCdfTargetWrite("wca_mv")
+      assertMvCorrect("wca_mv", viewSql)
+      assertMvCorrect("wca_downstream", downstreamSql)
     }
   }
 }

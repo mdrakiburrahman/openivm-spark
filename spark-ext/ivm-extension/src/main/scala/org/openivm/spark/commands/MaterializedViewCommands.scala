@@ -6,10 +6,11 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   AttributeReference,
+  EqualNullSafe,
   Expression,
   NamedExpression,
   RowOrdering,
@@ -24,6 +25,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
   Join,
   LocalLimit,
   LogicalPlan,
+  MergeIntoTable,
   Offset,
   Sort,
   Tail,
@@ -6281,23 +6283,48 @@ case class RefreshMaterializedViewCommand(
                   executeSqlAt(insertOnlyInsertSql.get, 1)
                 }
               } else {
+                var atomicApplyInsertIdx = Option.empty[Int]
                 rewritten.statements.tail.zipWithIndex.foreach { case (stmt, idx) =>
                   val stmtIdx = 1 + idx
                   val sql     = SparkRefreshRewriter.stripExecutionMarker(stmt)
                   val skipDeleteMerge =
                     SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRowsHere
 
-                  if (skipDeleteMerge) {
+                  if (atomicApplyInsertIdx.contains(stmtIdx)) {
+                    logSkippedWindowStmt(stmtIdx, "simple_projection_atomic_insert_skipped")
+                  } else if (skipDeleteMerge) {
                     logInfo(
                       s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                         "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
                     )
                     logSkippedDeleteMerge(stmtIdx)
                   } else {
+                    val atomicSql =
+                      if (SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt)) {
+                        val columns = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
+                        rewritten.statements.lift(stmtIdx + 1).flatMap { insert =>
+                          SparkRefreshRewriter
+                            .fuseSimpleProjectionApply(stmt, insert, mergeTargetId, columns, None)
+                            .flatMap { _ =>
+                              val predicate =
+                                profile.timeStep("simple_projection_target_keys", "source=net_retractions") {
+                                  collectSimpleProjectionTargetPredicate(spark, mergeTargetId)
+                                }
+                              SparkRefreshRewriter.fuseSimpleProjectionApply(
+                                stmt,
+                                insert,
+                                mergeTargetId,
+                                columns,
+                                predicate
+                              )
+                            }
+                        }
+                      } else None
+                    val applySql = atomicSql.getOrElse(sql)
                     val sqlForExec = fusedView match {
                       case Some(view) =>
-                        SparkRefreshRewriter.substituteViewDeltaPath(sql, viewDeltaPath, s"global_temp`.`$view")
-                      case None => sql
+                        SparkRefreshRewriter.substituteViewDeltaPath(applySql, viewDeltaPath, s"global_temp`.`$view")
+                      case None => applySql
                     }
                     // Wrap EVERY openivm-emitted MERGE in the SIMPLE_PROJECTION
                     // tail (not just the recompute INSERT MERGE). The value-equality
@@ -6317,6 +6344,7 @@ case class RefreshMaterializedViewCommand(
                     } else {
                       executeSqlAt(sqlForExec, stmtIdx)
                     }
+                    if (atomicSql.nonEmpty) atomicApplyInsertIdx = Some(stmtIdx + 1)
                   }
                 }
               }
@@ -6516,7 +6544,11 @@ case class RefreshMaterializedViewCommand(
                         shape.affectedCol,
                         shape.partitionCol,
                         viewDeltaPath
-                      )
+                      ).orElse {
+                        if (!propagation.requiresDmlInterception)
+                          buildWindowCdfPartitionMerge(spark, mergeTargetId, shape, rewrittenSql(shape.deleteStmtIdx))
+                        else None
+                      }
                     }
                   else None
                 if (windowSinglePassPlan.isEmpty) {
@@ -7186,6 +7218,46 @@ case class RefreshMaterializedViewCommand(
       .nonEmpty
   }
 
+  private def collectSimpleProjectionTargetPredicate(
+      spark: SparkSession,
+      targetId: TableIdentifier
+  ): Option[String] = {
+    val fields = spark
+      .table(MvCommandHelper.sqlIdent(targetId))
+      .schema
+      .fields
+      .filter { field =>
+        field.dataType match {
+          case org.apache.spark.sql.types.ByteType | org.apache.spark.sql.types.ShortType |
+              org.apache.spark.sql.types.IntegerType | org.apache.spark.sql.types.LongType =>
+            true
+          case _ => false
+        }
+      }
+      .take(4)
+    val net    = quoteCol(s"openivm_sp_net_${name.table}")
+    val select = if (fields.isEmpty) "1" else fields.map(f => quoteCol(f.name)).mkString(", ")
+    val limit  = if (fields.isEmpty) 1 else WindowReplaceMaxLiteralKeys + 1
+    val rows = spark
+      .sql(
+        s"SELECT $select FROM $net WHERE __openivm_net < 0 LIMIT $limit"
+      )
+      .collect()
+    // Raw signed rows can cancel during consolidation. A false target
+    // predicate makes a positive-only net batch avoid every target scan.
+    if (rows.isEmpty) return Some("false")
+    if (fields.isEmpty || rows.length > WindowReplaceMaxLiteralKeys) return None
+    val predicates = fields.zipWithIndex.map { case (field, i) =>
+      val target = s"v.${quoteCol(field.name)}"
+      val values = rows.filterNot(_.isNullAt(i)).map(r => literalSql(r.get(i)).get).distinct
+      val arms = (if (values.nonEmpty) Seq(s"$target IN (${values.mkString(", ")})") else Seq.empty) ++
+        (if (rows.exists(_.isNullAt(i))) Seq(s"$target IS NULL") else Seq.empty)
+      arms.mkString("(", " OR ", ")")
+    }
+    val predicate = predicates.mkString(" AND ")
+    if (predicate.length > WindowReplaceMaxPredicateBytes) None else Some(predicate)
+  }
+
   private def cdfBatchesContainOnlyInserts(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
     try {
       batches
@@ -7621,6 +7693,66 @@ case class RefreshMaterializedViewCommand(
         restoreSql = restoreSql
       )
     )
+  }
+
+  /** A large affected-key set cannot use a bounded REPLACE WHERE predicate.
+    * Under CDF, one MERGE can replace those partitions atomically and supply
+    * the downstream feed without writing an old/new cascade table first.
+    */
+  private def buildWindowCdfPartitionMerge(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      shape: WindowCascadeMergeShape,
+      deleteSql: String
+  ): Option[WindowSinglePassWrite] = {
+    val targetRef  = MvCommandHelper.sqlIdent(targetId)
+    val schema     = spark.table(targetRef).schema
+    val keyName    = "__openivm_replace_key"
+    val deleteName = "__openivm_replace_delete"
+    val resolver   = spark.sessionState.analyzer.resolver
+    def isKey(expression: Expression, alias: String, key: String): Boolean = expression match {
+      case a: UnresolvedAttribute =>
+        a.nameParts.size == 2 && resolver(a.nameParts.head, alias) && resolver(a.nameParts.last, stripSqlIdent(key))
+      case _ => false
+    }
+    val singleKeyDelete = spark.sessionState.sqlParser
+      .parsePlan(deleteSql)
+      .collectFirst { case m: MergeIntoTable => m.mergeCondition }
+      .exists {
+        case EqualNullSafe(left, right) =>
+          (isKey(left, "v", shape.partitionCol) && isKey(right, "d", shape.affectedCol)) ||
+          (isKey(right, "v", shape.partitionCol) && isKey(left, "d", shape.affectedCol))
+        case _ => false
+      }
+    if (!singleKeyDelete) return None
+    if (schema.fieldNames.exists(c => resolver(c, keyName) || resolver(c, deleteName))) return None
+    val keyType = spark
+      .table(shape.affectedViewName)
+      .schema
+      .fields
+      .find(f => resolver(f.name, stripSqlIdent(shape.affectedCol)))
+      .map(_.dataType.sql)
+      .getOrElse(return None)
+    val columns      = schema.fieldNames.toSeq.map(quoteCol)
+    val emptyColumns = schema.fields.map(f => s"CAST(NULL AS ${f.dataType.sql}) AS ${quoteCol(f.name)}")
+    // Keep the affected key in a separate, source-typed column. Casting it
+    // into a target column could change the original NULL-safe comparison.
+    val sql =
+      s"""|MERGE INTO $targetRef AS v
+          |USING (
+          |  SELECT ${columns.mkString(", ")}, CAST(NULL AS $keyType) AS $keyName,
+          |         false AS $deleteName
+          |  FROM ${quoteCol(s"openivm_new_${name.table}")}
+          |  UNION ALL
+          |  SELECT DISTINCT ${emptyColumns.mkString(", ")}, ${shape.affectedCol} AS $keyName,
+          |         true AS $deleteName
+          |  FROM ${quoteCol(shape.affectedViewName)}
+          |) AS d
+          |ON d.$deleteName AND v.${shape.partitionCol} IS NOT DISTINCT FROM d.$keyName
+          |WHEN MATCHED THEN DELETE
+          |WHEN NOT MATCHED AND NOT d.$deleteName THEN
+          |  INSERT (${columns.mkString(", ")}) VALUES (${columns.map(c => s"d.$c").mkString(", ")})""".stripMargin
+    Some(WindowSinglePassWrite(sql, sql))
   }
 
   private def isWindowNewSnapshotInsertSql(sql: String, targetId: TableIdentifier): Boolean = {

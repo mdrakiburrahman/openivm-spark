@@ -159,6 +159,54 @@ object SparkRefreshRewriter {
   private[spark] def isSimpleProjectionDeleteMerge(sql: String): Boolean =
     sql.contains(SimpleProjectionDeleteMergeMarker)
 
+  /** Fuse our bag-correct DELETE/INSERT pair into one Delta commit. The insert
+    * source already restores partially retracted duplicates from the pinned
+    * pre-refresh snapshot; insert rows must never match the delete branch.
+    */
+  private[spark] def fuseSimpleProjectionApply(
+      deleteSql: String,
+      insertSql: String,
+      mvName: TableIdentifier,
+      columns: Seq[String],
+      targetPredicate: Option[String]
+  ): Option[String] = {
+    if (!isSimpleProjectionDeleteMerge(deleteSql) || columns.exists(_.equalsIgnoreCase("__openivm_apply_delete")))
+      return None
+    val target = backtickMvName(mvName)
+    val cols   = columns.map(c => s"`${c.replace("`", "``")}`")
+    val sql    = stripExecutionMarker(deleteSql)
+    val header = s"MERGE INTO $target AS v\nUSING ("
+    if (!sql.startsWith(header)) return None
+    val open  = header.length - 1
+    val close = findMatchingCloseParen(sql, open)
+    if (close < 0) return None
+    val expectedOn = cols.map(c => s"v.$c IS NOT DISTINCT FROM d.$c").mkString(" AND ")
+    if (sql.substring(close + 1).trim != s"AS d ON $expectedOn\nWHEN MATCHED THEN DELETE") return None
+    val insertPrefix = s"INSERT INTO $target\nSELECT ${cols.mkString(", ")}\n"
+    if (!insertSql.startsWith(insertPrefix)) return None
+    val query     = insertSql.substring(s"INSERT INTO $target\n".length)
+    val countJoin = "ON n2.__openivm_net < 0 AND "
+    if (!query.contains(countJoin)) return None
+    val prunedQuery =
+      targetPredicate.fold(query)(p => query.replace(countJoin, s"ON ($p) AND n2.__openivm_net < 0 AND "))
+    val matchPredicate = targetPredicate.fold(expectedOn)(p => s"$expectedOn AND ($p)")
+    val deleteSource   = sql.substring(open + 1, close)
+    Some(
+      s"""|MERGE INTO $target AS v
+          |USING (
+          |  SELECT ${cols.mkString(", ")}, true AS __openivm_apply_delete
+          |  FROM ($deleteSource) __openivm_delete_rows
+          |  UNION ALL
+          |  SELECT ${cols.mkString(", ")}, false AS __openivm_apply_delete
+          |  FROM ($prunedQuery) __openivm_insert_rows
+          |) AS d
+          |ON d.__openivm_apply_delete AND $matchPredicate
+          |WHEN MATCHED THEN DELETE
+          |WHEN NOT MATCHED AND NOT d.__openivm_apply_delete THEN
+          |  INSERT (${cols.mkString(", ")}) VALUES (${cols.map(c => s"d.$c").mkString(", ")})""".stripMargin
+    )
+  }
+
   private[spark] val RunningWindowFallbackMarker = "/*OPENIVM_RUNNING_WINDOW_FALLBACK*/"
   private[spark] val RunningWindowSuffixMarker   = "/*OPENIVM_RUNNING_WINDOW_SUFFIX*/"
 
