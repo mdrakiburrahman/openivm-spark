@@ -430,6 +430,56 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
 
     describe("CREATE data and catalog SQL shape") {
+      it("preserves the logical managed catalog namespace for initial CTAS") {
+        val ident = TableIdentifier("mv_native_shape", Some("dbo"), Some("insights_raw"))
+        val sql = MvCommandHelper.createDataWriteSql(
+          "abfss://workspace@onelake/lakehouse/Tables/dbo/mv_native_shape",
+          "CLUSTER BY (`id`) ",
+          "TBLPROPERTIES ('_ivm_create_watermarks_v1' = 'true') ",
+          "SELECT id, MAX(value) AS value FROM insights_raw.dbo.source GROUP BY id",
+          Some(ident)
+        )
+        sql should startWith("CREATE TABLE `insights_raw`.`dbo`.`mv_native_shape` USING DELTA ")
+        sql should include("LOCATION 'abfss://workspace@onelake/lakehouse/Tables/dbo/mv_native_shape'")
+        sql should not include "CREATE TABLE delta."
+        val encoded =
+          "chimcobldhq2akqh9gg58pbcclmmat3if4g2c829dpq6ar3cd5jmarj3ckg2q825ah620b908hinc81d41mm8sjic5k6qobe4lkmssr9ctk78sqve9gne9b4c9ng"
+        val native = MvCommandHelper.createDataWriteSql(
+          "/warehouse/native",
+          "",
+          "",
+          "SELECT 1 AS id",
+          Some(TableIdentifier("target", Some(encoded), Some("spark_catalog")))
+        )
+        native should startWith(s"CREATE TABLE `spark_catalog`.`$encoded`.`target`")
+        native should not include "CREATE TABLE delta."
+      }
+
+      it("commits grouped managed CTAS before idempotent named registration") {
+        val ident    = TableIdentifier("mv_managed_group_ctas", Some("default"), Some("spark_catalog"))
+        val location = s"$warehouseDir/managed-group-ctas"
+        val sql = MvCommandHelper.createDataWriteSql(
+          location,
+          "",
+          "TBLPROPERTIES ('_ivm_create_watermarks_v1' = 'true') ",
+          "SELECT id, MAX(value) AS value FROM VALUES (1, 2), (1, 3) AS source(id, value) GROUP BY id",
+          Some(ident)
+        )
+        spark.sql(sql).collect()
+        spark.table("default.mv_managed_group_ctas").collect().head.getInt(1) shouldBe 3
+        val id = MvCommandHelper.deltaIdentityAt(spark, location).flatMap(_._1).get
+        MvCommandHelper.validateCatalogRegistration(
+          spark,
+          ident,
+          location,
+          requireExists = true,
+          expectedTableId = Some(id)
+        ) shouldBe true
+        spark.sql(MvCommandHelper.createCatalogRegistrationSql(ident, location)).collect()
+        MvCommandHelper.recoverCreateWatermarkProperties(spark, location) shouldBe Some(Map.empty)
+        spark.sql("DROP TABLE default.mv_managed_group_ctas").collect()
+      }
+
       it("uses a path CTAS followed by a named Delta registration") {
         val dataSql = MvCommandHelper.createDataWriteSql(
           location = "/warehouse/mv_shape",

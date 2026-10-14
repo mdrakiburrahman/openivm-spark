@@ -441,10 +441,42 @@ object OpenIvmInsightsBroker {
 
   def annotateMvQueryHashDecision(
       spark: SparkSession,
-      annotation: MvQueryHashDecision
+      annotation: MvQueryHashDecision,
+      requestId: Option[String] = None
   ): Unit = {
     val normalized = validateMvQueryHashDecision(annotation)
-    val (app, capture) = currentCapture(spark).getOrElse {
+    val resolved = requestId match {
+      case None => currentCapture(spark)
+      case Some(id) =>
+        requireIdentity("request-id", id)
+        val bound = currentCapture(spark)
+        requireCondition(
+          bound.forall(_._2.requestId == id),
+          FailureCode.AnnotationContextMismatch,
+          "the explicit annotation request conflicts with the current active request"
+        )
+        Option(Applications.get(spark.sparkContext.applicationId)).flatMap { app =>
+          app.synchronized {
+            app.captures.get(id).map { capture =>
+              requireCondition(
+                capture.requestStatus.isEmpty,
+                FailureCode.ActiveCaptureRequired,
+                "the explicit annotation request has already ended"
+              )
+              requireCondition(
+                capture.modelContext.exists(context =>
+                  context.executionMode == ExecutionMode.MaterializedView &&
+                    context.targetRelation.equalsIgnoreCase(normalized.targetRelation)
+                ),
+                FailureCode.AnnotationContextMismatch,
+                "the explicit annotation must match an existing materialized-view request"
+              )
+              app -> capture
+            }
+          }
+        }
+    }
+    val (app, capture) = resolved.getOrElse {
       throw explicit(
         FailureCode.ActiveCaptureRequired,
         "an active OpenIVM insight request is required for query-hash annotations"

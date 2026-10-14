@@ -260,9 +260,12 @@ object StreamingTableDefinition {
       spec: StreamingTableSpec,
       analyzed: LogicalPlan,
       targetIdentity: String,
-      runtime: StreamingRuntimeOptions
+      runtime: StreamingRuntimeOptions,
+      sourceDeclaration: Option[LogicalPlan] = None
   ): StreamingTableDefinition = {
-    val sources  = collectSources(spark, spec.query, analyzed)
+    // Expanded views have multiple physical occurrences per declaration. Their options
+    // are already bound to each analyzed leaf, not zipped with the next STREAM marker.
+    val sources  = collectSources(spark, sourceDeclaration.getOrElse(spec.query), analyzed)
     val semantic = Mapper.createObjectNode()
     semantic.put("formatVersion", FormatVersion)
     semantic.put("targetIdentity", targetIdentity)
@@ -734,12 +737,13 @@ object StreamingTableDefinition {
       spark: SparkSession,
       relation: CompatibleV1StreamingRelation
   ): SourceSeed = {
-    val source  = relation.dataSource
-    val options = readOptions(source.options.toSeq, s"streaming source ${relation.sourceName}")
+    val source     = relation.dataSource
+    val options    = readOptions(source.options.toSeq, s"streaming source ${relation.sourceName}")
+    val sourcePath = source.paths.headOption.orElse(options.get("path"))
     val logicalIdentity = source.catalogTable
       .map(table => StreamingTableMetadata.canonicalIdentity(spark, table.identifier.nameParts))
       .orElse {
-        source.paths.headOption.map(path => s"stream-path:${StreamingTableMetadata.normalizePath(spark, path)}")
+        sourcePath.map(path => s"stream-path:${StreamingTableMetadata.normalizePath(spark, path)}")
       }
       .getOrElse(s"stream:${source.className}:${jsonString(relation.sourceName)}")
     if (source.className.equalsIgnoreCase("delta")) {
@@ -750,7 +754,7 @@ object StreamingTableDefinition {
             table.identifier.quotedString
           )
         )
-        .orElse(source.paths.headOption.map(path => DeltaLog.forTable(spark, new Path(path))))
+        .orElse(sourcePath.map(path => DeltaLog.forTable(spark, new Path(path))))
         .getOrElse(
           StreamingTableErrors.invalid(
             s"Delta streaming source ${relation.sourceName} did not resolve to a catalog table or path"

@@ -23,6 +23,9 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
 
   protected var spark: SparkSession = _
 
+  protected def sessionExtensions: String =
+    "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+
   override protected def beforeAll(): Unit = {
     super.beforeAll()
     warehouse.mkdirs()
@@ -32,7 +35,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
       .appName(s"${getClass.getSimpleName}-${UUID.randomUUID().toString.take(8)}")
       .config(
         "spark.sql.extensions",
-        "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+        sessionExtensions
       )
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config("spark.openivm.enabled", "true")

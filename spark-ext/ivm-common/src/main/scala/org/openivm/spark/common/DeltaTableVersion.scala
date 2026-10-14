@@ -123,8 +123,16 @@ object DeltaTableVersion {
     * failing closed. Analysis only — no Spark job is submitted.
     */
   private[common] def analyzerDeltaLog(spark: SparkSession, tableRef: String): Option[DeltaLog] =
-    try deltaLogFromPlan(spark.table(tableRef).queryExecution.analyzed)
+    try analyzedDeltaLogOption(spark, tableRef)
     catch { case NonFatal(_) => None }
+
+  /** Resolve the analyzed Delta relation without suppressing catalog/storage failures.
+    *
+    * @param spark session whose analyzer resolves the target
+    * @param tableRef qualified target identifier
+    */
+  def analyzedDeltaLogOption(spark: SparkSession, tableRef: String): Option[DeltaLog] =
+    deltaLogFromPlan(spark.table(tableRef).queryExecution.analyzed)
 
   private def deltaLogFromPlan(plan: LogicalPlan): Option[DeltaLog] =
     plan.collectFirst {

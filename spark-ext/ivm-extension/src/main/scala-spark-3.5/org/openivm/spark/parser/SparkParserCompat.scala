@@ -9,7 +9,7 @@ private[parser] trait ParserInterfaceCompat extends ParserInterface {
   protected def delegate: ParserInterface
 }
 
-private[parser] object SparkParserCompat {
+private[spark] object SparkParserCompat {
 
   def parseException(sqlText: String, message: String): ParseException =
     new ParseException(Some(sqlText), message, Origin(), Origin())

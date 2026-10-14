@@ -380,11 +380,15 @@ object StreamingTableMetadata {
   def resolveDeltaTarget(
       spark: SparkSession,
       name: Seq[String],
-      requireTableIdMarker: Boolean
+      requireTableIdMarker: Boolean,
+      preserveResolutionFailure: Boolean = false
   ): StreamingTableTarget = {
     val sqlIdentifier = quoteMultipart(name)
-    val log = DeltaTableVersion
-      .deltaLogOption(spark, sqlIdentifier)
+    val resolvedLog =
+      if (preserveResolutionFailure)
+        DeltaTableVersion.analyzedDeltaLogOption(spark, sqlIdentifier).filter(_.tableExists)
+      else DeltaTableVersion.deltaLogOption(spark, sqlIdentifier)
+    val log = resolvedLog
       .getOrElse(
         StreamingTableErrors.invalid(
           s"Target $sqlIdentifier is not a readable Delta table; refusing to adopt or overwrite it"

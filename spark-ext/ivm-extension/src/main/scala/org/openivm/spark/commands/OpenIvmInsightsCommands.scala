@@ -56,7 +56,8 @@ case class AnnotateOpenIvmMvQueryHashCommand(
     newQueryHash: String,
     policy: String,
     decision: String,
-    reason: String
+    reason: String,
+    requestId: Option[String] = None
 ) extends LeafRunnableCommand {
 
   override def run(spark: SparkSession): Seq[Row] = {
@@ -69,7 +70,8 @@ case class AnnotateOpenIvmMvQueryHashCommand(
         policy,
         decision,
         reason
-      )
+      ),
+      requestId
     )
     Seq.empty
   }

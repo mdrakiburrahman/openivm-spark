@@ -807,7 +807,9 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private def rewriteOutsideProtected(sql: String)(matcher: Int => Option[(Int, String)]): String = {
+  private[compiler] def rewriteOutsideProtected(sql: String, protectBackticks: Boolean = false)(
+      matcher: Int => Option[(Int, String)]
+  ): String = {
     val out = new StringBuilder(sql.length)
     var i   = 0
     while (i < sql.length) {
@@ -816,7 +818,18 @@ private[compiler] object SparkFunctionShimSql {
         else if (startsBlockComment(sql, i)) Some(consumeBlockComment(sql, i))
         else if (sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
         else if (sql.charAt(i) == '"') Some(consumeDoubleQuoted(sql, i))
-        else None
+        else if (protectBackticks && sql.charAt(i) == '`') {
+          var end    = i + 1
+          var closed = false
+          while (end < sql.length && !closed) {
+            if (sql.charAt(end) == '`') {
+              end += 1
+              if (end < sql.length && sql.charAt(end) == '`') end += 1
+              else closed = true
+            } else end += 1
+          }
+          Some(end)
+        } else None
 
       next match {
         case Some(end) =>
@@ -1055,8 +1068,13 @@ private[compiler] object SparkFunctionShimSql {
   }
 
   private def consumeBlockComment(sql: String, start: Int): Int = {
-    var i = start + 2
-    while (i + 1 < sql.length && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) i += 1
-    if (i + 1 < sql.length) i + 2 else sql.length
+    var i     = start + 2
+    var depth = 1
+    while (i < sql.length && depth > 0) {
+      if (sql.startsWith("/*", i)) { depth += 1; i += 2 }
+      else if (sql.startsWith("*/", i)) { depth -= 1; i += 2 }
+      else i += 1
+    }
+    i
   }
 }

@@ -16,14 +16,17 @@ object SparkSessionAccess {
 
   /** Returns a cloned SparkSession that shares this one's SparkContext and
     * table cache while copying its SQLConf, registered temp views, UDFs,
-    * and session-state catalog.
+    * and session-state catalog. Already inherited namespace state is not
+    * reapplied through public catalog setters, which can reject native names.
     */
   def cloneSession(spark: SparkSession): SparkSession = {
     val currentCatalog  = spark.catalog.currentCatalog()
     val currentDatabase = spark.catalog.currentDatabase
     val cloned          = SparkSessionCloneCompatibility.cloneSession(spark)
-    cloned.catalog.setCurrentCatalog(currentCatalog)
-    cloned.catalog.setCurrentDatabase(currentDatabase)
+    if (cloned.catalog.currentCatalog() != currentCatalog)
+      cloned.catalog.setCurrentCatalog(currentCatalog)
+    if (cloned.catalog.currentDatabase != currentDatabase)
+      cloned.catalog.setCurrentDatabase(currentDatabase)
     cloned
   }
 

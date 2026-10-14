@@ -144,7 +144,7 @@ object LptsSparkDialect {
                             rewriteTimestampWithTimeZone(
                               rewriteSparkFunctionInlinings(
                                 rewriteToTimestampDoubleCast(
-                                  rewriteNowTimestamp(sql)
+                                  rewriteNowTimestamp(rewriteLikeOperators(sql))
                                 )
                               )
                             )
@@ -160,6 +160,19 @@ object LptsSparkDialect {
         )
       )
     )
+
+  /** Normalize DuckDB pattern operators without changing literals or identifiers.
+    *
+    * @param sql generated SQL in the compiler output dialect
+    */
+  private[compiler] def rewriteLikeOperators(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
+      Seq("!~~*" -> "NOT ILIKE", "!~~" -> "NOT LIKE", "~~*" -> "ILIKE", "~~" -> "LIKE")
+        .collectFirst {
+          case (operator, keyword) if sql.startsWith(operator, index) =>
+            (index + operator.length, s" $keyword ")
+        }
+    }
 
   /** Removes the spurious `CAST(<string-literal> AS DOUBLE)` wrapper that
     * openivm inserts around `to_timestamp('<date-string>')` arguments due to

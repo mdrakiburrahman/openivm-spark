@@ -7,9 +7,10 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
+import org.apache.spark.sql.catalyst.util.StringUtils
 import org.apache.spark.sql.openivm.StreamingDatasetAccess
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
-import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryListener}
+import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryException, StreamingQueryListener}
 import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
 import org.openivm.spark.commands.{MaterializedViewLifecycle, RefreshMutex}
 import org.openivm.spark.common.{
@@ -144,8 +145,9 @@ object StreamingTableManager {
     StreamingTableMetadata.validateProvider(spec)
     StreamingTableMetadata.validateUserProperties(spec.tableProperties)
     spec.location.foreach(location => StreamingTableMetadata.validateRequestedLocation(spark, location, spec.name))
-    val runtime = StreamingRuntimeOptions.parse(spec.options)
-    val frame   = StreamingDatasetAccess.ofRows(spark, spec.query)
+    val runtime       = StreamingRuntimeOptions.parse(spec.options)
+    val expandedQuery = StreamingViewResolver.expand(spark, spec.query)
+    val frame         = StreamingDatasetAccess.ofRows(spark, expandedQuery)
     validateStreamingQuery(spark, frame, spec, runtime)
 
     val identity = StreamingTableMetadata.canonicalIdentity(spark, spec.name)
@@ -154,7 +156,8 @@ object StreamingTableManager {
       spec,
       frame.queryExecution.analyzed,
       identity,
-      runtime
+      runtime,
+      sourceDeclaration = if (expandedQuery eq spec.query) None else Some(frame.queryExecution.analyzed)
     )
     if (definition.sourceIdentities.exists(source => source == identity || source.startsWith(identity + "|")))
       StreamingTableErrors.invalid(
@@ -612,46 +615,84 @@ object StreamingTableManager {
     }
   }
 
-  def show(spark: SparkSession, namespace: Option[Seq[String]]): Seq[StreamingTableStatus] = {
-    val catalogNames = candidateCatalogNames(spark, namespace)
+  def show(
+      spark: SparkSession,
+      namespace: Option[Seq[String]],
+      pattern: Option[String] = None
+  ): Seq[StreamingTableStatus] = {
+    val catalogNames = candidateCatalogNames(spark, namespace, pattern)
     val knownTargets = StreamingTableRegistry
       .registeredTargets(spark)
       .filter(target => namespace.forall(matchesNamespace(spark, target.name, _)))
-    val registryNames = knownTargets.map(_.name)
-    (catalogNames ++ registryNames)
+    val knownByIdentity = knownTargets.map(target => target.identity -> target).toMap
+    val registryNames   = knownTargets.map(_.name)
+    val candidates = (catalogNames ++ registryNames)
       .groupBy(name => StreamingTableMetadata.canonicalIdentity(spark, name))
       .toSeq
       .sortBy(_._1)
-      .flatMap { case (identity, names) =>
-        val name  = names.head
-        val known = knownTargets.find(_.identity == identity)
-        val target =
-          try Some(StreamingTableMetadata.resolveDeltaTarget(spark, name, requireTableIdMarker = true))
-          catch {
-            case _: org.apache.spark.sql.AnalysisException => None
+      .map { case (_, names) => names.head }
+    resolveShowCandidates(candidates, pattern) { name =>
+      val identity                             = StreamingTableMetadata.canonicalIdentity(spark, name)
+      val known                                = knownByIdentity.get(identity)
+      var resolutionFailure: Option[Throwable] = None
+      val target =
+        try
+          Some(
+            StreamingTableMetadata.resolveDeltaTarget(
+              spark,
+              name,
+              requireTableIdMarker = true,
+              preserveResolutionFailure = true
+            )
+          )
+        catch {
+          case NonFatal(error) if known.nonEmpty =>
+            resolutionFailure = Some(error)
+            None
+          case _: org.apache.spark.sql.AnalysisException => None
+        }
+      target
+        .map { owned =>
+          try {
+            val manifest = StreamingTableMetadata.readManifest(spark, owned)
+            StreamingTableMetadata.verifyOwned(spark, owned, manifest)
+            statusFor(spark, owned, manifest, forcedStatus = None)
+          } catch {
+            case NonFatal(error) =>
+              metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
           }
-        target
-          .map { owned =>
-            try {
-              val manifest = StreamingTableMetadata.readManifest(spark, owned)
-              StreamingTableMetadata.verifyOwned(spark, owned, manifest)
-              statusFor(spark, owned, manifest, forcedStatus = None)
-            } catch {
-              case NonFatal(error) =>
-                metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
-            }
+        }
+        .orElse {
+          known.map { target =>
+            metadataErrorStatus(
+              spark,
+              target,
+              "The known owned target could not be resolved; ownership could not be verified. " +
+                resolutionFailure.map(resolutionFailureDetails).getOrElse("No readable Delta relation was returned")
+            )
           }
-          .orElse {
-            known.map { target =>
-              metadataErrorStatus(
-                spark,
-                target,
-                "The known owned target can no longer be resolved; it may have been moved, replaced, or deleted"
-              )
-            }
-          }
-      }
+        }
+    }
   }
+
+  private[streaming] def resolveShowCandidates[A](
+      names: Seq[Seq[String]],
+      pattern: Option[String]
+  )(resolve: Seq[String] => Option[A]): Seq[A] =
+    names
+      .filter(name => pattern.forall(value => StringUtils.filterPattern(Seq(name.last), value).nonEmpty))
+      .flatMap(name => resolve(name).toSeq)
+
+  private[streaming] def resolutionFailureDetails(error: Throwable): String =
+    Iterator
+      .iterate(error)(_.getCause)
+      .takeWhile(_ != null)
+      .take(8)
+      .map { cause =>
+        val message = StreamingTableDefinition.redactText(Option(cause.getMessage).getOrElse("")).take(120)
+        s"${cause.getClass.getName.take(80)}: $message"
+      }
+      .mkString(" caused by ")
 
   private def metadataErrorStatus(
       spark: SparkSession,
@@ -1806,9 +1847,15 @@ object StreamingTableManager {
       manifest: StreamingTableManifest,
       forcedStatus: Option[String]
   ): StreamingTableStatus = {
-    val key      = StreamingTableRegistry.targetKey(target)
-    val query    = StreamingTableRegistry.findActive(spark, key, target)
-    val entry    = StreamingTableRegistry.entry(spark, key, target)
+    val key   = StreamingTableRegistry.targetKey(target)
+    val query = StreamingTableRegistry.findActive(spark, key, target)
+    val entry = StreamingTableRegistry.entry(spark, key, target)
+    query.filterNot(_.isActive).foreach { current =>
+      entry.reconcileNaturalTermination(
+        current,
+        math.max(1L, StreamingLifecycleSettings.fromSpark(spark).stopTimeout.toMillis)
+      )
+    }
     val snapshot = entry.snapshot
     val nativeProgress = query.flatMap { current =>
       Option(current.lastProgress).map(value =>
@@ -2056,23 +2103,41 @@ object StreamingTableManager {
     )
   }
 
-  private def candidateCatalogNames(spark: SparkSession, namespace: Option[Seq[String]]): Seq[Seq[String]] =
-    namespace match {
-      case Some(parts) =>
-        val qualified = StreamingTableMetadata.quoteMultipart(parts)
-        spark
-          .sql(s"SHOW TABLES IN $qualified")
-          .collect()
-          .toSeq
-          .filterNot(_.getAs[Boolean]("isTemporary"))
-          .map(row => parts :+ row.getAs[String]("tableName"))
-      case None =>
-        spark
-          .sql("SHOW TABLES")
-          .collect()
-          .toSeq
-          .filterNot(_.getAs[Boolean]("isTemporary"))
-          .map(row => Seq(row.getAs[String]("tableName")))
+  private def candidateCatalogNames(
+      spark: SparkSession,
+      namespace: Option[Seq[String]],
+      pattern: Option[String]
+  ): Seq[Seq[String]] = {
+    val filter = pattern.map(value => " LIKE '" + value.replace("'", "\\'") + "'").getOrElse("")
+    directOrListedCatalogNames(namespace, pattern) {
+      namespace match {
+        case Some(parts) =>
+          val qualified = StreamingTableMetadata.quoteMultipart(parts)
+          spark
+            .sql(s"SHOW TABLES IN $qualified$filter")
+            .collect()
+            .toSeq
+            .filterNot(_.getAs[Boolean]("isTemporary"))
+            .map(row => parts :+ row.getAs[String]("tableName"))
+        case None =>
+          spark
+            .sql(s"SHOW TABLES$filter")
+            .collect()
+            .toSeq
+            .filterNot(_.getAs[Boolean]("isTemporary"))
+            .map(row => Seq(row.getAs[String]("tableName")))
+      }
+    }
+  }
+
+  private[streaming] def directOrListedCatalogNames(
+      namespace: Option[Seq[String]],
+      pattern: Option[String]
+  )(list: => Seq[Seq[String]]): Seq[Seq[String]] =
+    pattern.map(_.trim) match {
+      case Some(name) if name.matches("[A-Za-z0-9_]+") =>
+        Seq(namespace.getOrElse(Seq.empty) :+ name)
+      case _ => list
     }
 
   private def matchesNamespace(spark: SparkSession, name: Seq[String], namespace: Seq[String]): Boolean = {
@@ -2140,6 +2205,37 @@ private[streaming] object StreamingTableRegistry {
 
     def currentQuery: Option[StreamingQuery] = synchronized {
       if (terminated) None else Option(query)
+    }
+
+    /** Confirm natural completion without depending on termination-listener delivery.
+      *
+      * @param current Native query for the registered run.
+      * @param timeoutMs Existing lifecycle budget for native termination confirmation.
+      */
+    def reconcileNaturalTermination(current: StreamingQuery, timeoutMs: Long): Unit = {
+      val run = current.runId.toString
+      val pending = synchronized {
+        runId == run && !terminated && !stopRequested && stopFailure.isEmpty
+      }
+      if (pending && !current.isActive) {
+        try {
+          if (current.awaitTermination(timeoutMs)) {
+            val progress = Option(current.lastProgress).map(value => StreamingTableDefinition.redactText(value.json))
+            synchronized {
+              if (runId == run && !terminated && !stopRequested && stopFailure.isEmpty) {
+                progress.foreach(value => lastProgress = value)
+                finish(run, Option(lastFailure))
+              }
+            }
+          }
+        } catch {
+          case error: StreamingQueryException =>
+            synchronized {
+              if (runId == run && !terminated)
+                lastFailure = StreamingTableDefinition.redactText(error.getMessage)
+            }
+        }
+      }
     }
 
     def beginStop(run: String): Unit = synchronized {

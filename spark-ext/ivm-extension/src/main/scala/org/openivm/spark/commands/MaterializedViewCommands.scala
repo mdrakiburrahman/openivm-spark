@@ -1623,10 +1623,18 @@ private[commands] object MvCommandHelper {
       location: String,
       clusterClause: String,
       tablePropertiesClause: String,
-      querySql: String
-  ): String =
-    s"CREATE TABLE delta.`${location.replace("`", "``")}` USING DELTA " +
-      s"$clusterClause${tablePropertiesClause}AS $querySql"
+      querySql: String,
+      managedTarget: Option[TableIdentifier] = None
+  ): String = {
+    val target = managedTarget
+      .map(sqlIdent)
+      .getOrElse(s"delta.`${location.replace("`", "``")}`")
+    val locationClause = managedTarget
+      .map(_ => s"LOCATION '${location.replace("'", "\\'")}' ")
+      .getOrElse("")
+    s"CREATE TABLE $target USING DELTA " +
+      s"$clusterClause${tablePropertiesClause}${locationClause}AS $querySql"
+  }
 
   def fullRefreshReplaceWhereWriterLog(location: String, querySql: String): String = {
     val escapedLocation = location.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -3335,7 +3343,13 @@ case class CreateMaterializedViewCommand(
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
     val dataWriteSql =
-      createDataWriteSql(dataLocation, clusterClause, tblPropsClause, viewBodySql)
+      createDataWriteSql(
+        dataLocation,
+        clusterClause,
+        tblPropsClause,
+        viewBodySql,
+        spark.conf.getOption("spark.openivm.managedTablesRoot").map(_.trim).filter(_.nonEmpty).map(_ => dataIdent)
+      )
     val catalogRegistrationSql =
       createCatalogRegistrationSql(dataIdent, dataLocation)
     val preexistingCatalogRegistration = profile.timeStep("create_validate_catalog_registration") {

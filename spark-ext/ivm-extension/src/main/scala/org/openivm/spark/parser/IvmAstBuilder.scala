@@ -165,7 +165,8 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       StreamingQuerySql.parseStringLiteral(ctx.newQueryHash.getText, sqlText),
       StreamingQuerySql.parseStringLiteral(ctx.policy.getText, sqlText),
       StreamingQuerySql.parseStringLiteral(ctx.decision.getText, sqlText),
-      StreamingQuerySql.parseStringLiteral(ctx.reason.getText, sqlText)
+      StreamingQuerySql.parseStringLiteral(ctx.reason.getText, sqlText),
+      Option(ctx.requestId).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText))
     )
 
   override def visitReleaseOpenivmInsightsRequest(
@@ -243,7 +244,8 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       ctx: IvmSqlBaseParser.ShowStreamingTablesContext
   ): AnyRef =
     ShowStreamingTablesCommand(
-      Option(ctx.multipartIdentifier()).map(multipartIdentifierParts)
+      Option(ctx.multipartIdentifier()).map(multipartIdentifierParts),
+      Option(ctx.STRING()).map(token => StreamingQuerySql.parseStringLiteral(token.getText, sqlText))
     )
 
   override def visitStopStreamingTable(
