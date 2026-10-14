@@ -71,7 +71,8 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_mv", viewSql)
       mvRefreshType("wri_mv") shouldBe RefreshTypeCode.WindowPartition
       val executedSql = executedRefreshSql
-      executedSql.exists(_.contains("CACHE TABLE `openivm_run_result_wri_mv`")) shouldBe true
+      executedSql should contain("CACHE LAZY TABLE `openivm_run_result_wri_mv`")
+      executedSql should not contain "CACHE TABLE `openivm_run_result_wri_mv`"
       executedSql should not contain "CACHE TABLE `openivm_run_fast_wri_mv`"
       executedSql should not contain "CACHE TABLE `openivm_run_fallback_wri_mv`"
       executedSql.exists(s => s.startsWith("MERGE INTO") && s.contains("wri_mv")) shouldBe false
@@ -128,6 +129,7 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_seq_mv", seqSql)
       mvRefreshType("wri_seq_mv") shouldBe RefreshTypeCode.WindowPartition
       stateKeyDetails("wri_seq_mv").last shouldBe "hits=1;requested=1"
+      executedRefreshSql.count(_ == "CACHE LAZY TABLE `openivm_run_result_wri_seq_mv`") shouldBe 2
 
       // Partial hit: an already cached partition and one unseen key. The new
       // partition must still be seeded by the authoritative historical scan.
@@ -252,6 +254,7 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       assertMvCorrect("wri_casc_agg", downstreamSql)
       mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
       executedRefreshSql.exists(_.contains("openivm_empty_fallback WHERE false")) shouldBe true
+      executedRefreshSql should contain("CACHE LAZY TABLE `openivm_run_result_wri_casc_win`")
 
       // The fallback delta and materialised suffix must both reach the child.
       sql(
@@ -262,6 +265,10 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       refreshMv("wri_casc_agg")
       assertMvCorrect("wri_casc_win", upstreamSql)
       assertMvCorrect("wri_casc_agg", downstreamSql)
+      // A mixed fallback/suffix batch does not publish a seed update and must
+      // retain eager materialization before either target mutation.
+      executedRefreshSql should contain("CACHE TABLE `openivm_run_result_wri_casc_win`")
+      executedRefreshSql.count(_ == "CACHE LAZY TABLE `openivm_run_result_wri_casc_win`") shouldBe 1
     }
 
     it("preserves ROWS positions while skipping empty fallback and suffix branches") {
@@ -280,7 +287,37 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       // The second batch is entirely backdated: peer-position and result caches
       // must not be populated again, while the persisted positions stay correct.
       executedRefreshSql.count(_ == "CACHE TABLE `openivm_run_suffix_wri_rows_mv`") shouldBe 1
-      executedRefreshSql.count(_ == "CACHE TABLE `openivm_run_result_wri_rows_mv`") shouldBe 1
+      executedRefreshSql.count(_ == "CACHE LAZY TABLE `openivm_run_result_wri_rows_mv`") shouldBe 1
+    }
+
+    it("handles a NULL-order suffix followed by a mixed backdated batch without reusing stale seeds") {
+      sql("CREATE TABLE wri_null_order_source(k STRING, t INT, v INT) USING DELTA")
+      sql("INSERT INTO wri_null_order_source VALUES ('A',1,10),('B',1,20)")
+      val query = "SELECT k,t,v,MIN(v) OVER (PARTITION BY k ORDER BY t NULLS LAST) AS lo," +
+        "MAX(v) OVER (PARTITION BY k ORDER BY t NULLS LAST) AS hi FROM wri_null_order_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_null_order_mv AS $query")
+
+      // NULL follows every non-NULL order key. This suffix seeds the cache's
+      // null counter, not just its maximum non-NULL order value.
+      sql("INSERT INTO wri_null_order_source VALUES ('A',2,7),('B',NULL,8)")
+      refreshMv("wri_null_order_mv")
+      assertMvCorrect("wri_null_order_mv", query)
+      executedRefreshSql should contain("CACHE LAZY TABLE `openivm_run_result_wri_null_order_mv`")
+
+      // B's non-NULL row precedes its cached NULL tail and must recompute B;
+      // A still extends its suffix. Both changes must remain exact.
+      sql("INSERT INTO wri_null_order_source VALUES ('A',3,5),('B',2,6)")
+      refreshMv("wri_null_order_mv")
+      assertMvCorrect("wri_null_order_mv", query)
+      stateKeyDetails("wri_null_order_mv").last shouldBe "hits=2;requested=2"
+      executedRefreshSql should contain("CACHE TABLE `openivm_run_result_wri_null_order_mv`")
+
+      // The mixed refresh invalidates the old cache generation, including A.
+      sql("INSERT INTO wri_null_order_source VALUES ('A',4,4)")
+      refreshMv("wri_null_order_mv")
+      assertMvCorrect("wri_null_order_mv", query)
+      stateKeyDetails("wri_null_order_mv").last shouldBe "hits=0;requested=1"
+      mvRefreshType("wri_null_order_mv") shouldBe RefreshTypeCode.WindowPartition
     }
 
     it("preserves nullable cumulative SUM and AVG seeds across consecutive suffix batches") {

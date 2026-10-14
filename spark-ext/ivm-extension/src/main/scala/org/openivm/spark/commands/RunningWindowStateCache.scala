@@ -97,8 +97,8 @@ private[commands] object RunningWindowStateCache {
   ) {
     val requested: Int = partitionKeys.size
 
-    /** The result is already materialized before any target write. Aggregate
-      * only that suffix, retaining native tail/null semantics; add historical
+    /** This aggregate materializes the cached result before any target write.
+      * Consume only that suffix, retaining native tail/null semantics; add historical
       * row counters so ROWS positions and future append bounds remain correct.
       */
     def prepareUpdate(): Update = {

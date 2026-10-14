@@ -6328,14 +6328,22 @@ case class RefreshMaterializedViewCommand(
               // The native suffix program splits fallback and append partitions.
               // Whole-partition Spark shortcuts must not skip its fallback delta
               // or apply the suffix a second time.
-              var runningState = Option.empty[RunningWindowStateCache.State]
+              var runningState   = Option.empty[RunningWindowStateCache.State]
+              val cacheResultSql = s"CACHE TABLE `openivm_run_result_${name.table}`"
               def executeRunningWindowSql(sql: String, idx: Int): Unit = {
+                // The seed aggregate below consumes the entire suffix before
+                // target mutation and fills this cache. Avoid an extra eager
+                // count-only action when that aggregate is already required.
+                val sqlForExec =
+                  if (sql == cacheResultSql && runningState.nonEmpty)
+                    s"CACHE LAZY TABLE `openivm_run_result_${name.table}`"
+                  else sql
                 if (
                   SparkRefreshRewriter.isMergeStatement(sql) ||
                   SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined
                 ) {
-                  withPlanTimeBroadcastDisabled { executeSqlAt(sql, idx) }
-                } else executeSqlAt(sql, idx)
+                  withPlanTimeBroadcastDisabled { executeSqlAt(sqlForExec, idx) }
+                } else executeSqlAt(sqlForExec, idx)
                 if (sql.startsWith(s"CREATE OR REPLACE TEMPORARY VIEW openivm_run_state_${name.table} AS")) {
                   runningState = profile.timeStep("window_running_state_load", "backend=rocksdb") {
                     RunningWindowStateCache.load(spark, meta, sql)
@@ -6347,7 +6355,7 @@ case class RefreshMaterializedViewCommand(
                       0L
                     )
                   }
-                } else if (sql == s"CACHE TABLE `openivm_run_result_${name.table}`") {
+                } else if (sql == cacheResultSql) {
                   runningWindowStateUpdate = runningState.map { state =>
                     profile.timeStep("window_running_state_prepare", "source=cached_suffix") { state.prepareUpdate() }
                   }
