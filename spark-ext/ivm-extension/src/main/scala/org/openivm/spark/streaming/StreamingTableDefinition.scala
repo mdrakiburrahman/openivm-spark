@@ -668,6 +668,7 @@ object StreamingTableDefinition {
         if (snapshot.version < 0L)
           StreamingTableErrors.invalid(s"Delta source $fallbackName has no committed snapshot")
         val path = StreamingTableMetadata.normalizePath(spark, delta.deltaLog.dataPath)
+        validateSourceGeneration(path, delta.initialSnapshot.metadata.id, snapshot.metadata.id)
         val effectiveOptions = mergeOptions(
           readOptions(delta.options.toSeq, s"Delta source $fallbackName"),
           parsedOptions,
@@ -708,6 +709,7 @@ object StreamingTableDefinition {
         if (snapshot.version < 0L)
           StreamingTableErrors.invalid("Resolved Delta source has no committed snapshot")
         val path = StreamingTableMetadata.normalizePath(spark, deltaIndex.deltaLog.dataPath)
+        validateSourceGeneration(path, deltaIndex.metadata.id, snapshot.metadata.id)
         val logicalIdentity = catalogName
           .map(parts => StreamingTableMetadata.canonicalIdentity(spark, parts))
           .getOrElse(s"delta-path:$path")
@@ -732,6 +734,14 @@ object StreamingTableDefinition {
           deltaTableId = None
         )
     }
+
+  private def validateSourceGeneration(path: String, analyzedDeltaId: String, currentDeltaId: String): Unit =
+    if (analyzedDeltaId != currentDeltaId)
+      StreamingTableErrors.invalid(
+        s"Delta source '$path' changed generation after query analysis. " +
+          "Recreate the source Dataset/DataFrame against the replacement table before creating a streaming table; " +
+          "the analyzed reader may refer to deleted data or checkpoints from the previous generation."
+      )
 
   private def sourceFromStreamingRelation(
       spark: SparkSession,

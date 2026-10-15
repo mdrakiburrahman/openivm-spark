@@ -142,6 +142,7 @@ object StreamingTableManager {
       spec: StreamingTableSpec,
       insight: InsightOperation
   ): StreamingTableStatus = {
+    StreamingLifecycleSettings.validateProgressRetention(spark)
     StreamingTableMetadata.validateProvider(spec)
     StreamingTableMetadata.validateUserProperties(spec.tableProperties)
     spec.location.foreach(location => StreamingTableMetadata.validateRequestedLocation(spark, location, spec.name))
@@ -1856,14 +1857,14 @@ object StreamingTableManager {
         math.max(1L, StreamingLifecycleSettings.fromSpark(spark).stopTimeout.toMillis)
       )
     }
-    val snapshot = entry.snapshot
     val nativeProgress = query.flatMap { current =>
       Option(current.lastProgress).map(value =>
         current.runId.toString -> StreamingTableDefinition.redactText(value.json)
       )
     }
-    val progress = nativeProgress.map(_._2).orElse(snapshot.lastProgress)
     nativeProgress.foreach { case (run, value) => StreamingTableRegistry.recordProgress(spark, key, run, value) }
+    val snapshot = entry.snapshot
+    val progress = nativeProgress.map(_._2).orElse(snapshot.lastProgress)
     val failure = query
       .flatMap(_.exception.map(error => StreamingTableDefinition.redactText(error.getMessage)))
       .orElse(snapshot.lastFailure)
