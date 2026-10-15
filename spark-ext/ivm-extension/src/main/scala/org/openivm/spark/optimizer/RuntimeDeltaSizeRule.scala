@@ -4,6 +4,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{And, Exists, Expression, InSubquery, Literal, Or}
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.{EXISTS_SUBQUERY, IN_SUBQUERY}
 import org.openivm.spark.common.FeatureGate
 
 /** Fold positive filter predicates whose source delta is provably empty.
@@ -19,7 +20,10 @@ import org.openivm.spark.common.FeatureGate
 final class RuntimeDeltaSizeRule(session: SparkSession) extends Rule[LogicalPlan] {
 
   override def apply(plan: LogicalPlan): LogicalPlan =
-    if (!FeatureGate.enabled(session) || plan.isStreaming) plan
+    if (
+      !FeatureGate.enabled(session) ||
+      !plan.containsAnyPattern(IN_SUBQUERY, EXISTS_SUBQUERY) || plan.isStreaming
+    ) plan
     else {
       def fold(condition: Expression): Expression = condition match {
         case _: And | _: Or => condition.mapChildren(fold)
@@ -29,8 +33,8 @@ final class RuntimeDeltaSizeRule(session: SparkSession) extends Rule[LogicalPlan
           Literal(false)
         case _ => condition
       }
-      plan.transformUp {
-        case filter: Filter if filter.resolved =>
+      plan.transformUpWithPruning(_.containsAnyPattern(IN_SUBQUERY, EXISTS_SUBQUERY)) {
+        case filter: Filter if filter.resolved && filter.condition.containsAnyPattern(IN_SUBQUERY, EXISTS_SUBQUERY) =>
           val condition = fold(filter.condition)
           if (condition.fastEquals(filter.condition)) filter else filter.copy(condition = condition)
       }
