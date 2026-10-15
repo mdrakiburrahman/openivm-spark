@@ -15,7 +15,7 @@ private[spark] final case class StreamingLifecycleSettings(
 
 private[spark] object StreamingLifecycleSettings {
 
-  private val ProgressRetentionKey = "spark.sql.streaming.maxBatchesToRetainInMemory"
+  private val ProgressRetentionKey = "spark.sql.streaming.numRecentProgressUpdates"
   private val DurationLiteral =
     "([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)\\s*([\\p{L}]+)".r
   private val MaxNanos = Decimal.valueOf(Long.MaxValue)
@@ -29,13 +29,13 @@ private[spark] object StreamingLifecycleSettings {
     */
   def validateProgressRetention(spark: SparkSession): Unit =
     spark.conf.getOption(ProgressRetentionKey).foreach { configured =>
-      val positive =
-        try configured.trim.toInt > 0
+      val retainsProgress =
+        try configured.trim.toInt >= 2
         catch { case NonFatal(_) => false }
-      if (!positive)
+      if (!retainsProgress)
         StreamingTableErrors.invalid(
-          s"Configuration '$ProgressRetentionKey' must be a positive integer for OpenIVM streaming tables. " +
-            "Remove the override to use Spark's default or configure at least 1 retained progress batch; " +
+          s"Configuration '$ProgressRetentionKey' must be an integer of at least 2 for OpenIVM streaming tables. " +
+            "Remove the override to use Spark's default; a value of 1 leaves the native progress buffer empty. " +
             "OpenIVM requires native progress to reconcile writer health when listener events are unavailable."
         )
     }

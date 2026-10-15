@@ -151,12 +151,17 @@ startup-only unhealthy state. The watchdog never stops queries, deletes
 storage, or terminates the session; SHOW exposes its bounded failure details.
 
 OpenIVM requires positive native progress retention:
-`spark.sql.streaming.maxBatchesToRetainInMemory` must be at least `1` when
-explicitly configured. Remove the override to retain Spark's default.
+`spark.sql.streaming.numRecentProgressUpdates` must be at least `2` when
+explicitly configured. On the supported Spark versions, `1` leaves the native
+progress buffer empty. Remove the override to retain Spark's default of `100`.
 An incompatible value is rejected before CREATE starts, resumes, or rebuilds
 a writer; OpenIVM never changes this application-wide setting. Native progress
 is reconciled before the same SHOW response is built, so a recovered startup
 diagnostic does not linger for an extra poll. Real query and stop failures remain visible.
+
+`spark.sql.streaming.maxBatchesToRetainInMemory` controls batch caching, not
+progress history. Setting it to `0` remains supported and does not disable
+native progress reporting.
 
 Checkpoint archival requires a durable Hadoop-filesystem root outside managed
 table storage:
