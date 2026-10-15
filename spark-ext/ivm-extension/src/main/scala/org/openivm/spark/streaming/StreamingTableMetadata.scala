@@ -148,6 +148,21 @@ object StreamingTableMetadata {
     "spark.openivm.streaming.manifestReadRetryIntervalMs"
   private val DefaultManifestReadRetryTimeoutMs  = 15000L
   private val DefaultManifestReadRetryIntervalMs = 250L
+  private[streaming] val TargetReadRetryTimeoutMsKey =
+    "spark.openivm.streaming.targetReadRetryTimeoutMs"
+  private[streaming] val TargetReadRetryIntervalMsKey =
+    "spark.openivm.streaming.targetReadRetryIntervalMs"
+  private val DefaultTargetReadRetryTimeoutMs  = 15000L
+  private val DefaultTargetReadRetryIntervalMs = 250L
+
+  @volatile private var afterTargetCreatedHookForTesting: Seq[String] => Unit = (_: Seq[String]) => ()
+  @volatile private var afterTargetBoundHookForTesting: Seq[String] => Unit   = (_: Seq[String]) => ()
+
+  private[streaming] def setAfterTargetCreatedHookForTesting(hook: Seq[String] => Unit): Unit =
+    afterTargetCreatedHookForTesting = hook
+
+  private[streaming] def setAfterTargetBoundHookForTesting(hook: Seq[String] => Unit): Unit =
+    afterTargetBoundHookForTesting = hook
 
   def canonicalIdentity(spark: SparkSession, name: Seq[String]): String = {
     if (name.isEmpty || name.exists(part => Option(part).forall(_.trim.isEmpty)))
@@ -424,10 +439,72 @@ object StreamingTableMetadata {
     manifest
   }
 
+  /** Returns the owned target left by a creation that stopped before its manifest was written.
+    *
+    * Creation commits `CREATE TABLE`, binds the Delta identity, then writes the manifest. A failure between
+    * those steps leaves a target that carries this table's ownership markers but no data files and no
+    * manifest. Finishing that creation is safe; refusing it would block every retry permanently.
+    *
+    * @param spark
+    *   The active session.
+    * @param name
+    *   The requested streaming-table name.
+    */
+  def interruptedCreation(spark: SparkSession, name: Seq[String]): Option[StreamingTableTarget] =
+    try {
+      if (!catalogTableExists(spark, name)) None
+      else
+        DeltaTableVersion.deltaLogOption(spark, quoteMultipart(name)).flatMap { log =>
+          val snapshot      = log.update()
+          val configuration = snapshot.metadata.configuration
+          val resolvedName  = qualifiedNameParts(spark, name)
+          val identity      = canonicalIdentity(spark, resolvedName)
+          val dataPath      = normalizePath(spark, log.dataPath)
+          val pristineOwned =
+            snapshot.version >= 0L &&
+              snapshot.numOfFiles == 0L &&
+              configuration.get(OwnerMarkerKey).contains(OwnerMarkerValue) &&
+              configuration.get(TargetIdentityMarkerKey).contains(identity) &&
+              configuration.get(DeltaIdMarkerKey).forall(_ == snapshot.metadata.id) &&
+              configuration.get(TargetPathMarkerKey).forall(_ == dataPath)
+          configuration
+            .get(TableIdMarkerKey)
+            .filter(tableId => pristineOwned && tableId.nonEmpty)
+            .map { tableId =>
+              StreamingTableTarget(
+                name = resolvedName,
+                identity = identity,
+                sqlIdentifier = quoteMultipart(resolvedName),
+                dataPath = dataPath,
+                deltaTableId = snapshot.metadata.id,
+                tableId = tableId
+              )
+            }
+            .filterNot { target =>
+              val path = definitionPath(target)
+              path.getFileSystem(spark.sessionState.newHadoopConf()).exists(path)
+            }
+        }
+    } catch {
+      case NonFatal(_) => None
+    }
+
+  /** Creates and binds an owned streaming target, or finishes binding an interrupted creation.
+    *
+    * @param spark
+    *   The active session.
+    * @param spec
+    *   The requested streaming table.
+    * @param schema
+    *   The streaming query's output schema.
+    * @param interrupted
+    *   A target returned by [[interruptedCreation]] to finish instead of creating a new one.
+    */
   def createOwnedTarget(
       spark: SparkSession,
       spec: StreamingTableSpec,
-      schema: StructType
+      schema: StructType,
+      interrupted: Option[StreamingTableTarget] = None
   ): StreamingTableTarget = {
     validateProvider(spec)
     validateUserProperties(spec.tableProperties)
@@ -438,37 +515,71 @@ object StreamingTableMetadata {
       spec.tableProperties,
       spark
     )
-    if (catalogTableExists(spark, spec.name))
-      StreamingTableErrors.invalid(
-        s"Target ${quoteMultipart(spec.name)} already exists and cannot be adopted as a streaming table"
-      )
-    spec.location.foreach { location =>
-      validateRequestedLocation(spark, location, spec.name)
-      assertLocationAbsent(spark, location)
+    val tableId = interrupted match {
+      case Some(existing) =>
+        spec.location.foreach { location =>
+          validateRequestedLocation(spark, location, spec.name)
+          if (normalizePath(spark, location) != existing.dataPath)
+            StreamingTableErrors.invalid(
+              s"Interrupted target ${existing.sqlIdentifier} is at '${existing.dataPath}', not the requested " +
+                s"LOCATION '$location'"
+            )
+        }
+        existing.tableId
+      case None =>
+        if (catalogTableExists(spark, spec.name))
+          StreamingTableErrors.invalid(
+            s"Target ${quoteMultipart(spec.name)} already exists and cannot be adopted as a streaming table"
+          )
+        spec.location.foreach { location =>
+          validateRequestedLocation(spark, location, spec.name)
+          assertLocationAbsent(spark, location)
+        }
+        val createdTableId = UUID.randomUUID().toString
+        val properties = spec.tableProperties ++ Map(
+          OwnerMarkerKey          -> OwnerMarkerValue,
+          TableIdMarkerKey        -> createdTableId,
+          TargetIdentityMarkerKey -> canonicalIdentity(spark, spec.name)
+        )
+        spark.sql(createTableSql(spec, schema, properties)).collect()
+        afterTargetCreatedHookForTesting(spec.name)
+        createdTableId
     }
 
-    val tableId  = UUID.randomUUID().toString
-    val identity = canonicalIdentity(spark, spec.name)
-    val properties = spec.tableProperties ++ Map(
-      OwnerMarkerKey          -> OwnerMarkerValue,
-      TableIdMarkerKey        -> tableId,
-      TargetIdentityMarkerKey -> identity
-    )
-    spark.sql(createTableSql(spec, schema, properties)).collect()
-
-    val initiallyCreated = resolveDeltaTarget(spark, spec.name, requireTableIdMarker = false)
+    val initiallyCreated = awaitReadableTarget(spark, spec.name, requireTableIdMarker = false)
     val setIdentitySql =
       s"ALTER TABLE ${initiallyCreated.sqlIdentifier} SET TBLPROPERTIES " +
         s"(${sqlString(DeltaIdMarkerKey)}=${sqlString(initiallyCreated.deltaTableId)}, " +
         s"${sqlString(TargetPathMarkerKey)}=${sqlString(initiallyCreated.dataPath)})"
     spark.sql(setIdentitySql).collect()
 
-    val target = resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+    val target = awaitReadableTarget(spark, spec.name, requireTableIdMarker = true)
     if (target.tableId != tableId)
       StreamingTableErrors.invalid(
         s"Target ${target.sqlIdentifier} changed ownership identity while it was being created"
       )
+    afterTargetBoundHookForTesting(spec.name)
     target
+  }
+
+  /** Resolves a target this creation just committed, waiting out catalog and log-listing visibility lag. */
+  private def awaitReadableTarget(
+      spark: SparkSession,
+      name: Seq[String],
+      requireTableIdMarker: Boolean
+  ): StreamingTableTarget = {
+    val timeoutMs  = spark.conf.get(TargetReadRetryTimeoutMsKey, DefaultTargetReadRetryTimeoutMs.toString).toLong
+    val intervalMs = spark.conf.get(TargetReadRetryIntervalMsKey, DefaultTargetReadRetryIntervalMs.toString).toLong
+    val deadline   = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(math.max(0L, timeoutMs))
+
+    var target: Option[StreamingTableTarget] = None
+    while (target.isEmpty) {
+      try target = Some(resolveDeltaTarget(spark, name, requireTableIdMarker))
+      catch {
+        case NonFatal(_) if System.nanoTime() < deadline => Thread.sleep(math.max(1L, intervalMs))
+      }
+    }
+    target.get
   }
 
   def validateExistingTargetAgainstManifest(
@@ -640,12 +751,15 @@ object StreamingTableMetadata {
       )
   }
 
-  def writeManifest(
-      spark: SparkSession,
-      target: StreamingTableTarget,
-      definition: StreamingTableDefinition
-  ): StreamingTableManifest = {
-    val manifest = StreamingTableManifest(
+  /** Builds the manifest that describes a target materialized for a streaming-table definition.
+    *
+    * @param target
+    *   The owned target.
+    * @param definition
+    *   The streaming-table definition the target materializes.
+    */
+  def manifestFor(target: StreamingTableTarget, definition: StreamingTableDefinition): StreamingTableManifest =
+    StreamingTableManifest(
       formatVersion = definition.formatVersion,
       target = target,
       definitionHash = definition.fingerprint,
@@ -655,7 +769,14 @@ object StreamingTableMetadata {
       operationalHash = definition.operationalHash,
       sourcePaths = definition.sourcePaths
     )
-    val path = definitionPath(target)
+
+  def writeManifest(
+      spark: SparkSession,
+      target: StreamingTableTarget,
+      definition: StreamingTableDefinition
+  ): StreamingTableManifest = {
+    val manifest = manifestFor(target, definition)
+    val path     = definitionPath(target)
     writeNewAtomically(
       path.getFileSystem(spark.sessionState.newHadoopConf()),
       path,
