@@ -6360,10 +6360,14 @@ case class RefreshMaterializedViewCommand(
               )
             ) {
               // The native suffix program splits fallback and append partitions.
-              // Whole-partition Spark shortcuts must not skip its fallback delta
-              // or apply the suffix a second time.
-              var runningState   = Option.empty[RunningWindowStateCache.State]
-              val cacheResultSql = s"CACHE TABLE `openivm_run_result_${name.table}`"
+              // Preserve its target writes and snapshot ordering together rather
+              // than applying a whole-partition shortcut to either branch.
+              var runningState             = Option.empty[RunningWindowStateCache.State]
+              val cacheResultSql           = s"CACHE TABLE `openivm_run_result_${name.table}`"
+              val targetCdfSuppliesCascade = !propagation.requiresDmlInterception && propagation.requiresMvCdf
+              val cascadeAppend =
+                ("(?is)^\\s*INSERT\\s+INTO\\s+delta\\.`" +
+                  java.util.regex.Pattern.quote(viewDeltaPath.replace("`", "``")) + "`\\s+SELECT\\b").r
               def executeRunningWindowSql(sql: String, idx: Int): Unit = {
                 // The seed aggregate below consumes the entire suffix before
                 // target mutation and fills this cache. Avoid an extra eager
@@ -6419,7 +6423,18 @@ case class RefreshMaterializedViewCommand(
               if (hasFallback) runningState = None
               indexed.drop(boundsIdx + 1).foreach { case (stmt, idx) =>
                 val sql = SparkRefreshRewriter.stripExecutionMarker(stmt)
-                if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {
+                // CDF consumers read the target's committed changes; only
+                // intercept consumers need the separate fallback/suffix copy.
+                // Match its exact destination so the real target append stays.
+                val skipCdfCascade = targetCdfSuppliesCascade && (
+                  (stmt.contains(SparkRefreshRewriter.RunningWindowFallbackMarker) &&
+                    SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath).isDefined) ||
+                    (stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker) &&
+                      cascadeAppend.findFirstIn(sql).isDefined)
+                )
+                if (skipCdfCascade) {
+                  logSkippedWindowStmt(idx, "window_target_cdf_cascade_skipped")
+                } else if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {
                   logSkippedWindowStmt(idx, "window_running_empty_suffix_skipped")
                 } else if (!hasFallback && stmt.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) {
                   SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath) match {

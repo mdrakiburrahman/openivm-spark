@@ -1,7 +1,15 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, MvCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.apache.spark.sql.types._
+import org.openivm.spark.common.{
+  ChangeFeedMode,
+  ChangePropagationFactory,
+  FeatureGate,
+  MvCatalog,
+  RefreshSqlLogCatalog,
+  RefreshTypeCode
+}
 import org.openivm.spark.commands.RefreshFailureInjection
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
@@ -133,6 +141,91 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   }
 
   describe("joined WINDOW_PARTITION cascade reuse") {
+    it("registers typed empty deltas locally without losing nested types, nullability or metadata") {
+      val metadata = new MetadataBuilder().putString("comment", "source identity").build()
+      val schema = StructType(
+        Seq(
+          StructField("id", LongType, nullable = false, metadata),
+          StructField(
+            "payload",
+            StructType(
+              Seq(
+                StructField("values", ArrayType(DecimalType(18, 4), containsNull = false), nullable = false),
+                StructField("labels", MapType(StringType, StringType, valueContainsNull = true))
+              )
+            )
+          )
+        )
+      )
+      ChangePropagationFactory.forSession(spark).registerSourceDeltaView(spark, "we_typed", schema, Seq.empty)
+      val empty = spark.table("openivm_delta_we_typed")
+      empty.schema shouldBe schema.add("openivm_timestamp", TimestampType).add("openivm_multiplicity", IntegerType)
+      empty.queryExecution.optimizedPlan.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+      ] shouldBe true
+      empty.count() shouldBe 0L
+    }
+
+    it("folds typed empty delta scans while preserving UNION key types, NULLs and duplicate bags") {
+      sql(
+        "CREATE OR REPLACE TEMP VIEW openivm_delta_we_live AS " +
+          "SELECT * FROM VALUES (CAST(9007199254740993 AS BIGINT)), (CAST(NULL AS BIGINT)), " +
+          "(CAST(9007199254740993 AS BIGINT)) AS changes(id)"
+      )
+      sql("CREATE OR REPLACE TEMP VIEW openivm_delta_we_empty AS SELECT id FROM range(0)")
+      val sourceSchema = spark.table("openivm_delta_we_empty").schema
+      ChangePropagationFactory.forSession(spark).registerSourceDeltaView(spark, "we_empty", sourceSchema, Seq.empty)
+      spark
+        .table("openivm_delta_we_empty")
+        .queryExecution
+        .optimizedPlan
+        .isInstanceOf[
+          org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+        ] shouldBe true
+      val body = "SELECT id FROM openivm_delta_we_live UNION ALL " +
+        "SELECT CAST(id AS DOUBLE) AS id FROM range(10000) WHERE id IN " +
+        "(SELECT id FROM openivm_delta_we_empty)"
+      // Keep the reference independent of the empty-subquery rewrite. The
+      // absent DOUBLE arm must still coerce the surviving BIGINT values.
+      sql("CREATE OR REPLACE TEMP VIEW we_expected AS SELECT CAST(id AS DOUBLE) AS id FROM openivm_delta_we_live")
+      sql(s"CREATE OR REPLACE TEMP VIEW openivm_affected_we_mv AS $body")
+      spark.table("openivm_affected_we_mv").schema.fields.map(_.dataType).toSeq shouldBe Seq(DoubleType)
+      spark.table("openivm_affected_we_mv").schema shouldBe spark.table("we_expected").schema
+      assertBagEqual("SELECT * FROM openivm_affected_we_mv", "SELECT * FROM we_expected")
+      spark.table("openivm_affected_we_mv").queryExecution.optimizedPlan.toString should not include "10000"
+      // Empty scalar aggregates and outer/anti joins must keep their rows;
+      // Catalyst handles these semantics rather than a text-level UNION pass.
+      sql("SELECT 0 AS id WHERE 0 IN (SELECT COUNT(*) FROM openivm_delta_we_empty)").count() shouldBe 1L
+      sql("SELECT 0 AS id WHERE EXISTS (SELECT MAX(id) FROM openivm_delta_we_empty)").count() shouldBe 1L
+      sql("SELECT l.id FROM range(2) l LEFT ANTI JOIN openivm_delta_we_empty r ON l.id = r.id").count() shouldBe 2L
+      sql("SELECT l.id FROM range(2) l LEFT JOIN openivm_delta_we_empty r ON l.id = r.id").count() shouldBe 2L
+
+      // An opaque empty RDD provides the existing runtime behavior as the
+      // reference for projected/negated NULL predicates under either setting.
+      spark
+        .createDataFrame(spark.sparkContext.emptyRDD[Row], sourceSchema)
+        .createOrReplaceTempView("we_opaque_empty")
+      val nullBehavior = "spark.sql.legacy.nullInEmptyListBehavior"
+      val previous     = spark.conf.getOption(nullBehavior)
+      try
+        Seq("true", "false").foreach { legacy =>
+          spark.conf.set(nullBehavior, legacy)
+          Seq(
+            "SELECT (CAST(NULL AS BIGINT) IN (SELECT id FROM %s)) AS result",
+            "SELECT NOT (CAST(NULL AS BIGINT) IN (SELECT id FROM %s)) AS result",
+            "SELECT id FROM openivm_delta_we_live WHERE NOT (id IN (SELECT id FROM %s))",
+            "SELECT 0 AS id WHERE COALESCE(CAST(NULL AS BIGINT) IN (SELECT id FROM %s), true)"
+          ).foreach { query =>
+            assertBagEqual(query.format("openivm_delta_we_empty"), query.format("we_opaque_empty"))
+          }
+        }
+      finally
+        previous match {
+          case Some(value) => spark.conf.set(nullBehavior, value)
+          case None        => spark.conf.unset(nullBehavior)
+        }
+    }
+
     itCdf("replaces exactly the bounded integral-key limit including a NULL partition") {
       sql("CREATE TABLE wcb_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql(
@@ -233,6 +326,19 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
       assertMvCorrect("wcr_mv", viewSql)
       if (changeFeedMode == ChangeFeedMode.Cdf) assertDirectCdfTargetWrite("wcr_mv")
       else assertCascadeFirstTargetWrite("wcr_mv")
+
+      // With only one changed source, empty delta arms fold away while full
+      // unchanged lookup tables still contribute affected partition keys.
+      Seq(
+        "UPDATE wcr_trade SET t_ca_id = t_ca_id + 1 WHERE t_id = 100",
+        "UPDATE wcr_status SET st_name = 'revised' WHERE st_id = 1",
+        "DELETE FROM wcr_trade_history WHERE th_t_id = 400"
+      ).foreach { change =>
+        sql(change)
+        RefreshSqlLogCatalog.removeAll(spark)
+        refreshMv("wcr_mv")
+        assertMvCorrect("wcr_mv", viewSql)
+      }
     }
 
     it("replaces more than 1,000 partitions with bounded CDF or persisted intercept cascade") {

@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** running-window suffix-extend refresh (`windowRunningIncremental`).
@@ -35,6 +35,20 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       .collect()
       .map(_.getString(0))
       .toSeq
+
+  private def assertCascadeStorageMode(viewName: String): Unit = {
+    val statements = sql("SHOW OPENIVM QUERY LOG")
+      .where(s"category = 'rewritten_stmt' AND view_name IN ('$viewName', 'default.$viewName')")
+      .select("sql_text")
+      .collect()
+      .map(_.getString(0))
+    statements.exists(_.contains("/_ivm/view_deltas/")) shouldBe (changeFeedMode == ChangeFeedMode.Intercept)
+    // The real target append must not be confused with the suffix cascade copy.
+    statements.exists(s =>
+      s.startsWith("INSERT INTO") && s.contains(s"FROM openivm_run_result_$viewName") &&
+        !s.contains("/_ivm/view_deltas/")
+    ) shouldBe true
+  }
 
   private val viewSql =
     "SELECT dm_date, dm_s_symb, " +
@@ -236,7 +250,7 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
           "MAX(dm_high) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS wk_high " +
           "FROM wri_casc_market"
       sql(s"CREATE MATERIALIZED VIEW wri_casc_win AS $upstreamSql")
-      // Downstream MV consumes the window MV's view-delta (depth-2 MV-over-MV chain).
+      // Downstream reads the target CDF or the persisted intercept cascade.
       val downstreamSql =
         "SELECT dm_s_symb, COUNT(*) AS n, MIN(wk_low) AS lo, MAX(wk_high) AS hi FROM wri_casc_win GROUP BY dm_s_symb"
       sql(s"CREATE MATERIALIZED VIEW wri_casc_agg AS $downstreamSql")
@@ -246,15 +260,18 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       // Strictly-later insert-only batch → window fast path → cascade view-delta → downstream stays incremental.
       sql(
         "INSERT INTO wri_casc_market VALUES " +
-          "(DATE '2024-01-03','AAA',7,24),(DATE '2024-01-03','BBB',13,27),(DATE '2024-01-01','CCC',30,40)"
+          "(DATE '2024-01-03','AAA',7,24),(DATE '2024-01-03','BBB',13,27)," +
+          "(DATE '2024-01-01','CCC',30,40),(DATE '2024-01-01','CCC',30,40)"
       )
       refreshMv("wri_casc_win")
       refreshMv("wri_casc_agg")
       assertMvCorrect("wri_casc_win", upstreamSql)
       assertMvCorrect("wri_casc_agg", downstreamSql)
       mvRefreshType("wri_casc_win") shouldBe RefreshTypeCode.WindowPartition
-      executedRefreshSql.exists(_.contains("openivm_empty_fallback WHERE false")) shouldBe true
+      executedRefreshSql.exists(_.contains("openivm_empty_fallback WHERE false")) shouldBe
+        (changeFeedMode == ChangeFeedMode.Intercept)
       executedRefreshSql should contain("CACHE LAZY TABLE `openivm_run_result_wri_casc_win`")
+      assertCascadeStorageMode("wri_casc_win")
 
       // The fallback delta and materialised suffix must both reach the child.
       sql(
@@ -269,6 +286,45 @@ abstract class WindowRunningIncrementalScenarios extends IvmParitySpecBase("wind
       // retain eager materialization before either target mutation.
       executedRefreshSql should contain("CACHE TABLE `openivm_run_result_wri_casc_win`")
       executedRefreshSql.count(_ == "CACHE LAZY TABLE `openivm_run_result_wri_casc_win`") shouldBe 1
+      assertCascadeStorageMode("wri_casc_win")
+    }
+
+    itCdf("retries a rejected suffix append without publishing its prepared state or losing the downstream change") {
+      sql("CREATE TABLE wri_retry_source(k STRING, t INT, v INT) USING DELTA")
+      sql("INSERT INTO wri_retry_source VALUES ('A',1,10)")
+      val query = "SELECT k,t,v,MIN(v) OVER (PARTITION BY k ORDER BY t) AS lo," +
+        "MAX(v) OVER (PARTITION BY k ORDER BY t) AS hi FROM wri_retry_source"
+      sql(s"CREATE MATERIALIZED VIEW wri_retry_mv AS $query")
+      val childQuery = "SELECT k,COUNT(*) AS n,MIN(lo) AS lo,MAX(hi) AS hi FROM wri_retry_mv GROUP BY k"
+      sql(s"CREATE MATERIALIZED VIEW wri_retry_child AS $childQuery")
+      val path = mvDataLocation("wri_retry_mv").replace("`", "``")
+      sql(s"ALTER TABLE delta.`$path` ADD CONSTRAINT wri_retry_order CHECK (t < 3)")
+
+      // Consume the constraint's metadata version before exercising the cache's
+      // prepare-before-mutation path on the next refresh.
+      sql("INSERT INTO wri_retry_source VALUES ('A',2,8)")
+      refreshMv("wri_retry_mv")
+      refreshMv("wri_retry_child")
+      val beforeVersion = mvDataVersion("wri_retry_mv")
+      sql("INSERT INTO wri_retry_source VALUES ('A',3,6)")
+      intercept[Exception] { refreshMv("wri_retry_mv") }
+      mvDataVersion("wri_retry_mv") shouldBe beforeVersion
+      sql("SELECT COUNT(*) FROM wri_retry_mv").head().getLong(0) shouldBe 2L
+      assertMvCorrect("wri_retry_child", childQuery)
+      val failedProfile = RefreshProfileCatalog
+        .scanAll(spark)
+        .filter(_.viewName.split("\\.").last == "wri_retry_mv")
+      failedProfile.count(_.stepName == "window_running_state_prepare") shouldBe 1
+      failedProfile.count(_.stepName == "window_running_state_commit") shouldBe 0
+
+      sql(s"ALTER TABLE delta.`$path` DROP CONSTRAINT wri_retry_order")
+      refreshMv("wri_retry_mv")
+      refreshMv("wri_retry_child")
+      // Dropping the constraint and the successful append each commit once.
+      mvDataVersion("wri_retry_mv") shouldBe beforeVersion + 2L
+      assertMvCorrect("wri_retry_mv", query)
+      assertMvCorrect("wri_retry_child", childQuery)
+      assertCascadeStorageMode("wri_retry_mv")
     }
 
     it("preserves ROWS positions while skipping empty fallback and suffix branches") {
