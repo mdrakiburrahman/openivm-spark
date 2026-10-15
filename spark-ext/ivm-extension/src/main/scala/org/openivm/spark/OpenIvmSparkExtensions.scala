@@ -47,6 +47,7 @@ class OpenIvmSparkExtensions extends (SparkSessionExtensions => Unit) {
         new NoOpRule
     }
     ext.injectOptimizerRule(session => new optimizer.RuntimeDeltaSizeRule(session))
+    ext.injectOptimizerRule(session => new optimizer.DistinctJoinReductionRule(session))
     ext.injectPlannerStrategy { session =>
       if (ChangePropagationFactory.forSession(session).requiresDmlInterception)
         new analyzer.IvmStrategy(session)
