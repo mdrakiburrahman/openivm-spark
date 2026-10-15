@@ -1,7 +1,7 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{FeatureGate, MvCatalog}
+import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, MvCatalog}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 abstract class CompileCacheScenarios extends IvmParitySpecBase("compile-cache") {
@@ -108,7 +108,10 @@ abstract class CompileCacheScenarios extends IvmParitySpecBase("compile-cache") 
         .collect()
         .flatMap(row => "(?i)delta\\.`([^`]*view_deltas[^`]+)`".r.findAllMatchIn(row.getString(0)).map(_.group(1)))
         .toSet
-      paths should have size 2
+      // CDF reads committed target changes without a scratch cascade. The
+      // intercept path still needs a fresh persisted cascade per refresh.
+      if (changeFeedMode == ChangeFeedMode.Cdf) paths shouldBe empty
+      else paths should have size 2
 
       sql("DELETE FROM cc_window_source WHERE id = 6")
       sql("INSERT INTO cc_window_source VALUES (8,'A',1,3)")
