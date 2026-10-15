@@ -47,6 +47,51 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     super.afterAll()
   }
 
+  "raw compile cache identity" should "cover the complete request and verified compiler generation" in {
+    val schema = StructType(Seq(StructField("id", IntegerType)))
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM db.source VERSION AS OF 1",
+      Map("source" -> schema),
+      Map("source" -> "db.source"),
+      Map("source" -> "/verified/source")
+    )
+    val tier = sharedCompiler.compileCacheTier(request)
+    val changedRequests = Seq(
+      request.copy(viewName = "other_mv"),
+      request.copy(viewSql = "SELECT id FROM db.source VERSION AS OF 2"),
+      request.copy(sources = Map("source" -> StructType(Seq(StructField("id", LongType))))),
+      request.copy(sourceQualifiedNames = Map("source" -> "other_db.source")),
+      request.copy(sourceSnapshotPinnedPaths = Map("source" -> "/other/source")),
+      request.copy(facts = request.facts.copy(runningWindowIncremental = true)),
+      request.copy(facts = request.facts.copy(schemaVersion = request.facts.schemaVersion + 1))
+    )
+    changedRequests.foreach(changed => sharedCompiler.compileCacheTier(changed) should not equal tier)
+    val nextCompiler = OpenIvmCompiler.build(extensionPath)
+    try nextCompiler.compileCacheTier(request) should not equal tier
+    finally nextCompiler.close()
+  }
+
+  it should "ignore map ordering and quantitative facts that native compilation does not consume" in {
+    val schema = StructType(Seq(StructField("id", IntegerType)))
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM a JOIN b ON a.id=b.id",
+      Map("a" -> schema, "b"        -> schema),
+      Map("a" -> "db.a", "b"        -> "db.b"),
+      Map("a" -> "/verified/a", "b" -> "/verified/b")
+    )
+    val reordered = request.copy(
+      sources = request.sources.toSeq.reverse.toMap,
+      sourceQualifiedNames = request.sourceQualifiedNames.toSeq.reverse.toMap,
+      sourceSnapshotPinnedPaths = request.sourceSnapshotPinnedPaths.toSeq.reverse.toMap,
+      facts = request.facts.copy(
+        tableStats = Map("a" -> org.openivm.spark.common.WorkloadTableStats(rowCount = Some(100)))
+      )
+    )
+    sharedCompiler.compileCacheTier(reordered) shouldBe sharedCompiler.compileCacheTier(request)
+  }
+
   "native view identity normalization" should "map internal tables without changing source references or literals" in {
     val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
     val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +

@@ -133,6 +133,24 @@ abstract class WindowCascadeReuseScenarios(compileCacheEnabled: Boolean)
   }
 
   describe("joined WINDOW_PARTITION cascade reuse") {
+    itCdf("replaces exactly the bounded integral-key limit including a NULL partition") {
+      sql("CREATE TABLE wcb_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
+      sql(
+        "INSERT INTO wcb_events SELECT id, 1, id FROM range(9999) " +
+          "UNION ALL SELECT CAST(NULL AS BIGINT), 1, -1 " +
+          "UNION ALL SELECT CAST(NULL AS BIGINT), 2, -2"
+      )
+      val query =
+        "SELECT id, seq, payload, LAG(payload) OVER (PARTITION BY id ORDER BY seq) AS previous_payload FROM wcb_events"
+      sql(s"CREATE MATERIALIZED VIEW wcb_mv AS $query")
+      sql("UPDATE wcb_events SET payload = payload + 1")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("wcb_mv")
+      assertMvCorrect("wcb_mv", query)
+      assertDirectCdfTargetWrite("wcb_mv")
+      rewrittenRows("wcb_mv").map(_.getString(ColSqlText)).mkString("\n") should include("id IS NULL")
+    }
+
     itCdf("retains atomic MERGE above the expanded bounded-key limit") {
       sql("CREATE TABLE wcl_events(id BIGINT, seq INT, payload BIGINT) USING DELTA")
       sql("INSERT INTO wcl_events SELECT id, 1, id FROM range(10001)")

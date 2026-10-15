@@ -571,6 +571,12 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
 
       MvMetadata.cachedCompiledSql(props, fp1, tier1) shouldBe Some("SQL")
       MvMetadata.cachedInitialLoadSql(props, fp1, tier1) shouldBe Some("INIT")
+      MvMetadata.cachedCompiledClassification(props, fp1, tier1) shouldBe Some(0 -> "AGGREGATE_GROUP")
+      MvMetadata.cachedCompiledClassification(
+        props - MvMetadata.compileCacheRefreshTypeKey(fp1, tier1),
+        fp1,
+        tier1
+      ) shouldBe None
       MvMetadata.cachedCompiledSql(props, fp2, tier1) shouldBe None
       MvMetadata.cachedCompiledSql(props, fp1, tier2) shouldBe None
     }
@@ -581,6 +587,35 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
 
       MvMetadata.compileCacheTier(off) should not equal MvMetadata.compileCacheTier(on)
       off.toJson shouldBe on.toJson
+    }
+
+    it("keys every structural fact while allowing quantitative statistics to change") {
+      val facts = WorkloadFacts()
+      val tier  = MvMetadata.compileCacheTier(facts)
+      MvMetadata.compileCacheTier(facts.copy(runningWindowIncremental = true)) should not equal tier
+      MvMetadata.compileCacheTier(facts.copy(schemaVersion = facts.schemaVersion + 1)) should not equal tier
+      MvMetadata.compileCacheTier(
+        facts.copy(
+          tableStats = Map("orders" -> WorkloadTableStats(rowCount = Some(100))),
+          columnStats = Map("orders.id" -> WorkloadColumnStats(ndv = Some(100))),
+          deltaStats = Map("orders" -> WorkloadDeltaStats(rowCount = Some(5)))
+        )
+      ) shouldBe tier
+    }
+
+    it("retires obsolete compiler generations without losing MV properties or current tiers") {
+      val initial = MvMetadata.withCompileCacheGeneration(Map("user_property" -> "keep"), "first") ++
+        MvMetadata.compiledProperties("schema", "first:tier", "old SQL", "old INIT", 2, "SIMPLE_PROJECTION") ++
+        Map(MvMetadata.CompiledInitialLoadSqlKey -> "authoritative INIT")
+      MvMetadata.withCompileCacheGeneration(initial, "first") shouldBe initial
+      val next = MvMetadata.withCompileCacheGeneration(initial, "second") ++
+        MvMetadata.compiledProperties("schema", "second:tier", "new SQL", "new INIT", 2, "SIMPLE_PROJECTION")
+      MvMetadata.cachedCompiledSql(next, "schema", "first:tier") shouldBe None
+      MvMetadata.cachedInitialLoadSql(next, "schema", "first:tier") shouldBe None
+      MvMetadata.cachedCompiledSql(next, "schema", "second:tier") shouldBe Some("new SQL")
+      next("user_property") shouldBe "keep"
+      next(MvMetadata.CompiledInitialLoadSqlKey) shouldBe "authoritative INIT"
+      MvMetadata.withCompileCacheGeneration(next, "second") shouldBe next
     }
   }
 

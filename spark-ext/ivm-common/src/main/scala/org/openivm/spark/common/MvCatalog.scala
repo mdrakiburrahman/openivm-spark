@@ -258,6 +258,7 @@ object MvMetadata {
   val SourceVersionAdvanceCascadePathKey: String  = "_ivm_source_version_advance_cascade_path"
 
   private val CompileCachePrefix: String                = "_ivm_compile_cache"
+  private val CompileCacheGenerationKey: String         = "_ivm_compile_cache_generation"
   private val CompileCacheSqlSuffix: String             = "sql"
   private val CompileCacheInitialLoadSuffix: String     = "initial_load_sql"
   private val CompileCacheRefreshTypeSuffix: String     = "refresh_type"
@@ -319,24 +320,18 @@ object MvMetadata {
     * stats that should be handled by Spark-side rewrites after cache lookup.
     */
   def compileCacheTier(facts: WorkloadFacts): String = {
-    val shapes = facts.deltaShape.toSeq
-      .sortBy(_._1)
-      .map { case (table, shape) => s"$table=${shape.compileFactValue}" }
-      .mkString(",")
-    val fks = facts.fkRelations
-      .sortBy(fk => (fk.childTable, fk.childColumns.mkString(","), fk.parentTable, fk.parentColumns.mkString(",")))
-      .map(fk =>
-        s"${fk.childTable}(${fk.childColumns.mkString(",")})->${fk.parentTable}(${fk.parentColumns.mkString(",")})/${fk.rely}"
-      )
-      .mkString(";")
-    val uniques = facts.uniqueKeys
-      .sortBy(key => (key.table, key.columns.mkString(",")))
-      .map(key => s"${key.table}(${key.columns.mkString(",")})/${key.rely}")
-      .mkString(";")
-    val raw =
-      s"dialect=${facts.targetDialect}|compileOnly=${facts.compileOnly}|cascade=${facts.forceViewDeltaCascade}|" +
-        s"insertOnly=${facts.assumeInsertOnly}|declareRelyFk=${facts.declareRelyFk}|shape=$shapes|fk=$fks|" +
-        s"unique=$uniques"
+    val structural = facts.copy(
+      fkRelations = facts.fkRelations.sortBy(fk =>
+        (fk.childTable, fk.childColumns.mkString(","), fk.parentTable, fk.parentColumns.mkString(","), fk.rely)
+      ),
+      uniqueKeys = facts.uniqueKeys.sortBy(key => (key.table, key.columns.mkString(","), key.rely)),
+      tableStats = Map.empty,
+      columnStats = Map.empty,
+      deltaStats = Map.empty
+    )
+    // Native e773 ignores quantitative statistics. Keep all structural wire
+    // fields, plus the bridge-only RELY declaration switch, in the identity.
+    val raw    = s"${structural.toJson}|declareRelyFk=${facts.declareRelyFk}"
     val digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes("UTF-8"))
     digest.map("%02x".format(_)).mkString
   }
@@ -366,6 +361,18 @@ object MvMetadata {
       tier: String
   ): Option[String] =
     properties.get(compileCacheInitialLoadSqlKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+
+  def cachedCompiledClassification(
+      properties: Map[String, String],
+      sourceSchemaFingerprint: String,
+      tier: String
+  ): Option[(Int, String)] =
+    for {
+      code <- properties
+        .get(compileCacheRefreshTypeKey(sourceSchemaFingerprint, tier))
+        .flatMap(value => Try(value.toInt).toOption)
+      name <- properties.get(compileCacheRefreshTypeNameKey(sourceSchemaFingerprint, tier)).filter(_.nonEmpty)
+    } yield code -> name
 
   def anyCachedInitialLoadSql(properties: Map[String, String], sourceSchemaFingerprint: String): Option[String] = {
     val prefix = s"$CompileCachePrefix:$sourceSchemaFingerprint:"
@@ -399,6 +406,18 @@ object MvMetadata {
       compileCacheRefreshTypeNameKey(sourceSchemaFingerprint, tier) -> refreshTypeName
     )
   }
+
+  /** SQL is reusable only within the verified compiler instance that produced
+    * it. Retire old generations together so application restarts do not keep
+    * appending complete SQL programs to the durable MV property map.
+    */
+  def withCompileCacheGeneration(properties: Map[String, String], generation: String): Map[String, String] =
+    if (properties.get(CompileCacheGenerationKey).contains(generation)) properties
+    else
+      properties.filterNot { case (key, _) =>
+        key.startsWith(CompileCachePrefix)
+      } +
+        (CompileCacheGenerationKey -> generation)
 
   private def compileCacheKey(sourceSchemaFingerprint: String, tier: String, suffix: String): String =
     s"$CompileCachePrefix:$sourceSchemaFingerprint:$tier:$suffix"

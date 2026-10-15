@@ -157,7 +157,8 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
-  /** Cache openivm compile/classification results per MV schema + facts tier.
+  /** Cache raw openivm compile/classification results per verified compiler
+    * generation, complete request identity, MV schema and structural facts.
     * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
     * the cached shape-stable SQL every time so per-refresh snapshot temp views
     * are recreated on each execution.

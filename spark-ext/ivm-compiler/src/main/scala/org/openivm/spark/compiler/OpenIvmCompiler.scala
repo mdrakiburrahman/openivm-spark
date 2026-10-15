@@ -2,11 +2,19 @@ package org.openivm.spark.compiler
 
 import java.io.{File, IOException}
 import java.nio.file.{Files, Path, Paths}
-import java.util.{Comparator, Locale}
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.{Comparator, Locale, UUID}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
+import org.openivm.spark.common.{
+  ForeignKeyRelation,
+  MemoryMainRefs,
+  MvMetadata,
+  PinnedSourcePathMissingException,
+  WorkloadFacts
+}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
@@ -90,6 +98,30 @@ class OpenIvmCompiler private (
 ) extends AutoCloseable {
 
   @volatile private var closed: Boolean = false
+
+  val cacheGeneration: String = UUID.randomUUID().toString
+
+  /** Cache the raw native program, never rewritten executable statements. The
+    * generation prevents reuse after a compiler/bridge restart or upgrade.
+    * Quantitative statistics are deliberately absent: the pinned native facts
+    * parser ignores them; Spark consumes current statistics after lookup.
+    */
+  def compileCacheTier(req: CompileRequest): String = {
+    val digest = MessageDigest.getInstance("SHA-256")
+    def add(value: String): Unit = {
+      val bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      digest.update(ByteBuffer.allocate(4).putInt(bytes.length).array())
+      digest.update(bytes)
+    }
+    Seq(req.viewName, req.viewSql, MvMetadata.compileCacheTier(req.facts)).foreach(add)
+    add(req.sources.size.toString)
+    req.sources.toSeq.sortBy(_._1).foreach { case (name, schema) => add(name); add(schema.json) }
+    Seq(req.sourceQualifiedNames, req.sourceSnapshotPinnedPaths).foreach { bindings =>
+      add(bindings.size.toString)
+      bindings.toSeq.sortBy(_._1).foreach { case (name, value) => add(name); add(value) }
+    }
+    s"$cacheGeneration:${digest.digest().map("%02x".format(_)).mkString}"
+  }
 
   /** Verify the native deployment once before allowing query-specific fallbacks.
     * The probe uses empty compiler tables; it never reads or writes Spark data.
