@@ -133,5 +133,33 @@ class DistinctJoinReductionCdfSpec extends IvmParitySpecBase("distinct-join-redu
         FROM t9_join"""
       compare(query)
     }
+
+    it("reduces duplicate-producing membership joins without a native DISTINCT wrapper") {
+      setupSmall()
+      for (membership <- Seq("EXISTS", "NOT EXISTS")) {
+        compare(s"""SELECT o.broker FROM sj_left o WHERE $membership (
+          SELECT 1 FROM sj_left l JOIN sj_right r ON l.account = r.account
+          WHERE l.broker <=> o.broker)""")
+        compare(s"""SELECT o.broker, COUNT(*) FROM sj_left o WHERE $membership (
+          SELECT 1 FROM sj_left l JOIN sj_right r ON l.account <=> r.account AND r.flag = 1
+          WHERE l.broker <=> o.broker) GROUP BY o.broker""")
+      }
+      setupSmall(right = Vector.empty)
+      compare("""SELECT o.broker FROM sj_left o WHERE NOT EXISTS (
+        SELECT 1 FROM sj_left l JOIN sj_right r ON l.account = r.account
+        WHERE l.broker <=> o.broker)""")
+    }
+
+    it("keeps membership joins whose correlation needs the right-side output") {
+      setupSmall()
+      for (membership <- Seq("EXISTS", "NOT EXISTS")) {
+        compare(
+          s"""SELECT o.broker FROM sj_left o WHERE $membership (
+          SELECT 1 FROM sj_left l JOIN sj_right r ON l.account = r.account
+          WHERE l.broker <=> o.broker AND r.flag = o.score)""",
+          mustReduce = false
+        )
+      }
+    }
   }
 }
