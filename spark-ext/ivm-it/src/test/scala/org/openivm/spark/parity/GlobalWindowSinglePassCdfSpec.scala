@@ -26,6 +26,44 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     "spark.openivm.catalogPreservesColumnCase"    -> "false"
   )
 
+  it("preserves the managed catalog target when creating grouped-window state") {
+    val key   = "spark.openivm.managedTablesRoot"
+    val prior = spark.conf.getOption(key)
+    spark.conf.set(key, s"$warehouseDir/Tables")
+    try {
+      sql("CREATE TABLE gw_managed_input(k BIGINT,v BIGINT) USING DELTA")
+      sql("INSERT INTO gw_managed_input VALUES(1,7),(1,7),(2,8),(3,NULL)")
+      val rank = if (backing) "Rank" else "rank"
+      val query = "WITH grouped AS (SELECT k,COUNT(*) AS n,COUNT(DISTINCT v) AS d," +
+        s"SUM(v) AS s FROM gw_managed_input GROUP BY k) SELECT k,n,d,s,DENSE_RANK() OVER(ORDER BY n DESC) AS $rank FROM grouped"
+      RefreshSqlLogCatalog.removeAll(spark)
+      sql(s"CREATE MATERIALIZED VIEW default.gw_managed_rank AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("default.gw_managed_rank")
+      MvCatalog.lookup(spark, id).get.properties.contains("_ivm_grouped_window_input_v1") shouldBe true
+      val writes = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .filter(_.contains("openivm_grouped_initial_"))
+      writes.length shouldBe 1
+      writes.head should startWith("CREATE TABLE `default`.")
+      assertMvCorrect("gw_managed_rank", query)
+      sql("INSERT INTO gw_managed_input VALUES(1,9),(4,10)")
+      sql("DELETE FROM gw_managed_input WHERE k=2")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("default.gw_managed_rank")
+      assertMvCorrect("gw_managed_rank", query)
+      sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .exists(_.contains("openivm_grouped_result_")) shouldBe true
+    } finally {
+      prior match {
+        case Some(value) => spark.conf.set(key, value)
+        case None        => spark.conf.unset(key)
+      }
+    }
+  }
+
   it("maintains the complete broker query from grouped state through mixed source and cash changes") {
     sql(
       "CREATE TABLE gw_group_trade(sk_broker_id BIGINT,sk_customer_id BIGINT,sk_security_id BIGINT," +

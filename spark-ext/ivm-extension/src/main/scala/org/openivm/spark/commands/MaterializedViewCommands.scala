@@ -3447,8 +3447,13 @@ case class CreateMaterializedViewCommand(
                 groupedInitial.foreach { initial =>
                   val temp = "openivm_grouped_initial_" + UUID.randomUUID().toString.replace("-", "")
                   initial.rows.createOrReplaceTempView(temp); groupedInitialView = Some(temp)
-                  dataWriteSql =
-                    createDataWriteSql(dataLocation, clusterClause, tblPropsClause, s"SELECT * FROM `$temp`", managedDataTarget)
+                  dataWriteSql = createDataWriteSql(
+                    dataLocation,
+                    clusterClause,
+                    tblPropsClause,
+                    s"SELECT * FROM `$temp`",
+                    managedDataTarget
+                  )
                 }
                 val ctasStmtKind = RefreshPerf.classify(dataWriteSql, "")
                 var attempt      = 0
