@@ -130,6 +130,99 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       } finally state.close()
     }
 
+    it("preserves timestamp and timestamp-NTZ microseconds in grouped snapshots and refreshes") {
+      import org.apache.spark.sql.DataFrame
+      import org.apache.spark.sql.functions._
+      Seq("TIMESTAMP", "TIMESTAMP_NTZ").foreach { kind =>
+        val initial = spark.sql(
+          s"SELECT CAST(1 AS BIGINT) g, CAST(7 AS BIGINT) v, " +
+            s"CAST('2024-01-01 01:02:03.123456' AS $kind) t"
+        )
+        val added = spark.sql(
+          s"SELECT CAST(1 AS BIGINT) g, CAST(8 AS BIGINT) v, " +
+            s"CAST('2024-01-01 01:02:03.654321' AS $kind) t"
+        )
+        def ordinary(df: DataFrame) = df
+          .groupBy("g")
+          .agg(count(lit(1L)).as("n"), min("t").as("lo"), max("t").as("hi"))
+        def summary(df: DataFrame) = df
+          .groupBy("g")
+          .agg(count(lit(1L)).as("n"), min("t").as("lo"), max("t").as("hi"), countDistinct("v").as("d"))
+        def exact(a: DataFrame, b: DataFrame): Unit = {
+          a.exceptAll(b).count() shouldBe 0L
+          b.exceptAll(a).count() shouldBe 0L
+        }
+        val state = new GroupedDistinctState(
+          spark,
+          "default.grouped_" + kind.toLowerCase(java.util.Locale.ROOT),
+          "timestamp-microseconds",
+          initial.schema,
+          summary(initial).schema,
+          Vector("g"),
+          "n",
+          Vector("v" -> "d")
+        )
+        try {
+          state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
+          exact(state.all("0"), summary(initial))
+          val current = initial.unionByName(added)
+          val next    = state.prepare(added.withColumn("openivm_multiplicity", lit(1L)), current, "0")(ordinary)
+          exact(next.summary, summary(current))
+          next.publish("1", Array[Byte](1))
+          exact(state.all("1"), summary(current))
+        } finally state.close()
+      }
+    }
+
+    it("preserves exact decimal digits and negative zero in grouped refresh payloads") {
+      import org.apache.spark.sql.DataFrame
+      import org.apache.spark.sql.functions._
+      val initial = spark.sql(
+        "SELECT CAST(1 AS BIGINT) g,CAST(7 AS BIGINT) v," +
+          "CAST('12345678901234567890.123456789012345678' AS DECIMAL(38,18)) amount," +
+          "CAST('-0.0' AS DOUBLE) z"
+      )
+      val added = spark.sql(
+        "SELECT CAST(1 AS BIGINT) g,CAST(8 AS BIGINT) v," +
+          "CAST('0.000000000000000001' AS DECIMAL(38,18)) amount,CAST('-0.0' AS DOUBLE) z"
+      )
+      def ordinary(df: DataFrame) = df
+        .groupBy("g")
+        .agg(
+          count(lit(1L)).as("n"),
+          min("amount").as("lo"),
+          max("amount").as("hi"),
+          sum("amount").as("total"),
+          min("z").as("zero")
+        )
+      def summary(df: DataFrame) = ordinary(df).join(df.groupBy("g").agg(countDistinct("v").as("d")), Seq("g"))
+      def exact(a: DataFrame, b: DataFrame): Unit = {
+        a.exceptAll(b).count() shouldBe 0L
+        b.exceptAll(a).count() shouldBe 0L
+        java.lang.Double.doubleToRawLongBits(a.head().getAs[Double]("zero")) shouldBe
+          java.lang.Double.doubleToRawLongBits(-0.0d)
+      }
+      val state = new GroupedDistinctState(
+        spark,
+        "default.grouped_decimal",
+        "exact-decimals",
+        initial.schema,
+        summary(initial).schema,
+        Vector("g"),
+        "n",
+        Vector("v" -> "d")
+      )
+      try {
+        state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
+        exact(state.all("0"), summary(initial))
+        val current = initial.unionByName(added)
+        val next    = state.prepare(added.withColumn("openivm_multiplicity", lit(1L)), current, "0")(ordinary)
+        exact(next.summary, summary(current))
+        next.publish("1", Array[Byte](1))
+        exact(state.all("1"), summary(current))
+      } finally state.close()
+    }
+
     it("reuses an already-open MV shard without creating a cache column family") {
       val view = "default.no_extra_family"
       val path = OpenIvmStatePaths.perMvDbPath(spark, view)

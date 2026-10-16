@@ -167,6 +167,40 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     mvDataVersion("gw_stats_rank") shouldBe before
   }
 
+  it("preserves timestamp microseconds through grouped-window commands") {
+    sql("CREATE TABLE gw_timestamp(k BIGINT,v BIGINT,t TIMESTAMP) USING DELTA")
+    sql(
+      "INSERT INTO gw_timestamp VALUES(1,7,TIMESTAMP '2024-01-01 01:02:03.123456')," +
+        "(2,8,TIMESTAMP '2024-01-01 01:02:03.654321')"
+    )
+    val rank = if (backing) "Rank" else "rank"
+    val query = s"WITH grouped AS (SELECT k,COUNT(*) AS n,COUNT(DISTINCT v) AS d," +
+      s"MIN(t) AS lo,MAX(t) AS hi FROM gw_timestamp GROUP BY k) " +
+      s"SELECT k,n,d,lo,hi,DENSE_RANK() OVER(ORDER BY n DESC) AS $rank FROM grouped"
+    sql(s"CREATE MATERIALIZED VIEW gw_timestamp_rank AS $query")
+    assertMvCorrect("gw_timestamp_rank", query)
+    val changes = Vector(
+      Vector(
+        "UPDATE gw_timestamp SET t=TIMESTAMP '2024-01-01 01:02:03.111111' WHERE k=1",
+        "INSERT INTO gw_timestamp VALUES(1,9,TIMESTAMP '2024-01-01 01:02:03.999999')",
+        "DELETE FROM gw_timestamp WHERE k=2"
+      ),
+      Vector("UPDATE gw_timestamp SET t=TIMESTAMP '2024-01-01 01:02:03.222222'")
+    )
+    changes.foreach { step =>
+      step.foreach(sql)
+      val before = mvDataVersion("gw_timestamp_rank")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("gw_timestamp_rank")
+      assertMvCorrect("gw_timestamp_rank", query)
+      sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .exists(_.contains("openivm_grouped_result_")) shouldBe true
+      mvDataVersion("gw_timestamp_rank") shouldBe before + 1L
+    }
+  }
+
   it("keeps the existing incremental grouped-rank path when grouped state is disabled") {
     val key   = FeatureGate.GroupedWindowStateEnabledKey
     val prior = spark.conf.getOption(key)

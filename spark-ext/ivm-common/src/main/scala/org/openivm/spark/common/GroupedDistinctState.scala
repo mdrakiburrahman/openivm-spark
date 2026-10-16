@@ -41,7 +41,13 @@ private[spark] final class GroupedDistinctState(
     ),
     "reserved grouped-state field"
   )
-  private val JsonOptions = Map("ignoreNullFields" -> "false", "timeZone" -> "UTC")
+  private val JsonOptions = Map(
+    "ignoreNullFields"   -> "false",
+    "timeZone"           -> "UTC",
+    "timestampFormat"    -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
+    "timestampNTZFormat" -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+    "mode"               -> "FAILFAST"
+  )
   private val mapper      = new ObjectMapper()
   private val path        = OpenIvmStatePaths.perMvDbPath(spark, view)
   private val db          = OpenIvmRocksDBRegistry.getOrOpen(spark, path, OpenIvmStatePaths.PerMvColumnFamilies)
@@ -67,7 +73,7 @@ private[spark] final class GroupedDistinctState(
   private val settings                = settingsFingerprint
   private def requireSettings(): Unit = require(settingsFingerprint == settings, "group-state SQL settings changed")
   private val identity =
-    "typed-frequency-v2\n" + program + "\n" + inputSchema.json + "\n" + summarySchema.json + "\n" + keys.mkString(",") +
+    "typed-frequency-v3\n" + program + "\n" + inputSchema.json + "\n" + summarySchema.json + "\n" + keys.mkString(",") +
       "\n" + channels.mkString(",") + "\n" + spark.conf.get("spark.sql.session.timeZone") + "\n" + settings
   private val g     = "__rd_g"; private val ch = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
   private val index = Vector(g, ch, value)
@@ -223,7 +229,10 @@ private[spark] final class GroupedDistinctState(
     )
     val tag      = AttributeReference(ch, IntegerType, nullable = false)()
     val valueTag = AttributeReference(tv, ValueSchema, nullable = false)()
-    val outputs  = child.output.map(a => if (keys.contains(a.name) || a.name == tg) a else a.withNullability(true))
+    // Payload slots can be nulled by Expand. Fresh IDs keep the optimizer from
+    // restoring the original input's non-nullability after constant folding.
+    val outputs =
+      child.output.map(a => if (keys.contains(a.name) || a.name == tg) a else a.withNullability(true).newInstance())
     val regular: Seq[Expression] = child.output ++ Seq(Literal(-1), empty)
     val projections = Vector(regular) ++ active.map { i =>
       val name = channels(i)._1; val a = source(name)
@@ -378,12 +387,16 @@ private[spark] final class GroupedDistinctState(
     next.values.foreach(_.valid())
     val prepared = new Prepared(epoch, cacheBefore, next.toVector, writes, misses.size)
     val completedRows = records.filter(_.getAs[Int](ch) == -1).map { r =>
-      val key = r.getAs[String](g)
-      val node = mapper
-        .readTree(r.getAs[String]("__rd_ordinary"))
-        .asInstanceOf[com.fasterxml.jackson.databind.node.ObjectNode]
-      channels.zipWithIndex.foreach { case ((_, name), i) => node.put(name, next(key).distinct(i)) }
-      key -> mapper.writeValueAsString(node)
+      val key     = r.getAs[String](g)
+      val payload = r.getAs[String]("__rd_ordinary")
+      // This is Spark's nonempty struct JSON. Preserve its numeric lexemes:
+      // parsing/re-emitting ordinary values through DoubleNode rounds DECIMAL.
+      val distinct = channels.zipWithIndex
+        .map { case ((_, name), i) =>
+          mapper.writeValueAsString(name) + ":" + next(key).distinct(i).toString
+        }
+        .mkString(",")
+      key -> (payload.dropRight(1) + "," + distinct + "}")
     }
     prepared.complete(completedRows)
   }
