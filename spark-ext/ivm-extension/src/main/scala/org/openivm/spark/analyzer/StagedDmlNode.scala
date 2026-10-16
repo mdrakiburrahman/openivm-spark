@@ -4,7 +4,10 @@ import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.delta.DeltaRelation
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.openivm.spark.common.{StagingCatalog, StagingDelta}
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
@@ -98,7 +101,14 @@ case class StagedDmlNode(
     val schema = StructType(
       plan.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata))
     )
-    val qe = spark.sessionState.executePlan(plan)
+    // Write-target relations may retain their V2-only tag; staging needs a batch-readable relation.
+    val readPlan = plan.transformUp { case relation: DataSourceV2Relation =>
+      relation.table match {
+        case delta: DeltaTableV2 => DeltaRelation.fromV2Relation(delta, relation, relation.options)
+        case _                   => relation
+      }
+    }
+    val qe = spark.sessionState.executePlan(readPlan)
     val externalRdd = qe.toRdd.mapPartitions { iter =>
       val converter = CatalystTypeConverters.createToScalaConverter(schema)
       iter.map(ir => converter(ir).asInstanceOf[Row])
