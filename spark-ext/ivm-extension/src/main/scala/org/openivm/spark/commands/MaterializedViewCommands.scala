@@ -37,7 +37,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
@@ -3321,10 +3321,20 @@ case class CreateMaterializedViewCommand(
       profile.timeStep("create_resolve_direct_mv_dependency_map", s"sources=${qualNames.size}") {
         mvDependencyMapProperties(resolveDirectMvDependencies(spark, name, qualNames))
       }
+    val groupedWindowPlan =
+      if (
+        FeatureGate.groupedWindowStateEnabled(spark) && effectiveRefreshType == RefreshTypeCode.WindowPartition &&
+        propagation.requiresMvCdf && !propagation.requiresDmlInterception && pinBinding.resolvedPins.isEmpty &&
+        topKViewSuffix.isEmpty
+      )
+        profile.timeStep("create_grouped_window_compile") {
+          GroupedWindowStatePlan.create(spark, metaName(name), originalQueryText, qualNames, qualSchemas, compiler)
+        }
+      else None
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
         queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++
-        watermarkProps ++ mvDependencyMapProps
+        watermarkProps ++ mvDependencyMapProps ++ groupedWindowPlan.toSeq.flatMap(_.properties)
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -3374,14 +3384,10 @@ case class CreateMaterializedViewCommand(
     val tblProps = renderTableProperties(dataTableProps)
     val tblPropsClause =
       if (tblProps.nonEmpty) s"TBLPROPERTIES (${tblProps.mkString(", ")}) " else ""
-    val dataWriteSql =
-      createDataWriteSql(
-        dataLocation,
-        clusterClause,
-        tblPropsClause,
-        viewBodySql,
-        spark.conf.getOption("spark.openivm.managedTablesRoot").map(_.trim).filter(_.nonEmpty).map(_ => dataIdent)
-      )
+    val managedDataTarget =
+      spark.conf.getOption("spark.openivm.managedTablesRoot").map(_.trim).filter(_.nonEmpty).map(_ => dataIdent)
+    var dataWriteSql =
+      createDataWriteSql(dataLocation, clusterClause, tblPropsClause, viewBodySql, managedDataTarget)
     val catalogRegistrationSql =
       createCatalogRegistrationSql(dataIdent, dataLocation)
     val preexistingCatalogRegistration = profile.timeStep("create_validate_catalog_registration") {
@@ -3407,6 +3413,8 @@ case class CreateMaterializedViewCommand(
     var writtenDataTableId: Option[String]      = None
     var createdPublicView: Option[CatalogTable] = None
     var publicationCommitted                    = false
+    var groupedInitial                          = Option.empty[GroupedWindowStatePlan.Initial]
+    var groupedInitialView                      = Option.empty[String]
     // CREATE PRE: re-verify each pinned source's physical identity at its
     // verified path immediately before the initial CTAS. A drop/recreate between
     // pin resolution and the write is a rebind and hard-fails before any owned
@@ -3428,6 +3436,20 @@ case class CreateMaterializedViewCommand(
             ) {
               reusedDeltaPath = DeltaTable.isDeltaTable(spark, dataLocation)
               if (!reusedDeltaPath) {
+                groupedInitial = groupedWindowPlan.flatMap { plan =>
+                  profile.timeStep("create_grouped_window_state") {
+                    plan.initial(
+                      watermarksBySource,
+                      StructType(physicalOutput.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
+                    )
+                  }
+                }
+                groupedInitial.foreach { initial =>
+                  val temp = "openivm_grouped_initial_" + UUID.randomUUID().toString.replace("-", "")
+                  initial.rows.createOrReplaceTempView(temp); groupedInitialView = Some(temp)
+                  dataWriteSql =
+                    createDataWriteSql(dataLocation, clusterClause, tblPropsClause, s"SELECT * FROM `$temp`", managedDataTarget)
+                }
                 val ctasStmtKind = RefreshPerf.classify(dataWriteSql, "")
                 var attempt      = 0
                 var done         = false
@@ -3437,6 +3459,7 @@ case class CreateMaterializedViewCommand(
                   var attemptSucceeded = false
                   try {
                     CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
+                    groupedInitial.foreach(_.verifySources(spark))
                     val dataWriteT0 = System.nanoTime()
                     val dataWriteOutcome =
                       try Right(spark.sql(dataWriteSql))
@@ -3493,6 +3516,7 @@ case class CreateMaterializedViewCommand(
           // still false) and is never retried or demoted.
           if (createPinnedIdentities.nonEmpty)
             verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
+          groupedInitial.foreach(_.verifySources(spark))
 
           writtenDataTableId = Some(
             deltaIdentityAt(spark, dataLocation)
@@ -3637,6 +3661,11 @@ case class CreateMaterializedViewCommand(
           // a `DeltaTable.history` read would submit a Spark job that has to
           // queue behind the concurrent Delta data writes for a task slot.
           val version = DeltaTableVersion.requireLatest(spark, dataLocation)
+          groupedInitial.foreach { initial =>
+            profile.timeStep("create_grouped_window_commit", s"version=$version") {
+              initial.commit(dataLocation, version)
+            }
+          }
           MvCatalog.upsert(spark, meta.copy(lastVersion = version))
           publicationCommitted = true
         }
@@ -3649,6 +3678,9 @@ case class CreateMaterializedViewCommand(
             cleanupFailedCreateArtifacts(spark, name, dataIdent, dataLocation, writtenDataTableId)
         }
         throw t
+    } finally {
+      groupedInitialView.foreach(spark.catalog.dropTempView)
+      groupedInitial.foreach(_.close())
     }
 
     recordInsightClassification(
@@ -4924,6 +4956,7 @@ case class RefreshMaterializedViewCommand(
       }
 
       var runningWindowStateUpdate = Option.empty[RunningWindowStateCache.Update]
+      var groupedWindowStateUpdate = Option.empty[GroupedWindowStatePlan.Refresh]
 
       def finalizeRefresh(cleanupMeta: MvMetadata): Unit = {
         // The authoritative pinned-identity gate has already run at the boundary
@@ -4938,6 +4971,9 @@ case class RefreshMaterializedViewCommand(
         val dataVersion = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
         runningWindowStateUpdate.foreach { update =>
           profile.timeStep("window_running_state_commit", s"version=$dataVersion") { update.commit(dataVersion) }
+        }
+        groupedWindowStateUpdate.foreach { update =>
+          profile.timeStep("window_grouped_state_commit", s"version=$dataVersion") { update.commit(dataVersion) }
         }
         val replacementMeta = preparedSourceAdvance.map(_.updatedMeta(cleanupMeta, dataVersion))
         val consumedBatches = preparedSourceAdvance.map(_.consumedBatches).getOrElse(changeBatches)
@@ -6117,7 +6153,37 @@ case class RefreshMaterializedViewCommand(
               )
             }
 
-            if (directAggregateMerge.isDefined) {
+            val groupedWindowRefresh =
+              if (
+                FeatureGate.groupedWindowStateEnabled(spark) && meta.refreshType == RefreshTypeCode.WindowPartition &&
+                propagation.requiresMvCdf && !propagation.requiresDmlInterception && preparedSourceAdvance.isEmpty &&
+                refreshResolvedPins.isEmpty && cdfChangeBatches.size == changeBatches.size
+              )
+                profile.timeStep("window_grouped_prepare") {
+                  GroupedWindowStatePlan.load(spark, viewNameStr, meta, freshSchemas).flatMap { plan =>
+                    val deltas = meta.sourceTables.map { source =>
+                      source -> spark.table(s"`${StagingDeltaView.deltaViewName(source).replace("`", "``")}`")
+                    }.toMap
+                    plan.refresh(meta, cdfChangeBatches, deltas)
+                  }
+                }
+              else None
+            if (groupedWindowRefresh.nonEmpty) {
+              val update = groupedWindowRefresh.get
+              val select = update.register(); sourceSnapshotTempViews += update.temporaryView
+              executeSqlAt(
+                s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select",
+                0
+              )
+              groupedWindowStateUpdate = Some(update)
+              profile.appendStep("window_grouped_applied", s"hits=${update.hits};misses=${update.misses}", 0L)
+              RefreshPerf.emit(
+                refreshId,
+                viewLabel,
+                "fast_path",
+                s"outcome='grouped_window_state' hits=${update.hits} misses=${update.misses}"
+              )
+            } else if (directAggregateMerge.isDefined) {
               advanceStmtCounterPast(0)
               RefreshPerf.logStmt(refreshId, viewLabel, 0, "view_delta_inlined", 0L)
               profile.appendStep(

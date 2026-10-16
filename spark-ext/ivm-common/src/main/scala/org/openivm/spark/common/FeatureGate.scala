@@ -411,6 +411,11 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Opt-in exact grouped-state cache before rank/window evaluation. Unsupported
+    * shapes retain the native incremental program; CDF mode only.
+    */
+  val GroupedWindowStateEnabledKey: String = "spark.openivm.refresh.groupedWindowState.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -709,6 +714,12 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def groupedWindowStateEnabled(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(GroupedWindowStateEnabledKey)
+      .map(_.toBoolean)
+      .getOrElse(boolConf(spark.sparkContext.getConf, GroupedWindowStateEnabledKey, default = false))
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)

@@ -1019,6 +1019,45 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
     }
 
+  /** Materialize a bounded prefix scan. Exceeding either limit fails the entire
+    * read rather than returning incomplete grouped state.
+    */
+  def boundedPrefixScan(
+      columnFamily: String,
+      prefix: Array[Byte],
+      maxEntries: Int,
+      maxBytes: Long
+  ): Vector[(Array[Byte], Array[Byte])] = {
+    require(maxEntries >= 0 && maxBytes >= 0L, "Prefix read limits must be nonnegative")
+    withNativeHandle("bounded_prefix_scan") {
+      val iterator = dbHandle.newIterator(cf(columnFamily))
+      try {
+        val rows      = Vector.newBuilder[(Array[Byte], Array[Byte])]
+        var count     = 0
+        var bytes     = 0L
+        val sizeProbe = ByteBuffer.allocate(0)
+        iterator.seek(prefix)
+        while (iterator.isValid && startsWith(iterator.key(), prefix)) {
+          if (count >= maxEntries)
+            throw new IllegalStateException("RocksDB prefix read exceeded its row or byte limit")
+          // Probe lengths before copying a potentially large value into the JVM.
+          val entryBytes = iterator.key(sizeProbe).toLong + iterator.value(sizeProbe).toLong
+          if (entryBytes > maxBytes - bytes)
+            throw new IllegalStateException("RocksDB prefix read exceeded its row or byte limit")
+          val key   = iterator.key()
+          val value = iterator.value()
+          OpenIvmMetrics.recordColumnFamilyRead(columnFamily, entryBytes)
+          rows += key -> value
+          count += 1
+          bytes += entryBytes
+          iterator.next()
+        }
+        iterator.status()
+        rows.result()
+      } finally iterator.close()
+    }
+  }
+
   def currentVersion: Long = withNativeHandle("current_version") {
     versionValue
   }

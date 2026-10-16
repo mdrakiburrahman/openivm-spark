@@ -43,6 +43,93 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
   }
 
   describe("versioned prototype state") {
+    it("keeps fused grouped DISTINCT state exact and rejects SQL-settings changes before publication") {
+      import org.apache.spark.sql.{DataFrame, Row}
+      import org.apache.spark.sql.functions._
+      import org.apache.spark.sql.types._
+      val group = "group.key"; val value = "value ` key"; val countName = "row.count"; val distinct = "distinct.v"
+      def quoted(name: String)  = "`" + name.replace("`", "``") + "`"
+      val inputSchema           = new StructType().add(group, StringType).add(value, LongType).add("amount", DoubleType)
+      def input(rows: Seq[Row]) = spark.createDataFrame(rows.asJava, inputSchema)
+      def ordinary(rows: DataFrame) =
+        rows.groupBy(col(quoted(group))).agg(count(lit(1L)).as(countName), sum("amount").as("total"))
+      def summary(rows: DataFrame) =
+        rows
+          .groupBy(col(quoted(group)))
+          .agg(count(lit(1L)).as(countName), sum("amount").as("total"), countDistinct(col(quoted(value))).as(distinct))
+      def exact(a: DataFrame, b: DataFrame): Unit = {
+        a.exceptAll(b).count() shouldBe 0L
+        b.exceptAll(a).count() shouldBe 0L
+      }
+      val initial = input(Seq(Row("a", 1L, 1.5), Row("a", 1L, 1.5), Row(null, 2L, 1.0)))
+      val current = input(Seq(Row("a", 1L, 1.5), Row("a", 2L, 2.0), Row(null, 2L, 1.0)))
+      val delta = input(Seq(Row("a", 1L, 1.5)))
+        .withColumn("openivm_multiplicity", lit(-1L))
+        .unionByName(input(Seq(Row("a", 2L, 2.0))).withColumn("openivm_multiplicity", lit(1L)))
+      val view = "default.fused_grouped_distinct"
+      val db = OpenIvmRocksDBRegistry.getOrOpen(
+        spark,
+        OpenIvmStatePaths.perMvDbPath(spark, view),
+        OpenIvmStatePaths.PerMvColumnFamilies
+      )
+      val neighbor = RocksDBCodec.utf8("grouped_distinct:v1:g;neighbor")
+      db.withBatch(b => db.put(b, "default", neighbor, RocksDBCodec.utf8("keep")))
+      val state = new GroupedDistinctState(
+        spark,
+        view,
+        "unit",
+        inputSchema,
+        summary(initial).schema,
+        Vector(group),
+        countName,
+        Vector(value -> distinct),
+        maxCache = 1
+      )
+      try {
+        state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
+        state.cachedSize("0") shouldBe 0L
+        val prepared = state.prepare(delta, current, "0")(ordinary)
+        exact(prepared.summary, summary(current))
+        intercept[IllegalStateException] {
+          db.withBatch { batch =>
+            prepared.stageInto(db, batch, "uncommitted"); throw new IllegalStateException("rollback")
+          }
+        }
+        exact(state.all("0"), summary(initial))
+        GroupedDistinctState.checkpoint(spark, view).map(_.toVector) shouldBe Some(Vector[Byte](0))
+        prepared.publish("1", Array[Byte](1, 2, 3))
+        GroupedDistinctState.checkpoint(spark, view).map(_.toVector) shouldBe Some(Vector[Byte](1, 2, 3))
+        exact(state.all("1"), summary(current))
+        state.cachedSize("1") should be <= 1L
+        db.get("default", neighbor).map(RocksDBCodec.fromUtf8) shouldBe Some("keep")
+        val adaptive      = "spark.sql.adaptive.autoBroadcastJoinThreshold"
+        val priorAdaptive = spark.sessionState.conf.getAllConfs.get(adaptive)
+        spark.conf.set(adaptive, "-1")
+        try state.cachedSize("1") should be <= 1L
+        finally
+          priorAdaptive match {
+            case Some(value) => spark.conf.set(adaptive, value)
+            case None        => spark.conf.unset(adaptive)
+          }
+        val setting = "spark.sql.ansi.enabled"
+        val prior   = spark.sessionState.conf.getAllConfs.get(setting)
+        spark.conf.set(setting, (!spark.conf.get(setting).toBoolean).toString)
+        try {
+          intercept[IllegalArgumentException] { state.cachedSize("1") }.getMessage should include(
+            "SQL settings changed"
+          )
+          intercept[IllegalArgumentException] {
+            state.prepareBootstrap(summary(current), "2")
+          }.getMessage should include("SQL settings changed")
+        } finally
+          prior match {
+            case Some(value) => spark.conf.set(setting, value)
+            case None        => spark.conf.unset(setting)
+          }
+        exact(state.all("1"), summary(current))
+      } finally state.close()
+    }
+
     it("reuses an already-open MV shard without creating a cache column family") {
       val view = "default.no_extra_family"
       val path = OpenIvmStatePaths.perMvDbPath(spark, view)

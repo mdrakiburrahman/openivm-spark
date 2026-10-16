@@ -2100,7 +2100,7 @@ object SparkRefreshRewriter {
     *   3. Leading AND: `WHERE openivm_timestamp OP '...'::TIMESTAMP AND <filter>`
     *      — strip only the `openivm_timestamp … AND ` prefix.
     */
-  private[common] def stripTimestampPredicate(sql: String): String = {
+  private[spark] def stripTimestampPredicate(sql: String): String = {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
