@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, UniqueKey, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -90,6 +90,94 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       )
     )
     sharedCompiler.compileCacheTier(reordered) shouldBe sharedCompiler.compileCacheTier(request)
+  }
+
+  "compiler source facts" should "bind qualified structural facts to the declared synthetic tables" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM app.a JOIN app.b ON a.id=b.id",
+      Map("a" -> StructType.fromDDL("id INT"), "b" -> StructType.fromDDL("id INT")),
+      Map("a" -> "catalog.app.a", "b"              -> "app.b"),
+      facts = WorkloadFacts(
+        deltaShape = Map("`catalog`.`app`.`a`" -> DeltaShape.InsertOnly, "`app`.`b`" -> DeltaShape.Unchanged),
+        fkRelations = Seq(ForeignKeyRelation("catalog.app.a", Seq("id"), "app.b", Seq("id"))),
+        uniqueKeys = Seq(UniqueKey("app.b", Seq("id")))
+      )
+    )
+    val bound = sharedCompiler.compilerSourceFacts(request)
+    bound.deltaShape shouldBe Map("a" -> DeltaShape.InsertOnly, "b" -> DeltaShape.Unchanged)
+    bound.fkRelations shouldBe Seq(ForeignKeyRelation("a", Seq("id"), "b", Seq("id")))
+    bound.uniqueKeys shouldBe Seq(UniqueKey("b", Seq("id")))
+    request.facts.deltaShape.keySet should contain("`app`.`b`")
+  }
+
+  it should "not borrow unchanged-source facts from a differently cased physical relation" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM app.Customer",
+      Map("Customer" -> StructType.fromDDL("id INT")),
+      Map("Customer" -> "app.Customer"),
+      facts = WorkloadFacts(deltaShape = Map("app.customer" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerSourceFacts(request).deltaShape shouldBe empty
+  }
+
+  it should "ignore foreign and ambiguous qualified facts instead of matching their trailing table name" in {
+    val schema = StructType.fromDDL("id INT")
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM a",
+      Map("a" -> schema, "b"     -> schema),
+      Map("a" -> "app.same", "b" -> "app.same"),
+      facts = WorkloadFacts(
+        declareRelyFk = true,
+        deltaShape = Map("other.a" -> DeltaShape.Unchanged, "app.same" -> DeltaShape.Unchanged),
+        fkRelations = Seq(ForeignKeyRelation("other.a", Seq("id"), "b", Seq("id"))),
+        uniqueKeys = Seq(UniqueKey("other.a", Seq("id")))
+      )
+    )
+    val bound = sharedCompiler.compilerSourceFacts(request)
+    bound.deltaShape shouldBe empty
+    bound.fkRelations shouldBe empty
+    bound.uniqueKeys shouldBe empty
+    sharedCompiler.declareRelyFkStatements(request) shouldBe empty
+  }
+
+  it should "keep conflicting short and qualified shapes conservative" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM app.a",
+      Map("a" -> StructType.fromDDL("id INT")),
+      Map("a" -> "app.a"),
+      facts = WorkloadFacts(deltaShape = Map("a" -> DeltaShape.General, "app.a" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerSourceFacts(request).deltaShape shouldBe Map("a" -> DeltaShape.General)
+  }
+
+  it should "prune the same native join branches for qualified and short source identities" in {
+    val schema = StructType.fromDDL("id INT")
+    val request = CompileRequest(
+      "mv_fact_bindings",
+      "SELECT a.id FROM app.a JOIN app.b ON a.id=b.id JOIN app.c ON b.id=c.id",
+      Map("a" -> schema, "b"  -> schema, "c"  -> schema),
+      Map("a" -> "app.a", "b" -> "app.b", "c" -> "app.c"),
+      facts = WorkloadFacts(deltaShape =
+        Map("app.a" -> DeltaShape.InsertOnly, "app.b" -> DeltaShape.Unchanged, "app.c" -> DeltaShape.Unchanged)
+      )
+    )
+    val qualified = sharedCompiler.compile(request)
+    val short = sharedCompiler.compile(
+      request.copy(facts =
+        request.facts.copy(
+          deltaShape = Map("a" -> DeltaShape.InsertOnly, "b" -> DeltaShape.Unchanged, "c" -> DeltaShape.Unchanged)
+        )
+      )
+    )
+    val unknown = sharedCompiler.compile(request.copy(facts = request.facts.copy(deltaShape = Map.empty)))
+    def ctes(sql: String): Int = "(?i)\\bAS\\s*\\(".r.findAllIn(sql).size
+    ctes(qualified.sql) shouldBe ctes(short.sql)
+    ctes(qualified.sql) should be < ctes(unknown.sql)
+    qualified.refreshTypeName shouldBe short.refreshTypeName
   }
 
   "native view identity normalization" should "map internal tables without changing source references or literals" in {

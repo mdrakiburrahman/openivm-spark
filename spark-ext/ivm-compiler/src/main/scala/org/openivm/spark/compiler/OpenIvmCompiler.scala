@@ -9,6 +9,7 @@ import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{
+  DeltaShape,
   ForeignKeyRelation,
   MemoryMainRefs,
   MvMetadata,
@@ -370,7 +371,7 @@ class OpenIvmCompiler private (
     //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
     //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
     //                                   MV-over-MV chains never fall back to FULL_REFRESH.
-    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(req.facts.toJson)}');\n"
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(compilerSourceFacts(req).toJson)}');\n"
     sb.toString
   }
 
@@ -562,24 +563,53 @@ class OpenIvmCompiler private (
     )
   }
 
+  private def compilerSourceName(req: CompileRequest, table: String): Option[String] = {
+    val parts = SparkTimeTravelSql.caseSensitiveSegments(table)
+    val matches = req.sources.keysIterator.filter { short =>
+      SparkTimeTravelSql.caseSensitiveSegments(short) == parts ||
+      req.sourceQualifiedNames.get(short).exists(SparkTimeTravelSql.caseSensitiveSegments(_) == parts)
+    }.toVector
+    if (matches.size == 1) Some(matches.head) else None
+  }
+
+  /** The body is bound against synthetic main.<short> tables. Structural facts
+    * must use those same identities; a Spark schema is not a DuckDB schema.
+    * Ignore unbound/ambiguous facts rather than matching another schema by suffix.
+    * Preserve case because the caller's physical catalog can be case-sensitive.
+    */
+  private[compiler] def compilerSourceFacts(req: CompileRequest): WorkloadFacts = {
+    val shapes = req.facts.deltaShape.toSeq
+      .flatMap { case (table, shape) =>
+        compilerSourceName(req, table).map(_ -> shape)
+      }
+      .groupBy(_._1)
+      .map { case (table, entries) =>
+        val distinct = entries.map(_._2).distinct
+        table -> (if (distinct.size == 1) distinct.head else DeltaShape.General)
+      }
+    req.facts.copy(
+      deltaShape = shapes,
+      fkRelations = req.facts.fkRelations.flatMap { fk =>
+        for {
+          child  <- compilerSourceName(req, fk.childTable)
+          parent <- compilerSourceName(req, fk.parentTable)
+        } yield fk.copy(childTable = child, parentTable = parent)
+      }.distinct,
+      uniqueKeys = req.facts.uniqueKeys.flatMap { key =>
+        compilerSourceName(req, key.table).map(table => key.copy(table = table))
+      }.distinct
+    )
+  }
+
   private[compiler] def declareRelyFkStatements(req: CompileRequest): Seq[String] = {
     if (!req.facts.declareRelyFk) return Seq.empty
-
-    def normalizeTableName(table: String): Option[String] = {
-      val exactShort = req.sources.get(table).map(_ => table)
-      val fromQual = req.sourceQualifiedNames.collectFirst {
-        case (short, qualified) if qualified.equalsIgnoreCase(table) && req.sources.contains(short) => short
-      }
-      val trailing = table.split('.').lastOption.filter(req.sources.contains)
-      exactShort.orElse(fromQual).orElse(trailing)
-    }
 
     req.facts.fkRelations
       .filter(fk => fk.rely && fk.childColumns.nonEmpty && fk.parentColumns.nonEmpty)
       .flatMap { fk =>
         for {
-          child  <- normalizeTableName(fk.childTable)
-          parent <- normalizeTableName(fk.parentTable)
+          child  <- compilerSourceName(req, fk.childTable)
+          parent <- compilerSourceName(req, fk.parentTable)
         } yield declareRelyFkStatement(fk.copy(childTable = child, parentTable = parent))
       }
       .distinct

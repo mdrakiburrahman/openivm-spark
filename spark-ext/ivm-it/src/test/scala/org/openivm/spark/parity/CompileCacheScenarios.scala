@@ -21,6 +21,67 @@ abstract class CompileCacheScenarios extends IvmParitySpecBase("compile-cache") 
   }
 
   describe("compile-classification cache") {
+    it("binds qualified source facts and keeps cached programs separate as the changed join source switches") {
+      sql("CREATE DATABASE cc_bound_sources")
+      try {
+        Seq("a", "b", "c").foreach { table =>
+          sql(s"CREATE TABLE cc_bound_sources.cc_bound_$table(id INT, v INT) USING DELTA")
+          sql(s"INSERT INTO cc_bound_sources.cc_bound_$table VALUES (1,10),(2,20),(3,30)")
+        }
+        sql("DELETE FROM cc_bound_sources.cc_bound_a WHERE id IN (2,3)")
+        val query = "SELECT a.id, a.v AS av, b.v AS bv, c.v AS cv " +
+          "FROM cc_bound_sources.cc_bound_a a " +
+          "JOIN cc_bound_sources.cc_bound_b b ON a.id=b.id " +
+          "JOIN cc_bound_sources.cc_bound_c c ON b.id=c.id"
+        sql(s"CREATE MATERIALIZED VIEW cc_bound_mv AS $query")
+
+        def loggedDeltas: Vector[(String, String)] =
+          sql("SHOW OPENIVM QUERY LOG")
+            .where(
+              "view_name IN ('cc_bound_mv','default.cc_bound_mv') AND " +
+                "(category = 'fused_view_delta_select' OR stmt_kind = 'view_delta_ctas')"
+            )
+            .select("refresh_id", "sql_text")
+            .collect()
+            .toVector
+            .map(r => r.getString(0) -> r.getString(1))
+
+        def refreshAndCheck(changed: String, cacheHit: Boolean = false): Unit = {
+          val prior = loggedDeltas.map(_._1).toSet
+          refreshMv("cc_bound_mv")
+          assertMvCorrect("cc_bound_mv", query)
+          val fresh = loggedDeltas.filterNot(r => prior(r._1))
+          fresh should have size 1
+          val (refreshId, deltaSql) = fresh.head
+          Seq("a", "b", "c").foreach { table =>
+            val references = deltaSql.contains(s"openivm_delta_cc_bound_$table")
+            withClue(s"changed=$changed, referenced=$table: ") { references shouldBe (table == changed) }
+          }
+          if (cacheHit) {
+            val detail = sql("SHOW OPENIVM REFRESH PROFILE")
+              .where(s"refresh_id = '$refreshId' AND step_name = 'generate_refresh_sql.compile'")
+              .select("detail")
+              .collect()
+              .head
+              .getString(0)
+            detail should include("compile_cache_hit=true")
+          }
+        }
+
+        sql("INSERT INTO cc_bound_sources.cc_bound_a VALUES (2,20)")
+        refreshAndCheck("a")
+        sql("UPDATE cc_bound_sources.cc_bound_b SET v=99 WHERE id=1")
+        refreshAndCheck("b")
+        sql("DELETE FROM cc_bound_sources.cc_bound_c WHERE id=2")
+        refreshAndCheck("c")
+        sql("INSERT INTO cc_bound_sources.cc_bound_a VALUES (3,30)")
+        refreshAndCheck("a", cacheHit = true)
+      } finally {
+        sql("DROP MATERIALIZED VIEW IF EXISTS cc_bound_mv")
+        sql("DROP DATABASE cc_bound_sources CASCADE")
+      }
+    }
+
     it("reuses cached SQL on a cache hit while preserving correctness after restore") {
       sql("CREATE TABLE IF NOT EXISTS cc_sales(region STRING, amount INT) USING DELTA")
       sql("INSERT INTO cc_sales VALUES ('us', 10)")
