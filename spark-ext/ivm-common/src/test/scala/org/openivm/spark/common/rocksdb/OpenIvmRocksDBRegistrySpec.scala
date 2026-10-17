@@ -1358,6 +1358,45 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         .map(RocksDBCodec.fromUtf8) shouldBe Some("retry")
     }
 
+    it("retains only the newest committed generations and drops abandoned uploads") {
+      val stateRoot  = newDir("state-sync-retain-local")
+      val remoteRoot = newDir("state-sync-retain-remote")
+      val spark = newSpark(
+        "state-sync-retain",
+        Seq(
+          FeatureGate.StatePathKey                  -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey               -> remoteRoot.toURI.toString,
+          FeatureGate.StateSyncRetainGenerationsKey -> "3"
+        )
+      )
+      val dbPath = new File(stateRoot, "_openivm/mvs/retain/rocksdb").getAbsolutePath
+      val db     = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      def publish(value: String): Unit = {
+        db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("generation"), RocksDBCodec.utf8(value)))
+        OpenIvmStateSync.backupNow(spark)
+      }
+      publish("1")
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, _, remote) =>
+        fs.create(remote, true).close()
+        throw new java.io.IOException("abandoned upload")
+      }
+      intercept[java.io.IOException](publish("abandoned")).getMessage shouldBe "abandoned upload"
+      OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
+      (2 to 5).foreach(index => publish(index.toString))
+
+      val control   = new File(remoteRoot, ".openivm-state-sync")
+      val committed = new File(control, "commits").list().filter(_.endsWith(".commit")).map(_.stripSuffix(".commit"))
+      committed should have length 3
+      new File(control, "snapshots").list().toSet shouldBe committed.toSet
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(new File(stateRoot, "_openivm"))
+      OpenIvmStateSync.resetForTesting()
+      OpenIvmRocksDBRegistry
+        .getOrOpen(spark, dbPath, Seq("meta"))
+        .get("meta", RocksDBCodec.utf8("generation"))
+        .map(RocksDBCodec.fromUtf8) shouldBe Some("5")
+    }
+
     it("preserves the previous committed snapshot after interrupted packed upload") {
       val stateRoot  = newDir("state-sync-interrupted-local")
       val remoteRoot = newDir("state-sync-interrupted-remote")

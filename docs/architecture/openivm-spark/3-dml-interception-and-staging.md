@@ -521,9 +521,11 @@ Citation: `StagingCatalog.scala:152-160`; the put is at `StagingCatalog.scala:16
 
 Decoded schema:
 
-| Location                       | Key                                                            | Value                       |
-| ------------------------------ | -------------------------------------------------------------- | --------------------------- |
-| per-base RocksDB, `staging` CF | composite `(txnTsMillis: Long big-endian, stagingPath: UTF-8)` | composite `(opType: UTF-8)` |
+| Location                       | Key                                                            | Value                                                 |
+| ------------------------------ | -------------------------------------------------------------- | ----------------------------------------------------- |
+| per-base RocksDB, `staging` CF | composite `(txnTsMillis: Long big-endian, stagingPath: UTF-8)` | composite `(opType: UTF-8)`                           |
+| per-base RocksDB, `ledger` CF  | `source`                                                       | composite `(deltaTableId: UTF-8, version: Long big-endian)` |
+| per-base RocksDB, `gc` CF      | `stagingPath: UTF-8` of a pruned record                        | empty                                                 |
 
 The index DB's `table_index` CF maps `baseTable -> baseDbPath`, written at
 `StagingCatalog.scala:169-180`.
@@ -620,7 +622,11 @@ After staging exists, refresh follows this lifecycle:
 1. `StagingDeltaView.buildSourceDeltaViewSql` builds signed delta temp views.
 1. `MaterializedViewCommands` executes the rewritten refresh SQL.
 1. `postRefreshCleanup` advances the MV version and marks staging paths consumed.
-1. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs.
+1. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs and
+   tombstones their locations in the same write; `forgetConsumed` drops the refreshing MV's
+   consumption markers for records that no longer exist.
+1. After the refresh publishes its state, `OpenIvmGarbageCollector` deletes the tombstoned
+   locations (section 3.14).
 
 Citations:
 
@@ -633,3 +639,65 @@ Citations:
 The important property is that refresh reads the OpenIVM staging index, not
 Delta CDF. That is the reason the DML interception tee is on the critical path
 for every MV-backed base-table mutation.
+
+______________________________________________________________________
+
+## 3.13 Source change ledger
+
+Interception alone cannot see every commit of a source. Native streaming sinks commit without a
+logical write plan, writers without the extension bypass the rule, and a restarted Fabric driver
+restores the newest published state snapshot, which can predate records written just before the
+previous driver stopped. Any such commit would be silently missing from every dependent MV.
+
+`SourceChangeLedger` closes the gap. Each base table's `ledger` entry is the Delta version (and
+Delta table id) up to which its staging records describe every change:
+
+- `StagedDmlNode` and `StagedTableReplacementNode` reconcile the table first, then publish their
+  records together with the version they commit in one RocksDB write, under the table's mutation
+  lock. A write that was not the table's only commit since reconciliation has its interval
+  captured from the Delta log instead; a write that committed nothing publishes nothing.
+- `REFRESH` (and `CREATE`, before taking its watermark) reconciles every base-table source. Commits
+  after the ledger position are captured from the Delta log: appended files (streaming appends,
+  blind inserts) as `INSERT` rows read through `DeltaLog.createDataFrame`, other changes as the
+  exact `old EXCEPT ALL new` / `new EXCEPT ALL old` multiset difference, and intervals that change
+  the schema or cannot be read as an empty `OVERWRITE`, which dependents apply as a full refresh.
+  Commits that change no rows (OPTIMIZE, VACUUM, property changes) only advance the position.
+- A table with dependents but no ledger entry (state written before the ledger existed) publishes
+  one `OVERWRITE`, so each existing dependent recomputes once.
+
+MV sources (matched by short name, as downstream records are) are not reconciled; their
+refreshes publish the downstream records. Instead each refresh compares the MV's recorded
+`lastVersion` with its live Delta version. Rows that differ from the recorded version mean a
+refresh committed after the restored snapshot (or a failed refresh was not rolled back), so
+incremental apply would replay consumed deltas: the refresh becomes a full recompute
+(`state_lag_full_refresh`), and a cascading MV's signed delta for downstream views starts at the
+recorded version, the state those views reflect. If that version is no longer readable, consumers
+receive an `OVERWRITE`. Row-preserving commits (OPTIMIZE, VACUUM, properties) and a RESTORE back
+to the recorded version, as in-process rollbacks perform, are not a lag.
+
+## 3.14 Staging storage reclamation
+
+Staging (`_ivm/staging`), view-delta (`_ivm/view_deltas`) and trigger (`_openivm/triggers`)
+locations are reclaimed by `OpenIvmGarbageCollector`:
+
+Records under a key no materialized view reads, such as the view-delta records a view without
+consumers leaves under its own name, are pruned by that view's refresh (`pruneUnconsumed`); a
+view created later starts after them.
+
+1. Before a refresh publishes its state (`OpenIvmStateSync.backupNow`), `prepare` reads the
+   tombstones and every location still referenced by staging records or MV metadata.
+1. After the publish returns, `collect` deletes the tombstoned locations nothing references,
+   including the inputs of cached view deltas (`openivm-cache:` refs) still awaiting consumers. With
+   state sync, the newest published snapshot therefore never references a deleted location;
+   without it, local RocksDB is durable and deletion is immediate.
+1. At most once per `spark.openivm.gc.orphanSweepInterval` (default `6h`), a background sweep
+   deletes locations no record referenced at `prepare` time that are older than
+   `spark.openivm.gc.orphanGracePeriod` (default `24h`), left by drivers that stopped between
+   writing and recording a location, and mirrored telemetry spans under
+   `spark.openivm.telemetry.oneLakeDir` older than `spark.openivm.telemetry.oneLakeDir.retention`
+   (default `7d`). The sweep touches only the file system.
+
+State-sync publishes keep the newest `spark.openivm.stateSync.retainGenerations` (default `10`,
+minimum `2`) committed generations, plus no snapshot or pending marker older than them, deleting
+at most 25 entries per publish so an existing backlog drains without stalling one. Set
+`spark.openivm.gc.enabled=false` to disable reclamation.

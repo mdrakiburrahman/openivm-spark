@@ -146,13 +146,13 @@ class StagedDmlBatchReadSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       val target      = retainedTarget(tableName, Map("versionAsOf" -> "1"))
       val stagingPath = new File(warehouse, "options-before").getAbsolutePath
       StagedDmlNode(
-        spark.sessionState.sqlParser.parsePlan("SELECT 1"),
+        spark.sessionState.sqlParser.parsePlan(s"UPDATE $tableName SET name = 'final'"),
         Seq((Filter(Literal(true), target), stagingPath, "DELETE")),
         s"default.$tableName"
       ).run(spark)
 
       assertRows(spark.read.format("delta").load(stagingPath), "SELECT 1 AS id, 'original' AS name")
-      assertRows(spark.table(tableName), "SELECT 1 AS id, 'changed' AS name")
+      assertRows(spark.table(tableName), "SELECT 1 AS id, 'final' AS name")
     }
   }
 }

@@ -12,7 +12,7 @@ import scala.jdk.CollectionConverters._
   */
 private[common] object OpenIvmStatePaths {
   val PerMvColumnFamilies: Seq[String]            = Seq("meta", "properties", "consumed", "cdf_watermarks")
-  val BaseTableColumnFamilies: Seq[String]        = Seq("staging")
+  val BaseTableColumnFamilies: Seq[String]        = Seq("staging", "ledger", "gc")
   val SourceDependencyColumnFamilies: Seq[String] = Seq("dependent_mvs")
 
   private def canonicalLocalPath(path: String): String =

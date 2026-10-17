@@ -23,20 +23,21 @@ import scala.collection.mutable
 /**
  * Runnable command wrapping DELETE / UPDATE / MERGE / INSERT / OVERWRITE operations.
  *
- * Execution contract:
- *   1. Set [[IvmDmlInterceptorRule.bypass]] to prevent re-interception.
+ * Execution contract (under the base table's mutation lock):
+ *   1. Set [[IvmDmlInterceptorRule.bypass]] to prevent re-interception, and capture any
+ *      unrecorded commit of the table ([[SourceChangeLedger.reconcileLocked]]).
  *   2. For each op in [[stagingOps]] (pre-DML): execute the plan and write rows
  *      to [[stagingPath]] as a Delta table (append). If a staging write fails,
  *      the exception propagates and [[dml]] is never executed.
  *   3. Execute [[dml]] via `executePlan`.  Delta re-lowers the plan if it is
  *      still in pre-lowered form; if it is already `ReplaceData` / `WriteDelta`
  *      it passes through analysis unchanged and is physically executed by Delta.
- *      Publish the pre-DML staging records only after this commit succeeds, so
- *      an OCC retry cannot consume a phantom delta from the failed attempt.
  *   4. For each op in [[postStagingOps]] (post-DML): same as step 2 but executed
- *      after [[dml]] completes so the plan reads the updated table state, then
- *      publish its staging record.
- *   5. Clear [[IvmDmlInterceptorRule.bypass]] in the `finally` block.
+ *      after [[dml]] completes so the plan reads the updated table state.
+ *   5. Publish every record together with the committed table position in one write
+ *      ([[SourceChangeLedger.publishWrite]]), so an OCC retry cannot consume a phantom delta
+ *      and a failure after the commit leaves the commit to be captured from the Delta log.
+ *   6. Clear [[IvmDmlInterceptorRule.bypass]] in the `finally` block.
  *
  * @param dml             the original DML logical plan (pre- or post-Delta-lowered)
  * @param stagingOps      pre-DML sequence of (plan, stagingPath, opType) tuples
@@ -59,10 +60,7 @@ case class StagedDmlNode(
       val previousBypass = IvmDmlInterceptorRule.bypass.get()
       IvmDmlInterceptorRule.bypass.set(true)
       try {
-        val recordedDeltas =
-          if (OpenIvmInsightsBroker.hasActiveRegularSparkCapture(spark))
-            Some(mutable.ArrayBuffer.empty[StagingDelta])
-          else None
+        val before = SourceChangeLedger.reconcileLocked(spark, baseTable)
         val preDeltas = stagingOps.map { case (preReadPlan, stagPath, opTyp) =>
           writeStagingDelta(spark, preReadPlan, stagPath, opTyp)
         }
@@ -76,18 +74,20 @@ case class StagedDmlNode(
             throw failure
         }
 
-        preDeltas.foreach { delta =>
-          StagingCatalog.record(spark, delta)
-          recordedDeltas.foreach(_ += delta)
+        // Records publish only once complete: if staging the post-DML image fails, nothing is
+        // published and the commit is captured from the Delta log by the next reconciliation.
+        val deltas = mutable.ArrayBuffer.empty[StagingDelta] ++= preDeltas
+        try
+          for ((postReadPlan, stagPath, opTyp) <- postStagingOps)
+            deltas += writeStagingDelta(spark, postReadPlan, stagPath, opTyp)
+        catch {
+          case failure: Throwable =>
+            deltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
+            throw failure
         }
-        for ((postReadPlan, stagPath, opTyp) <- postStagingOps) {
-          val delta = writeStagingDelta(spark, postReadPlan, stagPath, opTyp)
-          StagingCatalog.record(spark, delta)
-          recordedDeltas.foreach(_ += delta)
-        }
-        recordedDeltas.foreach(deltas =>
-          StagedDmlNode.emitChangeCapture(spark, baseTable, deltas.toVector, dependentMaterializedViews)
-        )
+        val published = SourceChangeLedger.publishWrite(spark, baseTable, before, deltas.toVector)
+        if (OpenIvmInsightsBroker.hasActiveRegularSparkCapture(spark))
+          StagedDmlNode.emitChangeCapture(spark, baseTable, published, dependentMaterializedViews)
       } finally {
         IvmDmlInterceptorRule.bypass.set(previousBypass)
       }

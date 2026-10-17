@@ -51,6 +51,41 @@ object DeltaCommitClassifier {
   def classifyShape(spark: SparkSession, tableNameOrPath: String, lastConsumedVersion: Long): DeltaShape =
     shapeOf(classify(spark, tableNameOrPath, lastConsumedVersion))
 
+  /** Whether the table's rows at its latest version equal its rows at `version`: every later
+    * commit changes no rows, counting from the last RESTORE back to `version` when there is one.
+    * Unreadable history answers `false`.
+    *
+    * @param spark           active session
+    * @param tableNameOrPath table name or Delta path
+    * @param version         committed version the rows are compared with
+    */
+  def rowsUnchangedSince(spark: SparkSession, tableNameOrPath: String, version: Long): Boolean = {
+    val deltaLog = deltaLogFor(spark, tableNameOrPath)
+    val latest   = deltaLog.update().version
+    if (latest <= version) latest == version
+    else {
+      val commits = deltaLog
+        .getChanges(version + 1L, failOnDataLoss = false)
+        .takeWhile(_._1 <= latest)
+        .map { case (commitVersion, actions) => commitVersion -> actions.toVector }
+        .toVector
+      commits.map(_._1) == (version + 1L to latest) && {
+        val restored = commits.lastIndexWhere { case (_, actions) => restoresTo(actions, version) }
+        commits.drop(restored + 1).forall { case (_, actions) => classifyCommit(actions) == Noop }
+      }
+    }
+  }
+
+  private def restoresTo(actions: Seq[Action], version: Long): Boolean =
+    actions.collectFirst { case info: CommitInfo => info }.exists { info =>
+      info.operation.trim.equalsIgnoreCase("RESTORE") &&
+      info.operationParameters
+        .get("version")
+        .map(normalizeParameter)
+        .flatMap(value => scala.util.Try(value.toLong).toOption)
+        .contains(version)
+    }
+
   def shapeOf(verdict: BatchVerdict): DeltaShape =
     verdict match {
       case Noop       => DeltaShape.Unchanged

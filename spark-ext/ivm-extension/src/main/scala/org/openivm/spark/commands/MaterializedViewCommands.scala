@@ -35,7 +35,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
-import org.openivm.spark.analyzer.IvmDmlInterceptorRule
+import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
@@ -596,6 +596,35 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
   * never demoted to FULL_REFRESH.
   */
 private[commands] final class SourceIdentityRebindingException(message: String) extends RuntimeException(message)
+
+/** Committed MV data that the MV's recorded state does not describe.
+  *
+  * @param liveVersion current Delta version of the MV's data table
+  */
+private[commands] final case class MvStateLag(liveVersion: Long)
+
+private[commands] object MvStateLag {
+
+  /** Detect MV rows that differ from the version the MV's state records, as left by a refresh
+    * that committed after the newest published state snapshot a restarted driver restored, by a
+    * failed refresh that was not rolled back, or by a writer outside OpenIVM. Commits that change
+    * no rows (OPTIMIZE, VACUUM, property changes) and rollbacks that RESTORE the recorded version
+    * are not a lag. Unreadable history counts as a lag, so the MV recomputes.
+    *
+    * @param spark active session
+    * @param meta  the MV's recorded state
+    */
+  def detect(spark: SparkSession, meta: MvMetadata): Option[MvStateLag] = {
+    val live = DeltaTableVersion.requireLatest(spark, meta.location)
+    val lagging =
+      live != meta.lastVersion && (
+        live < meta.lastVersion || meta.lastVersion < 0L ||
+          (try !DeltaCommitClassifier.rowsUnchangedSince(spark, meta.location, meta.lastVersion)
+          catch { case NonFatal(_) => true })
+      )
+    if (lagging) Some(MvStateLag(live)) else None
+  }
+}
 
 private[commands] object MvCommandHelper {
 
@@ -3248,8 +3277,12 @@ case class CreateMaterializedViewCommand(
           }
           recovered
         case None =>
+          val tracked = qualNames.filterNot(pinnedVersions.contains)
+          // Records describing every committed source change up to now precede the watermark,
+          // so this MV, whose initial load reads those changes, never consumes them.
+          if (propagation.requiresDmlInterception) SourceChangeLedger.reconcile(spark, tracked)
           MvMetadata.changeWatermarkProperties(
-            propagation.currentWatermarks(spark, qualNames.filterNot(pinnedVersions.contains))
+            propagation.currentWatermarks(spark, tracked)
           ) ++ pinnedWatermarks
       }
     }
@@ -3827,7 +3860,11 @@ case class RefreshMaterializedViewCommand(
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
+      // Garbage is read before the publish and deleted only after it, so the published state
+      // never references a deleted staging location.
+      val garbage = OpenIvmGarbageCollector.prepare(spark)
       OpenIvmStateSync.backupNow(spark)
+      OpenIvmGarbageCollector.collect(spark, garbage)
       rows
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
@@ -4609,6 +4646,24 @@ case class RefreshMaterializedViewCommand(
           .map(_.changeBatches.map(batch => batch.baseTable -> batch.startVersionInclusive).toMap)
           .getOrElse(Map.empty)
 
+      // A restarted driver restores the newest published state snapshot, which can predate a
+      // refresh that already committed MV data; incremental apply would then replay its deltas.
+      val stateLag: Option[MvStateLag] =
+        if (preparedSourceAdvance.nonEmpty) None
+        else MvStateLag.detect(spark, meta)
+      stateLag.foreach { lag =>
+        logWarning(
+          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='state_lag_full_refresh' " +
+            s"recorded_version=${meta.lastVersion} live_version=${lag.liveVersion}"
+        )
+      }
+      // Capture base-table commits no staging record describes (native streaming appends, writes
+      // without the extension, records lost to a state restore) before collecting changes.
+      if (propagation.requiresDmlInterception)
+        profile.timeStep("metadata_pre_sql", "phase=reconcile_sources") {
+          SourceChangeLedger.reconcile(spark, changeFeedSources)
+        }
+
       // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
       // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
@@ -4820,7 +4875,7 @@ case class RefreshMaterializedViewCommand(
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
-      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty && stateLag.isEmpty) {
         // No source-consuming mutation, but the frozen deltas are still consumed
         // here: gate on pinned identity first so a rebound pinned MV never reports
         // a clean no-op or consumes frozen state.
@@ -4868,6 +4923,7 @@ case class RefreshMaterializedViewCommand(
 
       if (
         FeatureGate.noopFastExitEnabled(spark) &&
+        stateLag.isEmpty &&
         meta.refreshType != RefreshTypeCode.FullRefresh &&
         cdfChangeBatches.size == changeBatches.size &&
         cdfChangeBatches.nonEmpty &&
@@ -5116,8 +5172,8 @@ case class RefreshMaterializedViewCommand(
       // FULL_REFRESH at CREATE.
       lazy val replaceBatch: Boolean =
         hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
-      if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
-        if (meta.refreshType != RefreshTypeCode.FullRefresh)
+      if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch || stateLag.nonEmpty) {
+        if (meta.refreshType != RefreshTypeCode.FullRefresh && stateLag.isEmpty)
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
           )
@@ -5196,11 +5252,13 @@ case class RefreshMaterializedViewCommand(
             propagation.requiresDmlInterception && meta.emitsCascadeViewDelta
           val cascadeKeys: Set[String] =
             if (emitsSignedDelta) downstreamSourceKeysForThisMv else Set.empty
+          // Consumers reflect this MV at its recorded version, which a state lag places before the
+          // live one, so the signed delta starts there.
           val cascadePreRefreshVersion: Option[Long] =
             if (!emitsSignedDelta) None
             else
               Some(profile.timeStep("pin_full_refresh_cascade_version", "source=delta_log_snapshot") {
-                DeltaTableVersion.requireLatest(spark, meta.location)
+                if (stateLag.nonEmpty) meta.lastVersion else DeltaTableVersion.requireLatest(spark, meta.location)
               })
           // Write-ahead guard BEFORE the recompute INSERT OVERWRITE (the first
           // source-consuming MV write); abort before mutation if it can't be set.
@@ -5275,6 +5333,7 @@ case class RefreshMaterializedViewCommand(
               preRefreshVersion = preVersion,
               exactDiff = exactDiff
             )
+            var cascadeOpType = StagingDelta.OpTypes.MvViewDelta
             profile.timeStep(
               "full_refresh_cascade_snapshot",
               s"pre_version=$preVersion;exact_diff=$exactDiff;consumers=${cascadeKeys.size}"
@@ -5283,12 +5342,30 @@ case class RefreshMaterializedViewCommand(
               val t0               = System.nanoTime()
               var cascadeSucceeded = false
               try {
-                spark
-                  .sql(cascadeSelect)
-                  .write
-                  .format("delta")
-                  .mode("overwrite")
-                  .save(cascadePath)
+                try
+                  spark
+                    .sql(cascadeSelect)
+                    .write
+                    .format("delta")
+                    .mode("overwrite")
+                    .save(cascadePath)
+                catch {
+                  // The lagging recorded version may no longer be readable (e.g. vacuumed); an
+                  // empty OVERWRITE makes every consumer recompute instead.
+                  case NonFatal(unreadable) if stateLag.nonEmpty =>
+                    logWarning(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot diff from recorded version " +
+                        s"$preVersion; consumers refresh fully",
+                      unreadable
+                    )
+                    spark
+                      .sql(s"SELECT * FROM ${sqlIdent(fullRefreshTarget)} WHERE 1 = 0")
+                      .write
+                      .format("delta")
+                      .mode("overwrite")
+                      .save(cascadePath)
+                    cascadeOpType = StagingDelta.OpTypes.Overwrite
+                }
                 cascadeSucceeded = true
               } finally {
                 sqlLog.record(
@@ -5311,7 +5388,7 @@ case class RefreshMaterializedViewCommand(
                     spark,
                     StagingDelta(
                       baseTable = triggerKey,
-                      opType = StagingDelta.OpTypes.MvViewDelta,
+                      opType = cascadeOpType,
                       stagingPath = cascadePath,
                       txnTs = txnTs,
                       consumedBy = Seq.empty
@@ -6618,6 +6695,9 @@ case class RefreshMaterializedViewCommand(
                                 executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
                                 executeSqlAt(plan.restoreSql, plan.insertStmtIdx)
                               }
+                              // The compensation restores the recorded rows at a new version;
+                              // record it so the next refresh does not mistake it for a state lag.
+                              MvCatalog.advance(spark, name, DeltaTableVersion.requireLatest(spark, meta.location))
                               logInfo(
                                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                                   "outcome='window_cascade_compensated' reason='target_write_failed'"
@@ -6823,7 +6903,16 @@ case class RefreshMaterializedViewCommand(
                   val cascadeCacheOn = FeatureGate.fuseScratchCascadeCacheEnabled(spark)
                   val stagingPathForCascade =
                     fusedScratchView match {
-                      case Some(view) if cascadeCacheOn => StagingDeltaView.CachedViewDeltaRef.encode(view)
+                      case Some(view) if cascadeCacheOn =>
+                        // The cached rows are recomputed from this refresh's inputs on re-resolution.
+                        StagingDeltaView.CachedViewDeltaRef.registerInputs(
+                          view,
+                          changeBatches
+                            .collect { case batch: StagingChangeBatch => batch.deltas.map(_.stagingPath) }
+                            .flatten
+                            .toSet
+                        )
+                        StagingDeltaView.CachedViewDeltaRef.encode(view)
                       case Some(view) if triggerKeys.nonEmpty =>
                         spark
                           .table(s"global_temp.$view")
@@ -8072,6 +8161,12 @@ case class RefreshMaterializedViewCommand(
         .groupBy(_._1)
         .map { case (t, pairs) => t -> pairs.map(_._2) }
       propagation.pruneConsumed(spark, viewsByTable)
+      StagingCatalog.forgetConsumed(
+        spark,
+        viewNameStr,
+        viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
+      )
+      if (!viewsByTable.contains(viewNameStr)) StagingCatalog.pruneUnconsumed(spark, viewNameStr)
 
       if (!meta.emitsCascadeViewDelta && !suppressNonCascadeTrigger) {
         val upstreamShortName = name.identifier
@@ -8155,6 +8250,11 @@ case class RefreshMaterializedViewCommand(
         .groupBy(_._1)
         .map { case (t, pairs) => t -> pairs.map(_._2) }
       propagation.pruneConsumed(spark, viewsByTable)
+      StagingCatalog.forgetConsumed(
+        spark,
+        viewNameStr,
+        viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
+      )
     }
   }
 

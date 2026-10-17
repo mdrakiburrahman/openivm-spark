@@ -125,6 +125,8 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       createdAt = new Timestamp(System.currentTimeMillis()),
       properties = Map.empty
     )
+    // CREATE MATERIALIZED VIEW records the source's change position before registering the view.
+    SourceChangeLedger.reconcile(spark, Seq(qn))
     MvCatalog.upsert(spark, meta)
     qn
   }

@@ -1,6 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.SparkConf
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.sql.SparkSession
 
 /**
@@ -48,6 +49,31 @@ object FeatureGate {
     * local-only behavior unchanged.
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+
+  /** Number of newest published state-sync snapshot generations kept under [[StateSyncUriKey]];
+    * older generations are deleted after each publish. Restore only reads the newest one. Minimum 2.
+    */
+  val StateSyncRetainGenerationsKey: String  = "spark.openivm.stateSync.retainGenerations"
+  val StateSyncRetainGenerationsDefault: Int = 10
+
+  /** Whether OpenIVM deletes staging, view-delta and trigger locations that no durable state
+    * references any more (default `true`).
+    */
+  val GcEnabledKey: String = "spark.openivm.gc.enabled"
+
+  /** Minimum age of an unreferenced staging, view-delta or trigger location before the orphan
+    * sweep deletes it; it must exceed the longest write that stages data before recording it.
+    */
+  val GcOrphanGracePeriodKey: String     = "spark.openivm.gc.orphanGracePeriod"
+  val GcOrphanGracePeriodDefault: String = "24h"
+
+  /** Minimum interval between orphan sweeps of one driver. */
+  val GcOrphanSweepIntervalKey: String     = "spark.openivm.gc.orphanSweepInterval"
+  val GcOrphanSweepIntervalDefault: String = "6h"
+
+  /** Age after which mirrored span objects under [[OneLakeTelemetryDirKey]] are deleted. */
+  val TelemetryOneLakeRetentionKey: String     = "spark.openivm.telemetry.oneLakeDir.retention"
+  val TelemetryOneLakeRetentionDefault: String = "7d"
 
   /** Required Hadoop filesystem root for archived native streaming checkpoints.
     *
@@ -469,6 +495,23 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def stateSyncRetainGenerations(spark: SparkSession): Int =
+    math.max(2, spark.sparkContext.getConf.getInt(StateSyncRetainGenerationsKey, StateSyncRetainGenerationsDefault))
+
+  def gcEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, GcEnabledKey, default = true)
+
+  def gcOrphanGracePeriodMs(spark: SparkSession): Long =
+    JavaUtils.timeStringAsMs(spark.sparkContext.getConf.get(GcOrphanGracePeriodKey, GcOrphanGracePeriodDefault))
+
+  def gcOrphanSweepIntervalMs(spark: SparkSession): Long =
+    JavaUtils.timeStringAsMs(spark.sparkContext.getConf.get(GcOrphanSweepIntervalKey, GcOrphanSweepIntervalDefault))
+
+  def telemetryOneLakeRetentionMs(spark: SparkSession): Long =
+    JavaUtils.timeStringAsMs(
+      spark.sparkContext.getConf.get(TelemetryOneLakeRetentionKey, TelemetryOneLakeRetentionDefault)
+    )
 
   def streamingCheckpointArchiveUri(conf: SparkConf): Option[String] =
     conf
