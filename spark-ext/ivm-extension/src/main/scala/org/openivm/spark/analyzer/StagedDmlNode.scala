@@ -1,10 +1,13 @@
 package org.openivm.spark.analyzer
 
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.delta.DeltaRelation
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.openivm.spark.common.{StagingCatalog, StagingDelta}
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
@@ -69,7 +72,7 @@ case class StagedDmlNode(
           spark.sessionState.executePlan(dml).executedPlan.executeCollect()
         } catch {
           case failure: Throwable =>
-            preDeltas.foreach(delta => cleanupStagingPath(spark, delta.stagingPath, failure))
+            preDeltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
             throw failure
         }
 
@@ -82,7 +85,9 @@ case class StagedDmlNode(
           StagingCatalog.record(spark, delta)
           recordedDeltas.foreach(_ += delta)
         }
-        recordedDeltas.foreach(deltas => emitChangeCapture(spark, deltas.toVector))
+        recordedDeltas.foreach(deltas =>
+          StagedDmlNode.emitChangeCapture(spark, baseTable, deltas.toVector, dependentMaterializedViews)
+        )
       } finally {
         IvmDmlInterceptorRule.bypass.set(previousBypass)
       }
@@ -98,45 +103,99 @@ case class StagedDmlNode(
     val schema = StructType(
       plan.output.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata))
     )
-    val qe = spark.sessionState.executePlan(plan)
+    // Write-target relations may retain their V2-only tag; staging needs a batch-readable relation.
+    val readPlan = plan.transformUp { case relation: DataSourceV2Relation =>
+      relation.table match {
+        case delta: DeltaTableV2 => DeltaRelation.fromV2Relation(delta, relation, relation.options)
+        case _                   => relation
+      }
+    }
+    val qe = spark.sessionState.executePlan(readPlan)
     val externalRdd = qe.toRdd.mapPartitions { iter =>
       val converter = CatalystTypeConverters.createToScalaConverter(schema)
       iter.map(ir => converter(ir).asInstanceOf[Row])
     }
-    try {
-      spark
-        .createDataFrame(externalRdd, schema)
-        .write
-        .format("delta")
-        .mode("append")
-        .save(stagPath)
-    } catch {
+    StagedDmlNode.writeStaging(spark, spark.createDataFrame(externalRdd, schema), baseTable, stagPath, opTyp)
+  }
+}
+
+private[analyzer] object StagedDmlNode {
+  private val mutationLocks = new ConcurrentHashMap[String, AnyRef]()
+
+  def withBaseTableMutationLock[A](baseTable: String)(body: => A): A = {
+    val key       = baseTable.trim.toLowerCase(Locale.ROOT)
+    val candidate = new Object
+    val existing  = mutationLocks.putIfAbsent(key, candidate)
+    val lock      = if (existing == null) candidate else existing
+    lock.synchronized(body)
+  }
+
+  /** Write `rows` to a fresh staging path, leaving no partial output behind on failure.
+    *
+    * @param spark       active session
+    * @param rows        rows to stage, in the base table's column order
+    * @param baseTable   qualified name of the base table the rows describe
+    * @param stagingPath fresh staging location for this op
+    * @param opType      one of [[StagingDelta.OpTypes]]
+    */
+  def writeStaging(
+      spark: SparkSession,
+      rows: DataFrame,
+      baseTable: String,
+      stagingPath: String,
+      opType: String
+  ): StagingDelta = {
+    try rows.write.format("delta").mode("append").save(stagingPath)
+    catch {
       case failure: Throwable =>
-        cleanupStagingPath(spark, stagPath, failure)
+        cleanupStagingPath(spark, stagingPath, failure)
         throw failure
     }
     StagingCatalog.ensureTables(spark)
     StagingDelta(
       baseTable = baseTable,
-      opType = opTyp,
-      stagingPath = stagPath,
+      opType = opType,
+      stagingPath = stagingPath,
       txnTs = new Timestamp(System.currentTimeMillis()),
       consumedBy = Seq.empty
     )
   }
 
-  private def cleanupStagingPath(spark: SparkSession, stagPath: String, failure: Throwable): Unit =
-    try {
-      val path = new Path(stagPath)
-      val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
-      if (fs.exists(path) && !fs.delete(path, true)) {
-        throw new IllegalStateException(s"Failed to clean uncommitted OpenIVM staging path: $stagPath")
-      }
-    } catch {
-      case cleanupFailure: Throwable => failure.addSuppressed(cleanupFailure)
-    }
+  /** Delete an unpublished staging path.
+    *
+    * @param spark       active session
+    * @param stagingPath staging location that no catalog record references
+    */
+  def deleteStagingPath(spark: SparkSession, stagingPath: String): Unit = {
+    val path = new Path(stagingPath)
+    val fs   = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+    if (fs.exists(path) && !fs.delete(path, true))
+      throw new IllegalStateException(s"Failed to clean uncommitted OpenIVM staging path: $stagingPath")
+  }
 
-  private def emitChangeCapture(spark: SparkSession, deltas: Seq[StagingDelta]): Unit = {
+  /** Delete an unpublished staging path after `failure`, recording any cleanup error on it.
+    *
+    * @param spark       active session
+    * @param stagingPath staging location that no catalog record references
+    * @param failure     the error that abandoned the staging write
+    */
+  def cleanupStagingPath(spark: SparkSession, stagingPath: String, failure: Throwable): Unit =
+    try deleteStagingPath(spark, stagingPath)
+    catch { case cleanupFailure: Throwable => failure.addSuppressed(cleanupFailure) }
+
+  /** Emit the regular-Spark change-capture insight for published staging records.
+    *
+    * @param spark                      active session
+    * @param baseTable                  qualified name of the written base table
+    * @param deltas                     staging records published for the write
+    * @param dependentMaterializedViews MVs whose change feed receives the write
+    */
+  def emitChangeCapture(
+      spark: SparkSession,
+      baseTable: String,
+      deltas: Seq[StagingDelta],
+      dependentMaterializedViews: Seq[String]
+  ): Unit = {
     if (deltas.isEmpty || dependentMaterializedViews.isEmpty) return
     OpenIvmInsightsBroker.emit(spark) {
       val modelContext  = OpenIvmInsightsBroker.currentModelContext(spark)
@@ -177,18 +236,6 @@ case class StagedDmlNode(
       )
     }
     ()
-  }
-}
-
-private[analyzer] object StagedDmlNode {
-  private val mutationLocks = new ConcurrentHashMap[String, AnyRef]()
-
-  def withBaseTableMutationLock[A](baseTable: String)(body: => A): A = {
-    val key       = baseTable.trim.toLowerCase(Locale.ROOT)
-    val candidate = new Object
-    val existing  = mutationLocks.putIfAbsent(key, candidate)
-    val lock      = if (existing == null) candidate else existing
-    lock.synchronized(body)
   }
 
   private def signedChange(opType: String): Map[String, Any] =

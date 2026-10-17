@@ -15,12 +15,30 @@ private[spark] final case class StreamingLifecycleSettings(
 
 private[spark] object StreamingLifecycleSettings {
 
+  private val ProgressRetentionKey = "spark.sql.streaming.numRecentProgressUpdates"
   private val DurationLiteral =
     "([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)\\s*([\\p{L}]+)".r
   private val MaxNanos = Decimal.valueOf(Long.MaxValue)
 
   def fromSpark(spark: SparkSession): StreamingLifecycleSettings =
     parse(key => spark.conf.getOption(key))
+
+  /** Validate native progress availability before creating or changing a writer.
+    *
+    * @param spark session whose native streaming settings apply to the writer
+    */
+  def validateProgressRetention(spark: SparkSession): Unit =
+    spark.conf.getOption(ProgressRetentionKey).foreach { configured =>
+      val retainsProgress =
+        try configured.trim.toInt >= 2
+        catch { case NonFatal(_) => false }
+      if (!retainsProgress)
+        StreamingTableErrors.invalid(
+          s"Configuration '$ProgressRetentionKey' must be an integer of at least 2 for OpenIVM streaming tables. " +
+            "Remove the override to use Spark's default; a value of 1 leaves the native progress buffer empty. " +
+            "OpenIVM requires native progress to reconcile writer health when listener events are unavailable."
+        )
+    }
 
   def parse(read: String => Option[String]): StreamingLifecycleSettings =
     StreamingLifecycleSettings(

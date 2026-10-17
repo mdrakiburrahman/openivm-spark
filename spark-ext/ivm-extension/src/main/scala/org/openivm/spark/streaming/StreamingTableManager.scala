@@ -142,6 +142,7 @@ object StreamingTableManager {
       spec: StreamingTableSpec,
       insight: InsightOperation
   ): StreamingTableStatus = {
+    StreamingLifecycleSettings.validateProgressRetention(spark)
     StreamingTableMetadata.validateProvider(spec)
     StreamingTableMetadata.validateUserProperties(spec.tableProperties)
     spec.location.foreach(location => StreamingTableMetadata.validateRequestedLocation(spark, location, spec.name))
@@ -180,7 +181,8 @@ object StreamingTableManager {
             s"Streaming sources for ${StreamingTableMetadata.quoteMultipart(spec.name)} changed during lifecycle admission"
           )
         StreamingTableRegistry.requireNoPendingStop(spark, identity)
-        if (StreamingTableMetadata.catalogTableExists(spark, spec.name)) {
+        val interrupted = StreamingTableMetadata.interruptedCreation(spark, spec.name)
+        if (interrupted.isEmpty && StreamingTableMetadata.catalogTableExists(spark, spec.name)) {
           val target   = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
           val manifest = StreamingTableMetadata.readManifest(spark, target)
           StreamingTableMetadata.verifyOwned(spark, target, manifest)
@@ -267,34 +269,36 @@ object StreamingTableManager {
               )
               emitAlreadyCompletedDescendants(spark, insight, intent)
               stopRecoveryWriter(spark, spec.name, intent, insight.stopDeadline)
-              val archived = StreamingTableMetadata.deleteResetOwnedPath(
-                spark,
-                intent,
-                (intent.sourcePaths ++ definition.sourcePaths).distinct,
-                operationId = Some(insight.operationId)
-              )
-              emitArchiveAction(
-                spark,
-                insight,
-                insight.targetRelation,
-                targetKind = "streaming",
-                targetIdentity = intent.targetIdentity,
-                causedBy = None,
-                archived
-              )
-              StreamingInsightEvents.action(
-                spark,
-                insight.operationId,
-                insight.targetRelation,
-                targetKind = "streaming",
-                targetIdentity = intent.targetIdentity,
-                causedBy = None,
-                stage = "target_cleanup",
-                code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetDropped,
-                message = "Removed the residual streaming target during rebuild recovery.",
-                status = "recovery_cleanup_completed",
-                details = Seq("target_path" -> intent.targetPath)
-              )
+              if (!interrupted.exists(_.dataPath == intent.targetPath)) {
+                val archived = StreamingTableMetadata.deleteResetOwnedPath(
+                  spark,
+                  intent,
+                  (intent.sourcePaths ++ definition.sourcePaths).distinct,
+                  operationId = Some(insight.operationId)
+                )
+                emitArchiveAction(
+                  spark,
+                  insight,
+                  insight.targetRelation,
+                  targetKind = "streaming",
+                  targetIdentity = intent.targetIdentity,
+                  causedBy = None,
+                  archived
+                )
+                StreamingInsightEvents.action(
+                  spark,
+                  insight.operationId,
+                  insight.targetRelation,
+                  targetKind = "streaming",
+                  targetIdentity = intent.targetIdentity,
+                  causedBy = None,
+                  stage = "target_cleanup",
+                  code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetDropped,
+                  message = "Removed the residual streaming target during rebuild recovery.",
+                  status = "recovery_cleanup_completed",
+                  details = Seq("target_path" -> intent.targetPath)
+                )
+              }
 
             case None =>
               insight.selectBranch(org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S1)
@@ -311,7 +315,21 @@ object StreamingTableManager {
                 )
               )
           }
-          val target = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
+          val target = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, interrupted)
+          if (interrupted.nonEmpty)
+            try
+              StreamingTableMetadata.validateExistingTargetAgainstManifest(
+                spark,
+                target,
+                StreamingTableMetadata.manifestFor(target, definition)
+              )
+            catch {
+              case NonFatal(error) =>
+                StreamingTableErrors.invalid(
+                  s"Interrupted target ${target.sqlIdentifier} does not match the requested definition; drop it " +
+                    s"and retry: ${error.getMessage}"
+                )
+            }
           StreamingInsightEvents.action(
             spark,
             insight.operationId,
@@ -325,7 +343,8 @@ object StreamingTableManager {
                 org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetRecreated
               else org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetCreated,
             message =
-              if (recovery.nonEmpty) "Recreated the owned streaming target."
+              if (interrupted.nonEmpty) "Finished the interrupted creation of the owned streaming target."
+              else if (recovery.nonEmpty) "Recreated the owned streaming target."
               else "Created the owned streaming target.",
             details = Seq(
               "target_path"         -> target.dataPath,
@@ -1856,14 +1875,14 @@ object StreamingTableManager {
         math.max(1L, StreamingLifecycleSettings.fromSpark(spark).stopTimeout.toMillis)
       )
     }
-    val snapshot = entry.snapshot
     val nativeProgress = query.flatMap { current =>
       Option(current.lastProgress).map(value =>
         current.runId.toString -> StreamingTableDefinition.redactText(value.json)
       )
     }
-    val progress = nativeProgress.map(_._2).orElse(snapshot.lastProgress)
     nativeProgress.foreach { case (run, value) => StreamingTableRegistry.recordProgress(spark, key, run, value) }
+    val snapshot = entry.snapshot
+    val progress = nativeProgress.map(_._2).orElse(snapshot.lastProgress)
     val failure = query
       .flatMap(_.exception.map(error => StreamingTableDefinition.redactText(error.getMessage)))
       .orElse(snapshot.lastFailure)

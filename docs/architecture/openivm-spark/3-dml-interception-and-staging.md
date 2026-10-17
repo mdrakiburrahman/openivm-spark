@@ -365,6 +365,31 @@ original DML with bypass enabled, then write any post-DML staging. Citation:
 `StagedDmlNode.scala:43-59`. Its writer records `StagingDelta` at
 `StagedDmlNode.scala:81-91`.
 
+### Table replacements
+
+`CREATE TABLE AS SELECT`, `REPLACE TABLE` and `CREATE OR REPLACE TABLE` (including
+`DataFrameWriterV2.createOrReplace()`) write their rows into an uncommitted
+`StagedTable`. That table is write-only, Spark 3.5 presents the nested write as
+an `AppendData`, and it commits only after the nested write returns, so the
+nested write is never a valid capture point.
+
+`IvmDmlInterceptorRule` therefore wraps the whole command in
+`StagedTableReplacementNode`, which pins the committed Delta version, runs the
+command with bypass enabled, and derives the change from the two committed
+snapshots:
+
+- same schema (compared by DDL, the identity dependents fingerprint) and no
+  map-typed columns: `old EXCEPT ALL new` is staged as `DELETE` and
+  `new EXCEPT ALL old` as `INSERT`, so dependents refresh incrementally and a
+  rebuild that reproduces the same rows publishes nothing;
+- otherwise (no prior version, schema change, incomparable columns): the
+  committed rows are staged as `OVERWRITE`, preceded by the prior rows as
+  `DELETE` when readable, and dependents take the full-refresh path.
+
+Records are published only after the replacement commits. A write into an
+uncommitted `StagedTable` that reaches the `AppendData` / `OverwriteByExpression`
+branches fails closed instead of being captured.
+
 ______________________________________________________________________
 
 ## 3.7 The seven `opType` values
@@ -383,15 +408,15 @@ object OpTypes {
 }
 ```
 
-| opType          | Triggered by                                 | Staging shape                              | Exact emitter                                                                                                                           |
-| --------------- | -------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `INSERT`        | `AppendData` / `INSERT INTO`                 | rows to add                                | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`.                                                           |
-| `DELETE`        | `DELETE FROM`                                | rows to remove                             | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`.          |
-| `UPDATE_BEFORE` | `UPDATE` before-image                        | old rows matching the predicate            | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`.   |
-| `UPDATE_AFTER`  | `UPDATE` after-image                         | rows after SET projections                 | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`.   |
-| `MERGE_SRC`     | `MERGE INTO` source side                     | source rows available to the merge         | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`.                      |
-| `OVERWRITE`     | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set                   | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`. |
-| `MV_VIEW_DELTA` | MV-over-MV cascade                           | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`.                                                                     |
+| opType          | Triggered by                                 | Staging shape                              | Exact emitter                                                                                                                                                                                         |
+| --------------- | -------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INSERT`        | `AppendData` / `INSERT INTO`                 | rows to add                                | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`; exact table-replacement additions from `StagedTableReplacementNode`.                                                    |
+| `DELETE`        | `DELETE FROM`                                | rows to remove                             | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`; exact table-replacement retractions from `StagedTableReplacementNode`. |
+| `UPDATE_BEFORE` | `UPDATE` before-image                        | old rows matching the predicate            | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`.                                                                 |
+| `UPDATE_AFTER`  | `UPDATE` after-image                         | rows after SET projections                 | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`.                                                                 |
+| `MERGE_SRC`     | `MERGE INTO` source side                     | source rows available to the merge         | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`.                                                                                    |
+| `OVERWRITE`     | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set                   | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`; table replacements that admit no exact change set.            |
+| `MV_VIEW_DELTA` | MV-over-MV cascade                           | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`.                                                                                                                                   |
 
 `StagingDeltaView` maps these to refresh-time multiplicities:
 
