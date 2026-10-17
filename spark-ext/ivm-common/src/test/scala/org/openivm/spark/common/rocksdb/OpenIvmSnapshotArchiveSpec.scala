@@ -30,6 +30,65 @@ class OpenIvmSnapshotArchiveSpec extends AnyFunSpec with Matchers {
   }
 
   describe("packed snapshot archive validation") {
+    it("computes exact component identities while packing changed files") {
+      withDirectory { root =>
+        val source = new File(root, "source")
+        source.mkdirs()
+        val files = Seq("state-a", "telemetry", "state-b").zipWithIndex.map { case (name, index) =>
+          val file = new File(source, name)
+          Files.write(file.toPath, Array.fill[Byte](70000 + index)((index + 1).toByte))
+          file
+        }
+        val classify: String => String = name => if (name == "telemetry") "telemetry" else "state"
+        val hashes =
+          OpenIvmSnapshotArchive.pack(source, files.reverse, new File(root, "snapshot.zip"), _ => (), Some(classify))
+        hashes shouldBe files.groupBy(file => classify(file.getName)).map { case (name, members) =>
+          name -> OpenIvmSnapshotArchive.contentHash(source, members)
+        }
+      }
+    }
+
+    it("hashes content and names rather than file modification times") {
+      withDirectory { root =>
+        val file = new File(root, "state")
+        Files.write(file.toPath, Array[Byte](1, 2, 3))
+        val first = OpenIvmSnapshotArchive.contentHash(root, Seq(file))
+        file.setLastModified(123456789000L) shouldBe true
+        OpenIvmSnapshotArchive.contentHash(root, Seq(file)) shouldBe first
+        Files.write(file.toPath, Array[Byte](4, 5, 6))
+        file.setLastModified(123456789000L) shouldBe true
+        OpenIvmSnapshotArchive.contentHash(root, Seq(file)) should not be first
+        val beforeRename = OpenIvmSnapshotArchive.contentHash(root, Seq(file))
+        val moved        = new File(root, "renamed")
+        Files.move(file.toPath, moved.toPath)
+        val renamed = OpenIvmSnapshotArchive.contentHash(root, Seq(moved))
+        renamed should not be beforeRename
+      }
+    }
+
+    it("extracts only selected components and enforces the shared restore budget") {
+      withDirectory { root =>
+        val source = new File(root, "source")
+        source.mkdirs()
+        val state     = new File(source, "state")
+        val telemetry = new File(source, "telemetry")
+        Files.write(state.toPath, Array[Byte](1, 2))
+        Files.write(telemetry.toPath, Array[Byte](3, 4, 5))
+        val archive = new File(root, "snapshot.zip")
+        OpenIvmSnapshotArchive.pack(source, Seq(state, telemetry), archive, _ => ())
+        val restored = new File(root, "restored")
+        val used     = OpenIvmSnapshotArchive.extract(archive, restored, _ == "state", 1, 2L)
+        used shouldBe (1 -> 2L)
+        new File(restored, "telemetry").exists() shouldBe false
+        intercept[IOException] {
+          OpenIvmSnapshotArchive.extract(archive, restored, _ == "telemetry", 1 - used._1, 5L - used._2)
+        }.getMessage should include("entry limit")
+        intercept[IOException] {
+          OpenIvmSnapshotArchive.extract(archive, restored, _ == "telemetry", 1, 1L)
+        }.getMessage should include("size")
+      }
+    }
+
     it("round trips state bytes and CURRENT newlines") {
       withDirectory { root =>
         val source    = new File(root, "state")
@@ -57,6 +116,7 @@ class OpenIvmSnapshotArchiveSpec extends AnyFunSpec with Matchers {
           .foreach { name =>
             writeZip(archive, name, Array[Byte](1))
             intercept[IOException](OpenIvmSnapshotArchive.extract(archive, destination))
+            intercept[IOException](OpenIvmSnapshotArchive.extract(archive, destination, _ => false))
             destination.listFiles() shouldBe empty
           }
         new File(root, "escaped").exists() shouldBe false

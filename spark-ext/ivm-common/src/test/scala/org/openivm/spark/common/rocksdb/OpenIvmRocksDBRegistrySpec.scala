@@ -1,7 +1,14 @@
 package org.openivm.spark.common.rocksdb
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
-import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, OpenIvmStatePaths}
+import org.openivm.spark.common.{
+  FeatureGate,
+  MvCatalog,
+  MvMetadata,
+  OpenIvmStatePaths,
+  RefreshProfileCatalog,
+  RefreshProfileRow
+}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
@@ -33,6 +40,39 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   private val sparks = ArrayBuffer.empty[SparkSession]
   private val dirs   = ArrayBuffer.empty[File]
   private val json   = new ObjectMapper()
+
+  private def recordProfile(spark: SparkSession, index: Int): Unit =
+    RefreshProfileCatalog.record(
+      spark,
+      Seq(
+        RefreshProfileRow(
+          s"noop-$index",
+          "unchanged_mv",
+          new Timestamp(index.toLong),
+          0,
+          "total_refresh",
+          1L,
+          "outcome=no_pending_deltas"
+        )
+      )
+    )
+
+  private def withComponentState(name: String)(body: (SparkSession, File, File, File) => Unit): Unit = {
+    val local  = newDir(s"$name-local")
+    val remote = newDir(s"$name-remote")
+    val spark = newSpark(
+      name,
+      Seq(
+        FeatureGate.StatePathKey    -> local.getAbsolutePath,
+        FeatureGate.StateSyncUriKey -> remote.toURI.toString
+      )
+    )
+    val stateFile = new File(local, "_openivm/mvs/unchanged/rocksdb/1.sst")
+    stateFile.getParentFile.mkdirs()
+    java.nio.file.Files.write(stateFile.toPath, Array[Byte](11, 22, 33))
+    recordProfile(spark, 1)
+    body(spark, local, remote, stateFile)
+  }
 
   private def snapshot(spark: SparkSession, path: String, timeoutMs: Long = 1000L): JsonNode =
     json.readTree(OpenIvmMetadataSnapshot.captureIfOpenJson(spark, path, 8192, 8L * 1024 * 1024, timeoutMs))
@@ -941,6 +981,147 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         try zip.size() shouldBe 200
         finally zip.close()
       } finally release.countDown()
+    }
+
+    it("uploads only telemetry for profiling-only changes and restores one complete committed state") {
+      withComponentState("state-sync-components") { (spark, local, remote, stateFile) =>
+        val copies = ArrayBuffer.empty[Vector[String]]
+        OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, destination) =>
+          val zip = new java.util.zip.ZipFile(file)
+          try copies += zip.entries().asScala.map(_.getName).toVector
+          finally zip.close()
+          fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), destination)
+        }
+        OpenIvmStateSync.backupNow(spark)
+        copies.size shouldBe 1
+        copies.head.exists(_.startsWith("mvs/")) shouldBe true
+        (2 to 3).foreach { index => recordProfile(spark, index); OpenIvmStateSync.backupNow(spark) }
+        copies.size shouldBe 3
+        copies.tail.foreach { names =>
+          names should not be empty
+          names.forall(_.startsWith("refresh_profile/")) shouldBe true
+        }
+        // A failed publication must not make its new state reusable.
+        val originalMtime = stateFile.lastModified()
+        java.nio.file.Files.write(stateFile.toPath, Array[Byte](44, 55, 66))
+        stateFile.setLastModified(originalMtime) shouldBe true
+        recordProfile(spark, 4)
+        OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("commit failed"))
+        intercept[java.io.IOException](OpenIvmStateSync.backupNow(spark)).getMessage shouldBe "commit failed"
+        OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+        OpenIvmStateSync.backupNow(spark)
+        copies.size shouldBe 5
+        copies.last.exists(_.startsWith("mvs/")) shouldBe true
+        OpenIvmRocksDBRegistry.closeAll()
+        OpenIvmStateSync.resetForTesting()
+        deleteRecursively(new File(local, "_openivm"))
+        OpenIvmStateSync.maybeRestore(spark)
+        java.nio.file.Files.readAllBytes(stateFile.toPath).toSeq shouldBe Seq[Byte](44, 55, 66)
+        RefreshProfileCatalog.scanAll(spark).size shouldBe 4
+      }
+    }
+
+    it("does not resurrect deleted state from a reused combined archive") {
+      withComponentState("state-sync-components-delete") { (spark, local, remote, stateFile) =>
+        val uploads = new AtomicInteger(0)
+        OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, destination) =>
+          uploads.incrementAndGet()
+          fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), destination)
+        }
+        OpenIvmStateSync.backupNow(spark)
+        java.nio.file.Files.delete(stateFile.toPath)
+        OpenIvmStateSync.backupNow(spark)
+        uploads.get() shouldBe 1
+        OpenIvmRocksDBRegistry.closeAll()
+        OpenIvmStateSync.resetForTesting()
+        deleteRecursively(new File(local, "_openivm"))
+        OpenIvmStateSync.maybeRestore(spark)
+        stateFile.exists() shouldBe false
+        RefreshProfileCatalog.scanAll(spark).size shouldBe 1
+      }
+    }
+
+    it("reuploads a missing reused archive instead of publishing a broken reference") {
+      withComponentState("state-sync-components-missing") { (spark, local, remote, stateFile) =>
+        OpenIvmStateSync.backupNow(spark)
+        val root = new org.apache.hadoop.fs.Path(remote.toURI)
+        val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+        val old  = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+        fs.delete(new org.apache.hadoop.fs.Path(old, "snapshot.zip"), false) shouldBe true
+        recordProfile(spark, 2)
+        OpenIvmStateSync.backupNow(spark)
+        OpenIvmRocksDBRegistry.closeAll()
+        OpenIvmStateSync.resetForTesting()
+        deleteRecursively(new File(local, "_openivm"))
+        OpenIvmStateSync.maybeRestore(spark)
+        java.nio.file.Files.readAllBytes(stateFile.toPath).toSeq shouldBe Seq[Byte](11, 22, 33)
+        RefreshProfileCatalog.scanAll(spark).size shouldBe 2
+      }
+    }
+
+    it("fails closed on corruption in an older archive referenced by the latest commit") {
+      withComponentState("state-sync-components-corrupt") { (spark, local, remote, _) =>
+        OpenIvmStateSync.backupNow(spark)
+        val root = new org.apache.hadoop.fs.Path(remote.toURI)
+        val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+        val old  = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+        recordProfile(spark, 2)
+        OpenIvmStateSync.backupNow(spark)
+        val archive = new File(new org.apache.hadoop.fs.Path(old, "snapshot.zip").toUri)
+        val bytes   = java.nio.file.Files.readAllBytes(archive.toPath)
+        bytes(0) = (bytes(0) ^ 1).toByte
+        val output = fs.create(new org.apache.hadoop.fs.Path(archive.toURI), true)
+        try output.write(bytes)
+        finally output.close()
+        OpenIvmRocksDBRegistry.closeAll()
+        OpenIvmStateSync.resetForTesting()
+        deleteRecursively(new File(local, "_openivm"))
+        intercept[java.io.IOException](OpenIvmStateSync.maybeRestore(spark)).getMessage.toLowerCase should include(
+          "checksum"
+        )
+        new File(local, "_openivm").exists() shouldBe false
+      }
+    }
+
+    it("rejects malformed component references without restoring partial state") {
+      withComponentState("state-sync-components-invalid") { (spark, local, remote, _) =>
+        OpenIvmStateSync.backupNow(spark)
+        val root   = new org.apache.hadoop.fs.Path(remote.toURI)
+        val fs     = root.getFileSystem(spark.sessionState.newHadoopConf())
+        val latest = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
+        val commit = new org.apache.hadoop.fs.Path(root, s".openivm-state-sync/commits/${latest.getName}.commit")
+        val input  = fs.open(commit)
+        val record =
+          try scala.io.Source.fromInputStream(input, "UTF-8").mkString
+          finally input.close()
+        val original = record.split("\n", -1).toVector
+        original.head shouldBe "OPENIVM_STATE_SNAPSHOT_V3"
+        def change(field: Int, value: String): String = {
+          val entry = original(3).split("\t", -1).updated(field, value).mkString("\t")
+          original.updated(3, entry).mkString("\n")
+        }
+        val bad = Seq(
+          original.updated(4, original(3)).mkString("\n"),
+          change(0, "other"),
+          change(1, "bad-hash"),
+          change(2, "../escape"),
+          change(3, "999999999999"),
+          original.updated(2, "0").mkString("\n"),
+          change(4, "0" * 64)
+        )
+        OpenIvmRocksDBRegistry.closeAll()
+        deleteRecursively(new File(local, "_openivm"))
+        bad.foreach { text =>
+          val output = fs.create(commit, true)
+          try output.write(text.getBytes("UTF-8"))
+          finally output.close()
+          OpenIvmStateSync.resetForTesting()
+          intercept[java.io.IOException](OpenIvmStateSync.maybeRestore(spark)).getMessage should include(
+            "component snapshot commit"
+          )
+          new File(local, "_openivm").exists() shouldBe false
+        }
+      }
     }
 
     it("propagates packed upload failure without committing and permits explicit retry") {
