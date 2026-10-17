@@ -157,7 +157,8 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
-  /** Cache openivm compile/classification results per MV schema + facts tier.
+  /** Cache raw openivm compile/classification results per verified compiler
+    * generation, complete request identity, MV schema and structural facts.
     * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
     * the cached shape-stable SQL every time so per-refresh snapshot temp views
     * are recreated on each execution.
@@ -409,6 +410,11 @@ object FeatureGate {
     * the full window recompute. Default OFF (opt-in, append-only-shape only).
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
+
+  /** Opt-in exact grouped-state cache before rank/window evaluation. Unsupported
+    * shapes retain the native incremental program; CDF mode only.
+    */
+  val GroupedWindowStateEnabledKey: String = "spark.openivm.refresh.groupedWindowState.enabled"
 
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
@@ -708,6 +714,12 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def groupedWindowStateEnabled(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(GroupedWindowStateEnabledKey)
+      .map(_.toBoolean)
+      .getOrElse(boolConf(spark.sparkContext.getConf, GroupedWindowStateEnabledKey, default = false))
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)

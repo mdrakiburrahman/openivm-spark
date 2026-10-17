@@ -71,6 +71,36 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   private var spark: SparkSession = _
 
+  describe("compiler runtime ownership") {
+    it("reuses the verified compiler across isolated command sessions with the same loader settings") {
+      val compiler = OpenIvmCompilers.forSession(spark)
+      org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
+        cloned should not be theSameInstanceAs(spark)
+        OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
+        cloned.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
+      }
+      org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
+        OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
+        val key = "spark.openivm.compiler.cliLibraryPath"
+        val current = spark.conf
+          .getOption(key)
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
+          .getOrElse(new File(compiler.extensionPath).getParent)
+        // Repeating the loader search list keeps the native runtime usable,
+        // while proving a distinct configured runtime owns its own generation.
+        cloned.conf.set(key, s"$current${File.pathSeparator}$current")
+        val alternate = OpenIvmCompilers.forSession(cloned)
+        alternate should not be theSameInstanceAs(compiler)
+        alternate.cacheGeneration should not equal compiler.cacheGeneration
+        OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs alternate
+      }
+      OpenIvmCompilers.forSession(spark) should be theSameInstanceAs compiler
+    }
+  }
+
   override def beforeAll(): Unit = {
     super.beforeAll()
     spark = SparkSession
@@ -411,6 +441,83 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // ---------------------------------------------------------------------------
   // Test 1 — CREATE happy path
   // ---------------------------------------------------------------------------
+  describe("complete joined window affected keys") {
+    it("keeps complete tuples, old lookup images and removed base partition keys") {
+      spark.sql(
+        "CREATE TABLE wjk_base (pid INT, first_name STRING, last_name STRING, postal INT, addr STRING, addr2 STRING, seq INT) USING DELTA"
+      )
+      spark.sql(
+        "CREATE TABLE wjk_lookup (first_name STRING, last_name STRING, postal STRING, addr STRING, addr2 STRING, value STRING) USING DELTA"
+      )
+      spark.sql(
+        "INSERT INTO wjk_base VALUES (1,'Ann','Bee',10,'Main',NULL,1), (1,'Ann','Bee',10,'Main',NULL,2), (2,'Ann','Other',10,'Main',NULL,1), (3,'Other','Bee',10,'Main',NULL,1), (4,'Old','Key',20,'Side','',1), (NULL,'Ann','Bee',10,'Main',NULL,1), (8,NULL,'Bee',10,'Main',NULL,1)"
+      )
+      spark.sql("CREATE OR REPLACE TEMP VIEW openivm_delta_wjk_base AS SELECT 999 AS pid")
+      spark.sql(
+        "CREATE OR REPLACE TEMP VIEW openivm_delta_wjk_lookup AS SELECT * FROM VALUES ('Ann','Bee','10','Main','',1), ('Old','Key','20','Side',NULL,-1), (NULL,'Bee','10','Main','',1) AS d(first_name,last_name,postal,addr,addr2,openivm_multiplicity)"
+      )
+      val query = """WITH joined AS (
+                    | SELECT b.*, p.value FROM wjk_base b LEFT JOIN wjk_lookup p
+                    | ON b.first_name = p.first_name AND b.last_name = p.last_name
+                    | AND CAST(b.postal AS STRING) = p.postal AND b.addr = p.addr
+                    | AND COALESCE(b.addr2, '') = COALESCE(p.addr2, '')
+                    |) SELECT pid, seq, LAST_VALUE(value, true) OVER (PARTITION BY pid ORDER BY seq) AS carried
+                    |FROM joined""".stripMargin
+      val refined = WindowJoinAffectedKeys
+        .query(
+          spark,
+          query,
+          Seq("default.wjk_base", "default.wjk_lookup"),
+          "`pid`"
+        )
+        .getOrElse(fail("eligible composite join was not refined"))
+      spark.sql(refined).collect().toSet shouldBe Set(
+        org.apache.spark.sql.Row(1),
+        org.apache.spark.sql.Row(4),
+        org.apache.spark.sql.Row(null),
+        org.apache.spark.sql.Row(999)
+      )
+      refined should include("LEFT SEMI JOIN")
+      refined should include("coalesce")
+      val nullSafe = WindowJoinAffectedKeys
+        .query(
+          spark,
+          query.replace("b.first_name = p.first_name", "b.first_name <=> p.first_name"),
+          Seq("default.wjk_base", "default.wjk_lookup"),
+          "`pid`"
+        )
+        .getOrElse(fail("eligible null-safe join was not refined"))
+      spark.sql(nullSafe).collect().toSet shouldBe spark.sql(refined).collect().toSet + org.apache.spark.sql.Row(8)
+      WindowJoinAffectedKeys.query(
+        spark,
+        query.replace("wjk_base b", "wjk_base VERSION AS OF 0 b"),
+        Seq("default.wjk_base", "default.wjk_lookup"),
+        "`pid`"
+      ) shouldBe None
+    }
+
+    it("retains conservative keys for self joins, derived keys and right-side partitions") {
+      spark.sql("CREATE TABLE wjk_left (id INT, k INT) USING DELTA")
+      spark.sql("CREATE TABLE wjk_right (rid INT, k INT) USING DELTA")
+      val sources = Seq("default.wjk_left", "default.wjk_right")
+      Seq(
+        "SELECT l.id, ROW_NUMBER() OVER (PARTITION BY r.rid ORDER BY l.id) AS rn FROM wjk_left l JOIN wjk_right r ON l.k = r.k" -> "rid",
+        "SELECT l.id, ROW_NUMBER() OVER (PARTITION BY l.id + 1 ORDER BY l.id) AS rn FROM wjk_left l JOIN wjk_right r ON l.k = r.k" -> "id",
+        "SELECT l.id, ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY l.id) AS rn FROM wjk_left l JOIN wjk_right r ON l.k = r.k JOIN wjk_left x ON x.id = l.id" -> "id",
+        "SELECT l.id, ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY l.id) AS rn FROM wjk_left l JOIN wjk_right r ON l.k = r.k UNION ALL SELECT id, 1 AS rn FROM wjk_left" -> "id",
+        "SELECT id, SUM(rn) FROM (SELECT l.id, ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY l.id) AS rn FROM wjk_left l JOIN wjk_right r ON l.k = r.k) s GROUP BY id" -> "id"
+      ).foreach { case (query, key) =>
+        WindowJoinAffectedKeys.query(spark, query, sources, key) shouldBe None
+      }
+      WindowJoinAffectedKeys.query(
+        spark,
+        "SELECT 1",
+        Seq("catalog.default.wjk_left", "catalog.default.wjk_right"),
+        "id"
+      ) shouldBe None
+    }
+  }
+
   describe("replacement-batch detection") {
     val timestamp = new Timestamp(0L)
 

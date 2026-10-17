@@ -171,9 +171,8 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
     // OpenIvmCompiler always sets the SPARK dialect on its embedded DuckDB
     // session, so we verify by compiling a SIMPLE_PROJECTION view (which
     // exercises the lpts SPARK pipeline) and asserting the generated SQL
-    // contains the fully-qualified quoted `memory`.`main`.`...` table reference
-    // that the SPARK dialect emits.
-    it("emits SPARK-dialect SQL with fully-qualified quoted memory.main references for SIMPLE_PROJECTION") {
+    // maps the native compiler's private internal references to logical names.
+    it("emits logical internal references for SIMPLE_PROJECTION") {
       val result = sharedCompiler.compile(
         CompileRequest(
           viewName = "mv_sales_proj",
@@ -183,7 +182,10 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
       )
       result.refreshType shouldBe 2
       result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-      result.sql should include("`memory`.`main`.")
+      result.sql should include("openivm_delta_sales")
+      result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+      result.sql should include("FROM openivm_data_mv_sales_proj")
+      result.sql should not include "openivm_data___openivm_mv_"
     }
 
     // openivm Test 5 — AGGREGATE_GROUP shape, compile returns non-empty SQL.

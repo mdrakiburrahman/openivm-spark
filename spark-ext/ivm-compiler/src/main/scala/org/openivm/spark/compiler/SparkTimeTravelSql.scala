@@ -1468,7 +1468,7 @@ object SparkTimeTravelSql {
     * cased pins are kept apart instead of being collapsed into one relation
     * read at two versions.
     */
-  private def caseSensitiveSegments(tableRef: String): Seq[String] = {
+  private[compiler] def caseSensitiveSegments(tableRef: String): Seq[String] = {
     val segments = scala.collection.mutable.ArrayBuffer.empty[String]
     val current  = new StringBuilder
     var i        = 0

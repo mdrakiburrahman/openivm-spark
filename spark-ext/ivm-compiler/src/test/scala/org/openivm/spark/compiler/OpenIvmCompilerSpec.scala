@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, UniqueKey, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -45,6 +45,178 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   override def afterAll(): Unit = {
     if (sharedCompiler != null) sharedCompiler.close()
     super.afterAll()
+  }
+
+  "raw compile cache identity" should "cover the complete request and verified compiler generation" in {
+    val schema = StructType(Seq(StructField("id", IntegerType)))
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM db.source VERSION AS OF 1",
+      Map("source" -> schema),
+      Map("source" -> "db.source"),
+      Map("source" -> "/verified/source")
+    )
+    val tier = sharedCompiler.compileCacheTier(request)
+    val changedRequests = Seq(
+      request.copy(viewName = "other_mv"),
+      request.copy(viewSql = "SELECT id FROM db.source VERSION AS OF 2"),
+      request.copy(sources = Map("source" -> StructType(Seq(StructField("id", LongType))))),
+      request.copy(sourceQualifiedNames = Map("source" -> "other_db.source")),
+      request.copy(sourceSnapshotPinnedPaths = Map("source" -> "/other/source")),
+      request.copy(facts = request.facts.copy(runningWindowIncremental = true)),
+      request.copy(facts = request.facts.copy(schemaVersion = request.facts.schemaVersion + 1))
+    )
+    changedRequests.foreach(changed => sharedCompiler.compileCacheTier(changed) should not equal tier)
+    val nextCompiler = OpenIvmCompiler.build(extensionPath)
+    try nextCompiler.compileCacheTier(request) should not equal tier
+    finally nextCompiler.close()
+  }
+
+  it should "ignore map ordering and quantitative facts that native compilation does not consume" in {
+    val schema = StructType(Seq(StructField("id", IntegerType)))
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM a JOIN b ON a.id=b.id",
+      Map("a" -> schema, "b"        -> schema),
+      Map("a" -> "db.a", "b"        -> "db.b"),
+      Map("a" -> "/verified/a", "b" -> "/verified/b")
+    )
+    val reordered = request.copy(
+      sources = request.sources.toSeq.reverse.toMap,
+      sourceQualifiedNames = request.sourceQualifiedNames.toSeq.reverse.toMap,
+      sourceSnapshotPinnedPaths = request.sourceSnapshotPinnedPaths.toSeq.reverse.toMap,
+      facts = request.facts.copy(
+        tableStats = Map("a" -> org.openivm.spark.common.WorkloadTableStats(rowCount = Some(100)))
+      )
+    )
+    sharedCompiler.compileCacheTier(reordered) shouldBe sharedCompiler.compileCacheTier(request)
+  }
+
+  "compiler source facts" should "bind qualified structural facts to the declared synthetic tables" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM app.a JOIN app.b ON a.id=b.id",
+      Map("a" -> StructType.fromDDL("id INT"), "b" -> StructType.fromDDL("id INT")),
+      Map("a" -> "catalog.app.a", "b"              -> "app.b"),
+      facts = WorkloadFacts(
+        deltaShape = Map("`catalog`.`app`.`a`" -> DeltaShape.InsertOnly, "`app`.`b`" -> DeltaShape.Unchanged),
+        fkRelations = Seq(ForeignKeyRelation("catalog.app.a", Seq("id"), "app.b", Seq("id"))),
+        uniqueKeys = Seq(UniqueKey("app.b", Seq("id")))
+      )
+    )
+    val bound = sharedCompiler.compilerSourceFacts(request)
+    bound.deltaShape shouldBe Map("a" -> DeltaShape.InsertOnly, "b" -> DeltaShape.Unchanged)
+    bound.fkRelations shouldBe Seq(ForeignKeyRelation("a", Seq("id"), "b", Seq("id")))
+    bound.uniqueKeys shouldBe Seq(UniqueKey("b", Seq("id")))
+    request.facts.deltaShape.keySet should contain("`app`.`b`")
+  }
+
+  it should "not borrow unchanged-source facts from a differently cased physical relation" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM app.Customer",
+      Map("Customer" -> StructType.fromDDL("id INT")),
+      Map("Customer" -> "app.Customer"),
+      facts = WorkloadFacts(deltaShape = Map("app.customer" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerSourceFacts(request).deltaShape shouldBe empty
+  }
+
+  it should "ignore foreign and ambiguous qualified facts instead of matching their trailing table name" in {
+    val schema = StructType.fromDDL("id INT")
+    val request = CompileRequest(
+      "mv",
+      "SELECT a.id FROM a",
+      Map("a" -> schema, "b"     -> schema),
+      Map("a" -> "app.same", "b" -> "app.same"),
+      facts = WorkloadFacts(
+        declareRelyFk = true,
+        deltaShape = Map("other.a" -> DeltaShape.Unchanged, "app.same" -> DeltaShape.Unchanged),
+        fkRelations = Seq(ForeignKeyRelation("other.a", Seq("id"), "b", Seq("id"))),
+        uniqueKeys = Seq(UniqueKey("other.a", Seq("id")))
+      )
+    )
+    val bound = sharedCompiler.compilerSourceFacts(request)
+    bound.deltaShape shouldBe empty
+    bound.fkRelations shouldBe empty
+    bound.uniqueKeys shouldBe empty
+    sharedCompiler.declareRelyFkStatements(request) shouldBe empty
+  }
+
+  it should "keep conflicting short and qualified shapes conservative" in {
+    val request = CompileRequest(
+      "mv",
+      "SELECT id FROM app.a",
+      Map("a" -> StructType.fromDDL("id INT")),
+      Map("a" -> "app.a"),
+      facts = WorkloadFacts(deltaShape = Map("a" -> DeltaShape.General, "app.a" -> DeltaShape.Unchanged))
+    )
+    sharedCompiler.compilerSourceFacts(request).deltaShape shouldBe Map("a" -> DeltaShape.General)
+  }
+
+  it should "prune the same native join branches for qualified and short source identities" in {
+    val schema = StructType.fromDDL("id INT")
+    val request = CompileRequest(
+      "mv_fact_bindings",
+      "SELECT a.id FROM app.a JOIN app.b ON a.id=b.id JOIN app.c ON b.id=c.id",
+      Map("a" -> schema, "b"  -> schema, "c"  -> schema),
+      Map("a" -> "app.a", "b" -> "app.b", "c" -> "app.c"),
+      facts = WorkloadFacts(deltaShape =
+        Map("app.a" -> DeltaShape.InsertOnly, "app.b" -> DeltaShape.Unchanged, "app.c" -> DeltaShape.Unchanged)
+      )
+    )
+    val qualified = sharedCompiler.compile(request)
+    val short = sharedCompiler.compile(
+      request.copy(facts =
+        request.facts.copy(
+          deltaShape = Map("a" -> DeltaShape.InsertOnly, "b" -> DeltaShape.Unchanged, "c" -> DeltaShape.Unchanged)
+        )
+      )
+    )
+    val unknown = sharedCompiler.compile(request.copy(facts = request.facts.copy(deltaShape = Map.empty)))
+    def ctes(sql: String): Int = "(?i)\\bAS\\s*\\(".r.findAllIn(sql).size
+    ctes(qualified.sql) shouldBe ctes(short.sql)
+    ctes(qualified.sql) should be < ctes(unknown.sql)
+    qualified.refreshTypeName shouldBe short.refreshTypeName
+  }
+
+  "native view identity normalization" should "map internal tables without changing source references or literals" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
+      s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
+      "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
+      "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
+  }
+
+  it should "preserve long escaped literals without overflowing the regex stack" in {
+    val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val literal = "escaped''" * 10000 + s"openivm_data_$key"
+    val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
+    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+      s"SELECT '$literal' FROM openivm_data_mv"
+  }
+
+  it should "read the native-key initial-load file and preserve hidden seed columns" in {
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
+    val dir  = Files.createTempDirectory("native-view-initial-load")
+    val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
+    val req  = CompileRequest("mv", "SELECT id FROM src", Map("src" -> StructType.fromDDL("id INT")))
+    try {
+      Files.write(
+        file,
+        s"create table memory.main.openivm_data_$key as SELECT id, 1 AS openivm_running_input_0 FROM memory.main.src;"
+          .getBytes("UTF-8")
+      )
+      val initial = sharedCompiler.parseInitialLoadSql(dir, req, key)
+      initial should include("openivm_running_input_0")
+      initial should not include "memory.main."
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -428,10 +600,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   // With `target_dialect="spark"` set in the CompileFacts JSON payload,
   // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
   // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
-  // Current output backtick-quotes each identifier segment, so the delta-scan
-  // CTE should reference the staged source as `` `memory`.`main`.`...` ``.
+  // The bridge removes the compiler's private catalog qualification from
+  // internal tables and maps encoded MV keys to the logical Spark view name.
 
-  it should "produce fully-qualified backtick-quoted memory.main table references in SPARK dialect for SIMPLE_PROJECTION" in {
+  it should "normalize SIMPLE_PROJECTION internal references to the Spark bridge's logical names" in {
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
@@ -440,7 +612,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-    result.sql should include("`memory`.`main`.`openivm_delta_sales`")
+    result.sql should include("FROM    openivm_delta_sales")
+    result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+    result.sql should include("FROM openivm_data_mv_sales_proj")
+    result.sql should not include "openivm_data___openivm_mv_"
   }
 
   // ── Test 6: Type mapping ──────────────────────────────────────────────────

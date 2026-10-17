@@ -441,6 +441,60 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("confines bounded prefix reads and releases iterators after limit failures") {
+      Seq(false, true).foreach { multiProcess =>
+        val dir = newDbDir("bounded-prefix-read")
+        val db = new OpenIvmRocksDB(
+          dir.getAbsolutePath,
+          OpenIvmRocksDBConf.default.copy(multiProcess = multiProcess),
+          Seq("scan")
+        )
+        val prefix                        = Array[Byte](32)
+        def key(suffix: Int): Array[Byte] = prefix :+ suffix.toByte
+        val keys                          = Vector(0, 127, 128, 255).map(key)
+        try {
+          db.withBatch { batch =>
+            (Vector(Array[Byte](16, -1), Array[Byte](48, 0)) ++ keys).foreach { k =>
+              db.put(batch, "scan", k, Array[Byte](1))
+            }
+          }
+          val all = db.boundedPrefixScan("scan", prefix, 4, 12L)
+          all.map(_._1.toVector) shouldBe keys.map(_.toVector)
+          all.map(_._2.toVector) shouldBe Vector.fill(4)(Vector[Byte](1))
+          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 3, 12L) }
+          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 4, 11L) }
+          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 0, 0L) }
+          // In multi-process mode each completed call has already closed its
+          // native handle. Values remain valid and later reads still succeed.
+          db.get("scan", key(255)).map(_.toVector) shouldBe Some(Vector[Byte](1))
+          db.boundedPrefixScan("scan", Array[Byte](64), 0, 0L) shouldBe empty
+          val largePrefix = Array[Byte](80)
+          db.withBatch(batch => db.put(batch, "scan", largePrefix, new Array[Byte](1024 * 1024)))
+          intercept[IllegalStateException] {
+            db.boundedPrefixScan("scan", largePrefix, 1, 1024L)
+          }
+          db.boundedPrefixScan("scan", prefix, 4, 12L).map(_._1.toVector) shouldBe keys.map(_.toVector)
+        } finally {
+          closeQuietly(db)
+          deleteRecursively(dir)
+        }
+      }
+    }
+
+    it("rejects invalid prefix-read limits before opening the native database") {
+      val dir    = newDbDir("prefix-limits")
+      val db     = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("scan"))
+      val prefix = Array[Byte](32)
+      try {
+        intercept[IllegalArgumentException] { db.boundedPrefixScan("scan", prefix, -1, 100L) }
+        intercept[IllegalArgumentException] { db.boundedPrefixScan("scan", prefix, 1, -1L) }
+        new File(dir, "CURRENT").exists() shouldBe false
+      } finally {
+        closeQuietly(db)
+        deleteRecursively(dir)
+      }
+    }
+
     it("keeps commit versions monotonic") {
       val dir = newDbDir("versions")
       val db  = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
