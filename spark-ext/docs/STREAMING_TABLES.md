@@ -206,6 +206,17 @@ and persistent query ID with a new run ID. With no new source commit, the new ru
 does no source-row or target-data work. New inserts are consumed exactly once on
 the next run; already committed input is not replayed.
 
+A column added upstream that the declaration cannot read does not change the
+definition. When every previously recorded source column is unchanged, the
+output schema is unchanged, and the analyzed plan matches apart from relation
+output lists, OpenIVM re-records the definition and resumes the same checkpoint
+instead of rebuilding and replaying the sources. Declarations that expand views
+stay strict, because a redefined view leaves the declaration unchanged. Setting
+`spark.openivm.streaming.definition.ignoreAnalyzedPlanDrift=true` also resumes an
+unchanged, view-free declaration whose analyzed plan is encoded differently, for
+example after a Spark runtime patch. It is off by default because session
+settings such as ANSI mode or the time zone surface only in the analyzed plan.
+
 The checkpoint is bound to the persisted semantic definition. A changed query,
 source identity, source semantic option, watermark, output mode, partitioning,
 or target property fails without stopping or mutating the existing table by

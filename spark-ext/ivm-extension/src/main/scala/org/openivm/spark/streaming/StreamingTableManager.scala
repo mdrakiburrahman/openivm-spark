@@ -192,7 +192,17 @@ object StreamingTableManager {
             Some(target.dataPath)
           )
           StreamingTableMetadata.validateExistingTargetAgainstManifest(spark, target, manifest)
-          reconcileExisting(spark, frame, spec, runtime, definition, target, manifest, insight)
+          reconcileExisting(
+            spark,
+            frame,
+            spec,
+            runtime,
+            definition,
+            target,
+            manifest,
+            insight,
+            expandsViews = !(expandedQuery eq spec.query)
+          )
         } else {
           if (plannedPath.isEmpty)
             StreamingTableErrors.invalid(
@@ -742,10 +752,14 @@ object StreamingTableManager {
       runtime: StreamingRuntimeOptions,
       definition: StreamingTableDefinition,
       target: StreamingTableTarget,
-      manifest: StreamingTableManifest,
-      insight: InsightOperation
+      storedManifest: StreamingTableManifest,
+      insight: InsightOperation,
+      expandsViews: Boolean
   ): StreamingTableStatus = {
-    reconcileResetJournal(spark, target, manifest, definition, runtime)
+    reconcileResetJournal(spark, target, storedManifest, definition, runtime)
+    val manifest     = adoptResumableDrift(spark, target, storedManifest, definition, expandsViews)
+    val adoptedDrift = manifest ne storedManifest
+
     val exactDefinition = manifest.definitionHash == definition.fingerprint
     val compatibleLegacyDefinition =
       !exactDefinition && (
@@ -789,7 +803,7 @@ object StreamingTableManager {
       if (observedQuery.exists(query => !query.isActive))
         stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
       val active        = StreamingTableRegistry.findActive(spark, registryKey, target)
-      val changedTuning = manifest.operationalHash != definition.operationalHash
+      val changedTuning = storedManifest.operationalHash != definition.operationalHash
       val before        = statusFor(spark, target, manifest, forcedStatus = None)
       insight.observe(before)
       lazy val effectiveManifest =
@@ -807,7 +821,8 @@ object StreamingTableManager {
           policy = runtime.onQueryChange,
           details = StreamingInsightEvents.fingerprintDetails("definition", definition.fingerprint) ++ Seq(
             "target_identity"              -> target.identity,
-            "compatible_legacy_definition" -> compatibleLegacyDefinition
+            "compatible_legacy_definition" -> compatibleLegacyDefinition,
+            "adopted_definition_drift"     -> adoptedDrift
           )
         )
         val status = statusFor(spark, target, effectiveManifest, forcedStatus = Some("active"))
@@ -839,13 +854,14 @@ object StreamingTableManager {
           policy = runtime.onQueryChange,
           details = StreamingInsightEvents.fingerprintDetails("definition", definition.fingerprint) ++
             (if (changedTuning)
-               StreamingInsightEvents.fingerprintDetails("previous_operational", manifest.operationalHash) ++
+               StreamingInsightEvents.fingerprintDetails("previous_operational", storedManifest.operationalHash) ++
                  StreamingInsightEvents.fingerprintDetails("requested_operational", definition.operationalHash)
              else Seq.empty) ++
             Seq(
               "target_identity"              -> target.identity,
               "was_active"                   -> before.isActive,
-              "compatible_legacy_definition" -> compatibleLegacyDefinition
+              "compatible_legacy_definition" -> compatibleLegacyDefinition,
+              "adopted_definition_drift"     -> adoptedDrift
             )
         )
         if (active.nonEmpty) {
@@ -896,6 +912,35 @@ object StreamingTableManager {
       }
     }
   }
+
+  /** Re-record the owned target's definition when it differs from the stored one only by drift that
+    * cannot change the stream's output, so the stream resumes its checkpoint instead of rebuilding.
+    *
+    * @param spark          active session
+    * @param target         owned streaming target
+    * @param storedManifest manifest persisted for the target
+    * @param definition     freshly analyzed definition of the submitted declaration
+    * @param expandsViews   whether the submitted declaration expanded a view
+    * @return the manifest reconciliation continues with
+    */
+  private def adoptResumableDrift(
+      spark: SparkSession,
+      target: StreamingTableTarget,
+      storedManifest: StreamingTableManifest,
+      definition: StreamingTableDefinition,
+      expandsViews: Boolean
+  ): StreamingTableManifest =
+    if (
+      storedManifest.definitionHash != definition.fingerprint &&
+      !StreamingTableDefinition.semanticallyEquivalent(storedManifest.semanticJson, definition.semanticJson) &&
+      StreamingDefinitionDrift.resumable(
+        storedManifest.semanticJson,
+        definition,
+        expandsViews,
+        StreamingDefinitionDrift.ignoreAnalyzedPlanDrift(spark)
+      )
+    ) StreamingTableMetadata.replaceManifest(spark, target, definition)
+    else storedManifest
 
   private def rebuild(
       spark: SparkSession,

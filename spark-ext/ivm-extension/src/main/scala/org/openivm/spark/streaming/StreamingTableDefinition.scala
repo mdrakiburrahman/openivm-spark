@@ -493,7 +493,7 @@ object StreamingTableDefinition {
     )
   }
 
-  private def normalizeSemanticJson(json: String): String = {
+  private[streaming] def normalizeSemanticJson(json: String): String = {
     val root = Mapper.readTree(json).deepCopy[ObjectNode]()
     Seq("declarationPlan", "analyzedPlan").foreach { field =>
       Option(root.get(field))
