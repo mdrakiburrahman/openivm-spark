@@ -2742,8 +2742,9 @@ case class CreateMaterializedViewCommand(
                 }
               } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
+          // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
-            OpenIvmStateSync.backupNow(spark)
+            if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
             createOutcome = outcome
           }
           outcome
@@ -2752,7 +2753,7 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        OpenIvmStateSync.backupNow(spark)
+        if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
         createOutcome = outcome
       }
       if (outcome == "create_executed")
