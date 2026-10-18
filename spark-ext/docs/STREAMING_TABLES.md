@@ -213,6 +213,19 @@ default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
 replacement of the extension-owned target. The previous checkpoint remains in
 the archive for diagnosis and audit.
 
+Operational source options are not part of the semantic definition: the rate
+limits `maxFilesPerTrigger` / `maxBytesPerTrigger` and the Delta change-commit
+tolerances `ignoreDeletes`, `ignoreChanges` and `skipChangeCommits` (keys are
+case-insensitive). Reissuing a declaration that changes only these options
+restarts the same checkpoint and table with the new values and records them in
+the persisted definition; it never rebuilds. This is the documented Delta
+remedy when a source starts committing retention deletes and the query fails
+with `DELTA_SOURCE_IGNORE_DELETE`: add `'ignoreDeletes' = 'true'` and reissue.
+`startingVersion` and `startingTimestamp` stay semantic. Definitions persisted
+by earlier versions, which counted the tolerances as semantic, are accepted as
+the same definition and re-persisted in the current form, including a pending
+rebuild's reset journal, so upgrading the extension never rebuilds a stream.
+
 Before rebuilding or dropping a managed target, OpenIVM resolves one dependency
 graph spanning both streaming tables and materialized views, then drops every
 transitively downstream managed object in reverse topological order (leaves

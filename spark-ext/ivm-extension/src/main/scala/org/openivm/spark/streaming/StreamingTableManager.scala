@@ -201,7 +201,9 @@ object StreamingTableManager {
           val recovery = StreamingTableMetadata.pendingResetIntent(spark, identity)
           recovery match {
             case Some(intent) =>
-              if (runtime.onQueryChange != "rebuild" || intent.replacementDefinitionHash != definition.fingerprint)
+              if (
+                runtime.onQueryChange != "rebuild" || !definition.matchesFingerprint(intent.replacementDefinitionHash)
+              )
                 StreamingTableErrors.invalid(
                   s"A reset recovery for ${StreamingTableMetadata.quoteMultipart(spec.name)} is pending; " +
                     "resubmit the exact replacement with onQueryChange=rebuild"
@@ -746,8 +748,10 @@ object StreamingTableManager {
     reconcileResetJournal(spark, target, manifest, definition, runtime)
     val exactDefinition = manifest.definitionHash == definition.fingerprint
     val compatibleLegacyDefinition =
-      !exactDefinition &&
-        StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
+      !exactDefinition && (
+        definition.legacyFingerprints.contains(manifest.definitionHash) ||
+          StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
+      )
     if (!exactDefinition && !compatibleLegacyDefinition) {
       val rebuildDecision = StreamingTableDefinition.rebuildDecision(
         manifest.definitionHash,
@@ -1779,10 +1783,10 @@ object StreamingTableManager {
       val matchesReplacement =
         intent.targetIdentity == target.identity &&
           intent.targetPath == target.dataPath &&
-          intent.replacementDefinitionHash == definition.fingerprint
+          definition.matchesFingerprint(intent.replacementDefinitionHash)
       val completedReplacement =
         matchesReplacement &&
-          manifest.definitionHash == definition.fingerprint &&
+          definition.matchesFingerprint(manifest.definitionHash) &&
           target.deltaTableId != intent.oldDeltaTableId
       if (completedReplacement) StreamingTableMetadata.clearResetIntent(spark, intent)
       else if (!matchesReplacement || runtime.onQueryChange != "rebuild")
