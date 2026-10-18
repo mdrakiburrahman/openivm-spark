@@ -25,7 +25,8 @@ private[streaming] final case class StreamingStartupObservation(
 
 /** Diagnoses startup without stopping a query. This watchdog owns its supplied scheduler.
   *
-  * Confirmed zero work must remain continuous for the configured grace after the startup deadline.
+  * Startup phase changes renew the inactivity budget without counting as completed batch progress.
+  * Confirmed zero work must remain continuous for the configured grace after that budget expires.
   * Non-fatal observation/delivery failures are reported and retried; delivery must be idempotent.
   * Fatal failures or a throwing reporter fail the returned future, never count as a successful diagnosis.
   * Cancellation never interrupts an in-flight observation/delivery. The default daemon starts on registration.
@@ -46,9 +47,10 @@ private[streaming] final class StreamingFirstProgressWatchdog(
   def watch(
       deadline: LifecycleDeadline,
       observe: () => StreamingStartupObservation,
-      onUnhealthy: () => Unit
+      onUnhealthy: () => Unit,
+      startupActivity: () => Option[String] = () => None
   ): ScheduledFuture[_] = {
-    val registration = new Registration(deadline, observe, onUnhealthy)
+    val registration = new Registration(deadline, observe, onUnhealthy, startupActivity)
     lock.synchronized {
       if (closed) throw new RejectedExecutionException("Streaming first-progress watchdog is shut down")
       registrations += registration
@@ -57,7 +59,7 @@ private[streaming] final class StreamingFirstProgressWatchdog(
     try {
       val task = scheduler.scheduleWithFixedDelay(
         registration,
-        deadline.remainingNanos,
+        0L,
         StreamingFirstProgressWatchdog.PollNanos,
         TimeUnit.NANOSECONDS
       )
@@ -95,7 +97,8 @@ private[streaming] final class StreamingFirstProgressWatchdog(
   private final class Registration(
       deadline: LifecycleDeadline,
       observe: () => StreamingStartupObservation,
-      onUnhealthy: () => Unit
+      onUnhealthy: () => Unit,
+      startupActivity: () => Option[String]
   ) extends Runnable
       with ScheduledFuture[Unit] {
 
@@ -103,6 +106,8 @@ private[streaming] final class StreamingFirstProgressWatchdog(
     private val cancelled             = new AtomicBoolean(false)
     private val scheduled             = new AtomicReference[ScheduledFuture[_]]()
     private var zeroWorkGraceDeadline = Option.empty[LifecycleDeadline]
+    private var inactivityDeadline    = deadline
+    private var lastStartupActivity   = Option.empty[String]
 
     def attach(task: ScheduledFuture[_]): Unit = {
       scheduled.set(task)
@@ -113,6 +118,19 @@ private[streaming] final class StreamingFirstProgressWatchdog(
     override def run(): Unit =
       if (!finished.get() && !closed) {
         try {
+          val activity =
+            try startupActivity()
+            catch {
+              case error: Throwable =>
+                zeroWorkGraceDeadline = None
+                throw error
+            }
+          if (activity.isDefined && activity != lastStartupActivity) {
+            lastStartupActivity = activity
+            inactivityDeadline = LifecycleDeadline.start(deadline.timeout, nanoTime)
+            zeroWorkGraceDeadline = None
+          }
+          if (inactivityDeadline.remainingNanos > 0L) return
           val observation =
             try observe()
             catch {
@@ -122,8 +140,10 @@ private[streaming] final class StreamingFirstProgressWatchdog(
             }
           if (!finished.get() && !closed) {
             if (observation.progressObserved || !observation.active) cancel(false)
-            else if (deadline.remainingNanos > 0L) zeroWorkGraceDeadline = None
-            else
+            else if (observation.workActive.contains(true)) {
+              inactivityDeadline = LifecycleDeadline.start(deadline.timeout, nanoTime)
+              zeroWorkGraceDeadline = None
+            } else
               observation.workActive match {
                 case Some(false) =>
                   zeroWorkGraceDeadline match {

@@ -1,6 +1,7 @@
 package org.openivm.spark.streaming
 
 import org.apache.spark.SparkContext
+import org.apache.spark.openivm.OpenIvmSchedulerObservation
 import org.apache.hadoop.fs.Path
 import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd}
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -2471,7 +2472,8 @@ private[streaming] object StreamingTableRegistry {
     def unhealthy(run: String, timeout: FiniteDuration): Unit = synchronized {
       if (runId == run && !terminated && !progressObserved && !stopRequested)
         startupFailure = Some(
-          s"Native writer $run for ${target.sqlIdentifier} emitted no first progress or idle event within $timeout " +
+          s"Native writer $run for ${target.sqlIdentifier} emitted no first progress or idle event, " +
+            s"showed no startup phase advancement or confirmed Spark work for $timeout, " +
             "and has no running stream-scoped Spark work. Inspect or recycle the Spark session."
         )
     }
@@ -2540,20 +2542,35 @@ private[streaming] object StreamingTableRegistry {
     )
 
     def watch(entry: Entry, run: String, deadline: LifecycleDeadline): Unit = {
+      def pendingQuery: Option[StreamingQuery] =
+        entry.currentQuery.filter { current =>
+          Option(current.lastProgress) match {
+            case Some(progress) =>
+              entry.progress(run, Some(StreamingTableDefinition.redactText(progress.json)))
+              false
+            case None => true
+          }
+        }
+
       val check = watchdog.watch(
         deadline,
         () =>
           try {
-            entry.currentQuery.flatMap(query => Option(query.lastProgress)).foreach { progress =>
-              entry.progress(run, Some(StreamingTableDefinition.redactText(progress.json)))
-            }
+            pendingQuery
             entry.observation(run, workActive(run))
           } catch {
             case NonFatal(error) =>
               entry.diagnosticError(run, error)
               throw error
           },
-        () => entry.unhealthy(run, deadline.timeout)
+        () => entry.unhealthy(run, deadline.timeout),
+        () =>
+          try pendingQuery.map(current => StreamingTableDefinition.redactText(current.status.message))
+          catch {
+            case NonFatal(error) =>
+              entry.diagnosticError(run, error)
+              throw error
+          }
       )
       entry.attachStartup(run, check)
     }
@@ -2753,14 +2770,7 @@ private[streaming] object StreamingTableRegistry {
       val existing   = registries.get(contextKey)
       if (existing != null) existing
       else {
-        val created = new ContextRegistry(run => {
-          val tracker = contextKey.statusTracker
-          val active  = tracker.getActiveJobIds().toSet
-          val grouped = tracker.getJobIdsForGroup(run)
-          if (grouped.exists(active.contains)) Some(true)
-          else if (active.forall(id => tracker.getJobInfo(id).isDefined)) Some(false)
-          else None
-        })
+        val created = new ContextRegistry(run => OpenIvmSchedulerObservation.workActive(contextKey, run))
         registries.put(contextKey, created)
         contextKey.addSparkListener(new SparkListener {
           override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit =
