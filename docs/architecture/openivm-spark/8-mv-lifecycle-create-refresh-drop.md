@@ -366,6 +366,12 @@ Source:
 - `MvCatalog.scala:78-105`
   These watermarks prevent CREATE from double-applying older staging rows during the first REFRESH. The initial snapshot already includes the live source state.
 
+In CDF mode a REFRESH never replays a change feed it cannot apply exactly. A source with no consumed Delta version (no CDF cursor and no `v:` CREATE watermark, e.g. a view created under intercept mode before the deployment switched to `cdf`) and a range whose change rows Delta no longer holds (`CdfChangeAvailability`: commits removed by log cleanup, the change feed disabled inside the range, or `_change_data` files, removed data files or deletion vectors deleted by VACUUM) both route the refresh to the full recompute before anything is applied. The recompute marks every collected batch consumed, so the source is re-baselined at its current version and the next refresh is incremental again. The refresh logs `outcome='cdf_rebaseline_full_refresh'` at WARN and records a `cdf_rebaseline` profile step naming each source and reason.
+
+### 1.13.1 Determinism at CREATE
+
+Incremental maintenance evaluates an expression only for the rows, groups or partitions a refresh touches, so CREATE rejects a view whose effective refresh type is incremental when its analyzed plan (subqueries included) contains a random expression (`rand`, `uuid`, `shuffle`, `monotonically_increasing_id`, `input_file_name`, `spark_partition_id`, non-deterministic UDFs, …) or a time-dependent one (`current_date`, `current_timestamp`, `now`, `localtimestamp`, `current_timezone`, …). Window functions and Spark's built-in order-dependent aggregates (`first`, `last`, `collect_list`, …) are allowed. A `FULL_REFRESH` view recomputes on every refresh and is always accepted. `spark.openivm.create.allowNonDeterministic=true` (session conf) accepts the divergence.
+
 ### 1.14 Schema fingerprint
 
 CREATE fingerprints current source schemas. If a source is itself an MV, the fingerprint also includes that upstream MV identity hash.

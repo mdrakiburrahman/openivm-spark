@@ -444,6 +444,14 @@ object FeatureGate {
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
 
+  /** Let CREATE MATERIALIZED VIEW accept an incrementally maintained query that contains a random or
+    * time-dependent expression (`rand()`, `uuid()`, `current_date()`, …). Default OFF: incremental
+    * maintenance evaluates such an expression only for changed rows, so the view diverges from a
+    * recompute of its query and CREATE rejects it. Views recomputed on every refresh (FULL_REFRESH) are
+    * always accepted. Read from the session conf, so one CREATE can opt in with `SET`.
+    */
+  val AllowNonDeterministicKey: String = "spark.openivm.create.allowNonDeterministic"
+
   /** Compile-time cost model observability. Default OFF: when opted in, REFRESH
     * records the deterministic WorkloadFacts-derived cost hint in MV metadata.
     */
@@ -757,6 +765,12 @@ object FeatureGate {
 
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def allowNonDeterministic(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(AllowNonDeterministicKey)
+      .orElse(spark.sparkContext.getConf.getOption(AllowNonDeterministicKey))
+      .exists(_.trim.equalsIgnoreCase("true"))
 
   def costModelEnabled(conf: SparkConf): Boolean =
     boolConf(conf, CostModelEnabledKey, default = false)

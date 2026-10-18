@@ -3136,6 +3136,32 @@ case class CreateMaterializedViewCommand(
         logInfo(msg)
     }
 
+    // Incremental maintenance evaluates an expression only for the rows, groups or partitions a
+    // refresh touches, so a random or time-dependent one leaves the view diverging from a
+    // recompute of its query. A FULL_REFRESH view is recomputed on every refresh and unaffected.
+    if (effectiveRefreshType != RefreshTypeCode.FullRefresh) {
+      val varying = MvDeterminism.varyingExpressions(analyzed)
+      if (varying.nonEmpty) {
+        val described = varying.map(MvDeterminism.describe).mkString(", ")
+        if (FeatureGate.allowNonDeterministic(spark))
+          logWarning(
+            s"[openivm-mv] view='${sqlIdent(name)}' outcome='non_deterministic_allowed' " +
+              s"effective_refresh_type='$effectiveRefreshTypeName' expressions='$described'"
+          )
+        else
+          throw new AnalysisException(
+            "_LEGACY_ERROR_TEMP_2273",
+            Map(
+              "message" -> (s"openivm-spark: materialized view ${sqlIdent(name)} would be maintained " +
+                s"incrementally ($effectiveRefreshTypeName), but its query contains random or time-dependent " +
+                s"expressions: $described. Incremental maintenance evaluates them only for the rows a refresh " +
+                "touches, so the view would diverge from a recompute of its query. Remove them, or set " +
+                s"${FeatureGate.AllowNonDeterministicKey}=true to accept that divergence.")
+            )
+          )
+      }
+    }
+
     // Analyze the physical initial load, not column-name prefixes: user projections
     // can legitimately use openivm_* names, while native maintenance adds counts,
     // join keys and null state that must never become public result columns.
@@ -4838,9 +4864,10 @@ case class RefreshMaterializedViewCommand(
             val versionBatches =
               versionBatchesBySource.getOrElse(source.toLowerCase(java.util.Locale.ROOT), Seq.empty)
             val starts = versionBatches.flatMap {
-              case batch: CdfChangeBatch           => Some(batch.startVersionExclusive)
-              case batch: SourceVersionChangeBatch => Some(batch.startVersionInclusive)
-              case _                               => None
+              case batch: CdfChangeBatch if batch.hasBaseline => Some(batch.startVersionExclusive)
+              case batch: CdfChangeBatch                      => Some(batch.endVersionInclusive)
+              case batch: SourceVersionChangeBatch            => Some(batch.startVersionInclusive)
+              case _                                          => None
             }
             val ends = versionBatches.flatMap {
               case batch: CdfChangeBatch           => Some(batch.endVersionInclusive)
@@ -4892,6 +4919,56 @@ case class RefreshMaterializedViewCommand(
 
       val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
 
+      // A CDF source whose change rows cannot be applied on top of the view's rows -- no consumed
+      // version is known, or Delta no longer holds the range (VACUUM, log cleanup) -- routes this
+      // refresh to the full recompute below, which re-baselines the source at its collected version.
+      // Checked before anything is applied, so an unreadable change feed is never partially applied.
+      // A refresh that already recomputes reads no change rows and needs no check.
+      val cdfRebaselineReasons: Map[String, String] =
+        if (cdfChangeBatches.isEmpty || meta.refreshType == RefreshTypeCode.FullRefresh || stateLag.nonEmpty)
+          Map.empty
+        else
+          profile.timeStep("metadata_pre_sql", "phase=cdf_change_availability") {
+            RefreshPerf.timePhase(refreshId, viewLabel, "cdf_change_availability") {
+              cdfChangeBatches
+                .groupBy(_.baseTable)
+                .toSeq
+                .flatMap { case (source, batches) =>
+                  if (!batches.forall(_.hasBaseline)) Some(source -> "cdf_watermark_missing")
+                  else
+                    CdfChangeAvailability
+                      .unavailableReason(
+                        spark,
+                        source,
+                        batches.map(_.startVersionExclusive).min,
+                        batches.map(_.endVersionInclusive).max
+                      )
+                      .map(detail => source -> s"cdf_change_data_unavailable ($detail)")
+                }
+                .toMap
+            }
+          }
+      if (cdfRebaselineReasons.nonEmpty) {
+        val rebaselined = cdfRebaselineReasons.toSeq.sortBy(_._1)
+        rebaselined.foreach { case (source, reason) =>
+          logWarning(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='cdf_rebaseline_full_refresh' " +
+              s"source='$source' reason='$reason'"
+          )
+        }
+        profile.appendStep(
+          "cdf_rebaseline",
+          rebaselined.map { case (source, reason) => s"$source=$reason" }.mkString(";"),
+          0L
+        )
+        RefreshPerf.emit(
+          refreshId,
+          viewLabel,
+          "cdf_rebaseline",
+          s"outcome='cdf_rebaseline_full_refresh' sources='${rebaselined.map(_._1).mkString(",")}'"
+        )
+      }
+
       // Regular N-term SQL reads unchanged relations from the snapshot immediately
       // before this refresh. Metadata watermarks describe MV creation and become
       // stale after the first CDF refresh, so reconstruct that pre-refresh snapshot:
@@ -4917,8 +4994,10 @@ case class RefreshMaterializedViewCommand(
           .map { case (source, batches) =>
             val startVersion = batches.map(_.startVersionExclusive).min
             val verdict =
-              try DeltaCommitClassifier.classify(spark, source, startVersion)
-              catch { case _: Throwable => BatchVerdict.Replace }
+              if (cdfRebaselineReasons.contains(source)) BatchVerdict.Replace
+              else
+                try DeltaCommitClassifier.classify(spark, source, startVersion)
+                catch { case _: Throwable => BatchVerdict.Replace }
             source -> verdict
           }
 
@@ -5174,7 +5253,7 @@ case class RefreshMaterializedViewCommand(
       lazy val replaceBatch: Boolean =
         hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
       if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch || stateLag.nonEmpty) {
-        if (meta.refreshType != RefreshTypeCode.FullRefresh && stateLag.isEmpty)
+        if (meta.refreshType != RefreshTypeCode.FullRefresh && stateLag.isEmpty && cdfRebaselineReasons.isEmpty)
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
           )
