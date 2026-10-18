@@ -1401,18 +1401,17 @@ object StreamingTableManager {
       StreamingTableErrors.invalid(
         s"Materialized view '${materializedName(expected.name)}' changed during cascade resolution"
       )
+    // A registration whose Delta data is gone was dropped outside OpenIVM. It still joins the
+    // cascade so its OpenIVM state is removed; MaterializedViewLifecycle.dropOne only drops what
+    // OpenIVM still owns.
     val snapshot = DeltaLog.forTable(spark, new Path(meta.location)).update()
-    if (snapshot.version < 0L)
-      StreamingTableErrors.invalid(
-        s"Materialized view '${materializedName(meta.name)}' has no readable Delta generation"
-      )
     CascadeNode(
       StreamingTableCascadeTarget(
         kind = "materialized",
         name = tableNameParts(meta.name),
         identity = StreamingDependencyCatalog.materializedIdentity(materializedName(meta.name)),
         dataPath = StreamingTableMetadata.normalizePath(spark, meta.location),
-        deltaTableId = snapshot.metadata.id,
+        deltaTableId = if (snapshot.version < 0L) "" else snapshot.metadata.id,
         tableId = MvCatalog.mvIdentity(meta),
         sourcePaths = Seq.empty
       ),
@@ -1623,9 +1622,13 @@ object StreamingTableManager {
           StreamingTableErrors.invalid(
             s"Downstream materialized view '${materializedName(name)}' changed during cascade cleanup"
           )
-        val archived = StreamingTableMetadata.archiveMaterializedTarget(spark, descendant, context)
-        MaterializedViewLifecycle.dropOne(spark, name, meta, context.operationId)
-        CascadeDropResult(archiveLocation = Some(archived), runtime = None)
+        val ownership = MaterializedViewLifecycle.liveOwnership(spark, name, meta)
+        val archived =
+          if (ownership.publicOwned || ownership.dataOwned)
+            Some(StreamingTableMetadata.archiveMaterializedTarget(spark, descendant, context))
+          else None
+        MaterializedViewLifecycle.dropOne(spark, name, meta, context.operationId, Some(ownership))
+        CascadeDropResult(archiveLocation = archived, runtime = None)
 
       case other =>
         StreamingTableErrors.invalid(s"Unsupported managed cascade target kind '$other'")

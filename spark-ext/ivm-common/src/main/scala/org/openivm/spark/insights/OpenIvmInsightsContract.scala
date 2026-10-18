@@ -261,6 +261,8 @@ object OpenIvmInsightsContract {
     val ViewDeltaNamespaceCleanupFailed: String =
       "view_delta_namespace_cleanup_failed"
     val CatalogEntryRemoved: String = "catalog_entry_removed"
+    val ExternalRelationRetained: String =
+      "external_relation_retained"
 
     val StreamingCascadePlan: String                = "streaming_cascade_plan"
     val StreamingRecoveryStateObserved: String      = "streaming_recovery_state_observed"

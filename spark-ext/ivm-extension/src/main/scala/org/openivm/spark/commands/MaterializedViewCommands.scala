@@ -8379,41 +8379,139 @@ case class RefreshMaterializedViewCommand(
 // DropMaterializedViewCommand
 // ---------------------------------------------------------------------------
 
-private[spark] object MaterializedViewLifecycle {
+private[spark] object MaterializedViewLifecycle extends org.apache.spark.internal.Logging {
 
+  /** Whether the live relation and storage an MV registration names are still the objects
+    * OpenIVM created.
+    *
+    * @param publicOwned the relation at the MV name is the OpenIVM table, or the public view
+    *                    over the OpenIVM backing table
+    * @param dataOwned   the Delta table at the registered location carries OpenIVM's CREATE marker
+    * @param dataPresent a Delta table exists at the registered location
+    * @param reason      why the registration is not fully owned; empty when it is
+    */
+  final case class LiveOwnership(
+      publicOwned: Boolean,
+      dataOwned: Boolean,
+      dataPresent: Boolean,
+      reason: String
+  ) {
+    def owned: Boolean = publicOwned && dataOwned
+  }
+
+  /** Probe the live relation and storage an MV registration names. A relation replaced or
+    * dropped outside OpenIVM (for example by a dbt `table` materialization) is not OpenIVM's
+    * to drop. Read failures propagate instead of downgrading ownership.
+    *
+    * @param spark active session
+    * @param name  registered MV identifier
+    * @param meta  registered MV metadata
+    */
+  def liveOwnership(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): LiveOwnership = {
+    import MvCommandHelper._
+
+    val snapshot    = DeltaLog.forTable(spark, new Path(meta.location)).update()
+    val dataPresent = snapshot.version >= 0L
+    val dataOwned = dataPresent &&
+      snapshot.metadata.configuration.get(CreateRecoveryWatermarksMarker).exists(_.equalsIgnoreCase("true"))
+    val ident        = sqlIdent(name)
+    val publicExists = spark.catalog.tableExists(ident)
+    val hadoopConf   = spark.sessionState.newHadoopConf()
+    def qualified(path: Path): java.net.URI =
+      path.getFileSystem(hadoopConf).makeQualified(path).toUri.normalize()
+    val registeredData = qualified(new Path(meta.location))
+    val publicOwned = dataOwned && publicExists && {
+      val analyzed =
+        try Some(spark.table(ident).queryExecution.analyzed)
+        catch { case _: AnalysisException => None }
+      analyzed.exists { plan =>
+        plan.exists(_.isInstanceOf[View]) == meta.usesBackingDataTable &&
+        DeltaTableVersion.deltaLogFromPlan(plan).exists(log => qualified(log.dataPath) == registeredData)
+      }
+    }
+    val expectedObject =
+      if (meta.usesBackingDataTable) "the public view over its backing table" else "its materialized table"
+    val reason =
+      if (!dataPresent) s"no Delta table at ${meta.location}"
+      else if (!dataOwned) s"the Delta table at ${meta.location} lacks $CreateRecoveryWatermarksMarker"
+      else if (!publicExists) s"relation $ident does not exist"
+      else if (!publicOwned) s"relation $ident is not $expectedObject"
+      else ""
+    LiveOwnership(publicOwned, dataOwned, dataPresent, reason)
+  }
+
+  /** Drop one registered materialized view and remove its OpenIVM state. Catalog objects and
+    * storage are dropped only while OpenIVM still owns them; a registration whose relation was
+    * replaced or dropped outside OpenIVM is deregistered without touching the live relation.
+    *
+    * @param spark           active session
+    * @param name            registered MV identifier
+    * @param meta            registered MV metadata
+    * @param operationId     insight operation identifier
+    * @param probedOwnership ownership already probed by the caller under the same locks
+    */
   def dropOne(
       spark: SparkSession,
       name: TableIdentifier,
       meta: MvMetadata,
-      operationId: String
+      operationId: String,
+      probedOwnership: Option[LiveOwnership] = None
   ): Unit = {
     import MvCommandHelper._
 
-    val viewName = metaName(name)
+    val viewName  = metaName(name)
+    val ownership = probedOwnership.getOrElse(liveOwnership(spark, name, meta))
+    if (!ownership.owned) {
+      logWarning(
+        s"[openivm] materialized view $viewName was replaced or dropped outside OpenIVM " +
+          s"(${ownership.reason}); removing its OpenIVM state without touching objects OpenIVM no longer owns"
+      )
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "ownership_check",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.ExternalRelationRetained,
+        message = "The materialized view was replaced or dropped outside OpenIVM; objects it no longer owns are kept.",
+        status = "external_relation_retained",
+        level = org.openivm.spark.insights.OpenIvmInsightsContract.Level.Warn,
+        details = Seq(
+          "reason"       -> ownership.reason,
+          "public_owned" -> ownership.publicOwned,
+          "data_owned"   -> ownership.dataOwned
+        )
+      )
+    }
     if (meta.usesBackingDataTable) {
-      spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
-      OpenIvmInsightEvents.action(
-        spark,
-        operationId,
-        viewName,
-        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
-        stage = "catalog_cleanup",
-        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.PublicViewRemoved,
-        message = "Removed the public materialized-view wrapper.",
-        details = Seq("object_kind" -> "view")
-      )
-      spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
-      OpenIvmInsightEvents.action(
-        spark,
-        operationId,
-        viewName,
-        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
-        stage = "catalog_cleanup",
-        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.BackingTableRemoved,
-        message = "Removed the materialized-view backing table.",
-        details = Seq("object_kind" -> "backing_table")
-      )
-    } else {
+      if (ownership.publicOwned) {
+        spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
+        OpenIvmInsightEvents.action(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          stage = "catalog_cleanup",
+          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.PublicViewRemoved,
+          message = "Removed the public materialized-view wrapper.",
+          details = Seq("object_kind" -> "view")
+        )
+      }
+      val backing = dataTableId(name)
+      if (ownership.dataOwned && registrationResolvesTo(spark, backing, meta.location)) {
+        spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(backing)}")
+        OpenIvmInsightEvents.action(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          stage = "catalog_cleanup",
+          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.BackingTableRemoved,
+          message = "Removed the materialized-view backing table.",
+          details = Seq("object_kind" -> "backing_table")
+        )
+      }
+    } else if (ownership.publicOwned) {
       spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
       OpenIvmInsightEvents.action(
         spark,
@@ -8430,7 +8528,7 @@ private[spark] object MaterializedViewLifecycle {
     val hadoopPath  = new Path(meta.location)
     val fs          = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
     val pathExisted = fs.exists(hadoopPath)
-    val pathDeleted = !pathExisted || fs.delete(hadoopPath, /* recursive = */ true)
+    val pathDeleted = !pathExisted || (ownership.dataOwned && fs.delete(hadoopPath, /* recursive = */ true))
     OpenIvmInsightEvents.action(
       spark,
       operationId,
@@ -8440,9 +8538,10 @@ private[spark] object MaterializedViewLifecycle {
       code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StoragePathRemoved,
       message = "Processed materialized-view storage-path cleanup.",
       details = Seq(
-        "path"    -> meta.location,
-        "existed" -> pathExisted,
-        "deleted" -> pathDeleted
+        "path"     -> meta.location,
+        "existed"  -> pathExisted,
+        "deleted"  -> pathDeleted,
+        "retained" -> (pathExisted && !ownership.dataOwned)
       )
     )
 

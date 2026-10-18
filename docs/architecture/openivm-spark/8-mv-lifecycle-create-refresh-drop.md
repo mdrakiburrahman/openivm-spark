@@ -929,9 +929,13 @@ Source:
   Source:
 - `MaterializedViewCommands.scala:1382-1385`
 
+### 3.3a Relations replaced or dropped outside OpenIVM
+
+Before dropping anything, `MaterializedViewLifecycle.liveOwnership` probes whether the registration still names OpenIVM's objects. The Delta table at `meta.location` is owned only while it carries the CREATE marker `_ivm_create_watermarks_v1` (a `CREATE OR REPLACE TABLE` resets table properties). The relation at the MV name is owned only when it is that Delta table, or, for a view-shaped MV, a view whose plan reads that backing table. A relation replaced or dropped outside OpenIVM (for example by a dbt `table` materialization) is never dropped and its data is never deleted: DROP, `DROP ... IF EXISTS` and every cascade (MV drop, streaming-table drop or rebuild) only remove what OpenIVM still owns (the backing table, owned storage, view deltas, change-propagation rows, CDF watermarks, the catalog entry), log a WARN and emit `external_relation_retained`. A registration whose Delta data is gone still joins a cascade instead of failing it.
+
 ### 3.4 Delete Delta table at `_ivm/views/db/mv/`
 
-DROP deletes the physical Delta files at `meta.location`. That is the path under `<warehouse>/_ivm/views/...` computed at CREATE.
+DROP deletes the physical Delta files at `meta.location` while OpenIVM owns them. That is the path under `<warehouse>/_ivm/views/...` computed at CREATE.
 Source:
 
 - `MaterializedViewCommands.scala:1387-1390`
