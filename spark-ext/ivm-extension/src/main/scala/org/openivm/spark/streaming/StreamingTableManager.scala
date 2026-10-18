@@ -326,8 +326,17 @@ object StreamingTableManager {
                   "source_count"    -> definition.sources.size
                 )
               )
+              if (interrupted.isEmpty && spec.location.isEmpty)
+                discardUncommittedCreation(spark, spec.name, identity, plannedPath.get, definition, insight)
           }
-          val target = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, interrupted)
+          val target =
+            try StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, interrupted)
+            catch {
+              case NonFatal(error) if interrupted.isEmpty && recovery.isEmpty && spec.location.isEmpty =>
+                try discardUncommittedCreation(spark, spec.name, identity, plannedPath.get, definition, insight)
+                catch { case NonFatal(cleanup) => error.addSuppressed(cleanup) }
+                throw error
+            }
           if (interrupted.nonEmpty)
             try
               StreamingTableMetadata.validateExistingTargetAgainstManifest(
@@ -694,17 +703,119 @@ object StreamingTableManager {
           }
         }
         .orElse {
-          known.map { target =>
-            metadataErrorStatus(
-              spark,
-              target,
-              "The known owned target could not be resolved; ownership could not be verified. " +
-                resolutionFailure.map(resolutionFailureDetails).getOrElse("No readable Delta relation was returned")
-            )
+          known.flatMap { target =>
+            if (resolutionFailure.exists(missingFromCatalog) && !catalogObjectMayExist(spark, target.name))
+              uncommittedStatus(spark, target)
+            else
+              Some(
+                metadataErrorStatus(
+                  spark,
+                  target,
+                  "The known owned target could not be resolved; ownership could not be verified. " +
+                    resolutionFailure
+                      .map(resolutionFailureDetails)
+                      .getOrElse("No readable Delta relation was returned")
+                )
+              )
           }
         }
     }
   }
+
+  /** Status of a target this session registered but no catalog object names.
+    *
+    * While its run is active the run's own status is reported, so a slow or lagging catalog commit does
+    * not fail the run. Once no run is active the target is absent, so the next CREATE replaces the
+    * uncommitted residue; a failed run keeps reporting its failure.
+    */
+  private def uncommittedStatus(
+      spark: SparkSession,
+      target: StreamingTableTarget
+  ): Option[StreamingTableStatus] = {
+    val entry    = StreamingTableRegistry.entry(spark, StreamingTableRegistry.targetKey(target), target)
+    val snapshot = entry.snapshot
+    entry.currentQuery.filter(_.isActive) match {
+      case Some(query) =>
+        Some(
+          StreamingTableStatus(
+            tableName = target.sqlIdentifier,
+            queryId = Some(query.id.toString),
+            runId = Some(query.runId.toString),
+            status = snapshot.diagnosticStatus.getOrElse("active"),
+            checkpointLocation = Some(target.checkpointLocation),
+            definitionHash = Option(entry.definitionHash),
+            isActive = true,
+            lastProgress = snapshot.lastProgress,
+            lastFailure = snapshot.lastFailure
+          )
+        )
+      case None if snapshot.lastFailure.nonEmpty =>
+        Some(metadataErrorStatus(spark, target, "The owned target is not in the catalog"))
+      case None => None
+    }
+  }
+
+  private def missingFromCatalog(error: Throwable): Boolean =
+    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).take(8).exists {
+      case _: org.apache.spark.sql.catalyst.analysis.NoSuchTableException => true
+      case cause => Option(cause.getMessage).exists(_.contains("TABLE_OR_VIEW_NOT_FOUND"))
+    }
+
+  private def catalogObjectMayExist(spark: SparkSession, name: Seq[String]): Boolean =
+    try StreamingTableMetadata.catalogTableExists(spark, name)
+    catch { case NonFatal(_) => true }
+
+  /** Remove OpenIVM-owned residue that an interrupted first CREATE left without committing its catalog
+    * table, so the creation starts fresh instead of failing on the occupied location.
+    *
+    * @param spark      active session
+    * @param name       requested streaming-table name
+    * @param identity   canonical identity of the requested target
+    * @param path       managed path the creation uses
+    * @param definition requested definition, whose sources the deletion must not overlap
+    * @param insight    operation receiving the cleanup events
+    */
+  private def discardUncommittedCreation(
+      spark: SparkSession,
+      name: Seq[String],
+      identity: String,
+      path: String,
+      definition: StreamingTableDefinition,
+      insight: InsightOperation
+  ): Unit =
+    StreamingTableMetadata.uncommittedCreationResidue(spark, name, identity, path).foreach { residue =>
+      val registryKey = StreamingTableRegistry.targetKey(residue)
+      stopNative(spark, residue, registryKey, insight.stopDeadline, insight.operationId)
+      val archived = StreamingTableMetadata.discardUncommittedCreation(
+        spark,
+        residue,
+        definition.sourcePaths,
+        StreamingArchiveContext(action = "interrupted-create", operationId = insight.operationId, rootTarget = identity)
+      )
+      StreamingTableRegistry.forget(spark, registryKey)
+      emitArchiveAction(
+        spark,
+        insight,
+        insight.targetRelation,
+        targetKind = "streaming",
+        targetIdentity = identity,
+        causedBy = None,
+        archived
+      )
+      StreamingInsightEvents.action(
+        spark,
+        insight.operationId,
+        insight.targetRelation,
+        targetKind = "streaming",
+        targetIdentity = identity,
+        causedBy = None,
+        stage = "target_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetDropped,
+        message = "Removed the residue of an interrupted creation that never committed its catalog table.",
+        status = "interrupted_create_cleanup",
+        details = Seq("target_path" -> path)
+      )
+    }
 
   private[streaming] def resolveShowCandidates[A](
       names: Seq[Seq[String]],

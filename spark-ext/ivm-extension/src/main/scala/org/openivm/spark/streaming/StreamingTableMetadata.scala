@@ -489,6 +489,134 @@ object StreamingTableMetadata {
       case NonFatal(_) => None
     }
 
+  /** Returns the OpenIVM-owned residue a creation left at a target path without a catalog table.
+    *
+    * A first CREATE can stop after Delta wrote the target's log, manifest or checkpoint but before the
+    * catalog committed the table, for example when its session is cancelled. No catalog object names that
+    * residue, so every retry would otherwise fail on the non-empty location. The residue is owned when its
+    * Delta log carries this target's ownership markers, its manifest names this target and path, or it holds
+    * nothing but OpenIVM's own directories and an empty Delta log.
+    *
+    * @param spark
+    *   The active session.
+    * @param name
+    *   The requested streaming-table name.
+    * @param identity
+    *   The canonical identity of the requested target.
+    * @param path
+    *   The normalized path the creation uses.
+    * @return
+    *   The residue as a target, or None when a catalog object exists or the path holds nothing. Fails when
+    *   the path holds data OpenIVM cannot prove it wrote for this target.
+    */
+  def uncommittedCreationResidue(
+      spark: SparkSession,
+      name: Seq[String],
+      identity: String,
+      path: String
+  ): Option[StreamingTableTarget] = {
+    val root = new Path(path)
+    val fs   = root.getFileSystem(spark.sessionState.newHadoopConf())
+    if (catalogTableExists(spark, name) || !fs.exists(root) || fs.listStatus(root).isEmpty) None
+    else {
+      val resolvedName = qualifiedNameParts(spark, name)
+      def residue(deltaTableId: String, tableId: String): StreamingTableTarget =
+        StreamingTableTarget(
+          name = resolvedName,
+          identity = identity,
+          sqlIdentifier = quoteMultipart(resolvedName),
+          dataPath = path,
+          deltaTableId = deltaTableId,
+          tableId = tableId
+        )
+      val log         = new Path(root, "_delta_log")
+      val logCommits  = fs.exists(log) && fs.listStatus(log).exists(_.getPath.getName.endsWith(".json"))
+      val provisional = residue(deltaTableId = "", tableId = "")
+      val markedLog =
+        if (!logCommits) None
+        else {
+          val snapshot      = DeltaLog.forTable(spark, root).update()
+          val configuration = snapshot.metadata.configuration
+          val owned =
+            snapshot.version >= 0L &&
+              configuration.get(OwnerMarkerKey).contains(OwnerMarkerValue) &&
+              configuration.get(TargetIdentityMarkerKey).contains(identity) &&
+              configuration.get(TargetPathMarkerKey).forall(_ == path)
+          if (!owned)
+            StreamingTableErrors.invalid(
+              s"Target path '$path' for ${quoteMultipart(resolvedName)} holds a Delta table OpenIVM did not create " +
+                "for this streaming table; refusing to replace it"
+            )
+          Some(residue(snapshot.metadata.id, configuration.getOrElse(TableIdMarkerKey, "")))
+        }
+      markedLog.orElse {
+        val manifestPath = definitionPath(provisional)
+        if (fs.exists(manifestPath)) {
+          val manifest = readManifest(spark, provisional)
+          if (manifest.target.identity != identity || manifest.target.dataPath != path)
+            StreamingTableErrors.invalid(
+              s"Target path '$path' holds the streaming-table definition of '${manifest.target.identity}'; " +
+                s"refusing to replace it for ${quoteMultipart(resolvedName)}"
+            )
+          Some(residue(manifest.target.deltaTableId, manifest.target.tableId))
+        } else {
+          val ownedOnly = fs.listStatus(root).forall { status =>
+            val entry = status.getPath.getName
+            entry.startsWith(OpenIvmDirectory) || entry == "_delta_log"
+          }
+          if (!ownedOnly)
+            StreamingTableErrors.invalid(
+              s"Target path '$path' for ${quoteMultipart(resolvedName)} holds data OpenIVM cannot prove it " +
+                "wrote; refusing to replace it"
+            )
+          Some(provisional)
+        }
+      }
+    }
+  }
+
+  /** Archives the checkpoint of uncommitted creation residue, then deletes the residue and any orphaned
+    * reset journal beside it.
+    *
+    * @param spark
+    *   The active session.
+    * @param residue
+    *   Residue returned by [[uncommittedCreationResidue]].
+    * @param sourcePaths
+    *   Source paths the deletion must not overlap.
+    * @param context
+    *   Archive provenance.
+    * @return
+    *   The archived checkpoint location, when a checkpoint existed.
+    */
+  def discardUncommittedCreation(
+      spark: SparkSession,
+      residue: StreamingTableTarget,
+      sourcePaths: Seq[String],
+      context: StreamingArchiveContext
+  ): Option[String] = {
+    assertSafeForDeletion(spark, residue, sourcePaths)
+    val archived = archiveCheckpoint(spark, residue, context)
+    val path     = new Path(residue.dataPath)
+    val fs       = path.getFileSystem(spark.sessionState.newHadoopConf())
+    if (fs.exists(path) && !fs.delete(path, true))
+      StreamingTableErrors.invalid(s"Failed to delete interrupted-creation residue '${residue.dataPath}'")
+    if (fs.exists(path))
+      StreamingTableErrors.invalid(s"Interrupted-creation residue '${residue.dataPath}' still exists after deletion")
+    DeltaLog.invalidateCache(spark, path)
+    val journal   = resetIntentPath(spark, residue.identity, residue.dataPath)
+    val index     = resetIndexPath(spark, residue.identity)
+    val journalFs = journal.getFileSystem(spark.sessionState.newHadoopConf())
+    if (
+      journalFs.exists(journal) &&
+      !index.getFileSystem(spark.sessionState.newHadoopConf()).exists(index) &&
+      parseResetIntent(readText(journalFs, journal), journal.toString).targetIdentity == residue.identity &&
+      !journalFs.delete(journal, false)
+    )
+      StreamingTableErrors.invalid(s"Failed to delete orphaned reset journal '$journal'")
+    archived
+  }
+
   /** Creates and binds an owned streaming target, or finishes binding an interrupted creation.
     *
     * @param spark
