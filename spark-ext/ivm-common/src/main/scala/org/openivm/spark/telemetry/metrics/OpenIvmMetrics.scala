@@ -188,11 +188,20 @@ object OpenIvmMetrics extends Logging {
     if (!failed) increment(s"$prefix.version_bump")
   }
 
+  // A bounded summary scan records every row. Reuse the registered counters
+  // instead of sanitizing and resolving both metric names for each key.
+  private val columnFamilyReadCounters = TrieMap.empty[String, (Counter, Counter)]
+
   def recordColumnFamilyRead(columnFamily: String, bytes: Long): Unit = {
     if (!enabled) return
-    val prefix = s"rocksdb.column_family.${sanitize(columnFamily)}.read"
-    increment(s"$prefix.count")
-    increment(s"$prefix.bytes", math.max(0L, bytes))
+    val (count, byteCount) = columnFamilyReadCounters.getOrElseUpdate(
+      if (columnFamily == null) "null" else columnFamily, {
+        val prefix = s"rocksdb.column_family.${sanitize(columnFamily)}.read"
+        counter(s"$prefix.count") -> counter(s"$prefix.bytes")
+      }
+    )
+    count.inc()
+    byteCount.inc(math.max(0L, bytes))
   }
 
   def recordColumnFamilyWrite(columnFamily: String, bytes: Long): Unit = {

@@ -49,6 +49,59 @@ class OpenIvmMetricSetSpec extends AnyFunSpec with Matchers {
       OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.native.open.count").getCount should be >= 1L
     }
 
+    it("preserves read counters, metric names and registry updates across enable changes") {
+      val prior        = OpenIvmMetrics.enabled
+      val count        = OpenIvmMetrics.counter("rocksdb.column_family.cached_read_family.read.count")
+      val bytes        = OpenIvmMetrics.counter("rocksdb.column_family.cached_read_family.read.bytes")
+      val initialCount = count.getCount
+      val initialBytes = bytes.getCount
+      try {
+        OpenIvmMetrics.configure(enabled = true)
+        OpenIvmMetrics.recordColumnFamilyRead("Cached_Read_Family", 17L)
+        OpenIvmMetrics.recordColumnFamilyRead("cached_read_family", -1L)
+        val registry = new MetricRegistry
+        OpenIvmMetrics.bindRegistry(registry)
+        OpenIvmMetrics.configure(enabled = false)
+        OpenIvmMetrics.recordColumnFamilyRead("Cached_Read_Family", 99L)
+        OpenIvmMetrics.configure(enabled = true)
+        OpenIvmMetrics.recordColumnFamilyRead("Cached_Read_Family", 3L)
+        count.getCount shouldBe initialCount + 3L
+        bytes.getCount shouldBe initialBytes + 20L
+        registry.getCounters.get(
+          "openivm.rocksdb.column_family.cached_read_family.read.count"
+        ) should be theSameInstanceAs count
+        registry.getCounters.get(
+          "openivm.rocksdb.column_family.cached_read_family.read.bytes"
+        ) should be theSameInstanceAs bytes
+      } finally OpenIvmMetrics.configure(prior)
+    }
+
+    it("counts concurrent reads exactly when the family counters are first resolved") {
+      import java.util.concurrent.{Callable, Executors, TimeUnit}
+      val prior        = OpenIvmMetrics.enabled
+      val pool         = Executors.newFixedThreadPool(4)
+      val count        = OpenIvmMetrics.counter("rocksdb.column_family.concurrent_cached_read.read.count")
+      val bytes        = OpenIvmMetrics.counter("rocksdb.column_family.concurrent_cached_read.read.bytes")
+      val initialCount = count.getCount
+      val initialBytes = bytes.getCount
+      try {
+        OpenIvmMetrics.configure(enabled = true)
+        val tasks = (1 to 4).map { _ =>
+          pool.submit(new Callable[Unit] {
+            override def call(): Unit = (1 to 1000).foreach { _ =>
+              OpenIvmMetrics.recordColumnFamilyRead("concurrent_cached_read", 13L)
+            }
+          })
+        }
+        tasks.foreach(_.get(30, TimeUnit.SECONDS))
+        count.getCount shouldBe initialCount + 4000L
+        bytes.getCount shouldBe initialBytes + 52000L
+      } finally {
+        pool.shutdownNow()
+        OpenIvmMetrics.configure(prior)
+      }
+    }
+
     it("separates physical writes, logical commits, and manual flush telemetry") {
       OpenIvmMetrics.configure(enabled = true)
       val scope = s"telemetry_${System.nanoTime()}"
