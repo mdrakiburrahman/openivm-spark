@@ -348,6 +348,11 @@ cmd_window_benchmark() {
     setup_test_log_dir
     run_sbt "$@" \
         "ivmIt/testOnly org.openivm.spark.bench.WindowNoopWriteHarness -- -n org.openivm.spark.tags.MicroBenchmark"
+    # Isolated benchmark branch: compile/run the unmanaged POC in the pinned runtime.
+    run_sbt "$@" \
+        'set ivmIt / Test / unmanagedSources += (ThisBuild / baseDirectory).value.getParentFile / "bench-pocs" / "SecurityMembershipProbe.scala"' \
+        'ivmIt/Test/scalafmt' \
+        'ivmIt/Test/runMain org.openivm.spark.common.SecurityMembershipProbe'
 }
 
 cmd_openivm_test() {
