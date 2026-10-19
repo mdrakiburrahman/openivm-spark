@@ -7,7 +7,7 @@ import org.apache.spark.sql.functions.{col, lit, sum}
 import org.apache.spark.sql.types.{LongType, StructType}
 import org.openivm.spark.common.rocksdb._
 import org.openivm.spark.parser.GroupedWindowStagePlan
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import scala.io.Source
 import scala.util.Try
