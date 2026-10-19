@@ -365,6 +365,31 @@ original DML with bypass enabled, then write any post-DML staging. Citation:
 `StagedDmlNode.scala:43-59`. Its writer records `StagingDelta` at
 `StagedDmlNode.scala:81-91`.
 
+### Table replacements
+
+`CREATE TABLE AS SELECT`, `REPLACE TABLE` and `CREATE OR REPLACE TABLE` (including
+`DataFrameWriterV2.createOrReplace()`) write their rows into an uncommitted
+`StagedTable`. That table is write-only, Spark 3.5 presents the nested write as
+an `AppendData`, and it commits only after the nested write returns, so the
+nested write is never a valid capture point.
+
+`IvmDmlInterceptorRule` therefore wraps the whole command in
+`StagedTableReplacementNode`, which pins the committed Delta version, runs the
+command with bypass enabled, and derives the change from the two committed
+snapshots:
+
+- same schema (compared by DDL, the identity dependents fingerprint) and no
+  map-typed columns: `old EXCEPT ALL new` is staged as `DELETE` and
+  `new EXCEPT ALL old` as `INSERT`, so dependents refresh incrementally and a
+  rebuild that reproduces the same rows publishes nothing;
+- otherwise (no prior version, schema change, incomparable columns): the
+  committed rows are staged as `OVERWRITE`, preceded by the prior rows as
+  `DELETE` when readable, and dependents take the full-refresh path.
+
+Records are published only after the replacement commits. A write into an
+uncommitted `StagedTable` that reaches the `AppendData` / `OverwriteByExpression`
+branches fails closed instead of being captured.
+
 ______________________________________________________________________
 
 ## 3.7 The seven `opType` values
@@ -383,15 +408,15 @@ object OpTypes {
 }
 ```
 
-| opType          | Triggered by                                 | Staging shape                              | Exact emitter                                                                                                                           |
-| --------------- | -------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `INSERT`        | `AppendData` / `INSERT INTO`                 | rows to add                                | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`.                                                           |
-| `DELETE`        | `DELETE FROM`                                | rows to remove                             | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`.          |
-| `UPDATE_BEFORE` | `UPDATE` before-image                        | old rows matching the predicate            | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`.   |
-| `UPDATE_AFTER`  | `UPDATE` after-image                         | rows after SET projections                 | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`.   |
-| `MERGE_SRC`     | `MERGE INTO` source side                     | source rows available to the merge         | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`.                      |
-| `OVERWRITE`     | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set                   | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`. |
-| `MV_VIEW_DELTA` | MV-over-MV cascade                           | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`.                                                                     |
+| opType          | Triggered by                                 | Staging shape                              | Exact emitter                                                                                                                                                                                         |
+| --------------- | -------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INSERT`        | `AppendData` / `INSERT INTO`                 | rows to add                                | `IvmDmlInterceptorRule.scala:49-55`; recorded by `StagedDmlNode.scala:84-90`; exact table-replacement additions from `StagedTableReplacementNode`.                                                    |
+| `DELETE`        | `DELETE FROM`                                | rows to remove                             | `DeltaDelete` at `IvmDmlInterceptorRule.scala:73-80`; `ReplaceData` delete fallback at `147-162`; Spark fallback at `176-182`; exact table-replacement retractions from `StagedTableReplacementNode`. |
+| `UPDATE_BEFORE` | `UPDATE` before-image                        | old rows matching the predicate            | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:105-127`; `ReplaceData` update fallback at `151-157`; Spark fallback at `196-211`.                                                                 |
+| `UPDATE_AFTER`  | `UPDATE` after-image                         | rows after SET projections                 | `DeltaUpdateTable` at `IvmDmlInterceptorRule.scala:118-128`; `ReplaceData` update fallback at `151-157`; Spark fallback at `202-212`.                                                                 |
+| `MERGE_SRC`     | `MERGE INTO` source side                     | source rows available to the merge         | `DeltaMergeInto` at `IvmDmlInterceptorRule.scala:135-140`; `WriteDelta` at `165-170`; Spark fallback at `216-221`.                                                                                    |
+| `OVERWRITE`     | `OverwriteByExpression` / `INSERT OVERWRITE` | full replacement row set                   | `IvmDmlInterceptorRule.scala:61-67`; synthetic non-cascade trigger also uses `Overwrite` at `MaterializedViewCommands.scala:1303-1311`; table replacements that admit no exact change set.            |
+| `MV_VIEW_DELTA` | MV-over-MV cascade                           | upstream MV delta with signed multiplicity | `MaterializedViewCommands.scala:1107-1154`, especially `1144-1153`.                                                                                                                                   |
 
 `StagingDeltaView` maps these to refresh-time multiplicities:
 
@@ -496,9 +521,11 @@ Citation: `StagingCatalog.scala:152-160`; the put is at `StagingCatalog.scala:16
 
 Decoded schema:
 
-| Location                       | Key                                                            | Value                       |
-| ------------------------------ | -------------------------------------------------------------- | --------------------------- |
-| per-base RocksDB, `staging` CF | composite `(txnTsMillis: Long big-endian, stagingPath: UTF-8)` | composite `(opType: UTF-8)` |
+| Location                       | Key                                                            | Value                                                 |
+| ------------------------------ | -------------------------------------------------------------- | ----------------------------------------------------- |
+| per-base RocksDB, `staging` CF | composite `(txnTsMillis: Long big-endian, stagingPath: UTF-8)` | composite `(opType: UTF-8)`                           |
+| per-base RocksDB, `ledger` CF  | `source`                                                       | composite `(deltaTableId: UTF-8, version: Long big-endian)` |
+| per-base RocksDB, `gc` CF      | `stagingPath: UTF-8` of a pruned record                        | empty                                                 |
 
 The index DB's `table_index` CF maps `baseTable -> baseDbPath`, written at
 `StagingCatalog.scala:169-180`.
@@ -595,7 +622,11 @@ After staging exists, refresh follows this lifecycle:
 1. `StagingDeltaView.buildSourceDeltaViewSql` builds signed delta temp views.
 1. `MaterializedViewCommands` executes the rewritten refresh SQL.
 1. `postRefreshCleanup` advances the MV version and marks staging paths consumed.
-1. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs.
+1. `StagingCatalog.pruneFullyConsumed` removes staging keys consumed by all dependent MVs and
+   tombstones their locations in the same write; `forgetConsumed` drops the refreshing MV's
+   consumption markers for records that no longer exist.
+1. After the refresh publishes its state, `OpenIvmGarbageCollector` deletes the tombstoned
+   locations (section 3.14).
 
 Citations:
 
@@ -608,3 +639,65 @@ Citations:
 The important property is that refresh reads the OpenIVM staging index, not
 Delta CDF. That is the reason the DML interception tee is on the critical path
 for every MV-backed base-table mutation.
+
+______________________________________________________________________
+
+## 3.13 Source change ledger
+
+Interception alone cannot see every commit of a source. Native streaming sinks commit without a
+logical write plan, writers without the extension bypass the rule, and a restarted Fabric driver
+restores the newest published state snapshot, which can predate records written just before the
+previous driver stopped. Any such commit would be silently missing from every dependent MV.
+
+`SourceChangeLedger` closes the gap. Each base table's `ledger` entry is the Delta version (and
+Delta table id) up to which its staging records describe every change:
+
+- `StagedDmlNode` and `StagedTableReplacementNode` reconcile the table first, then publish their
+  records together with the version they commit in one RocksDB write, under the table's mutation
+  lock. A write that was not the table's only commit since reconciliation has its interval
+  captured from the Delta log instead; a write that committed nothing publishes nothing.
+- `REFRESH` (and `CREATE`, before taking its watermark) reconciles every base-table source. Commits
+  after the ledger position are captured from the Delta log: appended files (streaming appends,
+  blind inserts) as `INSERT` rows read through `DeltaLog.createDataFrame`, other changes as the
+  exact `old EXCEPT ALL new` / `new EXCEPT ALL old` multiset difference, and intervals that change
+  the schema or cannot be read as an empty `OVERWRITE`, which dependents apply as a full refresh.
+  Commits that change no rows (OPTIMIZE, VACUUM, property changes) only advance the position.
+- A table with dependents but no ledger entry (state written before the ledger existed) publishes
+  one `OVERWRITE`, so each existing dependent recomputes once.
+
+MV sources (matched by short name, as downstream records are) are not reconciled; their
+refreshes publish the downstream records. Instead each refresh compares the MV's recorded
+`lastVersion` with its live Delta version. Rows that differ from the recorded version mean a
+refresh committed after the restored snapshot (or a failed refresh was not rolled back), so
+incremental apply would replay consumed deltas: the refresh becomes a full recompute
+(`state_lag_full_refresh`), and a cascading MV's signed delta for downstream views starts at the
+recorded version, the state those views reflect. If that version is no longer readable, consumers
+receive an `OVERWRITE`. Row-preserving commits (OPTIMIZE, VACUUM, properties) and a RESTORE back
+to the recorded version, as in-process rollbacks perform, are not a lag.
+
+## 3.14 Staging storage reclamation
+
+Staging (`_ivm/staging`), view-delta (`_ivm/view_deltas`) and trigger (`_openivm/triggers`)
+locations are reclaimed by `OpenIvmGarbageCollector`:
+
+Records under a key no materialized view reads, such as the view-delta records a view without
+consumers leaves under its own name, are pruned by that view's refresh (`pruneUnconsumed`); a
+view created later starts after them.
+
+1. Before a refresh publishes its state (`OpenIvmStateSync.backupNow`), `prepare` reads the
+   tombstones and every location still referenced by staging records or MV metadata.
+1. After the publish returns, `collect` deletes the tombstoned locations nothing references,
+   including the inputs of cached view deltas (`openivm-cache:` refs) still awaiting consumers. With
+   state sync, the newest published snapshot therefore never references a deleted location;
+   without it, local RocksDB is durable and deletion is immediate.
+1. At most once per `spark.openivm.gc.orphanSweepInterval` (default `6h`), a background sweep
+   deletes locations no record referenced at `prepare` time that are older than
+   `spark.openivm.gc.orphanGracePeriod` (default `24h`), left by drivers that stopped between
+   writing and recording a location, and mirrored telemetry spans under
+   `spark.openivm.telemetry.oneLakeDir` older than `spark.openivm.telemetry.oneLakeDir.retention`
+   (default `7d`). The sweep touches only the file system.
+
+State-sync publishes keep the newest `spark.openivm.stateSync.retainGenerations` (default `10`,
+minimum `2`) committed generations, plus no snapshot or pending marker older than them, deleting
+at most 25 entries per publish so an existing backlog drains without stalling one. Set
+`spark.openivm.gc.enabled=false` to disable reclamation.

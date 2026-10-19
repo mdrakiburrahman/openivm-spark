@@ -110,6 +110,8 @@ object OpenIvmStateSync {
     }
   }
 
+  private val MaxPrunedPerPublish = 25
+
   private val restoreStates = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
   private val backupStates  = new ConcurrentHashMap[String, BackupState]()
   @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
@@ -384,8 +386,51 @@ object OpenIvmStateSync {
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes, $attempts passes) at $uri"
       )
+      pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
     } finally Files.deleteIfExists(archive.toPath)
   }
+
+  /** Delete committed generations older than the newest `retain`, then snapshots and pending
+    * commit markers older than every retained generation, which interrupted publishes left behind.
+    * A generation is unpublished before its archive is deleted, so restore never selects it. At
+    * most [[MaxPrunedPerPublish]] entries go per publish, so a large backlog never stalls one.
+    */
+  private def pruneGenerations(fs: FileSystem, controlRoot: Path, retain: Int): Unit =
+    try {
+      val commitRoot    = new Path(controlRoot, "commits")
+      val snapshotsRoot = new Path(controlRoot, "snapshots")
+      val committed = fs
+        .listStatus(commitRoot)
+        .toSeq
+        .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
+        .map(_.getPath.getName.stripSuffix(".commit"))
+        .sorted
+      val retained = committed.takeRight(retain)
+      val expired  = committed.dropRight(retain).take(MaxPrunedPerPublish)
+      expired.foreach { generation =>
+        fs.delete(new Path(commitRoot, s"$generation.commit"), false)
+        fs.delete(new Path(snapshotsRoot, generation), true)
+      }
+      val budget = MaxPrunedPerPublish - expired.size
+      if (budget > 0) retained.headOption.foreach { oldestRetained =>
+        val staleSnapshots = fs
+          .listStatus(snapshotsRoot)
+          .toSeq
+          .filter(status => status.isDirectory && status.getPath.getName < oldestRetained)
+          .map(_.getPath)
+        val stalePending = fs
+          .listStatus(commitRoot)
+          .toSeq
+          .filter { status =>
+            val name = status.getPath.getName
+            name.startsWith(".") && name.endsWith(".pending") && name.stripPrefix(".") < oldestRetained
+          }
+          .map(_.getPath)
+        (staleSnapshots ++ stalePending).take(budget).foreach(path => fs.delete(path, true))
+      }
+    } catch {
+      case NonFatal(error) => log.warn(s"openivm state-sync: cannot prune old snapshot generations: $error")
+    }
 
   private def backupFiles(local: File): Seq[File] =
     listLocalFiles(local)

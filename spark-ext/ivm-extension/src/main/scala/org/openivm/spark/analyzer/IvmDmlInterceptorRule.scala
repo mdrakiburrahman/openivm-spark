@@ -4,7 +4,8 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.analysis.NamedRelation
+import org.apache.spark.sql.catalyst.analysis.{NamedRelation, ResolvedIdentifier}
+import org.apache.spark.sql.connector.catalog.{Identifier, StagedTable}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.openivm.spark.common.{FeatureGate, MvCatalog}
@@ -28,6 +29,10 @@ import java.util.UUID
  *   - `DeleteFromTable` → `ReplaceData`, `UpdateTable` → `ReplaceData`,
  *     `MergeIntoTable` → `WriteDelta` before our rule fires → our rule matches
  *     the Delta-lowered forms and wraps them in [[StagedDmlNode]].
+ *   - `CreateTableAsSelect` / `ReplaceTableAsSelect` / `ReplaceTable` are
+ *     wrapped whole in [[StagedTableReplacementNode]]: Spark writes their rows
+ *     into an uncommitted `StagedTable` that is neither readable nor committed
+ *     when its nested `AppendData` / `OverwriteByExpression` runs.
  *
  * Pre-lowered forms (`DeleteFromTable`, `UpdateTable`, `MergeIntoTable`) are
  * also matched as a fallback in case ordering changes in future Spark/Delta
@@ -45,6 +50,11 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
 
     plan match {
 
+      // CTAS / RTAS / REPLACE TABLE: the whole command is one table replacement.
+      case c: CreateTableAsSelect  => interceptReplacement(c, c.name)
+      case r: ReplaceTableAsSelect => interceptReplacement(r, r.name)
+      case r: ReplaceTable         => interceptReplacement(r, r.name)
+
       // -----------------------------------------------------------------------
       // INSERT — pre-read staging: capture incoming rows before write
       // -----------------------------------------------------------------------
@@ -53,6 +63,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) a
         else {
+          requireCommittedTarget(a.table, tableName)
           val sp  = stagingPath(tableName, "INSERT")
           val ops = Seq((a.query, sp, "INSERT"))
           StagedDmlNode(a, ops, tableName, dependentMaterializedViews = dependents)
@@ -66,6 +77,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) o
         else {
+          requireCommittedTarget(o.table, tableName)
           // OverwriteByExpression replaces the rows selected by deleteExpr.  The
           // incoming query alone is not a complete signed delta: treating only
           // those rows as +1 leaves every replaced row in dependent projection
@@ -262,7 +274,30 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
     }.isDefined
 
   private def alreadyWrapped(p: LogicalPlan): Boolean =
-    p.find(_.isInstanceOf[StagedDmlNode]).isDefined
+    p.find(node => node.isInstanceOf[StagedDmlNode] || node.isInstanceOf[StagedTableReplacementNode]).isDefined
+
+  /** Wrap a CTAS / RTAS / REPLACE TABLE whose target feeds materialized views. */
+  private def interceptReplacement(command: LogicalPlan, name: LogicalPlan): LogicalPlan = name match {
+    case ResolvedIdentifier(_, identifier) =>
+      val tableName  = qualifiedName(identifier)
+      val dependents = dependentMvs(tableName)
+      if (dependents.isEmpty) command
+      else StagedTableReplacementNode(command, tableName, dependents)
+    case _ => command
+  }
+
+  /** A write into an uncommitted replacement must arrive through [[interceptReplacement]]:
+    * its rows are unreadable, Spark 3.5 presents it as an append, and it is not yet committed.
+    */
+  private def requireCommittedTarget(target: LogicalPlan, tableName: String): Unit = target match {
+    case relation: DataSourceV2Relation if relation.table.isInstanceOf[StagedTable] =>
+      throw new IllegalStateException(
+        s"[openivm] refusing to capture a write into the uncommitted replacement of $tableName: " +
+          "the CREATE/REPLACE TABLE command was not intercepted as a table replacement, so its " +
+          "dependent materialized views cannot receive an exact change set"
+      )
+    case _ => ()
+  }
 
   private def dependentMvs(tableName: String): Seq[String] =
     if (tableName.isEmpty) Seq.empty
@@ -298,9 +333,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
 
   private def extractTableName(relation: LogicalPlan): String = relation match {
     case r: DataSourceV2Relation if r.identifier.isDefined =>
-      val id = r.identifier.get
-      val ns = id.namespace()
-      if (ns.nonEmpty) (ns :+ id.name()).mkString(".") else id.name()
+      qualifiedName(r.identifier.get)
     case r: LogicalRelation if r.catalogTable.isDefined =>
       val id = r.catalogTable.get.identifier
       id.database.fold(id.table)(db => s"$db.${id.table}")
@@ -309,15 +342,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
     case _                       => ""
   }
 
-  private def stagingPath(tableName: String, opType: String): String = {
-    val warehouse = session.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val safeTable = tableName.replace(".", "_").replace(" ", "_")
-    val txnTs = DateTimeFormatter
-      .ofPattern("yyyy-MM-dd'T'HH-mm-ss.SSS'Z'")
-      .withZone(ZoneOffset.UTC)
-      .format(Instant.now())
-    s"$warehouse/_ivm/staging/$safeTable/$opType/$txnTs-${UUID.randomUUID()}"
+  private def qualifiedName(identifier: Identifier): String = {
+    val ns = identifier.namespace()
+    if (ns.nonEmpty) (ns :+ identifier.name()).mkString(".") else identifier.name()
   }
+
+  private def stagingPath(tableName: String, opType: String): String =
+    IvmDmlInterceptorRule.stagingPath(session, tableName, opType)
 }
 
 object IvmDmlInterceptorRule {
@@ -325,4 +356,20 @@ object IvmDmlInterceptorRule {
   /** Thread-local bypass flag set by [[StagedDmlNode]] when re-executing the
    *  original DML to prevent infinite re-interception. */
   val bypass: ThreadLocal[Boolean] = ThreadLocal.withInitial(() => false)
+
+  /** Fresh staging location for one op of a write to `tableName`.
+    *
+    * @param spark     active session
+    * @param tableName qualified name of the written base table
+    * @param opType    one of [[org.openivm.spark.common.StagingDelta.OpTypes]]
+    */
+  private[analyzer] def stagingPath(spark: SparkSession, tableName: String, opType: String): String = {
+    val warehouse = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val safeTable = tableName.replace(".", "_").replace(" ", "_")
+    val txnTs = DateTimeFormatter
+      .ofPattern("yyyy-MM-dd'T'HH-mm-ss.SSS'Z'")
+      .withZone(ZoneOffset.UTC)
+      .format(Instant.now())
+    s"$warehouse/_ivm/staging/$safeTable/$opType/$txnTs-${UUID.randomUUID()}"
+  }
 }

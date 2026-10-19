@@ -69,6 +69,13 @@ object StagingDelta {
   }
 }
 
+/** Committed Delta version of a base table up to which staging records describe every change.
+  *
+  * @param tableId Delta table identity (`metaData.id`) the version belongs to
+  * @param version committed Delta version
+  */
+final case class SourceLedgerEntry(tableId: String, version: Long)
+
 /** RocksDB-backed catalog for DML staging records. */
 object StagingCatalog {
 
@@ -77,6 +84,9 @@ object StagingCatalog {
 
   private val StagingCf  = "staging"
   private val ConsumedCf = "consumed"
+  private val LedgerCf   = "ledger"
+  private val GcCf       = "gc"
+  private val LedgerKey  = RocksDBCodec.utf8("source")
 
   private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
     OpenIvmStatePaths.baseTableDbPath(spark, baseTable)
@@ -135,20 +145,57 @@ object StagingCatalog {
     ()
   }
 
-  def record(spark: SparkSession, delta: StagingDelta): Unit = {
-    val baseDb = openBaseTableDb(spark, delta.baseTable)
-    // `consumedBy` is intentionally ignored on write: consumed state now lives in each MV's
-    // dedicated RocksDB under the `consumed` column family.
-    val stagingKey = RocksDBCodec.compositeKey(
+  // `consumedBy` is intentionally not persisted: consumed state lives in each MV's dedicated
+  // RocksDB under the `consumed` column family.
+  private def stagingKey(delta: StagingDelta): Array[Byte] =
+    RocksDBCodec.compositeKey(
       Seq(RocksDBCodec.encodeLongBE(delta.txnTs.getTime), RocksDBCodec.utf8(delta.stagingPath))
     )
-    val stagingValue = RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(delta.opType)))
 
-    // `IvmDmlInterceptorRule.stagingPath` already uses millisecond-resolution timestamps, so a
-    // same-millisecond same-table same-op collision is a pre-existing path-generation bug that is
-    // intentionally left to follow-up work.
+  private def stagingValue(delta: StagingDelta): Array[Byte] =
+    RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(delta.opType)))
+
+  def record(spark: SparkSession, delta: StagingDelta): Unit = {
+    val baseDb = openBaseTableDb(spark, delta.baseTable)
     baseDb.withBatch { batch =>
-      OpenIvmRocksDBBatchOps.put(baseDb, batch, StagingCf, stagingKey, stagingValue)
+      OpenIvmRocksDBBatchOps.put(baseDb, batch, StagingCf, stagingKey(delta), stagingValue(delta))
+    }
+  }
+
+  /** Ledger position of `baseTable`, if one was ever published. */
+  def ledger(spark: SparkSession, baseTable: String): Option[SourceLedgerEntry] = {
+    val dbPath = baseTableDbPath(spark, baseTable)
+    if (!OpenIvmStatePaths.isExistingDb(dbPath)) None
+    else
+      openBaseTableDb(spark, baseTable).get(LedgerCf, LedgerKey).map { value =>
+        val parts = RocksDBCodec.splitComposite(value, 2)
+        require(parts.length == 2, s"Expected 2-part ledger value for $baseTable, found ${parts.length} part(s).")
+        SourceLedgerEntry(RocksDBCodec.fromUtf8(parts.head), RocksDBCodec.decodeLongBE(parts(1)))
+      }
+  }
+
+  private[openivm] def clearLedgerForTesting(spark: SparkSession, baseTable: String): Unit = {
+    val baseDb = openBaseTableDb(spark, baseTable)
+    baseDb.withBatch(batch => OpenIvmRocksDBBatchOps.delete(baseDb, batch, LedgerCf, LedgerKey))
+  }
+
+  /** Atomically publish the records describing changes of `baseTable` up to `ledger` and advance
+    * its ledger to that position.
+    *
+    * @param spark     active session
+    * @param baseTable qualified name of the changed base table
+    * @param deltas    records for every change after the previous ledger position
+    * @param ledger    committed position the records bring the table to
+    */
+  def publish(spark: SparkSession, baseTable: String, deltas: Seq[StagingDelta], ledger: SourceLedgerEntry): Unit = {
+    val baseDb = openBaseTableDb(spark, baseTable)
+    val value =
+      RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(ledger.tableId), RocksDBCodec.encodeLongBE(ledger.version)))
+    baseDb.withBatch { batch =>
+      deltas.foreach { delta =>
+        OpenIvmRocksDBBatchOps.put(baseDb, batch, StagingCf, stagingKey(delta), stagingValue(delta))
+      }
+      OpenIvmRocksDBBatchOps.put(baseDb, batch, LedgerCf, LedgerKey, value)
     }
   }
 
@@ -250,24 +297,127 @@ object StagingCatalog {
           }
           .toList
 
-        if (toDelete.nonEmpty) {
-          baseDb.withBatch { batch =>
-            toDelete.foreach { case (key, _) => OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key) }
-          }
-          toDelete
-            .map { case (_, stagingPath) => stagingPath }
-            .flatMap(p => StagingDeltaView.CachedViewDeltaRef.decode(p).map(p -> _))
-            .filterNot { case (stagingPath, _) => stagingPathStillTracked(spark, stagingPath) }
-            .foreach { case (_, globalView) =>
-              try spark.catalog.uncacheTable(s"global_temp.$globalView")
-              catch { case _: Throwable => () }
-              try spark.catalog.dropGlobalTempView(globalView)
-              catch { case _: Throwable => () }
-            }
-        }
+        deleteRecords(spark, baseDb, toDelete)
       }
     }
   }
+
+  /** Prune every record of `baseTable`, a key no materialized view reads, such as the view-delta
+    * records a view without consumers leaves under its own name. A view created later starts
+    * after them, so none is ever consumed.
+    *
+    * @param spark     active session
+    * @param baseTable staging key without dependents
+    */
+  def pruneUnconsumed(spark: SparkSession, baseTable: String): Unit = {
+    val dbPath = baseTableDbPath(spark, baseTable)
+    if (OpenIvmStatePaths.isExistingDb(dbPath)) {
+      val baseDb = openBaseTableDb(spark, baseTable)
+      deleteRecords(
+        spark,
+        baseDb,
+        baseDb
+          .prefixScan(StagingCf, Array.emptyByteArray)
+          .map { case (key, _) => key.clone() -> decodeStagingKey(key)._2 }
+          .toList
+      )
+    }
+  }
+
+  /** Delete `records` and tombstone their locations in one write. Locations stay on disk until a
+    * published state no longer references them; see [[pendingGarbage]].
+    */
+  private def deleteRecords(spark: SparkSession, baseDb: OpenIvmRocksDB, records: List[(Array[Byte], String)]): Unit =
+    if (records.nonEmpty) {
+      baseDb.withBatch { batch =>
+        records.foreach { case (key, stagingPath) =>
+          OpenIvmRocksDBBatchOps.delete(baseDb, batch, StagingCf, key)
+          if (StagingDeltaView.CachedViewDeltaRef.decode(stagingPath).isEmpty)
+            OpenIvmRocksDBBatchOps.put(baseDb, batch, GcCf, RocksDBCodec.utf8(stagingPath), Array.emptyByteArray)
+        }
+      }
+      records
+        .map { case (_, stagingPath) => stagingPath }
+        .flatMap(p => StagingDeltaView.CachedViewDeltaRef.decode(p).map(p -> _))
+        .filterNot { case (stagingPath, _) => stagingPathStillTracked(spark, stagingPath) }
+        .foreach { case (_, globalView) =>
+          try spark.catalog.uncacheTable(s"global_temp.$globalView")
+          catch { case _: Throwable => () }
+          try spark.catalog.dropGlobalTempView(globalView)
+          catch { case _: Throwable => () }
+          StagingDeltaView.CachedViewDeltaRef.forgetInputs(globalView)
+        }
+    }
+
+  /** Staging locations whose records were pruned and that await deletion. A location may only be
+    * deleted once a durable state that no longer references it exists: with state sync enabled,
+    * after the next published snapshot; otherwise immediately, since local RocksDB is durable.
+    */
+  def pendingGarbage(spark: SparkSession): Set[String] =
+    OpenIvmStatePaths
+      .existingBaseTableDbPaths(spark)
+      .iterator
+      .flatMap { dbPath =>
+        val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+        baseDb.prefixScan(GcCf, Array.emptyByteArray).map { case (key, _) => RocksDBCodec.fromUtf8(key) }.toVector
+      }
+      .toSet
+
+  /** Staging locations referenced by any published staging record. */
+  def referencedStagingPaths(spark: SparkSession): Set[String] =
+    OpenIvmStatePaths
+      .existingBaseTableDbPaths(spark)
+      .iterator
+      .flatMap { dbPath =>
+        val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).map { case (key, _) => decodeStagingKey(key)._2 }.toVector
+      }
+      .toSet
+
+  /** Drop the tombstones of deleted staging locations.
+    *
+    * @param spark active session
+    * @param paths staging locations no record references any more and that no longer exist
+    */
+  def forgetGarbage(spark: SparkSession, paths: Set[String]): Unit = {
+    if (paths.isEmpty) return
+    OpenIvmStatePaths.existingBaseTableDbPaths(spark).foreach { dbPath =>
+      val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
+      val victims = baseDb
+        .prefixScan(GcCf, Array.emptyByteArray)
+        .collect { case (key, _) if paths.contains(RocksDBCodec.fromUtf8(key)) => key.clone() }
+        .toList
+      if (victims.nonEmpty)
+        baseDb.withBatch(batch => victims.foreach(key => OpenIvmRocksDBBatchOps.delete(baseDb, batch, GcCf, key)))
+    }
+  }
+
+  /** Drop `viewName`'s consumption markers for staging locations no record of its `sources`
+    * references any more, so markers do not outlive the records they guard. Hold the view's
+    * refresh lock.
+    *
+    * @param spark    active session
+    * @param viewName serialized materialized-view name
+    * @param sources  the view's qualified source names
+    */
+  def forgetConsumed(spark: SparkSession, viewName: String, sources: Seq[String]): Unit =
+    openTrackedMvDb(spark, viewName).foreach { mvDb =>
+      val referenced = sources.distinct.iterator.flatMap { source =>
+        val dbPath = baseTableDbPath(spark, source)
+        if (!OpenIvmStatePaths.isExistingDb(dbPath)) Iterator.empty
+        else
+          openBaseTableDb(spark, source)
+            .prefixScan(StagingCf, Array.emptyByteArray)
+            .map { case (key, _) => decodeStagingKey(key)._2 }
+            .toVector
+      }.toSet
+      val stale = mvDb
+        .prefixScan(ConsumedCf, Array.emptyByteArray)
+        .collect { case (key, _) if !referenced.contains(RocksDBCodec.fromUtf8(key)) => key.clone() }
+        .toList
+      if (stale.nonEmpty)
+        mvDb.withBatch(batch => stale.foreach(key => OpenIvmRocksDBBatchOps.delete(mvDb, batch, ConsumedCf, key)))
+    }
 
   /** Remove every staging and per-MV consumption record for one exact staging
     * path. Used by source-version advancement rollback before the operation is
@@ -300,6 +450,7 @@ object StagingCatalog {
       catch { case _: Throwable => () }
       try spark.catalog.dropGlobalTempView(globalView)
       catch { case _: Throwable => () }
+      StagingDeltaView.CachedViewDeltaRef.forgetInputs(globalView)
     }
   }
 

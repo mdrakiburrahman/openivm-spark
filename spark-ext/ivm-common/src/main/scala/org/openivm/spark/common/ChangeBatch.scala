@@ -19,6 +19,17 @@ final case class CdfChangeBatch(
     endVersionInclusive: Long
 ) extends ChangeBatch {
   override def endWatermark: ChangeWatermark = ChangeWatermark.DeltaVersion(endVersionInclusive)
+
+  /** `false` when no consumed version is known for the source, so its change feed cannot be
+    * applied on top of the view's rows.
+    */
+  def hasBaseline: Boolean = startVersionExclusive != CdfChangeBatch.NoBaseline
+}
+
+object CdfChangeBatch {
+
+  /** `startVersionExclusive` of a source whose consumed version is unknown. */
+  val NoBaseline: Long = -1L
 }
 
 /** Exact immutable source-snapshot transition requested by ALTER MATERIALIZED

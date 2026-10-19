@@ -202,12 +202,20 @@ final case class StreamingTableDefinition(
     operationalHash: String,
     sources: Seq[StreamingSourceDefinition],
     sourcePaths: Seq[String],
-    sourceIdentities: Seq[String]
+    sourceIdentities: Seq[String],
+    legacyFingerprints: Set[String] = Set.empty
 ) {
 
   def hasSameSemantics(other: StreamingTableDefinition): Boolean = fingerprint == other.fingerprint
 
   def hasSameOperation(other: StreamingTableDefinition): Boolean = operationalHash == other.operationalHash
+
+  /** Whether `hash` identifies this definition, either as computed now or as an earlier extension
+    * version computed and persisted it.
+    *
+    * @param hash persisted definition hash
+    */
+  def matchesFingerprint(hash: String): Boolean = hash == fingerprint || legacyFingerprints.contains(hash)
 }
 
 final case class StreamingDefinitionChange(
@@ -237,10 +245,40 @@ object StreamingTableDefinition {
   val FormatVersion: Int = 1
 
   private val Mapper = new ObjectMapper()
+
+  /** Delta reader options that tune how a running query consumes its source, not what it computes:
+    * rate limits, and the change-commit tolerances Delta documents as safe to change when restarting
+    * the same checkpoint. They stay out of the semantic identity, so changing them resumes the query.
+    */
   private val OperationalReaderOptions = Set(
+    "maxfilespertrigger",
+    "maxbytespertrigger",
+    "ignoredeletes",
+    "ignorechanges",
+    "skipchangecommits"
+  )
+
+  /** Operational reader options of identities persisted before the change-commit tolerances were. */
+  private val LegacyOperationalReaderOptions = Set(
     "maxfilespertrigger",
     "maxbytespertrigger"
   )
+
+  private val ReclassifiedReaderOptions = OperationalReaderOptions -- LegacyOperationalReaderOptions
+
+  /** Reader options excluded from the identity being computed on this thread; legacy recomputation
+    * narrows it. Not inherited, so threads started while it is narrowed keep the current set.
+    */
+  private val identityOperationalOptions = new ThreadLocal[Set[String]] {
+    override def initialValue(): Set[String] = OperationalReaderOptions
+  }
+
+  /** A reclassified option entry inside an encoded `options[...]` / `map[...]` list of a plan string. */
+  private val ReclassifiedOptionEntry =
+    "\"(?i:" + ReclassifiedReaderOptions.toSeq.sorted.mkString("|") + ")\"=\"(?:[^\"\\\\]|\\\\.)*\""
+  private val LeadingReclassifiedOptionPattern  = Pattern.compile(ReclassifiedOptionEntry + ",")
+  private val TrailingReclassifiedOptionPattern = Pattern.compile("," + ReclassifiedOptionEntry + "(?=\\])")
+  private val SoleReclassifiedOptionPattern     = Pattern.compile(ReclassifiedOptionEntry + "(?=\\])")
   private val SecretKeyPattern =
     "(?i).*(password|secret|token|access[_-]?key|credential|private[_-]?key|keytab|oauth|sas).*".r
   private val InlineSecretPattern = Pattern.compile(
@@ -255,7 +293,52 @@ object StreamingTableDefinition {
       """\(\[value:java\.lang\.Long:"-?\d+",value:java\.lang\.Boolean:"(?:true|false)"\]\)"""
   )
 
+  /** Builds the definition of a submitted declaration.
+    *
+    * When a source sets a reader option that earlier extension versions counted as semantic, the
+    * fingerprint those versions persisted is recorded in `legacyFingerprints`, so reconciliation
+    * recognizes their identity instead of treating the upgrade as a definition change.
+    *
+    * @param spark             active session
+    * @param spec              parsed declaration
+    * @param analyzed          analyzed query of the declaration
+    * @param targetIdentity    canonical identity of the target table
+    * @param runtime           parsed extension-owned options
+    * @param sourceDeclaration expanded declaration, when views were expanded
+    */
   def build(
+      spark: SparkSession,
+      spec: StreamingTableSpec,
+      analyzed: LogicalPlan,
+      targetIdentity: String,
+      runtime: StreamingRuntimeOptions,
+      sourceDeclaration: Option[LogicalPlan] = None
+  ): StreamingTableDefinition = {
+    val definition = buildDefinition(spark, spec, analyzed, targetIdentity, runtime, sourceDeclaration)
+    val reclassified =
+      definition.sources.exists(_.operationalOptions.keySet.exists(ReclassifiedReaderOptions.contains))
+    if (!reclassified) definition
+    else {
+      val legacy = withLegacyOperationalOptions(
+        buildDefinition(spark, spec, analyzed, targetIdentity, runtime, sourceDeclaration)
+      )
+      definition.copy(legacyFingerprints = Set(legacy.fingerprint) - definition.fingerprint)
+    }
+  }
+
+  /** Evaluates `body` with the operational reader options earlier extension versions used, so any
+    * definition built inside it carries the identity those versions persisted.
+    *
+    * @param body computation that builds definitions
+    */
+  private[streaming] def withLegacyOperationalOptions[T](body: => T): T = {
+    val current = identityOperationalOptions.get()
+    identityOperationalOptions.set(LegacyOperationalReaderOptions)
+    try body
+    finally identityOperationalOptions.set(current)
+  }
+
+  private def buildDefinition(
       spark: SparkSession,
       spec: StreamingTableSpec,
       analyzed: LogicalPlan,
@@ -410,12 +493,26 @@ object StreamingTableDefinition {
     )
   }
 
-  private def normalizeSemanticJson(json: String): String = {
+  private[streaming] def normalizeSemanticJson(json: String): String = {
     val root = Mapper.readTree(json).deepCopy[ObjectNode]()
     Seq("declarationPlan", "analyzedPlan").foreach { field =>
       Option(root.get(field))
         .filter(_.isTextual)
         .foreach(node => root.put(field, normalizeLegacyPlan(node.asText())))
+    }
+    // Identities persisted before the change-commit tolerances became operational carry them as
+    // semantic source options; they compare equal to the current identity without them.
+    Option(root.get("sources")).filter(_.isArray).foreach { sources =>
+      sources.elements().asScala.foreach { source =>
+        Option(source.get("options")).collect { case options: ObjectNode => options }.foreach { options =>
+          options
+            .fieldNames()
+            .asScala
+            .toList
+            .filter(key => ReclassifiedReaderOptions.contains(key.toLowerCase(Locale.ROOT)))
+            .foreach(key => options.remove(key))
+        }
+      }
     }
     Mapper.writeValueAsString(root)
   }
@@ -513,8 +610,12 @@ object StreamingTableDefinition {
   private def diagnosticText(json: String, field: String): Option[String] =
     Option(Mapper.readTree(json).get(field)).filter(_.isTextual).map(_.asText())
 
-  private def normalizeLegacyPlan(plan: String): String =
-    LegacyCommonExpressionIdPattern.matcher(plan).replaceAll(CommonExpressionIdToken)
+  private def normalizeLegacyPlan(plan: String): String = {
+    val withoutExpressionIds = LegacyCommonExpressionIdPattern.matcher(plan).replaceAll(CommonExpressionIdToken)
+    val withoutLeading       = LeadingReclassifiedOptionPattern.matcher(withoutExpressionIds).replaceAll("")
+    val withoutTrailing      = TrailingReclassifiedOptionPattern.matcher(withoutLeading).replaceAll("")
+    SoleReclassifiedOptionPattern.matcher(withoutTrailing).replaceAll("")
+  }
 
   def redactText(text: String): String =
     InlineSecretPattern.matcher(Option(text).getOrElse("")).replaceAll("$1[REDACTED]")
@@ -628,8 +729,9 @@ object StreamingTableDefinition {
         } else Map.empty[String, String]
       val merged = mergeOptions(seed.options, declaredOptions, seed.identity)
       if (seed.provider == "delta") validateDeltaReaderOptions(spark, merged)
+      val operationalKeys = identityOperationalOptions.get()
       val (operational, semantic) = merged.partition { case (key, _) =>
-        OperationalReaderOptions.contains(key)
+        operationalKeys.contains(key)
       }
       StreamingSourceDefinition(
         occurrence = occurrence,
@@ -668,6 +770,7 @@ object StreamingTableDefinition {
         if (snapshot.version < 0L)
           StreamingTableErrors.invalid(s"Delta source $fallbackName has no committed snapshot")
         val path = StreamingTableMetadata.normalizePath(spark, delta.deltaLog.dataPath)
+        validateSourceGeneration(path, delta.initialSnapshot.metadata.id, snapshot.metadata.id)
         val effectiveOptions = mergeOptions(
           readOptions(delta.options.toSeq, s"Delta source $fallbackName"),
           parsedOptions,
@@ -708,6 +811,7 @@ object StreamingTableDefinition {
         if (snapshot.version < 0L)
           StreamingTableErrors.invalid("Resolved Delta source has no committed snapshot")
         val path = StreamingTableMetadata.normalizePath(spark, deltaIndex.deltaLog.dataPath)
+        validateSourceGeneration(path, deltaIndex.metadata.id, snapshot.metadata.id)
         val logicalIdentity = catalogName
           .map(parts => StreamingTableMetadata.canonicalIdentity(spark, parts))
           .getOrElse(s"delta-path:$path")
@@ -732,6 +836,14 @@ object StreamingTableDefinition {
           deltaTableId = None
         )
     }
+
+  private def validateSourceGeneration(path: String, analyzedDeltaId: String, currentDeltaId: String): Unit =
+    if (analyzedDeltaId != currentDeltaId)
+      StreamingTableErrors.invalid(
+        s"Delta source '$path' changed generation after query analysis. " +
+          "Recreate the source Dataset/DataFrame against the replacement table before creating a streaming table; " +
+          "the analyzed reader may refer to deleted data or checkpoints from the previous generation."
+      )
 
   private def sourceFromStreamingRelation(
       spark: SparkSession,
@@ -1068,8 +1180,10 @@ object StreamingTableDefinition {
       }
       .mkString("options[", ",", "]")
 
-  private def semanticReaderOptions(options: Map[String, String]): Map[String, String] =
-    options.filterNot { case (key, _) => OperationalReaderOptions.contains(key) }
+  private def semanticReaderOptions(options: Map[String, String]): Map[String, String] = {
+    val operationalKeys = identityOperationalOptions.get()
+    options.filterNot { case (key, _) => operationalKeys.contains(key) }
+  }
 
   private def encodeSeq(values: Seq[String]): String = values.mkString("[", ",", "]")
 

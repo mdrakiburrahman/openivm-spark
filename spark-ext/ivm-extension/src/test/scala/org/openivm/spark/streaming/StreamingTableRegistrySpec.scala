@@ -114,6 +114,7 @@ package org.openivm.spark.streaming {
         current.finish(old.runId.toString, None)
         val replacement = new StreamingQueryTestDouble(() => (), id = old.id)
         current.bind(replacement, "replacement")
+        current.unhealthy(replacement.runId.toString, 5.minutes)
         val registry = context(current)
         try {
           current.progress(old.runId.toString, Some("old progress"))
@@ -124,6 +125,8 @@ package org.openivm.spark.streaming {
           current.snapshot.lastProgress shouldBe None
           current.snapshot.progressObserved shouldBe false
           current.snapshot.terminationUnconfirmed shouldBe true
+          current.snapshot.diagnosticStatus shouldBe Some("unhealthy")
+          current.snapshot.lastFailure.get should include(replacement.runId.toString)
         } finally registry.close()
       }
 

@@ -83,3 +83,14 @@ well.
    curl -fsSL https://gh.io/copilot-install | bash
    $HOME/.local/bin/copilot --yolo
    ```
+
+4. Hydrate up `GH_TOKEN` for agentic git pushes:
+
+   ```bash
+   line="export GH_TOKEN='ghp_7m...T'"
+   sed -i.bak '/^export GH_TOKEN=/d' ~/.bashrc
+   printf '%s\n' "$line" >> ~/.bashrc
+
+   source ~/.bashrc
+   gh repo list
+   ```

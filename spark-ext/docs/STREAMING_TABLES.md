@@ -150,6 +150,19 @@ and native idle events count as startup progress. New progress clears a
 startup-only unhealthy state. The watchdog never stops queries, deletes
 storage, or terminates the session; SHOW exposes its bounded failure details.
 
+OpenIVM requires positive native progress retention:
+`spark.sql.streaming.numRecentProgressUpdates` must be at least `2` when
+explicitly configured. On the supported Spark versions, `1` leaves the native
+progress buffer empty. Remove the override to retain Spark's default of `100`.
+An incompatible value is rejected before CREATE starts, resumes, or rebuilds
+a writer; OpenIVM never changes this application-wide setting. Native progress
+is reconciled before the same SHOW response is built, so a recovered startup
+diagnostic does not linger for an extra poll. Real query and stop failures remain visible.
+
+`spark.sql.streaming.maxBatchesToRetainInMemory` controls batch caching, not
+progress history. Setting it to `0` remains supported and does not disable
+native progress reporting.
+
 Checkpoint archival requires a durable Hadoop-filesystem root outside managed
 table storage:
 
@@ -193,12 +206,36 @@ and persistent query ID with a new run ID. With no new source commit, the new ru
 does no source-row or target-data work. New inserts are consumed exactly once on
 the next run; already committed input is not replayed.
 
+A column added upstream that the declaration cannot read does not change the
+definition. When every previously recorded source column is unchanged, the
+output schema is unchanged, and the analyzed plan matches apart from relation
+output lists, OpenIVM re-records the definition and resumes the same checkpoint
+instead of rebuilding and replaying the sources. Declarations that expand views
+stay strict, because a redefined view leaves the declaration unchanged. Setting
+`spark.openivm.streaming.definition.ignoreAnalyzedPlanDrift=true` also resumes an
+unchanged, view-free declaration whose analyzed plan is encoded differently, for
+example after a Spark runtime patch. It is off by default because session
+settings such as ANSI mode or the time zone surface only in the analyzed plan.
+
 The checkpoint is bound to the persisted semantic definition. A changed query,
 source identity, source semantic option, watermark, output mode, partitioning,
 or target property fails without stopping or mutating the existing table by
 default. Explicit `OPTIONS ('onQueryChange' = 'rebuild')` opts into destructive
 replacement of the extension-owned target. The previous checkpoint remains in
 the archive for diagnosis and audit.
+
+Operational source options are not part of the semantic definition: the rate
+limits `maxFilesPerTrigger` / `maxBytesPerTrigger` and the Delta change-commit
+tolerances `ignoreDeletes`, `ignoreChanges` and `skipChangeCommits` (keys are
+case-insensitive). Reissuing a declaration that changes only these options
+restarts the same checkpoint and table with the new values and records them in
+the persisted definition; it never rebuilds. This is the documented Delta
+remedy when a source starts committing retention deletes and the query fails
+with `DELTA_SOURCE_IGNORE_DELETE`: add `'ignoreDeletes' = 'true'` and reissue.
+`startingVersion` and `startingTimestamp` stay semantic. Definitions persisted
+by earlier versions, which counted the tolerances as semantic, are accepted as
+the same definition and re-persisted in the current form, including a pending
+rebuild's reset journal, so upgrading the extension never rebuilds a stream.
 
 Before rebuilding or dropping a managed target, OpenIVM resolves one dependency
 graph spanning both streaming tables and materialized views, then drops every
@@ -218,6 +255,14 @@ declarations in topological order so new checkpoints and definitions bind to
 the replacement source generation. An interrupted streaming rebuild resumes
 from its durable reset journal when the exact replacement declaration is
 retried.
+
+Recreate previously analyzed source DataFrames/Datasets after a destructive
+same-path rebuild. OpenIVM rejects a resolved Delta reader whose bound table
+identity differs from the current source generation before creating its target.
+This includes snapshot-pinned batch inputs (for example, time-travel dimensions
+in a stream-static join), which otherwise may access a deleted checkpoint.
+Version changes within the same Delta table identity remain valid; the guard
+does not refresh a time-travel query to a different version or clear global caches.
 
 State-store selection remains ordinary Spark configuration; the extension does
 not clone the session or mutate `SparkConf` / `SQLConf`:

@@ -193,6 +193,56 @@ class StreamingTableFingerprintSpec extends AnyFunSpec with StreamingTableTestFi
       second.semanticJson shouldBe first.semanticJson
     }
 
+    it("keeps Delta change-commit tolerances out of the semantic identity and recognizes legacy identities") {
+      val source = "strt_fingerprint_tolerance_source"
+      createSource(source)
+
+      def definition(readerOptions: String): StreamingTableDefinition = {
+        val command = spark.sessionState.sqlParser
+          .parsePlan(
+            s"""CREATE STREAMING TABLE strt_fingerprint_tolerance_target AS
+               |SELECT id, value, part FROM STREAM $source WITH ($readerOptions)""".stripMargin
+          )
+          .asInstanceOf[CreateStreamingTableCommand]
+        val frame = StreamingDatasetAccess.ofRows(spark, command.spec.query)
+        StreamingTableDefinition.build(
+          spark,
+          command.spec,
+          frame.queryExecution.analyzed,
+          StreamingTableMetadata.canonicalIdentity(spark, command.spec.name),
+          StreamingRuntimeOptions.parse(command.spec.options)
+        )
+      }
+
+      val tolerances =
+        "'startingVersion' = '0', 'ignoreDeletes' = 'true', 'IGNORECHANGES' = 'true', 'skipChangeCommits' = 'false'"
+      val plain    = definition("'startingVersion' = '0'")
+      val tolerant = definition(tolerances)
+      val moved    = definition("'startingVersion' = '1', 'ignoreDeletes' = 'true'")
+
+      tolerant.fingerprint shouldBe plain.fingerprint
+      tolerant.semanticJson shouldBe plain.semanticJson
+      tolerant.operationalHash should not be plain.operationalHash
+      tolerant.operationalJson should include("\"ignoredeletes\":\"true\"")
+      tolerant.operationalJson should include("\"ignorechanges\":\"true\"")
+      tolerant.operationalJson should include("\"skipchangecommits\":\"false\"")
+      moved.fingerprint should not be plain.fingerprint
+      plain.legacyFingerprints shouldBe empty
+
+      val legacy = StreamingTableDefinition.withLegacyOperationalOptions(definition(tolerances))
+      val legacyMoved = StreamingTableDefinition.withLegacyOperationalOptions(
+        definition("'startingVersion' = '1', 'ignoreDeletes' = 'true'")
+      )
+      legacy.fingerprint should not be tolerant.fingerprint
+      legacy.semanticJson should include("ignorechanges")
+      legacy.operationalJson should not include "ignorechanges"
+      tolerant.legacyFingerprints shouldBe Set(legacy.fingerprint)
+      tolerant.matchesFingerprint(legacy.fingerprint) shouldBe true
+      tolerant.matchesFingerprint(legacyMoved.fingerprint) shouldBe false
+      StreamingTableDefinition.semanticallyEquivalent(legacy.semanticJson, tolerant.semanticJson) shouldBe true
+      StreamingTableDefinition.semanticallyEquivalent(legacyMoved.semanticJson, tolerant.semanticJson) shouldBe false
+    }
+
     it("ignores ephemeral Spark common-expression IDs and migrates legacy fingerprints") {
       val prefix =
         """{"formatVersion":1,"declarationPlan":"stable","analyzedPlan":"before:"""
