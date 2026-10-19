@@ -3080,8 +3080,11 @@ object SparkRefreshRewriter {
     val headerRe = ("(?is)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
       "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+EXISTS\\s*\\(").r
     headerRe.findFirstMatchIn(stmt) match {
-      case None => stmt
+      case None    => stmt
       case Some(m) =>
+        // The EXISTS source can refer to CTEs defined before DELETE. Keep
+        // those definitions in the MERGE source's query scope.
+        val ctePrefix   = stmt.substring(0, m.start).trim
         val tgtAlias    = Option(m.group(1)).getOrElse("v")
         val existsOpen  = m.end - 1
         val existsClose = findMatchingCloseParen(stmt, existsOpen)
@@ -3117,9 +3120,10 @@ object SparkRefreshRewriter {
               .map { t =>
                 val affAlias = t.group(1)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(2), tgtAlias, affAlias)
+                val source   = if (ctePrefix.isEmpty) subBody else s"$ctePrefix\n$subBody"
                 s"""|MERGE INTO $mvRef AS v
                   |USING (
-                  |$subBody
+                  |$source
                   |) AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
@@ -3133,8 +3137,9 @@ object SparkRefreshRewriter {
                 val src      = t.group(1)
                 val affAlias = t.group(2)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                val source   = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v
-                  |USING $src AS d
+                  |USING $source AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }

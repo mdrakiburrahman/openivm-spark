@@ -1084,6 +1084,42 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements.last should include("WHEN NOT MATCHED THEN INSERT")
     }
 
+    Seq(false, true).foreach { inlineSource =>
+      it(s"keeps leading CTEs inside an EXISTS delete MERGE source (inline=$inlineSource)") {
+        val source =
+          if (inlineSource)
+            "(SELECT openivm_left_key FROM openivm_affected WHERE openivm_left_key IS NULL OR openivm_left_key = 1)"
+          else "openivm_affected"
+        val input =
+          s"""WITH affected_seed AS (SELECT 1 AS openivm_left_key),
+             |openivm_affected AS (SELECT openivm_left_key FROM affected_seed)
+             |DELETE FROM openivm_data_mv_r AS openivm_delete_target
+             |WHERE EXISTS (SELECT 1 FROM $source AS aff
+             |WHERE aff.openivm_left_key IS NOT DISTINCT FROM openivm_delete_target.openivm_left_key);
+             |""".stripMargin
+
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+
+        rewritten.statements should have size 1
+        val merge = rewritten.statements.head
+        merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+        merge should include("WITH affected_seed AS")
+        merge should include("openivm_affected AS (SELECT openivm_left_key FROM affected_seed)")
+        merge should include(
+          if (inlineSource) "SELECT openivm_left_key FROM openivm_affected" else "SELECT * FROM openivm_affected"
+        )
+        merge should include("ON d.openivm_left_key IS NOT DISTINCT FROM v.openivm_left_key")
+        merge should include("WHEN MATCHED THEN DELETE")
+      }
+    }
+
     it("rewrites DELETE USING into a key-safe delete MERGE") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
