@@ -49,6 +49,46 @@ abstract class SimpleProjectionOuterJoinScenarios extends IvmParitySpecBase("sim
     }
   }
 
+  describe("nested LEFT JOIN with a widened nullable lookup key") {
+    it("preserves null-padded duplicates through mixed changes") {
+      sql("CREATE TABLE spoj_n_events(id INT) USING DELTA")
+      sql("CREATE TABLE spoj_n_profiles(id INT, value INT) USING DELTA")
+      sql("CREATE TABLE spoj_n_dimensions(value INT, dimension_key INT) USING DELTA")
+      sql("INSERT INTO spoj_n_events VALUES (1)")
+      sql("INSERT INTO spoj_n_profiles VALUES (1, 10)")
+      sql("INSERT INTO spoj_n_dimensions VALUES (10, 2)")
+
+      // The BIGINT cast also arises implicitly for an INT key coalesced with
+      // -2147483648. The first lookup's nullable key must survive that cast.
+      val viewBody =
+        "SELECT e.id, COALESCE(d.dimension_key, 1) AS dimension_key " +
+          "FROM spoj_n_events e " +
+          "LEFT JOIN spoj_n_profiles p ON e.id = p.id " +
+          "LEFT JOIN spoj_n_dimensions d ON COALESCE(CAST(p.value AS BIGINT), -1) = d.value"
+      sql(s"CREATE MATERIALIZED VIEW spoj_n_mv AS $viewBody")
+      assertSimpleProjection("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+
+      sql("INSERT INTO spoj_n_events VALUES (2), (2)")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+
+      sql("INSERT INTO spoj_n_profiles VALUES (2, 20)")
+      sql("INSERT INTO spoj_n_dimensions VALUES (20, 3)")
+      sql("UPDATE spoj_n_profiles SET value = 20 WHERE id = 1")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+
+      sql("DELETE FROM spoj_n_profiles WHERE id = 2")
+      sql("DELETE FROM spoj_n_dimensions WHERE value = 20")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+    }
+  }
+
   describe("RIGHT JOIN SIMPLE_PROJECTION") {
     it("uses incremental partial recompute for preserved-right transitions") {
       sql("CREATE TABLE IF NOT EXISTS spoj_r_sales(id INT, product_id INT, qty INT) USING DELTA")
