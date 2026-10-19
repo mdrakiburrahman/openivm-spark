@@ -43,6 +43,70 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
   }
 
   describe("versioned prototype state") {
+    it("selects exact nullable composite groups for small and large change sets") {
+      import org.apache.spark.sql.{DataFrame, Row}
+      import org.apache.spark.sql.functions._
+      import org.apache.spark.sql.types._
+      val schema = new StructType()
+        .add("k", LongType)
+        .add("label", StringType)
+        .add("day", DateType)
+        .add("v", LongType)
+        .add("amount", DoubleType)
+      def frame(rows: Seq[Row]) = spark.createDataFrame(rows.asJava, schema)
+      val keys                  = Vector("k", "label", "day")
+      def ordinary(df: DataFrame) = df
+        .groupBy(keys.map(col): _*)
+        .agg(count(lit(1L)).as("n"), sum("amount").as("total"))
+      def summary(df: DataFrame) = df
+        .groupBy(keys.map(col): _*)
+        .agg(count(lit(1L)).as("n"), sum("amount").as("total"), countDistinct("v").as("d"))
+      def exact(a: DataFrame, b: DataFrame): Unit = {
+        a.exceptAll(b).count() shouldBe 0L
+        b.exceptAll(a).count() shouldBe 0L
+      }
+      // Exercise singleton filtering, multi-group joins, and oversized key payloads.
+      Vector((1, false), (2, false), (86, false), (1, true)).foreach { case (size, wide) =>
+        val originals = (0 until size + 2).map { i =>
+          val k: java.lang.Long = if (i % 4 == 0) null else Long.box(i % 2L)
+          Row(
+            k,
+            if (i % 3 == 0 && !wide) null else s"é.$i'`" + (if (wide) "x" * 70000 else ""),
+            java.sql.Date.valueOf(java.time.LocalDate.of(2024, 1, 1).plusDays(i)),
+            7L,
+            1.5
+          )
+        }
+        // All its components occur in changed groups, but this tuple is untouched.
+        val hybrid  = Row(originals.head(0), originals(1)(1), originals(1)(2), 11L, 6.5)
+        val initial = frame(originals.flatMap(r => Seq(r, r)) :+ hybrid)
+        val deleted = originals.take(size) ++ (if (size > 1) Seq(originals.head) else Seq.empty)
+        val added   = originals.slice(if (size == 1) 0 else 1, size).map(r => Row(r(0), r(1), r(2), 9L, 2.5))
+        val delta = frame(deleted)
+          .withColumn("openivm_multiplicity", lit(-1L))
+          .unionByName(frame(added).withColumn("openivm_multiplicity", lit(1L)))
+        val current = initial.exceptAll(frame(deleted)).unionByName(frame(added))
+        val state = new GroupedDistinctState(
+          spark,
+          s"default.composite_groups_${size}_$wide",
+          "nullable-composite",
+          schema,
+          summary(initial).schema,
+          keys,
+          "n",
+          Vector("v" -> "d")
+        )
+        try {
+          state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
+          val next = state.prepare(delta, current, "0")(ordinary)
+          exact(next.summary, summary(current))
+          next.publish("1", Array[Byte](1))
+          val empty = state.prepare(delta.limit(0), current, "1")(ordinary)
+          exact(empty.summary, summary(current))
+        } finally state.close()
+      }
+    }
+
     it("keeps fused grouped DISTINCT state exact and rejects SQL-settings changes before publication") {
       import org.apache.spark.sql.{DataFrame, Row}
       import org.apache.spark.sql.functions._

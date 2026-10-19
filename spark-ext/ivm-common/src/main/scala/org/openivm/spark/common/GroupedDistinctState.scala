@@ -105,9 +105,31 @@ private[spark] final class GroupedDistinctState(
     (if (schema(name).dataType == StringType) field(name).cast(BinaryType) else field(name)).as(name)
   private def withGroupKey(df: DataFrame): DataFrame =
     df.withColumn(g, to_json(struct(keys.map(n => keyValue(n, df.schema)): _*), JsonOptions))
-  private def selectChanged(joined: DataFrame, requested: DataFrame): DataFrame = {
-    val decoded = requested.select(from_json(col(g), GroupSchema, JsonOptions).as("k"))
-    val source  = joined.alias("s"); val wanted = broadcast(decoded).alias("d")
+  private def selectChanged(joined: DataFrame, requested: Vector[String]): DataFrame = {
+    // A single group's literal filter avoids a broadcast stage and can reach
+    // source scans through input joins. Larger sets keep the original semi-join.
+    if (
+      requested.size <= 1 && requested.size.toLong * keys.size <= 256L &&
+      requested.iterator.map(_.getBytes(UTF_8).length.toLong).sum * keys.size <= 64L * 1024L
+    ) {
+      val predicate = requested.headOption
+        .map { key =>
+          val decoded = from_json(lit(key), GroupSchema, JsonOptions)
+          keys
+            .map { n =>
+              val actual = if (inputSchema(n).dataType == StringType) field(n).cast(BinaryType) else field(n)
+              actual.eqNullSafe(decoded.getField(n))
+            }
+            .reduce(_ && _)
+        }
+        .getOrElse(lit(false))
+      return joined.filter(predicate)
+    }
+    val decoded = spark
+      .createDataset(requested)(Encoders.STRING)
+      .toDF(g)
+      .select(from_json(col(g), GroupSchema, JsonOptions).as("k"))
+    val source = joined.alias("s"); val wanted = broadcast(decoded).alias("d")
     val condition = keys
       .map { n =>
         val source = col(s"s.${quoted(n)}")
@@ -292,7 +314,7 @@ private[spark] final class GroupedDistinctState(
       )
     }
     val misses  = frequency.zip(cached).collect { case ((k, _), None) => k }
-    val touched = selectChanged(currentJoined, spark.createDataset(affected)(Encoders.STRING).toDF(g))
+    val touched = selectChanged(currentJoined, affected)
     // One Spark action produces ordinary aggregates AND requested current
     // frequencies. There is no persisted intermediate or second group job.
     val expanded = expandCurrent(touched, misses.map(_.channel).distinct)
