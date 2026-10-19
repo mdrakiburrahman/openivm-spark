@@ -89,6 +89,45 @@ abstract class SimpleProjectionOuterJoinScenarios extends IvmParitySpecBase("sim
     }
   }
 
+  describe("affected-key CTE scope") {
+    it("keeps affected-key CTEs in executable delete MERGEs") {
+      sql("CREATE TABLE spoj_cte_target(openivm_left_key INT, label STRING) USING DELTA")
+      val target = spark.sessionState.sqlParser.parseTableIdentifier("spoj_cte_target")
+      Seq(false, true).foreach { inlineSource =>
+        sql("DELETE FROM spoj_cte_target")
+        sql(
+          "INSERT INTO spoj_cte_target VALUES (NULL, 'drop-null'), (1, 'drop-a'), (1, 'drop-b'), (2, 'keep'), (2, 'keep')"
+        )
+        val source =
+          if (inlineSource)
+            "(SELECT openivm_left_key FROM openivm_affected WHERE openivm_left_key IS NULL OR openivm_left_key = 1)"
+          else "openivm_affected"
+        val compiled =
+          s"""WITH affected_seed AS (
+             |  SELECT CAST(NULL AS INT) AS openivm_left_key UNION ALL SELECT 1 UNION ALL SELECT 1
+             |), openivm_affected AS (SELECT DISTINCT openivm_left_key FROM affected_seed)
+             |DELETE FROM openivm_data_spoj_cte_target AS tgt
+             |WHERE EXISTS (SELECT 1 FROM $source AS aff
+             |WHERE aff.openivm_left_key IS NOT DISTINCT FROM tgt.openivm_left_key);
+             |""".stripMargin
+        val rewritten = org.openivm.spark.common.SparkRefreshRewriter.rewrite(
+          compiledSql = compiled,
+          mvName = target,
+          mvLocation = warehouseDir,
+          viewLogicalName = "spoj_cte_target",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = s"$warehouseDir/unused-view-delta"
+        )
+        rewritten.statements should have size 1
+        rewritten.statements.foreach(statement => sql(statement).collect())
+        assertMvCorrect(
+          "spoj_cte_target",
+          "SELECT CAST(2 AS INT) AS openivm_left_key, 'keep' AS label UNION ALL SELECT 2, 'keep'"
+        )
+      }
+    }
+  }
+
   describe("RIGHT JOIN SIMPLE_PROJECTION") {
     it("uses incremental partial recompute for preserved-right transitions") {
       sql("CREATE TABLE IF NOT EXISTS spoj_r_sales(id INT, product_id INT, qty INT) USING DELTA")
