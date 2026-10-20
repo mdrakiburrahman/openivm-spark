@@ -22,7 +22,7 @@ object FrequencyCountProbe {
       close: () => Unit
   )
   private def exact(left: DataFrame, right: DataFrame): Unit = {
-    val aligned = left.select(right.columns.map(col): _*)
+    val aligned = left.select(right.columns.toIndexedSeq.map(col): _*)
     require(aligned.exceptAll(right).count() == 0L && right.exceptAll(aligned).count() == 0L,
       "grouped preparation changed the output bag")
   }

@@ -145,7 +145,7 @@ private[spark] final class GroupedDistinctState(
   private case class FrequencyProbe(channel: Int, request: String, input: String, count: String)
   private def requestFrame(groups: Map[String, Vector[Index]], probes: Vector[FrequencyProbe]): DataFrame = {
     val schema = StructType(StructField(g, StringType) +: probes.map(p => StructField(p.request, StringType)))
-    val rows = new java.util.ArrayList[Row](groups.size)
+    val rows   = new java.util.ArrayList[Row](groups.size)
     groups.foreach { case (group, requested) =>
       val values = requested.map(k => k.channel -> k.value).toMap
       rows.add(Row.fromSeq(group +: probes.map(p => values.get(p.channel).orNull)))
@@ -330,10 +330,11 @@ private[spark] final class GroupedDistinctState(
       misses.map(k => k.group.getBytes(UTF_8).length.toLong + k.value.getBytes(UTF_8).length + 8L).sum
     val requests          = misses.groupBy(_.group)
     val requestedChannels = misses.map(_.channel).distinct
-    val wideBytes = requestBytes + requests.size.toLong * requestedChannels.size * ValueSchema.defaultSize
+    val wideBytes         = requestBytes + requests.size.toLong * requestedChannels.size * ValueSchema.defaultSize
     // A unique requested value per (group,channel) is a functional dependency,
     // not a group-count threshold. Attach all channels once before aggregation.
-    val direct = misses.map(k => k.group -> k.channel).distinct.size == misses.size && wideBytes <= MaxBytes
+    val requestedValues = misses.map(k => (k.group -> k.channel) -> k.value).toMap
+    val direct          = requestedValues.size == misses.size && wideBytes <= MaxBytes
     val probes =
       if (direct) requestedChannels.zipWithIndex.map { case (channel, i) =>
         FrequencyProbe(channel, "__rd_probe_value_" + i, "__rd_probe_input_" + i, "__rd_probe_count_" + i)
@@ -346,8 +347,10 @@ private[spark] final class GroupedDistinctState(
       if (direct) {
         val input = requestRows
           .map { rows =>
-            val wanted = rows.select((Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++
-              probes.map(p => from_json(col(p.request), ValueSchema, JsonOptions).as(p.request))): _*)
+            val wanted = rows.select(
+              (Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++
+                probes.map(p => from_json(col(p.request), ValueSchema, JsonOptions).as(p.request))): _*
+            )
             val probe = if (wideBytes <= 1024L * 1024L) broadcast(wanted) else wanted
             touched.withColumn(tg, struct(keys.map(n => keyValue(n, touched.schema)): _*)).join(probe, Seq(tg), "left")
           }
@@ -365,8 +368,7 @@ private[spark] final class GroupedDistinctState(
             when(col(p.request).isNotNull && field(column).isNotNull && actual.eqNullSafe(wanted), lit(1L))
           )
         }
-      }
-      else {
+      } else {
         val expanded = expandCurrent(touched, misses.map(_.channel).distinct)
         val request = frameIndex(misses)
           .select(
@@ -415,7 +417,7 @@ private[spark] final class GroupedDistinctState(
       )
     }
     val aggregate = org.apache.spark.sql.openivm.StreamingDatasetAccess.ofRows(spark, fused)
-    val grouped = withGroupKey(aggregate)
+    val grouped   = withGroupKey(aggregate)
     val result = if (direct) {
       val ordinaryRow = struct(
         lit(-1).as(ch),
@@ -426,16 +428,12 @@ private[spark] final class GroupedDistinctState(
       val frequencyRows = probes.map { p =>
         struct(
           lit(p.channel).as(ch),
-          col(p.request).as(value),
+          lit(null).cast(StringType).as(value),
           col(p.count).as("__rd_current_count"),
           lit(null).cast(StringType).as("__rd_ordinary")
         )
       }
-      val completed = requestRows.map { rows =>
-        val probe = if (wideBytes <= 1024L * 1024L) broadcast(rows) else rows
-        grouped.join(probe, Seq(g), "left")
-      }.getOrElse(grouped)
-      completed
+      grouped
         .select(col(g), explode(array((ordinaryRow +: frequencyRows): _*)).as("__rd_record"))
         .select(col(g), col("__rd_record.*"))
         .filter(col(ch) === -1 || col("__rd_current_count") > 0L)
@@ -452,12 +450,19 @@ private[spark] final class GroupedDistinctState(
       .collect()
       .toVector
     require(records.size <= affected.size + misses.size, "unexpected fused aggregate cardinality")
+    // Unique (group,channel) requests are already driver-local. Restore their
+    // original JSON after the bounded collect, without another Spark join.
+    def recordValue(row: Row): String = {
+      val channel = row.getAs[Int](ch)
+      if (direct && channel >= 0) requestedValues(row.getAs[String](g) -> channel)
+      else row.getAs[String](value)
+    }
     require(
       records
         .map(r =>
           r.getString(0).getBytes(UTF_8).length.toLong +
             Option(r.getAs[String]("__rd_ordinary")).fold(0L)(_.getBytes(UTF_8).length.toLong) +
-            Option(r.getAs[String](value)).fold(0L)(_.getBytes(UTF_8).length.toLong) + 16L
+            Option(recordValue(r)).fold(0L)(_.getBytes(UTF_8).length.toLong) + 16L
         )
         .sum <= MaxBytes,
       "fused aggregate byte cap"
@@ -465,7 +470,7 @@ private[spark] final class GroupedDistinctState(
     val currentFrequencies = records
       .filter(_.getAs[Int](ch) >= 0)
       .map { r =>
-        Index(r.getAs[String](g), r.getAs[Int](ch), r.getAs[String](value)) -> r.getAs[Long]("__rd_current_count")
+        Index(r.getAs[String](g), r.getAs[Int](ch), recordValue(r)) -> r.getAs[Long]("__rd_current_count")
       }
       .toMap
     require(currentFrequencies.keySet.subsetOf(misses.toSet), "unrequested fused frequency")
@@ -522,8 +527,8 @@ private[spark] final class GroupedDistinctState(
       new Completed(rows)
     }
     final class Completed private[Prepared] (rows: Vector[(String, String)]) {
-      val hits: Int   = Prepared.this.hits
-      val misses: Int = Prepared.this.misses
+      val hits: Int              = Prepared.this.hits
+      val misses: Int            = Prepared.this.misses
       val lookupStrategy: String = strategy
       private val nextRows: Vector[String] = {
         val old = db

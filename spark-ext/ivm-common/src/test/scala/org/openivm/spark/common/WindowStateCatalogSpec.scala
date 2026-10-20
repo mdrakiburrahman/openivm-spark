@@ -89,7 +89,13 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
         }
         // All its components occur in changed groups, but this tuple is untouched.
         val hybrid = Row(
-          originals.head(0), originals(1)(1), originals(1)(2), 11L, "hybrid", java.sql.Date.valueOf("2022-01-01"), 6.5
+          originals.head(0),
+          originals(1)(1),
+          originals(1)(2),
+          11L,
+          "hybrid",
+          java.sql.Date.valueOf("2022-01-01"),
+          6.5
         )
         val initial = frame(originals.flatMap(r => Seq(r, r)) :+ hybrid)
         val deleted = originals.take(size) ++ (if (size > 1) Seq(originals.head) else Seq.empty)
@@ -122,33 +128,39 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
           // request only a subset of channels; nulls never contribute to DISTINCT.
           val inserted = frame(originals.take(size).zipWithIndex.map { case (r, i) =>
             Row(
-              r(0), r(1), r(2), if (i % 3 == 0) null else Long.box(13L),
-              if (i % 3 == 1) null else "é.new'`", java.sql.Date.valueOf("2025-01-01"), 3.5
+              r(0),
+              r(1),
+              r(2),
+              if (i % 3 == 0) null else Long.box(13L),
+              if (i % 3 == 1) null else "é.new'`",
+              java.sql.Date.valueOf("2025-01-01"),
+              3.5
             )
           })
           val insertDelta = inserted.withColumn("openivm_multiplicity", lit(1L))
-          val current2 = current.unionByName(inserted)
-          val cold = state.prepare(insertDelta, current2, "1")(ordinary)
+          val current2    = current.unionByName(inserted)
+          val cold        = state.prepare(insertDelta, current2, "1")(ordinary)
           cold.lookupStrategy shouldBe "conditional_counts"
           exact(cold.summary, summary(current2))
           exact(state.all("1"), summary(current))
           cold.publish("2", Array[Byte](2))
           val current3 = current2.unionByName(inserted)
-          val warm = state.prepare(insertDelta, current3, "2")(ordinary)
+          val warm     = state.prepare(insertDelta, current3, "2")(ordinary)
           warm.misses shouldBe 0
           warm.lookupStrategy shouldBe "conditional_counts"
           exact(warm.summary, summary(current3))
           warm.publish("3", Array[Byte](3))
           val changed = inserted.withColumn("amount", lit(4.5))
-          val payloadDelta = inserted.withColumn("openivm_multiplicity", lit(-1L))
+          val payloadDelta = inserted
+            .withColumn("openivm_multiplicity", lit(-1L))
             .unionByName(changed.withColumn("openivm_multiplicity", lit(1L)))
           val current4 = current3.exceptAll(inserted).unionByName(changed)
-          val payload = state.prepare(payloadDelta, current4, "3")(ordinary)
+          val payload  = state.prepare(payloadDelta, current4, "3")(ordinary)
           payload.misses shouldBe 0
           exact(payload.summary, summary(current4))
           payload.publish("4", Array[Byte](4))
           val remove = inserted.unionByName(changed).withColumn("openivm_multiplicity", lit(-1L))
-          val last = state.prepare(remove, current, "4")(ordinary)
+          val last   = state.prepare(remove, current, "4")(ordinary)
           exact(last.summary, summary(current))
           last.publish("5", Array[Byte](5))
         } finally state.close()

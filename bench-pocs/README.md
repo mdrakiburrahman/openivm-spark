@@ -52,3 +52,31 @@ its whitespace patch before normal verification, because this host has no
 devcontainer runtime. Apply the recovered formatting and remove that temporary
 formatting hook before any SF100 pin or production review. No verification,
 inventory, assembly guard, parity tests or workflow gates are removed.
+
+## First result and follow-up
+
+Run 39387596565 passed all production verification suites on Spark 3.5 and 4.1.
+The Spark 4.1 probe alone failed on the Scala 2.13 Array-to-varargs deprecation;
+using `toIndexedSeq` fixes that without changing the test or query.
+
+Spark 3.5's four measured-round medians versus 7383ad1:
+
+| Settings | Preparation B2 baseline/candidate | Preparation B3 baseline/candidate |
+|---|---:|---:|
+| Fabric-like | 1.454 / 1.236s (-15.0%) | 0.582 / 0.681s (+17.0%) |
+| Spark-like | 1.132 / 0.799s (-29.4%) | 0.494 / 0.455s (-8.0%) |
+
+All 80 bidirectional EXCEPT ALL checks passed. This is not sufficient to promote
+with a Fabric-like B3 regression. The candidate launched 15 preparation jobs in
+Fabric-like settings versus 14/13 for the baseline's B2/B3; the result-metadata
+join adds work even though requests are already bounded and driver-local.
+
+The follow-up removes that result join. Under the verified `(group,channel)`
+uniqueness condition, the existing request map recovers the original frequency
+key after the bounded collect. The frequencies themselves still come from Spark
+COUNT, never from an assumed cache value. Byte checks include the recovered key.
+Missing channel requests contribute zero and are filtered before map lookup.
+The fallback path, numerical aggregates, cache format and publication are
+unchanged. This removes an execution stage instead of choosing a hardcoded
+request-count threshold. Runtime results are pending; the first-run regression
+has not yet been proven fixed.
