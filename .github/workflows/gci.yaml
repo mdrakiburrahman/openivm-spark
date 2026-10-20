@@ -144,10 +144,16 @@ jobs:
           unzip -q candidate-native/duckdb.zip -d candidate-native
           chmod +x candidate-native/duckdb
           python3 -m pip install --target candidate-python duckdb==1.2.1 sqlglot==30.23.0
+          curl --fail --location --retry 3 --max-time 120 https://extensions.duckdb.org/v1.5.4/linux_amd64/icu.duckdb_extension.gz -o candidate-native/icu.duckdb_extension.gz
+          gzip -d candidate-native/icu.duckdb_extension.gz
+          platform="$(python3 -c "import duckdb; print(duckdb.sql('PRAGMA platform').fetchone()[0])")"
+          mkdir -p "candidate-native/extensions/v1.2.1/$platform"
+          curl --fail --location --retry 3 --max-time 120 "https://extensions.duckdb.org/v1.2.1/$platform/tpcds.duckdb_extension.gz" -o "candidate-native/extensions/v1.2.1/$platform/tpcds.duckdb_extension.gz"
+          gzip -d "candidate-native/extensions/v1.2.1/$platform/tpcds.duckdb_extension.gz"
           python3 - <<'PY'
           from pathlib import Path
           native = Path('candidate-native').resolve()
-          (native/'init.sql').write_text("LOAD json; SET custom_extension_repository='https://extensions.duckdb.org'; INSTALL icu; LOAD icu; SET TimeZone='UTC'; SET threads=4; SET memory_limit='2GB'; SET max_temp_directory_size='8GB'; LOAD '" + str(native/'openivm.duckdb_extension') + "';\n")
+          (native/'init.sql').write_text("LOAD json; LOAD '" + str(native/'icu.duckdb_extension') + "'; SET TimeZone='UTC'; SET threads=4; SET memory_limit='2GB'; SET max_temp_directory_size='8GB'; LOAD '" + str(native/'openivm.duckdb_extension') + "';\n")
           PY
           candidate-native/duckdb -unsigned -init candidate-native/init.sql -c "SELECT version(); SELECT extension_name,extension_version FROM duckdb_extensions() WHERE loaded;" > candidate-native/versions.txt
           cat candidate-native/versions.txt

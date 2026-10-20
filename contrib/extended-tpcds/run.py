@@ -91,6 +91,7 @@ def main():
     class BoundedConnection:
         def __init__(self, *args, **kwargs):
             self.connection = original_connect(*args, **kwargs)
+            self.connection.execute("SET extension_directory=" + generate.quote(repo / "candidate-native/extensions"))
             self.connection.execute("SET TimeZone='UTC'")
 
         def execute(self, sql, *args, **kwargs):
