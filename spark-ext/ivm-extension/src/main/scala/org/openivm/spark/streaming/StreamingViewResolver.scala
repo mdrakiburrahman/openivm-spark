@@ -1,7 +1,9 @@
 package org.openivm.spark.streaming
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.catalog.CatalogTableType
 import org.apache.spark.sql.catalyst.expressions.{Alias, SubqueryExpression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, UnresolvedWith, View}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
@@ -10,9 +12,12 @@ import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRela
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 /** Expands only explicit STREAM view boundaries, using Spark's stored-view resolution. */
 private[streaming] object StreamingViewResolver {
+
+  private val SessionCatalogName = "spark_catalog"
 
   /** Resolve view namespaces and output casts before replacing their Delta leaves.
     *
@@ -44,6 +49,7 @@ private[streaming] object StreamingViewResolver {
   }
 
   private def resolveBoundary(spark: SparkSession, relation: UnresolvedRelation): LogicalPlan = {
+    if (isSessionCatalogTable(spark, relation.multipartIdentifier)) return relation
     val batch =
       try
         spark
@@ -116,6 +122,32 @@ private[streaming] object StreamingViewResolver {
           case _ => unsupported(name, leaf)
         }
       case leaf if leaf.children.isEmpty => unsupported(name, leaf)
+    }
+  }
+
+  /** Whether the session catalog records `nameParts` as a table rather than a view.
+    *
+    * Tables never expand, so they skip analysis: analyzing a Delta table refreshes its
+    * snapshot under the table's lock, serializing every STREAM boundary that reads it.
+    *
+    * @param spark caller's catalog and current namespace
+    * @param nameParts relation name as written in the query
+    */
+  private[streaming] def isSessionCatalogTable(spark: SparkSession, nameParts: Seq[String]): Boolean = {
+    val catalog          = spark.sessionState.catalog
+    val currentIsSession = spark.catalog.currentCatalog().equalsIgnoreCase(SessionCatalogName)
+    val identifier = nameParts match {
+      case Seq(table) if currentIsSession           => Some(TableIdentifier(table))
+      case Seq(database, table) if currentIsSession => Some(TableIdentifier(table, Some(database)))
+      case Seq(name, database, table) if name.equalsIgnoreCase(SessionCatalogName) =>
+        Some(TableIdentifier(table, Some(database), Some(name)))
+      case _ => None
+    }
+    identifier.exists { tableIdentifier =>
+      !catalog.isTempView(nameParts) &&
+      Try(catalog.getTableRawMetadata(tableIdentifier)).toOption.exists { table =>
+        table.tableType == CatalogTableType.MANAGED || table.tableType == CatalogTableType.EXTERNAL
+      }
     }
   }
 
