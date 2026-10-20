@@ -4,6 +4,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      extended_tpcds_sf1:
+        description: Run the isolated Extended TPC-DS SF1 Spark candidate experiment
+        type: boolean
+        default: false
 
 concurrency:
   group: gci-${{ github.ref }}
@@ -14,6 +19,7 @@ permissions:
 
 jobs:
   verify:
+    if: ${{ !inputs.extended_tpcds_sf1 }}
     name: Nx verify (${{ matrix.target }})
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
@@ -87,3 +93,97 @@ jobs:
 
       - name: Compare discovered tests
         run: npx --no-install nx run spark-ext:compare-test-inventory
+
+  extended-tpcds-sf1:
+    if: github.event_name == 'workflow_dispatch' && inputs.extended_tpcds_sf1
+    name: Extended TPC-DS SF1 candidate (Spark 4.1)
+    runs-on: [self-hosted, openivm-spark-azure]
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    container:
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
+      options: --cpus=8 --memory=32g --memory-swap=32g
+    defaults:
+      run:
+        shell: bash
+    env:
+      NX_DAEMON: 'false'
+      OPENIVM_SPARK_TARGET: spark-4.1
+      JAVA_HOME: /opt/java/jdk-21
+      OPENIVM_SBT_OPTS: -Xmx4G -XX:ActiveProcessorCount=8 -Dsbt.task.cpus=8 -Dsbt.supershell=false
+      PYTHONPATH: ${{ github.workspace }}/candidate-python
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Checkout benchmark source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          repository: mdrakiburrahman/ivm-bench
+          ref: aa44dc36c15a5f25d97b889a3ad408debbef1c77
+          path: benchmark-source
+          persist-credentials: false
+
+      - name: Download exact native candidate CI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          repository: ila/openivm
+          run-id: 39226213916
+          name: openivm-v1.5.4-extension-linux_amd64
+          path: candidate-native
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare isolated candidate compiler and Python dependencies
+        run: |
+          set -euo pipefail
+          echo 'ce6cccb23bd04b579bc8e019608c36f52e6bd8cc7b5f5d8a1aac88d7a65d84f1  candidate-native/openivm.duckdb_extension' | sha256sum -c -
+          curl --fail --location --retry 3 --max-time 120 https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip -o candidate-native/duckdb.zip
+          echo '1f2fa724fb054b3dbe1a9cbd13de5b76997d850e7087ec762ba88db04e0180cf  candidate-native/duckdb.zip' | sha256sum -c -
+          unzip -q candidate-native/duckdb.zip -d candidate-native
+          chmod +x candidate-native/duckdb
+          python3 -m pip install --target candidate-python duckdb==1.2.1 sqlglot==30.23.0
+          python3 - <<'PY'
+          from pathlib import Path
+          native = Path('candidate-native').resolve()
+          (native/'init.sql').write_text("LOAD json; SET custom_extension_repository='https://extensions.duckdb.org'; INSTALL icu; LOAD icu; SET TimeZone='UTC'; SET threads=4; SET memory_limit='2GB'; SET max_temp_directory_size='8GB'; LOAD '" + str(native/'openivm.duckdb_extension') + "';\n")
+          PY
+          candidate-native/duckdb -unsigned -init candidate-native/init.sql -c "SELECT version(); SELECT extension_name,extension_version FROM duckdb_extensions() WHERE loaded;" > candidate-native/versions.txt
+          cat candidate-native/versions.txt
+          sha256sum candidate-native/duckdb candidate-native/openivm.duckdb_extension > candidate-native/SHA256SUMS
+
+      - name: Build candidate Spark classes using locked tooling
+        run: |
+          set -euo pipefail
+          npm ci --prefer-offline --no-audit --no-fund
+          npx --no-install nx run spark-ext:build --configuration=spark-4.1 -- 'export ivmExtension / Compile / fullClasspath' | tee sf1-build.log
+          python3 - <<'PY'
+          from pathlib import Path
+          lines = Path('sf1-build.log').read_text().splitlines()
+          paths = [line.strip() for line in lines if line.startswith('/') and ':' in line and '.jar' in line]
+          if len(paths) != 1:
+              raise RuntimeError('Could not identify the exported runtime classpath')
+          Path('spark-classpath.txt').write_text(paths[0])
+          PY
+
+      - name: Generate SF1 data, build independent references, run Spark
+        run: |
+          set -euo pipefail
+          python3 -u contrib/extended-tpcds/run.py 2>&1 | tee sf1-worker.log
+
+      - name: Upload SF1 results and diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: extended-tpcds-spark-sf1-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            sf1-worker.log
+            sf1-build.log
+            candidate-native/versions.txt
+            candidate-native/SHA256SUMS
+            sf1-results/*.json
+            sf1-results/compiler-trace/
+            sf1-results/compile-failures/
