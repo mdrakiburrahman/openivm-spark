@@ -230,6 +230,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
                     rows,
                     complete.hits,
                     complete.misses,
+                    complete.lookupStrategy,
                     () => {
                       verify(spark, pins);
                       require(target(spark, meta.location) == before, "grouped-window target changed before write")
@@ -266,6 +267,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
       val rows: DataFrame,
       val hits: Int,
       val misses: Int,
+      val lookupStrategy: String,
       preflight: () => Unit,
       publish: Long => Unit
   ) {

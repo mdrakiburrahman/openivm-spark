@@ -6234,7 +6234,11 @@ case class RefreshMaterializedViewCommand(
                 0
               )
               groupedWindowStateUpdate = Some(update)
-              profile.appendStep("window_grouped_applied", s"hits=${update.hits};misses=${update.misses}", 0L)
+              profile.appendStep(
+                "window_grouped_applied",
+                s"hits=${update.hits};misses=${update.misses};lookup=${update.lookupStrategy}",
+                0L
+              )
               RefreshPerf.emit(
                 refreshId,
                 viewLabel,

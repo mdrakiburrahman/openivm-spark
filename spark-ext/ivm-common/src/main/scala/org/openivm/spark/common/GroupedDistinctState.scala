@@ -7,6 +7,7 @@ import org.apache.spark.sql.{DataFrame, Encoders, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.catalyst.expressions.{
+  Alias,
   AttributeReference,
   Cast,
   CreateNamedStruct,
@@ -141,6 +142,16 @@ private[spark] final class GroupedDistinctState(
   }
   private def groupKey(key: String) = GroupPrefix ++ key.getBytes(UTF_8)
   private case class Index(group: String, channel: Int, value: String)
+  private case class FrequencyProbe(channel: Int, request: String, input: String, count: String)
+  private def requestFrame(groups: Map[String, Vector[Index]], probes: Vector[FrequencyProbe]): DataFrame = {
+    val schema = StructType(StructField(g, StringType) +: probes.map(p => StructField(p.request, StringType)))
+    val rows = new java.util.ArrayList[Row](groups.size)
+    groups.foreach { case (group, requested) =>
+      val values = requested.map(k => k.channel -> k.value).toMap
+      rows.add(Row.fromSeq(group +: probes.map(p => values.get(p.channel).orNull)))
+    }
+    spark.createDataFrame(rows, schema)
+  }
   private def frequencyKey(k: Index) = FreqPrefix ++ RocksDBCodec.compositeKey(
     Seq(k.group.getBytes(UTF_8), RocksDBCodec.encodeLongBE(k.channel.toLong), k.value.getBytes(UTF_8))
   )
@@ -315,12 +326,48 @@ private[spark] final class GroupedDistinctState(
     }
     val misses  = frequency.zip(cached).collect { case ((k, _), None) => k }
     val touched = selectChanged(currentJoined, affected)
+    val requestBytes =
+      misses.map(k => k.group.getBytes(UTF_8).length.toLong + k.value.getBytes(UTF_8).length + 8L).sum
+    val requests          = misses.groupBy(_.group)
+    val requestedChannels = misses.map(_.channel).distinct
+    val wideBytes = requestBytes + requests.size.toLong * requestedChannels.size * ValueSchema.defaultSize
+    // A unique requested value per (group,channel) is a functional dependency,
+    // not a group-count threshold. Attach all channels once before aggregation.
+    val direct = misses.map(k => k.group -> k.channel).distinct.size == misses.size && wideBytes <= MaxBytes
+    val probes =
+      if (direct) requestedChannels.zipWithIndex.map { case (channel, i) =>
+        FrequencyProbe(channel, "__rd_probe_value_" + i, "__rd_probe_input_" + i, "__rd_probe_count_" + i)
+      }
+      else Vector.empty
+    val requestRows = if (probes.nonEmpty) Some(requestFrame(requests, probes)) else None
     // One Spark action produces ordinary aggregates AND requested current
     // frequencies. There is no persisted intermediate or second group job.
-    val expanded = expandCurrent(touched, misses.map(_.channel).distinct)
     val tagged =
-      if (misses.isEmpty) expanded
+      if (direct) {
+        val input = requestRows
+          .map { rows =>
+            val wanted = rows.select((Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++
+              probes.map(p => from_json(col(p.request), ValueSchema, JsonOptions).as(p.request))): _*)
+            val probe = if (wideBytes <= 1024L * 1024L) broadcast(wanted) else wanted
+            touched.withColumn(tg, struct(keys.map(n => keyValue(n, touched.schema)): _*)).join(probe, Seq(tg), "left")
+          }
+          .getOrElse(touched)
+        probes.foldLeft(input) { case (input, p) =>
+          val column = channels(p.channel)._1
+          val t      = inputSchema(column).dataType
+          val actual =
+            if (t == StringType) field(column).cast(BinaryType)
+            else if (t == DateType) datediff(field(column), lit("1970-01-01").cast(DateType)).cast(LongType)
+            else field(column).cast(LongType)
+          val wanted = col(p.request).getField(if (t == StringType) "b" else "l")
+          input.withColumn(
+            p.input,
+            when(col(p.request).isNotNull && field(column).isNotNull && actual.eqNullSafe(wanted), lit(1L))
+          )
+        }
+      }
       else {
+        val expanded = expandCurrent(touched, misses.map(_.channel).distinct)
         val request = frameIndex(misses)
           .select(
             from_json(col(g), GroupSchema, JsonOptions).as(tg),
@@ -328,8 +375,6 @@ private[spark] final class GroupedDistinctState(
             from_json(col(value), ValueSchema, JsonOptions).as(tv),
             lit(true).as("__rd_requested")
           )
-        val requestBytes =
-          misses.map(k => k.group.getBytes(UTF_8).length.toLong + k.value.getBytes(UTF_8).length + 8L).sum
         val probe = if (requestBytes <= 1024L * 1024L) broadcast(request) else request
         expanded
           .join(probe, typedIndex, "left")
@@ -356,20 +401,53 @@ private[spark] final class GroupedDistinctState(
       "frequency output requires the original COUNT(*)"
     )
     val ordinaryNames = normal.output.map(_.name).toVector
-    val tags          = Vector(ch, tv).map(n => normal.child.output.find(_.name == n).get)
-    val fused = normal.copy(
-      groupingExpressions = normal.groupingExpressions ++ tags,
-      aggregateExpressions = normal.aggregateExpressions ++ tags
-    )
+    val fused = if (direct) {
+      val counts = probes.map { p =>
+        val value = normal.child.output.find(_.name == p.input).get
+        Alias(Count(Seq(value)).toAggregateExpression(), p.count)()
+      }
+      normal.copy(aggregateExpressions = normal.aggregateExpressions ++ counts)
+    } else {
+      val tags = Vector(ch, tv).map(n => normal.child.output.find(_.name == n).get)
+      normal.copy(
+        groupingExpressions = normal.groupingExpressions ++ tags,
+        aggregateExpressions = normal.aggregateExpressions ++ tags
+      )
+    }
     val aggregate = org.apache.spark.sql.openivm.StreamingDatasetAccess.ofRows(spark, fused)
-    val records = withGroupKey(aggregate)
-      .select(
+    val grouped = withGroupKey(aggregate)
+    val result = if (direct) {
+      val ordinaryRow = struct(
+        lit(-1).as(ch),
+        lit("{\"l\":null,\"b\":null}").as(value),
+        field(countName).as("__rd_current_count"),
+        json(ordinaryNames).as("__rd_ordinary")
+      )
+      val frequencyRows = probes.map { p =>
+        struct(
+          lit(p.channel).as(ch),
+          col(p.request).as(value),
+          col(p.count).as("__rd_current_count"),
+          lit(null).cast(StringType).as("__rd_ordinary")
+        )
+      }
+      val completed = requestRows.map { rows =>
+        val probe = if (wideBytes <= 1024L * 1024L) broadcast(rows) else rows
+        grouped.join(probe, Seq(g), "left")
+      }.getOrElse(grouped)
+      completed
+        .select(col(g), explode(array((ordinaryRow +: frequencyRows): _*)).as("__rd_record"))
+        .select(col(g), col("__rd_record.*"))
+        .filter(col(ch) === -1 || col("__rd_current_count") > 0L)
+    } else
+      grouped.select(
         col(g),
         col(ch),
         to_json(col(tv), JsonOptions).as(value),
         field(countName).as("__rd_current_count"),
         when(col(ch) === -1, json(ordinaryNames)).otherwise(lit(null).cast(StringType)).as("__rd_ordinary")
       )
+    val records = result
       .limit(affected.size + misses.size + 1)
       .collect()
       .toVector
@@ -407,7 +485,8 @@ private[spark] final class GroupedDistinctState(
       k -> updated
     }
     next.values.foreach(_.valid())
-    val prepared = new Prepared(epoch, cacheBefore, next.toVector, writes, misses.size)
+    val strategy = if (direct) "conditional_counts" else "expanded_frequencies"
+    val prepared = new Prepared(epoch, cacheBefore, next.toVector, writes, misses.size, strategy)
     val completedRows = records.filter(_.getAs[Int](ch) == -1).map { r =>
       val key     = r.getAs[String](g)
       val payload = r.getAs[String]("__rd_ordinary")
@@ -427,7 +506,8 @@ private[spark] final class GroupedDistinctState(
       cacheBefore: Long,
       changed: Vector[(String, Counts)],
       frequencies: Vector[(Index, Long)],
-      val misses: Int
+      val misses: Int,
+      strategy: String
   ) {
     val touchedKeys: Vector[String] = changed.map(_._1)
     val hits: Int                   = frequencies.size - misses
@@ -444,6 +524,7 @@ private[spark] final class GroupedDistinctState(
     final class Completed private[Prepared] (rows: Vector[(String, String)]) {
       val hits: Int   = Prepared.this.hits
       val misses: Int = Prepared.this.misses
+      val lookupStrategy: String = strategy
       private val nextRows: Vector[String] = {
         val old = db
           .withSession { check(epoch); db.boundedPrefixScan(Cf, GroupPrefix, MaxGroups, MaxBytes) }

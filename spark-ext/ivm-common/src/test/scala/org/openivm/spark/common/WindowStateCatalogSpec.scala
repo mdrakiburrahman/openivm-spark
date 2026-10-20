@@ -52,6 +52,8 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
         .add("label", StringType)
         .add("day", DateType)
         .add("v", LongType)
+        .add("token", StringType)
+        .add("observed", DateType)
         .add("amount", DoubleType)
       def frame(rows: Seq[Row]) = spark.createDataFrame(rows.asJava, schema)
       val keys                  = Vector("k", "label", "day")
@@ -60,7 +62,13 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
         .agg(count(lit(1L)).as("n"), sum("amount").as("total"))
       def summary(df: DataFrame) = df
         .groupBy(keys.map(col): _*)
-        .agg(count(lit(1L)).as("n"), sum("amount").as("total"), countDistinct("v").as("d"))
+        .agg(
+          count(lit(1L)).as("n"),
+          sum("amount").as("total"),
+          countDistinct("v").as("d"),
+          countDistinct("token").as("tokens"),
+          countDistinct("observed").as("days")
+        )
       def exact(a: DataFrame, b: DataFrame): Unit = {
         a.exceptAll(b).count() shouldBe 0L
         b.exceptAll(a).count() shouldBe 0L
@@ -74,14 +82,20 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
             if (i % 3 == 0 && !wide) null else s"é.$i'`" + (if (wide) "x" * 70000 else ""),
             java.sql.Date.valueOf(java.time.LocalDate.of(2024, 1, 1).plusDays(i)),
             7L,
+            if (i % 2 == 0) null else "é.old",
+            java.sql.Date.valueOf("2023-01-01"),
             1.5
           )
         }
         // All its components occur in changed groups, but this tuple is untouched.
-        val hybrid  = Row(originals.head(0), originals(1)(1), originals(1)(2), 11L, 6.5)
+        val hybrid = Row(
+          originals.head(0), originals(1)(1), originals(1)(2), 11L, "hybrid", java.sql.Date.valueOf("2022-01-01"), 6.5
+        )
         val initial = frame(originals.flatMap(r => Seq(r, r)) :+ hybrid)
         val deleted = originals.take(size) ++ (if (size > 1) Seq(originals.head) else Seq.empty)
-        val added   = originals.slice(if (size == 1) 0 else 1, size).map(r => Row(r(0), r(1), r(2), 9L, 2.5))
+        val added = originals.slice(if (size == 1) 0 else 1, size).map { r =>
+          Row(r(0), r(1), r(2), 9L, "changed", java.sql.Date.valueOf("2024-01-01"), 2.5)
+        }
         val delta = frame(deleted)
           .withColumn("openivm_multiplicity", lit(-1L))
           .unionByName(frame(added).withColumn("openivm_multiplicity", lit(1L)))
@@ -94,15 +108,49 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
           summary(initial).schema,
           keys,
           "n",
-          Vector("v" -> "d")
+          Vector("v" -> "d", "token" -> "tokens", "observed" -> "days")
         )
         try {
           state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
           val next = state.prepare(delta, current, "0")(ordinary)
+          next.lookupStrategy shouldBe "expanded_frequencies"
           exact(next.summary, summary(current))
           next.publish("1", Array[Byte](1))
           val empty = state.prepare(delta.limit(0), current, "1")(ordinary)
           exact(empty.summary, summary(current))
+          // One requested value per channel, for any number of groups. Some groups
+          // request only a subset of channels; nulls never contribute to DISTINCT.
+          val inserted = frame(originals.take(size).zipWithIndex.map { case (r, i) =>
+            Row(
+              r(0), r(1), r(2), if (i % 3 == 0) null else Long.box(13L),
+              if (i % 3 == 1) null else "é.new'`", java.sql.Date.valueOf("2025-01-01"), 3.5
+            )
+          })
+          val insertDelta = inserted.withColumn("openivm_multiplicity", lit(1L))
+          val current2 = current.unionByName(inserted)
+          val cold = state.prepare(insertDelta, current2, "1")(ordinary)
+          cold.lookupStrategy shouldBe "conditional_counts"
+          exact(cold.summary, summary(current2))
+          exact(state.all("1"), summary(current))
+          cold.publish("2", Array[Byte](2))
+          val current3 = current2.unionByName(inserted)
+          val warm = state.prepare(insertDelta, current3, "2")(ordinary)
+          warm.misses shouldBe 0
+          warm.lookupStrategy shouldBe "conditional_counts"
+          exact(warm.summary, summary(current3))
+          warm.publish("3", Array[Byte](3))
+          val changed = inserted.withColumn("amount", lit(4.5))
+          val payloadDelta = inserted.withColumn("openivm_multiplicity", lit(-1L))
+            .unionByName(changed.withColumn("openivm_multiplicity", lit(1L)))
+          val current4 = current3.exceptAll(inserted).unionByName(changed)
+          val payload = state.prepare(payloadDelta, current4, "3")(ordinary)
+          payload.misses shouldBe 0
+          exact(payload.summary, summary(current4))
+          payload.publish("4", Array[Byte](4))
+          val remove = inserted.unionByName(changed).withColumn("openivm_multiplicity", lit(-1L))
+          val last = state.prepare(remove, current, "4")(ordinary)
+          exact(last.summary, summary(current))
+          last.publish("5", Array[Byte](5))
         } finally state.close()
       }
     }
