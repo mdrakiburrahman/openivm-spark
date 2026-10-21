@@ -69,7 +69,7 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       try {
         // One row in the last partition reproduces the old repeated executeTake
         // probes without relying on wall-clock performance assertions.
-        val sparse = spark.range(0L, 64L, 1L, 64).filter("id = 63")
+        val sparse = spark.range(0L, 64L, 1L, 64).filter("id = 63").toDF()
         spark.sparkContext.setJobGroup(group, group)
         GroupedDistinctState.collectBounded(sparse, 2).map(_.getLong(0)) shouldBe Vector(63L)
         spark.sparkContext.clearJobGroup()
