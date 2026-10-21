@@ -121,7 +121,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && (inputs.extended_tpcds_sf1 || inputs.monthly_precision_only || inputs.monthly_snapshot_probe)
     name: ${{ inputs.monthly_precision_only && 'Monthly decimal parity (Spark 3.5 + 4.1)' || inputs.monthly_snapshot_probe && 'SF1 monthly snapshot diagnostics' || 'Extended TPC-DS SF1 candidate (Spark 4.1)' }}
     runs-on: ${{ (inputs.monthly_precision_only || inputs.monthly_snapshot_probe) && 'ubuntu-latest' || fromJSON('["self-hosted","openivm-spark-azure"]') }}
-    timeout-minutes: ${{ inputs.monthly_precision_only && 45 || 180 }}
+    timeout-minutes: ${{ inputs.monthly_precision_only && 45 || inputs.monthly_snapshot_probe && 180 || 480 }}
     permissions:
       contents: read
       actions: read
@@ -137,11 +137,12 @@ jobs:
       JAVA_HOME: /opt/java/jdk-21
       OPENIVM_SBT_OPTS: -Xmx4G -XX:ActiveProcessorCount=8 -Dsbt.task.cpus=8 -Dsbt.supershell=false
       PYTHONPATH: ${{ github.workspace }}/candidate-python
+      EXTENDED_TPCDS_BENCHMARK_COMMIT: ${{ inputs.monthly_snapshot_probe && 'aa44dc36c15a5f25d97b889a3ad408debbef1c77' || '34cc4700b1fb18a605572bd26a0ce52868d36fae' }}
     steps:
       - name: Retain completed SF1 inputs before checkout
         run: |
           python3 - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
           current = Path('sf1-results')
           metadata = current/'provenance.json'
@@ -150,7 +151,7 @@ jobs:
           if metadata.is_file() and manifest.is_file() and not retained.exists():
               previous = json.loads(metadata.read_text())
               plan = json.loads(manifest.read_text())
-              if (previous.get('benchmark_commit') == 'aa44dc36c15a5f25d97b889a3ad408debbef1c77'
+              if (previous.get('benchmark_commit') == os.environ['EXTENDED_TPCDS_BENCHMARK_COMMIT']
                       and plan.get('plan_id') == '24fdc6d2172de3a9'
                       and (current/'reference/batch1/int_engagement_status_transaction.parquet').is_file()
                       and (current/'reference/batch1/fact_engagement_status_monthly_snapshot.parquet').is_file()):
@@ -164,7 +165,7 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           repository: mdrakiburrahman/ivm-bench
-          ref: aa44dc36c15a5f25d97b889a3ad408debbef1c77
+          ref: ${{ env.EXTENDED_TPCDS_BENCHMARK_COMMIT }}
           path: benchmark-source
           persist-credentials: false
 

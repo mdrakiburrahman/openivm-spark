@@ -18,6 +18,7 @@ import duckdb
 repo = Path(__file__).resolve().parents[2]
 runner = Path(__file__).resolve().parent
 bench = repo / "benchmark-source"
+benchmark_commit = subprocess.check_output(["git", "-C", str(bench), "rev-parse", "HEAD"], text=True).strip()
 sys.path.insert(0, str(bench / "src/workloads/extended-tpcds"))
 import generate
 import mutations
@@ -74,7 +75,7 @@ def monitor():
 
 
 def timed(connection, sql):
-    timer = threading.Timer(300, connection.interrupt)
+    timer = threading.Timer(1800, connection.interrupt)
     timer.start()
     try:
         return connection.execute(sql)
@@ -90,7 +91,7 @@ def prepare_inputs():
         cached_plan = retained / "prepared/plan"
         cached_manifest = json.loads((cached_plan / "manifest.json").read_text())
         cached_refs = retained / "reference"
-        if (previous.get("benchmark_commit") == "aa44dc36c15a5f25d97b889a3ad408debbef1c77"
+        if (previous.get("benchmark_commit") == benchmark_commit
                 and cached_manifest.get("plan_id") == "24fdc6d2172de3a9"
                 and all((cached_refs / ("batch" + str(batch)) / (name + ".parquet")).is_file()
                         for batch in ([1] if monthly_probe else [1, 2, 3]) for name in selected)):
@@ -127,7 +128,7 @@ def prepare_inputs():
 
         def execute(self, sql, *args, **kwargs):
             print("PREPARE", str(sql).splitlines()[0][:100], flush=True)
-            timer = threading.Timer(300, self.connection.interrupt)
+            timer = threading.Timer(1800, self.connection.interrupt)
             timer.start()
             try:
                 self.connection.execute(sql, *args, **kwargs)
@@ -242,7 +243,7 @@ def main():
         command.append(str(out / "probe-reference"))
     process = subprocess.Popen(command, env=env, cwd=out, start_new_session=True)
     try:
-        status = process.wait(timeout=7200)
+        status = process.wait(timeout=21600)
     finally:
         # Includes any native compiler process left behind by a timed-out JVM.
         try:
@@ -259,8 +260,8 @@ thread.start()
 provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 1 if monthly_probe else 3, "models": len(selected),
               "purpose": "monthly_precision_probe" if monthly_probe else "full_benchmark",
               "seed": 17, "report_date": "2002-12-31", "spark_commit": os.environ["GITHUB_SHA"],
-              "spark_candidate_parent": "98f133b01fbd95175fdca86a589c33762dbd71a0",
-              "benchmark_commit": "aa44dc36c15a5f25d97b889a3ad408debbef1c77",
+              "spark_candidate_parent": "e84d79a6393dec1bb26ae62236de251295f7ba31",
+              "benchmark_commit": benchmark_commit,
               "native_commit": "91ae4040438cb1b0cf11c04b9f68a20cfadf9c48",
               "native_artifact_run": 39226213916,
               "native_extension_sha256": hashlib.file_digest(
@@ -271,7 +272,7 @@ provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 1 if monthly_prob
                          "container_cpus": 4 if monthly_probe else 8, "java_heap_gib": 6 if monthly_probe else 12,
                          "duckdb_memory_gb": 6 if monthly_probe else 8, "duckdb_threads": 4,
                          "preparation_working_tables": "disk-backed",
-                         "statement_timeout_s": 300, "spark_timeout_s": 7200}}
+                         "statement_timeout_s": 1800, "spark_timeout_s": 21600}}
 save("provenance.json", provenance)
 try:
     main()

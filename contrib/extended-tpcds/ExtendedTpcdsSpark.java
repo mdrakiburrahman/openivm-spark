@@ -23,7 +23,7 @@ public class ExtendedTpcdsSpark {
   static List<Row> execute(String label,String sql) throws Exception {
     System.out.println("BEGIN "+label);System.out.flush();
     long start=System.nanoTime();
-    ScheduledFuture<?> deadline=timers.schedule(()->{System.err.println("STATEMENT TIMEOUT "+label);Runtime.getRuntime().halt(124);},300,TimeUnit.SECONDS);
+    ScheduledFuture<?> deadline=timers.schedule(()->{System.err.println("STATEMENT TIMEOUT "+label);Runtime.getRuntime().halt(124);},1800,TimeUnit.SECONDS);
     try {Dataset<Row> df=spark.sql(sql);List<Row> rows=df.collectAsList();
       ObjectNode item=statements.addObject();item.put("label",label);item.put("duration_s",(System.nanoTime()-start)/1e9);save();
       System.out.println("END "+label);System.out.flush();return rows;
