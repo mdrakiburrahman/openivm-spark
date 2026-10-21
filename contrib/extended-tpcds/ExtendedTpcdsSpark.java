@@ -14,6 +14,7 @@ public class ExtendedTpcdsSpark {
   static ObjectNode result=mapper.createObjectNode();
   static ArrayNode statements=result.putArray("statements"),checks=result.putArray("checks");
   static Path output;
+  static Map<String,String> queries=new HashMap<>();
   static String phase="startup";
   static ScheduledExecutorService timers=Executors.newSingleThreadScheduledExecutor(r->{Thread t=new Thread(r);t.setDaemon(true);return t;});
   static void save() throws Exception { mapper.writerWithDefaultPrettyPrinter().writeValue(output.toFile(),result); }
@@ -42,7 +43,53 @@ public class ExtendedTpcdsSpark {
     String query="SELECT count(*) AS differences FROM (("+actual+" EXCEPT ALL "+expected+") UNION ALL ("+expected+" EXCEPT ALL "+actual+"))";
     long differences=execute("validate:"+batch+":"+name,query).get(0).getLong(0);
     ObjectNode check=checks.addObject();check.put("batch",batch);check.put("model",name);check.put("differences",differences);save();
-    if(differences!=0) throw new IllegalStateException(name+" has "+differences+" bag differences against DuckDB reference");
+    if(differences!=0) {
+      diagnose(name,batch,references,actual,expected);
+      throw new IllegalStateException(name+" has "+differences+" bag differences against DuckDB reference");
+    }
+  }
+  static List<JsonNode> capture(String label,String query) throws Exception {
+    List<JsonNode> rows=new ArrayList<>();
+    for(Row row:execute(label,"SELECT to_json(struct(t.*)) FROM ("+query+") t LIMIT 10000"))
+      rows.add(mapper.readTree(row.getString(0)));
+    mapper.writerWithDefaultPrettyPrinter().writeValue(output.resolveSibling(label+".json").toFile(),rows);
+    return rows;
+  }
+  static void diagnose(String name,int batch,Path references,String actual,String expected) throws Exception {
+    List<JsonNode> bad=new ArrayList<>();
+    bad.addAll(capture("actual-only",actual+" EXCEPT ALL "+expected));
+    bad.addAll(capture("expected-only",expected+" EXCEPT ALL "+actual));
+    String fresh=normalized(spark.sql(queries.get(name)).schema(),"("+queries.get(name)+") fresh");
+    capture("fresh-only",fresh+" EXCEPT ALL "+expected);
+    capture("expected-minus-fresh",expected+" EXCEPT ALL "+fresh);
+    if(!name.equals("fact_engagement_status_monthly_snapshot")) return;
+    String parent="int_engagement_status_transaction";
+    String duckParent="parquet.`"+references.resolve("batch"+batch).resolve(parent+".parquet")+"`";
+    String duckSql=queries.get(name).replace(parent,duckParent);
+    String duckFresh=normalized(spark.sql(duckSql).schema(),"("+duckSql+") fresh");
+    capture("duck-parent-fresh-only",duckFresh+" EXCEPT ALL "+expected);
+    capture("expected-minus-duck-parent-fresh",expected+" EXCEPT ALL "+duckFresh);
+    String[] keys={"household_key","account_offer_key","account_usage_key","platform_key","preference_key",
+                   "product_tier_key","product_version_key","engagement_type_key","mode_key"};
+    Set<String> groups=new LinkedHashSet<>();
+    for(JsonNode row:bad) {
+      List<String> terms=new ArrayList<>();
+      terms.add("year(event_time)*10000+month(event_time)*100+1="+row.get("dim_date_key").asInt());
+      for(String key:keys)terms.add(key+" <=> "+(row.get(key).isNull()?"NULL":row.get(key).asText()));
+      groups.add("("+String.join(" AND ",terms)+")");
+    }
+    String predicate=String.join(" OR ",groups);
+    capture("spark-parent-rows","SELECT * FROM "+parent+" WHERE "+predicate);
+    capture("duck-parent-rows","SELECT * FROM "+duckParent+" WHERE "+predicate);
+    // The canonical query has a final SELECT after the agg CTE. Keep the
+    // unrounded aggregate so a half-unit boundary can be examined directly.
+    int finalSelect=queries.get(name).lastIndexOf("SELECT TRY_CAST(ROW_NUMBER()");
+    if(finalSelect>=0) {
+      String ctes=queries.get(name).substring(0,finalSelect);
+      capture("spark-unrounded",ctes+"SELECT * FROM agg WHERE dim_date_key IN ("+
+          String.join(",",bad.stream().map(row->row.get("dim_date_key").asText()).distinct().toList())+") AND household_key IN ("+
+          String.join(",",bad.stream().map(row->row.get("household_key").asText()).distinct().toList())+")");
+    }
   }
   static void requireIncremental(String name,String refreshType) {
     if(refreshType.equals("FULL_REFRESH") && !name.equals("meta_ingestion"))
@@ -52,6 +99,7 @@ public class ExtendedTpcdsSpark {
     Path out=Path.of(args[0]),plan=Path.of(args[1]),modelsPath=Path.of(args[2]),references=Path.of(args[3]);
     output=out.resolve("spark-result.json");
     JsonNode manifest=mapper.readTree(plan.resolve("manifest.json").toFile()),models=mapper.readTree(modelsPath.toFile());
+    for(JsonNode model:models)queries.put(model.get("name").asText(),model.get("sql").asText());
     result.put("status","running");result.put("plan_id",manifest.get("plan_id").asText());result.put("scale_factor",manifest.at("/source_configuration/base_scale_factor").asDouble());result.put("spark_commit",System.getProperty("extendedtpcds.sparkCommit","54859a476528927f84d777a1f7099626ba644b56"));
     result.put("validation","DuckDB full DAG, bidirectional EXCEPT ALL, floating columns rounded to 10 decimal places");save();
     try {

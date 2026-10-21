@@ -115,6 +115,24 @@ jobs:
       OPENIVM_SBT_OPTS: -Xmx4G -XX:ActiveProcessorCount=8 -Dsbt.task.cpus=8 -Dsbt.supershell=false
       PYTHONPATH: ${{ github.workspace }}/candidate-python
     steps:
+      - name: Retain completed SF1 inputs before checkout
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          current = Path('sf1-results')
+          metadata = current/'provenance.json'
+          manifest = current/'prepared/plan/manifest.json'
+          retained = Path.cwd().parent/'extended-tpcds-retained'
+          if metadata.is_file() and manifest.is_file() and not retained.exists():
+              previous = json.loads(metadata.read_text())
+              plan = json.loads(manifest.read_text())
+              if (previous.get('benchmark_commit') == 'aa44dc36c15a5f25d97b889a3ad408debbef1c77'
+                      and plan.get('plan_id') == '24fdc6d2172de3a9'
+                      and len(list((current/'reference').glob('batch*/*.parquet'))) == 288):
+                  current.rename(retained)
+                  print('Retained completed SF1 source plan and reference snapshots')
+          PY
       - name: Checkout candidate
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 

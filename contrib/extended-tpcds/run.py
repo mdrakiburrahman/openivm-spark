@@ -77,9 +77,29 @@ def timed(connection, sql):
         timer.cancel()
 
 
-def main():
-    if shutil.disk_usage(out).free < 100 * 1024**3:
-        raise RuntimeError("SF1 needs at least 100 GiB free scratch space")
+def prepare_inputs():
+    retained = repo.parent / "extended-tpcds-retained"
+    metadata = retained / "provenance.json"
+    if metadata.is_file():
+        previous = json.loads(metadata.read_text())
+        cached_plan = retained / "prepared/plan"
+        cached_manifest = json.loads((cached_plan / "manifest.json").read_text())
+        cached_refs = retained / "reference"
+        if (previous.get("benchmark_commit") == "aa44dc36c15a5f25d97b889a3ad408debbef1c77"
+                and cached_manifest.get("plan_id") == "24fdc6d2172de3a9"
+                and len(list(cached_refs.glob("batch*/*.parquet"))) == 288):
+            phase("verify_retained_inputs")
+            images = list(cached_manifest["initial"].values())
+            for batch in cached_manifest["batches"]:
+                for operation in batch["operations"]:
+                    images.extend(operation[key] for key in ("before", "after") if operation[key] is not None)
+            for image in images:
+                if mutations.file_checksum(cached_plan / image["path"]) != image["sha256"]:
+                    raise RuntimeError("Retained source checksum mismatch: " + image["path"])
+            save("manifest.json", cached_manifest)
+            save("retained-inputs.json", {"directory": str(retained), "plan_id": cached_manifest["plan_id"]})
+            subprocess.run([sys.executable, str(runner / "translate.py"), str(bench), str(cached_plan), str(out)], check=True)
+            return cached_plan, cached_refs
     phase("source_preparation")
     options = {"profile": "native", "mode": "mixed", "seed": 17, "report_date": "2002-12-31",
                "history_months": 12, "days": 3, "mutation_cohort": "all"}
@@ -159,6 +179,13 @@ def main():
                     connection.execute("DROP TABLE " + name)
     (out / "reference.duckdb").unlink()
 
+    return plan, refs
+
+
+def main():
+    if shutil.disk_usage(out).free < 100 * 1024**3:
+        raise RuntimeError("SF1 needs at least 100 GiB free scratch space")
+    plan, refs = prepare_inputs()
     phase("spark_execution")
     classpath = (repo / "spark-classpath.txt").read_text().strip() + ":" + str(runner)
     java = Path(os.environ["JAVA_HOME"]) / "bin/java"
