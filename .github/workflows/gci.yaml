@@ -17,17 +17,32 @@ on:
         description: Diagnose only the SF1 monthly snapshot and its ancestors
         type: boolean
         default: false
+      runner_capacity_probe:
+        description: Inspect hosted memory and scratch capacity
+        type: boolean
+        default: false
 
 concurrency:
-  group: gci-${{ github.ref }}${{ inputs.monthly_precision_only && '-monthly-precision' || inputs.monthly_snapshot_probe && '-monthly-probe' || '' }}
+  group: gci-${{ github.ref }}${{ inputs.runner_capacity_probe && '-capacity' || inputs.monthly_precision_only && '-monthly-precision' || inputs.monthly_snapshot_probe && '-monthly-probe' || '' }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  runner-capacity:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_capacity_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect hosted resources
+        run: |
+          df -hT
+          free -m
+          lsblk
+
   verify:
-    if: ${{ !inputs.extended_tpcds_sf1 && !inputs.monthly_precision_only && !inputs.monthly_snapshot_probe }}
+    if: ${{ !inputs.extended_tpcds_sf1 && !inputs.monthly_precision_only && !inputs.monthly_snapshot_probe && !inputs.runner_capacity_probe }}
     name: Nx verify (${{ matrix.target }})
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
