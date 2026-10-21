@@ -82,14 +82,14 @@ private[spark] final class GroupedDistinctState(
   private val identity =
     "typed-frequency-v3\n" + program + "\n" + inputSchema.json + "\n" + summarySchema.json + "\n" + keys.mkString(",") +
       "\n" + channels.mkString(",") + "\n" + spark.conf.get("spark.sql.session.timeZone") + "\n" + settings
-  private val g     = "__rd_g"; private val ch = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
-  private val tg         = "__rd_group"; private val tv = "__rd_value"
+  private val g  = "__rd_g"; private val ch     = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
+  private val tg = "__rd_group"; private val tv = "__rd_value"
   private val typedIndex = Vector(tg, ch, tv)
   private val GroupSchema = StructType(keys.map(n => {
     val f = inputSchema(n); if (f.dataType == StringType) f.copy(dataType = BinaryType) else f
   }))
   private val ValueSchema = StructType(Vector(StructField("l", LongType), StructField("b", BinaryType)))
-  private val MaxGroups = 100000; private val MaxUpdates = 1000000; private val MaxBytes = 64L * 1024L * 1024L
+  private val MaxGroups   = 100000; private val MaxUpdates = 1000000; private val MaxBytes = 64L * 1024L * 1024L
   private def supported(t: DataType): Boolean =
     t == LongType || t == IntegerType || t == ShortType || t == ByteType || t == DateType || t == StringType
   require(
@@ -177,7 +177,8 @@ private[spark] final class GroupedDistinctState(
   def cachedSize(epoch: String): Long = db.withSession { check(epoch) }
   private def encodeRows(df: DataFrame): Vector[(String, String)] = {
     val found = GroupedDistinctState.collectBounded(
-      withGroupKey(df).select(col(g), json(summarySchema.fieldNames.toVector)), MaxGroups + 1
+      withGroupKey(df).select(col(g), json(summarySchema.fieldNames.toVector)),
+      MaxGroups + 1
     )
     require(found.size <= MaxGroups, "group-state cap")
     val rows = found.map(r => r.getString(0) -> r.getString(1))
@@ -374,18 +375,21 @@ private[spark] final class GroupedDistinctState(
         val frequencyProbes = requestedChannels.zipWithIndex.map { case (channel, i) =>
           channel -> ("__rd_requested_values_" + i)
         }
-        val schema = StructType(StructField(g, StringType) +:
-          frequencyProbes.map(p => StructField(p._2, ArrayType(StringType, containsNull = false))))
+        val schema = StructType(
+          StructField(g, StringType) +:
+            frequencyProbes.map(p => StructField(p._2, ArrayType(StringType, containsNull = false)))
+        )
         val rows = new java.util.ArrayList[Row](requests.size)
         requests.foreach { case (group, values) =>
           val byChannel = values.groupBy(_.channel)
-          rows.add(Row.fromSeq(group +: frequencyProbes.map(p =>
-            byChannel.getOrElse(p._1, Vector.empty).map(_.value))))
+          rows.add(Row.fromSeq(group +: frequencyProbes.map(p => byChannel.getOrElse(p._1, Vector.empty).map(_.value))))
         }
-        val wanted = spark.createDataFrame(rows, schema).select(
-          (Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++ frequencyProbes.map(p =>
-            transform(col(p._2), v => from_json(v, ValueSchema, JsonOptions)).as(p._2))): _*
-        )
+        val wanted = spark
+          .createDataFrame(rows, schema)
+          .select(
+            (Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++ frequencyProbes
+              .map(p => transform(col(p._2), v => from_json(v, ValueSchema, JsonOptions)).as(p._2))): _*
+          )
         val probe = if (requestBytes <= 1024L * 1024L) broadcast(wanted) else wanted
         val input = touched
           .withColumn(tg, struct(keys.map(n => keyValue(n, touched.schema)): _*))

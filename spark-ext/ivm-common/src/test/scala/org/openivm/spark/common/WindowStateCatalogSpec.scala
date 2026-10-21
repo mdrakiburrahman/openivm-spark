@@ -48,9 +48,9 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       import org.apache.spark.sql.execution.QueryExecution
       import org.apache.spark.sql.util.QueryExecutionListener
       import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
-      val group = "bounded-sparse-state-collect"
+      val group        = "bounded-sparse-state-collect"
       val executionIds = new ConcurrentLinkedQueue[String]()
-      val end = new CountDownLatch(1)
+      val end          = new CountDownLatch(1)
       val listener = new SparkListener {
         override def onJobStart(event: SparkListenerJobStart): Unit = {
           if (event.properties.getProperty("spark.jobGroup.id") == group)
@@ -96,28 +96,59 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       import org.apache.spark.sql.{DataFrame, Row}
       import org.apache.spark.sql.functions._
       import org.apache.spark.sql.types._
-      val schema = new StructType().add("g", StringType).add("v", LongType)
-        .add("token", StringType).add("amount", DoubleType)
-      def frame(rows: Seq[Row]) = spark.createDataFrame(rows.asJava, schema)
+      val schema = new StructType()
+        .add("g", StringType)
+        .add("v", LongType)
+        .add("token", StringType)
+        .add("amount", DoubleType)
+      def frame(rows: Seq[Row])   = spark.createDataFrame(rows.asJava, schema)
       def ordinary(df: DataFrame) = df.groupBy("g").agg(count(lit(1L)).as("n"), sum("amount").as("total"))
-      def summary(df: DataFrame) = df.groupBy("g").agg(count(lit(1L)).as("n"), sum("amount").as("total"),
-        countDistinct("v").as("values"), countDistinct("token").as("tokens"))
+      def summary(df: DataFrame) = df
+        .groupBy("g")
+        .agg(
+          count(lit(1L)).as("n"),
+          sum("amount").as("total"),
+          countDistinct("v").as("values"),
+          countDistinct("token").as("tokens")
+        )
       def exact(a: DataFrame, b: DataFrame): Unit = {
         a.exceptAll(b).count() shouldBe 0L
         b.exceptAll(a).count() shouldBe 0L
       }
-      val initial = frame(Seq(Row(null, 1L, "a", 1.0), Row(null, 2L, "b", 2.0),
-        Row("gone", 1L, "gone", 3.0), Row("ordinary", null, null, 4.0),
-        Row("only-v", 1L, null, 5.0), Row("only-token", null, "old", 6.0)))
+      val initial = frame(
+        Seq(
+          Row(null, 1L, "a", 1.0),
+          Row(null, 2L, "b", 2.0),
+          Row("gone", 1L, "gone", 3.0),
+          Row("ordinary", null, null, 4.0),
+          Row("only-v", 1L, null, 5.0),
+          Row("only-token", null, "old", 6.0)
+        )
+      )
       val removed = initial.filter("g IS NULL OR g = 'gone' OR g = 'ordinary'")
-      val inserted = frame((0L until 128L).map(i => Row("many", i, s"é.$i'`", 1.0)) ++
-        Seq(Row(null, 3L, "c", 7.0), Row("ordinary", null, null, 8.0),
-          Row("only-v", 2L, null, 9.0), Row("only-token", null, "new", 10.0)))
-      val delta = removed.withColumn("openivm_multiplicity", lit(-1L))
+      val inserted = frame(
+        (0L until 128L).map(i => Row("many", i, s"é.$i'`", 1.0)) ++
+          Seq(
+            Row(null, 3L, "c", 7.0),
+            Row("ordinary", null, null, 8.0),
+            Row("only-v", 2L, null, 9.0),
+            Row("only-token", null, "new", 10.0)
+          )
+      )
+      val delta = removed
+        .withColumn("openivm_multiplicity", lit(-1L))
         .unionByName(inserted.withColumn("openivm_multiplicity", lit(1L)))
       val current = initial.exceptAll(removed).unionByName(inserted)
-      val state = new GroupedDistinctState(spark, "default.multi_value_requests", "multi-value-requests",
-        schema, summary(initial).schema, Vector("g"), "n", Vector("v" -> "values", "token" -> "tokens"))
+      val state = new GroupedDistinctState(
+        spark,
+        "default.multi_value_requests",
+        "multi-value-requests",
+        schema,
+        summary(initial).schema,
+        Vector("g"),
+        "n",
+        Vector("v" -> "values", "token" -> "tokens")
+      )
       try {
         state.prepareBootstrap(summary(initial), "0").publish(Array[Byte](0))
         val next = state.prepare(delta, current, "0")(ordinary)

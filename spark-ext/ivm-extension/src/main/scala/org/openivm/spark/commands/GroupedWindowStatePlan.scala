@@ -159,7 +159,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
     def initial(versions: Map[String, Long], targetSchema: StructType): Option[Initial] = unsupported {
       val pins = capture(spark, names, schemas, versions); val current = frames(spark, pins)
       encode(Checkpoint(pins, Target("", "", 0L, targetSchema)))
-      val input = contract.input(current)
+      val input   = contract.input(current)
       val summary = contract.summary(current).persist(StorageLevel.MEMORY_AND_DISK)
       try {
         val cache = state(input, summary.schema); val seed = cache.prepareBootstrap(summary, "0")
@@ -212,7 +212,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
             if (pins.zip(c.sources).exists { case (a, b) => a.path != b.path || a.id != b.id }) None
             else {
               val current = frames(spark, pins); val input = contract.input(current)
-              val cache = state(input, contract.summary(current).schema)
+              val cache   = state(input, contract.summary(current).schema)
               unsupported { cache.cachedSize(before.version.toString) }.flatMap { _ =>
                 val bases = names.flatMap { name =>
                   val short = spark.sessionState.sqlParser.parseMultipartIdentifier(name).last
