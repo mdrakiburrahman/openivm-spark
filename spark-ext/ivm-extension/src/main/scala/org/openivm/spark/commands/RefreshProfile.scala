@@ -42,6 +42,9 @@ final class RefreshProfile private (
   private val stepOrder     = new AtomicInteger(0)
   private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
   private var spanCompleted = false
+  private var spanOutcome   = "failed_before_end"
+  private var spanEndNanos  = 0L
+  private var finished      = false
 
   /** True when this profile is wired to a real RocksDB sink. False instances
     * pay zero allocation per step.
@@ -118,7 +121,8 @@ final class RefreshProfile private (
   def completeSpan(outcome: String, threadName: String): Unit = synchronized {
     if (spanCompleted) return
     val endEpochMs = System.currentTimeMillis()
-    val durationMs = (System.nanoTime() - spanStartNanos) / 1000000L
+    val endNanos = System.nanoTime()
+    val durationMs = (endNanos - spanStartNanos) / 1000000L
     if (active) {
       appendStep(
         "query_span",
@@ -126,54 +130,77 @@ final class RefreshProfile private (
         durationMs
       )
     }
-    executionSpan.complete(outcome, threadName)
+    if (mode == RefreshProfile.Mode.Create) executionSpan.complete(outcome, threadName)
+    spanOutcome = outcome
+    spanEndNanos = endNanos
     spanCompleted = true
   }
 
-  /** Persist all buffered rows in a single RocksDB batch and clear the
-    * buffer. Idempotent — a no-op on inactive instances or after a prior
-    * flush.
+  /** Persist the current rows without ending the enclosing command's telemetry.
+    * REFRESH still has cleanup and a durable backup after its query span ends.
     */
-  def flush(): Unit = {
-    try {
-      completeSpan("failed_before_end", Thread.currentThread().getName)
-      if (active) {
-        rocksdbTelemetry.toSeq.flatMap(_.finish()).foreach { summary =>
-          appendStep(
-            stepName = "rocksdb_operation",
-            detail = Seq(
-              s"db_scope=${summary.dbScope}",
-              s"operation=${summary.operation}",
-              s"multi_process=${summary.multiProcess}",
-              s"operation_count=${summary.operationCount}",
-              s"failed_count=${summary.failedCount}",
-              s"total_ns=${summary.totalNanos}",
-              s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
-              s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
-              s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
-              s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
-              s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
-              s"native_open_ns=${summary.nativeOpenNanos}",
-              s"native_close_ns=${summary.nativeCloseNanos}",
-              s"body_ns=${summary.bodyNanos}"
-            ).mkString(";"),
-            durationMs = summary.totalNanos / 1000000L
-          )
-        }
-        if (buffer.nonEmpty) {
-          val rows = buffer.toVector
-          buffer.clear()
-          try RefreshProfileCatalog.record(spark, rows)
-          catch {
-            case t: Throwable =>
-              // Telemetry must never fail the refresh — log the error and move on.
-              RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
-          }
+  def persist(): Unit = {
+    completeSpan("failed_before_end", Thread.currentThread().getName)
+    if (active) {
+      rocksdbTelemetry.toSeq.flatMap(_.finish()).foreach { summary =>
+        appendStep(
+          stepName = "rocksdb_operation",
+          detail = Seq(
+            s"db_scope=${summary.dbScope}",
+            s"operation=${summary.operation}",
+            s"multi_process=${summary.multiProcess}",
+            s"operation_count=${summary.operationCount}",
+            s"failed_count=${summary.failedCount}",
+            s"total_ns=${summary.totalNanos}",
+            s"jvm_lock_wait_ns=${summary.jvmLockWaitNanos}",
+            s"max_jvm_lock_wait_ns=${summary.maxJvmLockWaitNanos}",
+            s"jvm_lock_held_ns=${summary.jvmLockHeldNanos}",
+            s"external_lock_wait_ns=${summary.externalLockWaitNanos}",
+            s"max_external_lock_wait_ns=${summary.maxExternalLockWaitNanos}",
+            s"native_open_ns=${summary.nativeOpenNanos}",
+            s"native_close_ns=${summary.nativeCloseNanos}",
+            s"body_ns=${summary.bodyNanos}"
+          ).mkString(";"),
+          durationMs = summary.totalNanos / 1000000L
+        )
+      }
+      if (buffer.nonEmpty) {
+        val rows = buffer.toVector
+        buffer.clear()
+        try RefreshProfileCatalog.record(spark, rows)
+        catch {
+          case t: Throwable =>
+            // Telemetry must never fail the refresh — log the error and move on.
+            RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
         }
       }
-    } finally {
-      executionSpan.emitIfNeeded("failed_before_end", Thread.currentThread().getName)
-      RefreshProfile.clearActive(this)
+    }
+  }
+
+  /** End the whole command, including work after the historical query span.
+    * The final diagnostic write and telemetry publication are outside command_span.
+    */
+  def flush(outcomeOverride: Option[String] = None): Unit = {
+    if (finished) return
+    finished = true
+    val threadName = Thread.currentThread().getName
+    completeSpan("failed_before_end", threadName)
+    val outcome = outcomeOverride.getOrElse(spanOutcome)
+    val endNanos = System.nanoTime()
+    if (mode == RefreshProfile.Mode.Refresh) {
+      appendStep("after_query_span", s"outcome=$outcome", (endNanos - spanEndNanos) / 1000000L)
+      appendStep(
+        "command_span",
+        s"start_epoch_ms=${executionSpan.startedAtEpochMs};end_epoch_ms=${System.currentTimeMillis()};" +
+          s"thread=$threadName;outcome=$outcome",
+        (endNanos - executionSpan.startedAtNanos) / 1000000L
+      )
+    }
+    try persist()
+    finally {
+      executionSpan.complete(outcome, threadName)
+      try executionSpan.emitIfNeeded("failed_before_end", threadName)
+      finally RefreshProfile.clearActive(this)
     }
   }
 
@@ -237,7 +264,14 @@ object RefreshProfile {
     OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
   }
 
-  def flushActive(): Unit = Option(current.get()).foreach(_.flush())
+  def flushActive(outcomeOverride: Option[String] = None): Unit =
+    Option(current.get()).foreach(_.flush(outcomeOverride))
+
+  def timeActiveStep[A](stepName: String)(body: => A): A =
+    Option(current.get()) match {
+      case Some(profile) => profile.timeStep(stepName)(body)
+      case None          => body
+    }
 
   /** Lifecycle mode — drives the `refresh_id` shape so the chart's
     * `_create_mv_` substring discriminator routes CREATE-phase rows to the

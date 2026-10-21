@@ -3895,6 +3895,7 @@ case class RefreshMaterializedViewCommand(
     val viewMeta = metaName(name)
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0 = System.nanoTime()
+    var commandCompleted = false
     try {
       // Every refresh — ordinary or source-version-advance — deterministically
       // also holds the DIRECT upstream MV keys taken from its AUTHORITATIVE
@@ -3944,12 +3945,15 @@ case class RefreshMaterializedViewCommand(
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
-      OpenIvmStateSync.backupNow(spark)
+      RefreshProfile.timeActiveStep("state_backup") {
+        OpenIvmStateSync.backupNow(spark)
+      }
+      commandCompleted = true
       rows
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
-      try RefreshProfile.flushActive()
+      try RefreshProfile.flushActive(if (commandCompleted) None else Some("refresh_failed"))
       finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
     }
   }
@@ -4454,7 +4458,9 @@ case class RefreshMaterializedViewCommand(
           totalMs
         )
         profile.completeSpan(outcome, threadName)
-        profile.flush()
+        profile.timeStep("profile_persist") {
+          profile.persist()
+        }
         sqlLog.flush()
       }
     }
@@ -7351,7 +7357,7 @@ case class RefreshMaterializedViewCommand(
         }
     } finally {
       try {
-        if (!endEmitted) profile.flush()
+        if (!endEmitted) profile.persist()
       } finally sqlLog.finish(queryLogOutcome)
     }
   }
