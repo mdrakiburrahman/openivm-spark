@@ -120,14 +120,14 @@ jobs:
   extended-tpcds-sf1:
     if: github.event_name == 'workflow_dispatch' && (inputs.extended_tpcds_sf1 || inputs.monthly_precision_only || inputs.monthly_snapshot_probe)
     name: ${{ inputs.monthly_precision_only && 'Monthly decimal parity (Spark 3.5 + 4.1)' || inputs.monthly_snapshot_probe && 'SF1 monthly snapshot diagnostics' || 'Extended TPC-DS SF1 candidate (Spark 4.1)' }}
-    runs-on: ${{ inputs.monthly_precision_only && 'ubuntu-latest' || fromJSON('["self-hosted","openivm-spark-azure"]') }}
+    runs-on: ${{ (inputs.monthly_precision_only || inputs.monthly_snapshot_probe) && 'ubuntu-latest' || fromJSON('["self-hosted","openivm-spark-azure"]') }}
     timeout-minutes: ${{ inputs.monthly_precision_only && 45 || 180 }}
     permissions:
       contents: read
       actions: read
     container:
       image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
-      options: ${{ inputs.monthly_precision_only && '--user=0:0 --cpus=4 --memory=8g --memory-swap=8g' || '--cpus=8 --memory=32g --memory-swap=32g' }}
+      options: ${{ inputs.monthly_precision_only && '--user=0:0 --cpus=4 --memory=8g --memory-swap=8g' || inputs.monthly_snapshot_probe && '--user=0:0 --cpus=4 --memory=14g --memory-swap=14g' || '--cpus=8 --memory=32g --memory-swap=32g' }}
     defaults:
       run:
         shell: bash
@@ -214,6 +214,7 @@ jobs:
               raise RuntimeError('Could not identify the exported runtime classpath')
           Path('spark-classpath.txt').write_text(paths[0])
           PY
+          "$JAVA_HOME/bin/javac" -proc:none -cp "$(cat spark-classpath.txt)" contrib/extended-tpcds/ExtendedTpcdsSpark.java
 
       - name: Check decimal monthly totals in both Spark targets
         if: ${{ !inputs.monthly_snapshot_probe }}

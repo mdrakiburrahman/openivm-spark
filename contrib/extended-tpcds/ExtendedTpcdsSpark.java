@@ -148,7 +148,7 @@ public class ExtendedTpcdsSpark {
     result.put("status","running");result.put("plan_id",manifest.get("plan_id").asText());result.put("scale_factor",manifest.at("/source_configuration/base_scale_factor").asDouble());result.put("spark_commit",System.getProperty("extendedtpcds.sparkCommit","54859a476528927f84d777a1f7099626ba644b56"));
     result.put("validation","DuckDB full DAG, bidirectional EXCEPT ALL, floating columns rounded to 10 decimal places");save();
     try {
-      spark=SparkSession.builder().master("local[8]").appName("extended-tpcds-openivm-spark")
+      spark=SparkSession.builder().master("local["+Integer.getInteger("extendedtpcds.workers",8)+"]").appName("extended-tpcds-openivm-spark")
         .config("spark.ui.enabled","false").config("spark.driver.host","127.0.0.1").config("spark.driver.bindAddress","127.0.0.1")
         .config("spark.sql.extensions","io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions")
         .config("spark.sql.catalog.spark_catalog","org.apache.spark.sql.delta.catalog.DeltaCatalog")

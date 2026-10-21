@@ -33,6 +33,8 @@ peak_rss = 0
 monthly_probe = os.environ.get("EXTENDED_TPCDS_MONTHLY_PROBE") == "1"
 monthly = "fact_engagement_status_monthly_snapshot"
 selected = pipeline.selected_models([monthly]) if monthly_probe else pipeline.selected_models()
+duckdb_memory = "6GB" if monthly_probe else "8GB"
+spill_limit = "24GB" if monthly_probe else "64GB"
 
 
 def save(name, value):
@@ -108,7 +110,7 @@ def prepare_inputs():
     options = {"profile": "native", "mode": "mixed", "seed": 17, "report_date": "2002-12-31",
                "history_months": 12, "days": 3, "mutation_cohort": "all"}
     step = {"insert_pct": "1", "update_pct": "1", "delete_pct": "1"}
-    os.environ.update(DUCKDB_MEM_LIMIT="8GB", DUCKDB_THREADS="4", DUCKDB_MAX_TEMP_DIRECTORY_SIZE="64GB")
+    os.environ.update(DUCKDB_MEM_LIMIT=duckdb_memory, DUCKDB_THREADS="4", DUCKDB_MAX_TEMP_DIRECTORY_SIZE=spill_limit)
     # Interrupt long preparation statements without changing the canonical generator.
     original_connect = duckdb.connect
 
@@ -156,8 +158,8 @@ def prepare_inputs():
     phase("reference_generation")
     refs = out / "reference"
     refs.mkdir()
-    with duckdb.connect(str(out / "reference.duckdb"), config={"memory_limit": "8GB", "threads": 4,
-                                                            "max_temp_directory_size": "64GB"}) as connection:
+    with duckdb.connect(str(out / "reference.duckdb"), config={"memory_limit": duckdb_memory, "threads": 4,
+                                                            "max_temp_directory_size": spill_limit}) as connection:
         connection.execute("SET TimeZone='UTC'")
         mutations.load_initial(connection, manifest, plan)
         for batch in ([None] if monthly_probe else [None, *manifest["batches"]]):
@@ -187,8 +189,9 @@ def prepare_inputs():
 
 
 def main():
-    if shutil.disk_usage(out).free < 100 * 1024**3:
-        raise RuntimeError("SF1 needs at least 100 GiB free scratch space")
+    reserve = 60 if monthly_probe else 100
+    if shutil.disk_usage(out).free < reserve * 1024**3:
+        raise RuntimeError("Experiment needs at least " + str(reserve) + " GiB free scratch space")
     plan, refs = prepare_inputs()
     models = json.loads((out / "models.json").read_text())
     if monthly_probe:
@@ -199,11 +202,23 @@ def main():
         original = next(model["duckdb_sql"] for model in models if model["name"] == monthly)
         assert original.count("SUM(effective_units)") == 1
         fixed = original.replace("SUM(effective_units)", "SUM(CAST(effective_units AS DECIMAL(28,10)))")
-        with duckdb.connect(config={"memory_limit": "8GB", "threads": 4, "max_temp_directory_size": "64GB"}) as connection:
+        with duckdb.connect(config={"memory_limit": duckdb_memory, "threads": 4, "max_temp_directory_size": spill_limit}) as connection:
             connection.execute("SET TimeZone='UTC'")
             connection.execute("CREATE VIEW int_engagement_status_transaction AS SELECT * FROM read_parquet(" +
                                generate.quote(refs / "batch1/int_engagement_status_transaction.parquet") + ")")
             timed(connection, "COPY (" + fixed + ") TO " + generate.quote(candidate_refs / (monthly + "_fixed.parquet")) + " (FORMAT PARQUET)")
+            expected = "SELECT * FROM read_parquet(" + generate.quote(refs / ("batch1/" + monthly + ".parquet")) + ")"
+            probes = []
+            for threads in (1, 2, 4):
+                connection.execute("SET threads=" + str(threads))
+                timed(connection, "CREATE OR REPLACE TEMP TABLE float_probe AS " + original)
+                difference = "(SELECT * FROM float_probe EXCEPT ALL " + expected + ") UNION ALL (" + expected + " EXCEPT ALL SELECT * FROM float_probe)"
+                count = timed(connection, "SELECT count(*) FROM (" + difference + ") d").fetchone()[0]
+                rows = timed(connection, "SELECT * FROM (" + difference + ") d LIMIT 100").fetchall()
+                columns = [column[0] for column in connection.description]
+                probes.append({"threads": threads, "differences": count,
+                               "rows": [dict(zip(columns, row)) for row in rows]})
+            save("duckdb-float-probes.json", probes)
     phase("spark_execution")
     classpath = (repo / "spark-classpath.txt").read_text().strip() + ":" + str(runner)
     java = Path(os.environ["JAVA_HOME"]) / "bin/java"
@@ -211,15 +226,15 @@ def main():
         "java.lang", "java.lang.invoke", "java.lang.reflect", "java.io", "java.net", "java.nio", "java.util",
         "java.util.concurrent", "java.util.concurrent.atomic", "sun.nio.ch", "sun.nio.cs",
         "sun.security.action", "sun.util.calendar"]]
-    subprocess.run([str(java.with_name("javac")), "-proc:none", "-cp", classpath,
-                    str(runner / "ExtendedTpcdsSpark.java")], check=True)
     env = dict(os.environ, SPARK_LOCAL_IP="127.0.0.1", OPENIVM_CLI_PATH=str(runner / "compiler-adapter.py"),
                OPENIVM_EXTENSION_PATH=str(repo / "candidate-native/openivm.duckdb_extension"),
                EXTENDED_TPCDS_NATIVE_CLI=str(repo / "candidate-native/duckdb"),
                EXTENDED_TPCDS_COMPILER_INIT=str(repo / "candidate-native/init.sql"),
                EXTENDED_TPCDS_COMPILE_TRACE=str(out / "compiler-trace"),
                OPENIVM_COMPILE_FAILURE_BUNDLE_DIR=str(out / "compile-failures"))
-    command = [str(java), "-Xmx12g", "-XX:ActiveProcessorCount=8",
+    command = [str(java), "-Xmx6g" if monthly_probe else "-Xmx12g",
+               "-XX:ActiveProcessorCount=4" if monthly_probe else "-XX:ActiveProcessorCount=8",
+               "-Dextendedtpcds.workers=" + ("4" if monthly_probe else "8"),
                "-Dextendedtpcds.sparkCommit=" + os.environ["GITHUB_SHA"],
                "-Dextendedtpcds.monthlyProbe=" + str(monthly_probe).lower(), *opts, "-cp", classpath,
                "ExtendedTpcdsSpark", str(out), str(plan), str(out / "models.json"), str(refs)]
@@ -252,8 +267,9 @@ provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 1 if monthly_prob
                   (repo / "candidate-native/openivm.duckdb_extension").open("rb"), "sha256").hexdigest(),
               "validation": "Independent DuckDB full-DAG references, bidirectional EXCEPT ALL, float rounding 10 places",
               "compiler_adapter": "Experimental standalone compatibility adapter, not a production pin upgrade",
-              "limits": {"container_memory_gib": 32, "container_cpus": 8, "java_heap_gib": 12,
-                         "duckdb_memory_gb": 8, "duckdb_threads": 4,
+              "limits": {"container_memory_gib": 14 if monthly_probe else 32,
+                         "container_cpus": 4 if monthly_probe else 8, "java_heap_gib": 6 if monthly_probe else 12,
+                         "duckdb_memory_gb": 6 if monthly_probe else 8, "duckdb_threads": 4,
                          "preparation_working_tables": "disk-backed",
                          "statement_timeout_s": 300, "spark_timeout_s": 7200}}
 save("provenance.json", provenance)
