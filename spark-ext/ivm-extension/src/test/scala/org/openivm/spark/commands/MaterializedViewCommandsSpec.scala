@@ -1791,7 +1791,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           val failure = intercept[Exception] {
             spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
           }
-          Iterator.iterate[Throwable](failure)(_.getCause).takeWhile(_ != null)
+          Iterator
+            .iterate[Throwable](failure)(_.getCause)
+            .takeWhile(_ != null)
             .exists(_.getMessage == "injected durable backup failure") shouldBe true
         } finally {
           OpenIvmStateSync.setBackupPassHookForTesting(null)

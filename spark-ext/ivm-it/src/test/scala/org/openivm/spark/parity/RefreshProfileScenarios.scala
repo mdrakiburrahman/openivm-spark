@@ -112,11 +112,11 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       backupEntered shouldBe true
       OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
 
-      val rows        = showProfile()
-      val query       = rows.find(_.getString(4) == "query_span").get
-      val backup      = rows.find(_.getString(4) == "state_backup").get
-      val after       = rows.find(_.getString(4) == "after_query_span").get
-      val command     = rows.find(_.getString(4) == "command_span").get
+      val rows    = showProfile()
+      val query   = rows.find(_.getString(4) == "query_span").get
+      val backup  = rows.find(_.getString(4) == "state_backup").get
+      val after   = rows.find(_.getString(4) == "after_query_span").get
+      val command = rows.find(_.getString(4) == "command_span").get
       command.getLong(5) should be >= query.getLong(5)
       after.getLong(5) should be >= backup.getLong(5)
       rows.count(_.getString(4) == "query_span") shouldBe 1
@@ -162,7 +162,9 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         val failure = intercept[Exception] {
           sql("REFRESH MATERIALIZED VIEW profile_backup_mv").collect()
         }
-        Iterator.iterate[Throwable](failure)(_.getCause).takeWhile(_ != null)
+        Iterator
+          .iterate[Throwable](failure)(_.getCause)
+          .takeWhile(_ != null)
           .exists(_.getMessage == "injected profile backup failure") shouldBe true
       } finally {
         OpenIvmStateSync.setBackupPassHookForTesting(null)

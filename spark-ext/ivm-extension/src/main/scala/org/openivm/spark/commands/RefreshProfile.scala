@@ -121,7 +121,7 @@ final class RefreshProfile private (
   def completeSpan(outcome: String, threadName: String): Unit = synchronized {
     if (spanCompleted) return
     val endEpochMs = System.currentTimeMillis()
-    val endNanos = System.nanoTime()
+    val endNanos   = System.nanoTime()
     val durationMs = (endNanos - spanStartNanos) / 1000000L
     if (active) {
       appendStep(
@@ -185,7 +185,7 @@ final class RefreshProfile private (
     finished = true
     val threadName = Thread.currentThread().getName
     completeSpan("failed_before_end", threadName)
-    val outcome = outcomeOverride.getOrElse(spanOutcome)
+    val outcome  = outcomeOverride.getOrElse(spanOutcome)
     val endNanos = System.nanoTime()
     if (mode == RefreshProfile.Mode.Refresh) {
       appendStep("after_query_span", s"outcome=$outcome", (endNanos - spanEndNanos) / 1000000L)
