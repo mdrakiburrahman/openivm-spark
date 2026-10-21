@@ -30,6 +30,9 @@ start = time.monotonic()
 phase_name = "startup"
 finished = threading.Event()
 peak_rss = 0
+monthly_probe = os.environ.get("EXTENDED_TPCDS_MONTHLY_PROBE") == "1"
+monthly = "fact_engagement_status_monthly_snapshot"
+selected = pipeline.selected_models([monthly]) if monthly_probe else pipeline.selected_models()
 
 
 def save(name, value):
@@ -87,7 +90,8 @@ def prepare_inputs():
         cached_refs = retained / "reference"
         if (previous.get("benchmark_commit") == "aa44dc36c15a5f25d97b889a3ad408debbef1c77"
                 and cached_manifest.get("plan_id") == "24fdc6d2172de3a9"
-                and len(list(cached_refs.glob("batch*/*.parquet"))) == 288):
+                and all((cached_refs / ("batch" + str(batch)) / (name + ".parquet")).is_file()
+                        for batch in ([1] if monthly_probe else [1, 2, 3]) for name in selected)):
             phase("verify_retained_inputs")
             images = list(cached_manifest["initial"].values())
             for batch in cached_manifest["batches"]:
@@ -156,16 +160,16 @@ def prepare_inputs():
                                                             "max_temp_directory_size": "64GB"}) as connection:
         connection.execute("SET TimeZone='UTC'")
         mutations.load_initial(connection, manifest, plan)
-        for batch in [None, *manifest["batches"]]:
+        for batch in ([None] if monthly_probe else [None, *manifest["batches"]]):
             number = 1 if batch is None else batch["number"]
             if batch:
                 mutations.apply_batch(connection, manifest, plan, batch)
             directory = refs / ("batch" + str(number))
             directory.mkdir()
             parents = {name: list(filter(None, row["parent_models"].split(";")))
-                       for name, row in pipeline.mapping().items()}
+                       for name, row in pipeline.mapping().items() if name in selected}
             remaining = Counter(parent for entries in parents.values() for parent in entries)
-            for name in pipeline.selected_models():
+            for name in selected:
                 print("REFERENCE", number, name, flush=True)
                 timed(connection, "CREATE OR REPLACE TABLE " + name + " AS " +
                       pipeline.render_model(name, manifest["source_configuration"]))
@@ -186,6 +190,20 @@ def main():
     if shutil.disk_usage(out).free < 100 * 1024**3:
         raise RuntimeError("SF1 needs at least 100 GiB free scratch space")
     plan, refs = prepare_inputs()
+    models = json.loads((out / "models.json").read_text())
+    if monthly_probe:
+        models = [model for model in models if model["name"] in selected]
+        save("models.json", models)
+        candidate_refs = out / "probe-reference/batch1"
+        candidate_refs.mkdir(parents=True)
+        original = next(model["duckdb_sql"] for model in models if model["name"] == monthly)
+        assert original.count("SUM(effective_units)") == 1
+        fixed = original.replace("SUM(effective_units)", "SUM(CAST(effective_units AS DECIMAL(28,10)))")
+        with duckdb.connect(config={"memory_limit": "8GB", "threads": 4, "max_temp_directory_size": "64GB"}) as connection:
+            connection.execute("SET TimeZone='UTC'")
+            connection.execute("CREATE VIEW int_engagement_status_transaction AS SELECT * FROM read_parquet(" +
+                               generate.quote(refs / "batch1/int_engagement_status_transaction.parquet") + ")")
+            timed(connection, "COPY (" + fixed + ") TO " + generate.quote(candidate_refs / (monthly + "_fixed.parquet")) + " (FORMAT PARQUET)")
     phase("spark_execution")
     classpath = (repo / "spark-classpath.txt").read_text().strip() + ":" + str(runner)
     java = Path(os.environ["JAVA_HOME"]) / "bin/java"
@@ -202,8 +220,11 @@ def main():
                EXTENDED_TPCDS_COMPILE_TRACE=str(out / "compiler-trace"),
                OPENIVM_COMPILE_FAILURE_BUNDLE_DIR=str(out / "compile-failures"))
     command = [str(java), "-Xmx12g", "-XX:ActiveProcessorCount=8",
-               "-Dextendedtpcds.sparkCommit=" + os.environ["GITHUB_SHA"], *opts, "-cp", classpath,
+               "-Dextendedtpcds.sparkCommit=" + os.environ["GITHUB_SHA"],
+               "-Dextendedtpcds.monthlyProbe=" + str(monthly_probe).lower(), *opts, "-cp", classpath,
                "ExtendedTpcdsSpark", str(out), str(plan), str(out / "models.json"), str(refs)]
+    if monthly_probe:
+        command.append(str(out / "probe-reference"))
     process = subprocess.Popen(command, env=env, cwd=out, start_new_session=True)
     try:
         status = process.wait(timeout=7200)
@@ -220,7 +241,8 @@ def main():
 
 thread = threading.Thread(target=monitor, daemon=True)
 thread.start()
-provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 3, "models": 96,
+provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 1 if monthly_probe else 3, "models": len(selected),
+              "purpose": "monthly_precision_probe" if monthly_probe else "full_benchmark",
               "seed": 17, "report_date": "2002-12-31", "spark_commit": os.environ["GITHUB_SHA"],
               "spark_candidate_parent": "98f133b01fbd95175fdca86a589c33762dbd71a0",
               "benchmark_commit": "aa44dc36c15a5f25d97b889a3ad408debbef1c77",

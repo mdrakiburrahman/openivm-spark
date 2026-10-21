@@ -13,9 +13,13 @@ on:
         description: Run only focused decimal monthly parity checks on a hosted runner
         type: boolean
         default: false
+      monthly_snapshot_probe:
+        description: Diagnose only the SF1 monthly snapshot and its ancestors
+        type: boolean
+        default: false
 
 concurrency:
-  group: gci-${{ github.ref }}${{ inputs.monthly_precision_only && '-monthly-precision' || '' }}
+  group: gci-${{ github.ref }}${{ inputs.monthly_precision_only && '-monthly-precision' || inputs.monthly_snapshot_probe && '-monthly-probe' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -23,7 +27,7 @@ permissions:
 
 jobs:
   verify:
-    if: ${{ !inputs.extended_tpcds_sf1 && !inputs.monthly_precision_only }}
+    if: ${{ !inputs.extended_tpcds_sf1 && !inputs.monthly_precision_only && !inputs.monthly_snapshot_probe }}
     name: Nx verify (${{ matrix.target }})
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
@@ -99,8 +103,8 @@ jobs:
         run: npx --no-install nx run spark-ext:compare-test-inventory
 
   extended-tpcds-sf1:
-    if: github.event_name == 'workflow_dispatch' && (inputs.extended_tpcds_sf1 || inputs.monthly_precision_only)
-    name: ${{ inputs.monthly_precision_only && 'Monthly decimal parity (Spark 3.5 + 4.1)' || 'Extended TPC-DS SF1 candidate (Spark 4.1)' }}
+    if: github.event_name == 'workflow_dispatch' && (inputs.extended_tpcds_sf1 || inputs.monthly_precision_only || inputs.monthly_snapshot_probe)
+    name: ${{ inputs.monthly_precision_only && 'Monthly decimal parity (Spark 3.5 + 4.1)' || inputs.monthly_snapshot_probe && 'SF1 monthly snapshot diagnostics' || 'Extended TPC-DS SF1 candidate (Spark 4.1)' }}
     runs-on: ${{ inputs.monthly_precision_only && 'ubuntu-latest' || fromJSON('["self-hosted","openivm-spark-azure"]') }}
     timeout-minutes: ${{ inputs.monthly_precision_only && 45 || 180 }}
     permissions:
@@ -133,7 +137,8 @@ jobs:
               plan = json.loads(manifest.read_text())
               if (previous.get('benchmark_commit') == 'aa44dc36c15a5f25d97b889a3ad408debbef1c77'
                       and plan.get('plan_id') == '24fdc6d2172de3a9'
-                      and len(list((current/'reference').glob('batch*/*.parquet'))) == 288):
+                      and (current/'reference/batch1/int_engagement_status_transaction.parquet').is_file()
+                      and (current/'reference/batch1/fact_engagement_status_monthly_snapshot.parquet').is_file()):
                   current.rename(retained)
                   print('Retained completed SF1 source plan and reference snapshots')
           PY
@@ -196,6 +201,7 @@ jobs:
           PY
 
       - name: Check decimal monthly totals in both Spark targets
+        if: ${{ !inputs.monthly_snapshot_probe }}
         env:
           OPENIVM_TEST_FORKS: '1'
         run: |
@@ -213,6 +219,8 @@ jobs:
 
       - name: Generate SF1 data, build independent references, run Spark
         if: ${{ !inputs.monthly_precision_only }}
+        env:
+          EXTENDED_TPCDS_MONTHLY_PROBE: ${{ inputs.monthly_snapshot_probe && '1' || '0' }}
         run: |
           set -euo pipefail
           python3 -u contrib/extended-tpcds/run.py 2>&1 | tee sf1-worker.log
@@ -221,7 +229,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: extended-tpcds-spark-${{ inputs.monthly_precision_only && 'monthly-parity' || 'sf1' }}-${{ github.run_id }}
+          name: extended-tpcds-spark-${{ inputs.monthly_precision_only && 'monthly-parity' || inputs.monthly_snapshot_probe && 'monthly-probe' || 'sf1' }}-${{ github.run_id }}
           retention-days: 14
           include-hidden-files: true
           if-no-files-found: warn

@@ -15,6 +15,8 @@ public class ExtendedTpcdsSpark {
   static ArrayNode statements=result.putArray("statements"),checks=result.putArray("checks");
   static Path output;
   static Map<String,String> queries=new HashMap<>();
+  static final String monthly="fact_engagement_status_monthly_snapshot";
+  static final boolean monthlyProbe=Boolean.getBoolean("extendedtpcds.monthlyProbe");
   static String phase="startup";
   static ScheduledExecutorService timers=Executors.newSingleThreadScheduledExecutor(r->{Thread t=new Thread(r);t.setDaemon(true);return t;});
   static void save() throws Exception { mapper.writerWithDefaultPrettyPrinter().writeValue(output.toFile(),result); }
@@ -43,8 +45,9 @@ public class ExtendedTpcdsSpark {
     String query="SELECT count(*) AS differences FROM (("+actual+" EXCEPT ALL "+expected+") UNION ALL ("+expected+" EXCEPT ALL "+actual+"))";
     long differences=execute("validate:"+batch+":"+name,query).get(0).getLong(0);
     ObjectNode check=checks.addObject();check.put("batch",batch);check.put("model",name);check.put("differences",differences);save();
-    if(differences!=0) {
+    if(differences!=0 || (monthlyProbe && name.equals(monthly))) {
       diagnose(name,batch,references,actual,expected);
+      if(monthlyProbe && name.equals(monthly)) return;
       throw new IllegalStateException(name+" has "+differences+" bag differences against DuckDB reference");
     }
   }
@@ -62,7 +65,13 @@ public class ExtendedTpcdsSpark {
     String fresh=normalized(spark.sql(queries.get(name)).schema(),"("+queries.get(name)+") fresh");
     capture("fresh-only",fresh+" EXCEPT ALL "+expected);
     capture("expected-minus-fresh",expected+" EXCEPT ALL "+fresh);
-    if(!name.equals("fact_engagement_status_monthly_snapshot")) return;
+    if(!name.equals(monthly)) return;
+    int finalSelect=queries.get(name).lastIndexOf("SELECT TRY_CAST(ROW_NUMBER()");
+    if(finalSelect<0)throw new IllegalStateException("Unexpected monthly query shape");
+    String ctes=queries.get(name).substring(0,finalSelect);
+    List<JsonNode> near=capture("near-half-aggregates",ctes+
+        "SELECT * FROM agg WHERE ABS(effective_units_count-FLOOR(effective_units_count)-0.5)<1e-8");
+    if(bad.isEmpty())bad.addAll(near.subList(0,Math.min(near.size(),8)));
     String parent="int_engagement_status_transaction";
     String duckParent="parquet.`"+references.resolve("batch"+batch).resolve(parent+".parquet")+"`";
     String duckSql=queries.get(name).replace(parent,duckParent);
@@ -78,18 +87,54 @@ public class ExtendedTpcdsSpark {
       for(String key:keys)terms.add(key+" <=> "+(row.get(key).isNull()?"NULL":row.get(key).asText()));
       groups.add("("+String.join(" AND ",terms)+")");
     }
+    if(groups.isEmpty())return;
     String predicate=String.join(" OR ",groups);
     capture("spark-parent-rows","SELECT * FROM "+parent+" WHERE "+predicate);
     capture("duck-parent-rows","SELECT * FROM "+duckParent+" WHERE "+predicate);
     // The canonical query has a final SELECT after the agg CTE. Keep the
     // unrounded aggregate so a half-unit boundary can be examined directly.
-    int finalSelect=queries.get(name).lastIndexOf("SELECT TRY_CAST(ROW_NUMBER()");
     if(finalSelect>=0) {
-      String ctes=queries.get(name).substring(0,finalSelect);
       capture("spark-unrounded",ctes+"SELECT * FROM agg WHERE dim_date_key IN ("+
           String.join(",",bad.stream().map(row->row.get("dim_date_key").asText()).distinct().toList())+") AND household_key IN ("+
           String.join(",",bad.stream().map(row->row.get("household_key").asText()).distinct().toList())+")");
     }
+  }
+  static void runMonthlyProbe(Path references,Path candidateReferences) throws Exception {
+    String original=queries.get(monthly);
+    String candidate=original.replace("SUM(effective_units)","SUM(CAST(effective_units AS DECIMAL(28,10)))");
+    if(original.equals(candidate))throw new IllegalStateException("Missing monthly double aggregate");
+    String fixedName=monthly+"_fixed";
+    queries.put(fixedName,candidate);
+    execute("create:decimal-candidate","CREATE MATERIALIZED VIEW "+fixedName+" AS "+candidate);
+    requireIncremental(fixedName,MvCatalog.lookup(spark,new TableIdentifier(fixedName,scala.Option.empty())).get().refreshTypeName());
+    validate(fixedName,1,candidateReferences);
+    spark.conf().set("spark.sql.adaptive.enabled","false");
+    ArrayNode probes=result.putArray("precision_probes");
+    boolean captured=false;
+    for(int partitions:new int[]{1,2,3,4,8}) {
+      spark.conf().set("spark.sql.shuffle.partitions",Integer.toString(partitions));
+      for(boolean decimal:new boolean[]{false,true}) {
+        String label=(decimal?"decimal":"double")+"-partitions-"+partitions;
+        String sql=decimal?candidate:original;
+        String reference=(decimal?candidateReferences:references).resolve("batch1").resolve((decimal?fixedName:monthly)+".parquet").toString();
+        String actual=normalized(spark.sql(sql).schema(),"("+sql+") fresh");
+        String expected=normalized(spark.read().parquet(reference).schema(),"parquet.`"+reference+"`");
+        String diff="("+actual+" EXCEPT ALL "+expected+") UNION ALL ("+expected+" EXCEPT ALL "+actual+")";
+        long count=execute(label,"SELECT count(*) FROM ("+diff+") d").get(0).getLong(0);
+        probes.addObject().put("kind",decimal?"decimal":"double").put("partitions",partitions).put("differences",count);save();
+        if(count!=0) {
+          capture(label+"-differences",diff);
+          if(!decimal && !captured) {
+            result.put("witness_partitions",partitions);save();
+            diagnose(monthly,1,references,actual,expected);
+            captured=true;
+          }
+        }
+        if(decimal && count!=0)throw new IllegalStateException("Fixed precision differs for "+partitions+" partitions");
+      }
+    }
+    result.put("status","diagnostic_complete");
+    result.put("scope","Initial monthly query and its ancestors only; not a full SF1 benchmark pass");
   }
   static void requireIncremental(String name,String refreshType) {
     if(refreshType.equals("FULL_REFRESH") && !name.equals("meta_ingestion"))
@@ -127,6 +172,7 @@ public class ExtendedTpcdsSpark {
         requireIncremental(name, meta.refreshTypeName());
         validate(name,1,references);
       }
+      if(monthlyProbe) {runMonthlyProbe(references,Path.of(args[4]));return;}
       int batch=1;
       for(JsonNode step:manifest.get("batches")) {batch++;phase="mutations:"+batch;
         for(JsonNode op:step.get("operations")) {String name=op.get("table").asText(),kind=op.get("kind").asText();

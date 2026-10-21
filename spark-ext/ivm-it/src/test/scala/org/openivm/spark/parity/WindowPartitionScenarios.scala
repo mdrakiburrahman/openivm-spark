@@ -402,7 +402,9 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
       sql(s"CREATE MATERIALIZED VIEW wp_monthly_units_mv AS $query")
       mvRefreshType("wp_monthly_units_mv") should not be RefreshTypeCode.FullRefresh
       sql("SELECT * FROM wp_monthly_units_mv ORDER BY household_key").collect().map(_.toSeq).toSeq shouldBe Seq(
-        Seq[Any](1, 13L, 1), Seq[Any](2, 13L, -1), Seq[Any](3, 1L, null)
+        Seq[Any](1, 13L, 1),
+        Seq[Any](2, 13L, -1),
+        Seq[Any](3, 1L, null)
       )
       assertMvCorrect("wp_monthly_units_mv", query)
 
