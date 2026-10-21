@@ -217,7 +217,7 @@ jobs:
           PY
           "$JAVA_HOME/bin/javac" -proc:none -cp "$(cat spark-classpath.txt)" contrib/extended-tpcds/ExtendedTpcdsSpark.java
 
-      - name: Check decimal monthly totals in both Spark targets
+      - name: Check Spark null ordering in both Spark targets
         if: ${{ !inputs.monthly_snapshot_probe }}
         env:
           OPENIVM_TEST_FORKS: '1'
@@ -230,9 +230,9 @@ jobs:
           export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false'
           npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- \
             "ivmIt/Test/scalafmtOnly $GITHUB_WORKSPACE/spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala" \
-            'ivmIt/testOnly org.openivm.spark.parity.WindowPartitionSpec org.openivm.spark.parity.WindowPartitionCdfSpec -- -z "decimal monthly totals"'
+            'ivmIt/testOnly org.openivm.spark.parity.WindowPartitionSpec org.openivm.spark.parity.WindowPartitionCdfSpec -- -z "Spark null ordering"'
           npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
-            'ivmIt/testOnly org.openivm.spark.parity.WindowPartitionSpec org.openivm.spark.parity.WindowPartitionCdfSpec -- -z "decimal monthly totals"'
+            'ivmIt/testOnly org.openivm.spark.parity.WindowPartitionSpec org.openivm.spark.parity.WindowPartitionCdfSpec -- -z "Spark null ordering"'
 
       - name: Generate SF1 data, build independent references, run Spark
         if: ${{ !inputs.monthly_precision_only }}
