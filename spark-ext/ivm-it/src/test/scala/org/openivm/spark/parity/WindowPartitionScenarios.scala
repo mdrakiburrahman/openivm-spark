@@ -377,6 +377,49 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
     }
   }
 
+  describe("fixed-precision monthly units after latest-row selection") {
+    it("keeps decimal monthly totals exact through mixed DML and an empty refresh") {
+      sql(
+        "CREATE TABLE wp_monthly_units(id INT, household_key INT, event_time TIMESTAMP, effective_units DOUBLE) USING DELTA"
+      )
+      val values = (1 to 13).flatMap { id =>
+        val units = if (id == 13) "0.03846153846153846" else "0.038461538461538464"
+        Seq(
+          s"($id,1,TIMESTAMP '2002-12-01 00:00:00',$units)",
+          s"(${id + 100},2,TIMESTAMP '2002-12-01 00:00:00',-$units)"
+        )
+      }
+      sql(s"INSERT INTO wp_monthly_units VALUES ${values.mkString(",")},(200,3,TIMESTAMP '2002-12-01 00:00:00',NULL)")
+      val query =
+        """WITH latest AS (
+          | SELECT household_key, effective_units,
+          |        ROW_NUMBER() OVER (PARTITION BY household_key,id ORDER BY event_time DESC) AS rn
+          | FROM wp_monthly_units
+          |)
+          |SELECT household_key, COUNT(*) AS engagement_count,
+          |       TRY_CAST(ROUND(SUM(CAST(effective_units AS DECIMAL(28,10)))) AS INT) AS rounded_units
+          |FROM latest WHERE rn=1 GROUP BY household_key""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW wp_monthly_units_mv AS $query")
+      mvRefreshType("wp_monthly_units_mv") should not be RefreshTypeCode.FullRefresh
+      sql("SELECT * FROM wp_monthly_units_mv ORDER BY household_key").collect().map(_.toSeq).toSeq shouldBe Seq(
+        Seq[Any](1, 13L, 1), Seq[Any](2, 13L, -1), Seq[Any](3, 1L, null)
+      )
+      assertMvCorrect("wp_monthly_units_mv", query)
+
+      sql("INSERT INTO wp_monthly_units VALUES (1,1,TIMESTAMP '2002-12-02 00:00:00',0.9)")
+      sql("UPDATE wp_monthly_units SET effective_units=effective_units+2.0 WHERE id=2")
+      sql("DELETE FROM wp_monthly_units WHERE id=3")
+      refreshMv("wp_monthly_units_mv")
+      assertMvCorrect("wp_monthly_units_mv", query)
+      sql("SELECT * FROM wp_monthly_units_mv WHERE household_key=1").collect().map(_.toSeq).toSeq shouldBe Seq(
+        Seq[Any](1, 12L, 3)
+      )
+      refreshMv("wp_monthly_units_mv")
+      assertMvCorrect("wp_monthly_units_mv", query)
+      mvRefreshType("wp_monthly_units_mv") should not be RefreshTypeCode.FullRefresh
+    }
+  }
+
   // ── (12) Batched conflicting DML across multiple partitions → single REFRESH ─
 
   describe("(12) Batched mixed DML across multiple partitions consolidates into one REFRESH") {
