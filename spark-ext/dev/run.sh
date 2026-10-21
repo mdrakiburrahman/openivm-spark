@@ -321,12 +321,6 @@ cmd_verify() {
     cmd_pins_sync
     prepare_sbt 1
     setup_test_log_dir
-    # Diagnostic checkout only: recover formatting from the pinned devcontainer.
-    # All normal verification below remains enabled.
-    run_sbt "$@" scalafmtAll
-    printf '%s\n' 'FINALIZATION_FORMAT_PATCH_BEGIN'
-    git diff --binary -- '*.scala' '*.sbt'
-    printf '%s\n' 'FINALIZATION_FORMAT_PATCH_END'
     run_sbt "$@" \
         ivmExtension/clean \
         scalafmtCheckAll \
