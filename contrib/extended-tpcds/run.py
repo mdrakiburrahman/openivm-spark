@@ -84,12 +84,17 @@ def main():
     options = {"profile": "native", "mode": "mixed", "seed": 17, "report_date": "2002-12-31",
                "history_months": 12, "days": 3, "mutation_cohort": "all"}
     step = {"insert_pct": "1", "update_pct": "1", "delete_pct": "1"}
-    os.environ.update(DUCKDB_MEM_LIMIT="8GB", DUCKDB_THREADS="8", DUCKDB_MAX_TEMP_DIRECTORY_SIZE="64GB")
+    os.environ.update(DUCKDB_MEM_LIMIT="8GB", DUCKDB_THREADS="4", DUCKDB_MAX_TEMP_DIRECTORY_SIZE="64GB")
     # Interrupt long preparation statements without changing the canonical generator.
     original_connect = duckdb.connect
 
     class BoundedConnection:
         def __init__(self, *args, **kwargs):
+            # The canonical planner opens an anonymous database and copies all
+            # sources plus mutation pools into it. Persist its working tables so
+            # the registry export can evict them while sorting at SF1.
+            if not args and "database" not in kwargs:
+                kwargs["database"] = str(out / "preparation-state.duckdb")
             self.connection = original_connect(*args, **kwargs)
             self.connection.execute("SET extension_directory=" + generate.quote(repo / "candidate-native/extensions"))
             self.connection.execute("SET TimeZone='UTC'")
@@ -127,7 +132,7 @@ def main():
     phase("reference_generation")
     refs = out / "reference"
     refs.mkdir()
-    with duckdb.connect(str(out / "reference.duckdb"), config={"memory_limit": "8GB", "threads": 8,
+    with duckdb.connect(str(out / "reference.duckdb"), config={"memory_limit": "8GB", "threads": 4,
                                                             "max_temp_directory_size": "64GB"}) as connection:
         connection.execute("SET TimeZone='UTC'")
         mutations.load_initial(connection, manifest, plan)
@@ -199,7 +204,9 @@ provenance = {"scale_factor": 1, "mode": "mixed", "snapshots": 3, "models": 96,
               "validation": "Independent DuckDB full-DAG references, bidirectional EXCEPT ALL, float rounding 10 places",
               "compiler_adapter": "Experimental standalone compatibility adapter, not a production pin upgrade",
               "limits": {"container_memory_gib": 32, "container_cpus": 8, "java_heap_gib": 12,
-                         "duckdb_memory_gb": 8, "statement_timeout_s": 300, "spark_timeout_s": 7200}}
+                         "duckdb_memory_gb": 8, "duckdb_threads": 4,
+                         "preparation_working_tables": "disk-backed",
+                         "statement_timeout_s": 300, "spark_timeout_s": 7200}}
 save("provenance.json", provenance)
 try:
     main()
