@@ -109,6 +109,12 @@ class OpenIvmInsightsSpec extends IvmParitySpecBase("openivm-insights") with Int
       val completed = terminalOperation(capture)
       completed.getAs[String]("event_type") shouldBe OpenIvmInsightsContract.EventType.OperationCompleted
       completed.getAs[String]("status") shouldBe "no_pending_deltas"
+      details(capture).filter(_.has("step_name")).map(_.path("step_name").asText()).toSet should contain allOf (
+        "profile_persist",
+        "state_backup",
+        "after_query_span",
+        "command_span"
+      )
       event(capture, OpenIvmInsightsContract.Code.PendingDeltasObserved)
         .getAs[String]("operation") shouldBe OpenIvmInsightsContract.Operation.Refresh
       assertTerminalHasHighestOperationSequence(capture)

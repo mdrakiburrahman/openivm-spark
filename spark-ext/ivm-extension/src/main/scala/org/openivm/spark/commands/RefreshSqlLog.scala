@@ -45,6 +45,7 @@ final class RefreshSqlLog private (
     spark != null && OpenIvmInsightsBroker.hasActiveCapture(spark)
   private val startedNanos = System.nanoTime()
   private var finished     = false
+  private var finalOutcome = "refresh_failed"
 
   def isActive: Boolean = active
 
@@ -159,6 +160,11 @@ final class RefreshSqlLog private (
   /** Only the outermost lifecycle finally may finish a capture: an earlier
     * profile/span flush can still be followed by logged cleanup statements.
     */
+  def prepareFinish(outcome: String): Unit = {
+    finalOutcome = outcome
+    flush()
+  }
+
   def finish(outcome: String): Unit = synchronized {
     if (finished) return
     try {
@@ -167,8 +173,11 @@ final class RefreshSqlLog private (
         exportInvocation.foreach(_.finish(outcome))
       }
     } finally {
-      emitOperationTerminal(outcome)
-      finished = true
+      try emitOperationTerminal(outcome)
+      finally {
+        finished = true
+        RefreshSqlLog.clearActive(this)
+      }
     }
   }
 
@@ -196,6 +205,20 @@ final class RefreshSqlLog private (
 
 object RefreshSqlLog {
 
+  private val current = new ThreadLocal[RefreshSqlLog]()
+
+  private def clearActive(log: RefreshSqlLog): Unit =
+    if (current.get() eq log) current.remove()
+
+  def finishActive(outcomeOverride: Option[String]): Unit =
+    Option(current.get()).foreach { log =>
+      val outcome =
+        if (OpenIvmTelemetryContract.RefreshSuccessOutcomes.contains(log.finalOutcome))
+          outcomeOverride.getOrElse(log.finalOutcome)
+        else log.finalOutcome
+      log.finish(outcome)
+    }
+
   val ModeCreate: String  = "create"
   val ModeRefresh: String = "refresh"
 
@@ -222,7 +245,9 @@ object RefreshSqlLog {
             RefreshPerfBridge.logProfileFailure(refreshId, viewName, t)
             None
         }
-    new RefreshSqlLog(spark, refreshId, viewName, mode, active, exportInvocation)
+    val log = new RefreshSqlLog(spark, refreshId, viewName, mode, active, exportInvocation)
+    current.set(log)
+    log
   }
 
   /** Inactive instance for code paths that never opt into the query log. */
