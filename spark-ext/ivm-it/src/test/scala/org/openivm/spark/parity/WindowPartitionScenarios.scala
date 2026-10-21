@@ -377,6 +377,47 @@ abstract class WindowPartitionScenarios extends IvmParitySpecBase("window-partit
     }
   }
 
+  describe("Spark null ordering in aggregate surrogate keys") {
+    Seq(
+      ("asc_default", "ASC", Seq[String](null, "a", "z")),
+      ("desc_default", "DESC", Seq[String]("z", "a", null)),
+      ("asc_nulls_last", "ASC NULLS LAST", Seq[String]("a", "z", null)),
+      ("desc_nulls_first", "DESC NULLS FIRST", Seq[String](null, "z", "a"))
+    ).foreach { case (suffix, ordering, expectedPolicies) =>
+      it(s"preserves Spark null ordering for $suffix through aggregate refresh") {
+        val source = s"wp_null_order_$suffix"
+        val view   = s"${source}_mv"
+        sql(s"CREATE TABLE $source(id INT, household_key INT, policy_type STRING, units INT) USING DELTA")
+        sql(s"INSERT INTO $source VALUES (1,1,'a',1),(2,1,'z',2)")
+        val query =
+          s"""SELECT CAST(ROW_NUMBER() OVER (ORDER BY household_key,policy_type $ordering) AS INT) AS primary_key,
+                       |       household_key, policy_type, engagement_count, total_units
+                       |FROM (SELECT household_key, policy_type, COUNT(DISTINCT id) AS engagement_count,
+                       |             SUM(units) AS total_units FROM $source GROUP BY household_key,policy_type) grouped""".stripMargin
+        sql(s"CREATE MATERIALIZED VIEW $view AS $query")
+        mvRefreshType(view) should not be RefreshTypeCode.FullRefresh
+        assertMvCorrect(view, query)
+
+        sql(s"INSERT INTO $source VALUES (3,1,NULL,3)")
+        refreshMv(view)
+        assertMvCorrect(view, query)
+        sql(s"SELECT policy_type FROM $view ORDER BY primary_key")
+          .collect()
+          .map(_.get(0))
+          .toSeq shouldBe expectedPolicies
+
+        sql(s"UPDATE $source SET policy_type='b' WHERE id=1")
+        sql(s"DELETE FROM $source WHERE id=2")
+        sql(s"INSERT INTO $source VALUES (4,1,NULL,4)")
+        refreshMv(view)
+        assertMvCorrect(view, query)
+        refreshMv(view)
+        assertMvCorrect(view, query)
+        mvRefreshType(view) should not be RefreshTypeCode.FullRefresh
+      }
+    }
+  }
+
   describe("fixed-precision monthly units after latest-row selection") {
     it("keeps decimal monthly totals exact through mixed DML and an empty refresh") {
       sql(
