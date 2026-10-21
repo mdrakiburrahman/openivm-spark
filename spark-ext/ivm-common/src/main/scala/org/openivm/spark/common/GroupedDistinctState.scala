@@ -6,7 +6,13 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.{DataFrame, Encoders, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.catalyst.CatalystTypeConverters
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.catalyst.expressions.{
+  And,
+  ArrayContains,
+  If,
+  IsNotNull,
   Alias,
   AttributeReference,
   Cast,
@@ -77,16 +83,12 @@ private[spark] final class GroupedDistinctState(
     "typed-frequency-v3\n" + program + "\n" + inputSchema.json + "\n" + summarySchema.json + "\n" + keys.mkString(",") +
       "\n" + channels.mkString(",") + "\n" + spark.conf.get("spark.sql.session.timeZone") + "\n" + settings
   private val g     = "__rd_g"; private val ch = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
-  private val index = Vector(g, ch, value)
   private val tg         = "__rd_group"; private val tv = "__rd_value"
   private val typedIndex = Vector(tg, ch, tv)
   private val GroupSchema = StructType(keys.map(n => {
     val f = inputSchema(n); if (f.dataType == StringType) f.copy(dataType = BinaryType) else f
   }))
   private val ValueSchema = StructType(Vector(StructField("l", LongType), StructField("b", BinaryType)))
-  private val IndexSchema = StructType(
-    Vector(StructField(g, StringType), StructField(ch, IntegerType), StructField(value, StringType))
-  )
   private val MaxGroups = 100000; private val MaxUpdates = 1000000; private val MaxBytes = 64L * 1024L * 1024L
   private def supported(t: DataType): Boolean =
     t == LongType || t == IntegerType || t == ShortType || t == ByteType || t == DateType || t == StringType
@@ -155,13 +157,6 @@ private[spark] final class GroupedDistinctState(
   private def frequencyKey(k: Index) = FreqPrefix ++ RocksDBCodec.compositeKey(
     Seq(k.group.getBytes(UTF_8), RocksDBCodec.encodeLongBE(k.channel.toLong), k.value.getBytes(UTF_8))
   )
-  private def frameIndex(rows: Vector[Index]): DataFrame = {
-    // These capped requests are already driver-local. Keep their cardinality
-    // visible to Spark rather than hiding them behind a size-unknown RDD.
-    val values = new java.util.ArrayList[Row](rows.size)
-    rows.foreach(k => values.add(Row(k.group, k.channel, k.value)))
-    spark.createDataFrame(values, IndexSchema)
-  }
   private def decode(rows: Vector[String]): DataFrame = spark.read
     .schema(summarySchema)
     .options(JsonOptions)
@@ -181,8 +176,9 @@ private[spark] final class GroupedDistinctState(
   def close(): Unit                   = OpenIvmRocksDBRegistry.close(path)
   def cachedSize(epoch: String): Long = db.withSession { check(epoch) }
   private def encodeRows(df: DataFrame): Vector[(String, String)] = {
-    val found =
-      withGroupKey(df).select(col(g), json(summarySchema.fieldNames.toVector)).limit(MaxGroups + 1).collect().toVector
+    val found = GroupedDistinctState.collectBounded(
+      withGroupKey(df).select(col(g), json(summarySchema.fieldNames.toVector)), MaxGroups + 1
+    )
     require(found.size <= MaxGroups, "group-state cap")
     val rows = found.map(r => r.getString(0) -> r.getString(1))
     require(rows.map(_._1).distinct.size == rows.size, "duplicate full group identity")
@@ -253,22 +249,22 @@ private[spark] final class GroupedDistinctState(
       .filter(col("v").isNotNull)
       .select(col(tg), col("v.*"))
   }
-  private def expandCurrent(joined: DataFrame, active: Vector[Int]): DataFrame = {
+  private def expandCurrent(joined: DataFrame, probes: Vector[(Int, String)]): DataFrame = {
     val group  = joined.withColumn(tg, struct(keys.map(n => keyValue(n, joined.schema)): _*))
     val child  = group.queryExecution.analyzed
     val source = child.output.map(a => a.name -> a).toMap
     val empty = CreateNamedStruct(
       Seq(Literal("l"), Literal.create(null, LongType), Literal("b"), Literal.create(null, BinaryType))
     )
-    val tag      = AttributeReference(ch, IntegerType, nullable = false)()
+    val tag      = AttributeReference(ch, IntegerType, nullable = true)()
     val valueTag = AttributeReference(tv, ValueSchema, nullable = false)()
     // Payload slots can be nulled by Expand. Fresh IDs keep the optimizer from
     // restoring the original input's non-nullability after constant folding.
     val outputs =
       child.output.map(a => if (keys.contains(a.name) || a.name == tg) a else a.withNullability(true).newInstance())
     val regular: Seq[Expression] = child.output ++ Seq(Literal(-1), empty)
-    val projections = Vector(regular) ++ active.map { i =>
-      val name = channels(i)._1; val a = source(name)
+    val projections = Vector(regular) ++ probes.map { case (channel, request) =>
+      val name = channels(channel)._1; val a = source(name)
       val long: Expression =
         if (a.dataType == StringType) Literal.create(null, LongType)
         else if (a.dataType == DateType) Cast(DateDiff(a, Literal.create(0, DateType)), LongType)
@@ -276,10 +272,18 @@ private[spark] final class GroupedDistinctState(
       val binary: Expression = if (a.dataType == StringType) Cast(a, BinaryType) else Literal.create(null, BinaryType)
       val typed              = CreateNamedStruct(Seq(Literal("l"), long, Literal("b"), binary))
       child.output.map(a => if (keys.contains(a.name) || a.name == tg) a else Literal.create(null, a.dataType)) ++
-        Seq(Literal(i), typed)
+        Seq(
+          If(
+            And(IsNotNull(a), ArrayContains(source(request), typed)),
+            Literal(channel),
+            Literal.create(null, IntegerType)
+          ),
+          typed
+        )
     }
     org.apache.spark.sql.openivm.StreamingDatasetAccess
       .ofRows(spark, Expand(projections, outputs ++ Seq(tag, valueTag), child))
+      .filter(col(ch).isNotNull)
   }
   private case class Counts(n: Long, distinct: Vector[Long]) {
     def valid(): Unit = {
@@ -297,14 +301,12 @@ private[spark] final class GroupedDistinctState(
       ordinary: DataFrame => DataFrame
   ): Prepared#Completed = {
     val cacheBefore = db.withSession { check(epoch) }
-    val consolidated = unfold(delta, channels.indices.toVector, true)
+    val contributions = unfold(delta, channels.indices.toVector, true)
       .groupBy(typedIndex.map(col): _*)
       .agg(sum(weight).as(weight))
       .filter(col(weight) =!= 0L)
       .select(to_json(col(tg), JsonOptions).as(g), col(ch), to_json(col(tv), JsonOptions).as(value), col(weight))
-      .limit(MaxUpdates + 1)
-      .collect()
-      .toVector
+    val consolidated = GroupedDistinctState.collectBounded(contributions, MaxUpdates + 1)
     require(consolidated.size <= MaxUpdates, "demand contribution cap")
     val changes = consolidated.map(r =>
       Index(r.getAs[String](g), r.getAs[Int](ch), r.getAs[String](value)) -> r.getAs[Long](weight)
@@ -369,19 +371,28 @@ private[spark] final class GroupedDistinctState(
           )
         }
       } else {
-        val expanded = expandCurrent(touched, misses.map(_.channel).distinct)
-        val request = frameIndex(misses)
-          .select(
-            from_json(col(g), GroupSchema, JsonOptions).as(tg),
-            col(ch),
-            from_json(col(value), ValueSchema, JsonOptions).as(tv),
-            lit(true).as("__rd_requested")
-          )
-        val probe = if (requestBytes <= 1024L * 1024L) broadcast(request) else request
-        expanded
-          .join(probe, typedIndex, "left")
-          .filter(col(ch) === -1 || col("__rd_requested").isNotNull)
-          .drop("__rd_requested")
+        val frequencyProbes = requestedChannels.zipWithIndex.map { case (channel, i) =>
+          channel -> ("__rd_requested_values_" + i)
+        }
+        val schema = StructType(StructField(g, StringType) +:
+          frequencyProbes.map(p => StructField(p._2, ArrayType(StringType, containsNull = false))))
+        val rows = new java.util.ArrayList[Row](requests.size)
+        requests.foreach { case (group, values) =>
+          val byChannel = values.groupBy(_.channel)
+          rows.add(Row.fromSeq(group +: frequencyProbes.map(p =>
+            byChannel.getOrElse(p._1, Vector.empty).map(_.value))))
+        }
+        val wanted = spark.createDataFrame(rows, schema).select(
+          (Vector(from_json(col(g), GroupSchema, JsonOptions).as(tg)) ++ frequencyProbes.map(p =>
+            transform(col(p._2), v => from_json(v, ValueSchema, JsonOptions)).as(p._2))): _*
+        )
+        val probe = if (requestBytes <= 1024L * 1024L) broadcast(wanted) else wanted
+        val input = touched
+          .withColumn(tg, struct(keys.map(n => keyValue(n, touched.schema)): _*))
+          .join(probe, Seq(tg), "left")
+        // Attach one request row per group before Expand, keeping ordinary
+        // aggregates unchanged while discarding unrequested frequency lanes.
+        expandCurrent(input, frequencyProbes)
       }
     val normal = ordinary(tagged).queryExecution.analyzed match {
       case a: Aggregate => a
@@ -445,10 +456,7 @@ private[spark] final class GroupedDistinctState(
         field(countName).as("__rd_current_count"),
         when(col(ch) === -1, json(ordinaryNames)).otherwise(lit(null).cast(StringType)).as("__rd_ordinary")
       )
-    val records = result
-      .limit(affected.size + misses.size + 1)
-      .collect()
-      .toVector
+    val records = GroupedDistinctState.collectBounded(result, affected.size + misses.size + 1)
     require(records.size <= affected.size + misses.size, "unexpected fused aggregate cardinality")
     // Unique (group,channel) requests are already driver-local. Restore their
     // original JSON after the bounded collect, without another Spark join.
@@ -566,6 +574,17 @@ private[spark] final class GroupedDistinctState(
 }
 
 private[spark] object GroupedDistinctState {
+  private[common] def collectBounded(frame: DataFrame, limit: Int): Vector[Row] = {
+    val query = frame.limit(limit).queryExecution
+    SQLExecution.withNewExecutionId(query, Some("collectBounded")) {
+      query.executedPlan.resetMetrics()
+      val convert = CatalystTypeConverters.createToScalaConverter(frame.schema)
+      // Execute the bounded plan as an RDD: CollectLimit gathers its output
+      // once instead of executeTake repeatedly probing sparse partitions.
+      // Copy rows before collecting because Spark operators reuse UnsafeRows.
+      query.toRdd.map(_.copy()).collect().iterator.map(row => convert(row).asInstanceOf[Row]).toVector
+    }
+  }
   private val CheckpointKey = RocksDBCodec.utf8("grouped_window:v1:checkpoint")
   def checkpoint(spark: SparkSession, view: String): Option[Array[Byte]] = {
     val db = OpenIvmRocksDBRegistry.getOrOpen(

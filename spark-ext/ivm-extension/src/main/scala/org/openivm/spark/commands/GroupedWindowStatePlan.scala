@@ -144,13 +144,13 @@ private[commands] object GroupedWindowStatePlan extends Logging {
   ) {
     val properties: Map[String, String] = Map(ProgramKey -> programSql)
     private val native                  = GroupedWindowStagePlan.inputDelta(spark, programSql, NativeView)
-    private def state(current: Map[String, DataFrame]) = {
+    private def state(input: DataFrame, summarySchema: StructType) = {
       new GroupedDistinctState(
         spark,
         view,
         contract.identity + "\n" + native.identity,
-        contract.input(current).schema,
-        contract.summary(current).schema,
+        input.schema,
+        summarySchema,
         contract.groupColumns,
         contract.countName,
         contract.channels.map(c => c.input -> c.output)
@@ -159,9 +159,10 @@ private[commands] object GroupedWindowStatePlan extends Logging {
     def initial(versions: Map[String, Long], targetSchema: StructType): Option[Initial] = unsupported {
       val pins = capture(spark, names, schemas, versions); val current = frames(spark, pins)
       encode(Checkpoint(pins, Target("", "", 0L, targetSchema)))
+      val input = contract.input(current)
       val summary = contract.summary(current).persist(StorageLevel.MEMORY_AND_DISK)
       try {
-        val cache = state(current); val seed = cache.prepareBootstrap(summary, "0")
+        val cache = state(input, summary.schema); val seed = cache.prepareBootstrap(summary, "0")
         val rows  = align(contract.post(current, summary), targetSchema)
         new Initial(
           rows,
@@ -210,7 +211,8 @@ private[commands] object GroupedWindowStatePlan extends Logging {
             val pins = capture(spark, names, schemas, versions)
             if (pins.zip(c.sources).exists { case (a, b) => a.path != b.path || a.id != b.id }) None
             else {
-              val current = frames(spark, pins); val cache = state(current)
+              val current = frames(spark, pins); val input = contract.input(current)
+              val cache = state(input, contract.summary(current).schema)
               unsupported { cache.cachedSize(before.version.toString) }.flatMap { _ =>
                 val bases = names.flatMap { name =>
                   val short = spark.sessionState.sqlParser.parseMultipartIdentifier(name).last
@@ -221,7 +223,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
                   )
                 }.toMap
                 val complete =
-                  cache.prepare(native(bases), contract.input(current), before.version.toString)(contract.ordinary)
+                  cache.prepare(native(bases), input, before.version.toString)(contract.ordinary)
                 val rows = align(contract.post(current, complete.summary), before.schema)
                 encode(Checkpoint(pins, before)) // encoding failures precede target mutation
                 verify(spark, pins)
