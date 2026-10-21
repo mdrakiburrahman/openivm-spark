@@ -321,6 +321,18 @@ cmd_verify() {
     cmd_pins_sync
     prepare_sbt 1
     setup_test_log_dir
+    # Diagnostic branch only: record the pinned formatter's exact changes,
+    # then execute every normal verification gate on those sources.
+    run_sbt scalafmtAll scalafmtSbt
+    echo 'WF_VALIDATED_FORMAT_PATCH_BEGIN'
+    git -C "$REPO_ROOT" diff -- spark-ext
+    echo 'WF_VALIDATED_FORMAT_PATCH_END'
+    python3 - "$REPO_ROOT" <<'PYHASH'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+files=sorted(p for p in (root/'spark-ext').rglob('*.scala') if 'target' not in p.parts)
+print('WF_VALIDATED_SOURCE_HASHES='+json.dumps({str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in files},sort_keys=True))
+PYHASH
     run_sbt "$@" \
         ivmExtension/clean \
         scalafmtCheckAll \
@@ -348,6 +360,10 @@ cmd_window_benchmark() {
     setup_test_log_dir
     run_sbt "$@" \
         "ivmIt/testOnly org.openivm.spark.bench.WindowNoopWriteHarness -- -n org.openivm.spark.tags.MicroBenchmark"
+    run_sbt "$@" \
+        'set ivmIt / Test / unmanagedSources ++= { val root = (ThisBuild / baseDirectory).value.getParentFile / "bench-pocs"; Seq("ReferenceGroupedDistinctState.scala", "GatherOnlyGroupedDistinctState.scala", "FrequencyProbeTrace.scala", "FrequencyCountProbe.scala").map(root / _) }' \
+        'ivmIt/Test/scalafmt' \
+        'ivmIt/Test/runMain org.openivm.spark.common.FrequencyCountProbe'
 }
 
 cmd_openivm_test() {
