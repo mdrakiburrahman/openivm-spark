@@ -108,7 +108,7 @@ jobs:
       actions: read
     container:
       image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:d1c83bb1b2a7506880df8c48bf3822ec4c3389858b975345bb8f2f3ee0b7fc32
-      options: ${{ inputs.monthly_precision_only && '--cpus=4 --memory=8g --memory-swap=8g' || '--cpus=8 --memory=32g --memory-swap=32g' }}
+      options: ${{ inputs.monthly_precision_only && '--user=0:0 --cpus=4 --memory=8g --memory-swap=8g' || '--cpus=8 --memory=32g --memory-swap=32g' }}
     defaults:
       run:
         shell: bash
