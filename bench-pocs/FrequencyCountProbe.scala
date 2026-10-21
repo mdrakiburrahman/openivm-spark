@@ -1,6 +1,8 @@
 package org.openivm.spark.common
 
 import java.nio.file.Files
+import java.lang.management.ManagementFactory
+import org.apache.spark.sql.execution.openivm.FrequencyProbeTrace
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
@@ -9,6 +11,48 @@ import scala.jdk.CollectionConverters._
 
 /** Paired grouped-preparation experiment; not SF100, dbt or the full rank query. */
 object FrequencyCountProbe {
+  private val mapper = new ObjectMapper()
+  private def emitTrace(group: String, trace: com.fasterxml.jackson.databind.node.ObjectNode): Unit = {
+    def emit(kind: String, node: com.fasterxml.jackson.databind.node.ObjectNode): Unit = {
+      node.put("group", group)
+      println("FREQUENCY_TRACE_" + kind + "_JSON=" + node.toString)
+    }
+    trace.withArray("jobs").elements().asScala.foreach { node =>
+      emit("JOB", node.deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]())
+    }
+    trace.withArray("stages").elements().asScala.foreach { node =>
+      val stage = node.deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+      val tasks = stage.remove("tasks")
+      emit("STAGE", stage)
+      tasks.elements().asScala.foreach { task =>
+        val row = task.deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+        row.put("stage_id", stage.get("stage_id").asInt())
+        emit("TASK", row)
+      }
+    }
+    trace.withArray("sql").elements().asScala.foreach { node =>
+      val sql = node.deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+      val operators = sql.remove("operators")
+      val initialPlan = sql.remove("initial_plan")
+      val finalPlan = sql.remove("final_plan")
+      emit("SQL", sql)
+      if (operators != null) operators.elements().asScala.foreach { op =>
+        val row = op.deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+        row.put("execution_id", sql.get("execution_id").asLong())
+        emit("OPERATOR", row)
+      }
+      if (group.startsWith("frequency-1-") || group.startsWith("frequency-4-")) {
+        Vector("initial" -> initialPlan, "final" -> finalPlan).foreach { case (kind, plan) =>
+          if (plan != null) plan.asText().split("\n").iterator.zipWithIndex.foreach { case (line, i) =>
+            val row = mapper.createObjectNode()
+            row.put("execution_id", sql.get("execution_id").asLong())
+            row.put("kind", kind); row.put("line", i); row.put("text", line)
+            emit("PLAN_LINE", row)
+          }
+        }
+      }
+    }
+  }
   private final case class Completion(
       summary: () => DataFrame,
       hits: Int,
@@ -33,6 +77,12 @@ object FrequencyCountProbe {
       .config("spark.ui.enabled", "false").config("spark.sql.warehouse.dir", root.resolve("warehouse").toString)
       .config("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    val trace = new FrequencyProbeTrace(spark)
+    def processCpu: Long = ManagementFactory.getOperatingSystemMXBean match {
+      case bean: com.sun.management.OperatingSystemMXBean => bean.getProcessCpuTime
+      case _ => throw new IllegalStateException("diagnostic requires process CPU counters")
+    }
+    def gcMillis: Long = ManagementFactory.getGarbageCollectorMXBeans.asScala.map(_.getCollectionTime).sum
     try {
       def trades(start: Long, end: Long, groups: Int): DataFrame = spark.range(start, end, 1, 4).selectExpr(
         s"cast(id % $groups as bigint) as k", s"cast(id % $groups + $start as bigint) as customer",
@@ -83,8 +133,10 @@ object FrequencyCountProbe {
             }, () => state.close())
         }
       }
-      val report = new ObjectMapper().createObjectNode()
-      report.put("scope", "paired grouped preparation only; not SF100, dbt or the full rank query")
+      val report = mapper.createObjectNode()
+      report.put("scope", "instrumented paired grouped preparation; not SF100 or untraced performance evidence")
+      report.put("production_code_changed", false)
+      report.put("component_total_not_used_for_regression_attribution", true)
       report.put("reference_commit", "7383ad194edbe2003a26f6d44c278e9b2f34ca5b")
       report.put("spark_version", spark.version)
       report.put("initial_rows", 1000000)
@@ -95,7 +147,10 @@ object FrequencyCountProbe {
       report.put("target_writes_and_remote_backup_included", false)
       val samples = report.putArray("samples")
       var checks = 0
-      val modes = Vector(("fabric_like", 200, 26214400L), ("spark_like", 16, 104857600L))
+      val modes = Vector(
+        ("fabric_like", 200, 26214400L), ("spark_like", 16, 104857600L),
+        ("p16_b25m", 16, 26214400L), ("p200_b100m", 200, 104857600L)
+      )
       for (round <- 0 until 5) {
         val modeOrder = if (round % 2 == 0) modes else modes.reverse
         modeOrder.foreach { case (mode, partitions, threshold) =>
@@ -114,11 +169,18 @@ object FrequencyCountProbe {
                 case (batch, delta, current, epoch, expected) =>
                   val job = s"frequency-$round-$mode-$label-$batch"
                   spark.sparkContext.setJobGroup(job, job)
+                  val cpuBefore = processCpu
+                  val gcBefore = gcMillis
+                  val epochStart = System.currentTimeMillis()
                   val start = System.nanoTime()
                   val next = state.prepare(delta, current, epoch)
                   val seconds = (System.nanoTime() - start).toDouble / 1e9
+                  val epochEnd = System.currentTimeMillis()
+                  val cpuNs = processCpu - cpuBefore
+                  val gcMs = gcMillis - gcBefore
                   val jobs = spark.sparkContext.statusTracker.getJobIdsForGroup(job).length
                   spark.sparkContext.clearJobGroup()
+                  val diagnostics = trace.snapshot(job, jobs)
                   if (label == "candidate") require(next.strategy == "conditional_counts", "optimized path not used")
                   val actual = next.summary()
                   exact(actual, expected); checks += 2
@@ -127,16 +189,21 @@ object FrequencyCountProbe {
                   val sample = samples.addObject()
                   sample.put("mode", mode); sample.put("round", round); sample.put("batch", batch); sample.put("label", label)
                   sample.put("preparation_seconds", seconds); sample.put("jobs", jobs)
+                  sample.put("process_cpu_ns", cpuNs); sample.put("process_gc_ms", gcMs)
+                  sample.put("prepare_start_ms", epochStart); sample.put("prepare_end_ms", epochEnd)
+                  sample.put("shuffle_partitions", partitions); sample.put("broadcast_threshold_bytes", threshold)
                   sample.put("state_publish_seconds", (System.nanoTime() - commit).toDouble / 1e9)
                   sample.put("hits", next.hits); sample.put("misses", next.misses); sample.put("lookup", next.strategy)
+                  emitTrace(job, diagnostics)
               }
             } finally state.close()
           }
         }
       }
       report.put("exact_except_all_checks", checks)
-      println("FREQUENCY_COUNT_PROBE_JSON=" + report.toString)
+      println("FREQUENCY_TRACE_PROBE_JSON=" + report.toString)
     } finally {
+      trace.close()
       OpenIvmRocksDBRegistry.closeAll()
       spark.stop(); SparkSession.clearActiveSession(); SparkSession.clearDefaultSession()
       val walk = Files.walk(root)

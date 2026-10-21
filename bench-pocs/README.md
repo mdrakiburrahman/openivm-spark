@@ -80,3 +80,44 @@ The fallback path, numerical aggregates, cache format and publication are
 unchanged. This removes an execution stage instead of choosing a hardcoded
 request-count threshold. Runtime results are pending; the first-run regression
 has not yet been proven fixed.
+
+## Regression diagnostic (measurement only)
+
+This branch retains exactly the production and test code verified at `963a477`.
+It changes no Spark/native/runtime dependency pin and no production algorithm.
+Both existing runtimes run the same baseline/candidate pair. The ongoing Fabric
+SF100 run is separate and must not be duplicated or cancelled by this probe.
+
+The first probe reported ratios of separately aggregated medians and included
+bootstrap in its component total. Bootstrap implementations are identical, yet
+its medians differed by 5.5% under 4.1/Fabric-like settings. Therefore that whole
+component-total difference cannot be attributed to the new maintenance path.
+In round-paired 4.1/Fabric-like data, B2 changes sign twice; B3 is consistently
+slower (+17/+36/+22/+215ms), and has one additional job. Job count alone does
+not establish the cause. Spark 3.5 B3 also changes sign across rounds despite a
+lower candidate median. Do not present these small samples as a pipeline fix.
+
+This diagnostic adds only a test-scoped Spark listener and a 2x2 cross of the
+already used settings: shuffle partitions 16/200 and broadcast threshold
+25MiB/100MiB. It does not tune those settings in production or propose a cutoff.
+It records process CPU/GC, each job and stage, task CPU/input/shuffle/spill/GC,
+initial/final AQE plans, and final per-operator SQL metrics. Listener snapshots
+wait for event delivery outside the timed preparation span and require complete
+job/SQL bindings; no sleep-based correctness or best-effort profiling. Plans
+are emitted as structured lines for measured rounds 1 and 4, rather than one
+oversized log record. These are instrumented diagnostics, not untraced speedups.
+All existing full verification, inventory and EXCEPT ALL gates remain enabled.
+
+Falsifiable explanations to check before proposing another performance change:
+
+- Incremental `CollectLimit` fetching: extra result jobs within the same SQL
+  execution, fetching different output partitions. Rule it out if the extra
+  job is instead a broadcast exchange.
+- AQE/join choice: one crossed setting changes join/exchange plans and stage
+  critical path. Compare one setting at a time, not platform labels alone.
+- Conditional-count CPU tradeoff: expanded output rows decrease, but task CPU
+  rises with the unchanged scanned input. Whole-stage timings overlap operator
+  timings; never sum them as independent costs.
+- Driver/GC/noise: unchanged work and plans with elapsed changes explained by
+  GC, planning or scheduling intervals. SQL intervals and parallel stages must
+  be unioned or shown on a timeline, not naively added together.

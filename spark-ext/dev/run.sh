@@ -321,12 +321,6 @@ cmd_verify() {
     cmd_pins_sync
     prepare_sbt 1
     setup_test_log_dir
-    # Experiment only: recover pinned-formatter output on hosts without the devcontainer.
-    # Keep all verification below; apply this whitespace patch before any SF100 pin.
-    run_sbt "$@" scalafmtAll
-    printf '%s\n' 'FREQUENCY_FORMAT_PATCH_BEGIN'
-    git diff --binary -- '*.scala' '*.sbt'
-    printf '%s\n' 'FREQUENCY_FORMAT_PATCH_END'
     run_sbt "$@" \
         ivmExtension/clean \
         scalafmtCheckAll \
@@ -355,7 +349,7 @@ cmd_window_benchmark() {
     run_sbt "$@" \
         "ivmIt/testOnly org.openivm.spark.bench.WindowNoopWriteHarness -- -n org.openivm.spark.tags.MicroBenchmark"
     run_sbt "$@" \
-        'set ivmIt / Test / unmanagedSources ++= { val root = (ThisBuild / baseDirectory).value.getParentFile / "bench-pocs"; Seq("ReferenceGroupedDistinctState.scala", "FrequencyCountProbe.scala").map(root / _) }' \
+        'set ivmIt / Test / unmanagedSources ++= { val root = (ThisBuild / baseDirectory).value.getParentFile / "bench-pocs"; Seq("ReferenceGroupedDistinctState.scala", "FrequencyProbeTrace.scala", "FrequencyCountProbe.scala").map(root / _) }' \
         'ivmIt/Test/scalafmt' \
         'ivmIt/Test/runMain org.openivm.spark.common.FrequencyCountProbe'
 }
