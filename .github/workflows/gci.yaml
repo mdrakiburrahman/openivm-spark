@@ -229,6 +229,7 @@ jobs:
           export EXTENDED_TPCDS_COMPILER_INIT="$GITHUB_WORKSPACE/candidate-native/init.sql"
           export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false'
           npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- \
+            "ivmCompiler/Compile/scalafmtOnly $GITHUB_WORKSPACE/spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala" \
             "ivmIt/Test/scalafmtOnly $GITHUB_WORKSPACE/spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala" \
             'ivmIt/testOnly org.openivm.spark.parity.WindowPartitionSpec org.openivm.spark.parity.WindowPartitionCdfSpec -- -z "Spark null ordering"'
           npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
@@ -259,4 +260,5 @@ jobs:
             sf1-results/compiler-trace/
             sf1-results/compile-failures/
             spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala
+            spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala
             .logs/

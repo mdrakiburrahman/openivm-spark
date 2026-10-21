@@ -257,6 +257,8 @@ class OpenIvmCompiler private (
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
+    // Bind omitted NULL ordering with Spark's defaults before serializing refresh SQL.
+    sb ++= "SET default_null_order='NULLS_FIRST_ON_ASC_LAST_ON_DESC';\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
