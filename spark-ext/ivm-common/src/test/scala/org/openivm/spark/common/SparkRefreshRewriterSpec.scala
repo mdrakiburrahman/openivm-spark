@@ -1120,6 +1120,29 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("keeps an unaliased FULL JOIN affected-key CTE inside a delete MERGE") {
+      val input =
+        """WITH openivm_affected AS (SELECT 1 AS _k UNION SELECT NULL AS _k)
+          |DELETE FROM openivm_data_mv_r WHERE EXISTS (
+          |SELECT 1 FROM openivm_affected WHERE _k <=> openivm_left_key OR _k <=> openivm_right_key);
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      rewritten.statements should have size 1
+      val merge = rewritten.statements.head
+      merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      merge should include("WITH openivm_affected AS")
+      merge should include("SELECT * FROM openivm_affected")
+      merge should include("ON _k <=> openivm_left_key OR _k <=> openivm_right_key")
+      merge should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("rewrites DELETE USING into a key-safe delete MERGE") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';

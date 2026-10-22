@@ -3130,12 +3130,12 @@ object SparkRefreshRewriter {
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:AS\s+)?(\w+)\s+WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)(?:\s+(?:AS\s+)?(\w+))?\s+WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>
                 val src      = t.group(1)
-                val affAlias = t.group(2)
+                val affAlias = Option(t.group(2)).getOrElse(src)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
                 val source   = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v
