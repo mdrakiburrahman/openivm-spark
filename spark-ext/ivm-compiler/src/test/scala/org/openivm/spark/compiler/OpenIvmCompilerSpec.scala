@@ -815,9 +815,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     normalized should include("JOIN openivm_delta_mv USING")
     normalized should include("JOIN openivm_meta_mv USING")
     normalized should include(s"'memory.main.openivm_data_$key'")
-    normalized should include(s"\"a openivm_data_$key\"")
+    normalized should include("\"a openivm_data_" + key + "\"")
     normalized should include(s"`a openivm_data_$key`")
-    normalized should include(s"-- \"memory\".\"main\".\"openivm_data_$key\"")
+    normalized should include("-- \"memory\".\"main\".\"openivm_data_" + key + "\"")
     normalized should include(s"/* openivm_delta_$key */")
   }
 
