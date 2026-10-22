@@ -94,6 +94,8 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
         // Regenerate with: ./spark-ext/dev/dev.sh test -Dopenivm.golden.print=true 'testOnly ...RefreshTypeGoldenSpec'
         if (sys.props.get("openivm.golden.print").contains("true")) {
           println(s"${c.caseName} ${result.refreshTypeName} $hash")
+          val evidence = java.nio.file.Files.createDirectories(java.nio.file.Paths.get("target", "golden-sql"))
+          java.nio.file.Files.write(evidence.resolve(c.caseName + ".sql"), result.sql.getBytes(StandardCharsets.UTF_8))
         } else {
           hash shouldBe goldenHashes(c.caseName)
         }

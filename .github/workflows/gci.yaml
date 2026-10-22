@@ -229,7 +229,8 @@ jobs:
           export EXTENDED_TPCDS_COMPILER_INIT="$GITHUB_WORKSPACE/candidate-native/init.sql"
           export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false -Dopenivm.golden.print=true'
           npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- \
-            'ivmCompiler/scalafmt' 'ivmCompiler/Test/scalafmt' 'ivmExtension/scalafmt' 'ivmIt/Test/scalafmt' \
+            'ivmCommon/scalafmt' 'ivmCommon/Test/scalafmt' 'ivmCompiler/scalafmt' 'ivmCompiler/Test/scalafmt' 'ivmExtension/scalafmt' 'ivmIt/Test/scalafmt' \
+            'ivmCommon/testOnly org.openivm.spark.common.SparkRefreshRewriterSpec' \
             'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec -- -z "native"' \
             'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec org.openivm.spark.parity.RefreshTypeGoldenSpec'
           npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
@@ -265,4 +266,7 @@ jobs:
             spark-ext/ivm-compiler/src/test/scala/org/openivm/spark/compiler/OpenIvmCompilerSpec.scala
             spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
             spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/RefreshTypeGoldenSpec.scala
+            spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala
+            spark-ext/ivm-common/src/test/scala/org/openivm/spark/common/SparkRefreshRewriterSpec.scala
+            spark-ext/target/golden-sql/
             .logs/
