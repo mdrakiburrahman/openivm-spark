@@ -1575,6 +1575,42 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       fastInsert should not include "openivm_timestamp"
     }
 
+    it("writes and cascades a materialized running-window suffix result") {
+      val sql =
+        """CREATE OR REPLACE TEMP TABLE openivm_old_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_wradm_mv
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_run_result_wradm_mv AS
+          |SELECT dm_s_symb, dm_date, dm_close, run_sum FROM openivm_run_fast_wradm_mv;
+          |INSERT INTO openivm_data_wradm_mv (dm_s_symb, dm_date, dm_close, run_sum)
+          |SELECT * FROM openivm_run_result_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
+          |DROP TABLE openivm_run_result_wradm_mv;
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = sql,
+        mvName = p52MvName,
+        mvLocation = "dbfs:/delta/wradm_mv",
+        viewLogicalName = p52ViewLogicalName,
+        sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+        viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+        mvVersionBeforeRefresh = Some(3)
+      ).statements
+      val dataInsert = rewritten.find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+        .getOrElse(fail("materialized suffix data insert missing"))
+      dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
+      dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
+      val append = rewritten.find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+        .getOrElse(fail("materialized suffix cascade append missing"))
+      append should include("FROM openivm_run_result_wradm_mv")
+      append should not include "openivm_timestamp"
+      rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
+      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
+    }
+
     it("drops running-window helper objects as views") {
       rewriteP52().takeRight(5) shouldBe Seq(
         "DROP VIEW IF EXISTS `openivm_run_state_wradm_mv`",
