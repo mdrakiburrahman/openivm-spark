@@ -196,7 +196,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           native = Path('candidate-native').resolve()
-          (native/'init.sql').write_text("LOAD json; LOAD '" + str(native/'icu.duckdb_extension') + "'; SET TimeZone='UTC'; SET threads=4; SET memory_limit='2GB'; SET max_temp_directory_size='8GB'; LOAD '" + str(native/'openivm.duckdb_extension') + "';\n")
+          (native/'init.sql').write_text(".startup_text off\nLOAD json; LOAD '" + str(native/'icu.duckdb_extension') + "'; SET TimeZone='UTC'; SET threads=4; SET memory_limit='2GB'; SET max_temp_directory_size='8GB'; LOAD '" + str(native/'openivm.duckdb_extension') + "';\n")
           PY
           candidate-native/duckdb -unsigned -init candidate-native/init.sql -c "SELECT version(); SELECT extension_name,extension_version FROM duckdb_extensions() WHERE loaded;" > candidate-native/versions.txt
           cat candidate-native/versions.txt
