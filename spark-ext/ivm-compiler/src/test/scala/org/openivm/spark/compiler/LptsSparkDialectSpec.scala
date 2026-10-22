@@ -25,12 +25,13 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         |CAST(')' AS "DATE") /* CAST(NULL AS "DATE") */ -- CAST(NULL AS "DATE")
         |""".stripMargin
       LptsSparkDialect.rewriteQuotedCastTypes(sql) shouldBe
-        sql.replace("(SELECT x AS \"DATE\") AS \"DATE\"", "(SELECT x AS \"DATE\") AS DATE")
+        sql
+          .replace("(SELECT x AS \"DATE\") AS \"DATE\"", "(SELECT x AS \"DATE\") AS DATE")
           .replace("CAST(')' AS \"DATE\")", "CAST(')' AS DATE)")
     }
 
     it("keeps DATE column aliases quoted and is idempotent through the full dialect pipeline") {
-      val sql = """SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS "DATE") END AS "DATE") AS "DATE" FROM t"""
+      val sql      = """SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS "DATE") END AS "DATE") AS "DATE" FROM t"""
       val expected = "SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS DATE) END AS DATE) AS `DATE` FROM t"
       LptsSparkDialect.translate(sql) shouldBe expected
       LptsSparkDialect.translate(expected) shouldBe expected
