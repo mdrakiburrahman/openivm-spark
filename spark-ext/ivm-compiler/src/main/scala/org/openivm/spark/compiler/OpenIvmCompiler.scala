@@ -934,7 +934,7 @@ object OpenIvmCompiler {
     * `-jsonlines` stdout alone.
     *
     * `buildScript` always emits `CREATE OR REPLACE MATERIALIZED VIEW ...`
-    * immediately followed by `SELECT * FROM openivm_compile_with_facts(...)`.
+    * before `SELECT * FROM openivm_compile_with_facts(...)`.
     * When `CREATE` fails, the DuckDB CLI reports the error on stderr and
     * (in `-jsonlines` mode) simply continues to the next statement without
     * emitting any output line for the failed one — so stdout never contains

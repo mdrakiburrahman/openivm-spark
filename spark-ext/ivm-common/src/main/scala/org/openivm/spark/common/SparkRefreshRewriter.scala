@@ -869,7 +869,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDataInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-      upper.contains(" OPENIVM_RUN_FAST_")
+      (upper.contains(" OPENIVM_RUN_FAST_") || upper.contains(" OPENIVM_RUN_RESULT_"))
     ) {
       StatementKind.RunningWindowFastInsert
     } else if (

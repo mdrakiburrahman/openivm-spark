@@ -7840,7 +7840,9 @@ case class RefreshMaterializedViewCommand(
           val targetContextPartExists =
             partitionMatch("openivm_target_context", "a", shape.partitionCols)
           val maxExists = partitionMatch("openivm_suffix", "m", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "context_source").map { suffixBody =>
+          // The physical query also computes native ROWS-window position state.
+          val physicalQuery = meta.properties.getOrElse(MvMetadata.CompiledInitialLoadSqlKey, meta.querySql)
+          replaceWindowSuffixSource(physicalQuery, "context_source", shape.sourceShort).map { suffixBody =>
             def suffixQuery(selectList: String): String =
               s"""|WITH affected AS (
                   |  SELECT DISTINCT $partList
@@ -7962,7 +7964,7 @@ case class RefreshMaterializedViewCommand(
           val deltaRef    = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
           val baseMatch   = partitionMatch("openivm_base", "a", shape.partitionCols)
           val resultMatch = partitionMatch("openivm_bounded", "a", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "bounded_source").map { boundedBody =>
+          replaceWindowSuffixSource(meta.querySql, "bounded_source", shape.sourceShort).map { boundedBody =>
             s"""|INSERT INTO $targetRef ($colList)
                 |WITH affected AS (
                 |  SELECT DISTINCT $partList
@@ -8105,11 +8107,13 @@ case class RefreshMaterializedViewCommand(
   private def quoteCol(col: String): String =
     s"`${col.replace("`", "``")}`"
 
-  private def replaceWindowSuffixSource(sql: String, replacement: String): Option[String] = {
+  private def replaceWindowSuffixSource(sql: String, replacement: String, sourceShort: String): Option[String] = {
     val fromRe =
       ("(?is)\\bFROM\\s+((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)" +
         "(\\s+(?:AS\\s+)?[A-Za-z_][A-Za-z0-9_]*)?").r
-    val matches = fromRe.findAllMatchIn(sql).toVector
+    val matches = fromRe.findAllMatchIn(sql)
+      .filter(m => stripSqlIdent(m.group(1).split("\\.").last).equalsIgnoreCase(sourceShort))
+      .toVector
     if (matches.size != 1) None
     else {
       val m      = matches.head
