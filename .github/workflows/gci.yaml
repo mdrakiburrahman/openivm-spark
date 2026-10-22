@@ -126,7 +126,7 @@ jobs:
       contents: read
       actions: read
     container:
-      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:4af4a30379b82eac66b90e4c65352066b521eeadd6824c254f3598ab41e658f3
+      image: ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:aa36121edac785872052f09852f04b34eb221076d97c867322fbf8bfe2b0c325
       options: ${{ inputs.monthly_precision_only && '--user=0:0 --cpus=4 --memory=8g --memory-swap=8g' || inputs.monthly_snapshot_probe && '--user=0:0 --cpus=4 --memory=14g --memory-swap=14g' || '--cpus=8 --memory=32g --memory-swap=32g' }}
     defaults:
       run:
@@ -217,7 +217,7 @@ jobs:
           PY
           "$JAVA_HOME/bin/javac" -proc:none -cp "$(cat spark-classpath.txt)" contrib/extended-tpcds/ExtendedTpcdsSpark.java
 
-      - name: Check null-padded duplicates in both Spark targets
+      - name: Check native compiler window compatibility in both Spark targets
         if: ${{ !inputs.monthly_snapshot_probe }}
         env:
           OPENIVM_TEST_FORKS: '1'
@@ -227,14 +227,18 @@ jobs:
           export OPENIVM_EXTENSION_PATH=/opt/openivm/openivm.duckdb_extension
           export EXTENDED_TPCDS_NATIVE_CLI="$GITHUB_WORKSPACE/candidate-native/duckdb"
           export EXTENDED_TPCDS_COMPILER_INIT="$GITHUB_WORKSPACE/candidate-native/init.sql"
-          export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false -Dopenivm.golden.print=true'
+          export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false'
           npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- \
             'ivmCommon/scalafmt' 'ivmCommon/Test/scalafmt' 'ivmCompiler/scalafmt' 'ivmCompiler/Test/scalafmt' 'ivmExtension/scalafmt' 'ivmIt/Test/scalafmt' \
             'ivmCommon/testOnly org.openivm.spark.common.SparkRefreshRewriterSpec' \
-            'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec -- -z "native"' \
-            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec org.openivm.spark.parity.RefreshTypeGoldenSpec'
+            'ivmCompiler/testOnly org.openivm.spark.compiler.LptsSparkDialectSpec' \
+            'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec -- -z "canonical delta"' \
+            'ivmIt/testOnly org.openivm.spark.parity.WindowRunningIncrementalSpec org.openivm.spark.parity.WindowRunningIncrementalCdfSpec org.openivm.spark.parity.DucklakeWindowDeltaSpec org.openivm.spark.parity.DucklakeWindowDeltaCdfSpec org.openivm.spark.parity.CompileRefreshSpec org.openivm.spark.parity.CompileRefreshCdfSpec'
           npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
-            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec'
+            'ivmCommon/testOnly org.openivm.spark.common.SparkRefreshRewriterSpec' \
+            'ivmCompiler/testOnly org.openivm.spark.compiler.LptsSparkDialectSpec' \
+            'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec -- -z "canonical delta"' \
+            'ivmIt/testOnly org.openivm.spark.parity.WindowRunningIncrementalSpec org.openivm.spark.parity.WindowRunningIncrementalCdfSpec org.openivm.spark.parity.DucklakeWindowDeltaSpec org.openivm.spark.parity.DucklakeWindowDeltaCdfSpec org.openivm.spark.parity.CompileRefreshSpec org.openivm.spark.parity.CompileRefreshCdfSpec'
 
       - name: Generate SF1 data, build independent references, run Spark
         if: ${{ !inputs.monthly_precision_only }}
@@ -262,10 +266,13 @@ jobs:
             sf1-results/compile-failures/
             spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala
             spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala
+            spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/LptsSparkDialect.scala
+            spark-ext/ivm-compiler/src/test/scala/org/openivm/spark/compiler/LptsSparkDialectSpec.scala
             spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/SparkFunctionShimSql.scala
             spark-ext/ivm-compiler/src/test/scala/org/openivm/spark/compiler/OpenIvmCompilerSpec.scala
             spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
             spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/RefreshTypeGoldenSpec.scala
+            spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/CompileRefreshScenarios.scala
             spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/SparkRefreshRewriter.scala
             spark-ext/ivm-common/src/test/scala/org/openivm/spark/common/SparkRefreshRewriterSpec.scala
             spark-ext/target/golden-sql/
