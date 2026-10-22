@@ -229,11 +229,12 @@ jobs:
           export EXTENDED_TPCDS_COMPILER_INIT="$GITHUB_WORKSPACE/candidate-native/init.sql"
           export OPENIVM_SBT_OPTS='-Xmx1536m -XX:ActiveProcessorCount=4 -Dsbt.task.cpus=4 -Dsbt.supershell=false'
           npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- \
-            "ivmCompiler/Compile/scalafmtOnly $GITHUB_WORKSPACE/spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala" \
-            "ivmIt/Test/scalafmtOnly $GITHUB_WORKSPACE/spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala" \
-            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec -- -z "null-padded duplicates"'
+            'ivmCompiler/scalafmt' 'ivmCompiler/Test/scalafmt' 'ivmExtension/scalafmt' 'ivmIt/Test/scalafmt' \
+            'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec -- -z "native"' \
+            'set ivmIt / Test / javaOptions += "-Dopenivm.golden.print=true"' \
+            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec org.openivm.spark.parity.RefreshTypeGoldenSpec'
           npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- \
-            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec -- -z "null-padded duplicates"'
+            'ivmIt/testOnly org.openivm.spark.parity.SimpleProjectionOuterJoinSpec org.openivm.spark.parity.SimpleProjectionOuterJoinCdfSpec'
 
       - name: Generate SF1 data, build independent references, run Spark
         if: ${{ !inputs.monthly_precision_only }}
@@ -261,4 +262,8 @@ jobs:
             sf1-results/compile-failures/
             spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/WindowPartitionScenarios.scala
             spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala
+            spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/SparkFunctionShimSql.scala
+            spark-ext/ivm-compiler/src/test/scala/org/openivm/spark/compiler/OpenIvmCompilerSpec.scala
+            spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+            spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/RefreshTypeGoldenSpec.scala
             .logs/
