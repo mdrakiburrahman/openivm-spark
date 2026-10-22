@@ -270,3 +270,12 @@ To ensure PR CI is robust and not flaky, follow this process:
 6. Run green
 7. Once green CI, push up **FIVE SENTINEL COMMITS** one after another into the repo to fire CI
 8. Must run green 5 times back to back. If any failure, repeat from Step 3.
+
+## Pushing code:
+
+The user should have hydrated `GH_TOKEN`, use that to push:
+
+```bash
+source ~/.bashrc
+gh repo list
+```

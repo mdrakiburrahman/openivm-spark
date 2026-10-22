@@ -64,7 +64,7 @@ final class CdfChangePropagation extends ChangePropagation {
     sources.distinct.flatMap { src =>
       val currentOpt = CdfChangePropagation.tableLatestVersion(spark, src)
       currentOpt.flatMap { cur =>
-        val from = effective.getOrElse(src, -1L)
+        val from = effective.getOrElse(src, CdfChangeBatch.NoBaseline)
         if (cur > from) Some(CdfChangeBatch(src, startVersionExclusive = from, endVersionInclusive = cur))
         else None
       }
@@ -171,8 +171,10 @@ final class CdfChangePropagation extends ChangePropagation {
    * Per-(view, source) last-consumed Delta version: prefer the value
    * persisted in [[CdfWatermarkCatalog]] (carries cross-refresh state),
    * fall back to the value captured at MV CREATE time (carried in
-   * `persisted`), and finally to "no version persisted" (consume everything
-   * since the start).
+   * `persisted`). A source with neither (e.g. a view created under intercept
+   * mode) is absent; [[collectChanges]] reports it as a batch without a
+   * baseline, which REFRESH recomputes and re-baselines rather than
+   * replaying the whole change feed onto the view's rows.
    */
   private def effectivePersistedVersions(
       spark: SparkSession,

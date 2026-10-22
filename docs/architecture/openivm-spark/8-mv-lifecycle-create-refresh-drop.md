@@ -366,6 +366,12 @@ Source:
 - `MvCatalog.scala:78-105`
   These watermarks prevent CREATE from double-applying older staging rows during the first REFRESH. The initial snapshot already includes the live source state.
 
+In CDF mode a REFRESH never replays a change feed it cannot apply exactly. A source with no consumed Delta version (no CDF cursor and no `v:` CREATE watermark, e.g. a view created under intercept mode before the deployment switched to `cdf`) and a range whose change rows Delta no longer holds (`CdfChangeAvailability`: commits removed by log cleanup, the change feed disabled inside the range, or `_change_data` files, removed data files or deletion vectors deleted by VACUUM) both route the refresh to the full recompute before anything is applied. The recompute marks every collected batch consumed, so the source is re-baselined at its current version and the next refresh is incremental again. The refresh logs `outcome='cdf_rebaseline_full_refresh'` at WARN and records a `cdf_rebaseline` profile step naming each source and reason.
+
+### 1.13.1 Determinism at CREATE
+
+Incremental maintenance evaluates an expression only for the rows, groups or partitions a refresh touches, so CREATE rejects a view whose effective refresh type is incremental when its analyzed plan (subqueries included) contains a random expression (`rand`, `uuid`, `shuffle`, `monotonically_increasing_id`, `input_file_name`, `spark_partition_id`, non-deterministic UDFs, …) or a time-dependent one (`current_date`, `current_timestamp`, `now`, `localtimestamp`, `current_timezone`, …). Window functions and Spark's built-in order-dependent aggregates (`first`, `last`, `collect_list`, …) are allowed. A `FULL_REFRESH` view recomputes on every refresh and is always accepted. `spark.openivm.create.allowNonDeterministic=true` (session conf) accepts the divergence.
+
 ### 1.14 Schema fingerprint
 
 CREATE fingerprints current source schemas. If a source is itself an MV, the fingerprint also includes that upstream MV identity hash.
@@ -923,9 +929,13 @@ Source:
   Source:
 - `MaterializedViewCommands.scala:1382-1385`
 
+### 3.3a Relations replaced or dropped outside OpenIVM
+
+Before dropping anything, `MaterializedViewLifecycle.liveOwnership` probes whether the registration still names OpenIVM's objects. The Delta table at `meta.location` is owned only while it carries the CREATE marker `_ivm_create_watermarks_v1` (a `CREATE OR REPLACE TABLE` resets table properties). The relation at the MV name is owned only when it is that Delta table, or, for a view-shaped MV, a view whose plan reads that backing table. A relation replaced or dropped outside OpenIVM (for example by a dbt `table` materialization) is never dropped and its data is never deleted: DROP, `DROP ... IF EXISTS` and every cascade (MV drop, streaming-table drop or rebuild) only remove what OpenIVM still owns (the backing table, owned storage, view deltas, change-propagation rows, CDF watermarks, the catalog entry), log a WARN and emit `external_relation_retained`. A registration whose Delta data is gone still joins a cascade instead of failing it.
+
 ### 3.4 Delete Delta table at `_ivm/views/db/mv/`
 
-DROP deletes the physical Delta files at `meta.location`. That is the path under `<warehouse>/_ivm/views/...` computed at CREATE.
+DROP deletes the physical Delta files at `meta.location` while OpenIVM owns them. That is the path under `<warehouse>/_ivm/views/...` computed at CREATE.
 Source:
 
 - `MaterializedViewCommands.scala:1387-1390`

@@ -6,6 +6,74 @@ A practical, demo-driven walkthrough of how OpenIVM delivers Incremental View
 Maintenance on Spark 3.5 + Delta Lake 3.2 and Spark 4.1 + Delta Lake 4.2 — and
 the two upstream DuckDB extensions it leans on (`openivm` and `lpts`).
 
+## How it works
+
+Spark stores and processes the rows; DuckDB + OpenIVM compile the maintenance
+SQL. This overview assumes **CDF mode**: configure
+`spark.openivm.changeFeed.mode=cdf` when starting the Spark session and enable
+`delta.enableChangeDataFeed=true` on each source table.
+
+```text
+  1. CREATE                         Compile once, build the initial result
+  -----------------------------------------------------------------------
+     MV query --> DuckDB + OpenIVM + lpts --> Saved maintenance SQL
+                       (compiler)                      |
+                                                       v
+                                          Spark builds the MV in Delta
+
+  2. WRITE                          Delta tracks changes through CDF
+  -----------------------------------------------------------------------
+                  INSERT / UPDATE / DELETE / MERGE
+                                 |
+                  +--------------+--------------+
+                  v                             v
+     +--------------------------+  +--------------------------+
+     | BASE TABLE               |  | DELTA CDF                |
+     | Your Delta data          |  | Changes by version       |
+     +--------------------------+  +------------+-------------+
+                                                |
+  3. REFRESH                        Read CDF since the last refresh
+  ----------------------------------------------|------------------------
+                                                v
+                                   +--------------------------+
+     REFRESH MATERIALIZED VIEW --->| SPARK SQL EXECUTION      |
+     Saved maintenance SQL ------->| Apply CDF row changes    |
+                                   +------------+-------------+
+                                                v
+                                   +--------------------------+
+                                   | sales_mv__ivm_data       |
+                                   | Delta rows + bookkeeping |
+                                   +------------+-------------+
+                                                v
+                                   +--------------------------+
+     SELECT * FROM sales_mv ------>| sales_mv (public VIEW)   |
+                                   | Your query's columns     |
+                                   +--------------------------+
+
+  WHERE THINGS LIVE                 Default warehouse / table locations
+  -----------------------------------------------------------------------
+  _openivm/...          RocksDB: plans, dependencies, consumed CDF versions
+  _ivm/views/...        Delta: MV results + maintenance columns
+  Each Delta table     Delta manages its own change feed
+                       No OpenIVM _ivm/staging/ copies needed
+```
+
+The diagram shows the **CDF incremental path with a backing table**.
+`sales_mv__ivm_data` is the physical table when maintenance needs extra columns
+or a different internal result; `sales_mv` exposes the original query's result.
+If no separate backing table is needed, `sales_mv` is itself the Delta table.
+Queries that cannot be incrementalized use full recomputation on REFRESH.
+OpenIVM reads changes after each MV's last-consumed source version, then
+advances that progress after refresh. MV backing tables also have CDF enabled
+automatically, so downstream MVs read their changes through CDF too.
+The default `intercept` mode is an alternative: it captures writes in
+`_ivm/staging/` instead of reading Delta CDF.
+
+For the physical directory tree, see [State Storage: RocksDB and Delta](architecture/openivm-spark/7-state-storage-rocksdb-and-delta.md);
+for CREATE, REFRESH, and DROP, see [MV lifecycle](architecture/openivm-spark/8-mv-lifecycle-create-refresh-drop.md).
+
+## Architectural layers
+
 The docs are organised as **three architectural layers**:
 
 ```

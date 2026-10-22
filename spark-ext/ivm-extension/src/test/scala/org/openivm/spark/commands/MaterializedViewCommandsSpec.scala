@@ -1289,6 +1289,28 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
+    it("does not publish state for CREATE IF NOT EXISTS of an existing view") {
+      spark.sql("CREATE TABLE sales_t1_exists (region STRING, amount INT) USING DELTA").collect()
+      spark.sql("INSERT INTO sales_t1_exists VALUES ('east', 1)").collect()
+      val viewSql = "SELECT region, SUM(amount) AS total FROM sales_t1_exists GROUP BY region"
+      spark.sql(s"CREATE MATERIALIZED VIEW mv_t1_exists AS $viewSql").collect()
+      val passes    = new java.util.concurrent.atomic.AtomicInteger()
+      val requestId = s"create-exists-${java.util.UUID.randomUUID()}"
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create-exists"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => passes.incrementAndGet(); () }
+      spark
+        .sql(s"OPENIVM INSIGHTS BEGIN REQUEST '$requestId' RUN 'run-exists' NODE 'model.openivm.mv_t1_exists'")
+        .collect()
+      try {
+        spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t1_exists AS $viewSql").collect()
+        passes.get() shouldBe 0
+      } finally {
+        spark.sql(s"OPENIVM INSIGHTS END REQUEST '$requestId' STATUS SUCCEEDED").collect()
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
+    }
+
     it("persists user properties on the public relation without replacing it on refresh") {
       val queryHashProperty = "dbt.fabricspark.materialized_view.query_hash"
       val queryHash         = "0123456789abcdef0123456789abcdef"

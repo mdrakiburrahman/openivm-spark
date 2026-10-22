@@ -31,6 +31,44 @@ object StagingDeltaView {
 
     def sqlRef(globalTempView: String): String =
       s"`global_temp`.`${globalTempView.replace("`", "``")}`"
+
+    /** Staging locations each cached view still reads; they must outlive its references. */
+    private val inputs = new java.util.concurrent.ConcurrentHashMap[String, Set[String]]()
+
+    /** Record the staging locations `globalTempView`'s plan reads.
+      *
+      * @param globalTempView cached view-delta view
+      * @param locations      staging locations (or cached refs) its rows are computed from
+      */
+    def registerInputs(globalTempView: String, locations: Set[String]): Unit = {
+      inputs.put(globalTempView, locations)
+      ()
+    }
+
+    /** Forget the inputs of a dropped view. */
+    def forgetInputs(globalTempView: String): Unit = {
+      inputs.remove(globalTempView)
+      ()
+    }
+
+    /** Every staging location the cached views referenced by `stagingPaths` read, transitively. */
+    def inputsOf(stagingPaths: Set[String]): Set[String] = {
+      val visited   = scala.collection.mutable.Set.empty[String]
+      val locations = scala.collection.mutable.Set.empty[String]
+      var pending   = stagingPaths.toList.flatMap(decode)
+      while (pending.nonEmpty) {
+        val view = pending.head
+        pending = pending.tail
+        if (visited.add(view))
+          Option(inputs.get(view)).getOrElse(Set.empty[String]).foreach { location =>
+            decode(location) match {
+              case Some(upstream) => pending = upstream :: pending
+              case None           => locations += location
+            }
+          }
+      }
+      locations.toSet
+    }
   }
 
   /** The openivm-internal TEMP VIEW name for a source table's delta. */

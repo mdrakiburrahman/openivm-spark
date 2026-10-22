@@ -26,7 +26,7 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       val fixture = new Fixture
       fixture.clock.advance(2.seconds)
       val future = fixture.watch()
-      future.getDelay(TimeUnit.NANOSECONDS) shouldBe 3.seconds.toNanos
+      future.getDelay(TimeUnit.NANOSECONDS) shouldBe 0L
 
       fixture.clock.advance(3.seconds - 1.nanosecond)
       fixture.scheduler.runDue()
@@ -39,7 +39,7 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.clock.advance(1.nanosecond)
       fixture.scheduler.runNextNow()
 
-      fixture.observations shouldBe 2
+      fixture.observations shouldBe 1
       fixture.unhealthyAttempts shouldBe 0
       future.isDone shouldBe false
       fixture.scheduler.pendingCount shouldBe 1
@@ -106,6 +106,7 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.unhealthyAttempts shouldBe 0
 
       fixture.observation = fixture.observation.copy(workActive = Some(false))
+      fixture.clock.advance(5.seconds)
       fixture.tick()
       fixture.clock.advance(2.seconds)
       fixture.observation = fixture.observation.copy(workActive = None)
@@ -121,6 +122,23 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
       fixture.tick()
       fixture.observations shouldBe 6
       fixture.unhealthyAttempts shouldBe 1
+
+      val planning = new Fixture
+      planning.startupActivity = Some("Getting offsets from source 1")
+      val planningFuture = planning.watch()
+      planning.scheduler.runDue()
+      planning.clock.advance(4.seconds)
+      planning.startupActivity = Some("Writing offsets to log")
+      planning.scheduler.runDue()
+      planning.clock.advance(4.seconds)
+      planning.scheduler.runDue()
+      planning.unhealthyAttempts shouldBe 0
+      planning.observations shouldBe 0
+      planning.clock.advance(1.second)
+      planning.scheduler.runDue()
+      planning.elapseGrace()
+      planning.unhealthyDeliveries shouldBe 1
+      planningFuture.isCancelled shouldBe true
     }
 
     it("does not diagnose a brief zero-work interval while progress or idle delivery lags") {
@@ -326,6 +344,7 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
     var observation =
       StreamingStartupObservation(active = true, progressObserved = false, workActive = Some(false))
     var observationFailure        = Option.empty[Throwable]
+    var startupActivity           = Option.empty[String]
     var deliveryFailure           = Option.empty[Throwable]
     var reporterFailure           = Option.empty[Throwable]
     var afterObserve: () => Unit  = () => ()
@@ -357,7 +376,8 @@ class StreamingFirstProgressWatchdogSpec extends AnyFunSpec with Matchers {
           deliveryFailure.foreach(failure => throw failure)
           afterDelivery()
           unhealthyDeliveries += 1
-        }
+        },
+        () => startupActivity
       )
 
     def atDeadline(): Unit = {

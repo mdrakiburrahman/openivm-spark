@@ -38,7 +38,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
-import org.openivm.spark.analyzer.IvmDmlInterceptorRule
+import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
@@ -628,6 +628,35 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
   * never demoted to FULL_REFRESH.
   */
 private[commands] final class SourceIdentityRebindingException(message: String) extends RuntimeException(message)
+
+/** Committed MV data that the MV's recorded state does not describe.
+  *
+  * @param liveVersion current Delta version of the MV's data table
+  */
+private[commands] final case class MvStateLag(liveVersion: Long)
+
+private[commands] object MvStateLag {
+
+  /** Detect MV rows that differ from the version the MV's state records, as left by a refresh
+    * that committed after the newest published state snapshot a restarted driver restored, by a
+    * failed refresh that was not rolled back, or by a writer outside OpenIVM. Commits that change
+    * no rows (OPTIMIZE, VACUUM, property changes) and rollbacks that RESTORE the recorded version
+    * are not a lag. Unreadable history counts as a lag, so the MV recomputes.
+    *
+    * @param spark active session
+    * @param meta  the MV's recorded state
+    */
+  def detect(spark: SparkSession, meta: MvMetadata): Option[MvStateLag] = {
+    val live = DeltaTableVersion.requireLatest(spark, meta.location)
+    val lagging =
+      live != meta.lastVersion && (
+        live < meta.lastVersion || meta.lastVersion < 0L ||
+          (try !DeltaCommitClassifier.rowsUnchangedSince(spark, meta.location, meta.lastVersion)
+          catch { case NonFatal(_) => true })
+      )
+    if (lagging) Some(MvStateLag(live)) else None
+  }
+}
 
 private[commands] object MvCommandHelper {
 
@@ -2782,8 +2811,9 @@ case class CreateMaterializedViewCommand(
                 }
               } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
+          // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
-            OpenIvmStateSync.backupNow(spark)
+            if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
             createOutcome = outcome
           }
           outcome
@@ -2792,7 +2822,7 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        OpenIvmStateSync.backupNow(spark)
+        if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
         createOutcome = outcome
       }
       if (outcome == "create_executed")
@@ -3181,6 +3211,32 @@ case class CreateMaterializedViewCommand(
         logInfo(msg)
     }
 
+    // Incremental maintenance evaluates an expression only for the rows, groups or partitions a
+    // refresh touches, so a random or time-dependent one leaves the view diverging from a
+    // recompute of its query. A FULL_REFRESH view is recomputed on every refresh and unaffected.
+    if (effectiveRefreshType != RefreshTypeCode.FullRefresh) {
+      val varying = MvDeterminism.varyingExpressions(analyzed)
+      if (varying.nonEmpty) {
+        val described = varying.map(MvDeterminism.describe).mkString(", ")
+        if (FeatureGate.allowNonDeterministic(spark))
+          logWarning(
+            s"[openivm-mv] view='${sqlIdent(name)}' outcome='non_deterministic_allowed' " +
+              s"effective_refresh_type='$effectiveRefreshTypeName' expressions='$described'"
+          )
+        else
+          throw new AnalysisException(
+            "_LEGACY_ERROR_TEMP_2273",
+            Map(
+              "message" -> (s"openivm-spark: materialized view ${sqlIdent(name)} would be maintained " +
+                s"incrementally ($effectiveRefreshTypeName), but its query contains random or time-dependent " +
+                s"expressions: $described. Incremental maintenance evaluates them only for the rows a refresh " +
+                "touches, so the view would diverge from a recompute of its query. Remove them, or set " +
+                s"${FeatureGate.AllowNonDeterministicKey}=true to accept that divergence.")
+            )
+          )
+      }
+    }
+
     // Analyze the physical initial load, not column-name prefixes: user projections
     // can legitimately use openivm_* names, while native maintenance adds counts,
     // join keys and null state that must never become public result columns.
@@ -3323,8 +3379,12 @@ case class CreateMaterializedViewCommand(
           }
           recovered
         case None =>
+          val tracked = qualNames.filterNot(pinnedVersions.contains)
+          // Records describing every committed source change up to now precede the watermark,
+          // so this MV, whose initial load reads those changes, never consumes them.
+          if (propagation.requiresDmlInterception) SourceChangeLedger.reconcile(spark, tracked)
           MvMetadata.changeWatermarkProperties(
-            propagation.currentWatermarks(spark, qualNames.filterNot(pinnedVersions.contains))
+            propagation.currentWatermarks(spark, tracked)
           ) ++ pinnedWatermarks
       }
     }
@@ -3945,9 +4005,13 @@ case class RefreshMaterializedViewCommand(
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
+      // Garbage is read before the publish and deleted only after it, so the published state
+      // never references a deleted staging location.
+      val garbage = OpenIvmGarbageCollector.prepare(spark)
       RefreshProfile.timeActiveStep("state_backup") {
         OpenIvmStateSync.backupNow(spark)
       }
+      OpenIvmGarbageCollector.collect(spark, garbage)
       commandCompleted = true
       rows
     } finally {
@@ -4736,6 +4800,24 @@ case class RefreshMaterializedViewCommand(
           .map(_.changeBatches.map(batch => batch.baseTable -> batch.startVersionInclusive).toMap)
           .getOrElse(Map.empty)
 
+      // A restarted driver restores the newest published state snapshot, which can predate a
+      // refresh that already committed MV data; incremental apply would then replay its deltas.
+      val stateLag: Option[MvStateLag] =
+        if (preparedSourceAdvance.nonEmpty) None
+        else MvStateLag.detect(spark, meta)
+      stateLag.foreach { lag =>
+        logWarning(
+          s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='state_lag_full_refresh' " +
+            s"recorded_version=${meta.lastVersion} live_version=${lag.liveVersion}"
+        )
+      }
+      // Capture base-table commits no staging record describes (native streaming appends, writes
+      // without the extension, records lost to a state restore) before collecting changes.
+      if (propagation.requiresDmlInterception)
+        profile.timeStep("metadata_pre_sql", "phase=reconcile_sources") {
+          SourceChangeLedger.reconcile(spark, changeFeedSources)
+        }
+
       // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
       // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
@@ -4909,9 +4991,10 @@ case class RefreshMaterializedViewCommand(
             val versionBatches =
               versionBatchesBySource.getOrElse(source.toLowerCase(java.util.Locale.ROOT), Seq.empty)
             val starts = versionBatches.flatMap {
-              case batch: CdfChangeBatch           => Some(batch.startVersionExclusive)
-              case batch: SourceVersionChangeBatch => Some(batch.startVersionInclusive)
-              case _                               => None
+              case batch: CdfChangeBatch if batch.hasBaseline => Some(batch.startVersionExclusive)
+              case batch: CdfChangeBatch                      => Some(batch.endVersionInclusive)
+              case batch: SourceVersionChangeBatch            => Some(batch.startVersionInclusive)
+              case _                                          => None
             }
             val ends = versionBatches.flatMap {
               case batch: CdfChangeBatch           => Some(batch.endVersionInclusive)
@@ -4947,7 +5030,7 @@ case class RefreshMaterializedViewCommand(
 
       // Defensive backstop: the cheap existence probe above and the full collect
       // can diverge if another refresh consumes the same rows before we collect.
-      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty) {
+      if (meta.refreshType != RefreshTypeCode.FullRefresh && changeBatches.isEmpty && stateLag.isEmpty) {
         // No source-consuming mutation, but the frozen deltas are still consumed
         // here: gate on pinned identity first so a rebound pinned MV never reports
         // a clean no-op or consumes frozen state.
@@ -4962,6 +5045,56 @@ case class RefreshMaterializedViewCommand(
       }
 
       val cdfChangeBatches = changeBatches.collect { case b: CdfChangeBatch => b }
+
+      // A CDF source whose change rows cannot be applied on top of the view's rows -- no consumed
+      // version is known, or Delta no longer holds the range (VACUUM, log cleanup) -- routes this
+      // refresh to the full recompute below, which re-baselines the source at its collected version.
+      // Checked before anything is applied, so an unreadable change feed is never partially applied.
+      // A refresh that already recomputes reads no change rows and needs no check.
+      val cdfRebaselineReasons: Map[String, String] =
+        if (cdfChangeBatches.isEmpty || meta.refreshType == RefreshTypeCode.FullRefresh || stateLag.nonEmpty)
+          Map.empty
+        else
+          profile.timeStep("metadata_pre_sql", "phase=cdf_change_availability") {
+            RefreshPerf.timePhase(refreshId, viewLabel, "cdf_change_availability") {
+              cdfChangeBatches
+                .groupBy(_.baseTable)
+                .toSeq
+                .flatMap { case (source, batches) =>
+                  if (!batches.forall(_.hasBaseline)) Some(source -> "cdf_watermark_missing")
+                  else
+                    CdfChangeAvailability
+                      .unavailableReason(
+                        spark,
+                        source,
+                        batches.map(_.startVersionExclusive).min,
+                        batches.map(_.endVersionInclusive).max
+                      )
+                      .map(detail => source -> s"cdf_change_data_unavailable ($detail)")
+                }
+                .toMap
+            }
+          }
+      if (cdfRebaselineReasons.nonEmpty) {
+        val rebaselined = cdfRebaselineReasons.toSeq.sortBy(_._1)
+        rebaselined.foreach { case (source, reason) =>
+          logWarning(
+            s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='cdf_rebaseline_full_refresh' " +
+              s"source='$source' reason='$reason'"
+          )
+        }
+        profile.appendStep(
+          "cdf_rebaseline",
+          rebaselined.map { case (source, reason) => s"$source=$reason" }.mkString(";"),
+          0L
+        )
+        RefreshPerf.emit(
+          refreshId,
+          viewLabel,
+          "cdf_rebaseline",
+          s"outcome='cdf_rebaseline_full_refresh' sources='${rebaselined.map(_._1).mkString(",")}'"
+        )
+      }
 
       // Regular N-term SQL reads unchanged relations from the snapshot immediately
       // before this refresh. Metadata watermarks describe MV creation and become
@@ -4988,13 +5121,16 @@ case class RefreshMaterializedViewCommand(
           .map { case (source, batches) =>
             val startVersion = batches.map(_.startVersionExclusive).min
             val verdict =
-              try DeltaCommitClassifier.classify(spark, source, startVersion)
-              catch { case _: Throwable => BatchVerdict.Replace }
+              if (cdfRebaselineReasons.contains(source)) BatchVerdict.Replace
+              else
+                try DeltaCommitClassifier.classify(spark, source, startVersion)
+                catch { case _: Throwable => BatchVerdict.Replace }
             source -> verdict
           }
 
       if (
         FeatureGate.noopFastExitEnabled(spark) &&
+        stateLag.isEmpty &&
         meta.refreshType != RefreshTypeCode.FullRefresh &&
         cdfChangeBatches.size == changeBatches.size &&
         cdfChangeBatches.nonEmpty &&
@@ -5252,8 +5388,8 @@ case class RefreshMaterializedViewCommand(
       // FULL_REFRESH at CREATE.
       lazy val replaceBatch: Boolean =
         hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
-      if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch) {
-        if (meta.refreshType != RefreshTypeCode.FullRefresh)
+      if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch || stateLag.nonEmpty) {
+        if (meta.refreshType != RefreshTypeCode.FullRefresh && stateLag.isEmpty && cdfRebaselineReasons.isEmpty)
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"
           )
@@ -5332,11 +5468,13 @@ case class RefreshMaterializedViewCommand(
             propagation.requiresDmlInterception && meta.emitsCascadeViewDelta
           val cascadeKeys: Set[String] =
             if (emitsSignedDelta) downstreamSourceKeysForThisMv else Set.empty
+          // Consumers reflect this MV at its recorded version, which a state lag places before the
+          // live one, so the signed delta starts there.
           val cascadePreRefreshVersion: Option[Long] =
             if (!emitsSignedDelta) None
             else
               Some(profile.timeStep("pin_full_refresh_cascade_version", "source=delta_log_snapshot") {
-                DeltaTableVersion.requireLatest(spark, meta.location)
+                if (stateLag.nonEmpty) meta.lastVersion else DeltaTableVersion.requireLatest(spark, meta.location)
               })
           // Write-ahead guard BEFORE the recompute INSERT OVERWRITE (the first
           // source-consuming MV write); abort before mutation if it can't be set.
@@ -5411,6 +5549,7 @@ case class RefreshMaterializedViewCommand(
               preRefreshVersion = preVersion,
               exactDiff = exactDiff
             )
+            var cascadeOpType = StagingDelta.OpTypes.MvViewDelta
             profile.timeStep(
               "full_refresh_cascade_snapshot",
               s"pre_version=$preVersion;exact_diff=$exactDiff;consumers=${cascadeKeys.size}"
@@ -5419,12 +5558,30 @@ case class RefreshMaterializedViewCommand(
               val t0               = System.nanoTime()
               var cascadeSucceeded = false
               try {
-                spark
-                  .sql(cascadeSelect)
-                  .write
-                  .format("delta")
-                  .mode("overwrite")
-                  .save(cascadePath)
+                try
+                  spark
+                    .sql(cascadeSelect)
+                    .write
+                    .format("delta")
+                    .mode("overwrite")
+                    .save(cascadePath)
+                catch {
+                  // The lagging recorded version may no longer be readable (e.g. vacuumed); an
+                  // empty OVERWRITE makes every consumer recompute instead.
+                  case NonFatal(unreadable) if stateLag.nonEmpty =>
+                    logWarning(
+                      s"[openivm-mv] refresh view='${sqlIdent(name)}' cannot diff from recorded version " +
+                        s"$preVersion; consumers refresh fully",
+                      unreadable
+                    )
+                    spark
+                      .sql(s"SELECT * FROM ${sqlIdent(fullRefreshTarget)} WHERE 1 = 0")
+                      .write
+                      .format("delta")
+                      .mode("overwrite")
+                      .save(cascadePath)
+                    cascadeOpType = StagingDelta.OpTypes.Overwrite
+                }
                 cascadeSucceeded = true
               } finally {
                 sqlLog.record(
@@ -5447,7 +5604,7 @@ case class RefreshMaterializedViewCommand(
                     spark,
                     StagingDelta(
                       baseTable = triggerKey,
-                      opType = StagingDelta.OpTypes.MvViewDelta,
+                      opType = cascadeOpType,
                       stagingPath = cascadePath,
                       txnTs = txnTs,
                       consumedBy = Seq.empty
@@ -6930,6 +7087,9 @@ case class RefreshMaterializedViewCommand(
                                 executeSqlAt(plan.deleteSql, plan.deleteStmtIdx)
                                 executeSqlAt(plan.restoreSql, plan.insertStmtIdx)
                               }
+                              // The compensation restores the recorded rows at a new version;
+                              // record it so the next refresh does not mistake it for a state lag.
+                              MvCatalog.advance(spark, name, DeltaTableVersion.requireLatest(spark, meta.location))
                               logInfo(
                                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                                   "outcome='window_cascade_compensated' reason='target_write_failed'"
@@ -7135,7 +7295,16 @@ case class RefreshMaterializedViewCommand(
                   val cascadeCacheOn = FeatureGate.fuseScratchCascadeCacheEnabled(spark)
                   val stagingPathForCascade =
                     fusedScratchView match {
-                      case Some(view) if cascadeCacheOn => StagingDeltaView.CachedViewDeltaRef.encode(view)
+                      case Some(view) if cascadeCacheOn =>
+                        // The cached rows are recomputed from this refresh's inputs on re-resolution.
+                        StagingDeltaView.CachedViewDeltaRef.registerInputs(
+                          view,
+                          changeBatches
+                            .collect { case batch: StagingChangeBatch => batch.deltas.map(_.stagingPath) }
+                            .flatten
+                            .toSet
+                        )
+                        StagingDeltaView.CachedViewDeltaRef.encode(view)
                       case Some(view) if triggerKeys.nonEmpty =>
                         spark
                           .table(s"global_temp.$view")
@@ -8581,6 +8750,12 @@ case class RefreshMaterializedViewCommand(
         .groupBy(_._1)
         .map { case (t, pairs) => t -> pairs.map(_._2) }
       propagation.pruneConsumed(spark, viewsByTable)
+      StagingCatalog.forgetConsumed(
+        spark,
+        viewNameStr,
+        viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
+      )
+      if (!viewsByTable.contains(viewNameStr)) StagingCatalog.pruneUnconsumed(spark, viewNameStr)
 
       if (!meta.emitsCascadeViewDelta && !suppressNonCascadeTrigger) {
         val upstreamShortName = name.identifier
@@ -8664,6 +8839,11 @@ case class RefreshMaterializedViewCommand(
         .groupBy(_._1)
         .map { case (t, pairs) => t -> pairs.map(_._2) }
       propagation.pruneConsumed(spark, viewsByTable)
+      StagingCatalog.forgetConsumed(
+        spark,
+        viewNameStr,
+        viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
+      )
     }
   }
 
@@ -8708,41 +8888,139 @@ case class RefreshMaterializedViewCommand(
 // DropMaterializedViewCommand
 // ---------------------------------------------------------------------------
 
-private[spark] object MaterializedViewLifecycle {
+private[spark] object MaterializedViewLifecycle extends org.apache.spark.internal.Logging {
 
+  /** Whether the live relation and storage an MV registration names are still the objects
+    * OpenIVM created.
+    *
+    * @param publicOwned the relation at the MV name is the OpenIVM table, or the public view
+    *                    over the OpenIVM backing table
+    * @param dataOwned   the Delta table at the registered location carries OpenIVM's CREATE marker
+    * @param dataPresent a Delta table exists at the registered location
+    * @param reason      why the registration is not fully owned; empty when it is
+    */
+  final case class LiveOwnership(
+      publicOwned: Boolean,
+      dataOwned: Boolean,
+      dataPresent: Boolean,
+      reason: String
+  ) {
+    def owned: Boolean = publicOwned && dataOwned
+  }
+
+  /** Probe the live relation and storage an MV registration names. A relation replaced or
+    * dropped outside OpenIVM (for example by a dbt `table` materialization) is not OpenIVM's
+    * to drop. Read failures propagate instead of downgrading ownership.
+    *
+    * @param spark active session
+    * @param name  registered MV identifier
+    * @param meta  registered MV metadata
+    */
+  def liveOwnership(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): LiveOwnership = {
+    import MvCommandHelper._
+
+    val snapshot    = DeltaLog.forTable(spark, new Path(meta.location)).update()
+    val dataPresent = snapshot.version >= 0L
+    val dataOwned = dataPresent &&
+      snapshot.metadata.configuration.get(CreateRecoveryWatermarksMarker).exists(_.equalsIgnoreCase("true"))
+    val ident        = sqlIdent(name)
+    val publicExists = spark.catalog.tableExists(ident)
+    val hadoopConf   = spark.sessionState.newHadoopConf()
+    def qualified(path: Path): java.net.URI =
+      path.getFileSystem(hadoopConf).makeQualified(path).toUri.normalize()
+    val registeredData = qualified(new Path(meta.location))
+    val publicOwned = dataOwned && publicExists && {
+      val analyzed =
+        try Some(spark.table(ident).queryExecution.analyzed)
+        catch { case _: AnalysisException => None }
+      analyzed.exists { plan =>
+        plan.exists(_.isInstanceOf[View]) == meta.usesBackingDataTable &&
+        DeltaTableVersion.deltaLogFromPlan(plan).exists(log => qualified(log.dataPath) == registeredData)
+      }
+    }
+    val expectedObject =
+      if (meta.usesBackingDataTable) "the public view over its backing table" else "its materialized table"
+    val reason =
+      if (!dataPresent) s"no Delta table at ${meta.location}"
+      else if (!dataOwned) s"the Delta table at ${meta.location} lacks $CreateRecoveryWatermarksMarker"
+      else if (!publicExists) s"relation $ident does not exist"
+      else if (!publicOwned) s"relation $ident is not $expectedObject"
+      else ""
+    LiveOwnership(publicOwned, dataOwned, dataPresent, reason)
+  }
+
+  /** Drop one registered materialized view and remove its OpenIVM state. Catalog objects and
+    * storage are dropped only while OpenIVM still owns them; a registration whose relation was
+    * replaced or dropped outside OpenIVM is deregistered without touching the live relation.
+    *
+    * @param spark           active session
+    * @param name            registered MV identifier
+    * @param meta            registered MV metadata
+    * @param operationId     insight operation identifier
+    * @param probedOwnership ownership already probed by the caller under the same locks
+    */
   def dropOne(
       spark: SparkSession,
       name: TableIdentifier,
       meta: MvMetadata,
-      operationId: String
+      operationId: String,
+      probedOwnership: Option[LiveOwnership] = None
   ): Unit = {
     import MvCommandHelper._
 
-    val viewName = metaName(name)
+    val viewName  = metaName(name)
+    val ownership = probedOwnership.getOrElse(liveOwnership(spark, name, meta))
+    if (!ownership.owned) {
+      logWarning(
+        s"[openivm] materialized view $viewName was replaced or dropped outside OpenIVM " +
+          s"(${ownership.reason}); removing its OpenIVM state without touching objects OpenIVM no longer owns"
+      )
+      OpenIvmInsightEvents.action(
+        spark,
+        operationId,
+        viewName,
+        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+        stage = "ownership_check",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.ExternalRelationRetained,
+        message = "The materialized view was replaced or dropped outside OpenIVM; objects it no longer owns are kept.",
+        status = "external_relation_retained",
+        level = org.openivm.spark.insights.OpenIvmInsightsContract.Level.Warn,
+        details = Seq(
+          "reason"       -> ownership.reason,
+          "public_owned" -> ownership.publicOwned,
+          "data_owned"   -> ownership.dataOwned
+        )
+      )
+    }
     if (meta.usesBackingDataTable) {
-      spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
-      OpenIvmInsightEvents.action(
-        spark,
-        operationId,
-        viewName,
-        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
-        stage = "catalog_cleanup",
-        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.PublicViewRemoved,
-        message = "Removed the public materialized-view wrapper.",
-        details = Seq("object_kind" -> "view")
-      )
-      spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(dataTableId(name))}")
-      OpenIvmInsightEvents.action(
-        spark,
-        operationId,
-        viewName,
-        org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
-        stage = "catalog_cleanup",
-        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.BackingTableRemoved,
-        message = "Removed the materialized-view backing table.",
-        details = Seq("object_kind" -> "backing_table")
-      )
-    } else {
+      if (ownership.publicOwned) {
+        spark.sql(s"DROP VIEW IF EXISTS ${sqlIdent(name)}")
+        OpenIvmInsightEvents.action(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          stage = "catalog_cleanup",
+          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.PublicViewRemoved,
+          message = "Removed the public materialized-view wrapper.",
+          details = Seq("object_kind" -> "view")
+        )
+      }
+      val backing = dataTableId(name)
+      if (ownership.dataOwned && registrationResolvesTo(spark, backing, meta.location)) {
+        spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(backing)}")
+        OpenIvmInsightEvents.action(
+          spark,
+          operationId,
+          viewName,
+          org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Drop,
+          stage = "catalog_cleanup",
+          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.BackingTableRemoved,
+          message = "Removed the materialized-view backing table.",
+          details = Seq("object_kind" -> "backing_table")
+        )
+      }
+    } else if (ownership.publicOwned) {
       spark.sql(s"DROP TABLE IF EXISTS ${sqlIdent(name)}")
       OpenIvmInsightEvents.action(
         spark,
@@ -8759,7 +9037,7 @@ private[spark] object MaterializedViewLifecycle {
     val hadoopPath  = new Path(meta.location)
     val fs          = hadoopPath.getFileSystem(spark.sessionState.newHadoopConf())
     val pathExisted = fs.exists(hadoopPath)
-    val pathDeleted = !pathExisted || fs.delete(hadoopPath, /* recursive = */ true)
+    val pathDeleted = !pathExisted || (ownership.dataOwned && fs.delete(hadoopPath, /* recursive = */ true))
     OpenIvmInsightEvents.action(
       spark,
       operationId,
@@ -8769,9 +9047,10 @@ private[spark] object MaterializedViewLifecycle {
       code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StoragePathRemoved,
       message = "Processed materialized-view storage-path cleanup.",
       details = Seq(
-        "path"    -> meta.location,
-        "existed" -> pathExisted,
-        "deleted" -> pathDeleted
+        "path"     -> meta.location,
+        "existed"  -> pathExisted,
+        "deleted"  -> pathDeleted,
+        "retained" -> (pathExisted && !ownership.dataOwned)
       )
     )
 
