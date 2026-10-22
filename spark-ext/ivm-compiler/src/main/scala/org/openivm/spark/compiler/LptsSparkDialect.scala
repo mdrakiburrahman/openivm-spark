@@ -241,8 +241,8 @@ object LptsSparkDialect {
     * alias named DATE remains an identifier, including inside subqueries.
     */
   private[compiler] def rewriteQuotedCastTypes(sql: String): String = {
-    val castStart = "(?i)(?:TRY_)?CAST\\s*\\(".r.pattern.matcher(sql)
-    val castType = "(?i)AS\\s+([\"`])([A-Za-z][A-Za-z0-9_]*)\\1(?=\\s*[()])".r.pattern.matcher(sql)
+    val castStart  = "(?i)(?:TRY_)?CAST\\s*\\(".r.pattern.matcher(sql)
+    val castType   = "(?i)AS\\s+([\"`])([A-Za-z][A-Za-z0-9_]*)\\1(?=\\s*[()])".r.pattern.matcher(sql)
     var castParens = List.empty[Boolean]
     SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
       val boundary = index == 0 || !(sql.charAt(index - 1).isLetterOrDigit || sql.charAt(index - 1) == '_')
@@ -257,7 +257,7 @@ object LptsSparkDialect {
         sql.charAt(index) match {
           case '(' => castParens = false :: castParens
           case ')' => castParens = castParens.drop(1)
-          case _ =>
+          case _   =>
         }
         None
       }

@@ -1590,20 +1590,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
           |DROP TABLE openivm_run_result_wradm_mv;
           |""".stripMargin
-      val rewritten = SparkRefreshRewriter.rewrite(
-        compiledSql = sql,
-        mvName = p52MvName,
-        mvLocation = "dbfs:/delta/wradm_mv",
-        viewLogicalName = p52ViewLogicalName,
-        sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
-        viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
-        mvVersionBeforeRefresh = Some(3)
-      ).statements
-      val dataInsert = rewritten.find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = sql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      val dataInsert = rewritten
+        .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
         .getOrElse(fail("materialized suffix data insert missing"))
       dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
       dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
-      val append = rewritten.find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+      val append = rewritten
+        .find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
         .getOrElse(fail("materialized suffix cascade append missing"))
       append should include("FROM openivm_run_result_wradm_mv")
       append should not include "openivm_timestamp"
