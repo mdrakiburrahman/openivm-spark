@@ -21,7 +21,7 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
     "aggregate-group"   -> "39008d641677a1c82c306574e0ba80ce2de6647ef8b7f4afd4f0ce7d77f89934",
     "simple-aggregate"  -> "afef8de6843efa9786213fd9ee3545bb4e586301003f62a64e7d80fbda849e41",
     "simple-projection" -> "1a749f0a8c4e9462352bbe9b1bc5f5602d5cdeb899558bf6f9bdbecd2302365f",
-    "window-partition"  -> "6eae946d75120d6cd1dbd75925412056db051df57ac12e60ee5f812722acf985",
+    "window-partition"  -> "24ee3f2d5039a18fd712636266ff912172190304900ffa134ed8dc42d1f7df73",
     "group-recompute"   -> "a62e8607f20f047693f0eca0e69b2e57b30d5e2c0c4d42614cf94a6ebc1c756d"
   )
 
