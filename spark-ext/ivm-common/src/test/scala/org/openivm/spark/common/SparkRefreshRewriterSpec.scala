@@ -1607,6 +1607,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         .getOrElse(fail("materialized suffix cascade append missing"))
       append should include("FROM openivm_run_result_wradm_mv")
       append should not include "openivm_timestamp"
+      append should not include "CURRENT_TIMESTAMP"
       rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
       rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }

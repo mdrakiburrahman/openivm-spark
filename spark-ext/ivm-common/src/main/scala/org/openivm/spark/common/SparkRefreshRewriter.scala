@@ -815,7 +815,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDrop
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
-      upper.contains("OPENIVM_RUN_FAST_")
+      (upper.contains("OPENIVM_RUN_FAST_") || upper.contains("OPENIVM_RUN_RESULT_"))
     ) {
       // WINDOW running-suffix fast-path cascade delta: an APPEND of the
       // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
@@ -823,7 +823,8 @@ object SparkRefreshRewriter {
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
       // statement appends to it. Distinguished from the fallback cascade by the
-      // OPENIVM_RUN_FAST_ reference (the fallback reads openivm_old/openivm_new).
+      // OPENIVM_RUN_FAST_ or materialized OPENIVM_RUN_RESULT_ reference (the
+      // fallback reads openivm_old/openivm_new).
       StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
