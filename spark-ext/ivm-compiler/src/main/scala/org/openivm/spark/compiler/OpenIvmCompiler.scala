@@ -940,7 +940,7 @@ object OpenIvmCompiler {
     * emitting any output line for the failed one — so stdout never contains
     * the view-creation confirmation row. When `CREATE` succeeds but
     * `openivm_compile_with_facts` itself fails, that confirmation row IS
-    * present, followed by nothing further (no `refresh_type` rows). This
+    * present even though no `refresh_type` rows follow. This
     * gives a reliable, non-heuristic signal from stdout content alone,
     * without parsing or pattern-matching stderr text.
     */
