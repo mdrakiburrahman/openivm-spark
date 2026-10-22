@@ -807,7 +807,11 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private[compiler] def rewriteOutsideProtected(sql: String, protectBackticks: Boolean = false, protectDoubleQuotes: Boolean = true)(
+  private[compiler] def rewriteOutsideProtected(
+      sql: String,
+      protectBackticks: Boolean = false,
+      protectDoubleQuotes: Boolean = true
+  )(
       matcher: Int => Option[(Int, String)]
   ): String = {
     val out = new StringBuilder(sql.length)

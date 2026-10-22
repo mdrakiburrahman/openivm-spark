@@ -180,7 +180,7 @@ class OpenIvmCompiler private (
           decodeJsonString(line, valueStart)._1
         }
         .getOrElse(req.viewName)
-      val partial = parseCompileResult(stdout, req.viewName, stderr)
+      val partial  = parseCompileResult(stdout, req.viewName, stderr)
       val initLoad = parseInitialLoadSql(tmpDir, req, nativeKey)
       partial.copy(
         sql = OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeKey, req.viewName),
@@ -739,10 +739,11 @@ class OpenIvmCompiler private (
     */
   private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeKey: String = ""): String = {
     import java.util.regex.Pattern
-    val key = if (nativeKey.isEmpty) req.viewName else nativeKey
+    val key  = if (nativeKey.isEmpty) req.viewName else nativeKey
     val file = tmpDir.resolve(s"openivm_compiled_queries_$key.sql")
     if (!Files.exists(file)) return ""
-    val content = OpenIvmCompiler.normalizeNativeViewObjects(new String(Files.readAllBytes(file), "UTF-8"), key, req.viewName)
+    val content =
+      OpenIvmCompiler.normalizeNativeViewObjects(new String(Files.readAllBytes(file), "UTF-8"), key, req.viewName)
 
     val pat = Pattern.compile(
       s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
@@ -892,14 +893,20 @@ object OpenIvmCompiler {
     * OpenIVM uses a catalog-qualified encoded key in its private catalog.
     */
   private[compiler] def normalizeNativeViewObjects(sql: String, nativeKey: String, viewName: String): String = {
-    val objects = java.util.regex.Pattern.compile(
-      """(?i)(?<![A-Za-z0-9_`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])"""
-    ).matcher(sql).useTransparentBounds(true)
+    val objects = java.util.regex.Pattern
+      .compile(
+        """(?i)(?<![A-Za-z0-9_`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
+      )
+      .matcher(sql)
+      .useTransparentBounds(true)
     SparkFunctionShimSql.rewriteOutsideProtected(sql, protectDoubleQuotes = false) { index =>
       objects.region(index, sql.length)
       if (objects.lookingAt()) {
-        val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
-        Some(objects.end() -> name.replace(nativeKey, viewName))
+        val replacement = Option(objects.group(4)).getOrElse {
+          val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
+          name.replace(nativeKey, viewName)
+        }
+        Some(objects.end() -> replacement)
       } else None
     }
   }

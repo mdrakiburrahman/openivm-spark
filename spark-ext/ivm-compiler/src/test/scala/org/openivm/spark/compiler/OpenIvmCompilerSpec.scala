@@ -804,7 +804,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
   it should "normalize native maintenance identifiers without changing SQL values or comments" in {
     val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
-    val sql = s"""SELECT 'memory.main.openivm_data_$key', "a openivm_data_$key",
+    val sql = s"""SELECT 'memory.main.openivm_data_$key', "a openivm_data_$key", `a openivm_data_$key`,
                  |  * FROM memory.main.openivm_data_$key
                  |  JOIN `memory`.`main`.`openivm_delta_$key` USING (id)
                  |  JOIN "memory"."main"."openivm_meta_$key" USING (id)
@@ -816,18 +816,22 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     normalized should include("JOIN openivm_meta_mv USING")
     normalized should include(s"'memory.main.openivm_data_$key'")
     normalized should include(s"\"a openivm_data_$key\"")
+    normalized should include(s"`a openivm_data_$key`")
     normalized should include(s"-- \"memory\".\"main\".\"openivm_data_$key\"")
     normalized should include(s"/* openivm_delta_$key */")
   }
 
   it should "read the encoded native initial-load file and retain hidden keys and source pins" in {
-    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
-    val dir = Files.createTempDirectory("openivm-native-initial-load-")
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val dir  = Files.createTempDirectory("openivm-native-initial-load-")
     val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
     try {
-      Files.write(file, (s"CREATE TABLE memory.main.openivm_data_$key AS " +
-        "SELECT c.name, a.city, c.id AS openivm_left_key_0 " +
-        "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;").getBytes("UTF-8"))
+      Files.write(
+        file,
+        (s"CREATE TABLE memory.main.openivm_data_$key AS " +
+          "SELECT c.name, a.city, c.id AS openivm_left_key_0 " +
+          "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;").getBytes("UTF-8")
+      )
       val sql = sharedCompiler.parseInitialLoadSql(dir, prefixCollisionRequest, key)
       sql should include("openivm_left_key_0")
       sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
