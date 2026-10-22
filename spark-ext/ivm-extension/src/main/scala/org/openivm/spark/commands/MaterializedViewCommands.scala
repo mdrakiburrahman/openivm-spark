@@ -6373,14 +6373,18 @@ case class RefreshMaterializedViewCommand(
                       case Some(view) => StagingDeltaView.CachedViewDeltaRef.sqlRef(view)
                       case None       => s"delta.`${viewDeltaPath.replace("`", "``")}`"
                     }
-                    val deltaCols =
-                      (fusedView match {
+                    val deltaRows =
+                      fusedView match {
                         case Some(view) => spark.table(s"global_temp.$view")
                         case None       => spark.read.format("delta").load(viewDeltaPath)
-                      }).columns.toSet
+                      }
+                    val deltaCols = deltaRows.columns.toSet
                     val mvCols = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
                     if (
-                      deltaCols.contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains)
+                      deltaCols.contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains) &&
+                      // Partial-recompute deltas may carry keys with unknown weights.
+                      // They cannot be expanded as an exact bag of appended rows.
+                      deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
                     ) {
                       val colList = mvCols.map(c => s"`$c`").mkString(", ")
                       Some(
