@@ -6320,16 +6320,7 @@ case class RefreshMaterializedViewCommand(
               val idx = stmtCounter.getAndIncrement()
               executeSqlAt(sql, idx)
             }
-            def logSkippedDeleteMerge(stmtIdx: Int): Unit = {
-              advanceStmtCounterPast(stmtIdx)
-              RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, "merge_skipped", 0L)
-              profile.appendStep(
-                "execute_refresh_sql_stmt",
-                s"statement=${stmtIdx + 1};stmt_kind=merge_skipped",
-                0L
-              )
-            }
-            def logSkippedWindowStmt(stmtIdx: Int, kind: String): Unit = {
+            def logSkippedStmt(stmtIdx: Int, kind: String): Unit = {
               advanceStmtCounterPast(stmtIdx)
               RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, kind, 0L)
               profile.appendStep(
@@ -6549,13 +6540,13 @@ case class RefreshMaterializedViewCommand(
                     SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt) && !hasNonAppendRowsHere
 
                   if (atomicApplyInsertIdx.contains(stmtIdx)) {
-                    logSkippedWindowStmt(stmtIdx, "simple_projection_atomic_insert_skipped")
+                    logSkippedStmt(stmtIdx, "simple_projection_atomic_insert_skipped")
                   } else if (skipDeleteMerge) {
                     logInfo(
                       s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                         "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
                     )
-                    logSkippedDeleteMerge(stmtIdx)
+                    logSkippedStmt(stmtIdx, "merge_skipped")
                   } else {
                     val atomicSql =
                       if (SparkRefreshRewriter.isSimpleProjectionDeleteMerge(stmt)) {
@@ -6685,9 +6676,9 @@ case class RefreshMaterializedViewCommand(
                       cascadeAppend.findFirstIn(sql).isDefined)
                 )
                 if (skipCdfCascade) {
-                  logSkippedWindowStmt(idx, "window_target_cdf_cascade_skipped")
+                  logSkippedStmt(idx, "window_target_cdf_cascade_skipped")
                 } else if (!hasSuffix && stmt.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) {
-                  logSkippedWindowStmt(idx, "window_running_empty_suffix_skipped")
+                  logSkippedStmt(idx, "window_running_empty_suffix_skipped")
                 } else if (!hasFallback && stmt.contains(SparkRefreshRewriter.RunningWindowFallbackMarker)) {
                   SparkRefreshRewriter.extractViewDeltaCtasBody(sql, viewDeltaPath) match {
                     case Some(body) =>
@@ -6698,7 +6689,7 @@ case class RefreshMaterializedViewCommand(
                         s"CREATE OR REPLACE TABLE delta.`$path` USING DELTA AS SELECT * FROM ($body) openivm_empty_fallback WHERE false",
                         idx
                       )
-                    case None => logSkippedWindowStmt(idx, "window_running_empty_fallback_skipped")
+                    case None => logSkippedStmt(idx, "window_running_empty_fallback_skipped")
                   }
                 } else executeRunningWindowSql(sql, idx)
               }
@@ -6888,7 +6879,7 @@ case class RefreshMaterializedViewCommand(
                     FeatureGate.windowSnapshotCacheEnabled(spark)
 
                 if (skipCdfWindowRefresh) {
-                  logSkippedWindowStmt(idx, "window_cdf_net_zero_skipped")
+                  logSkippedStmt(idx, "window_cdf_net_zero_skipped")
                 } else if (materializeWindowAffectedKeys) {
                   executeSqlAt(refinedWindowAffectedSql.getOrElse(sql), idx)
                   val shape = windowCascadeMergeShape.get
@@ -6898,7 +6889,7 @@ case class RefreshMaterializedViewCommand(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                       "outcome='skip_simple_projection_delete_merge' reason='no_negative_rows'"
                   )
-                  logSkippedDeleteMerge(idx)
+                  logSkippedStmt(idx, "merge_skipped")
                 } else if (replaceWithWindowSuffixCascadeCtas) {
                   withPlanTimeBroadcastDisabled {
                     executeSqlAt(windowSuffixSql.get.viewDeltaCtasSql, idx)
@@ -6906,9 +6897,9 @@ case class RefreshMaterializedViewCommand(
                   windowSuffixCascadeWritten = true
                   logViewDeltaDiagnostics(spark, name, viewDeltaPath, idx)
                 } else if (skipWindowPartitionAux) {
-                  logSkippedWindowStmt(idx, "window_suffix_aux_skipped")
+                  logSkippedStmt(idx, "window_suffix_aux_skipped")
                 } else if (skipWindowPartitionDelete) {
-                  logSkippedWindowStmt(idx, "window_suffix_delete_skipped")
+                  logSkippedStmt(idx, "window_suffix_delete_skipped")
                 } else if (skipWindowPartitionInsert) {
                   RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_suffix_skip'")
                   logInfo(
@@ -6931,7 +6922,7 @@ case class RefreshMaterializedViewCommand(
                     )
                   }
                 } else if (skipBoundedRankAux) {
-                  logSkippedWindowStmt(idx, "bounded_rank_aux_skipped")
+                  logSkippedStmt(idx, "bounded_rank_aux_skipped")
                 } else if (replaceWithBoundedRankInsert) {
                   RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='bounded_rank_topk'")
                   logInfo(
@@ -6949,7 +6940,7 @@ case class RefreshMaterializedViewCommand(
                           "outcome='window_target_delete_deferred' reason='reuse_materialized_cascade'"
                       )
                     case None =>
-                      logSkippedWindowStmt(idx, "window_replace_delete_skipped")
+                      logSkippedStmt(idx, "window_replace_delete_skipped")
                   }
                 } else if (replaceWithWindowCascadeMerge) {
                   logInfo(
@@ -6959,7 +6950,7 @@ case class RefreshMaterializedViewCommand(
                 } else if (replaceWithWindowSinglePassInsert) {
                   windowSinglePassPlan.get match {
                     case WindowSinglePassNoAffectedPartitions =>
-                      logSkippedWindowStmt(idx, "window_replace_empty_skipped")
+                      logSkippedStmt(idx, "window_replace_empty_skipped")
                     case plan: WindowSinglePassWrite if useCascadeFirstWindowPlan =>
                       deferredWindowTargetSql = Some(idx -> plan.cascadeSql)
                       logInfo(
@@ -6982,7 +6973,7 @@ case class RefreshMaterializedViewCommand(
                     s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                       "outcome='window_target_cdf_cascade_skip' reason='target_cdf_is_downstream_feed'"
                   )
-                  logSkippedWindowStmt(idx, "window_target_cdf_cascade_skipped")
+                  logSkippedStmt(idx, "window_target_cdf_cascade_skipped")
                 } else {
                   // Apply the per-statement plan-time broadcast disable to BOTH
                   // statement shapes that wrap the full MV body, matching the
@@ -7081,11 +7072,11 @@ case class RefreshMaterializedViewCommand(
                     } else {
                       cascadeProducedChanges = false
                       windowCascadeMergePlan.foreach { plan =>
-                        logSkippedWindowStmt(plan.deleteStmtIdx, "window_cascade_noop_skipped")
-                        logSkippedWindowStmt(plan.insertStmtIdx, "window_cascade_noop_skipped")
+                        logSkippedStmt(plan.deleteStmtIdx, "window_cascade_noop_skipped")
+                        logSkippedStmt(plan.insertStmtIdx, "window_cascade_noop_skipped")
                       }
                       deferredWindowTargetSql.foreach { case (targetIdx, _) =>
-                        logSkippedWindowStmt(targetIdx, "window_replace_noop_skipped")
+                        logSkippedStmt(targetIdx, "window_replace_noop_skipped")
                       }
                       RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='window_cascade_noop'")
                       logInfo(

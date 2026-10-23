@@ -69,8 +69,8 @@ private[spark] final class GroupedDistinctState(
   private val identity =
     "typed-frequency-v3\n" + program + "\n" + inputSchema.json + "\n" + summarySchema.json + "\n" + keys.mkString(",") +
       "\n" + channels.mkString(",") + "\n" + spark.conf.get("spark.sql.session.timeZone") + "\n" + settings
-  private val g     = "__rd_g"; private val ch = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
-  private val index = Vector(g, ch, value)
+  private val g = "__rd_g"; private val ch = "__rd_ch"; private val value = "__rd_v"; private val weight = "__rd_w"
+
   private val tg         = "__rd_group"; private val tv = "__rd_value"
   private val typedIndex = Vector(tg, ch, tv)
   private val GroupSchema = StructType(keys.map(n => {
@@ -208,7 +208,7 @@ private[spark] final class GroupedDistinctState(
     },
     summarySchema
   )
-  private def unfold(joined: DataFrame, active: Vector[Int], includeCount: Boolean): DataFrame = {
+  private def unfold(joined: DataFrame): DataFrame = {
     val group = joined.withColumn(tg, struct(keys.map(n => keyValue(n, joined.schema)): _*))
     val empty = struct(lit(null).cast(LongType).as("l"), lit(null).cast(BinaryType).as("b"))
     val row   = struct(lit(-1).as(ch), empty.as(tv), col("openivm_multiplicity").cast(LongType).as(weight))
@@ -219,7 +219,7 @@ private[spark] final class GroupedDistinctState(
       empty.as(tv),
       when(col("openivm_multiplicity") =!= 0L, lit(1L)).otherwise(lit(0L)).as(weight)
     )
-    val distinct = active.map { i =>
+    val distinct = channels.indices.map { i =>
       val name = channels(i)._1
       val t    = joined.schema(name).dataType
       val long =
@@ -233,7 +233,7 @@ private[spark] final class GroupedDistinctState(
         struct(lit(i).as(ch), typed.as(tv), col("openivm_multiplicity").cast(LongType).as(weight))
       )
     }
-    val entries = (if (includeCount) Vector(row, dirty) else Vector.empty) ++ distinct
+    val entries = Vector(row, dirty) ++ distinct
     group
       .select(col(tg), explode(array(entries: _*)).as("v"))
       .filter(col("v").isNotNull)
@@ -283,7 +283,7 @@ private[spark] final class GroupedDistinctState(
       ordinary: DataFrame => DataFrame
   ): Prepared#Completed = {
     val cacheBefore = db.withSession { check(epoch) }
-    val consolidated = unfold(delta, channels.indices.toVector, true)
+    val consolidated = unfold(delta)
       .groupBy(typedIndex.map(col): _*)
       .agg(sum(weight).as(weight))
       .filter(col(weight) =!= 0L)

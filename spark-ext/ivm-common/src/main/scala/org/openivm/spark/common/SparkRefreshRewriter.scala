@@ -658,12 +658,10 @@ object SparkRefreshRewriter {
             Seq(rewriteGroupRecomputeRowsInsert(stmt, viewLogicalName, mvName))
           case StatementKind.GroupRecomputeRowsDrop =>
             Seq(rewriteGroupRecomputeRowsDrop(viewLogicalName))
-          case StatementKind.CurrentSnapshotCreate =>
-            Seq(rewriteCurrentSnapshotCreate(stmt))
+          case StatementKind.CurrentSnapshotCreate | StatementKind.NewSnapshotCreate =>
+            Seq(rewriteSourceSnapshotCreate(stmt))
           case StatementKind.OldSnapshotCreate =>
             Seq(rewriteOldSnapshotCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
-          case StatementKind.NewSnapshotCreate =>
-            Seq(rewriteNewSnapshotCreate(stmt))
           case StatementKind.SnapshotDataInsert =>
             Seq(rewriteSnapshotDataInsert(stmt, viewLogicalName, mvName))
           case StatementKind.CurrentSnapshotDrop =>
@@ -3718,20 +3716,11 @@ object SparkRefreshRewriter {
     s
   }
 
-  /** Rewrites the current-diff full-query snapshot into a Spark TEMPORARY VIEW. */
-  private def rewriteCurrentSnapshotCreate(stmt: String): String = {
-    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = stripTimestampPredicate(s)
-    s = rewriteMemoryMainPrefix(s)
-    s = rewriteExcludeAsExcept(s)
-    s
-  }
-
-  /** Rewrites the pragma-gated `openivm_new_<view>` snapshot create into a
-    * Spark TEMPORARY VIEW. The query itself stays live because it only depends
-    * on stable source staging / base tables during the current refresh.
+  /** Rewrites current-diff and new-state source snapshots into Spark TEMPORARY
+    * VIEWs. Their queries stay live over stable source staging / base tables
+    * during the current refresh.
     */
-  private def rewriteNewSnapshotCreate(stmt: String): String = {
+  private def rewriteSourceSnapshotCreate(stmt: String): String = {
     var s = rewriteCreateOrReplaceTempTableAsView(stmt)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
