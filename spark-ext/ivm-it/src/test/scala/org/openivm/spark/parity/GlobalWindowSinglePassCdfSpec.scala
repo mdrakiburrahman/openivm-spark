@@ -6,12 +6,10 @@ import org.openivm.spark.common.{
   FeatureGate,
   GroupedDistinctState,
   MvCatalog,
-  OpenIvmStatePaths,
   RefreshSqlLogCatalog,
   RefreshTypeCode
 }
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDBRegistry, RocksDBCodec}
 
 class GlobalWindowSinglePassCdfSpec       extends GlobalWindowSinglePassCdfBase(backing = false)
 class BackedGlobalWindowSinglePassCdfSpec extends GlobalWindowSinglePassCdfBase(backing = true)
@@ -57,18 +55,10 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     assertMvCorrect(view, query)
     refreshMv("gw_capacity_consumer")
 
-    val db = OpenIvmRocksDBRegistry.getOrOpen(
-      spark,
-      OpenIvmStatePaths.perMvDbPath(spark, view),
-      OpenIvmStatePaths.PerMvColumnFamilies
-    )
-    def cacheImage = db.withSession {
-      db.prefixScan("default", RocksDBCodec.utf8("grouped_"))
-        .map { case (key, value) => key.toVector -> value.toVector }
-        .toVector
-    }
-    val initialCache = cacheImage
-    initialCache should not be empty
+    // Derived rows and this versioned checkpoint are published in one RocksDB batch.
+    def cacheCheckpoint: Option[Vector[Byte]] = GroupedDistinctState.checkpoint(spark, view).map(_.toVector)
+    val initialCheckpoint = cacheCheckpoint
+    initialCheckpoint.nonEmpty shouldBe true
     // Cross the real summary limit with narrow rows, without injecting a fake rejection.
     sql(s"INSERT INTO gw_capacity_source SELECT id,id FROM range(1,${GroupedDistinctState.MaxGroups + 1L})")
 
@@ -82,7 +72,7 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
       assertMvCorrect(view, query)
       MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.WindowPartition
       usedGroupedState shouldBe false
-      cacheImage shouldBe initialCache
+      cacheCheckpoint shouldBe initialCheckpoint
       refreshMv("gw_capacity_consumer")
       assertMvCorrect("gw_capacity_consumer", consumer)
     }
