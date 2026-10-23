@@ -10,7 +10,7 @@ class WindowSinglePassReplaceInterceptSpec
   override protected def extraSparkConf: Map[String, String] =
     Map(
       FeatureGate.WindowSinglePassReplaceEnabledKey -> "true",
-      FeatureGate.QueryLogEnabledKey -> "true"
+      FeatureGate.QueryLogEnabledKey                -> "true"
     )
 
   it("preserves the native global-window cascade in interception mode") {

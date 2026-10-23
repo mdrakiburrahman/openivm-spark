@@ -23,7 +23,7 @@ class GlobalWindowSinglePassCdfSpec extends IvmParitySpecBase("global-window-sin
         s"FROM (SELECT region, SUM(amount) AS total FROM $source GROUP BY region) t"
       sql(s"CREATE MATERIALIZED VIEW $view AS $query")
       assertMvCorrect(view, query)
-      val id = spark.sessionState.sqlParser.parseTableIdentifier(view)
+      val id   = spark.sessionState.sqlParser.parseTableIdentifier(view)
       val meta = MvCatalog.lookup(spark, id).getOrElse(fail("missing global window metadata"))
       meta.refreshType shouldBe RefreshTypeCode.WindowPartition
       meta.usesBackingDataTable shouldBe backing
