@@ -8,6 +8,7 @@ import org.apache.spark.sql.functions.{col, lit, raise_error, when}
 import org.apache.spark.sql.types.{DataType, DecimalType, DoubleType, IntegerType, LongType, StructType}
 import org.apache.spark.storage.StorageLevel
 import org.openivm.spark.common._
+import org.openivm.spark.common.rocksdb.OpenIvmRocksDB.PrefixReadLimitExceeded
 import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompileException, OpenIvmCompiler}
 import org.openivm.spark.parser.GroupedWindowStagePlan
 
@@ -182,7 +183,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
         meta: MvMetadata,
         batches: Seq[CdfChangeBatch],
         deltaFrames: Map[String, DataFrame]
-    ): Option[Refresh] = {
+    ): Option[Refresh] = try {
       val before = target(spark, meta.location)
       val cached = unsupported { GroupedDistinctState.checkpoint(spark, view).map(decode) }.flatten
       logDebug(
@@ -250,6 +251,11 @@ private[commands] object GroupedWindowStatePlan extends Logging {
             }
           }
         }
+    } catch {
+      // Preparation has not written the target or published derived state.
+      // Capacity is an optimization limit; identity and integrity failures remain fatal.
+      case e: GroupedDistinctState.CapacityExceeded => rejected(e)
+      case e: PrefixReadLimitExceeded              => rejected(e)
     }
   }
   final class Initial private[GroupedWindowStatePlan] (

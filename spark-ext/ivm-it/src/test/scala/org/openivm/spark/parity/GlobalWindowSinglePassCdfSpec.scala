@@ -4,11 +4,14 @@ import org.openivm.spark.common.{
   CdfWatermarkCatalog,
   ChangeWatermark,
   FeatureGate,
+  GroupedDistinctState,
   MvCatalog,
+  OpenIvmStatePaths,
   RefreshSqlLogCatalog,
   RefreshTypeCode
 }
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDBRegistry, RocksDBCodec}
 
 class GlobalWindowSinglePassCdfSpec       extends GlobalWindowSinglePassCdfBase(backing = false)
 class BackedGlobalWindowSinglePassCdfSpec extends GlobalWindowSinglePassCdfBase(backing = true)
@@ -25,6 +28,60 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     FeatureGate.GroupedWindowStateEnabledKey      -> "true",
     "spark.openivm.catalogPreservesColumnCase"    -> "false"
   )
+
+  it("falls back incrementally when grouped state exceeds capacity without publishing prepared cache state") {
+    sql("CREATE TABLE gw_capacity_source(k BIGINT,v BIGINT) USING DELTA")
+    sql("INSERT INTO gw_capacity_source VALUES(0,1)")
+    val rank = if (backing) "Rank" else "rank"
+    val query = "WITH grouped AS (SELECT k,COUNT(*) AS n,COUNT(DISTINCT v) AS d,SUM(v) AS s " +
+      "FROM gw_capacity_source GROUP BY k) " +
+      s"SELECT k,n,d,s,RANK() OVER(ORDER BY n DESC) AS $rank FROM grouped"
+    val view = "gw_capacity_rank"
+    sql(s"CREATE MATERIALIZED VIEW $view AS $query")
+    val id   = spark.sessionState.sqlParser.parseTableIdentifier(view)
+    val meta = MvCatalog.lookup(spark, id).get
+    meta.refreshType shouldBe RefreshTypeCode.WindowPartition
+    meta.properties.contains("_ivm_grouped_window_input_v1") shouldBe true
+    GroupedDistinctState.checkpoint(spark, view).nonEmpty shouldBe true
+
+    val db = OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.perMvDbPath(spark, view),
+      OpenIvmStatePaths.PerMvColumnFamilies
+    )
+    def cacheImage = db.withSession {
+      db.prefixScan("default", RocksDBCodec.utf8("grouped_"))
+        .map { case (key, value) => key.toVector -> value.toVector }
+        .toVector
+    }
+    val initialCache = cacheImage
+    initialCache should not be empty
+    // Cross the real summary limit with narrow rows, without injecting a fake rejection.
+    sql(s"INSERT INTO gw_capacity_source SELECT id,id FROM range(1,${GroupedDistinctState.MaxGroups + 1L})")
+    val consumer = "SELECT SUM(n) AS n,SUM(d) AS d FROM gw_capacity_rank"
+    sql(s"CREATE MATERIALIZED VIEW gw_capacity_consumer AS $consumer")
+
+    Vector(
+      Vector.empty[String],
+      Vector("DELETE FROM gw_capacity_source WHERE k>2", "INSERT INTO gw_capacity_source VALUES(0,5),(0,5)")
+    ).foreach { mutations =>
+      mutations.foreach(sql)
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv(view)
+      assertMvCorrect(view, query)
+      MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.WindowPartition
+      sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .exists(_.contains("openivm_grouped_result_")) shouldBe false
+      cacheImage shouldBe initialCache
+      refreshMv("gw_capacity_consumer")
+      assertMvCorrect("gw_capacity_consumer", consumer)
+    }
+    val version = mvDataVersion(view)
+    refreshMv(view)
+    mvDataVersion(view) shouldBe version
+  }
 
   it("preserves the managed catalog target when creating grouped-window state") {
     val key   = "spark.openivm.managedTablesRoot"

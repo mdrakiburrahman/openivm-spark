@@ -26,6 +26,9 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 object OpenIvmRocksDB {
   RocksDB.loadLibrary()
 
+  final class PrefixReadLimitExceeded
+      extends IllegalStateException("RocksDB prefix read exceeded its row or byte limit")
+
   private val ManifestPrefix     = "MANIFEST-"
   private val ManifestTxnPattern = """"txnId"\s*:\s*"([^"]+)"""".r
 
@@ -1039,11 +1042,11 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         iterator.seek(prefix)
         while (iterator.isValid && startsWith(iterator.key(), prefix)) {
           if (count >= maxEntries)
-            throw new IllegalStateException("RocksDB prefix read exceeded its row or byte limit")
+            throw new PrefixReadLimitExceeded
           // Probe lengths before copying a potentially large value into the JVM.
           val entryBytes = iterator.key(sizeProbe).toLong + iterator.value(sizeProbe).toLong
           if (entryBytes > maxBytes - bytes)
-            throw new IllegalStateException("RocksDB prefix read exceeded its row or byte limit")
+            throw new PrefixReadLimitExceeded
           val key   = iterator.key()
           val value = iterator.value()
           OpenIvmMetrics.recordColumnFamilyRead(columnFamily, entryBytes)

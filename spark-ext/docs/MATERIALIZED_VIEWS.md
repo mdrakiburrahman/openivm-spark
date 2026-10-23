@@ -56,6 +56,9 @@ seeds it from the grouped input, and refresh applies the compiled signed input
 delta before evaluating the window. Checkpoints bind it to source identities,
 schemas and consumed versions, and to the target's identity and version.
 Unsupported shapes or a cache miss retain the native incremental program.
+Exceeding a cache capacity limit during preparation also uses that program,
+without publishing partial cache state. Identity and integrity failures still
+fail the refresh.
 The cache is published only after the target write succeeds.
 
 ## Refresh timing

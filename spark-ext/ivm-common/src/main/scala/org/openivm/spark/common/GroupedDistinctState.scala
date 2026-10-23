@@ -35,6 +35,8 @@ private[spark] final class GroupedDistinctState(
     channels: Vector[(String, String)],
     maxCache: Int = 100000
 ) {
+  import GroupedDistinctState.{MaxBytes, MaxGroups, MaxUpdates, requireCapacity}
+
   require(keys.nonEmpty && channels.nonEmpty && maxCache >= 0)
   require(
     (inputSchema.fieldNames ++ summarySchema.fieldNames).forall(n =>
@@ -80,7 +82,6 @@ private[spark] final class GroupedDistinctState(
   private val IndexSchema = StructType(
     Vector(StructField(g, StringType), StructField(ch, IntegerType), StructField(value, StringType))
   )
-  private val MaxGroups = 100000; private val MaxUpdates = 1000000; private val MaxBytes = 64L * 1024L * 1024L
   private def supported(t: DataType): Boolean =
     t == LongType || t == IntegerType || t == ShortType || t == ByteType || t == DateType || t == StringType
   require(
@@ -165,10 +166,10 @@ private[spark] final class GroupedDistinctState(
         .limit(MaxGroups + 1)
         .collect()
         .toVector
-    require(found.size <= MaxGroups, "group-state cap")
+    requireCapacity(found.size <= MaxGroups, "group-state cap")
     val rows = found.map(r => r.getString(0) -> r.getString(1))
     require(rows.map(_._1).distinct.size == rows.size, "duplicate full group identity")
-    require(
+    requireCapacity(
       rows.map { case (k, v) => k.getBytes(UTF_8).length.toLong + v.getBytes(UTF_8).length }.sum <= MaxBytes,
       "group-state byte cap"
     )
@@ -291,11 +292,11 @@ private[spark] final class GroupedDistinctState(
       .limit(MaxUpdates + 1)
       .collect()
       .toVector
-    require(consolidated.size <= MaxUpdates, "demand contribution cap")
+    requireCapacity(consolidated.size <= MaxUpdates, "demand contribution cap")
     val changes = consolidated.map(r =>
       Index(r.getAs[String](g), r.getAs[Int](ch), r.getAs[String](value)) -> r.getAs[Long](weight)
     )
-    require(
+    requireCapacity(
       changes.map { case (k, _) =>
         k.group.getBytes(UTF_8).length.toLong + k.value.getBytes(UTF_8).length + 16L
       }.sum <= MaxBytes,
@@ -373,7 +374,7 @@ private[spark] final class GroupedDistinctState(
       .collect()
       .toVector
     require(records.size <= affected.size + misses.size, "unexpected fused aggregate cardinality")
-    require(
+    requireCapacity(
       records
         .map(r =>
           r.getString(0).getBytes(UTF_8).length.toLong +
@@ -431,7 +432,8 @@ private[spark] final class GroupedDistinctState(
     val touchedKeys: Vector[String] = changed.map(_._1)
     val hits: Int                   = frequencies.size - misses
     def complete(rows: Vector[(String, String)]): Completed = {
-      require(rows.size <= MaxGroups && rows.map(_._1).distinct.size == rows.size, "invalid fused group bag")
+      requireCapacity(rows.size <= MaxGroups, "group-state cap")
+      require(rows.map(_._1).distinct.size == rows.size, "invalid fused group bag")
       val expected = changed.filter(_._2.n > 0).toMap
       require(rows.map(_._1).toSet == expected.keySet, "recomputed group set disagrees with signed input")
       rows.foreach { case (k, json) =>
@@ -449,7 +451,7 @@ private[spark] final class GroupedDistinctState(
           .map { case (k, v) => new String(k.drop(GroupPrefix.length), UTF_8) -> RocksDBCodec.fromUtf8(v) }
           .toMap
         val all = (old -- touchedKeys) ++ rows
-        require(
+        requireCapacity(
           all.size <= MaxGroups && all.valuesIterator.map(_.getBytes(UTF_8).length.toLong).sum <= MaxBytes,
           "next summary cap"
         )
@@ -479,6 +481,15 @@ private[spark] final class GroupedDistinctState(
 }
 
 private[spark] object GroupedDistinctState {
+  val MaxGroups  = 100000
+  val MaxUpdates = 1000000
+  val MaxBytes   = 64L * 1024L * 1024L
+
+  final class CapacityExceeded(message: String) extends IllegalArgumentException(message)
+
+  private def requireCapacity(condition: Boolean, message: String): Unit =
+    if (!condition) throw new CapacityExceeded(message)
+
   private val CheckpointKey = RocksDBCodec.utf8("grouped_window:v1:checkpoint")
   def checkpoint(spark: SparkSession, view: String): Option[Array[Byte]] = {
     val db = OpenIvmRocksDBRegistry.getOrOpen(

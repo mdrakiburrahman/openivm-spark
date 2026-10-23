@@ -461,16 +461,16 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
           val all = db.boundedPrefixScan("scan", prefix, 4, 12L)
           all.map(_._1.toVector) shouldBe keys.map(_.toVector)
           all.map(_._2.toVector) shouldBe Vector.fill(4)(Vector[Byte](1))
-          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 3, 12L) }
-          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 4, 11L) }
-          intercept[IllegalStateException] { db.boundedPrefixScan("scan", prefix, 0, 0L) }
+          intercept[OpenIvmRocksDB.PrefixReadLimitExceeded] { db.boundedPrefixScan("scan", prefix, 3, 12L) }
+          intercept[OpenIvmRocksDB.PrefixReadLimitExceeded] { db.boundedPrefixScan("scan", prefix, 4, 11L) }
+          intercept[OpenIvmRocksDB.PrefixReadLimitExceeded] { db.boundedPrefixScan("scan", prefix, 0, 0L) }
           // In multi-process mode each completed call has already closed its
           // native handle. Values remain valid and later reads still succeed.
           db.get("scan", key(255)).map(_.toVector) shouldBe Some(Vector[Byte](1))
           db.boundedPrefixScan("scan", Array[Byte](64), 0, 0L) shouldBe empty
           val largePrefix = Array[Byte](80)
           db.withBatch(batch => db.put(batch, "scan", largePrefix, new Array[Byte](1024 * 1024)))
-          intercept[IllegalStateException] {
+          intercept[OpenIvmRocksDB.PrefixReadLimitExceeded] {
             db.boundedPrefixScan("scan", largePrefix, 1, 1024L)
           }
           db.boundedPrefixScan("scan", prefix, 4, 12L).map(_._1.toVector) shouldBe keys.map(_.toVector)
