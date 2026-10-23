@@ -8,7 +8,32 @@ class WindowSinglePassReplaceInterceptSpec
     with InterceptMode {
 
   override protected def extraSparkConf: Map[String, String] =
-    Map(FeatureGate.WindowSinglePassReplaceEnabledKey -> "true")
+    Map(
+      FeatureGate.WindowSinglePassReplaceEnabledKey -> "true",
+      FeatureGate.QueryLogEnabledKey -> "true"
+    )
+
+  it("preserves the native global-window cascade in interception mode") {
+    sql("CREATE TABLE wspri_global_sales(id INT, region STRING, amount INT) USING DELTA")
+    sql("INSERT INTO wspri_global_sales VALUES (1, 'east', 10), (2, 'west', 20)")
+    val query = "SELECT region, total, DENSE_RANK() OVER (ORDER BY total DESC) AS rank " +
+      "FROM (SELECT region, SUM(amount) AS total FROM wspri_global_sales GROUP BY region) t"
+    sql(s"CREATE MATERIALIZED VIEW wspri_global AS $query")
+    val downstream = "SELECT region, total, rank FROM wspri_global"
+    sql(s"CREATE MATERIALIZED VIEW wspri_global_consumer AS $downstream")
+    sql("INSERT INTO wspri_global_sales VALUES (3, 'east', 30), (4, 'transient', 1)")
+    sql("UPDATE wspri_global_sales SET amount = 40 WHERE id = 1")
+    sql("DELETE FROM wspri_global_sales WHERE id IN (2, 4)")
+    val before = mvDataVersion("wspri_global")
+    refreshMv("wspri_global")
+    assertMvCorrect("wspri_global", query)
+    val statements = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9)).mkString("\n")
+    mvDataVersion("wspri_global") shouldBe before + 2
+    statements should include("/_ivm/view_deltas/")
+    statements should not include "REPLACE WHERE true"
+    refreshMv("wspri_global_consumer")
+    assertMvCorrect("wspri_global_consumer", downstream)
+  }
 
   describe("WINDOW_PARTITION single-pass no-op replacement") {
     it("does not stage a downstream cascade when conflicting DML leaves the window bag unchanged") {
