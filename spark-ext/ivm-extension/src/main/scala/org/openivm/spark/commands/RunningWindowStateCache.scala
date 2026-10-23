@@ -1,11 +1,11 @@
 package org.openivm.spark.commands
 
-import org.apache.spark.sql.{Column, DataFrame, Encoders, SparkSession}
+import org.apache.spark.sql.{Column, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.logical.Aggregate
-import org.apache.spark.sql.functions.{coalesce, col, greatest, lit, struct, to_json}
+import org.apache.spark.sql.functions.{coalesce, col, greatest, lit}
 import org.apache.spark.sql.types.StructType
-import org.openivm.spark.common.{DeltaTableVersion, MvMetadata, WindowStateCatalog}
+import org.openivm.spark.common.{DeltaTableVersion, MvMetadata, WindowStateCatalog, WindowStateJson}
 
 /** Reuses the prototype's keyed JSON state store for the native suffix program.
   * Only tail-value seeds are cached; other state layouts keep native history
@@ -16,19 +16,7 @@ private[commands] object RunningWindowStateCache {
   private val Count   = "openivm_running_count"
   private val Nulls   = "openivm_running_nulls"
   private val Headers = Set(Max, Count, Nulls)
-  private val JsonOptions = Map(
-    "ignoreNullFields"   -> "false",
-    "timeZone"           -> "UTC",
-    "timestampFormat"    -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
-    "timestampNTZFormat" -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
-    "mode"               -> "FAILFAST"
-  )
-
   private def quoted(name: String): String = s"`${name.replace("`", "``")}`"
-  private def json(columns: Seq[String]): Column =
-    to_json(struct(columns.map(name => col(quoted(name))): _*), JsonOptions)
-  private def fromJson(spark: SparkSession, payloads: Seq[String], schema: StructType): DataFrame =
-    spark.read.schema(schema).options(JsonOptions).json(spark.createDataset(payloads)(Encoders.STRING))
 
   def load(spark: SparkSession, meta: MvMetadata, stateSql: String): Option[State] = {
     val stateName    = s"openivm_run_state_${meta.name.table}"
@@ -58,16 +46,16 @@ private[commands] object RunningWindowStateCache {
     if (snapshot.version != meta.lastVersion) return None
     val identity      = Seq(snapshot.metadata.id, body.replace(snapshotRef, "MV"), schema.json).mkString("\n")
     val view          = MvCommandHelper.metaName(meta.name)
-    val partitionKeys = affected.select(json(keys)).collect().map(_.getString(0)).toVector
+    val partitionKeys = affected.select(WindowStateJson.encode(keys)).collect().map(_.getString(0)).toVector
     val cached        = WindowStateCatalog.getMany(spark, view, identity, meta.lastVersion, partitionKeys)
     if (cached.nonEmpty) {
-      val restored = fromJson(spark, cached.values.toSeq, schema)
+      val restored = WindowStateJson.decode(spark, cached.values.toSeq, schema)
       val missing  = partitionKeys.filterNot(cached.contains)
       val state =
         if (missing.isEmpty) restored
         else {
           val missingName = s"openivm_run_missing_${meta.name.table}"
-          fromJson(spark, missing, affected.schema).createOrReplaceTempView(missingName)
+          WindowStateJson.decode(spark, missing, affected.schema).createOrReplaceTempView(missingName)
           // Capture the analyzed plan before dropping the temporary key relation.
           val uncached =
             try {
@@ -117,7 +105,7 @@ private[commands] object RunningWindowStateCache {
         value.cast(f.dataType).as(f.name)
       }: _*)
       val entries = updated
-        .select(json(keys), json(schema.fieldNames.toSeq))
+        .select(WindowStateJson.encode(keys), WindowStateJson.encode(schema.fieldNames.toSeq))
         .collect()
         .map { row =>
           row.getString(0) -> row.getString(1)

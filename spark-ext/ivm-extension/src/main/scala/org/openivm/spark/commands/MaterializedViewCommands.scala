@@ -5664,6 +5664,7 @@ case class RefreshMaterializedViewCommand(
         refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
         preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
       }
+      // Compile and rewrite use one fresh fact set owned by this REFRESH, never a cross-command cache.
       val constraintFacts = WorkloadFactsRegistry
         .forRefresh()
         .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
@@ -6118,9 +6119,7 @@ case class RefreshMaterializedViewCommand(
           val fkTermPruneEnabled        = FeatureGate.fkTermPruneEnabled(spark)
           val rewriteConstraintFacts =
             if (uniqueJoinSimplifyEnabled || fkTermPruneEnabled)
-              WorkloadFactsRegistry
-                .forRefresh()
-                .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
+              constraintFacts
             else WorkloadConstraintFacts()
 
           val rewrittenBase = profile.timeStep(
@@ -6275,46 +6274,8 @@ case class RefreshMaterializedViewCommand(
               }
             }
             def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
-              advanceStmtCounterPast(stmtIdx)
-              val kind     = RefreshPerf.classify(sql, viewDeltaPath)
-              val sqlBytes = sql.length
-              val qOrder   = qlogOrder.getAndIncrement()
-              profile.timeStep(
-                "execute_refresh_sql_stmt",
-                s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
-              ) {
-                RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
-                  val t0 = System.nanoTime()
-                  try {
-                    val df = spark.sql(sql)
-                    val r  = df.collect()
-                    recordPlanMetrics(df, kind)
-                    val ms = (System.nanoTime() - t0) / 1000000L
-                    sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
-                    // Diagnostic-only physical-plan capture (FeatureGate default OFF).
-                    // After the timer + reusing the executed plan, so zero overhead
-                    // unless explicitly enabled for a diagnostic refresh.
-                    if (sqlLog.isActive && FeatureGate.explainCaptureEnabled(spark)) {
-                      try
-                        sqlLog.record(
-                          "explain_formatted",
-                          qOrder,
-                          0,
-                          kind,
-                          df.queryExecution.explainString(org.apache.spark.sql.execution.FormattedMode),
-                          0L
-                        )
-                      catch { case _: Throwable => () }
-                    }
-                    r
-                  } catch {
-                    case t: Throwable =>
-                      val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms, succeeded = false)
-                      throw t
-                  }
-                }
-              }
+              executeSqlRowsAt(sql, stmtIdx)
+              ()
             }
             def executeSqlRowsAt(sql: String, stmtIdx: Int): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)

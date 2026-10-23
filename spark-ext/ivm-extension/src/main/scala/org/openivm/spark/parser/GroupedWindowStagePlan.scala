@@ -43,6 +43,18 @@ private[spark] object GroupedWindowStagePlan {
   private def quoted(name: String): String                = "`" + name.replace("`", "``") + "`"
   private def functionName(f: UnresolvedFunction): String = f.nameParts.last.toLowerCase(Locale.ROOT)
 
+  private def sourceBindings(
+      spark: SparkSession,
+      frames: Map[String, DataFrame],
+      normalize: String => String
+  ): Map[Vector[String], DataFrame] = {
+    val entries = frames.toVector.map { case (name, df) =>
+      spark.sessionState.sqlParser.parseMultipartIdentifier(name).map(normalize).toVector -> df
+    }
+    require(entries.map(_._1).distinct.size == entries.size, "ambiguous stage source binding")
+    entries.toMap
+  }
+
   /** Bind external relations before analysis, including nested CTE definitions
     * and correlated subqueries. Only preceding nonrecursive CTEs are visible in
     * each definition. No unknown name may fall through to the live catalog.
@@ -52,11 +64,16 @@ private[spark] object GroupedWindowStagePlan {
     val normalize: String => String =
       if (spark.sessionState.conf.caseSensitiveAnalysis) identity[String]
       else (s: String) => s.toLowerCase(Locale.ROOT)
-    val entries = frames.toVector.map { case (name, df) =>
-      spark.sessionState.sqlParser.parseMultipartIdentifier(name).map(normalize).toVector -> df.queryExecution.analyzed
-    }
-    require(entries.map(_._1).distinct.size == entries.size, "ambiguous stage source binding")
-    val inputs = entries.toMap
+    bindReadPlan(spark, plan, sourceBindings(spark, frames, normalize), normalize)
+  }
+
+  private def bindReadPlan(
+      spark: SparkSession,
+      plan: LogicalPlan,
+      frames: Map[Vector[String], DataFrame],
+      normalize: String => String
+  ): DataFrame = {
+    val inputs = frames.map { case (name, df) => name -> df.queryExecution.analyzed }
     def bind(p: LogicalPlan, scope: Set[String]): LogicalPlan = p match {
       case w: UnresolvedWith =>
         var visible = scope
@@ -170,34 +187,27 @@ private[spark] object GroupedWindowStagePlan {
       bindings: Map[Vector[String], Vector[String]],
       normalize: String => String
   ) {
-    private def execute(plan: LogicalPlan, frames: Map[String, DataFrame]): DataFrame = {
-      val entries = frames.toVector.map { case (name, df) =>
-        spark.sessionState.sqlParser.parseMultipartIdentifier(name).map(normalize).toVector -> df
-      }
-      require(entries.map(_._1).distinct.size == entries.size, "ambiguous stage source binding")
-      val supplied = entries.toMap
-      val aliases  = bindings.flatMap { case (alias, source) => supplied.get(source).map(alias -> _) }
-      bindReadPlan(spark, plan, (supplied ++ aliases).map { case (name, df) => name.map(quoted).mkString(".") -> df })
+    private def execute(plan: LogicalPlan, supplied: Map[Vector[String], DataFrame]): DataFrame = {
+      val aliases = bindings.flatMap { case (alias, source) => supplied.get(source).map(alias -> _) }
+      bindReadPlan(spark, plan, supplied ++ aliases, normalize)
     }
-    private def requireSources(frames: Map[String, DataFrame]): Unit = {
-      val keys =
-        frames.keys.map(n => spark.sessionState.sqlParser.parseMultipartIdentifier(n).map(normalize).toVector).toSet
-      require(keys == declared.toSet, "missing or unexpected stage source binding")
+    private def requireSources(frames: Map[String, DataFrame]): Map[Vector[String], DataFrame] = {
+      val supplied = sourceBindings(spark, frames, normalize)
+      require(supplied.keySet == declared.toSet, "missing or unexpected stage source binding")
+      supplied
     }
     def input(frames: Map[String, DataFrame]): DataFrame = {
-      requireSources(frames)
-      val df = execute(inputPlan, frames)
+      val df = execute(inputPlan, requireSources(frames))
       require(
         df.queryExecution.analyzed.collect { case p if !p.expressions.forall(_.deterministic) => p }.isEmpty,
         "nondeterministic stage input"
       )
       df
     }
-    def summary(frames: Map[String, DataFrame]): DataFrame = { requireSources(frames); execute(summaryPlan, frames) }
-    def ordinary(input: DataFrame): DataFrame              = execute(ordinaryPlan, Map(Input -> input))
-    def post(frames: Map[String, DataFrame], summary: DataFrame): DataFrame = {
-      requireSources(frames); execute(postPlan, frames + (State -> summary))
-    }
+    def summary(frames: Map[String, DataFrame]): DataFrame = execute(summaryPlan, requireSources(frames))
+    def ordinary(input: DataFrame): DataFrame              = execute(ordinaryPlan, Map(Vector(normalize(Input)) -> input))
+    def post(frames: Map[String, DataFrame], summary: DataFrame): DataFrame =
+      execute(postPlan, requireSources(frames) + (Vector(normalize(State)) -> summary))
   }
 
   def extract(

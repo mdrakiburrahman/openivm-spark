@@ -62,6 +62,38 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
     }
 
   describe("version-pinned grouped-window plan binding") {
+    it("normalizes quoted bindings once while retaining case-sensitive identities and source checks") {
+      val setting = "spark.sql.caseSensitive"
+      val prior   = spark.conf.get(setting)
+      val source  = "`stage.db`.`Input.Rows`"
+      val query = s"""WITH grouped AS (SELECT id AS g,COUNT(*) AS n,COUNT(DISTINCT id) AS d,SUM(id) AS s
+        |FROM $source GROUP BY id) SELECT g,n,d,s,DENSE_RANK() OVER(ORDER BY s DESC) AS r FROM grouped""".stripMargin
+      try {
+        Seq(false, true).foreach { caseSensitive =>
+          spark.conf.set(setting, caseSensitive.toString)
+          val contract = GroupedWindowStagePlan.extract(spark, query, Vector(source))
+          val frame    = spark.range(1L, 3L).toDF("id")
+          val frames   = Map(source -> frame)
+          contract.post(frames, contract.summary(frames)).count() shouldBe 2L
+          contract.input(frames).count() shouldBe 2L
+          val lowerCase = Map("`stage.db`.`input.rows`" -> frame)
+          if (caseSensitive) {
+            intercept[IllegalArgumentException] {
+              contract.summary(lowerCase)
+            }.getMessage should include("missing or unexpected stage source binding")
+          } else {
+            contract.summary(lowerCase).count() shouldBe 2L
+            intercept[IllegalArgumentException] {
+              contract.summary(frames ++ lowerCase)
+            }.getMessage should include("ambiguous stage source binding")
+          }
+          intercept[IllegalArgumentException] {
+            contract.input(Map.empty)
+          }.getMessage should include("missing or unexpected stage source binding")
+        }
+      } finally spark.conf.set(setting, prior)
+    }
+
     it("binds explicit SQL aliases to canonical command sources without live catalog lookup") {
       val query = """WITH grouped AS (SELECT id AS g,COUNT(*) AS n,COUNT(DISTINCT id) AS d,SUM(id) AS s
         |FROM stage_input GROUP BY id) SELECT g,n,d,s,DENSE_RANK() OVER(ORDER BY s DESC) AS r FROM grouped""".stripMargin

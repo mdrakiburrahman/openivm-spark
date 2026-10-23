@@ -17,6 +17,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Expand}
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.WindowStateJson.{options => JsonOptions}
 
 /** Bounded grouped state with native weighted DISTINCT zero crossings,
   * with exact current-frequency lookup on cache misses instead of an eager full
@@ -40,13 +41,6 @@ private[spark] final class GroupedDistinctState(
       !n.toLowerCase(java.util.Locale.ROOT).startsWith("__rd_")
     ),
     "reserved grouped-state field"
-  )
-  private val JsonOptions = Map(
-    "ignoreNullFields"   -> "false",
-    "timeZone"           -> "UTC",
-    "timestampFormat"    -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
-    "timestampNTZFormat" -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
-    "mode"               -> "FAILFAST"
   )
   private val mapper      = new ObjectMapper()
   private val path        = OpenIvmStatePaths.perMvDbPath(spark, view)
@@ -100,7 +94,6 @@ private[spark] final class GroupedDistinctState(
   )
   private def quoted(name: String): String = "`" + name.replace("`", "``") + "`"
   private def field(name: String)          = col(quoted(name))
-  private def json(names: Seq[String])     = to_json(struct(names.map(field): _*), JsonOptions)
   private def keyValue(name: String, schema: StructType) =
     (if (schema(name).dataType == StringType) field(name).cast(BinaryType) else field(name)).as(name)
   private def withGroupKey(df: DataFrame): DataFrame =
@@ -151,10 +144,6 @@ private[spark] final class GroupedDistinctState(
     rows.foreach(k => values.add(Row(k.group, k.channel, k.value)))
     spark.createDataFrame(values, IndexSchema)
   }
-  private def decode(rows: Vector[String]): DataFrame = spark.read
-    .schema(summarySchema)
-    .options(JsonOptions)
-    .json(spark.createDataset(rows)(Encoders.STRING))
   private def header(epoch: String, cached: Long): Array[Byte] =
     RocksDBCodec.utf8(mapper.writeValueAsString(Vector(identity, epoch, cached.toString).toArray))
   private def check(epoch: String): Long = {
@@ -171,7 +160,11 @@ private[spark] final class GroupedDistinctState(
   def cachedSize(epoch: String): Long = db.withSession { check(epoch) }
   private def encodeRows(df: DataFrame): Vector[(String, String)] = {
     val found =
-      withGroupKey(df).select(col(g), json(summarySchema.fieldNames.toVector)).limit(MaxGroups + 1).collect().toVector
+      withGroupKey(df)
+        .select(col(g), WindowStateJson.encode(summarySchema.fieldNames.toVector))
+        .limit(MaxGroups + 1)
+        .collect()
+        .toVector
     require(found.size <= MaxGroups, "group-state cap")
     val rows = found.map(r => r.getString(0) -> r.getString(1))
     require(rows.map(_._1).distinct.size == rows.size, "duplicate full group identity")
@@ -206,11 +199,15 @@ private[spark] final class GroupedDistinctState(
       OpenIvmRocksDBBatchOps.put(db, b, Cf, Header, header(epoch, 0L))
     }
   }
-  def all(epoch: String): DataFrame = decode(db.withSession {
-    check(epoch);
-    db.boundedPrefixScan(Cf, GroupPrefix, MaxGroups, MaxBytes)
-      .map(p => RocksDBCodec.fromUtf8(p._2))
-  })
+  def all(epoch: String): DataFrame = WindowStateJson.decode(
+    spark,
+    db.withSession {
+      check(epoch);
+      db.boundedPrefixScan(Cf, GroupPrefix, MaxGroups, MaxBytes)
+        .map(p => RocksDBCodec.fromUtf8(p._2))
+    },
+    summarySchema
+  )
   private def unfold(joined: DataFrame, active: Vector[Int], includeCount: Boolean): DataFrame = {
     val group = joined.withColumn(tg, struct(keys.map(n => keyValue(n, joined.schema)): _*))
     val empty = struct(lit(null).cast(LongType).as("l"), lit(null).cast(BinaryType).as("b"))
@@ -368,7 +365,9 @@ private[spark] final class GroupedDistinctState(
         col(ch),
         to_json(col(tv), JsonOptions).as(value),
         field(countName).as("__rd_current_count"),
-        when(col(ch) === -1, json(ordinaryNames)).otherwise(lit(null).cast(StringType)).as("__rd_ordinary")
+        when(col(ch) === -1, WindowStateJson.encode(ordinaryNames))
+          .otherwise(lit(null).cast(StringType))
+          .as("__rd_ordinary")
       )
       .limit(affected.size + misses.size + 1)
       .collect()
@@ -456,7 +455,7 @@ private[spark] final class GroupedDistinctState(
         )
         all.values.toVector
       }
-      def summary: DataFrame = decode(nextRows)
+      def summary: DataFrame = WindowStateJson.decode(spark, nextRows, summarySchema)
       def publish(nextEpoch: String, checkpoint: Array[Byte]): Unit = db.withBatch { b =>
         stageInto(db, b, nextEpoch);
         OpenIvmRocksDBBatchOps.put(db, b, Cf, GroupedDistinctState.CheckpointKey, checkpoint)

@@ -43,6 +43,46 @@ class WindowStateCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
   }
 
   describe("versioned prototype state") {
+    it("keeps the cache JSON wire format exact across nulls, quoted fields and session time zones") {
+      import org.apache.spark.sql.Row
+      import org.apache.spark.sql.types._
+      val schema = new StructType()
+        .add("key.part", StringType)
+        .add("quote`key", StringType)
+        .add("ts", TimestampType)
+        .add("local_ts", TimestampNTZType)
+        .add("amount", DecimalType(20, 6))
+      val rows = Seq(
+        Row(
+          "é.'`",
+          null,
+          java.sql.Timestamp.from(java.time.Instant.parse("2024-03-31T01:02:03.123456Z")),
+          java.time.LocalDateTime.parse("2024-03-31T01:02:03.123456"),
+          new java.math.BigDecimal("123456789.123456")
+        ),
+        Row(null, "text", null, null, null)
+      )
+      val frame = spark.createDataFrame(rows.asJava, schema)
+      val prior = spark.conf.get("spark.sql.session.timeZone")
+      try {
+        val encoded = Seq("America/Los_Angeles", "Asia/Tokyo").map { zone =>
+          spark.conf.set("spark.sql.session.timeZone", zone)
+          val payloads = frame.select(WindowStateJson.encode(schema.fieldNames.toSeq)).collect().map(_.getString(0))
+          payloads.head should include("\"quote`key\":null")
+          payloads.head should include("\"ts\":\"2024-03-31T01:02:03.123456Z\"")
+          payloads.head should include("\"local_ts\":\"2024-03-31T01:02:03.123456\"")
+          val restored = WindowStateJson.decode(spark, payloads.toVector, schema)
+          restored.exceptAll(frame).count() shouldBe 0L
+          frame.exceptAll(restored).count() shouldBe 0L
+          payloads.toVector
+        }
+        encoded.head shouldBe encoded.last
+        intercept[Exception] {
+          WindowStateJson.decode(spark, Seq("{malformed"), schema).collect()
+        }
+      } finally spark.conf.set("spark.sql.session.timeZone", prior)
+    }
+
     it("selects exact nullable composite groups for small and large change sets") {
       import org.apache.spark.sql.{DataFrame, Row}
       import org.apache.spark.sql.functions._

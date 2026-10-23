@@ -21,6 +21,41 @@ abstract class CompileCacheScenarios extends IvmParitySpecBase("compile-cache") 
   }
 
   describe("compile-classification cache") {
+    it("rediscovers changed constraints on the next refresh before reusing a compiled program") {
+      sql(
+        "CREATE TABLE cc_constraint_source(id INT, v INT) USING DELTA " +
+          "TBLPROPERTIES ('spark.openivm.unique_key' = 'id')"
+      )
+      sql("INSERT INTO cc_constraint_source VALUES (1,10)")
+      val query = "SELECT id,v FROM cc_constraint_source"
+      sql(s"CREATE MATERIALIZED VIEW cc_constraint_mv AS $query")
+
+      def refreshAndCheck(cacheHit: Boolean): Unit = {
+        refreshMv("cc_constraint_mv")
+        assertMvCorrect("cc_constraint_mv", query)
+        val detail = sql("SHOW OPENIVM REFRESH PROFILE")
+          .where(
+            "view_name IN ('cc_constraint_mv','default.cc_constraint_mv') " +
+              "AND step_name = 'generate_refresh_sql.compile'"
+          )
+          .select("detail")
+          .collect()
+          .last
+          .getString(0)
+        detail should include(s"compile_cache_hit=$cacheHit")
+      }
+
+      sql("INSERT INTO cc_constraint_source VALUES (2,20)")
+      refreshAndCheck(cacheHit = false)
+      sql("INSERT INTO cc_constraint_source VALUES (3,30)")
+      refreshAndCheck(cacheHit = true)
+      sql("ALTER TABLE cc_constraint_source UNSET TBLPROPERTIES ('spark.openivm.unique_key')")
+      sql("INSERT INTO cc_constraint_source VALUES (1,40),(1,40)")
+      refreshAndCheck(cacheHit = false)
+      sql("INSERT INTO cc_constraint_source VALUES (1,50)")
+      refreshAndCheck(cacheHit = true)
+    }
+
     it("binds qualified source facts and keeps cached programs separate as the changed join source switches") {
       sql("CREATE DATABASE cc_bound_sources")
       try {
