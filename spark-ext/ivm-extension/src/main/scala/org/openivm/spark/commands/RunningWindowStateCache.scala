@@ -16,6 +16,7 @@ private[commands] object RunningWindowStateCache {
   private val Count   = "openivm_running_count"
   private val Nulls   = "openivm_running_nulls"
   private val Headers = Set(Max, Count, Nulls)
+
   private def quoted(name: String): String = s"`${name.replace("`", "``")}`"
 
   def load(spark: SparkSession, meta: MvMetadata, stateSql: String): Option[State] = {

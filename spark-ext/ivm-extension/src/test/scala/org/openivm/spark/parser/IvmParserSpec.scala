@@ -62,7 +62,7 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
     }
 
   describe("version-pinned grouped-window plan binding") {
-    it("normalizes quoted bindings once while retaining case-sensitive identities and source checks") {
+    it("preserves quoted bindings, case-sensitive identities and source checks") {
       val setting = "spark.sql.caseSensitive"
       val prior   = spark.conf.get(setting)
       val source  = "`stage.db`.`Input.Rows`"

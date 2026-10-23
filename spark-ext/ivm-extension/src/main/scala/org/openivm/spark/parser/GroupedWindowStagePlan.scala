@@ -205,7 +205,7 @@ private[spark] object GroupedWindowStagePlan {
       df
     }
     def summary(frames: Map[String, DataFrame]): DataFrame = execute(summaryPlan, requireSources(frames))
-    def ordinary(input: DataFrame): DataFrame              = execute(ordinaryPlan, Map(Vector(normalize(Input)) -> input))
+    def ordinary(input: DataFrame): DataFrame = execute(ordinaryPlan, Map(Vector(normalize(Input)) -> input))
     def post(frames: Map[String, DataFrame], summary: DataFrame): DataFrame =
       execute(postPlan, requireSources(frames) + (Vector(normalize(State)) -> summary))
   }
