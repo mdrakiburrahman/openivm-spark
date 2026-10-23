@@ -61,6 +61,150 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       super.afterAll()
     }
 
+  describe("version-pinned grouped-window plan binding") {
+    it("preserves quoted bindings, case-sensitive identities and source checks") {
+      val setting = "spark.sql.caseSensitive"
+      val prior   = spark.conf.get(setting)
+      val source  = "`stage.db`.`Input.Rows`"
+      val query = s"""WITH grouped AS (SELECT id AS g,COUNT(*) AS n,COUNT(DISTINCT id) AS d,SUM(id) AS s
+        |FROM $source GROUP BY id) SELECT g,n,d,s,DENSE_RANK() OVER(ORDER BY s DESC) AS r FROM grouped""".stripMargin
+      try {
+        Seq(false, true).foreach { caseSensitive =>
+          spark.conf.set(setting, caseSensitive.toString)
+          val contract = GroupedWindowStagePlan.extract(spark, query, Vector(source))
+          val frame    = spark.range(1L, 3L).toDF("id")
+          val frames   = Map(source -> frame)
+          contract.post(frames, contract.summary(frames)).count() shouldBe 2L
+          contract.input(frames).count() shouldBe 2L
+          val lowerCase = Map("`stage.db`.`input.rows`" -> frame)
+          if (caseSensitive) {
+            intercept[IllegalArgumentException] {
+              contract.summary(lowerCase)
+            }.getMessage should include("missing or unexpected stage source binding")
+          } else {
+            contract.summary(lowerCase).count() shouldBe 2L
+            intercept[IllegalArgumentException] {
+              contract.summary(frames ++ lowerCase)
+            }.getMessage should include("ambiguous stage source binding")
+          }
+          intercept[IllegalArgumentException] {
+            contract.input(Map.empty)
+          }.getMessage should include("missing or unexpected stage source binding")
+        }
+      } finally spark.conf.set(setting, prior)
+    }
+
+    it("binds explicit SQL aliases to canonical command sources without live catalog lookup") {
+      val query = """WITH grouped AS (SELECT id AS g,COUNT(*) AS n,COUNT(DISTINCT id) AS d,SUM(id) AS s
+        |FROM stage_input GROUP BY id) SELECT g,n,d,s,DENSE_RANK() OVER(ORDER BY s DESC) AS r FROM grouped""".stripMargin
+      val contract = GroupedWindowStagePlan.extract(
+        spark,
+        query,
+        Vector("default.stage_input"),
+        Map("stage_input" -> "default.stage_input")
+      )
+      val frames = Map("default.stage_input" -> spark.range(1L, 3L).toDF("id"))
+      val rows = contract
+        .post(frames, contract.summary(frames))
+        .collect()
+        .map(r => (r.getLong(0), r.getLong(1), r.getLong(2), r.getLong(3), r.getInt(4)))
+        .toSet
+      rows shouldBe Set((1L, 1L, 1L, 1L, 2), (2L, 1L, 1L, 2L, 1))
+      intercept[IllegalArgumentException] {
+        GroupedWindowStagePlan.extract(
+          spark,
+          query,
+          Vector("default.stage_input"),
+          Map("stage_input" -> "other.stage_input")
+        )
+      }.getMessage should include("alias must name a declared source")
+    }
+    it("binds qualified sources, ordered CTEs, nested scope and correlated subqueries explicitly") {
+      val bound = spark.range(1L, 3L).toDF("id")
+      def run(query: String, inputs: Map[String, org.apache.spark.sql.DataFrame]) =
+        GroupedWindowStagePlan.bindReadPlan(spark, spark.sessionState.sqlParser.parsePlan(query), inputs)
+      run("SELECT db.source.id FROM db.source", Map("db.source" -> bound))
+        .collect()
+        .map(_.getLong(0))
+        .toSet shouldBe Set(1L, 2L)
+      val query = """WITH first AS (SELECT id FROM pinned),
+        |second AS (WITH first AS (SELECT id+10 AS id FROM pinned) SELECT id FROM first)
+        |SELECT a.id, b.id FROM first a JOIN second b ON b.id=a.id+10
+        |WHERE EXISTS (SELECT 1 FROM pinned p WHERE p.id=a.id)""".stripMargin
+      val setting = "spark.sql.legacy.ctePrecedencePolicy"
+      val prior   = spark.sessionState.conf.getAllConfs.get(setting)
+      try {
+        spark.conf.set(setting, "CORRECTED")
+        run(query, Map("pinned" -> bound)).collect().map(r => r.getLong(0) -> r.getLong(1)).toSet shouldBe
+          Set(1L -> 11L, 2L -> 12L)
+        spark.conf.set(setting, "LEGACY")
+        run(query, Map("pinned" -> bound)).count() shouldBe 0L
+        spark.conf.set(setting, "EXCEPTION")
+        intercept[org.apache.spark.sql.AnalysisException] {
+          run(query, Map("pinned" -> bound)).collect()
+        }.getMessage should include("AMBIGUOUS_ALIAS_IN_NESTED_CTE")
+      } finally
+        prior match {
+          case Some(value) => spark.conf.set(setting, value)
+          case None        => spark.conf.unset(setting)
+        }
+    }
+
+    it("refuses live-catalog fallback in missing CTE definitions and nested subqueries") {
+      val bound = spark.range(1L, 3L).toDF("id")
+      bound.createOrReplaceTempView("unbound_stage_source")
+      try {
+        val queries = Seq(
+          "SELECT * FROM unbound_stage_source",
+          "WITH first AS (SELECT * FROM unbound_stage_source) SELECT * FROM first",
+          "SELECT * FROM pinned p WHERE EXISTS (SELECT 1 FROM unbound_stage_source u WHERE u.id=p.id)",
+          "WITH later AS (SELECT * FROM next), next AS (SELECT * FROM pinned) SELECT * FROM later",
+          "WITH unbound_stage_source AS (SELECT * FROM unbound_stage_source) SELECT * FROM unbound_stage_source",
+          "SELECT * FROM other.pinned"
+        )
+        queries.foreach { query =>
+          intercept[IllegalArgumentException] {
+            GroupedWindowStagePlan.bindReadPlan(
+              spark,
+              spark.sessionState.sqlParser.parsePlan(query),
+              Map("pinned" -> bound)
+            )
+          }.getMessage should include("unbound stage relation")
+        }
+        intercept[IllegalArgumentException] {
+          GroupedWindowStagePlan.bindReadPlan(
+            spark,
+            spark.sessionState.sqlParser.parsePlan("SELECT * FROM pinned"),
+            Map("pinned" -> bound, "PINNED" -> bound)
+          )
+        }.getMessage should include("ambiguous stage source binding")
+      } finally spark.catalog.dropTempView("unbound_stage_source")
+    }
+
+    it("extracts only the signed native input query and normalizes compiler timestamp gates") {
+      val sql = """UPDATE openivm_views SET refresh_in_progress=true;
+        |WITH input_rows AS (
+        | SELECT id, openivm_multiplicity FROM openivm_delta_input
+        | WHERE (openivm_timestamp>=CAST('2026-01-01 00:00:00' AS TIMESTAMP)))
+        |INSERT INTO openivm_delta_stage(id,openivm_multiplicity)
+        |SELECT id,openivm_multiplicity FROM input_rows;""".stripMargin
+      val input        = spark.sql("SELECT CAST(7 AS BIGINT) AS id, CAST(-2 AS BIGINT) AS openivm_multiplicity")
+      val first        = GroupedWindowStagePlan.inputDelta(spark, sql, "stage")
+      val changedClock = GroupedWindowStagePlan.inputDelta(spark, sql.replace("2026-01-01", "2026-02-02"), "stage")
+      changedClock.identity shouldBe first.identity
+      val rows = first(Map("openivm_delta_input" -> input)).collect()
+      rows.length shouldBe 1
+      rows.head.getLong(0) shouldBe 7L
+      rows.head.getLong(1) shouldBe -2L
+      intercept[IllegalArgumentException] {
+        GroupedWindowStagePlan.inputDelta(spark, sql + sql, "stage")
+      }.getMessage should include("one native signed-input contribution")
+      intercept[IllegalArgumentException] {
+        first(Map("other.openivm_delta_input" -> input))
+      }.getMessage should include("unbound stage relation")
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Test 1 — basic CREATE MATERIALIZED VIEW
   // ---------------------------------------------------------------------------

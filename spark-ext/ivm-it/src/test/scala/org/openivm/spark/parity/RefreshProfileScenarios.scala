@@ -4,6 +4,8 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
 import org.openivm.spark.common.{ChangeFeedMode, RefreshProfileCatalog}
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 
 /** End-to-end coverage of `RefreshProfile` instrumentation in
   * `MaterializedViewCommands` + the `SHOW OPENIVM REFRESH PROFILE` SQL
@@ -80,6 +82,10 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       names should contain("total_refresh")
       names should contain("query_span")
       names should not contain "execute_refresh_sql_stmt"
+      names should contain("profile_persist")
+      names should contain("state_backup")
+      names should contain("after_query_span")
+      names should contain("command_span")
     }
   }
 
@@ -92,9 +98,29 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       sql("INSERT INTO profile_t3 VALUES (2, 20), (1, 30)")
       clearProfile()
 
-      sql("REFRESH MATERIALIZED VIEW profile_mv3").collect()
+      var backupEntered = false
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/profile-backup"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
+        backupEntered = true
+      }
+      try sql("REFRESH MATERIALIZED VIEW profile_mv3").collect()
+      finally {
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
+      backupEntered shouldBe true
+      OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
 
-      val rows        = showProfile()
+      val rows    = showProfile()
+      val query   = rows.find(_.getString(4) == "query_span").get
+      val backup  = rows.find(_.getString(4) == "state_backup").get
+      val after   = rows.find(_.getString(4) == "after_query_span").get
+      val command = rows.find(_.getString(4) == "command_span").get
+      command.getLong(5) should be >= query.getLong(5)
+      after.getLong(5) should be >= backup.getLong(5)
+      rows.count(_.getString(4) == "query_span") shouldBe 1
+      rows.count(_.getString(4) == "command_span") shouldBe 1
       val stmtDetails = detailsForStep(rows, "execute_refresh_sql_stmt")
       stmtDetails should not be empty
       stmtDetails.exists(_.contains("stmt_kind=")) shouldBe true
@@ -119,6 +145,36 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         detail should include("body_ns=")
         detail should not include spark.conf.get("spark.sql.warehouse.dir")
       }
+    }
+  }
+
+  describe("RefreshProfile — durable backup failure") {
+    it("retains the query profile and records the failed command without leaking its active span") {
+      sql("CREATE TABLE profile_backup_src(k INT) USING DELTA")
+      sql("CREATE MATERIALIZED VIEW profile_backup_mv AS SELECT k FROM profile_backup_src")
+      clearProfile()
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/profile-failed-backup"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
+        throw new java.io.IOException("injected profile backup failure")
+      }
+      try {
+        val failure = intercept[Exception] {
+          sql("REFRESH MATERIALIZED VIEW profile_backup_mv").collect()
+        }
+        Iterator
+          .iterate[Throwable](failure)(_.getCause)
+          .takeWhile(_ != null)
+          .exists(_.getMessage == "injected profile backup failure") shouldBe true
+      } finally {
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
+      OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
+      val rows = showProfile()
+      rows.count(_.getString(4) == "query_span") shouldBe 1
+      rows.count(_.getString(4) == "state_backup") shouldBe 1
+      detailsForStep(rows, "command_span").head should include("outcome=refresh_failed")
     }
   }
 

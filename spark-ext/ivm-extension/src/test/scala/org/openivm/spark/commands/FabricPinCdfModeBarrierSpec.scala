@@ -376,6 +376,100 @@ class FabricPinCdfModeBarrierSpec extends AnyFunSpec with Matchers with BeforeAn
       deps.map(_.key) shouldBe Seq(upKey)
       deps.head.deltaLogDataPath shouldBe upPath
       deps.head.deltaTableMetadataId shouldBe upId
+
+      val reads  = OpenIvmMetrics.timer("catalog.mv_backing_identity.lookup")
+      val before = reads.getCount
+      MvCommandHelper.resolveDirectMvDependencies(
+        spark,
+        TableIdentifier("e_enc_down_mv"),
+        Seq(encodedRef),
+        Some(spark.table(encodedRef).queryExecution.analyzed)
+      ) shouldBe deps
+      // Other managed MVs exist from the preceding barrier scenarios. Only the
+      // candidate at this encoded alias's physical path should be opened.
+      reads.getCount - before shouldBe 1L
+    }
+
+    it("reads only direct source backing logs, including public views inside subqueries") {
+      spark.sql(
+        s"CREATE TABLE $db.prune_src(id INT, amount INT) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
+      )
+      spark.sql(s"INSERT INTO $db.prune_src VALUES (1, 5)")
+      spark
+        .sql(s"CREATE MATERIALIZED VIEW prune_up_mv AS SELECT id, SUM(amount) AS total FROM $db.prune_src GROUP BY id")
+        .collect()
+      val query      = s"SELECT id FROM $db.prune_src WHERE EXISTS (SELECT 1 FROM prune_up_mv)"
+      val self       = TableIdentifier("prune_down_mv")
+      val sources    = Seq(s"$db.prune_src", "prune_up_mv")
+      val reads      = OpenIvmMetrics.timer("catalog.mv_backing_identity.lookup")
+      val fullBefore = reads.getCount
+      val expected   = MvCommandHelper.resolveDirectMvDependencies(spark, self, sources)
+      reads.getCount - fullBefore shouldBe MvCatalog.list(spark).size.toLong
+      expected.map(_.key) shouldBe Seq(MvCommandHelper.metaName(lookup("prune_up_mv").name))
+      val prunedBefore = reads.getCount
+      MvCommandHelper.resolveDirectMvDependencies(
+        spark,
+        self,
+        sources,
+        Some(spark.sql(query).queryExecution.analyzed)
+      ) shouldBe expected
+      reads.getCount - prunedBefore shouldBe 1L
+    }
+
+    it("falls back to fresh identities when an analyzed alias is rebound to another physical source") {
+      spark.sql(
+        s"CREATE TABLE $db.rebind_src(id INT) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
+      )
+      spark.sql(s"INSERT INTO $db.rebind_src VALUES (1)")
+      spark.sql(s"CREATE MATERIALIZED VIEW rebind_up_mv AS SELECT id FROM $db.rebind_src").collect()
+      spark.sql(s"CREATE VIEW $db.rebind_alias AS SELECT id FROM $db.rebind_src")
+      val stalePlan = spark.table(s"$db.rebind_alias").queryExecution.analyzed
+      spark.sql(s"ALTER VIEW $db.rebind_alias AS SELECT id FROM rebind_up_mv")
+      val reads  = OpenIvmMetrics.timer("catalog.mv_backing_identity.lookup")
+      val before = reads.getCount
+      val deps = MvCommandHelper.resolveDirectMvDependencies(
+        spark,
+        TableIdentifier("rebind_down_mv"),
+        Seq(s"$db.rebind_alias"),
+        Some(stalePlan)
+      )
+      deps.map(_.key) shouldBe Seq(MvCommandHelper.metaName(lookup("rebind_up_mv").name))
+      reads.getCount - before shouldBe MvCatalog.list(spark).size.toLong
+      // Unknown relation shapes provide no paths. A successful fresh Delta
+      // resolution must restore the full scan, rather than prove a base source.
+      MvCommandHelper.resolveDirectMvDependencies(
+        spark,
+        TableIdentifier("rebind_down_mv"),
+        Seq(s"$db.rebind_alias"),
+        Some(org.apache.spark.sql.catalyst.plans.logical.LocalRelation())
+      ) shouldBe deps
+    }
+
+    it("qualifies relative backing locations and still rejects ambiguous physical identities") {
+      spark.sql(
+        s"CREATE TABLE $db.ambiguous_src(id INT) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
+      )
+      spark.sql(s"INSERT INTO $db.ambiguous_src VALUES (1)")
+      spark.sql(s"CREATE MATERIALIZED VIEW ambiguous_up_mv AS SELECT id FROM $db.ambiguous_src").collect()
+      val upstream  = lookup("ambiguous_up_mv")
+      val backing   = new File(new org.apache.hadoop.fs.Path(upstream.location).toUri).toPath
+      val relative  = new File(".").getAbsoluteFile.toPath.normalize().relativize(backing).toString
+      val duplicate = upstream.copy(name = TableIdentifier("ambiguous_duplicate_mv"), location = relative + "/")
+      MvCatalog.upsert(spark, duplicate)
+      try {
+        val reads  = OpenIvmMetrics.timer("catalog.mv_backing_identity.lookup")
+        val before = reads.getCount
+        val error = intercept[SourceIdentityRebindingException] {
+          MvCommandHelper.resolveDirectMvDependencies(
+            spark,
+            TableIdentifier("ambiguous_down_mv"),
+            Seq("ambiguous_up_mv"),
+            Some(spark.table("ambiguous_up_mv").queryExecution.analyzed)
+          )
+        }
+        error.getMessage should include("2 managed materialized views")
+        reads.getCount - before shouldBe 2L
+      } finally MvCatalog.remove(spark, duplicate.name)
     }
 
     it("keeps only DIRECT upstream MV keys (no transitive over-locking) and independent base MVs concurrent") {

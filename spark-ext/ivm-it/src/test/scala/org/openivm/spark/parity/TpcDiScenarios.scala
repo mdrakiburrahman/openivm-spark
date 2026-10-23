@@ -6,7 +6,14 @@ import io.delta.tables.DeltaTable
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.functions.col
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode, StagingCatalog}
+import org.openivm.spark.common.{
+  FeatureGate,
+  MvCatalog,
+  RefreshSqlLogAsyncFlusher,
+  RefreshSqlLogCatalog,
+  RefreshTypeCode,
+  StagingCatalog
+}
 import org.openivm.spark.parity.tpcdi.TpcDiFixtureLoader
 
 import java.io.{File, InputStream}
@@ -49,6 +56,9 @@ import scala.util.control.NonFatal
   */
 abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] =
+    Map(FeatureGate.QueryLogEnabledKey -> "true")
 
   // Warehouse on the container's local /tmp (NOT the bind-mounted `target/`)
   // so Delta commit-log file writes hit the container's overlayfs/tmpfs
@@ -137,6 +147,7 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
     // initialisation overrode the levels we set above.
     quietLoggers()
     spark.sparkContext.setLogLevel("ERROR")
+    FeatureGate.queryLogEnabled(spark) shouldBe true
     MvCatalog.ensureTables(spark)
     StagingCatalog.ensureTables(spark)
 
@@ -207,6 +218,8 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
     }
 
     it("batch-2 incremental REFRESH: bag-equal AND structurally incremental") {
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
+      RefreshSqlLogCatalog.removeAll(spark)
       val preVersions = snapshotVersionsForNonFullRefreshMvs()
       val t0          = System.nanoTime()
       TpcDiFixtureLoader.appendBatch(spark, "batch2")
@@ -229,6 +242,8 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
     }
 
     it("batch-3 incremental REFRESH: bag-equal AND structurally incremental") {
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
+      RefreshSqlLogCatalog.removeAll(spark)
       val preVersions = snapshotVersionsForNonFullRefreshMvs()
       val t0          = System.nanoTime()
       TpcDiFixtureLoader.appendBatch(spark, "batch3")
@@ -522,9 +537,12 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
 
   /** For every non-FullRefresh MV: read its Delta history after the
     * pre-batch version snapshot, and fail iff ANY commit in that range
-    * is an unconditional `WRITE` / `Overwrite` (the signature of
-    * [[org.openivm.spark.common.FullRefreshAssembler]] firing, which
-    * would mean the refresh path fell back to a full recompute).
+    * is an unexplained unconditional `WRITE` / `Overwrite`, or the executed
+    * SQL logs show the full-refresh fallback. A global window has the whole
+    * result as its affected domain; its native single-pass replacement also
+    * records an unconditional overwrite. Accept that specific executed SQL
+    * shape only in CDF mode for WINDOW_PARTITION, while rejecting the
+    * full-refresh fallback for every non-FullRefresh MV.
     *
     * MVs with NO commits in the range (no work done — either source had
     * no delta or interceptor never fired) are skipped: there's nothing
@@ -537,6 +555,8 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
       phase: String
   ): Seq[String] = {
     val failures = mutable.ListBuffer.empty[String]
+    RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
+    val logsByView = RefreshSqlLogCatalog.scanAll(spark).filter(_.mode == "refresh").groupBy(_.viewName)
     MvCatalog.list(spark).foreach { meta =>
       if (meta.refreshType != RefreshTypeCode.FullRefresh) {
         val mvName       = serializeMvName(meta.name)
@@ -544,6 +564,23 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
         val dt           = DeltaTable.forPath(spark, meta.location)
         val historySince = dt.history().where(col("version") > preVer).orderBy(col("version"))
         val rows         = historySince.collect()
+        val logs         = logsByView.getOrElse(mvName, Seq.empty)
+        if (logs.exists(_.category == "full_refresh_stmt"))
+          failures += s"[$phase] $mvName (${meta.refreshTypeName}): executed full-refresh fallback"
+        if (rows.nonEmpty && !logs.exists(_.category == "rewritten_stmt"))
+          failures += s"[$phase] $mvName (${meta.refreshTypeName}): missing executed native refresh SQL"
+        val globalWindowSql =
+          s"INSERT INTO delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true " +
+            s"SELECT * FROM `openivm_new_${meta.name.table.replace("`", "``")}`"
+        val isNativeGlobalWindowReplacement =
+          changeFeedMode == org.openivm.spark.common.ChangeFeedMode.Cdf &&
+            meta.refreshType == RefreshTypeCode.WindowPartition &&
+            rows.length == 1 &&
+            logs.count(row =>
+              row.category == "rewritten_stmt" &&
+                row.sqlText.trim.replaceAll("\\s+", " ") == globalWindowSql
+            ) == 1 &&
+            !logs.exists(_.category == "full_refresh_stmt")
         // Empty rows = no new commits = refresh was a no-op (empty source delta). Skip.
         rows.foreach { row =>
           val op       = row.getAs[String]("operation")
@@ -557,7 +594,7 @@ abstract class TpcDiScenarios extends IvmParitySpecBase("tpc-di") {
           val isPredicateScopedOverwrite =
             predicate.exists(p => p.nonEmpty && p != "[]" && !p.equalsIgnoreCase("true"))
           val isOverwriteWrite = op == "WRITE" && mode == "Overwrite" && !isPredicateScopedOverwrite
-          if (isOverwriteWrite) {
+          if (isOverwriteWrite && !isNativeGlobalWindowReplacement) {
             failures += s"[$phase] $mvName (${meta.refreshTypeName}) at v${row.getAs[Long]("version")}: " +
               s"non-incremental WRITE/Overwrite (location=${meta.location}, params=$opParams)"
           }

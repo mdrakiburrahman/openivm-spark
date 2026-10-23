@@ -17,8 +17,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
     val operation: String,
     private val requestId: Option[String],
     private val dbtNodeId: Option[String],
-    private val startedAtEpochMs: Long,
-    private val startedAtNanos: Long,
+    private[spark] val startedAtEpochMs: Long,
+    private[spark] val startedAtNanos: Long,
     private val enabled: Boolean,
     private val configuredExport: Option[ConfiguredTelemetryExport],
     private val oneLakeSink: Option[SpanSink] = None

@@ -1,7 +1,8 @@
 package org.openivm.spark.parity
 
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.MvCatalog
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshSqlLogCatalog}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Regression spec for the SF=10 `gold.fact_holdings diff=18` failure.
@@ -33,6 +34,9 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   */
 abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("simple-projection-bag-delete") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] =
+    Map(FeatureGate.QueryLogEnabledKey -> "true")
 
   // ─────────────────────────────────────────────────────────────────────────
   // (1) Partial retract of value-equal duplicates — the SF=10 fact_holdings
@@ -115,6 +119,8 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
           "(1, NULL, NULL, 'p3')," +
           "(1, NULL, NULL, 'p4')," +
           "(1, NULL, NULL, 'p5')," +
+          "(NULL, NULL, NULL, 'null-1')," +
+          "(NULL, NULL, NULL, 'null-2')," +
           "(2, 1.0, 0.1, 'p6')"
       )
       sql("REFRESH MATERIALIZED VIEW spbd_mv3").collect()
@@ -123,7 +129,7 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
       // Batch 2: retract 2 of the 5 NULL-priced rows. MV must end up with
       // 3 NULL-priced rows; the pre-fix bug deletes ALL 5 because the
       // value-equality `IS NOT DISTINCT FROM` MERGE matches every NULL copy.
-      sql("DELETE FROM spbd_src3 WHERE payload IN ('p1', 'p2')")
+      sql("DELETE FROM spbd_src3 WHERE payload IN ('p1', 'p2', 'null-1')")
       sql("REFRESH MATERIALIZED VIEW spbd_mv3").collect()
       assertMvCorrect("spbd_mv3", "SELECT k, price, fee FROM spbd_src3")
     }
@@ -151,8 +157,18 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
       // drops to 0 (over-delete), k=3 gets 2 (correct). Expected k=1 → 2.
       sql("DELETE FROM spbd_src4 WHERE k=1 AND payload='a'")
       sql("INSERT INTO spbd_src4 VALUES (3,'a'),(3,'b')")
+      val beforeVersion = mvDataVersion("spbd_mv4")
+      RefreshSqlLogCatalog.removeAll(spark)
       sql("REFRESH MATERIALIZED VIEW spbd_mv4").collect()
       assertMvCorrect("spbd_mv4", "SELECT k FROM spbd_src4")
+      mvDataVersion("spbd_mv4") shouldBe beforeVersion + 1L
+      val applySql = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .find(_.contains("__openivm_apply_delete"))
+        .getOrElse(fail("missing atomic bag apply"))
+      applySql should include("v.`k` IN (1)")
+      applySql should include("VERSION AS OF")
     }
   }
 
@@ -209,6 +225,96 @@ abstract class SimpleProjectionBagDeleteScenarios extends IvmParitySpecBase("sim
         }
 
       unconditionalOverwrites shouldBe empty
+    }
+  }
+
+  describe("(6) SIMPLE_PROJECTION raw retractions that cancel in the net delta") {
+    it("preserves native net cancellation in a string-only projection without target deletions") {
+      sql("CREATE TABLE spbd_src6(k INT, payload STRING) USING DELTA")
+      sql("INSERT INTO spbd_src6 VALUES (1,'a'),(1,'b'),(2,'c')")
+      val query = "SELECT CAST(k AS STRING) AS label FROM spbd_src6"
+      sql(s"CREATE MATERIALIZED VIEW spbd_mv6 AS $query")
+      sql("UPDATE spbd_src6 SET payload = 'changed' WHERE k=1")
+      sql("INSERT INTO spbd_src6 VALUES (3,'new')")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("spbd_mv6")
+      assertMvCorrect("spbd_mv6", query)
+      val applySql = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9))
+      // The native compiler can consolidate away the negative rows before
+      // Spark sees them. Preserve that existing append path, too.
+      applySql.find(_.contains("__openivm_apply_delete")) match {
+        case Some(merge) => merge should include("AND (false)")
+        case None        => applySql.exists(_.startsWith("MERGE INTO")) shouldBe false
+      }
+      val history = sql(s"DESCRIBE HISTORY delta.`${mvDataLocation("spbd_mv6")}`").head()
+      val metrics = history.getAs[Map[String, String]]("operationMetrics")
+      history.getAs[String]("operation") match {
+        case "MERGE" =>
+          metrics("numTargetRowsDeleted") shouldBe "0"
+          metrics("numTargetFilesAfterSkipping") shouldBe "0"
+        case "WRITE" =>
+          history.getAs[Map[String, String]]("operationParameters")("mode") shouldBe "Append"
+        case other => fail(s"unexpected net-only operation: $other")
+      }
+    }
+  }
+
+  describe("(7) SIMPLE_PROJECTION bounded string target predicates") {
+    it("prunes exact string keys under both parser settings and falls back on oversized keys") {
+      sql("CREATE TABLE spbd_src7(id INT, k STRING, event_date DATE, watch_cnt BIGINT) USING DELTA")
+      val keys = Seq(Some("quote'key"), Some("back\\slash\\n"), Some("München☃"), None)
+      val values = keys.zipWithIndex.flatMap { case (key, i) =>
+        val literal =
+          key.fold("NULL")(s => s"CAST(${Literal(s.getBytes(java.nio.charset.StandardCharsets.UTF_8)).sql} AS STRING)")
+        val date = if (i == 2) "CAST(NULL AS DATE)" else "DATE '2026-01-01'"
+        (0 until 3).map(j => s"(${i * 10 + j}, $literal, $date, 1)")
+      }
+      sql(s"INSERT INTO spbd_src7 VALUES ${values.mkString(", ")}")
+      val query = "SELECT k, event_date, watch_cnt FROM spbd_src7"
+      sql(s"CREATE MATERIALIZED VIEW spbd_mv7 AS $query")
+      val parserKey       = "spark.sql.parser.escapedStringLiterals"
+      val previous        = spark.conf.getOption(parserKey)
+      val dateApiKey      = "spark.sql.datetime.java8API.enabled"
+      val previousDateApi = spark.conf.getOption(dateApiKey)
+      try {
+        for (escaped <- Seq(false, true)) {
+          spark.conf.set(parserKey, escaped.toString)
+          spark.conf.set(dateApiKey, escaped.toString)
+          val deletedSuffix = if (escaped) 1 else 0
+          sql(s"DELETE FROM spbd_src7 WHERE id % 10 = $deletedSuffix")
+          RefreshSqlLogCatalog.removeAll(spark)
+          refreshMv("spbd_mv7")
+          assertMvCorrect("spbd_mv7", query)
+          val apply = sql("SHOW OPENIVM QUERY LOG")
+            .collect()
+            .map(_.getString(9))
+            .find(_.contains("__openivm_apply_delete"))
+            .getOrElse(fail("missing atomic bag apply"))
+          apply should include("CAST(X'")
+          apply should include("v.`k` IS NULL")
+        }
+      } finally {
+        previous match {
+          case Some(value) => spark.conf.set(parserKey, value)
+          case None        => spark.conf.unset(parserKey)
+        }
+        previousDateApi match {
+          case Some(value) => spark.conf.set(dateApiKey, value)
+          case None        => spark.conf.unset(dateApiKey)
+        }
+      }
+      sql("INSERT INTO spbd_src7 SELECT CAST(id AS INT), REPEAT('x', 1024), DATE '2026-01-01', 1 FROM range(201,204)")
+      refreshMv("spbd_mv7")
+      sql("DELETE FROM spbd_src7 WHERE id = 201")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("spbd_mv7")
+      assertMvCorrect("spbd_mv7", query)
+      val apply = sql("SHOW OPENIVM QUERY LOG")
+        .collect()
+        .map(_.getString(9))
+        .find(_.contains("__openivm_apply_delete"))
+        .getOrElse(fail("missing fallback atomic bag apply"))
+      apply should not include " IN ("
     }
   }
 }

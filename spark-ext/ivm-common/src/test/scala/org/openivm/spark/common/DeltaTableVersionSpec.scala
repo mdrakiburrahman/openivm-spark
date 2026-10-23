@@ -203,6 +203,62 @@ class DeltaTableVersionSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       jobs shouldBe 0
     }
 
+    it("validates CDF from fresh snapshots for registered and catalog-qualified sources") {
+      val suffix = UUID.randomUUID().toString.replace("-", "").take(8)
+      val source = s"dtv_cdf_$suffix"
+      val alias  = s"dtv_cdf_alias_$suffix"
+      val path   = newLocation("cdf")
+      spark.sql(s"CREATE TABLE $source (id INT) USING DELTA LOCATION '$path'")
+      spark.sql(s"CREATE TABLE $alias USING DELTA LOCATION '$path'")
+      try {
+        val names = Seq(source, s"default.$source", s"spark_catalog.default.$source", alias)
+        names.foreach(CdfChangePropagation.tableHasCdf(spark, _) shouldBe false)
+        spark.sql(s"ALTER TABLE $source SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
+        names.foreach(CdfChangePropagation.tableHasCdf(spark, _) shouldBe true)
+        new CdfChangePropagation().validateSources(spark, names)
+        spark.sql(s"ALTER TABLE $source SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'false')")
+        names.foreach(CdfChangePropagation.tableHasCdf(spark, _) shouldBe false)
+        an[org.apache.spark.sql.AnalysisException] should be thrownBy
+          new CdfChangePropagation().validateSources(spark, names)
+      } finally {
+        spark.sql(s"DROP TABLE IF EXISTS $alias")
+        spark.sql(s"DROP TABLE IF EXISTS $source")
+      }
+    }
+
+    it("allows CDF through public MV projections but rejects ordinary views and non-Delta sources") {
+      val suffix     = UUID.randomUUID().toString.replace("-", "").take(8)
+      val source     = s"dtv_cdf_base_$suffix"
+      val projection = s"dtv_cdf_projection_$suffix"
+      val ordinary   = s"dtv_cdf_view_$suffix"
+      val temp       = s"dtv_cdf_temp_$suffix"
+      val parquet    = s"dtv_cdf_parquet_$suffix"
+      spark.sql(
+        s"CREATE TABLE $source USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true') AS SELECT 1 AS id"
+      )
+      spark.sql(
+        s"CREATE VIEW $projection TBLPROPERTIES ('${MvProjectionSource.CatalogProperty}' = 'true') AS SELECT id FROM $source"
+      )
+      spark.sql(s"CREATE VIEW $ordinary AS SELECT id FROM $source")
+      spark.table(source).createOrReplaceTempView(temp)
+      spark.sql(s"CREATE TABLE $parquet USING PARQUET AS SELECT 1 AS id")
+      try {
+        CdfChangePropagation.tableHasCdf(spark, projection) shouldBe true
+        CdfChangePropagation.tableHasCdf(spark, s"spark_catalog.default.$projection") shouldBe true
+        Seq(ordinary, temp, parquet, s"dtv_cdf_missing_$suffix").foreach { name =>
+          CdfChangePropagation.tableHasCdf(spark, name) shouldBe false
+        }
+        spark.sql(s"ALTER TABLE $source SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'false')")
+        CdfChangePropagation.tableHasCdf(spark, projection) shouldBe false
+      } finally {
+        spark.catalog.dropTempView(temp)
+        spark.sql(s"DROP VIEW IF EXISTS $ordinary")
+        spark.sql(s"DROP VIEW IF EXISTS $projection")
+        spark.sql(s"DROP TABLE IF EXISTS $parquet")
+        spark.sql(s"DROP TABLE IF EXISTS $source")
+      }
+    }
+
     it("resolves a version while every task slot is held by a running job") {
       val location = newLocation("contended")
       spark.sql(s"CREATE TABLE delta.`$location` USING DELTA AS SELECT 1 AS id")

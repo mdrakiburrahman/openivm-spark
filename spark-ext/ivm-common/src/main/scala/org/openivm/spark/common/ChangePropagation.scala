@@ -113,8 +113,11 @@ trait ChangePropagation {
     val short    = sourceTable.split("\\.").last
     val viewName = s"openivm_delta_$short"
     val schema   = sourceSchema.add("openivm_timestamp", TimestampType).add("openivm_multiplicity", IntegerType)
+    // A local relation exposes emptiness to Catalyst; an empty RDD still
+    // schedules scans/joins against unchanged deltas. The row-list overload
+    // preserves the supplied schema, including nested types and metadata.
     spark
-      .createDataFrame(spark.sparkContext.emptyRDD[Row], schema)
+      .createDataFrame(java.util.Collections.emptyList[Row](), schema)
       .createOrReplaceTempView(viewName)
     s"/* empty typed delta view `$viewName` (${schema.length} cols) registered via DataFrame API */"
   }
