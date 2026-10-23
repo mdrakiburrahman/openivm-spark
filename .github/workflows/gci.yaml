@@ -65,6 +65,19 @@ jobs:
           include-hidden-files: true
           retention-days: 14
 
+      - name: Collect formatting fixes after failure
+        if: failure()
+        run: |
+          npx --no-install nx run spark-ext:fmt --configuration=${{ matrix.target }}
+          git diff > scala-format.patch
+
+      - name: Upload formatting fixes
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: scala-format-${{ matrix.target }}
+          path: scala-format.patch
+
   compare-test-inventory:
     name: Identical test inventory
     needs: verify

@@ -2744,7 +2744,8 @@ case class CreateMaterializedViewCommand(
             }
           // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
-            if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
+            if (outcome != "create_already_exists")
+              profile.timeStep("state_backup") { OpenIvmStateSync.backupNow(spark) }
             createOutcome = outcome
           }
           outcome
@@ -2753,7 +2754,8 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
+        if (outcome != "create_already_exists")
+          profile.timeStep("state_backup") { OpenIvmStateSync.backupNow(spark) }
         createOutcome = outcome
       }
       if (outcome == "create_executed")
@@ -3837,7 +3839,8 @@ case class RefreshMaterializedViewCommand(
     // count-monoid aggregates.
     val viewMeta = metaName(name)
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
-    val lockT0 = System.nanoTime()
+    val lockT0           = System.nanoTime()
+    var commandCompleted = false
     try {
       // Every refresh — ordinary or source-version-advance — deterministically
       // also holds the DIRECT upstream MV keys taken from its AUTHORITATIVE
@@ -3889,15 +3892,26 @@ case class RefreshMaterializedViewCommand(
       }
       // Garbage is read before the publish and deleted only after it, so the published state
       // never references a deleted staging location.
-      val garbage = OpenIvmGarbageCollector.prepare(spark)
-      OpenIvmStateSync.backupNow(spark)
-      OpenIvmGarbageCollector.collect(spark, garbage)
+      val garbage = RefreshProfile.timeActiveStep("garbage_prepare") {
+        OpenIvmGarbageCollector.prepare(spark)
+      }
+      RefreshProfile.timeActiveStep("state_backup") {
+        OpenIvmStateSync.backupNow(spark)
+      }
+      RefreshProfile.timeActiveStep("garbage_collect") {
+        OpenIvmGarbageCollector.collect(spark, garbage)
+      }
+      commandCompleted = true
       rows
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
-      try RefreshProfile.flushActive()
-      finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+      val failedOutcome = if (commandCompleted) None else Some("refresh_failed")
+      try RefreshProfile.flushActive(failedOutcome)
+      finally {
+        try RefreshSqlLog.finishActive(failedOutcome)
+        finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+      }
     }
   }
 
@@ -4401,7 +4415,9 @@ case class RefreshMaterializedViewCommand(
           totalMs
         )
         profile.completeSpan(outcome, threadName)
-        profile.flush()
+        profile.timeStep("profile_persist") {
+          profile.persist()
+        }
         sqlLog.flush()
       }
     }
@@ -7227,8 +7243,8 @@ case class RefreshMaterializedViewCommand(
         }
     } finally {
       try {
-        if (!endEmitted) profile.flush()
-      } finally sqlLog.finish(queryLogOutcome)
+        if (!endEmitted) profile.persist()
+      } finally sqlLog.prepareFinish(queryLogOutcome)
     }
   }
 
