@@ -189,7 +189,8 @@ private[commands] object GroupedWindowStatePlan extends Logging {
         val cached = unsupported { GroupedDistinctState.checkpoint(spark, view).map(decode) }.flatten
         logDebug(
           s"Grouped-window cache view=$view checkpoint=${cached.nonEmpty} target=${cached.exists(_.target == before)} " +
-            s"version=${before.version}/${meta.lastVersion} sources=${cached.exists(_.sources.map(_.name) == names.sorted.toVector)} " +
+            s"version=${before.version}/${meta.lastVersion} sources=${cached
+                .exists(_.sources.map(_.name) == names.sorted.toVector)} " +
             s"schemas=${cached.exists(_.sources.forall(s => schemas.get(s.name).contains(s.schema)))}"
         )
         cached
@@ -256,7 +257,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
         // Preparation has not written the target or published derived state.
         // Capacity is an optimization limit; identity and integrity failures remain fatal.
         case e: GroupedDistinctState.CapacityExceeded => rejected(e)
-        case e: PrefixReadLimitExceeded              => rejected(e)
+        case e: PrefixReadLimitExceeded               => rejected(e)
       }
     }
   }
