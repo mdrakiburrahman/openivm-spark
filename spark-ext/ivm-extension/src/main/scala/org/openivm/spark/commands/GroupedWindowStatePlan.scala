@@ -183,79 +183,81 @@ private[commands] object GroupedWindowStatePlan extends Logging {
         meta: MvMetadata,
         batches: Seq[CdfChangeBatch],
         deltaFrames: Map[String, DataFrame]
-    ): Option[Refresh] = try {
-      val before = target(spark, meta.location)
-      val cached = unsupported { GroupedDistinctState.checkpoint(spark, view).map(decode) }.flatten
-      logDebug(
-        s"Grouped-window cache view=$view checkpoint=${cached.nonEmpty} target=${cached.exists(_.target == before)} " +
-          s"version=${before.version}/${meta.lastVersion} sources=${cached.exists(_.sources.map(_.name) == names.sorted.toVector)} " +
-          s"schemas=${cached.exists(_.sources.forall(s => schemas.get(s.name).contains(s.schema)))}"
-      )
-      cached
-        .filter(c =>
-          c.target == before && before.version == meta.lastVersion &&
-            c.sources.map(_.name) == names.sorted.toVector && c.sources.forall(s =>
-              schemas.get(s.name).contains(s.schema)
-            )
+    ): Option[Refresh] = {
+      try {
+        val before = target(spark, meta.location)
+        val cached = unsupported { GroupedDistinctState.checkpoint(spark, view).map(decode) }.flatten
+        logDebug(
+          s"Grouped-window cache view=$view checkpoint=${cached.nonEmpty} target=${cached.exists(_.target == before)} " +
+            s"version=${before.version}/${meta.lastVersion} sources=${cached.exists(_.sources.map(_.name) == names.sorted.toVector)} " +
+            s"schemas=${cached.exists(_.sources.forall(s => schemas.get(s.name).contains(s.schema)))}"
         )
-        .flatMap { c =>
-          val changed = batches.groupBy(_.baseTable)
-          if (
-            changed.values.exists(_.size != 1) || !changed.keySet.subsetOf(names.toSet) ||
-            c.sources.exists(s => changed.get(s.name).exists(_.head.startVersionExclusive != s.version))
-          ) None
-          else {
-            val versions = c.sources.map { s =>
-              s.name -> changed.get(s.name).map(_.head.endVersionInclusive).getOrElse(s.version)
-            }.toMap
-            val pins = capture(spark, names, schemas, versions)
-            if (pins.zip(c.sources).exists { case (a, b) => a.path != b.path || a.id != b.id }) None
+        cached
+          .filter(c =>
+            c.target == before && before.version == meta.lastVersion &&
+              c.sources.map(_.name) == names.sorted.toVector && c.sources.forall(s =>
+                schemas.get(s.name).contains(s.schema)
+              )
+          )
+          .flatMap { c =>
+            val changed = batches.groupBy(_.baseTable)
+            if (
+              changed.values.exists(_.size != 1) || !changed.keySet.subsetOf(names.toSet) ||
+              c.sources.exists(s => changed.get(s.name).exists(_.head.startVersionExclusive != s.version))
+            ) None
             else {
-              val current = frames(spark, pins); val cache = state(current)
-              unsupported { cache.cachedSize(before.version.toString) }.flatMap { _ =>
-                val bases = names.flatMap { name =>
-                  val short = spark.sessionState.sqlParser.parseMultipartIdentifier(name).last
-                  Vector(
-                    short                      -> current(name),
-                    ("memory.main." + short)   -> current(name),
-                    ("openivm_delta_" + short) -> deltaFrames(name)
+              val versions = c.sources.map { s =>
+                s.name -> changed.get(s.name).map(_.head.endVersionInclusive).getOrElse(s.version)
+              }.toMap
+              val pins = capture(spark, names, schemas, versions)
+              if (pins.zip(c.sources).exists { case (a, b) => a.path != b.path || a.id != b.id }) None
+              else {
+                val current = frames(spark, pins); val cache = state(current)
+                unsupported { cache.cachedSize(before.version.toString) }.flatMap { _ =>
+                  val bases = names.flatMap { name =>
+                    val short = spark.sessionState.sqlParser.parseMultipartIdentifier(name).last
+                    Vector(
+                      short                      -> current(name),
+                      ("memory.main." + short)   -> current(name),
+                      ("openivm_delta_" + short) -> deltaFrames(name)
+                    )
+                  }.toMap
+                  val complete =
+                    cache.prepare(native(bases), contract.input(current), before.version.toString)(contract.ordinary)
+                  val rows = align(contract.post(current, complete.summary), before.schema)
+                  encode(Checkpoint(pins, before)) // encoding failures precede target mutation
+                  verify(spark, pins)
+                  Some(
+                    new Refresh(
+                      rows,
+                      complete.hits,
+                      complete.misses,
+                      () => {
+                        verify(spark, pins);
+                        require(target(spark, meta.location) == before, "grouped-window target changed before write")
+                      },
+                      version => {
+                        verify(spark, pins)
+                        val after = target(spark, meta.location);
+                        require(
+                          after.version == version && after.id == before.id && after.path == before.path,
+                          "grouped-window target changed during publication"
+                        )
+                        if (version == before.version + 1L)
+                          complete.publish(version.toString, encode(Checkpoint(pins, after)))
+                      }
+                    )
                   )
-                }.toMap
-                val complete =
-                  cache.prepare(native(bases), contract.input(current), before.version.toString)(contract.ordinary)
-                val rows = align(contract.post(current, complete.summary), before.schema)
-                encode(Checkpoint(pins, before)) // encoding failures precede target mutation
-                verify(spark, pins)
-                Some(
-                  new Refresh(
-                    rows,
-                    complete.hits,
-                    complete.misses,
-                    () => {
-                      verify(spark, pins);
-                      require(target(spark, meta.location) == before, "grouped-window target changed before write")
-                    },
-                    version => {
-                      verify(spark, pins)
-                      val after = target(spark, meta.location);
-                      require(
-                        after.version == version && after.id == before.id && after.path == before.path,
-                        "grouped-window target changed during publication"
-                      )
-                      if (version == before.version + 1L)
-                        complete.publish(version.toString, encode(Checkpoint(pins, after)))
-                    }
-                  )
-                )
+                }
               }
             }
           }
-        }
-    } catch {
-      // Preparation has not written the target or published derived state.
-      // Capacity is an optimization limit; identity and integrity failures remain fatal.
-      case e: GroupedDistinctState.CapacityExceeded => rejected(e)
-      case e: PrefixReadLimitExceeded              => rejected(e)
+      } catch {
+        // Preparation has not written the target or published derived state.
+        // Capacity is an optimization limit; identity and integrity failures remain fatal.
+        case e: GroupedDistinctState.CapacityExceeded => rejected(e)
+        case e: PrefixReadLimitExceeded              => rejected(e)
+      }
     }
   }
   final class Initial private[GroupedWindowStatePlan] (

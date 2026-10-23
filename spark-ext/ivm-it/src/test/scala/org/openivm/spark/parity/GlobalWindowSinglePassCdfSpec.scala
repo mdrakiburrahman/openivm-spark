@@ -44,6 +44,19 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     meta.properties.contains("_ivm_grouped_window_input_v1") shouldBe true
     GroupedDistinctState.checkpoint(spark, view).nonEmpty shouldBe true
 
+    def usedGroupedState: Boolean = sql("SHOW OPENIVM QUERY LOG")
+      .collect()
+      .map(_.getString(9))
+      .exists(_.contains("openivm_grouped_result_"))
+    val consumer = "SELECT SUM(n) AS n,SUM(d) AS d FROM gw_capacity_rank"
+    sql(s"CREATE MATERIALIZED VIEW gw_capacity_consumer AS $consumer")
+    sql("INSERT INTO gw_capacity_source VALUES(0,2)")
+    RefreshSqlLogCatalog.removeAll(spark)
+    refreshMv(view)
+    usedGroupedState shouldBe true
+    assertMvCorrect(view, query)
+    refreshMv("gw_capacity_consumer")
+
     val db = OpenIvmRocksDBRegistry.getOrOpen(
       spark,
       OpenIvmStatePaths.perMvDbPath(spark, view),
@@ -58,8 +71,6 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
     initialCache should not be empty
     // Cross the real summary limit with narrow rows, without injecting a fake rejection.
     sql(s"INSERT INTO gw_capacity_source SELECT id,id FROM range(1,${GroupedDistinctState.MaxGroups + 1L})")
-    val consumer = "SELECT SUM(n) AS n,SUM(d) AS d FROM gw_capacity_rank"
-    sql(s"CREATE MATERIALIZED VIEW gw_capacity_consumer AS $consumer")
 
     Vector(
       Vector.empty[String],
@@ -70,10 +81,7 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
       refreshMv(view)
       assertMvCorrect(view, query)
       MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.WindowPartition
-      sql("SHOW OPENIVM QUERY LOG")
-        .collect()
-        .map(_.getString(9))
-        .exists(_.contains("openivm_grouped_result_")) shouldBe false
+      usedGroupedState shouldBe false
       cacheImage shouldBe initialCache
       refreshMv("gw_capacity_consumer")
       assertMvCorrect("gw_capacity_consumer", consumer)
