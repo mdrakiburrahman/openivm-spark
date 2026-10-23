@@ -5,7 +5,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
   */
-final case class RewrittenRefresh(statements: Seq[String])
+final case class RewrittenRefresh(statements: Seq[String], hasRunningWindowProgram: Boolean)
 
 /** Thrown when a snapshot-pinned source read is about to be emitted but the
   * caller supplied no VERIFIED physical Delta path to bind it to.
@@ -516,7 +516,8 @@ object SparkRefreshRewriter {
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
-      var viewDeltaMaterialized = false
+      var viewDeltaMaterialized   = false
+      var hasRunningWindowProgram = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
@@ -566,6 +567,7 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
+            hasRunningWindowProgram = true
             rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
           case StatementKind.RunningWindowFastInsert =>
             Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
@@ -610,7 +612,7 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
+      RewrittenRefresh(withSemiJoinRewrite.map(postProcess), hasRunningWindowProgram)
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)

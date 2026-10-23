@@ -1522,6 +1522,26 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
 
+    it("reports running-window programs independently of final SQL formatting") {
+      val recomputeOnly =
+        "CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;"
+      Seq(p52Input -> true, recomputeOnly -> false).foreach { case (compiledSql, expected) =>
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = compiledSql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          postProcess = _.toUpperCase(java.util.Locale.ROOT),
+          mvVersionBeforeRefresh = Some(3)
+        )
+        rewritten.statements should not be empty
+        rewritten.hasRunningWindowProgram shouldBe expected
+        rewritten.statements.exists(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_")) shouldBe false
+      }
+    }
+
     it("materialises running-window helper CREATEs as version-pinned, eagerly cached temporary views") {
       val rewritten = rewriteP52()
       val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))

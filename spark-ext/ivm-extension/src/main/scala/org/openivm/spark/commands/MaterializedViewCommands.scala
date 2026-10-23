@@ -6452,7 +6452,7 @@ case class RefreshMaterializedViewCommand(
               // Native suffix programs already contain both fallback and fast writes.
               // Recompute-only optimizations cannot replace just their fallback half.
               val optimizeWindowRecompute = meta.refreshType == RefreshTypeCode.WindowPartition &&
-                !rewritten.statements.exists(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
+                !rewritten.hasRunningWindowProgram
               val windowSuffixSql: Option[WindowSuffixSql] =
                 if (
                   FeatureGate.windowSuffixSkipEnabled(spark) &&
