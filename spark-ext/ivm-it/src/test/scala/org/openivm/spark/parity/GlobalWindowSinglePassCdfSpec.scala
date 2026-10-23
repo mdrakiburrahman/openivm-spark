@@ -57,7 +57,7 @@ abstract class GlobalWindowSinglePassCdfBase(backing: Boolean, cache: Boolean = 
 
     // Derived rows and this versioned checkpoint are published in one RocksDB batch.
     def cacheCheckpoint: Option[Vector[Byte]] = GroupedDistinctState.checkpoint(spark, view).map(_.toVector)
-    val initialCheckpoint = cacheCheckpoint
+    val initialCheckpoint                     = cacheCheckpoint
     initialCheckpoint.nonEmpty shouldBe true
     // Cross the real summary limit with narrow rows, without injecting a fake rejection.
     sql(s"INSERT INTO gw_capacity_source SELECT id,id FROM range(1,${GroupedDistinctState.MaxGroups + 1L})")
