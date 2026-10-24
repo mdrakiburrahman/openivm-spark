@@ -105,7 +105,13 @@ configured archive.
 Lifecycle admission and native stream cancellation use independent finite
 budgets. Admission begins immediately before canonical target and managed-parent
 guards are acquired, so definition/query analysis does not consume lock-wait
-time. One admission deadline covers every guard in the command. A separate stop
+time. A semantic rebuild also discovers its downstream cascade before admission.
+The complete target, parent, and descendant guard set is acquired in canonical
+order under one shared deadline, rather than acquiring new descendant guards
+after potentially slow manifest reconciliation. The cascade is revalidated
+under those guards before any writer is stopped; if it changed during admission,
+CREATE fails without authorizing cleanup and must be resubmitted.
+One admission deadline covers every guard in the command. A separate stop
 deadline begins with the first native cancellation and covers every writer in a
 cascade:
 
@@ -276,3 +282,24 @@ The implementation uses native append/complete output modes and native
 processing-time or `AvailableNow` triggers. It does not provide continuous
 processing, an update-mode MERGE sink, arbitrary Scala state callbacks, or a
 pipeline scheduler.
+
+### Expired committed-batch replay
+
+`spark.openivm.streaming.repairExpiredCommittedBatchReplay` defaults to `true`.
+Before restarting an exclusively owned, stateless Delta streaming table, OpenIVM
+checks the last fully committed batch. If only its discarded restart replay start
+has expired from the source Delta log, it appends an identical offset and commit
+pair using Spark's checkpoint logs. Spark then replays an empty range; target
+rows and source positions are unchanged. Normal incremental ingestion resumes.
+This does not extend source retention or recover unread data. A successful repair
+logs a WARN and emits the `streaming_committed_replay_repaired` insight event
+with the committed/replay batch IDs and per-source version ranges.
+
+The repair requires matching Delta source identities/counts, both adjacent offset
+records, a matching latest commit, no initial-snapshot offsets, an explicitly
+stateless plan, and no `state/` checkpoint directory. Other checkpoints are left to
+Spark. An expired committed **end** offset fails closed with a full-refresh rebuild
+message. The lifecycle lock serializes repairs with OpenIVM starts/stops; external
+writers must never share the checkpoint. Set the flag to `false` to leave native
+Spark restart behavior unchanged. Interrupted repairs leave at most an uncommitted
+empty batch, which Spark can execute safely on the next restart.

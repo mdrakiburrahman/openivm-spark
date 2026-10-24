@@ -273,6 +273,7 @@ object OpenIvmInsightsContract {
     val StreamingCheckpointArchived: String         = "streaming_checkpoint_archived"
     val StreamingQueryStarted: String               = "streaming_query_started"
     val StreamingQueryResumed: String               = "streaming_query_resumed"
+    val StreamingCommittedReplayRepaired: String    = "streaming_committed_replay_repaired"
     val StreamingQueryRestarted: String             = "streaming_query_restarted"
     val StreamingQueryStopped: String               = "streaming_query_stopped"
     val StreamingQueryStopTimeout: String           = "streaming_query_stop_timeout"

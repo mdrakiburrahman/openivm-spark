@@ -86,6 +86,8 @@ object FeatureGate {
 
   val StreamingLifecycleAdmissionTimeoutKey: String =
     "spark.openivm.streaming.lifecycleAdmissionTimeout"
+  val StreamingRepairExpiredCommittedBatchReplayKey: String =
+    "spark.openivm.streaming.repairExpiredCommittedBatchReplay"
   val StreamingStopTimeoutKey: String                   = "spark.openivm.streaming.stopTimeout"
   val StreamingFirstProgressTimeoutKey: String          = "spark.openivm.streaming.firstProgressTimeout"
   val StreamingLifecycleAdmissionTimeoutDefault: String = "60s"
