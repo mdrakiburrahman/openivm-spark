@@ -105,7 +105,13 @@ configured archive.
 Lifecycle admission and native stream cancellation use independent finite
 budgets. Admission begins immediately before canonical target and managed-parent
 guards are acquired, so definition/query analysis does not consume lock-wait
-time. One admission deadline covers every guard in the command. A separate stop
+time. A semantic rebuild also discovers its downstream cascade before admission.
+The complete target, parent, and descendant guard set is acquired in canonical
+order under one shared deadline, rather than acquiring new descendant guards
+after potentially slow manifest reconciliation. The cascade is revalidated
+under those guards before any writer is stopped; if it changed during admission,
+CREATE fails without authorizing cleanup and must be resubmitted.
+One admission deadline covers every guard in the command. A separate stop
 deadline begins with the first native cancellation and covers every writer in a
 cascade:
 
