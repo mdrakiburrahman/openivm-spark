@@ -144,7 +144,7 @@ object LptsSparkDialect {
                             rewriteTimestampWithTimeZone(
                               rewriteSparkFunctionInlinings(
                                 rewriteToTimestampDoubleCast(
-                                  rewriteNowTimestamp(rewriteLikeOperators(sql))
+                                  rewriteNowTimestamp(rewriteLikeOperators(rewriteQuotedCastTypes(sql)))
                                 )
                               )
                             )
@@ -235,6 +235,34 @@ object LptsSparkDialect {
       case "HUGEINT" | "UHUGEINT"      => "BIGINT"
       case t                           => t
     }
+
+  /** DuckDB can serialize built-in cast types as identifiers, e.g. `"DATE"`.
+    * Spark requires an unquoted type name. Track CAST parentheses so a column
+    * alias named DATE remains an identifier, including inside subqueries.
+    */
+  private[compiler] def rewriteQuotedCastTypes(sql: String): String = {
+    val castStart  = "(?i)(?:TRY_)?CAST\\s*\\(".r.pattern.matcher(sql)
+    val castType   = "(?i)AS\\s+([\"`])([A-Za-z][A-Za-z0-9_]*)\\1(?=\\s*[()])".r.pattern.matcher(sql)
+    var castParens = List.empty[Boolean]
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
+      val boundary = index == 0 || !(sql.charAt(index - 1).isLetterOrDigit || sql.charAt(index - 1) == '_')
+      castStart.region(index, sql.length)
+      castType.region(index, sql.length)
+      if (boundary && castStart.lookingAt()) {
+        castParens = true :: castParens
+        Some(castStart.end() -> sql.substring(index, castStart.end()))
+      } else if (boundary && castParens.headOption.contains(true) && castType.lookingAt()) {
+        Some(castType.end() -> s"AS ${normalizeSparkTypeName(castType.group(2))}")
+      } else {
+        sql.charAt(index) match {
+          case '(' => castParens = false :: castParens
+          case ')' => castParens = castParens.drop(1)
+          case _   =>
+        }
+        None
+      }
+    }
+  }
 
   /** Rewrites DuckDB's `to_<unit>(N)` interval constructors to Spark's
     * `INTERVAL N <UNIT>` syntax. openivm emits these forms when a user view

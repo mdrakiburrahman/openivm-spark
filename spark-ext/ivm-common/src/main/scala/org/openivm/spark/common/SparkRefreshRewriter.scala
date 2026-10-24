@@ -5,7 +5,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
   */
-final case class RewrittenRefresh(statements: Seq[String])
+final case class RewrittenRefresh(statements: Seq[String], hasRunningWindowProgram: Boolean)
 
 /** Thrown when a snapshot-pinned source read is about to be emitted but the
   * caller supplied no VERIFIED physical Delta path to bind it to.
@@ -516,7 +516,8 @@ object SparkRefreshRewriter {
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
 
-      var viewDeltaMaterialized = false
+      var viewDeltaMaterialized   = false
+      var hasRunningWindowProgram = false
       val rewritten: Seq[String] = stmts.flatMap { stmt =>
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
@@ -566,6 +567,7 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
+            hasRunningWindowProgram = true
             rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
           case StatementKind.RunningWindowFastInsert =>
             Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
@@ -610,7 +612,7 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
+      RewrittenRefresh(withSemiJoinRewrite.map(postProcess), hasRunningWindowProgram)
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
@@ -815,7 +817,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDrop
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
-      upper.contains("OPENIVM_RUN_FAST_")
+      (upper.contains("OPENIVM_RUN_FAST_") || upper.contains("OPENIVM_RUN_RESULT_"))
     ) {
       // WINDOW running-suffix fast-path cascade delta: an APPEND of the
       // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
@@ -823,7 +825,8 @@ object SparkRefreshRewriter {
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
       // statement appends to it. Distinguished from the fallback cascade by the
-      // OPENIVM_RUN_FAST_ reference (the fallback reads openivm_old/openivm_new).
+      // OPENIVM_RUN_FAST_ or materialized OPENIVM_RUN_RESULT_ reference (the
+      // fallback reads openivm_old/openivm_new).
       StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
@@ -869,7 +872,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDataInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-      upper.contains(" OPENIVM_RUN_FAST_")
+      (upper.contains(" OPENIVM_RUN_FAST_") || upper.contains(" OPENIVM_RUN_RESULT_"))
     ) {
       StatementKind.RunningWindowFastInsert
     } else if (
@@ -3080,8 +3083,11 @@ object SparkRefreshRewriter {
     val headerRe = ("(?is)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
       "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+EXISTS\\s*\\(").r
     headerRe.findFirstMatchIn(stmt) match {
-      case None => stmt
+      case None    => stmt
       case Some(m) =>
+        // The EXISTS source can refer to CTEs defined before DELETE. Keep
+        // those definitions in the MERGE source's query scope.
+        val ctePrefix   = stmt.substring(0, m.start).trim
         val tgtAlias    = Option(m.group(1)).getOrElse("v")
         val existsOpen  = m.end - 1
         val existsClose = findMatchingCloseParen(stmt, existsOpen)
@@ -3117,24 +3123,26 @@ object SparkRefreshRewriter {
               .map { t =>
                 val affAlias = t.group(1)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(2), tgtAlias, affAlias)
+                val source   = if (ctePrefix.isEmpty) subBody else s"$ctePrefix\n$subBody"
                 s"""|MERGE INTO $mvRef AS v
                   |USING (
-                  |$subBody
+                  |$source
                   |) AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:AS\s+)?(\w+)\s+WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)(?:\s+(?:AS\s+)?(\w+))?\s+WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>
                 val src      = t.group(1)
-                val affAlias = t.group(2)
+                val affAlias = Option(t.group(2)).getOrElse(src)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                val source   = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v
-                  |USING $src AS d
+                  |USING $source AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }

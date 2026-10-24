@@ -49,6 +49,85 @@ abstract class SimpleProjectionOuterJoinScenarios extends IvmParitySpecBase("sim
     }
   }
 
+  describe("nested LEFT JOIN with a widened nullable lookup key") {
+    it("preserves null-padded duplicates through mixed changes") {
+      sql("CREATE TABLE spoj_n_events(id INT) USING DELTA")
+      sql("CREATE TABLE spoj_n_profiles(id INT, value INT) USING DELTA")
+      sql("CREATE TABLE spoj_n_dimensions(value INT, dimension_key INT) USING DELTA")
+      sql("INSERT INTO spoj_n_events VALUES (1)")
+      sql("INSERT INTO spoj_n_profiles VALUES (1, 10)")
+      sql("INSERT INTO spoj_n_dimensions VALUES (10, 2)")
+
+      // The BIGINT cast also arises implicitly for an INT key coalesced with
+      // -2147483648. The first lookup's nullable key must survive that cast.
+      val viewBody =
+        "SELECT e.id, COALESCE(d.dimension_key, 1) AS dimension_key " +
+          "FROM spoj_n_events e " +
+          "LEFT JOIN spoj_n_profiles p ON e.id = p.id " +
+          "LEFT JOIN spoj_n_dimensions d ON COALESCE(CAST(p.value AS BIGINT), -1) = d.value"
+      sql(s"CREATE MATERIALIZED VIEW spoj_n_mv AS $viewBody")
+      assertSimpleProjection("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+
+      sql("INSERT INTO spoj_n_events VALUES (2), (2)")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+
+      sql("INSERT INTO spoj_n_profiles VALUES (2, 20)")
+      sql("INSERT INTO spoj_n_dimensions VALUES (20, 3)")
+      sql("UPDATE spoj_n_profiles SET value = 20 WHERE id = 1")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+
+      sql("DELETE FROM spoj_n_profiles WHERE id = 2")
+      sql("DELETE FROM spoj_n_dimensions WHERE value = 20")
+      refreshMv("spoj_n_mv")
+      assertMvCorrect("spoj_n_mv", viewBody)
+      assertSimpleProjection("spoj_n_mv")
+    }
+  }
+
+  describe("affected-key CTE scope") {
+    it("keeps affected-key CTEs in executable delete MERGEs") {
+      sql("CREATE TABLE spoj_cte_target(openivm_left_key INT, label STRING) USING DELTA")
+      val target = spark.sessionState.sqlParser.parseTableIdentifier("spoj_cte_target")
+      Seq(false, true).foreach { inlineSource =>
+        sql("DELETE FROM spoj_cte_target")
+        sql(
+          "INSERT INTO spoj_cte_target VALUES (NULL, 'drop-null'), (1, 'drop-a'), (1, 'drop-b'), (2, 'keep'), (2, 'keep')"
+        )
+        val source =
+          if (inlineSource)
+            "(SELECT openivm_left_key FROM openivm_affected WHERE openivm_left_key IS NULL OR openivm_left_key = 1)"
+          else "openivm_affected"
+        val compiled =
+          s"""WITH affected_seed AS (
+             |  SELECT CAST(NULL AS INT) AS openivm_left_key UNION ALL SELECT 1 UNION ALL SELECT 1
+             |), openivm_affected AS (SELECT DISTINCT openivm_left_key FROM affected_seed)
+             |DELETE FROM openivm_data_spoj_cte_target AS tgt
+             |WHERE EXISTS (SELECT 1 FROM $source AS aff
+             |WHERE aff.openivm_left_key IS NOT DISTINCT FROM tgt.openivm_left_key);
+             |""".stripMargin
+        val rewritten = org.openivm.spark.common.SparkRefreshRewriter.rewrite(
+          compiledSql = compiled,
+          mvName = target,
+          mvLocation = warehouseDir,
+          viewLogicalName = "spoj_cte_target",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = s"$warehouseDir/unused-view-delta"
+        )
+        rewritten.statements should have size 1
+        rewritten.statements.foreach(statement => sql(statement).collect())
+        assertMvCorrect(
+          "spoj_cte_target",
+          "SELECT CAST(2 AS INT) AS openivm_left_key, 'keep' AS label UNION ALL SELECT 2, 'keep'"
+        )
+      }
+    }
+  }
+
   describe("RIGHT JOIN SIMPLE_PROJECTION") {
     it("uses incremental partial recompute for preserved-right transitions") {
       sql("CREATE TABLE IF NOT EXISTS spoj_r_sales(id INT, product_id INT, qty INT) USING DELTA")

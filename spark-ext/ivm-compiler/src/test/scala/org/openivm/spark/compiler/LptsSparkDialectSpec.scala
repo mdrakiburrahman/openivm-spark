@@ -10,6 +10,34 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("rewriteQuotedCastTypes") {
+    it("normalizes quoted CAST and TRY_CAST types through nested expressions") {
+      val sql = """SELECT CAST(coalesce(TRY_CAST(x AS "DATE"), CAST(NULL AS `DATE`)) AS "DATE"),
+        |CAST(x AS "VARCHAR"), CAST(x AS "DECIMAL"(12, 2))""".stripMargin
+      LptsSparkDialect.rewriteQuotedCastTypes(sql) shouldBe
+        """SELECT CAST(coalesce(TRY_CAST(x AS DATE), CAST(NULL AS DATE)) AS DATE),
+          |CAST(x AS STRING), CAST(x AS DECIMAL(12, 2))""".stripMargin
+    }
+
+    it("preserves aliases, literals, quoted identifiers, and comments containing cast syntax") {
+      val sql = """SELECT CAST((SELECT x AS "DATE") AS "DATE"),
+        |'CAST(NULL AS "DATE")', "CAST(NULL AS ""DATE"")", `CAST(NULL AS "DATE")`,
+        |CAST(')' AS "DATE") /* CAST(NULL AS "DATE") */ -- CAST(NULL AS "DATE")
+        |""".stripMargin
+      LptsSparkDialect.rewriteQuotedCastTypes(sql) shouldBe
+        sql
+          .replace("(SELECT x AS \"DATE\") AS \"DATE\"", "(SELECT x AS \"DATE\") AS DATE")
+          .replace("CAST(')' AS \"DATE\")", "CAST(')' AS DATE)")
+    }
+
+    it("keeps DATE column aliases quoted and is idempotent through the full dialect pipeline") {
+      val sql      = """SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS "DATE") END AS "DATE") AS "DATE" FROM t"""
+      val expected = "SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS DATE) END AS DATE) AS `DATE` FROM t"
+      LptsSparkDialect.translate(sql) shouldBe expected
+      LptsSparkDialect.translate(expected) shouldBe expected
+    }
+  }
+
   // ── 1. generate_series (2-arg) ───────────────────────────────────────────────
   describe("rewriteGenerateSeries") {
     it("rewrites generate_series(1, 10) to sequence(1, 10)") {

@@ -91,6 +91,14 @@ abstract class DucklakeWindowDeltaScenarios extends IvmParitySpecBase("ducklake-
       // Now refresh the downstream join MV that reads from the upstream MV.
       refreshMv("dlwd_mv_market_join")
       assertMvCorrect("dlwd_mv_market_join", mvJoinSql)
+
+      // A backdated batch must use partition replacement and preserve the
+      // hidden ROWS state and the downstream signed delta as well.
+      sql("INSERT INTO dlwd_market VALUES ('A', 0, 50)")
+      refreshMv("dlwd_mv_market")
+      assertMvCorrect("dlwd_mv_market", mvMarketSql)
+      refreshMv("dlwd_mv_market_join")
+      assertMvCorrect("dlwd_mv_market_join", mvJoinSql)
     }
   }
 }
