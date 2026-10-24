@@ -397,7 +397,7 @@ object StreamingTableManager {
           )
           val manifest = StreamingTableMetadata.writeManifest(spark, target, definition)
           publishDependencyTarget(spark, target, definition, verifiedDependencySources)
-          val status = startNative(spark, frame, runtime, target, manifest, "initializing")
+          val status = startNative(spark, frame, runtime, target, manifest, "initializing", insight.operationId)
           insight.observe(status)
           StreamingInsightEvents.action(
             spark,
@@ -1064,7 +1064,8 @@ object StreamingTableManager {
           runtime,
           target,
           effectiveManifest,
-          if (changedTuning) "restarted" else "initializing"
+          if (changedTuning) "restarted" else "initializing",
+          insight.operationId
         )
         insight.observe(status)
         StreamingInsightEvents.action(
@@ -1290,7 +1291,8 @@ object StreamingTableManager {
       )
       val replacementManifest = StreamingTableMetadata.writeManifest(spark, replacement, definition)
       publishDependencyTarget(spark, replacement, definition)
-      val status = startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding")
+      val status =
+        startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding", insight.operationId)
       insight.observe(status)
       StreamingInsightEvents.action(
         spark,
@@ -2020,10 +2022,12 @@ object StreamingTableManager {
       runtime: StreamingRuntimeOptions,
       target: StreamingTableTarget,
       manifest: StreamingTableManifest,
-      status: String
+      status: String,
+      operationId: String
   ): StreamingTableStatus = {
     val key       = StreamingTableRegistry.targetKey(target)
     val queryName = target.queryName(runtime.displayName)
+    StreamingCommittedReplayRepair.beforeStart(spark, frame, target, Some(operationId))
     var writer = frame.writeStream
       .format("delta")
       .outputMode(runtime.outputMode)
