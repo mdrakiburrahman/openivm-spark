@@ -3,6 +3,7 @@ package org.openivm.spark.streaming
 import org.apache.hadoop.fs.Path
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.catalyst.optimizer.InlineCTE
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, Project, SubqueryAlias, Union, View}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.sources.DeltaSourceOffset
@@ -36,7 +37,8 @@ private[streaming] object StreamingCommittedReplayRepair extends Logging {
     val fs         = checkpoint.getFileSystem(conf)
     if (!fs.exists(checkpoint) || fs.exists(new Path(checkpoint, "state"))) return
 
-    val plan = frame.queryExecution.analyzed
+    // Spark inlines CTEs before collecting streaming sources; inspect the same expanded structure.
+    val plan = InlineCTE(alwaysInline = true)(frame.queryExecution.analyzed)
     // An allow-list is deliberately narrower than Spark's evolving set of stateful operators.
     // Unknown operators, static joins, aggregates, watermarks and deduplication are not repaired.
     if (

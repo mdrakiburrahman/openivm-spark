@@ -49,6 +49,30 @@ class StreamingCommittedReplayRepairSpec extends AnyFunSpec with StreamingSqlTes
       assertBagEqual(target, expected(sources.size, Seq(1, 2, 3, 4)))
     }
 
+    it("recovers the production three-source CTE UNION ALL without changing source positions or losing history") {
+      val sources     = Seq("strreplay_cte_a", "strreplay_cte_b", "strreplay_cte_c")
+      val target      = "strreplay_cte_target"
+      val declaration = seed(sources, target, withCtes = true)
+      val checkpoint  = completedCheckpoint(declaration)
+      val before      = StreamingReplayCheckpointLog.latestCommitted(spark, checkpoint).get
+      sources.foreach { source =>
+        insertRows(source, "(3)")
+        expireBefore(source, 3L)
+      }
+
+      createStreamingSqlToCompletion(declaration).inputRows shouldBe 3L
+      checkpointText(checkpoint, s"offsets/${before.batchId + 1L}") shouldBe
+        checkpointText(checkpoint, s"offsets/${before.batchId}")
+      checkpointText(checkpoint, s"commits/${before.batchId + 1L}") shouldBe
+        checkpointText(checkpoint, s"commits/${before.batchId}")
+      assertBagEqual(target, expected(sources.size, Seq(1, 2, 3)))
+      createStreamingSqlToCompletion(declaration).inputRows shouldBe 0L
+      assertBagEqual(target, expected(sources.size, Seq(1, 2, 3)))
+      sources.foreach(insertRows(_, "(4)"))
+      createStreamingSqlToCompletion(declaration).inputRows shouldBe 3L
+      assertBagEqual(target, expected(sources.size, Seq(1, 2, 3, 4)))
+    }
+
     it("adds an identical horizon only once and safely resumes an interrupted empty batch") {
       val source      = "strreplay_idempotent_source"
       val target      = "strreplay_idempotent_target"
@@ -93,6 +117,10 @@ class StreamingCommittedReplayRepairSpec extends AnyFunSpec with StreamingSqlTes
       assertNotRepaired("aggregate", stateful = true)
     }
 
+    it("does not modify a checkpoint for an aggregate hidden inside a CTE") {
+      assertNotRepaired("cte_aggregate", stateful = true, withCte = true)
+    }
+
     it("does not modify a checkpoint with a state directory even if empty") {
       assertNotRepaired("state", stateDirectory = true)
     }
@@ -106,12 +134,20 @@ class StreamingCommittedReplayRepairSpec extends AnyFunSpec with StreamingSqlTes
     }
   }
 
-  private def seed(sources: Seq[String], target: String): String = {
+  private def seed(sources: Seq[String], target: String, withCtes: Boolean = false): String = {
     sources.foreach { source =>
       createDeltaSource(source, "id INT")
       insertRows(source, "(1)")
     }
-    val query = sources.map(source => s"SELECT id FROM STREAM ${quoteIdentifier(source)}").mkString(" UNION ALL ")
+    val branches = sources.map(source => s"SELECT id FROM STREAM ${quoteIdentifier(source)}")
+    val query =
+      if (withCtes) {
+        val definitions = branches.zipWithIndex.map { case (branch, index) =>
+          s"branch_$index AS ($branch WHERE id >= 1)"
+        }
+        val selections = sources.indices.map(index => s"SELECT * FROM branch_$index")
+        s"WITH ${definitions.mkString(", ")} ${selections.mkString(" UNION ALL ")}"
+      } else branches.mkString(" UNION ALL ")
     val declaration =
       s"CREATE STREAMING TABLE ${quoteIdentifier(target)} OPTIONS ('trigger' = 'availableNow') AS $query"
     createStreamingSqlToCompletion(declaration)
@@ -143,7 +179,8 @@ class StreamingCommittedReplayRepairSpec extends AnyFunSpec with StreamingSqlTes
       stateful: Boolean = false,
       stateDirectory: Boolean = false,
       deleteCommit: Boolean = false,
-      deletePrevious: Boolean = false
+      deletePrevious: Boolean = false,
+      withCte: Boolean = false
   ): Unit = {
     val source      = s"strreplay_${suffix}_source"
     val target      = s"strreplay_${suffix}_target"
@@ -156,8 +193,14 @@ class StreamingCommittedReplayRepairSpec extends AnyFunSpec with StreamingSqlTes
     if (deletePrevious) assert(fs.delete(new Path(checkpoint, s"offsets/${batch.batchId - 1L}"), false))
     insertRows(source, "(3)")
     expireBefore(source, 3L)
-    val input    = spark.readStream.format("delta").table(source)
-    val frame    = if (stateful) input.groupBy("id").count() else input
+    val input = spark.readStream.format("delta").table(source)
+    val frame =
+      if (withCte) {
+        val view = s"strreplay_${suffix}_input"
+        input.createOrReplaceTempView(view)
+        spark.sql(s"WITH counts AS (SELECT id, count(*) AS count FROM $view GROUP BY id) SELECT * FROM counts")
+      } else if (stateful) input.groupBy("id").count()
+      else input
     val resolved = StreamingTableMetadata.resolveDeltaTarget(spark, Seq(target), requireTableIdMarker = true)
     StreamingCommittedReplayRepair.beforeStart(spark, frame, resolved)
     fs.exists(new Path(checkpoint, s"offsets/${batch.batchId + 1L}")) shouldBe false

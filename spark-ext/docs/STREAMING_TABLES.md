@@ -297,9 +297,12 @@ with the committed/replay batch IDs and per-source version ranges.
 
 The repair requires matching Delta source identities/counts, both adjacent offset
 records, a matching latest commit, no initial-snapshot offsets, an explicitly
-stateless plan, and no `state/` checkpoint directory. Other checkpoints are left to
-Spark. An expired committed **end** offset fails closed with a full-refresh rebuild
-message. The lifecycle lock serializes repairs with OpenIVM starts/stops; external
+stateless plan, and no `state/` checkpoint directory. CTEs are inlined for the
+eligibility check so filtered/projection `UNION ALL` branches are recognized;
+aggregates and other unsupported operators inside CTEs remain ineligible.
+Other checkpoints are left to Spark. An expired committed **end** offset fails
+closed with a full-refresh rebuild message. The lifecycle lock serializes repairs
+with OpenIVM starts/stops; external
 writers must never share the checkpoint. Set the flag to `false` to leave native
 Spark restart behavior unchanged. Interrupted repairs leave at most an uncommitted
 empty batch, which Spark can execute safely on the next restart.
