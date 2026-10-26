@@ -10,7 +10,8 @@ import org.openivm.spark.common.FeatureGate
 private[spark] final case class StreamingLifecycleSettings(
     lifecycleAdmissionTimeout: FiniteDuration,
     stopTimeout: FiniteDuration,
-    firstProgressTimeout: FiniteDuration
+    firstProgressTimeout: FiniteDuration,
+    repairExpiredCommittedBatchReplay: Boolean
 )
 
 private[spark] object StreamingLifecycleSettings {
@@ -54,7 +55,19 @@ private[spark] object StreamingLifecycleSettings {
       firstProgressTimeout = duration(
         FeatureGate.StreamingFirstProgressTimeoutKey,
         read(FeatureGate.StreamingFirstProgressTimeoutKey).getOrElse(FeatureGate.StreamingFirstProgressTimeoutDefault)
-      )
+      ),
+      repairExpiredCommittedBatchReplay = read(FeatureGate.StreamingRepairExpiredCommittedBatchReplayKey)
+        .map { value =>
+          Option(value).map(_.trim.toLowerCase(java.util.Locale.ROOT)) match {
+            case Some("true")  => true
+            case Some("false") => false
+            case _ =>
+              StreamingTableErrors.invalid(
+                s"Configuration '${FeatureGate.StreamingRepairExpiredCommittedBatchReplayKey}' must be true or false."
+              )
+          }
+        }
+        .getOrElse(true)
     )
 
   private def duration(key: String, value: String): FiniteDuration = {

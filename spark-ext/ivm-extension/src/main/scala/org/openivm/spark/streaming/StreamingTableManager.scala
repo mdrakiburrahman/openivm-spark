@@ -68,6 +68,7 @@ object StreamingTableManager {
         val configured = lifecycleSettings
         val started = LifecycleDeadline.start(
           configured.lifecycleAdmissionTimeout,
+          nanoTime = () => admissionNanoTime(),
           context = LifecycleDeadlineContext(
             phase = "lifecycle_admission",
             operationId = Some(operationId),
@@ -78,11 +79,6 @@ object StreamingTableManager {
         admissionBudget = Some(started)
         started
       }
-
-    def admissionDeadline: LifecycleDeadline =
-      admissionBudget.getOrElse(
-        throw new IllegalStateException("Streaming lifecycle admission deadline was not initialized")
-      )
 
     def stopDeadline: LifecycleDeadline =
       stopBudget.getOrElse {
@@ -128,6 +124,15 @@ object StreamingTableManager {
   @volatile private var beforeCascadeDropHookForTesting: StreamingTableCascadeTarget => Unit =
     (_: StreamingTableCascadeTarget) => ()
 
+  @volatile private var admissionNanoTime: () => Long              = () => System.nanoTime()
+  @volatile private var afterRebuildPlanHookForTesting: () => Unit = () => ()
+
+  private[streaming] def setAdmissionNanoTimeForTesting(clock: () => Long): Unit =
+    admissionNanoTime = clock
+
+  private[streaming] def setAfterRebuildPlanHookForTesting(hook: () => Unit): Unit =
+    afterRebuildPlanHookForTesting = hook
+
   private[streaming] def setBeforeCascadeDropHookForTesting(
       hook: StreamingTableCascadeTarget => Unit
   ): Unit =
@@ -169,9 +174,20 @@ object StreamingTableManager {
     plannedPath.foreach(path => StreamingTableMetadata.validateTargetPath(spark, path))
     StreamingTableMetadata.validateNoSourceTargetOverlap(spark, definition.sourcePaths, plannedPath)
     val dependencySources = resolveManagedDependencySources(spark, definition)
+    val rebuildAdmission = prepareRebuildAdmission(
+      spark,
+      spec,
+      runtime,
+      definition,
+      expandsViews = !(expandedQuery eq spec.query)
+    )
+    val descendants = rebuildAdmission.getOrElse(Seq.empty)
     val lockKeys = StreamingTableRegistry.provisionalKey(identity, plannedPath) +:
-      dependencySources.map(source => StreamingTableRegistry.lifecycleLockKey(source.parentIdentity))
-    val globalLockKeys    = identity +: dependencySources.map(_.parentIdentity)
+      (dependencySources.map(source => StreamingTableRegistry.lifecycleLockKey(source.parentIdentity)) ++
+        descendants
+          .filter(_.kind == "streaming")
+          .map(target => StreamingTableRegistry.lifecycleLockKey(target.identity)))
+    val globalLockKeys    = identity +: (dependencySources.map(_.parentIdentity) ++ descendants.map(_.identity))
     val admissionDeadline = insight.startAdmission()
 
     RefreshMutex.withLocks(globalLockKeys, admissionDeadline) {
@@ -202,6 +218,7 @@ object StreamingTableManager {
             target,
             manifest,
             insight,
+            rebuildAdmission,
             expandsViews = !(expandedQuery eq spec.query)
           )
         } else {
@@ -380,7 +397,7 @@ object StreamingTableManager {
           )
           val manifest = StreamingTableMetadata.writeManifest(spark, target, definition)
           publishDependencyTarget(spark, target, definition, verifiedDependencySources)
-          val status = startNative(spark, frame, runtime, target, manifest, "initializing")
+          val status = startNative(spark, frame, runtime, target, manifest, "initializing", insight.operationId)
           insight.observe(status)
           StreamingInsightEvents.action(
             spark,
@@ -857,6 +874,57 @@ object StreamingTableManager {
     )
   }
 
+  private def compatibleDefinition(
+      manifest: StreamingTableManifest,
+      definition: StreamingTableDefinition
+  ): Boolean =
+    manifest.definitionHash == definition.fingerprint ||
+      definition.legacyFingerprints.contains(manifest.definitionHash) ||
+      StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
+
+  private def resumableDrift(
+      spark: SparkSession,
+      manifest: StreamingTableManifest,
+      definition: StreamingTableDefinition,
+      expandsViews: Boolean
+  ): Boolean =
+    manifest.definitionHash != definition.fingerprint &&
+      !StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson) &&
+      StreamingDefinitionDrift.resumable(
+        manifest.semanticJson,
+        definition,
+        expandsViews,
+        StreamingDefinitionDrift.ignoreAnalyzedPlanDrift(spark)
+      )
+
+  private def prepareRebuildAdmission(
+      spark: SparkSession,
+      spec: StreamingTableSpec,
+      runtime: StreamingRuntimeOptions,
+      definition: StreamingTableDefinition,
+      expandsViews: Boolean
+  ): Option[Seq[StreamingTableCascadeTarget]] =
+    if (
+      runtime.onQueryChange != "rebuild" ||
+      StreamingTableMetadata.interruptedCreation(spark, spec.name).nonEmpty ||
+      !StreamingTableMetadata.catalogTableExists(spark, spec.name)
+    ) None
+    else {
+      val target   = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+      val manifest = StreamingTableMetadata.readManifest(spark, target)
+      StreamingTableMetadata.verifyOwned(spark, target, manifest)
+      if (compatibleDefinition(manifest, definition) || resumableDrift(spark, manifest, definition, expandsViews))
+        None
+      else {
+        val descendants = StreamingTableMetadata
+          .pendingResetIntent(spark, target)
+          .map(_.descendants)
+          .getOrElse(resolveCascadeDescendantsForRebuild(spark, target, manifest))
+        afterRebuildPlanHookForTesting()
+        Some(descendants)
+      }
+    }
+
   private def reconcileExisting(
       spark: SparkSession,
       frame: DataFrame,
@@ -866,18 +934,15 @@ object StreamingTableManager {
       target: StreamingTableTarget,
       storedManifest: StreamingTableManifest,
       insight: InsightOperation,
+      rebuildAdmission: Option[Seq[StreamingTableCascadeTarget]],
       expandsViews: Boolean
   ): StreamingTableStatus = {
     reconcileResetJournal(spark, target, storedManifest, definition, runtime)
     val manifest     = adoptResumableDrift(spark, target, storedManifest, definition, expandsViews)
     val adoptedDrift = manifest ne storedManifest
 
-    val exactDefinition = manifest.definitionHash == definition.fingerprint
-    val compatibleLegacyDefinition =
-      !exactDefinition && (
-        definition.legacyFingerprints.contains(manifest.definitionHash) ||
-          StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson)
-      )
+    val exactDefinition            = manifest.definitionHash == definition.fingerprint
+    val compatibleLegacyDefinition = !exactDefinition && compatibleDefinition(manifest, definition)
     if (!exactDefinition && !compatibleLegacyDefinition) {
       val rebuildDecision = StreamingTableDefinition.rebuildDecision(
         manifest.definitionHash,
@@ -908,7 +973,7 @@ object StreamingTableManager {
             "submit OPTIONS ('onQueryChange'='rebuild') to replace this owned target"
         )
       }
-      rebuild(spark, frame, spec, runtime, definition, target, manifest, rebuildDecision, insight)
+      rebuild(spark, frame, spec, runtime, definition, target, manifest, rebuildDecision, insight, rebuildAdmission)
     } else {
       val registryKey   = StreamingTableRegistry.targetKey(target)
       val observedQuery = StreamingTableRegistry.findActive(spark, registryKey, target)
@@ -999,7 +1064,8 @@ object StreamingTableManager {
           runtime,
           target,
           effectiveManifest,
-          if (changedTuning) "restarted" else "initializing"
+          if (changedTuning) "restarted" else "initializing",
+          insight.operationId
         )
         insight.observe(status)
         StreamingInsightEvents.action(
@@ -1042,16 +1108,8 @@ object StreamingTableManager {
       definition: StreamingTableDefinition,
       expandsViews: Boolean
   ): StreamingTableManifest =
-    if (
-      storedManifest.definitionHash != definition.fingerprint &&
-      !StreamingTableDefinition.semanticallyEquivalent(storedManifest.semanticJson, definition.semanticJson) &&
-      StreamingDefinitionDrift.resumable(
-        storedManifest.semanticJson,
-        definition,
-        expandsViews,
-        StreamingDefinitionDrift.ignoreAnalyzedPlanDrift(spark)
-      )
-    ) StreamingTableMetadata.replaceManifest(spark, target, definition)
+    if (resumableDrift(spark, storedManifest, definition, expandsViews))
+      StreamingTableMetadata.replaceManifest(spark, target, definition)
     else storedManifest
 
   private def rebuild(
@@ -1063,205 +1121,203 @@ object StreamingTableManager {
       target: StreamingTableTarget,
       manifest: StreamingTableManifest,
       rebuildDecision: StreamingRebuildDecision,
-      insight: InsightOperation
+      insight: InsightOperation,
+      rebuildAdmission: Option[Seq[StreamingTableCascadeTarget]]
   ): StreamingTableStatus = {
     val pending = StreamingTableMetadata.pendingResetIntent(spark, target)
     val descendants = pending
       .map(_.descendants)
       .getOrElse(resolveCascadeDescendantsForRebuild(spark, target, manifest))
-    val lockKeys = (target.identity +: descendants.filter(_.kind == "streaming").map(_.identity))
-      .map(StreamingTableRegistry.lifecycleLockKey)
-    val materializedLockKeys = target.identity +: descendants.map(_.identity)
-    val admissionDeadline    = insight.admissionDeadline
-    RefreshMutex.withLocks(materializedLockKeys, admissionDeadline) {
-      StreamingTableRegistry.withTargetLocks(spark, lockKeys, admissionDeadline) {
-        val branchCode =
-          if (pending.nonEmpty) org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S7
-          else org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S5
-        val authoritativeDecision = pending
-          .flatMap(_.rebuildDecision)
-          .getOrElse(rebuildDecision)
-        insight.selectBranch(branchCode)
-        StreamingInsightEvents.semanticBranch(
+    if (!rebuildAdmission.contains(descendants))
+      StreamingTableErrors.invalid(
+        s"Downstream dependencies for ${target.sqlIdentifier} changed during rebuild admission; resubmit CREATE"
+      )
+    val branchCode =
+      if (pending.nonEmpty) org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S7
+      else org.openivm.spark.insights.OpenIvmInsightsContract.BranchCode.S5
+    val authoritativeDecision = pending
+      .flatMap(_.rebuildDecision)
+      .getOrElse(rebuildDecision)
+    insight.selectBranch(branchCode)
+    StreamingInsightEvents.semanticBranch(
+      spark,
+      insight.operationId,
+      target.sqlIdentifier,
+      branchCode,
+      authoritativeDecision,
+      policy = runtime.onQueryChange,
+      details = Seq(
+        "target_identity"  -> target.identity,
+        "target_path"      -> target.dataPath,
+        "descendant_count" -> descendants.size
+      ) ++ pending.toSeq.flatMap(recoveryDetails)
+    )
+    StreamingInsightEvents.cascadePlan(
+      spark,
+      insight.operationId,
+      target.sqlIdentifier,
+      target.identity,
+      descendants,
+      pending.map(_.completedDescendantIdentities.toSet).getOrElse(Set.empty),
+      reason = authoritativeDecision.code
+    )
+    pending.foreach { intent =>
+      StreamingInsightEvents.recoveryState(
+        spark,
+        insight.operationId,
+        target.sqlIdentifier,
+        intent,
+        phase = "resuming"
+      )
+    }
+    val registryKey = StreamingTableRegistry.targetKey(target)
+    val before      = statusFor(spark, target, manifest, forcedStatus = None)
+    insight.observe(before)
+    val completed = pending.map(_.completedDescendantIdentities.toSet).getOrElse(Set.empty[String])
+    StreamingTableStopLifecycle.afterStops(
+      Seq(
+        () =>
+          stopCascadeWriters(
+            spark,
+            descendants.filterNot(descendant => completed.contains(descendant.identity)),
+            insight.stopDeadline,
+            insight.operationId
+          ),
+        () => stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
+      )
+    ) {
+      val intent = pending.getOrElse {
+        val verified = resolveCascadeDescendantsForRebuild(spark, target, manifest)
+        if (verified != descendants)
+          StreamingTableErrors.invalid(
+            s"Downstream dependencies for ${target.sqlIdentifier} changed during rebuild admission"
+          )
+        val written = StreamingTableMetadata.writeOrVerifyResetIntent(
           spark,
-          insight.operationId,
-          target.sqlIdentifier,
-          branchCode,
-          authoritativeDecision,
-          policy = runtime.onQueryChange,
-          details = Seq(
-            "target_identity"  -> target.identity,
-            "target_path"      -> target.dataPath,
-            "descendant_count" -> descendants.size
-          ) ++ pending.toSeq.flatMap(recoveryDetails)
-        )
-        StreamingInsightEvents.cascadePlan(
-          spark,
-          insight.operationId,
-          target.sqlIdentifier,
-          target.identity,
+          target,
+          definition.fingerprint,
+          manifest.sourcePaths,
+          rebuildDecision,
           descendants,
-          pending.map(_.completedDescendantIdentities.toSet).getOrElse(Set.empty),
-          reason = authoritativeDecision.code
+          operationId = insight.operationId
         )
-        pending.foreach { intent =>
-          StreamingInsightEvents.recoveryState(
-            spark,
-            insight.operationId,
-            target.sqlIdentifier,
-            intent,
-            phase = "resuming"
-          )
-        }
-        val registryKey = StreamingTableRegistry.targetKey(target)
-        val before      = statusFor(spark, target, manifest, forcedStatus = None)
-        insight.observe(before)
-        val completed = pending.map(_.completedDescendantIdentities.toSet).getOrElse(Set.empty[String])
-        StreamingTableStopLifecycle.afterStops(
-          Seq(
-            () =>
-              stopCascadeWriters(
-                spark,
-                descendants.filterNot(descendant => completed.contains(descendant.identity)),
-                insight.stopDeadline,
-                insight.operationId
-              ),
-            () => stopNative(spark, target, registryKey, insight.stopDeadline, insight.operationId)
-          )
-        ) {
-          val intent = pending.getOrElse {
-            val verified = resolveCascadeDescendantsForRebuild(spark, target, manifest)
-            if (verified != descendants)
-              StreamingTableErrors.invalid(
-                s"Downstream dependencies for ${target.sqlIdentifier} changed during rebuild admission"
-              )
-            val written = StreamingTableMetadata.writeOrVerifyResetIntent(
-              spark,
-              target,
-              definition.fingerprint,
-              manifest.sourcePaths,
-              rebuildDecision,
-              descendants,
-              operationId = insight.operationId
-            )
-            StreamingDependencyCatalog.backupNow(spark)
-            written
-          }
-          val afterDescendants = dropCascadeDescendants(spark, intent, insight)
-          StreamingInsightEvents.action(
-            spark,
-            insight.operationId,
-            target.sqlIdentifier,
-            targetKind = "streaming",
-            targetIdentity = target.identity,
-            causedBy = None,
-            stage = "query",
-            code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryStopped,
-            message =
-              if (before.isActive) "Stopped the root native streaming query before rebuild."
-              else "The root native streaming query was already stopped before rebuild.",
-            status = if (before.isActive) "stopped_for_rebuild" else "already_stopped",
-            runtime = Some(before.copy(status = "stopped", isActive = false))
-          )
-
-          val current = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
-          if (
-            current.dataPath != target.dataPath ||
-            current.deltaTableId != target.deltaTableId ||
-            current.tableId != target.tableId
-          )
-            StreamingTableErrors.invalid(
-              s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
-            )
-          val archived = StreamingTableMetadata.dropOwnedCatalogAndData(
-            spark,
-            current,
-            manifest.sourcePaths,
-            StreamingArchiveContext(
-              action = "rebuild",
-              operationId = insight.operationId,
-              rootTarget = intent.targetIdentity,
-              rebuildDecision = intent.rebuildDecision
-            )
-          )
-          emitArchiveAction(
-            spark,
-            insight,
-            current.sqlIdentifier,
-            targetKind = "streaming",
-            targetIdentity = current.identity,
-            causedBy = None,
-            archived
-          )
-          StreamingInsightEvents.action(
-            spark,
-            insight.operationId,
-            current.sqlIdentifier,
-            targetKind = "streaming",
-            targetIdentity = current.identity,
-            causedBy = None,
-            stage = "target_cleanup",
-            code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetDropped,
-            message = "Dropped the previous owned streaming target generation.",
-            status = "dropped_for_rebuild",
-            details = Seq("target_path" -> current.dataPath)
-          )
-          StreamingTableRegistry.forget(spark, registryKey)
-          StreamingDependencyCatalog.remove(spark, target.identity)
-          val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
-          StreamingTableMetadata.updateResetIntent(spark, afterDescendants, upstreamDropped)
-
-          val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
-          StreamingInsightEvents.action(
-            spark,
-            insight.operationId,
-            replacement.sqlIdentifier,
-            targetKind = "streaming",
-            targetIdentity = replacement.identity,
-            causedBy = None,
-            stage = "target",
-            code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetRecreated,
-            message = "Recreated the owned streaming target after semantic change.",
-            details = Seq(
-              "target_path"         -> replacement.dataPath,
-              "checkpoint_location" -> replacement.checkpointLocation
-            )
-          )
-          StreamingTableMetadata.validateNoSourceTargetOverlap(
-            spark,
-            definition.sourcePaths,
-            Some(replacement.dataPath)
-          )
-          val replacementManifest = StreamingTableMetadata.writeManifest(spark, replacement, definition)
-          publishDependencyTarget(spark, replacement, definition)
-          val status = startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding")
-          insight.observe(status)
-          StreamingInsightEvents.action(
-            spark,
-            insight.operationId,
-            replacement.sqlIdentifier,
-            targetKind = "streaming",
-            targetIdentity = replacement.identity,
-            causedBy = None,
-            stage = "query",
-            code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryStarted,
-            message = "Started the rebuilt native streaming query.",
-            status = status.status,
-            runtime = Some(status)
-          )
-          StreamingTableMetadata.clearResetIntent(spark, upstreamDropped)
-          pending.foreach { _ =>
-            StreamingInsightEvents.recoveryState(
-              spark,
-              insight.operationId,
-              target.sqlIdentifier,
-              upstreamDropped,
-              phase = "completed"
-            )
-          }
-          status
-        }
+        StreamingDependencyCatalog.backupNow(spark)
+        written
       }
+      val afterDescendants = dropCascadeDescendants(spark, intent, insight)
+      StreamingInsightEvents.action(
+        spark,
+        insight.operationId,
+        target.sqlIdentifier,
+        targetKind = "streaming",
+        targetIdentity = target.identity,
+        causedBy = None,
+        stage = "query",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryStopped,
+        message =
+          if (before.isActive) "Stopped the root native streaming query before rebuild."
+          else "The root native streaming query was already stopped before rebuild.",
+        status = if (before.isActive) "stopped_for_rebuild" else "already_stopped",
+        runtime = Some(before.copy(status = "stopped", isActive = false))
+      )
+
+      val current = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
+      if (
+        current.dataPath != target.dataPath ||
+        current.deltaTableId != target.deltaTableId ||
+        current.tableId != target.tableId
+      )
+        StreamingTableErrors.invalid(
+          s"Target ${target.sqlIdentifier} changed during rebuild admission; refusing destructive reset"
+        )
+      val archived = StreamingTableMetadata.dropOwnedCatalogAndData(
+        spark,
+        current,
+        manifest.sourcePaths,
+        StreamingArchiveContext(
+          action = "rebuild",
+          operationId = insight.operationId,
+          rootTarget = intent.targetIdentity,
+          rebuildDecision = intent.rebuildDecision
+        )
+      )
+      emitArchiveAction(
+        spark,
+        insight,
+        current.sqlIdentifier,
+        targetKind = "streaming",
+        targetIdentity = current.identity,
+        causedBy = None,
+        archived
+      )
+      StreamingInsightEvents.action(
+        spark,
+        insight.operationId,
+        current.sqlIdentifier,
+        targetKind = "streaming",
+        targetIdentity = current.identity,
+        causedBy = None,
+        stage = "target_cleanup",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetDropped,
+        message = "Dropped the previous owned streaming target generation.",
+        status = "dropped_for_rebuild",
+        details = Seq("target_path" -> current.dataPath)
+      )
+      StreamingTableRegistry.forget(spark, registryKey)
+      StreamingDependencyCatalog.remove(spark, target.identity)
+      val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
+      StreamingTableMetadata.updateResetIntent(spark, afterDescendants, upstreamDropped)
+
+      val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
+      StreamingInsightEvents.action(
+        spark,
+        insight.operationId,
+        replacement.sqlIdentifier,
+        targetKind = "streaming",
+        targetIdentity = replacement.identity,
+        causedBy = None,
+        stage = "target",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingTargetRecreated,
+        message = "Recreated the owned streaming target after semantic change.",
+        details = Seq(
+          "target_path"         -> replacement.dataPath,
+          "checkpoint_location" -> replacement.checkpointLocation
+        )
+      )
+      StreamingTableMetadata.validateNoSourceTargetOverlap(
+        spark,
+        definition.sourcePaths,
+        Some(replacement.dataPath)
+      )
+      val replacementManifest = StreamingTableMetadata.writeManifest(spark, replacement, definition)
+      publishDependencyTarget(spark, replacement, definition)
+      val status =
+        startNative(spark, frame, runtime, replacement, replacementManifest, "rebuilding", insight.operationId)
+      insight.observe(status)
+      StreamingInsightEvents.action(
+        spark,
+        insight.operationId,
+        replacement.sqlIdentifier,
+        targetKind = "streaming",
+        targetIdentity = replacement.identity,
+        causedBy = None,
+        stage = "query",
+        code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryStarted,
+        message = "Started the rebuilt native streaming query.",
+        status = status.status,
+        runtime = Some(status)
+      )
+      StreamingTableMetadata.clearResetIntent(spark, upstreamDropped)
+      pending.foreach { _ =>
+        StreamingInsightEvents.recoveryState(
+          spark,
+          insight.operationId,
+          target.sqlIdentifier,
+          upstreamDropped,
+          phase = "completed"
+        )
+      }
+      status
     }
   }
 
@@ -1966,10 +2022,12 @@ object StreamingTableManager {
       runtime: StreamingRuntimeOptions,
       target: StreamingTableTarget,
       manifest: StreamingTableManifest,
-      status: String
+      status: String,
+      operationId: String
   ): StreamingTableStatus = {
     val key       = StreamingTableRegistry.targetKey(target)
     val queryName = target.queryName(runtime.displayName)
+    StreamingCommittedReplayRepair.beforeStart(spark, frame, target, Some(operationId))
     var writer = frame.writeStream
       .format("delta")
       .outputMode(runtime.outputMode)
