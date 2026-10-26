@@ -119,7 +119,14 @@ cascade:
 SET spark.openivm.streaming.lifecycleAdmissionTimeout = '60s';
 SET spark.openivm.streaming.stopTimeout = '60s';
 SET spark.openivm.streaming.firstProgressTimeout = '5m';
+SET spark.openivm.streaming.catalogRetryTimeout = '60s';
 ```
+
+`catalogRetryTimeout` bounds how long `SHOW STREAMING TABLES` catalog reads retry
+metastore or storage connection timeouts (for example `Failed to get database
+metadata ... Read timed out`) before reporting `metadata_error`. While a status
+read keeps timing out, a target whose writer is active in this session reports
+that live run instead of an error.
 
 These are the defaults. All settings require positive finite durations;
 invalid, infinite, or overflowing values fail before lifecycle mutation.

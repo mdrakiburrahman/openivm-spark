@@ -73,6 +73,118 @@ class StreamingTableShowSpec extends AnyFunSpec with StreamingTableTestFixture w
       }
     }
 
+    it("classifies only connection timeouts as transient catalog failures") {
+      val metastore = new RuntimeException(
+        "Failed to get database metadata",
+        new java.net.SocketTimeoutException("Read timed out")
+      )
+      StreamingTableManager.transientCatalogFailure(metastore) shouldBe true
+      StreamingTableManager.transientCatalogFailure(
+        new IllegalStateException("load failed", new java.net.SocketTimeoutException("Read timed out"))
+      ) shouldBe true
+      StreamingTableManager.transientCatalogFailure(
+        new IllegalStateException("native load failed", new java.io.IOException("storage timeout"))
+      ) shouldBe false
+      StreamingTableManager.transientCatalogFailure(
+        new org.apache.spark.sql.catalyst.analysis.NoSuchTableException("schema", "absent")
+      ) shouldBe false
+    }
+
+    it("retries transient catalog failures until they clear or the retry budget is spent") {
+      val session = spark.newSession()
+      session.conf.set(org.openivm.spark.common.FeatureGate.StreamingCatalogRetryTimeoutKey, "5s")
+      var attempts = 0
+      StreamingTableManager.retryTransientCatalogFailure(session) {
+        attempts += 1
+        if (attempts < 3) throw new RuntimeException("Failed to get database metadata")
+        "resolved"
+      } shouldBe "resolved"
+      attempts shouldBe 3
+
+      attempts = 0
+      an[IllegalStateException] should be thrownBy {
+        StreamingTableManager.retryTransientCatalogFailure(session) {
+          attempts += 1
+          throw new IllegalStateException("permanent")
+        }
+      }
+      attempts shouldBe 1
+
+      session.conf.set(org.openivm.spark.common.FeatureGate.StreamingCatalogRetryTimeoutKey, "300ms")
+      attempts = 0
+      val started = System.nanoTime()
+      val error = intercept[RuntimeException] {
+        StreamingTableManager.retryTransientCatalogFailure(session) {
+          attempts += 1
+          throw new RuntimeException("Failed to get database metadata", new java.net.SocketTimeoutException())
+        }
+      }
+      error.getMessage shouldBe "Failed to get database metadata"
+      attempts should be > 1
+      (System.nanoTime() - started) / 1000000L should be < 5000L
+    }
+
+    it("retries a known target's metastore timeout before reporting metadata_error") {
+      val session = spark.newSession()
+      session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
+      session.conf.set(org.openivm.spark.common.FeatureGate.StreamingCatalogRetryTimeoutKey, "300ms")
+      val name = Seq("direct_status", "schema", "transient_native_target")
+      val target = StreamingTableTarget(
+        name,
+        StreamingTableMetadata.canonicalIdentity(session, name),
+        StreamingTableMetadata.quoteMultipart(name),
+        "/warehouse/transient_native_target",
+        "delta-id",
+        "table-id"
+      )
+      StreamingTableRegistry.entry(session, StreamingTableRegistry.targetKey(target), target)
+      try {
+        DirectStatusCatalog.failure = Some(
+          new RuntimeException("Failed to get database metadata", new java.net.SocketTimeoutException("Read timed out"))
+        )
+        DirectStatusCatalog.loads.set(0)
+        val status = StreamingTableManager.show(session, Some(name.dropRight(1)), Some(name.last)).head
+        DirectStatusCatalog.loads.get() should be > 1
+        status.status shouldBe "metadata_error"
+        status.lastFailure.get should include("Read timed out")
+      } finally {
+        DirectStatusCatalog.failure = None
+        StreamingTableRegistry.forget(session, StreamingTableRegistry.targetKey(target))
+      }
+    }
+
+    it("reports the session's active run while metastore reads keep timing out") {
+      val session = spark.newSession()
+      session.conf.set("spark.sql.catalog.direct_status", classOf[DirectStatusCatalog].getName)
+      session.conf.set(org.openivm.spark.common.FeatureGate.StreamingCatalogRetryTimeoutKey, "300ms")
+      val name = Seq("direct_status", "schema", "transient_active_target")
+      val target = StreamingTableTarget(
+        name,
+        StreamingTableMetadata.canonicalIdentity(session, name),
+        StreamingTableMetadata.quoteMultipart(name),
+        "/warehouse/transient_active_target",
+        "delta-id",
+        "table-id"
+      )
+      val key   = StreamingTableRegistry.targetKey(target)
+      val query = session.readStream.format("rate").load().writeStream.format("noop").start()
+      try {
+        StreamingTableRegistry.register(session, key, target, "active-definition", query)
+        DirectStatusCatalog.failure = Some(
+          new RuntimeException("Failed to get database metadata", new java.net.SocketTimeoutException("Read timed out"))
+        )
+        val status = StreamingTableManager.show(session, Some(name.dropRight(1)), Some(name.last)).head
+        status.isActive shouldBe true
+        status.queryId shouldBe Some(query.id.toString)
+        status.runId shouldBe Some(query.runId.toString)
+        status.lastFailure shouldBe None
+      } finally {
+        DirectStatusCatalog.failure = None
+        query.stop()
+        StreamingTableRegistry.forget(session, key)
+      }
+    }
+
     it("bounds and redacts native resolution diagnostics") {
       val error =
         new IllegalStateException("storage failure " + ("x" * 4000), new java.io.IOException("root storage failure"))

@@ -11,6 +11,7 @@ private[spark] final case class StreamingLifecycleSettings(
     lifecycleAdmissionTimeout: FiniteDuration,
     stopTimeout: FiniteDuration,
     firstProgressTimeout: FiniteDuration,
+    catalogRetryTimeout: FiniteDuration,
     repairExpiredCommittedBatchReplay: Boolean
 )
 
@@ -55,6 +56,10 @@ private[spark] object StreamingLifecycleSettings {
       firstProgressTimeout = duration(
         FeatureGate.StreamingFirstProgressTimeoutKey,
         read(FeatureGate.StreamingFirstProgressTimeoutKey).getOrElse(FeatureGate.StreamingFirstProgressTimeoutDefault)
+      ),
+      catalogRetryTimeout = duration(
+        FeatureGate.StreamingCatalogRetryTimeoutKey,
+        read(FeatureGate.StreamingCatalogRetryTimeoutKey).getOrElse(FeatureGate.StreamingCatalogRetryTimeoutDefault)
       ),
       repairExpiredCommittedBatchReplay = read(FeatureGate.StreamingRepairExpiredCommittedBatchReplayKey)
         .map { value =>
