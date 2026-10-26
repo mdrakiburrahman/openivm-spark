@@ -696,12 +696,14 @@ object StreamingTableManager {
       val target =
         try
           Some(
-            StreamingTableMetadata.resolveDeltaTarget(
-              spark,
-              name,
-              requireTableIdMarker = true,
-              preserveResolutionFailure = true
-            )
+            retryTransientCatalogFailure(spark) {
+              StreamingTableMetadata.resolveDeltaTarget(
+                spark,
+                name,
+                requireTableIdMarker = true,
+                preserveResolutionFailure = true
+              )
+            }
           )
         catch {
           case NonFatal(error) if known.nonEmpty =>
@@ -712,10 +714,17 @@ object StreamingTableManager {
       target
         .map { owned =>
           try {
-            val manifest = StreamingTableMetadata.readManifest(spark, owned)
-            StreamingTableMetadata.verifyOwned(spark, owned, manifest)
+            val manifest = retryTransientCatalogFailure(spark) {
+              val manifest = StreamingTableMetadata.readManifest(spark, owned)
+              StreamingTableMetadata.verifyOwned(spark, owned, manifest)
+              manifest
+            }
             statusFor(spark, owned, manifest, forcedStatus = None)
           } catch {
+            case NonFatal(error) if transientCatalogFailure(error) =>
+              activeRunStatus(spark, owned).getOrElse(
+                metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
+              )
             case NonFatal(error) =>
               metadataErrorStatus(spark, owned, Option(error.getMessage).getOrElse(error.getClass.getName))
           }
@@ -724,6 +733,8 @@ object StreamingTableManager {
           known.flatMap { target =>
             if (resolutionFailure.exists(missingFromCatalog) && !catalogObjectMayExist(spark, target.name))
               uncommittedStatus(spark, target)
+            else if (resolutionFailure.exists(transientCatalogFailure) && activeRunStatus(spark, target).nonEmpty)
+              activeRunStatus(spark, target)
             else
               Some(
                 metadataErrorStatus(
@@ -749,28 +760,63 @@ object StreamingTableManager {
   private def uncommittedStatus(
       spark: SparkSession,
       target: StreamingTableTarget
+  ): Option[StreamingTableStatus] =
+    activeRunStatus(spark, target).orElse {
+      val entry = StreamingTableRegistry.entry(spark, StreamingTableRegistry.targetKey(target), target)
+      if (entry.snapshot.lastFailure.nonEmpty)
+        Some(metadataErrorStatus(spark, target, "The owned target is not in the catalog"))
+      else None
+    }
+
+  /** Status of the session's own active run for a target, reported from the registry alone. */
+  private def activeRunStatus(
+      spark: SparkSession,
+      target: StreamingTableTarget
   ): Option[StreamingTableStatus] = {
     val entry    = StreamingTableRegistry.entry(spark, StreamingTableRegistry.targetKey(target), target)
     val snapshot = entry.snapshot
-    entry.currentQuery.filter(_.isActive) match {
-      case Some(query) =>
-        Some(
-          StreamingTableStatus(
-            tableName = target.sqlIdentifier,
-            queryId = Some(query.id.toString),
-            runId = Some(query.runId.toString),
-            status = snapshot.diagnosticStatus.getOrElse("active"),
-            checkpointLocation = Some(target.checkpointLocation),
-            definitionHash = Option(entry.definitionHash),
-            isActive = true,
-            lastProgress = snapshot.lastProgress,
-            lastFailure = snapshot.lastFailure
-          )
-        )
-      case None if snapshot.lastFailure.nonEmpty =>
-        Some(metadataErrorStatus(spark, target, "The owned target is not in the catalog"))
-      case None => None
+    entry.currentQuery.filter(_.isActive).map { query =>
+      StreamingTableStatus(
+        tableName = target.sqlIdentifier,
+        queryId = Some(query.id.toString),
+        runId = Some(query.runId.toString),
+        status = snapshot.diagnosticStatus.getOrElse("active"),
+        checkpointLocation = Some(target.checkpointLocation),
+        definitionHash = Option(entry.definitionHash),
+        isActive = true,
+        lastProgress = snapshot.lastProgress,
+        lastFailure = snapshot.lastFailure
+      )
     }
+  }
+
+  /** Whether a failure is a metastore or storage connection timeout that a later attempt can survive. */
+  private[streaming] def transientCatalogFailure(error: Throwable): Boolean =
+    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).take(16).exists { cause =>
+      val className = cause.getClass.getName
+      val message   = Option(cause.getMessage).getOrElse("")
+      cause.isInstanceOf[java.net.SocketTimeoutException] ||
+      className.endsWith(".ConnectionPoolTimeoutException") ||
+      className.endsWith(".ConnectTimeoutException") ||
+      message.contains("Failed to get database metadata") ||
+      message.contains("Timeout waiting for connection from pool")
+    }
+
+  /** Run a catalog read, retrying transient connection timeouts with backoff within the configured budget. */
+  private[streaming] def retryTransientCatalogFailure[A](spark: SparkSession)(read: => A): A = {
+    val deadline = System.nanoTime() + StreamingLifecycleSettings.fromSpark(spark).catalogRetryTimeout.toNanos
+    @scala.annotation.tailrec
+    def attempt(backoffMillis: Long): A =
+      scala.util.Try(read) match {
+        case scala.util.Success(value) => value
+        case scala.util.Failure(error @ NonFatal(_)) if transientCatalogFailure(error) =>
+          val remainingMillis = (deadline - System.nanoTime()) / 1000000L
+          if (remainingMillis <= 0L) throw error
+          Thread.sleep(math.min(backoffMillis, remainingMillis))
+          attempt(math.min(backoffMillis * 2L, 8000L))
+        case scala.util.Failure(error) => throw error
+      }
+    attempt(250L)
   }
 
   private def missingFromCatalog(error: Throwable): Boolean =

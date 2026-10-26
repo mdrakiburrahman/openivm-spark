@@ -11,7 +11,8 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
   private val keys = Seq(
     FeatureGate.StreamingLifecycleAdmissionTimeoutKey,
     FeatureGate.StreamingStopTimeoutKey,
-    FeatureGate.StreamingFirstProgressTimeoutKey
+    FeatureGate.StreamingFirstProgressTimeoutKey,
+    FeatureGate.StreamingCatalogRetryTimeoutKey
   )
 
   private def assertInvalid(value: String): Unit =
@@ -36,6 +37,7 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
       settings.lifecycleAdmissionTimeout shouldBe 60.seconds
       settings.stopTimeout shouldBe 60.seconds
       settings.firstProgressTimeout shouldBe 5.minutes
+      settings.catalogRetryTimeout shouldBe 60.seconds
       settings.lifecycleAdmissionTimeout shouldBe Duration(FeatureGate.StreamingLifecycleAdmissionTimeoutDefault)
       settings.stopTimeout shouldBe Duration(FeatureGate.StreamingStopTimeoutDefault)
       settings.firstProgressTimeout shouldBe Duration(FeatureGate.StreamingFirstProgressTimeoutDefault)
