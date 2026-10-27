@@ -11,7 +11,8 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
   private val keys = Seq(
     FeatureGate.StreamingLifecycleAdmissionTimeoutKey,
     FeatureGate.StreamingStopTimeoutKey,
-    FeatureGate.StreamingFirstProgressTimeoutKey
+    FeatureGate.StreamingFirstProgressTimeoutKey,
+    FeatureGate.StreamingCatalogRetryTimeoutKey
   )
 
   private def assertInvalid(value: String): Unit =
@@ -31,10 +32,12 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
         None
       }
 
-      requested.toSeq shouldBe keys
+      requested.toSeq shouldBe keys :+ FeatureGate.StreamingRepairExpiredCommittedBatchReplayKey
+      settings.repairExpiredCommittedBatchReplay shouldBe true
       settings.lifecycleAdmissionTimeout shouldBe 60.seconds
       settings.stopTimeout shouldBe 60.seconds
       settings.firstProgressTimeout shouldBe 5.minutes
+      settings.catalogRetryTimeout shouldBe 60.seconds
       settings.lifecycleAdmissionTimeout shouldBe Duration(FeatureGate.StreamingLifecycleAdmissionTimeoutDefault)
       settings.stopTimeout shouldBe Duration(FeatureGate.StreamingStopTimeoutDefault)
       settings.firstProgressTimeout shouldBe Duration(FeatureGate.StreamingFirstProgressTimeoutDefault)
@@ -129,8 +132,23 @@ class StreamingLifecycleSettingsSpec extends AnyFunSpec with Matchers {
       ).foreach(assertInvalid)
     }
 
+    it("validates the replay repair opt-out as a strict, dynamic boolean") {
+      val key = FeatureGate.StreamingRepairExpiredCommittedBatchReplayKey
+      Seq("true" -> true, " FALSE " -> false).foreach { case (value, expected) =>
+        StreamingLifecycleSettings.parse(Map(key -> value).get).repairExpiredCommittedBatchReplay shouldBe expected
+      }
+      Seq("", "yes", "1", null).foreach { value =>
+        val error = intercept[AnalysisException] {
+          StreamingLifecycleSettings.parse(Map(key -> value).get)
+        }
+        error.getMessage should include(key)
+        error.getMessage should include("true or false")
+      }
+    }
+
     it("accepts the largest exactly representable finite nanosecond budget") {
-      val settings = StreamingLifecycleSettings.parse(_ => Some(s"${Long.MaxValue}ns"))
+      val settings =
+        StreamingLifecycleSettings.parse(key => if (keys.contains(key)) Some(s"${Long.MaxValue}ns") else None)
 
       settings.lifecycleAdmissionTimeout.toNanos shouldBe Long.MaxValue
       settings.stopTimeout.toNanos shouldBe Long.MaxValue

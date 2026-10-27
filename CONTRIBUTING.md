@@ -19,54 +19,33 @@ well.
    winget install -e --id Microsoft.VisualStudioCode
    ```
 
-1. Get a fresh new WSL machine up:
-
-   > ⚠️ Warning: this removes Docker Desktop if you have it installed
+1. Clone the repo on Windows, then check out and push the branch you want to work on:
 
    ```powershell
-   $GIT_ROOT = git rev-parse --show-toplevel
-   & "$GIT_ROOT\contrib\bootstrap-dev-env.ps1"
-   ```
-
-1. Clone the repo:
-
-   > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is extremely slow for Spark I/O.
-   > You can technically run the Devcontainer using Windows Docker Desktop, but the I/O experience is slow and poor.
-
-   ```bash
-   cd ~/
-
-   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
-   read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
-
    git clone https://github.com/mdrakiburrahman/openivm-spark.git
-
-   git config --global user.name "$user_name"
-   git config --global user.email "$user_email"
-   cd openivm-spark/
-   git pull origin
    ```
 
-1. Run the bootstrapper script, that installs the minimal host tooling idempotently:
+1. From an **elevated PowerShell 7** prompt in the checkout, install [Task](https://taskfile.dev) and run
+   [`contrib/bootstrap-dev-env.yaml`](contrib/bootstrap-dev-env.yaml):
 
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
+   > ⚠️ This **deletes every WSL distribution** on the machine before recreating `Ubuntu-24.04`, and removes
+   > Docker Desktop if you have it installed. Push any work inside WSL first.
+
+   ```powershell
+   winget install Task.Task
+   $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User')
+   task --taskfile contrib/bootstrap-dev-env.yaml
    ```
 
-   The bootstrap idempotently installs or validates Git, Docker Engine,
-   Buildx, Compose, and the pinned Node/npm version, configures parallel Docker
-   transfers, pulls the pinned devcontainer image, then runs `npm ci`. Java,
-   Scala, sbt, and Spark stay inside the devcontainer.
-
-1. Launch the devcontainer from the repository root:
-
-   ```bash
-   cd ~/openivm-spark
-   docker ps -aq --filter "label=devcontainer.local_folder=$(wslpath -w .)" | xargs -r docker rm -f
-   HEX=$(printf '%s' "$(wslpath -w .)" | xxd -ps -c 256)
-   code --file-uri "vscode-remote://dev-container+${HEX}/workspaces/openivm-spark/spark.code-workspace"
-   ```
+   Without any prompts, this recreates WSL on the drive with the most free space and clones your current
+   branch into `~/openivm-spark` with this checkout's git identity; Linux > Windows drive commits via `/mnt/c`
+   are extremely slow for Spark I/O. It then runs
+   [`contrib/bootstrap-dev-env.sh`](contrib/bootstrap-dev-env.sh), which idempotently installs or validates
+   Git, Docker Engine, Buildx, Compose, and the pinned Node/npm version, configures parallel Docker
+   transfers, pulls the pinned devcontainer image, then runs `npm ci`. Java, Scala, sbt, and Spark stay
+   inside the devcontainer, which it starts and opens in VS Code through `spark.code-workspace`. After a
+   restart, run `task --taskfile contrib/bootstrap-dev-env.yaml up` instead; it keeps WSL and reopens the
+   devcontainer.
 
 2. All builds and tests should now run green inside the devcontainer:
 

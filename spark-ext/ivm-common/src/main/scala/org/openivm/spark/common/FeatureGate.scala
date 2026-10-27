@@ -86,11 +86,15 @@ object FeatureGate {
 
   val StreamingLifecycleAdmissionTimeoutKey: String =
     "spark.openivm.streaming.lifecycleAdmissionTimeout"
+  val StreamingRepairExpiredCommittedBatchReplayKey: String =
+    "spark.openivm.streaming.repairExpiredCommittedBatchReplay"
   val StreamingStopTimeoutKey: String                   = "spark.openivm.streaming.stopTimeout"
   val StreamingFirstProgressTimeoutKey: String          = "spark.openivm.streaming.firstProgressTimeout"
+  val StreamingCatalogRetryTimeoutKey: String           = "spark.openivm.streaming.catalogRetryTimeout"
   val StreamingLifecycleAdmissionTimeoutDefault: String = "60s"
   val StreamingStopTimeoutDefault: String               = "60s"
   val StreamingFirstProgressTimeoutDefault: String      = "5m"
+  val StreamingCatalogRetryTimeoutDefault: String       = "60s"
 
   /** Optional campaign-scoped Hadoop filesystem URI for completed execution
     * span objects. Unset preserves the historical log-only behavior.
