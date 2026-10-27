@@ -1292,8 +1292,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     it("returns from CREATE while an explicitly asynchronous backup is blocked") {
       spark.sql("CREATE TABLE sales_t1_async (id INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_async VALUES (1)").collect()
-      val entered = new CountDownLatch(1)
-      val release = new CountDownLatch(1)
+      val entered  = new CountDownLatch(1)
+      val release  = new CountDownLatch(1)
       val finished = new CountDownLatch(1)
       spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create-async"))

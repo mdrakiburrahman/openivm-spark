@@ -89,8 +89,8 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       spark.sql("INSERT INTO gc_async_src VALUES (1)")
       val staged = stagedPaths("gc_async_src")
       staged should not be empty
-      val entered = new CountDownLatch(1)
-      val release = new CountDownLatch(1)
+      val entered  = new CountDownLatch(1)
+      val release  = new CountDownLatch(1)
       val finished = new CountDownLatch(1)
       spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-gc-async"))

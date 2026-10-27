@@ -234,14 +234,13 @@ object OpenIvmStateSync {
         state.requested.set(false)
         // Capture before the snapshot: a later request must not clean up files
         // until a pass that covers its committed state has succeeded.
-        val requests = state.drainRequests()
-        val started = System.nanoTime()
+        val requests  = state.drainRequests()
+        val started   = System.nanoTime()
         var succeeded = false
         try {
           runBackupPass(key, spark, uri)
           succeeded = true
-        }
-        catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
+        } catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
         finally {
           val durationMs = (System.nanoTime() - started) / 1000000L
           requests.foreach(_.span.foreach(_.recordRocksDbBackup(durationMs)))
