@@ -37,11 +37,13 @@ object OpenIvmStateSync {
 
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
+  private final case class AsyncRequest(span: Option[OpenIvmExecutionSpan], afterPublish: () => Unit)
+
   private final class BackupState {
     val passLock                    = new ReentrantLock(true)
     val requested                   = new AtomicBoolean(false)
     val running                     = new AtomicBoolean(false)
-    private val spans               = new ConcurrentLinkedQueue[OpenIvmExecutionSpan]()
+    private val requests            = new ConcurrentLinkedQueue[AsyncRequest]()
     private val synchronousMonitor  = new Object
     private val synchronousRequests = scala.collection.mutable.ArrayBuffer.empty[CompletableFuture[Unit]]
     private var synchronousRunning  = false
@@ -96,15 +98,15 @@ object OpenIvmStateSync {
       }
     }
 
-    def capture(span: Option[OpenIvmExecutionSpan]): Unit =
-      span.foreach(spans.add)
+    def capture(span: Option[OpenIvmExecutionSpan], afterPublish: () => Unit): Unit =
+      requests.add(AsyncRequest(span, afterPublish))
 
-    def drainSpans(): Seq[OpenIvmExecutionSpan] = {
-      val drained = scala.collection.mutable.ArrayBuffer.empty[OpenIvmExecutionSpan]
-      var span    = spans.poll()
-      while (span != null) {
-        drained += span
-        span = spans.poll()
+    def drainRequests(): Seq[AsyncRequest] = {
+      val drained = scala.collection.mutable.ArrayBuffer.empty[AsyncRequest]
+      var request = requests.poll()
+      while (request != null) {
+        drained += request
+        request = requests.poll()
       }
       drained.toSeq
     }
@@ -196,14 +198,25 @@ object OpenIvmStateSync {
   /** Coalesced, non-blocking incremental backup of the local `_openivm` tree to
     * the remote URI. If a backup is already queued this call is folded into that
     * in-flight work and forces one more pass afterwards. */
-  def backupAsync(spark: SparkSession): Unit = {
+  def backupAsync(spark: SparkSession): Unit = backupAsync(spark, () => ())
+
+  /** Select the command's backup policy, then run cleanup only after publication succeeds. */
+  def backupForCommand(spark: SparkSession, afterPublish: () => Unit = () => ()): Unit =
+    if (FeatureGate.stateSyncAsyncEnabled(spark)) backupAsync(spark, afterPublish)
+    else {
+      backupNow(spark)
+      afterPublish()
+    }
+
+  private def backupAsync(spark: SparkSession, afterPublish: () => Unit): Unit = {
     val uri = stateSyncUri(spark)
-      .getOrElse(
+      .getOrElse {
+        afterPublish()
         return
-      )
+      }
     val key   = effectiveStateSyncKey(spark, uri)
     val state = backupStateFor(key)
-    state.capture(OpenIvmExecutionSpan.captureCurrent())
+    state.capture(OpenIvmExecutionSpan.captureCurrent(), afterPublish)
     state.requested.set(true)
     scheduleBackupIfNeeded(state, spark, uri)
   }
@@ -219,14 +232,28 @@ object OpenIvmStateSync {
       var continue = true
       while (continue) {
         state.requested.set(false)
-        val spans   = state.drainSpans()
+        // Capture before the snapshot: a later request must not clean up files
+        // until a pass that covers its committed state has succeeded.
+        val requests = state.drainRequests()
         val started = System.nanoTime()
-        try runBackupPass(key, spark, uri)
+        var succeeded = false
+        try {
+          runBackupPass(key, spark, uri)
+          succeeded = true
+        }
         catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
         finally {
           val durationMs = (System.nanoTime() - started) / 1000000L
-          spans.foreach(_.recordRocksDbBackup(durationMs))
+          requests.foreach(_.span.foreach(_.recordRocksDbBackup(durationMs)))
+          log.info(
+            s"openivm state-sync: async backup duration_ms=$durationMs succeeded=$succeeded requests=${requests.size}"
+          )
         }
+        if (succeeded)
+          requests.foreach { request =>
+            try request.afterPublish()
+            catch { case NonFatal(e) => log.warn(s"openivm state-sync: post-backup cleanup failed: $e") }
+          }
         continue = state.requested.get()
       }
     } finally {

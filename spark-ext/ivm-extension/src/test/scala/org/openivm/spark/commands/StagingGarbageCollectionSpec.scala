@@ -2,17 +2,21 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog}
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.scalatest.BeforeAndAfterAll
+import org.scalatest.concurrent.Eventually
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.{Millis, Seconds, Span}
 
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.jdk.CollectionConverters._
 
 /** Staging storage is reclaimed once no durable state references it, and never before. */
-class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
+class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers with Eventually {
   private var spark: SparkSession = _
   private val warehouse           = new File(s"target/test-warehouse-gc-${UUID.randomUUID().toString.take(8)}")
   private val DayMs               = 24L * 60L * 60L * 1000L
@@ -77,6 +81,43 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       staged.filter(localPath(_).exists()) shouldBe empty
       StagingCatalog.pendingGarbage(spark) shouldBe empty
       spark.table("gc_agg").where("name = 'a'").select("n").head().getLong(0) shouldBe 2L
+    }
+
+    it("keeps consumed staging files until an asynchronous backup succeeds") {
+      spark.sql("CREATE TABLE gc_async_src (id INT) USING delta")
+      spark.sql("CREATE MATERIALIZED VIEW gc_async_mv AS SELECT id FROM gc_async_src")
+      spark.sql("INSERT INTO gc_async_src VALUES (1)")
+      val staged = stagedPaths("gc_async_src")
+      staged should not be empty
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val finished = new CountDownLatch(1)
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-gc-async"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        entered.countDown()
+        try release.await(60, TimeUnit.SECONDS) shouldBe true
+        finally finished.countDown()
+      }
+      try {
+        spark.sql("REFRESH MATERIALIZED VIEW gc_async_mv").collect()
+        entered.await(30, TimeUnit.SECONDS) shouldBe true
+        all(staged.map(localPath(_).exists())) shouldBe true
+        spark.table("gc_async_mv").count() shouldBe 1L
+        release.countDown()
+        eventually(timeout(Span(30, Seconds)), interval(Span(20, Millis))) {
+          staged.filter(localPath(_).exists()) shouldBe empty
+          StagingCatalog.pendingGarbage(spark).intersect(staged.toSet) shouldBe empty
+        }
+      } finally {
+        release.countDown()
+        try finished.await(60, TimeUnit.SECONDS) shouldBe true
+        finally {
+          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+      }
     }
 
     it("deletes the view deltas of a view without consumers") {

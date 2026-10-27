@@ -75,6 +75,19 @@ through finalization even when profile collection is disabled; a backup failure
 reports a failed command. CREATE retains its existing timing fields and does
 not yet emit `command_span`.
 
+Remote backups can instead run asynchronously with
+`spark.openivm.stateSync.async.enabled=true` (default `false`). CREATE and REFRESH
+then return after local commit and enqueue a coalesced remote backup. If the
+driver is lost before publication, recovery starts from the last published
+generation. Garbage collection still waits for successful publication; a failed
+upload leaves its staging files intact and is logged in the background.
+
+In this mode, `state_backup_enqueue` measures submission, replacing `state_backup`.
+`command_span` excludes the later remote upload and cleanup. The state-sync log
+records each coalesced pass's actual `duration_ms`, `succeeded` and request count.
+Do not compare this command span with synchronous durable-command timing without
+labeling the backup mode.
+
 ## IVM DDL
 
 ```sql

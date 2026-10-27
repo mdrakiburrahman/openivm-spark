@@ -3,9 +3,10 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.{ChangeFeedMode, RefreshProfileCatalog}
+import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, RefreshProfileCatalog}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 /** End-to-end coverage of `RefreshProfile` instrumentation in
   * `MaterializedViewCommands` + the `SHOW OPENIVM REFRESH PROFILE` SQL
@@ -90,6 +91,41 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
   }
 
   describe("RefreshProfile — REFRESH with deltas") {
+    it("records enqueue time rather than remote upload time in asynchronous mode") {
+      sql("CREATE TABLE profile_async_src (id INT) USING DELTA")
+      sql("CREATE MATERIALIZED VIEW profile_async_mv AS SELECT id FROM profile_async_src")
+      sql("INSERT INTO profile_async_src VALUES (1)")
+      clearProfile()
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val finished = new CountDownLatch(1)
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/profile-async-backup"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        entered.countDown()
+        try release.await(60, TimeUnit.SECONDS) shouldBe true
+        finally finished.countDown()
+      }
+      try {
+        sql("REFRESH MATERIALIZED VIEW profile_async_mv").collect()
+        entered.await(30, TimeUnit.SECONDS) shouldBe true
+        sql("SELECT id FROM profile_async_mv").collect().toSeq shouldBe Seq(Row(1))
+        val rows = showProfile()
+        rows.count(_.getString(4) == "state_backup_enqueue") shouldBe 1
+        rows.count(_.getString(4) == "state_backup") shouldBe 0
+        detailsForStep(rows, "command_span").head should include("outcome=incremental_executed")
+        OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
+      } finally {
+        release.countDown()
+        try finished.await(60, TimeUnit.SECONDS) shouldBe true
+        finally {
+          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+      }
+    }
+
     it("emits statement and RocksDB contention telemetry") {
       clearProfile()
       sql("CREATE TABLE profile_t3 (k INT, v INT) USING DELTA")

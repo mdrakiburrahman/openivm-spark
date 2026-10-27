@@ -1289,6 +1289,38 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
+    it("returns from CREATE while an explicitly asynchronous backup is blocked") {
+      spark.sql("CREATE TABLE sales_t1_async (id INT) USING DELTA").collect()
+      spark.sql("INSERT INTO sales_t1_async VALUES (1)").collect()
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val finished = new CountDownLatch(1)
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create-async"))
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        entered.countDown()
+        try release.await(60, TimeUnit.SECONDS) shouldBe true
+        finally finished.countDown()
+      }
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val create = Future {
+        spark.sql("CREATE MATERIALIZED VIEW mv_t1_async AS SELECT id FROM sales_t1_async").collect()
+      }
+      try {
+        entered.await(60, TimeUnit.SECONDS) shouldBe true
+        Await.result(create, 60.seconds)
+        spark.table("mv_t1_async").count() shouldBe 1L
+      } finally {
+        release.countDown()
+        try finished.await(60, TimeUnit.SECONDS) shouldBe true
+        finally {
+          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+      }
+    }
+
     it("does not publish state for CREATE IF NOT EXISTS of an existing view") {
       spark.sql("CREATE TABLE sales_t1_exists (region STRING, amount INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_exists VALUES ('east', 1)").collect()
