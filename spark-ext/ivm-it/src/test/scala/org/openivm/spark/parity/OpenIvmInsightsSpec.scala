@@ -11,6 +11,7 @@ import scala.util.control.NonFatal
 class OpenIvmInsightsSpec extends IvmParitySpecBase("openivm-insights") with InterceptMode {
 
   override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.StateSyncAsyncEnabledKey             -> "false",
     FeatureGate.QueryLogEnabledKey                   -> "true",
     FeatureGate.ProfileRefreshKey                    -> "false",
     FeatureGate.UnifiedRefreshIntelligenceEnabledKey -> "true"

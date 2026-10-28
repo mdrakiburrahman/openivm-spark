@@ -1257,45 +1257,48 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
 
     it("waits for durable state backup before CREATE returns") {
-      spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
-      spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
-      val entered = new CountDownLatch(1)
-      val release = new CountDownLatch(1)
-      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-        entered.countDown()
-        release.await(30, TimeUnit.SECONDS)
-      }
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        spark.sql("CREATE TABLE sales_t1_sync (region STRING, amount INT) USING DELTA").collect()
+        spark.sql("INSERT INTO sales_t1_sync VALUES ('east', 1)").collect()
+        val entered = new CountDownLatch(1)
+        val release = new CountDownLatch(1)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          entered.countDown()
+          release.await(30, TimeUnit.SECONDS)
+        }
 
-      implicit val executionContext: ExecutionContext = ExecutionContext.global
-      val create = Future {
-        spark
-          .sql(
-            "CREATE MATERIALIZED VIEW mv_t1_sync AS " +
-              "SELECT region, SUM(amount) AS total FROM sales_t1_sync GROUP BY region"
-          )
-          .collect()
-      }
-      try {
-        entered.await(60, TimeUnit.SECONDS) shouldBe true
-        Thread.sleep(100L)
-        create.isCompleted shouldBe false
-        release.countDown()
-        Await.result(create, 120.seconds)
-      } finally {
-        release.countDown()
-        OpenIvmStateSync.setBackupPassHookForTesting(null)
-        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        implicit val executionContext: ExecutionContext = ExecutionContext.global
+        val create = Future {
+          spark
+            .sql(
+              "CREATE MATERIALIZED VIEW mv_t1_sync AS " +
+                "SELECT region, SUM(amount) AS total FROM sales_t1_sync GROUP BY region"
+            )
+            .collect()
+        }
+        try {
+          entered.await(60, TimeUnit.SECONDS) shouldBe true
+          Thread.sleep(100L)
+          create.isCompleted shouldBe false
+          release.countDown()
+          Await.result(create, 120.seconds)
+        } finally {
+          release.countDown()
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
       }
     }
 
-    it("returns from CREATE while an explicitly asynchronous backup is blocked") {
+    it("returns from CREATE while the default asynchronous backup is blocked") {
       spark.sql("CREATE TABLE sales_t1_async (id INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_async VALUES (1)").collect()
       val entered  = new CountDownLatch(1)
       val release  = new CountDownLatch(1)
       val finished = new CountDownLatch(1)
-      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      spark.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey) shouldBe None
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe true
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create-async"))
       OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
         entered.countDown()
@@ -1314,7 +1317,6 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         release.countDown()
         try finished.await(60, TimeUnit.SECONDS) shouldBe true
         finally {
-          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
           OpenIvmStateSync.setBackupPassHookForTesting(null)
           OpenIvmStateSync.setStateSyncUriHookForTesting(null)
         }
@@ -1796,69 +1798,73 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   describe("(5a) REFRESH execution spans reconstruct persisted classification on refresh-only runs") {
     it("keeps no-op and incremental telemetry attached through durable backup when profiling is off") {
-      val source = "src_t5a_backup"
-      val view   = "mv_t5a_backup"
-      FeatureGate.profileRefreshEnabled(spark) shouldBe false
-      spark.sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA").collect()
-      spark.sql(s"INSERT INTO $source VALUES (1, 10)").collect()
-      spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
-      var backups = 0
-      val payloads = withLogCapture { appender =>
-        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(s"file:/state-sync-$view"))
-        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-          OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
-          executionSpanPayloads(appender.messages, view).size shouldBe backups
-          backups += 1
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        val source = "src_t5a_backup"
+        val view   = "mv_t5a_backup"
+        FeatureGate.profileRefreshEnabled(spark) shouldBe false
+        spark.sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA").collect()
+        spark.sql(s"INSERT INTO $source VALUES (1, 10)").collect()
+        spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
+        var backups = 0
+        val payloads = withLogCapture { appender =>
+          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(s"file:/state-sync-$view"))
+          OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+            OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
+            executionSpanPayloads(appender.messages, view).size shouldBe backups
+            backups += 1
+          }
+          try {
+            spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
+            spark.sql(s"INSERT INTO $source VALUES (1, 5)").collect()
+            spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
+          } finally {
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          }
+          executionSpanPayloads(appender.messages, view)
         }
-        try {
-          spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
-          spark.sql(s"INSERT INTO $source VALUES (1, 5)").collect()
-          spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
-        } finally {
-          OpenIvmStateSync.setBackupPassHookForTesting(null)
-          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        backups shouldBe 2
+        payloads should have size 2
+        payloads.foreach { payload =>
+          payload.has("rocksdb_backup_ms") shouldBe true
+          payload.path("rocksdb_backup_ms").asLong() should be >= 0L
         }
-        executionSpanPayloads(appender.messages, view)
+        OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
+        assertBagEqual(view, s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
       }
-      backups shouldBe 2
-      payloads should have size 2
-      payloads.foreach { payload =>
-        payload.has("rocksdb_backup_ms") shouldBe true
-        payload.path("rocksdb_backup_ms").asLong() should be >= 0L
-      }
-      OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
-      assertBagEqual(view, s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
     }
 
     it("emits failed command telemetry and backup timing when durable backup throws") {
-      val view = "mv_t5a_backup_failure"
-      spark.sql("CREATE TABLE src_t5a_backup_failure(id INT) USING DELTA").collect()
-      spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM src_t5a_backup_failure").collect()
-      val payloads = withLogCapture { appender =>
-        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-failure"))
-        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-          OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
-          executionSpanPayloads(appender.messages, view) shouldBe empty
-          throw new java.io.IOException("injected durable backup failure")
-        }
-        try {
-          val failure = intercept[Exception] {
-            spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        val view = "mv_t5a_backup_failure"
+        spark.sql("CREATE TABLE src_t5a_backup_failure(id INT) USING DELTA").collect()
+        spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM src_t5a_backup_failure").collect()
+        val payloads = withLogCapture { appender =>
+          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-failure"))
+          OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+            OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
+            executionSpanPayloads(appender.messages, view) shouldBe empty
+            throw new java.io.IOException("injected durable backup failure")
           }
-          Iterator
-            .iterate[Throwable](failure)(_.getCause)
-            .takeWhile(_ != null)
-            .exists(_.getMessage == "injected durable backup failure") shouldBe true
-        } finally {
-          OpenIvmStateSync.setBackupPassHookForTesting(null)
-          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          try {
+            val failure = intercept[Exception] {
+              spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
+            }
+            Iterator
+              .iterate[Throwable](failure)(_.getCause)
+              .takeWhile(_ != null)
+              .exists(_.getMessage == "injected durable backup failure") shouldBe true
+          } finally {
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          }
+          executionSpanPayloads(appender.messages, view)
         }
-        executionSpanPayloads(appender.messages, view)
+        payloads should have size 1
+        payloads.head.path("outcome").asText() shouldBe "refresh_failed"
+        payloads.head.has("rocksdb_backup_ms") shouldBe true
+        OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
       }
-      payloads should have size 1
-      payloads.head.path("outcome").asText() shouldBe "refresh_failed"
-      payloads.head.has("rocksdb_backup_ms") shouldBe true
-      OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
     }
 
     it("reads compile/effective type and reason from metadata without recompiling") {

@@ -865,22 +865,53 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
+    it("honours an explicit synchronous command backup and propagates upload failure") {
+      val spark = newSpark(
+        "state-sync-command-override",
+        Seq(
+          FeatureGate.StateSyncUriKey          -> "file:/state-sync-command-override",
+          FeatureGate.StateSyncAsyncEnabledKey -> "false"
+        )
+      )
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe false
+      val caller   = Thread.currentThread()
+      val cleanups = new AtomicInteger(0)
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        Thread.currentThread() shouldBe caller
+        throw new java.io.IOException("injected synchronous command backup failure")
+      }
+      intercept[java.io.IOException] {
+        OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
+      }.getMessage shouldBe "injected synchronous command backup failure"
+      cleanups.get() shouldBe 0
+
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => Thread.currentThread() shouldBe caller }
+      OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
+      cleanups.get() shouldBe 1
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe true
+      spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe false
+    }
+
     it("runs local command cleanup inline when asynchronous remote sync has no URI") {
       val spark = newSpark("state-sync-local-command")
-      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      spark.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey) shouldBe None
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe true
       val cleanups = new AtomicInteger(0)
       OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
       cleanups.get() shouldBe 1
       OpenIvmStateSync.backupStateSnapshotForTesting(spark) shouldBe None
     }
 
-    it("runs asynchronous cleanup only after its own successful publication") {
+    it("runs asynchronous cleanup by default only after its own successful publication") {
       val spark = newSpark(
         "state-sync-async-command",
         Seq(FeatureGate.StateSyncUriKey -> "file:/state-sync-async-command")
       )
       val session = newStateSyncSession(spark, "async-command")
-      session.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      session.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey) shouldBe None
+      FeatureGate.stateSyncAsyncEnabled(session) shouldBe true
       val entered           = Array.fill(2)(new CountDownLatch(1))
       val release           = Array.fill(2)(new CountDownLatch(1))
       val passes            = new AtomicInteger(0)

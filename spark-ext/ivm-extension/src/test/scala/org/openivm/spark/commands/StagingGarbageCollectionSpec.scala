@@ -83,7 +83,7 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       spark.table("gc_agg").where("name = 'a'").select("n").head().getLong(0) shouldBe 2L
     }
 
-    it("keeps consumed staging files until an asynchronous backup succeeds") {
+    it("keeps consumed staging files until the default asynchronous backup succeeds") {
       spark.sql("CREATE TABLE gc_async_src (id INT) USING delta")
       spark.sql("CREATE MATERIALIZED VIEW gc_async_mv AS SELECT id FROM gc_async_src")
       spark.sql("INSERT INTO gc_async_src VALUES (1)")
@@ -92,7 +92,8 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       val entered  = new CountDownLatch(1)
       val release  = new CountDownLatch(1)
       val finished = new CountDownLatch(1)
-      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
+      spark.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey) shouldBe None
+      FeatureGate.stateSyncAsyncEnabled(spark) shouldBe true
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-gc-async"))
       OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
         entered.countDown()
@@ -113,7 +114,6 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
         release.countDown()
         try finished.await(60, TimeUnit.SECONDS) shouldBe true
         finally {
-          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
           OpenIvmStateSync.setBackupPassHookForTesting(null)
           OpenIvmStateSync.setStateSyncUriHookForTesting(null)
         }

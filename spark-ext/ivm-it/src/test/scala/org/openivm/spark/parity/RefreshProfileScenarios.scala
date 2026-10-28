@@ -18,7 +18,10 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    Map("spark.openivm.profile.refresh" -> "true")
+    Map(
+      "spark.openivm.profile.refresh"      -> "true",
+      FeatureGate.StateSyncAsyncEnabledKey -> "false"
+    )
 
   override def beforeAll(): Unit = {
     super.beforeAll()
@@ -119,7 +122,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         release.countDown()
         try finished.await(60, TimeUnit.SECONDS) shouldBe true
         finally {
-          spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+          spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
           OpenIvmStateSync.setBackupPassHookForTesting(null)
           OpenIvmStateSync.setStateSyncUriHookForTesting(null)
         }

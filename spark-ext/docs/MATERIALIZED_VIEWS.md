@@ -63,8 +63,8 @@ The cache is published only after the target write succeeds.
 
 ## Refresh timing
 
-With `spark.openivm.profile.refresh=true`, `SHOW OPENIVM REFRESH PROFILE`
-includes `state_backup` for the required durable state backup, `after_query_span`
+With `spark.openivm.profile.refresh=true` and synchronous remote backup enabled,
+`SHOW OPENIVM REFRESH PROFILE` includes `state_backup` for the required durable state backup, `after_query_span`
 for finalization after the historical `query_span`, and `command_span` for the
 enclosing refresh through backup and synchronous cleanup. The final diagnostic
 profile write and telemetry publication are outside `command_span`.
@@ -75,12 +75,14 @@ through finalization even when profile collection is disabled; a backup failure
 reports a failed command. CREATE retains its existing timing fields and does
 not yet emit `command_span`.
 
-Remote backups can instead run asynchronously with
-`spark.openivm.stateSync.async.enabled=true` (default `false`). CREATE and REFRESH
-then return after local commit and enqueue a coalesced remote backup. If the
+Remote backups run asynchronously by default
+(`spark.openivm.stateSync.async.enabled=true`). CREATE and REFRESH
+return after local commit and enqueue a coalesced remote backup. If the
 driver is lost before publication, recovery starts from the last published
 generation. Garbage collection still waits for successful publication; a failed
 upload leaves its staging files intact and is logged in the background.
+Set `spark.openivm.stateSync.async.enabled=false` to wait for remote publication
+and cleanup before CREATE/REFRESH returns, with upload failures failing the command.
 
 In this mode, `state_backup_enqueue` measures submission, replacing `state_backup`.
 `command_span` excludes the later remote upload and cleanup. The state-sync log
