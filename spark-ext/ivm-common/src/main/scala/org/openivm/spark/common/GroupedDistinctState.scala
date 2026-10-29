@@ -3,7 +3,7 @@ package org.openivm.spark.common
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
 import com.fasterxml.jackson.databind.ObjectMapper
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.sql.{DataFrame, Encoders, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.catalyst.expressions.{
@@ -119,13 +119,16 @@ private[spark] final class GroupedDistinctState(
         .getOrElse(lit(false))
       return joined.filter(predicate)
     }
-    val source = joined.alias("s")
-    val wanted = broadcast(WindowStateJson.decode(spark, requested, GroupSchema)).alias("d")
+    val decoded = spark
+      .createDataset(requested)(Encoders.STRING)
+      .toDF(g)
+      .select(from_json(col(g), GroupSchema, JsonOptions).as("k"))
+    val source = joined.alias("s"); val wanted = broadcast(decoded).alias("d")
     val condition = keys
       .map { n =>
         val source = col(s"s.${quoted(n)}")
         val actual = if (inputSchema(n).dataType == StringType) source.cast(BinaryType) else source
-        actual.eqNullSafe(col(s"d.${quoted(n)}"))
+        actual.eqNullSafe(col(s"d.k.${quoted(n)}"))
       }
       .reduce(_ && _)
     source.join(wanted, condition, "left_semi").select("s.*")
@@ -181,7 +184,11 @@ private[spark] final class GroupedDistinctState(
       prior: Option[Array[Byte]]
   ) {
     def publish(checkpoint: Array[Byte]): Unit = db.withBatch { b =>
+      stageInto(db, b); OpenIvmRocksDBBatchOps.put(db, b, Cf, GroupedDistinctState.CheckpointKey, checkpoint)
+    }
+    def stageInto(shared: OpenIvmRocksDB, b: org.rocksdb.WriteBatch): Unit = {
       requireSettings()
+      require(shared eq db, "demand bootstrap must share the owning MV shard")
       val current = db.get(Cf, Header)
       require(
         current.size == prior.size && current.zip(prior).forall { case (a, b) => java.util.Arrays.equals(a, b) },
@@ -191,7 +198,6 @@ private[spark] final class GroupedDistinctState(
       OpenIvmRocksDBBatchOps.deleteRange(db, b, Cf, FreqPrefix, FreqEnd)
       rows.foreach { case (k, v) => OpenIvmRocksDBBatchOps.put(db, b, Cf, groupKey(k), v.getBytes(UTF_8)) }
       OpenIvmRocksDBBatchOps.put(db, b, Cf, Header, header(epoch, 0L))
-      OpenIvmRocksDBBatchOps.put(db, b, Cf, GroupedDistinctState.CheckpointKey, checkpoint)
     }
   }
   def all(epoch: String): DataFrame = WindowStateJson.decode(
@@ -276,7 +282,7 @@ private[spark] final class GroupedDistinctState(
 
   def prepare(delta: DataFrame, currentJoined: DataFrame, epoch: String)(
       ordinary: DataFrame => DataFrame
-  ): Completed = {
+  ): Prepared#Completed = {
     val cacheBefore = db.withSession { check(epoch) }
     val consolidated = unfold(delta)
       .groupBy(typedIndex.map(col): _*)
@@ -401,6 +407,7 @@ private[spark] final class GroupedDistinctState(
       k -> updated
     }
     next.values.foreach(_.valid())
+    val prepared = new Prepared(epoch, cacheBefore, next.toVector, writes, misses.size)
     val completedRows = records.filter(_.getAs[Int](ch) == -1).map { r =>
       val key     = r.getAs[String](g)
       val payload = r.getAs[String]("__rd_ordinary")
@@ -413,54 +420,62 @@ private[spark] final class GroupedDistinctState(
         .mkString(",")
       key -> (payload.dropRight(1) + "," + distinct + "}")
     }
-    requireCapacity(completedRows.size <= MaxGroups, "group-state cap")
-    require(completedRows.map(_._1).distinct.size == completedRows.size, "invalid fused group bag")
-    val expected = next.filter(_._2.n > 0).toMap
-    require(completedRows.map(_._1).toSet == expected.keySet, "recomputed group set disagrees with signed input")
-    completedRows.foreach { case (k, json) =>
-      require(counts(Some(json)) == expected(k), "grouped COUNT disagrees with native delta/frequency state")
-    }
-    new Completed(epoch, cacheBefore, affected, writes, misses.size, completedRows)
+    prepared.complete(completedRows)
   }
-  final class Completed private[GroupedDistinctState] (
+  final class Prepared private[GroupedDistinctState] (
       epoch: String,
       cacheBefore: Long,
-      touchedKeys: Vector[String],
+      changed: Vector[(String, Counts)],
       frequencies: Vector[(Index, Long)],
-      val misses: Int,
-      rows: Vector[(String, String)]
+      val misses: Int
   ) {
-    val hits: Int = frequencies.size - misses
-    private val nextRows: Vector[String] = {
-      val old = db
-        .withSession { check(epoch); db.boundedPrefixScan(Cf, GroupPrefix, MaxGroups, MaxBytes) }
-        .map { case (k, v) => new String(k.drop(GroupPrefix.length), UTF_8) -> RocksDBCodec.fromUtf8(v) }
-        .toMap
-      val all = (old -- touchedKeys) ++ rows
-      requireCapacity(
-        all.size <= MaxGroups && all.valuesIterator.map(_.getBytes(UTF_8).length.toLong).sum <= MaxBytes,
-        "next summary cap"
-      )
-      all.values.toVector
-    }
-    def summary: DataFrame = WindowStateJson.decode(spark, nextRows, summarySchema)
-    def publish(nextEpoch: String, checkpoint: Array[Byte]): Unit = db.withBatch { b =>
-      stageInto(db, b, nextEpoch);
-      OpenIvmRocksDBBatchOps.put(db, b, Cf, GroupedDistinctState.CheckpointKey, checkpoint)
-    }
-    def stageInto(shared: OpenIvmRocksDB, b: org.rocksdb.WriteBatch, nextEpoch: String): Unit = {
-      require(shared eq db, "demand state must share the owning MV shard")
-      require(check(epoch) == cacheBefore, "frequency cache changed during prepare")
-      val reset = cacheBefore + misses > maxCache
-      if (reset) OpenIvmRocksDBBatchOps.deleteRange(db, b, Cf, FreqPrefix, FreqEnd)
-      val retained = if (reset && frequencies.size > maxCache) Vector.empty else frequencies
-      retained.foreach { case (k, n) =>
-        OpenIvmRocksDBBatchOps.put(db, b, Cf, frequencyKey(k), RocksDBCodec.encodeLongBE(n))
+    val touchedKeys: Vector[String] = changed.map(_._1)
+    val hits: Int                   = frequencies.size - misses
+    def complete(rows: Vector[(String, String)]): Completed = {
+      requireCapacity(rows.size <= MaxGroups, "group-state cap")
+      require(rows.map(_._1).distinct.size == rows.size, "invalid fused group bag")
+      val expected = changed.filter(_._2.n > 0).toMap
+      require(rows.map(_._1).toSet == expected.keySet, "recomputed group set disagrees with signed input")
+      rows.foreach { case (k, json) =>
+        val observed = counts(Some(json));
+        require(observed == expected(k), "grouped COUNT disagrees with native delta/frequency state")
       }
-      touchedKeys.foreach(k => OpenIvmRocksDBBatchOps.delete(db, b, Cf, groupKey(k)))
-      rows.foreach { case (k, v) => OpenIvmRocksDBBatchOps.put(db, b, Cf, groupKey(k), v.getBytes(UTF_8)) }
-      val size = if (reset) retained.size.toLong else cacheBefore + misses
-      OpenIvmRocksDBBatchOps.put(db, b, Cf, Header, header(nextEpoch, size))
+      new Completed(rows)
+    }
+    final class Completed private[Prepared] (rows: Vector[(String, String)]) {
+      val hits: Int   = Prepared.this.hits
+      val misses: Int = Prepared.this.misses
+      private val nextRows: Vector[String] = {
+        val old = db
+          .withSession { check(epoch); db.boundedPrefixScan(Cf, GroupPrefix, MaxGroups, MaxBytes) }
+          .map { case (k, v) => new String(k.drop(GroupPrefix.length), UTF_8) -> RocksDBCodec.fromUtf8(v) }
+          .toMap
+        val all = (old -- touchedKeys) ++ rows
+        requireCapacity(
+          all.size <= MaxGroups && all.valuesIterator.map(_.getBytes(UTF_8).length.toLong).sum <= MaxBytes,
+          "next summary cap"
+        )
+        all.values.toVector
+      }
+      def summary: DataFrame = WindowStateJson.decode(spark, nextRows, summarySchema)
+      def publish(nextEpoch: String, checkpoint: Array[Byte]): Unit = db.withBatch { b =>
+        stageInto(db, b, nextEpoch);
+        OpenIvmRocksDBBatchOps.put(db, b, Cf, GroupedDistinctState.CheckpointKey, checkpoint)
+      }
+      def stageInto(shared: OpenIvmRocksDB, b: org.rocksdb.WriteBatch, nextEpoch: String): Unit = {
+        require(shared eq db, "demand state must share the owning MV shard")
+        require(check(epoch) == cacheBefore, "frequency cache changed during prepare")
+        val reset = cacheBefore + misses > maxCache
+        if (reset) OpenIvmRocksDBBatchOps.deleteRange(db, b, Cf, FreqPrefix, FreqEnd)
+        val retained = if (reset && frequencies.size > maxCache) Vector.empty else frequencies
+        retained.foreach { case (k, n) =>
+          OpenIvmRocksDBBatchOps.put(db, b, Cf, frequencyKey(k), RocksDBCodec.encodeLongBE(n))
+        }
+        touchedKeys.foreach(k => OpenIvmRocksDBBatchOps.delete(db, b, Cf, groupKey(k)))
+        rows.foreach { case (k, v) => OpenIvmRocksDBBatchOps.put(db, b, Cf, groupKey(k), v.getBytes(UTF_8)) }
+        val size = if (reset) retained.size.toLong else cacheBefore + misses
+        OpenIvmRocksDBBatchOps.put(db, b, Cf, Header, header(nextEpoch, size))
+      }
     }
   }
 }
