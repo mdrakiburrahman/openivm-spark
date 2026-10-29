@@ -5,6 +5,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 
 private[common] trait MvCatalogBackend {
   def ensureTables(spark: SparkSession): Unit
+  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = ()
   def upsert(spark: SparkSession, meta: MvMetadata): Unit
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata]
   def list(spark: SparkSession): Seq[MvMetadata]

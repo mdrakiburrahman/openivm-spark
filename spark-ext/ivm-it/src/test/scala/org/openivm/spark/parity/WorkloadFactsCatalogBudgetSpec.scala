@@ -37,8 +37,9 @@ class WorkloadFactsCatalogBudgetSpec extends AnyFunSpec with Matchers with Befor
   private var spark: SparkSession = _
 
   /**
-   * One `get_table` for the shared `CatalogTable` plus the three Spark spends
-   * resolving the source relation for its schema (`DeltaCatalog.loadTable`).
+   * Two `get_table` calls for the shared `CatalogTable` (existence and metadata)
+   * plus the two Spark spends resolving the source relation for its schema
+   * (`DeltaCatalog.loadTable`).
    * Before the shared lookup this was 6: `deltaProperties` and
    * `catalogProperties` each resolved the same table independently.
    */
@@ -54,7 +55,7 @@ class WorkloadFactsCatalogBudgetSpec extends AnyFunSpec with Matchers with Befor
       val message = event.getMessage.getFormattedMessage
       if (message.contains("cmd=")) {
         commands.synchronized {
-          commands += message.substring(message.indexOf("cmd=") + 4).split("\\s+").head
+          commands += message.substring(message.indexOf("cmd=") + 4).split("\\s+").head.stripSuffix(":")
         }
       }
     }
@@ -130,6 +131,28 @@ class WorkloadFactsCatalogBudgetSpec extends AnyFunSpec with Matchers with Befor
     it("keeps discovering facts for tables that are not resolvable through the catalog") {
       val facts = WorkloadFactsRegistry.forRefresh().discover(spark, Seq("facts_db.missing_table"))
       facts shouldBe org.openivm.spark.common.WorkloadConstraintFacts()
+    }
+
+    it("avoids schema-resolution metastore reads when the analyzed schema is supplied") {
+      val source = "facts_db.orders"
+      val schema = spark.table(source).schema
+      val (expected, baselineCalls) = metastoreCalls {
+        WorkloadFactsRegistry.forRefresh().discover(spark, Seq(source))
+      }
+
+      val (facts, calls) = metastoreCalls {
+        WorkloadFactsRegistry
+          .forRefresh()
+          .discover(spark, Seq(source), resolvedSourceSchemas = Map(source -> schema))
+      }
+
+      facts shouldBe expected
+      info(s"baseline metastore calls: $baselineCalls; supplied-schema calls: $calls")
+      withClue(s"metastore calls: ${calls.toSeq.sorted.mkString(", ")}: ") {
+        calls.getOrElse("get_table", 0) shouldBe 2
+        calls.getOrElse("get_table", 0) should be < baselineCalls.getOrElse("get_table", 0)
+        calls.getOrElse("get_database", 0) shouldBe 1
+      }
     }
   }
 }

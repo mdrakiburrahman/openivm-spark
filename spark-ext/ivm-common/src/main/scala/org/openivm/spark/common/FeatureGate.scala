@@ -50,6 +50,11 @@ object FeatureGate {
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
 
+  /** Return from MV commands before remote backup completes (default true).
+    * Local commits remain synchronous; driver loss can restore an older remote generation.
+    */
+  val StateSyncAsyncEnabledKey: String = "spark.openivm.stateSync.async.enabled"
+
   /** Number of newest published state-sync snapshot generations kept under [[StateSyncUriKey]];
     * older generations are deleted after each publish. Restore only reads the newest one. Minimum 2.
     */
@@ -187,7 +192,8 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
-  /** Cache openivm compile/classification results per MV schema + facts tier.
+  /** Cache raw openivm compile/classification results per verified compiler
+    * generation, complete request identity, MV schema and structural facts.
     * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
     * the cached shape-stable SQL every time so per-refresh snapshot temp views
     * are recreated on each execution.
@@ -440,6 +446,11 @@ object FeatureGate {
     */
   val WindowRunningIncrementalEnabledKey: String = "spark.openivm.refresh.windowRunningIncremental.enabled"
 
+  /** Opt-in exact grouped-state cache before rank/window evaluation. Unsupported
+    * shapes retain the native incremental program; CDF mode only.
+    */
+  val GroupedWindowStateEnabledKey: String = "spark.openivm.refresh.groupedWindowState.enabled"
+
   /** Fast-exit a CDF refresh when every source-table Delta commit since the
     * last consumed version is metadata-only / dataChange=false NOOP. Default
     * OFF: the legacy empty-batch guard remains unchanged, and this opt-in skips
@@ -507,6 +518,12 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def stateSyncAsyncEnabled(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(StateSyncAsyncEnabledKey)
+      .map(_.toBoolean)
+      .getOrElse(boolConf(spark.sparkContext.getConf, StateSyncAsyncEnabledKey, default = true))
 
   def stateSyncRetainGenerations(spark: SparkSession): Int =
     math.max(2, spark.sparkContext.getConf.getInt(StateSyncRetainGenerationsKey, StateSyncRetainGenerationsDefault))
@@ -763,6 +780,12 @@ object FeatureGate {
 
   def windowRunningIncrementalEnabled(spark: SparkSession): Boolean =
     windowRunningIncrementalEnabled(spark.sparkContext.getConf)
+
+  def groupedWindowStateEnabled(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(GroupedWindowStateEnabledKey)
+      .map(_.toBoolean)
+      .getOrElse(boolConf(spark.sparkContext.getConf, GroupedWindowStateEnabledKey, default = false))
 
   def noopFastExitEnabled(conf: SparkConf): Boolean =
     boolConf(conf, NoopFastExitEnabledKey, default = false)
