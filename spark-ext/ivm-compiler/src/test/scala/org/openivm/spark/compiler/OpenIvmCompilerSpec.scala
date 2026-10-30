@@ -185,7 +185,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
       s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
       "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
@@ -195,7 +195,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
     val literal = "escaped''" * 10000 + s"openivm_data_$key"
     val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT '$literal' FROM openivm_data_mv"
   }
 
@@ -607,7 +607,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
-      sources = Map("sales" -> salesSchema)
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "`analytics`.`sales`")
     )
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
@@ -616,6 +617,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
     result.sql should include("FROM openivm_data_mv_sales_proj")
     result.sql should not include "openivm_data___openivm_mv_"
+    result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
+    result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
+    result.initialLoadSql should include("`analytics`.`sales`")
   }
 
   // ── Test 6: Type mapping ──────────────────────────────────────────────────
@@ -976,6 +980,47 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   private val prefixCollisionQueries: String =
     "CREATE TABLE openivm_data_mv_prefix_collision AS SELECT c.name, a.city " +
       "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;"
+
+  it should "normalize native maintenance identifiers without changing SQL values or comments" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val sql = s"""SELECT 'memory.main.openivm_data_$key', "a openivm_data_$key", `a openivm_data_$key`,
+                 |  * FROM memory.main.openivm_data_$key
+                 |  JOIN `memory`.`main`.`openivm_delta_$key` USING (id)
+                 |  JOIN "memory"."main"."openivm_meta_$key" USING (id)
+                 |  -- "memory"."main"."openivm_data_$key"
+                 |  /* openivm_delta_$key */""".stripMargin
+    val normalized = OpenIvmCompiler.normalizeNativeViewObjects(sql, key, "mv")
+    normalized should include("FROM openivm_data_mv")
+    normalized should include("JOIN openivm_delta_mv USING")
+    normalized should include("JOIN openivm_meta_mv USING")
+    normalized should include(s"'memory.main.openivm_data_$key'")
+    normalized should include("\"a openivm_data_" + key + "\"")
+    normalized should include(s"`a openivm_data_$key`")
+    normalized should include("-- \"memory\".\"main\".\"openivm_data_" + key + "\"")
+    normalized should include(s"/* openivm_delta_$key */")
+  }
+
+  it should "read the encoded native initial-load file and retain hidden keys and source pins" in {
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val dir  = Files.createTempDirectory("openivm-native-initial-load-")
+    val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
+    try {
+      Files.write(
+        file,
+        (s"CREATE TABLE memory.main.openivm_data_$key AS " +
+          "SELECT c.name, a.city, c.id AS openivm_left_key_0 " +
+          "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;").getBytes("UTF-8")
+      )
+      val sql = sharedCompiler.parseInitialLoadSql(dir, prefixCollisionRequest, key)
+      sql should include("openivm_left_key_0")
+      sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
+      sql should include("db.customer_address AS a")
+      sql should not include key
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
+  }
 
   it should "not bleed a shorter source's pin into a longer source name in the initial load" in {
     val sql = initialLoadSqlFor(prefixCollisionRequest, prefixCollisionQueries)

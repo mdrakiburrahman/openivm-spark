@@ -177,7 +177,8 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
         CompileRequest(
           viewName = "mv_sales_proj",
           viewSql = "SELECT region FROM sales WHERE amount > 0",
-          sources = Map("sales" -> salesSchema)
+          sources = Map("sales" -> salesSchema),
+          sourceQualifiedNames = Map("sales" -> "`analytics`.`sales`")
         )
       )
       result.refreshType shouldBe 2
@@ -186,6 +187,9 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
       result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
       result.sql should include("FROM openivm_data_mv_sales_proj")
       result.sql should not include "openivm_data___openivm_mv_"
+      result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
+      result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
+      result.initialLoadSql should include("`analytics`.`sales`")
     }
 
     // openivm Test 5 — AGGREGATE_GROUP shape, compile returns non-empty SQL.

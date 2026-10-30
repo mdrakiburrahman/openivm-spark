@@ -6506,14 +6506,19 @@ case class RefreshMaterializedViewCommand(
                       case Some(view) => StagingDeltaView.CachedViewDeltaRef.sqlRef(view)
                       case None       => s"delta.`${viewDeltaPath.replace("`", "``")}`"
                     }
-                    val deltaCols =
-                      (fusedView match {
+                    val deltaRows =
+                      fusedView match {
                         case Some(view) => spark.table(s"global_temp.$view")
                         case None       => spark.read.format("delta").load(viewDeltaPath)
-                      }).columns.toSet
-                    val mvCols = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
+                      }
+                    val deltaCols = deltaRows.columns.toSet
+                    val mvCols    = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
                     if (
-                      deltaCols.contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains)
+                      deltaCols
+                        .contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains) &&
+                      // Partial-recompute deltas may carry keys with unknown weights.
+                      // They cannot be expanded as an exact bag of appended rows.
+                      deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
                     ) {
                       val colList = mvCols.map(c => s"`$c`").mkString(", ")
                       Some(
@@ -6699,10 +6704,14 @@ case class RefreshMaterializedViewCommand(
                 } else executeRunningWindowSql(sql, idx)
               }
             } else {
+              // Native suffix programs already contain both fallback and fast writes.
+              // Recompute-only optimizations cannot replace just their fallback half.
+              val optimizeWindowRecompute = meta.refreshType == RefreshTypeCode.WindowPartition &&
+                !rewritten.hasRunningWindowProgram
               val windowSuffixSql: Option[WindowSuffixSql] =
                 if (
                   FeatureGate.windowSuffixSkipEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   batchInsertOnly
                 )
                   buildWindowSuffixSql(spark, meta, mergeTargetId, viewDeltaPath)
@@ -6717,14 +6726,14 @@ case class RefreshMaterializedViewCommand(
                   !windowSuffixSafe &&
                   !propagation.requiresDmlInterception &&
                   FeatureGate.boundedRankEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition
+                  optimizeWindowRecompute
                 ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
                 else None
               val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
               val windowCascadeMergeShape: Option[WindowCascadeMergeShape] =
                 if (
                   FeatureGate.windowCascadeMergeEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   !windowSuffixSafe &&
                   boundedRankInsertSql.isEmpty
                 )
@@ -6738,7 +6747,7 @@ case class RefreshMaterializedViewCommand(
                 if (
                   windowCascadeMergeShape.isEmpty &&
                   FeatureGate.windowSinglePassReplaceEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   !windowSuffixSafe &&
                   boundedRankInsertSql.isEmpty
                 )
@@ -8299,7 +8308,9 @@ case class RefreshMaterializedViewCommand(
           val targetContextPartExists =
             partitionMatch("openivm_target_context", "a", shape.partitionCols)
           val maxExists = partitionMatch("openivm_suffix", "m", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "context_source").map { suffixBody =>
+          // The physical query also computes native ROWS-window position state.
+          val physicalQuery = meta.properties.getOrElse(MvMetadata.CompiledInitialLoadSqlKey, meta.querySql)
+          replaceWindowSuffixSource(physicalQuery, "context_source", shape.sourceShort).map { suffixBody =>
             def suffixQuery(selectList: String): String =
               s"""|WITH affected AS (
                   |  SELECT DISTINCT $partList
@@ -8421,7 +8432,7 @@ case class RefreshMaterializedViewCommand(
           val deltaRef    = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
           val baseMatch   = partitionMatch("openivm_base", "a", shape.partitionCols)
           val resultMatch = partitionMatch("openivm_bounded", "a", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "bounded_source").map { boundedBody =>
+          replaceWindowSuffixSource(meta.querySql, "bounded_source", shape.sourceShort).map { boundedBody =>
             s"""|INSERT INTO $targetRef ($colList)
                 |WITH affected AS (
                 |  SELECT DISTINCT $partList
@@ -8564,11 +8575,14 @@ case class RefreshMaterializedViewCommand(
   private def quoteCol(col: String): String =
     s"`${col.replace("`", "``")}`"
 
-  private def replaceWindowSuffixSource(sql: String, replacement: String): Option[String] = {
+  private def replaceWindowSuffixSource(sql: String, replacement: String, sourceShort: String): Option[String] = {
     val fromRe =
       ("(?is)\\bFROM\\s+((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)" +
         "(\\s+(?:AS\\s+)?[A-Za-z_][A-Za-z0-9_]*)?").r
-    val matches = fromRe.findAllMatchIn(sql).toVector
+    val matches = fromRe
+      .findAllMatchIn(sql)
+      .filter(m => stripSqlIdent(m.group(1).split("\\.").last).equalsIgnoreCase(sourceShort))
+      .toVector
     if (matches.size != 1) None
     else {
       val m      = matches.head

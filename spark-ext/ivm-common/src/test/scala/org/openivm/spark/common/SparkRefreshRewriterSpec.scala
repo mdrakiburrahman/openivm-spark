@@ -1187,6 +1187,65 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements.last should include("WHEN NOT MATCHED THEN INSERT")
     }
 
+    Seq(false, true).foreach { inlineSource =>
+      it(s"keeps leading CTEs inside an EXISTS delete MERGE source (inline=$inlineSource)") {
+        val source =
+          if (inlineSource)
+            "(SELECT openivm_left_key FROM openivm_affected WHERE openivm_left_key IS NULL OR openivm_left_key = 1)"
+          else "openivm_affected"
+        val input =
+          s"""WITH affected_seed AS (SELECT 1 AS openivm_left_key),
+             |openivm_affected AS (SELECT openivm_left_key FROM affected_seed)
+             |DELETE FROM openivm_data_mv_r AS openivm_delete_target
+             |WHERE EXISTS (SELECT 1 FROM $source AS aff
+             |WHERE aff.openivm_left_key IS NOT DISTINCT FROM openivm_delete_target.openivm_left_key);
+             |""".stripMargin
+
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+
+        rewritten.statements should have size 1
+        val merge = rewritten.statements.head
+        merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+        merge should include("WITH affected_seed AS")
+        merge should include("openivm_affected AS (SELECT openivm_left_key FROM affected_seed)")
+        merge should include(
+          if (inlineSource) "SELECT openivm_left_key FROM openivm_affected" else "SELECT * FROM openivm_affected"
+        )
+        merge should include("ON d.openivm_left_key IS NOT DISTINCT FROM v.openivm_left_key")
+        merge should include("WHEN MATCHED THEN DELETE")
+      }
+    }
+
+    it("keeps an unaliased FULL JOIN affected-key CTE inside a delete MERGE") {
+      val input =
+        """WITH openivm_affected AS (SELECT 1 AS _k UNION SELECT NULL AS _k)
+          |DELETE FROM openivm_data_mv_r WHERE EXISTS (
+          |SELECT 1 FROM openivm_affected WHERE _k <=> openivm_left_key OR _k <=> openivm_right_key);
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      rewritten.statements should have size 1
+      val merge = rewritten.statements.head
+      merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      merge should include("WITH openivm_affected AS")
+      merge should include("SELECT * FROM openivm_affected")
+      merge should include("ON d._k <=> v.openivm_left_key OR d._k <=> v.openivm_right_key")
+      merge should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("rewrites DELETE USING into a key-safe delete MERGE") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1566,6 +1625,26 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
 
+    it("reports running-window programs independently of final SQL formatting") {
+      val recomputeOnly =
+        "CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;"
+      Seq(p52Input -> true, recomputeOnly -> false).foreach { case (compiledSql, expected) =>
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = compiledSql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          postProcess = _.toUpperCase(java.util.Locale.ROOT),
+          mvVersionBeforeRefresh = Some(3)
+        )
+        rewritten.statements should not be empty
+        rewritten.hasRunningWindowProgram shouldBe expected
+        rewritten.statements.exists(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_")) shouldBe false
+      }
+    }
+
     it("caches running-window snapshots but keeps bounds filters lazy") {
       val rewritten = rewriteP52()
       val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
@@ -1619,6 +1698,48 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       fastInsert should include("d.openivm_multiplicity > 0")
       fastInsert should not include "openivm_data_wradm_mv"
       fastInsert should not include "openivm_timestamp"
+    }
+
+    it("writes and cascades a materialized running-window suffix result") {
+      val sql =
+        """CREATE OR REPLACE TEMP TABLE openivm_old_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_wradm_mv
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_run_result_wradm_mv AS
+          |SELECT dm_s_symb, dm_date, dm_close, run_sum FROM openivm_run_fast_wradm_mv;
+          |INSERT INTO openivm_data_wradm_mv (dm_s_symb, dm_date, dm_close, run_sum)
+          |SELECT * FROM openivm_run_result_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
+          |DROP TABLE openivm_run_result_wradm_mv;
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = sql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+        .map(SparkRefreshRewriter.stripExecutionMarker)
+      val dataInsert = rewritten
+        .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+        .getOrElse(fail("materialized suffix data insert missing"))
+      dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
+      dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
+      val append = rewritten
+        .find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+        .getOrElse(fail("materialized suffix cascade append missing"))
+      append should include("FROM openivm_run_result_wradm_mv")
+      append should not include "openivm_timestamp"
+      append should include("CURRENT_TIMESTAMP")
+      rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
+      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
 
     it("drops running-window helper objects as views") {
