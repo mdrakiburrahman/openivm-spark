@@ -19,6 +19,19 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("null-on-error timestamp parser shim") {
+    it("renames the safe parser without changing literals or comments") {
+      val sql = "SELECT try_to_timestamp(d, 'yyyyMMdd'), 'try_to_timestamp(d, f)' -- try_to_timestamp(d, f)"
+      SparkFunctionShimSql.renameSparkFunctionShimCalls(sql) shouldBe
+        sql.replace("SELECT try_to_timestamp", "SELECT __sparkfn_try_to_timestamp")
+    }
+
+    it("restores safe timestamp parsing after native macro expansion") {
+      val sql = "SELECT try_strptime(d, 'yyyyMMdd'), 'try_strptime(d, f)'"
+      LptsSparkDialect.translate(sql) shouldBe "SELECT try_to_timestamp(d, 'yyyyMMdd'), 'try_strptime(d, f)'"
+    }
+  }
+
   describe("rewriteQuotedCastTypes") {
     it("normalizes quoted CAST and TRY_CAST types through nested expressions") {
       val sql = """SELECT CAST(coalesce(TRY_CAST(x AS "DATE"), CAST(NULL AS `DATE`)) AS "DATE"),

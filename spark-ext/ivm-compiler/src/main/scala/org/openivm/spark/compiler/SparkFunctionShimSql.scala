@@ -35,6 +35,7 @@ private[compiler] object SparkFunctionShimSql {
   private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
 
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
+    "try_to_timestamp" -> RenameRule(Map(1 -> "__sparkfn_try_to_timestamp")),
     "to_date" -> RenameRule(
       Map(
         0 -> "__sparkfn_to_date_1arg",
@@ -154,6 +155,7 @@ private[compiler] object SparkFunctionShimSql {
         .orElse(parseGetJsonObjectShim(sql, i))
         .orElse(parseCastTemporalShim(sql, i))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
+        .orElse(parseFunctionRewrite(sql, i, "try_strptime", "try_to_timestamp"))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "last_value"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "first_value"))

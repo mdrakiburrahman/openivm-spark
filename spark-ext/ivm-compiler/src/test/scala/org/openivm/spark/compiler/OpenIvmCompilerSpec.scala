@@ -424,6 +424,22 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  it should "preserve TRY_TO_TIMESTAMP in compiled refresh and initial load SQL" in {
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_try_timestamp",
+        viewSql = "SELECT id, try_to_timestamp(d, 'yyyyMMdd') AS ts FROM events",
+        sources = Map("events" -> StructType.fromDDL("id INT, d STRING"))
+      )
+    )
+    Seq(LptsSparkDialect.translate(result.sql), result.initialLoadSql).foreach { sql =>
+      sql.toLowerCase should include("try_to_timestamp")
+      sql should not include "__sparkfn_"
+      sql.toLowerCase should not include "try_strptime"
+    }
+    org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(result.initialLoadSql)
+  }
+
   it should "preserve native and Spark add_months parity in the compiled initial load" in {
     val cases = Seq(
       ("2015-02-28", 1),
