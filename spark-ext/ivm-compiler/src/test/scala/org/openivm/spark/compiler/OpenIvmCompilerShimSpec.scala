@@ -49,6 +49,15 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   ): CompiledRefresh =
     compiler.compile(CompileRequest(viewName = viewName, viewSql = body, sources = sources))
 
+  "month interval lowering" should "remove DuckDB numeric truncation from emitted Spark SQL" in {
+    val r = compileBody(
+      viewName = "shim_month_interval",
+      sources = Map("events" -> StructType.fromDDL("id INT, event_date DATE")),
+      body = "SELECT id FROM events WHERE event_date >= DATE '2002-12-31' + INTERVAL '-12' MONTH"
+    )
+    r.sql.toLowerCase should not include "trunc("
+  }
+
   // ── regexp_like / date-function / last_value shims ───────────────────────────
 
   private val textSchema: StructType    = StructType.fromDDL("id INT, txt STRING")

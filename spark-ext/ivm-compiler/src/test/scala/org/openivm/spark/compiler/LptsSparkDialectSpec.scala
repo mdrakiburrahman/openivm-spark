@@ -32,6 +32,26 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("integer casts around DuckDB numeric truncation") {
+    it("uses Spark's truncating integer cast for native interval constructors") {
+      val input    = "SELECT to_months(CAST(trunc(CAST(-12 AS DOUBLE)) AS INTEGER))"
+      val expected = "SELECT ((CAST(CAST(-12 AS DOUBLE) AS INTEGER)) * INTERVAL 1 MONTH)"
+      LptsSparkDialect.translate(input) shouldBe expected
+      LptsSparkDialect.translate(expected) shouldBe expected
+    }
+
+    it("preserves date truncation, decimal truncation and protected text") {
+      val input = "SELECT trunc(d, 'month'), trunc(x), CAST(trunc(x, 2) AS INT), " +
+        "CAST(trunc(x) AS DOUBLE), 'CAST(trunc(x) AS INT)' /* CAST(trunc(x) AS INT) */"
+      LptsSparkDialect.translate(input) shouldBe input
+    }
+
+    it("keeps nested arguments and truncates signed fractions before narrowing") {
+      LptsSparkDialect.translate("SELECT CAST(trunc(coalesce(x, -1.9)) AS BIGINT)") shouldBe
+        "SELECT CAST(coalesce(x, -1.9) AS BIGINT)"
+    }
+  }
+
   describe("rewriteQuotedCastTypes") {
     it("normalizes quoted CAST and TRY_CAST types through nested expressions") {
       val sql = """SELECT CAST(coalesce(TRY_CAST(x AS "DATE"), CAST(NULL AS `DATE`)) AS "DATE"),
