@@ -150,7 +150,7 @@ private[compiler] object SparkFunctionShimSql {
     * `date_format(to_date(x, f), g)`.
     */
   def rewriteInlinedSparkShimCalls(sql: String): String =
-    rewriteOutsideProtected(sql) { i =>
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
       parseMakeIntervalShim(sql, i)
         .orElse(parseGetJsonObjectShim(sql, i))
         .orElse(parseCastShim(sql, i))
