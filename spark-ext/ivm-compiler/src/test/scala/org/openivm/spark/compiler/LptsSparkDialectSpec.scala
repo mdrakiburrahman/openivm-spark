@@ -33,7 +33,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
     it("preserves date truncation, decimal truncation and protected text") {
       val input = "SELECT trunc(d, 'month'), trunc(x), CAST(trunc(x, 2) AS INT), " +
-        "CAST(trunc(x) AS DOUBLE), 'CAST(trunc(x) AS INT)' /* CAST(trunc(x) AS INT) */"
+        """CAST(trunc(x) AS DOUBLE), 'CAST(trunc(x) AS INT)', `CAST(trunc(x) AS INT)`, "CAST(trunc(x) AS INT)" /* CAST(trunc(x) AS INT) */"""
       LptsSparkDialect.translate(input) shouldBe input
     }
 
