@@ -1131,6 +1131,7 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_try_to_timestamp(s, fmt) AS try_strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The
