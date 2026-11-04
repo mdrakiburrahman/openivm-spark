@@ -282,10 +282,10 @@ test('local and consumer configurations preserve required runtime settings', () 
       'source=${localWorkspaceFolder},target=/workspaces/openivm-spark,type=bind,consistency=cached',
     );
     if (relativeFilename.endsWith('devcontainer.local.json')) {
-      assert.equal(config.build?.target, 'pr62-control-runtime');
+      assert.equal(config.build?.target, '${localEnv:OPENIVM_IMAGE_BUILD_TARGET:devcontainer}');
       assert.deepEqual(config.build?.options, [
         '--platform=linux/amd64',
-        '--build-context=pr62_assembly=${localEnv:OPENIVM_PR62_ASSEMBLY_DIR}',
+        '--build-context=pr62_assembly=${localEnv:OPENIVM_PR62_ASSEMBLY_DIR:.}',
       ]);
     }
   }

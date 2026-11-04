@@ -18,7 +18,18 @@ on:
       - 'spark-ext/dev/targets/**'
       - 'spark-ext/project/**'
       - '.github/workflows/devcontainer-image.yaml'
+      - '.github/scripts/stage-pr62-image-input.sh'
   workflow_dispatch:
+    inputs:
+      assembly_asset_id:
+        description: Optional numeric same-repository draft asset ID for verified PR62 packaging only
+        type: string
+        required: false
+      assembly_sha256:
+        description: Exact SHA256 of the existing immutable PR62 assembly
+        type: string
+        required: false
+        default: a49fe6c36626853a672f7a4d43250b7e798d01814b3b98b40c8e8885ec0286eb
 
 concurrency:
   group: devcontainer-image
@@ -49,6 +60,18 @@ jobs:
 
       - name: Validate Docker
         run: ./contrib/bootstrap-ci.sh
+
+      - name: Stage verified prebuilt PR62 input
+        if: github.event_name == 'workflow_dispatch' && inputs.assembly_asset_id != ''
+        env:
+          ASSEMBLY_ASSET_ID: ${{ inputs.assembly_asset_id }}
+          ASSEMBLY_SHA256: ${{ inputs.assembly_sha256 }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          context="${RUNNER_TEMP}/pr62-assembly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bash .github/scripts/stage-pr62-image-input.sh "$ASSEMBLY_ASSET_ID" "$ASSEMBLY_SHA256" "$context"
+          printf 'OPENIVM_PR62_ASSEMBLY_DIR=%s\nOPENIVM_IMAGE_BUILD_TARGET=pr62-control-runtime\n' "$context" >> "$GITHUB_ENV"
 
       - name: Synchronize candidate image reference
         run: npx --no-install nx run devcontainer:tag -- --update-consumer
