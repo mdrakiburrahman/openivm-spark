@@ -39,7 +39,47 @@ permissions:
   contents: read
 
 jobs:
+  stage-prebuilt:
+    if: github.repository == 'mdrakiburrahman/openivm-spark' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/copilot/pr62-spark35-artifact-20261103' && inputs.assembly_asset_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download and verify trusted draft input without checkout
+        env:
+          ASSEMBLY_ASSET_ID: ${{ inputs.assembly_asset_id }}
+          ASSEMBLY_SHA256: ${{ inputs.assembly_sha256 }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly sha=a49fe6c36626853a672f7a4d43250b7e798d01814b3b98b40c8e8885ec0286eb
+          if [[ ! "$ASSEMBLY_ASSET_ID" =~ ^[0-9]+$ || "$ASSEMBLY_SHA256" != "$sha" ]]; then
+            echo "Numeric asset ID and exact pinned PR62 SHA256 are required." >&2
+            exit 2
+          fi
+          context="${RUNNER_TEMP}/pr62-assembly"
+          mkdir "$context"
+          printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/octet-stream"\n' \
+            "$GITHUB_TOKEN" |
+            curl --config - --fail --silent --show-error --location \
+              --output "$context/ivmextension.jar" \
+              "https://api.github.com/repos/mdrakiburrahman/openivm-spark/releases/assets/${ASSEMBLY_ASSET_ID}"
+          test "$(stat --format=%s "$context/ivmextension.jar")" = 100880999
+          printf '%s  %s\n' "$sha" "$context/ivmextension.jar" | sha256sum -c -
+
+      - name: Transfer verified immutable input within this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr62-verified-build-input
+          path: ${{ runner.temp }}/pr62-assembly/ivmextension.jar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   image:
+    needs: stage-prebuilt
+    if: always() && (needs.stage-prebuilt.result == 'success' || (needs.stage-prebuilt.result == 'skipped' && inputs.assembly_asset_id == ''))
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
     permissions:
@@ -61,16 +101,24 @@ jobs:
       - name: Validate Docker
         run: ./contrib/bootstrap-ci.sh
 
-      - name: Stage verified prebuilt PR62 input
+      - name: Receive same-run verified PR62 input
+        if: github.event_name == 'workflow_dispatch' && inputs.assembly_asset_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr62-verified-build-input
+          path: ${{ runner.temp }}/pr62-assembly
+
+      - name: Reverify prebuilt identity and select packaging only
         if: github.event_name == 'workflow_dispatch' && inputs.assembly_asset_id != ''
         env:
-          ASSEMBLY_ASSET_ID: ${{ inputs.assembly_asset_id }}
           ASSEMBLY_SHA256: ${{ inputs.assembly_sha256 }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          context="${RUNNER_TEMP}/pr62-assembly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          bash .github/scripts/stage-pr62-image-input.sh "$ASSEMBLY_ASSET_ID" "$ASSEMBLY_SHA256" "$context"
+          readonly sha=a49fe6c36626853a672f7a4d43250b7e798d01814b3b98b40c8e8885ec0286eb
+          test "$ASSEMBLY_SHA256" = "$sha"
+          context="${RUNNER_TEMP}/pr62-assembly"
+          test "$(stat --format=%s "$context/ivmextension.jar")" = 100880999
+          printf '%s  %s\n' "$sha" "$context/ivmextension.jar" | sha256sum -c -
           printf 'OPENIVM_PR62_ASSEMBLY_DIR=%s\nOPENIVM_IMAGE_BUILD_TARGET=pr62-control-runtime\n' "$context" >> "$GITHUB_ENV"
 
       - name: Synchronize candidate image reference

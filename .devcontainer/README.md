@@ -29,8 +29,13 @@ The existing image-publication workflow also supports this route through
 `workflow_dispatch` on the intended branch: supply numeric `assembly_asset_id`
 for a **draft-only release asset in this repository** and the exact
 `assembly_sha256` above. The staging script downloads only that same-repository
-API resource with the existing job token, requires exactly 100880999 bytes, and
-verifies SHA256 before selecting the packaging-only target. Invalid inputs or
+API resource in an isolated no-checkout staging job restricted to that trusted
+PR93 branch and explicit prebuilt dispatch. Only this staging job has
+`contents:write`, the minimum draft-release read access; it executes inline
+download/hash checks, never repository or artifact code. A pinned same-run
+Actions artifact transfers the JAR to the build job, which retains only
+`contents:read` and `packages:write` and rechecks exactly 100880999 bytes and
+SHA256 before selecting the packaging-only target. Invalid inputs or
 inaccessible draft assets fail; there is no public-release, external-URL, or
 native-build fallback. The build-input release must remain draft.
 
