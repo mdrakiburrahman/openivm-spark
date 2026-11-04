@@ -3,7 +3,11 @@
   "build": {
     "context": "..",
     "dockerfile": "Dockerfile",
-    "options": ["--platform=linux/amd64"],
+    "target": "pr62-control-runtime",
+    "options": [
+      "--platform=linux/amd64",
+      "--build-context=pr62_assembly=${localEnv:OPENIVM_PR62_ASSEMBLY_DIR}"
+    ],
     "args": {
       "DUCKDB_COMMIT": "${localEnv:DUCKDB_COMMIT}",
       "DUCKDB_REF": "${localEnv:DUCKDB_REF}",
