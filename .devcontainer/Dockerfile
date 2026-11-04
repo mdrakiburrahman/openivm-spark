@@ -235,3 +235,51 @@ WORKDIR /workspaces/openivm-spark
 
 ENTRYPOINT ["/usr/local/bin/openivm-entrypoint"]
 CMD ["sleep", "infinity"]
+
+# Repackage the verified PR 62 compiler assets without rebuilding native sources.
+FROM ghcr.io/mdrakiburrahman/openivm-spark-devcontainer@sha256:1fa530da86a95918417c3728239cf553727e260013cfac416c31cd94580fca87 AS pr62-control-runtime
+
+USER root
+COPY --chown=vscode:vscode spark-ext/.sbtopts spark-ext/build.sbt /opt/openivm-sbt/
+COPY --chown=vscode:vscode spark-ext/project/ /opt/openivm-sbt/project/
+COPY --chmod=755 spark-ext/dev/docker/entrypoint.sh /usr/local/bin/openivm-entrypoint
+COPY --chmod=755 .devcontainer/scripts/post-create.sh /usr/local/share/openivm-spark/post-create.sh
+
+RUN --mount=type=bind,from=pr62_assembly,source=ivmextension.jar,target=/run/pr62-assembly.jar \
+    python3 - <<'PY'
+import hashlib
+import os
+import pwd
+from pathlib import Path
+import zipfile
+
+artifact = Path("/run/pr62-assembly.jar")
+expected = "a49fe6c36626853a672f7a4d43250b7e798d01814b3b98b40c8e8885ec0286eb"
+with artifact.open("rb") as stream:
+    actual = hashlib.file_digest(stream, "sha256").hexdigest()
+if actual != expected:
+    raise SystemExit("PR 62 assembly checksum mismatch")
+root = Path("/opt/openivm")
+names = ["duckdb", "openivm.duckdb_extension"]
+with zipfile.ZipFile(artifact) as archive:
+    libraries = ["libstdc++.so.6", "libgcc_s.so.1"]
+    present = [name for name in libraries if "openivm-native/" + name in archive.namelist()]
+    if present and present != libraries:
+        raise SystemExit("Incomplete bundled C++ runtime")
+    for name in libraries:
+        (root / name).unlink(missing_ok=True)
+    names += present
+    for name in names:
+        (root / name).write_bytes(archive.read("openivm-native/" + name))
+(root / "duckdb").chmod(0o755)
+(root / "SHA256SUMS").write_text("".join(
+    hashlib.sha256((root / name).read_bytes()).hexdigest() + "  " + name + "\n"
+    for name in names
+))
+user = pwd.getpwnam("vscode")
+for name in names + ["SHA256SUMS"]:
+    os.chown(root / name, user.pw_uid, user.pw_gid)
+PY
+
+USER vscode
+WORKDIR /workspaces/openivm-spark

@@ -2,6 +2,43 @@
 
 Run the headless commands from the repository root after `npm ci`.
 
+This PR 62 control branch packages its runtime from the published toolchain image
+at immutable digest `sha256:1fa530da86a95918417c3728239cf553727e260013cfac416c31cd94580fca87`.
+The final Dockerfile target replaces the base image's native compiler assets with
+those embedded in the verified assembly
+`org.openivm:ivmextension-spark-3.5_2.12:jar:assembly:1793685422.230497165.0`.
+It verifies assembly SHA256
+`a49fe6c36626853a672f7a4d43250b7e798d01814b3b98b40c8e8885ec0286eb`
+before extracting the assets and regenerating their native checksum manifest.
+No engine assembly or native source compilation is involved in this image target.
+The normal source-build target remains `devcontainer` when the prebuilt route is
+not explicitly selected.
+
+To build or publish this branch's image, download that immutable assembly using
+the approved feed credentials, place it in a dedicated directory as
+`ivmextension.jar`, set `OPENIVM_PR62_ASSEMBLY_DIR` to that directory's absolute
+local path, and set `OPENIVM_IMAGE_BUILD_TARGET=pr62-control-runtime`.
+The dedicated directory must contain only this non-secret artifact.
+BuildKit mounts it from a named build context; the assembly is not retained in
+the image. Use the existing `devcontainer:tag`, `devcontainer:build`,
+`devcontainer:test`, and `devcontainer:publish` commands; do not relabel an
+unrelated image under a computed content tag. Normal consumers only pull the
+published image and do not need the assembly file or feed credentials.
+
+The existing image-publication workflow also supports this route through
+`workflow_dispatch` on the intended branch: supply numeric `assembly_asset_id`
+for a **draft-only release asset in this repository** and the exact
+`assembly_sha256` above. The staging script downloads only that same-repository
+API resource in an isolated no-checkout staging job restricted to that trusted
+PR93 branch and explicit prebuilt dispatch. Only this staging job has
+`contents:write`, the minimum draft-release read access; it executes inline
+download/hash checks, never repository or artifact code. A pinned same-run
+Actions artifact transfers the JAR to the build job, which retains only
+`contents:read` and `packages:write` and rechecks exactly 100880999 bytes and
+SHA256 before selecting the packaging-only target. Invalid inputs or
+inaccessible draft assets fail; there is no public-release, external-URL, or
+native-build fallback. The build-input release must remain draft.
+
 Start or reuse the pinned devcontainer:
 
 ```bash

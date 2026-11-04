@@ -236,6 +236,7 @@ test('local and consumer configurations preserve required runtime settings', () 
     const config = JSON.parse(readFileSync(join(workspaceRoot, relativeFilename), 'utf8')) as {
       build?: {
         options?: string[];
+        target?: string;
       };
       containerUser?: string;
       containerEnv?: Record<string, string>;
@@ -281,7 +282,11 @@ test('local and consumer configurations preserve required runtime settings', () 
       'source=${localWorkspaceFolder},target=/workspaces/openivm-spark,type=bind,consistency=cached',
     );
     if (relativeFilename.endsWith('devcontainer.local.json')) {
-      assert.deepEqual(config.build?.options, ['--platform=linux/amd64']);
+      assert.equal(config.build?.target, '${localEnv:OPENIVM_IMAGE_BUILD_TARGET:devcontainer}');
+      assert.deepEqual(config.build?.options, [
+        '--platform=linux/amd64',
+        '--build-context=pr62_assembly=${localEnv:OPENIVM_PR62_ASSEMBLY_DIR:.}',
+      ]);
     }
   }
 });
