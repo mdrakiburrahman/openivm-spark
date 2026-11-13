@@ -90,6 +90,21 @@ private[compiler] object SparkFunctionShimSql {
     )
   )
 
+  def rewriteDuckdbIncompatibleTokens(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val collation = "collation"
+      val end       = i + collation.length
+      if (sql.startsWith("<=>", i)) Some((i + 3) -> " IS NOT DISTINCT FROM ")
+      else if (
+        hasLeftIdentifierBoundary(sql, i) && end <= sql.length &&
+        sql.regionMatches(true, i, collation, 0, collation.length) && hasRightIdentifierBoundary(sql, end)
+      ) {
+        val next = skipTriviaForward(sql, end, sql.length)
+        if (next < sql.length && sql.charAt(next) == '(') None
+        else Some(end -> s"\"${sql.substring(i, end)}\"")
+      } else None
+    }
+
   /** Pre-pass for the compile bridge: rename Spark function spellings that
     * DuckDB would otherwise parse or bind incompatibly to collision-free
     * `__sparkfn_*` spellings before the SQL reaches DuckDB.

@@ -61,6 +61,16 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   private val billingJsonSchema: StructType =
     StructType.fromDDL("usageuploadtime TIMESTAMP, azureresourceid STRING, additionalinfo STRING")
 
+  "Spark-only identifiers and null-safe comparisons" should "compile without losing incremental maintenance" in {
+    val r = compileBody(
+      viewName = "shim_nullsafe_collation",
+      sources = Map("token_src" -> StructType.fromDDL("id INT, collation STRING, previous STRING")),
+      body = "SELECT id, collation FROM token_src WHERE NOT (previous <=> collation)"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+    r.sql should not be empty
+  }
+
   "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {
     val r = compileBody(
       viewName = "shim_date_offset",

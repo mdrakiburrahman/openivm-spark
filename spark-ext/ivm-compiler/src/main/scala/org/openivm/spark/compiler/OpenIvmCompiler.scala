@@ -556,7 +556,8 @@ class OpenIvmCompiler private (
     val leftSemi          = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
     val leftAnti          = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
     val literalsRewritten = SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql)
-    val renamedFns        = OpenIvmCompiler.renameSparkFunctionShimCalls(literalsRewritten)
+    val tokensRewritten   = SparkFunctionShimSql.rewriteDuckdbIncompatibleTokens(literalsRewritten)
+    val renamedFns        = OpenIvmCompiler.renameSparkFunctionShimCalls(tokensRewritten)
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"

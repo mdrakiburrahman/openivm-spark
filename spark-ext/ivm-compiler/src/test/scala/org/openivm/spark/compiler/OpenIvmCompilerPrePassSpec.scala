@@ -5,6 +5,18 @@ import org.scalatest.matchers.should.Matchers
 
 class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
 
+  describe("DuckDB-incompatible tokens") {
+    it("rewrites null-safe equality and the reserved column name only outside protected text") {
+      val input = """SELECT s.collation, collation(x), 'collation <=>', "collation",
+                    |  NOT (a <=> b), my_collation FROM src s -- collation <=>
+                    |/* collation <=> */""".stripMargin
+      val output = """SELECT s."collation", collation(x), 'collation <=>', "collation",
+                     |  NOT (a  IS NOT DISTINCT FROM  b), my_collation FROM src s -- collation <=>
+                     |/* collation <=> */""".stripMargin
+      SparkFunctionShimSql.rewriteDuckdbIncompatibleTokens(input) shouldBe output
+    }
+  }
+
   describe("renameSparkFunctionShimCalls") {
     it("rewrites two-argument date arithmetic without touching literals, identifiers, comments, or other arities") {
       val sql =
