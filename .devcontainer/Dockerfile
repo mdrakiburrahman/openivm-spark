@@ -2,7 +2,7 @@
 
 ARG NODE_VERSION
 
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS openivm-builder
+FROM ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c AS openivm-builder
 
 ARG DUCKDB_COMMIT
 ARG DUCKDB_REF
@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
       sed -i \
         "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
-        /etc/apt/sources.list.d/ubuntu.sources; \
+        /etc/apt/sources.list; \
     fi \
     && apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 \
     && apt-get install -y --no-install-recommends \
