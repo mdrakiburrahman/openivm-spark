@@ -204,7 +204,7 @@ class OpenIvmCompiler private (
       val cols = schema.fields.map(f => s"${quoteDuckdbIdent(f.name)} ${sparkToDuckdbType(f.dataType)}").mkString(", ")
       name -> s"CREATE TABLE $name ($cols)"
     }
-    val depinnedViewSql = SparkTimeTravelSql.stripSnapshotPins(req.viewSql)
+    val depinnedViewSql = SparkRlikeSql.normalize(SparkTimeTravelSql.stripSnapshotPins(req.viewSql))
     val normalizedViewSql =
       normalizeSparkSqlForDuckdb(
         stripDbQualifiers(

@@ -216,10 +216,7 @@ object LptsSparkDialect {
     // Spark has regexp_like; not regexp_matches. The shim macro body
     // (`regexp_matches(s, p)`) gets inlined by openivm's LPTS serializer
     // — undo that here so Spark's analyzer binds against the built-in.
-    val regexpMatches = """(?i)\bregexp_matches\s*\(""".r
-    SparkFunctionShimSql.rewriteInlinedSparkShimCalls(
-      regexpMatches.replaceAllIn(sql, "regexp_like(")
-    )
+    SparkFunctionShimSql.rewriteInlinedSparkShimCalls(SparkRlikeSql.restore(sql))
   }
 
   /** Rewrites DuckDB's native positional 2-arg `` `trim`(<str>, <chars>) ``
