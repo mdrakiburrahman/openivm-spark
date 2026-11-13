@@ -26,6 +26,7 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
     && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
+      clang-15 \
       cmake \
       curl \
       git \
@@ -57,7 +58,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
     && git checkout "${LPTS_COMMIT}" \
     && git submodule update --init --recursive --depth 1
 
-RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
+RUN CC=clang-15 CXX=clang++-15 CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
 
 RUN mkdir -p /artifacts \
     && cp build/release/extension/openivm/openivm.duckdb_extension /artifacts/ \

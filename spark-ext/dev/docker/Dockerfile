@@ -51,7 +51,7 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
     fi && \
     apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 && \
     apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates \
+        build-essential clang-15 cmake ninja-build git ca-certificates \
         python3 python3-pip libssl-dev pkg-config zip unzip curl && \
     rm -rf /var/lib/apt/lists/*
 
@@ -80,7 +80,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
 # CLI and the loadable .duckdb_extension binary. We bypass the optional
 # third_party/benchbase + sqlstorm benchmarks (heavyweight, not on the test
 # critical path).
-RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
+RUN CC=clang-15 CXX=clang++-15 CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
 
 # Collect deliverables into a stable location.
 RUN mkdir -p /artifacts && \
