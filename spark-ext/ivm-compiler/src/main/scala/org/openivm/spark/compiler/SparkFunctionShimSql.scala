@@ -52,6 +52,12 @@ private[compiler] object SparkFunctionShimSql {
         1 -> "__sparkfn_date_format"
       )
     ),
+    "date_add" -> RenameRule(
+      Map(1 -> "__sparkfn_date_add")
+    ),
+    "date_sub" -> RenameRule(
+      Map(1 -> "__sparkfn_date_sub")
+    ),
     "make_interval" -> RenameRule(
       Map(
         6 -> "__sparkfn_make_interval"
@@ -96,6 +102,7 @@ private[compiler] object SparkFunctionShimSql {
     *   - 1-arg / 2-arg `to_date(...)`
     *   - 1-arg / 2-arg `to_timestamp(...)`
     *   - 2-arg `date_format(...)`
+    *   - 2-arg `date_add(...)` / `date_sub(...)`
     *   - 7-arg `make_interval(...)`
     *   - 2-arg `get_json_object(...)`
     *   - 2-arg `last_value(expr, true|false)`

@@ -1211,6 +1211,8 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_add(d, days) AS CAST(d AS DATE) + CAST(days AS INTEGER);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_sub(d, days) AS CAST(d AS DATE) - CAST(days AS INTEGER);",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The
       // interval fallback keeps the DuckDB macro type- and value-correct.

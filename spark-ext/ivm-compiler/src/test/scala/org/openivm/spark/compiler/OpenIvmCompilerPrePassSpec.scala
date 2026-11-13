@@ -6,6 +6,18 @@ import org.scalatest.matchers.should.Matchers
 class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
 
   describe("renameSparkFunctionShimCalls") {
+    it("rewrites two-argument date arithmetic without touching literals, identifiers, comments, or other arities") {
+      val sql =
+        """SELECT date_sub(coalesce(d, other_d), -n), DATE_ADD(d, 1),
+          |       'date_sub(d, 1)', "date_add", date_sub(d), date_add(d, n, x)
+          |FROM src -- date_sub(d, 1)
+          |""".stripMargin
+      OpenIvmCompiler.renameSparkFunctionShimCalls(sql) shouldBe
+        sql
+          .replace("date_sub(coalesce(d, other_d), -n)", "__sparkfn_date_sub(coalesce(d, other_d), -n)")
+          .replace("DATE_ADD(d, 1)", "__sparkfn_date_add(d, 1)")
+    }
+
     it("rewrites only the Spark spellings DuckDB cannot parse or bind directly") {
       val sql =
         "SELECT to_date(raw), to_timestamp(raw), date_format(ts), to_date(raw, 'yyyyMMdd'), " +

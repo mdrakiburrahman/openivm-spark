@@ -61,6 +61,31 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   private val billingJsonSchema: StructType =
     StructType.fromDDL("usageuploadtime TIMESTAMP, azureresourceid STRING, additionalinfo STRING")
 
+  "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {
+    val r = compileBody(
+      viewName = "shim_date_offset",
+      sources = Map("offsetsrc" -> StructType.fromDDL("id INT, d DATE, n INT")),
+      body = "SELECT id, date_sub(d, n) AS earlier, date_add(d, -n) AS shifted FROM offsetsrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should not include "__sparkfn_date_sub"
+    translated should not include "__sparkfn_date_add"
+  }
+
+  it should "compile Monitoring's current-date filter without disguising its full refresh classification" in {
+    val r = compileBody(
+      viewName = "shim_date_offset_current",
+      sources = Map("offsetsrc" -> StructType.fromDDL("id INT, YearMonth STRING, EVENTTIME TIMESTAMP")),
+      body = """SELECT id FROM offsetsrc s
+        |WHERE s.YearMonth >= DATE_FORMAT(DATE_SUB(CURRENT_DATE(), 6), 'yyyyMM')
+        |  AND s.EVENTTIME >= CAST(DATE_SUB(CURRENT_DATE(), 6) AS TIMESTAMP)
+        |  AND s.EVENTTIME < CAST(DATE_ADD(CURRENT_DATE(), 1) AS TIMESTAMP)""".stripMargin
+    )
+    r.refreshTypeName should equal("FULL_REFRESH")
+    r.sql should not be empty
+  }
+
   "shim regexp_like(s, p)" should "compile and emit a non-FULL_REFRESH classification" in {
     val r = compileBody(
       viewName = "shim_re_v1",
