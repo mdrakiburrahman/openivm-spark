@@ -87,6 +87,9 @@ Spark SQL extension delivering **OpenIVM incremental view maintenance** without 
 
 Spark 3.5 remains the default for every developer command that omits `--target`.
 
+Assembly jars bundle a Linux x86-64 native compiler built and smoke-tested on
+Ubuntu 22.04 with its system glibc and libstdc++.
+
 ## Documentation
 
 - [Materialized views](docs/MATERIALIZED_VIEWS.md)
