@@ -56,9 +56,9 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           .getString(0)
         detail should include("compile_cache_hit=true")
       }
-
-      class SparkExpressionCdfIntegrationSpec       extends SparkExpressionIntegrationScenarios with CdfMode
-      class SparkExpressionInterceptIntegrationSpec extends SparkExpressionIntegrationScenarios with InterceptMode
     }
   }
 }
+
+class SparkExpressionCdfIntegrationSpec       extends SparkExpressionIntegrationScenarios with CdfMode
+class SparkExpressionInterceptIntegrationSpec extends SparkExpressionIntegrationScenarios with InterceptMode
