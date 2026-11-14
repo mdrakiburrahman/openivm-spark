@@ -14,8 +14,10 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_key_group (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_key_group VALUES (1, 'a//b'), (2, 'a/b'), (3, 'c')")
-      val query = """SELECT regexp_replace(txt, '/+', '/') AS k, count(*) AS n
-        |FROM expr_key_group GROUP BY regexp_replace(txt, '/+', '/')""".stripMargin
+      val query =
+        """SELECT nullif(regexp_replace(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), '/$', ''), '') AS k,
+        |count(*) AS n FROM expr_key_group
+        |GROUP BY nullif(regexp_replace(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), '/$', ''), '')""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW expr_key_group_mv AS $query")
       checkIncremental("expr_key_group_mv")
       assertMvCorrect("expr_key_group_mv", query)

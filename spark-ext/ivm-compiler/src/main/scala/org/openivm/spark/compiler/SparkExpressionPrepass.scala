@@ -118,13 +118,15 @@ private[spark] object SparkExpressionPrepass {
     }
 
     plans(CatalystSqlParser.parsePlan(sql))
+    val encodedExpressions = mutable.Map.empty[(String, ResultType, Vector[String]), String]
     val replacements = targets
       .map { case (expr, result) =>
         val span      = expressionSpan(sql, expr)
         val arguments = mutable.ArrayBuffer.empty[String]
         val body      = template(sql, expr, span, arguments, caseSensitive)
         val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq
-        val encoded   = markers.encode(inputs, result)(args => body(args))
+        val key       = (sql.substring(span.start, span.end), result, inputs.toVector)
+        val encoded   = encodedExpressions.getOrElseUpdate(key, markers.encode(inputs, result)(args => body(args)))
         span -> encoded
       }
       .sortBy(_._1.start)
