@@ -164,10 +164,19 @@ private[spark] object SparkExpressionPrepass {
     }
 
     plans(CatalystSqlParser.parsePlan(sql))
+    val uniqueTargets = mutable.LinkedHashMap.empty[Span, (Expression, ResultType, Int)]
+    targets.foreach { case (expr, result, scope) =>
+      val span = expressionSpan(sql, expr)
+      uniqueTargets.get(span) match {
+        case Some((previous, previousResult, previousScope))
+            if previousScope == scope && previousResult == result && expr.semanticEquals(previous) =>
+        case Some(_) => throw new IllegalArgumentException("Conflicting Spark expressions at the same source span")
+        case None    => uniqueTargets.put(span, (expr, result, scope))
+      }
+    }
     val encodedExpressions = mutable.Map.empty[(Int, String, ResultType, Vector[String]), (Expression, String)]
-    val replacements = targets
-      .map { case (expr, result, scope) =>
-        val span      = expressionSpan(sql, expr)
+    val replacements = uniqueTargets.toSeq
+      .map { case (span, (expr, result, scope)) =>
         val arguments = mutable.ArrayBuffer.empty[String]
         val body      = template(sql, expr, span, arguments, caseSensitive)
         val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq

@@ -218,11 +218,13 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
         val source = s"expr_cdf_source_$ansi"
         val mv     = s"expr_cdf_mv_$ansi"
         val query = s"""SELECT id, txt RLIKE '(?i)ä' AS re, size(split(txt, '/')) AS n,
+          |CASE WHEN size(split(txt, '/')) BETWEEN 1 AND 2 THEN 'short' ELSE 'long' END AS range_label,
           |element_at(split(txt, '/'), -1) AS leaf,
           |nullif(regexp_replace(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), '/$$', ''), '') AS canonical,
           |regexp_extract(trim(cast(txt AS STRING)), '[A-Z](/.*)', 1) AS capture,
           |sha2(coalesce(txt, 'Unknown'), 256) AS scalar_hash,
-          |sha2(concat_ws('|', coalesce(lower(trim(txt)), ''), date_format(t, 'yyyy-MM-dd')), 256) AS date_hash,
+          |sha2(concat_ws('|', coalesce(cast(sha2(nullif(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), ''), 256)
+          |AS STRING), 'fallback'), date_format(cast(t AS TIMESTAMP), 'yyyy-MM-dd')), 256) AS date_hash,
           |sha2(to_json(struct(id, t, deleted, num), map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS struct_hash,
           |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', id)),
           |map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS digest
