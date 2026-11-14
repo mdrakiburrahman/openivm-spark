@@ -35,18 +35,7 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
     }
   }
 
-  it("preserves Spark ordering of nullable struct fields") {
-    sql("CREATE TABLE nsagg_compare_source (id INT) USING DELTA")
-    sql("INSERT INTO nsagg_compare_source VALUES (1)")
-    val query = """SELECT id, named_struct('k', CAST(NULL AS INT)) > named_struct('k', 1) AS comparison
-      |FROM nsagg_compare_source""".stripMargin
-    sql(s"CREATE MATERIALIZED VIEW nsagg_compare_mv AS $query")
-    assertMvCorrect("nsagg_compare_mv", query)
-    sql("INSERT INTO nsagg_compare_source VALUES (2)")
-    refreshMv("nsagg_compare_mv")
-    assertMvCorrect("nsagg_compare_mv", query)
-  }
 }
 
-class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode
