@@ -109,6 +109,28 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       assertMvCorrect("expr_legacy_pin_mv", query)
     }
 
+    it("rebaselines against advanced pinned sources") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_advance_dim (id INT, label STRING) USING DELTA")
+      sql("INSERT INTO expr_advance_dim VALUES (1, 'OLD')")
+      val oldVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
+      sql("CREATE TABLE expr_advance_fact (id INT, amount INT) USING DELTA")
+      sql("INSERT INTO expr_advance_fact VALUES (1, 10)")
+      def query(version: Long): String =
+        s"""SELECT lower(d.label) AS label, f.amount FROM expr_advance_dim VERSION AS OF $version d
+           |JOIN expr_advance_fact f ON f.id = d.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_advance_mv AS ${query(oldVersion)}")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_advance_mv")
+      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+      sql("UPDATE expr_advance_dim SET label = 'NEW' WHERE id = 1")
+      val newVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
+      sql(s"ALTER MATERIALIZED VIEW expr_advance_mv ADVANCE SOURCE VERSIONS (expr_advance_dim = $newVersion)")
+      assertMvCorrect("expr_advance_mv", query(newVersion))
+      sql("INSERT OVERWRITE TABLE expr_advance_fact SELECT 1, 20")
+      refreshMv("expr_advance_mv")
+      assertMvCorrect("expr_advance_mv", query(newVersion))
+    }
+
     it("retains a real native compile-failure receipt through create and refresh") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_bad_source (id INT) USING DELTA")
