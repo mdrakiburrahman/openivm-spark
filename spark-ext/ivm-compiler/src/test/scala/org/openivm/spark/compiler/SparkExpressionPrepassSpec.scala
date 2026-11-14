@@ -11,13 +11,13 @@ import org.scalatest.matchers.should.Matchers
 class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
   "Spark expression prepass" should "reject nondeterministic and unsupported marker expressions" in {
     intercept[IllegalArgumentException] {
-      SparkExpressionPrepass.prepare("SELECT sha2(rand(), 256) FROM src")
+      SparkExpressionPrepass.prepare("SELECT sha2(rand(), 256) FROM src", caseSensitive = false)
     }
     intercept[IllegalArgumentException] {
-      SparkExpressionPrepass.prepare("SELECT sha2(custom_fn(s), 256) FROM src")
+      SparkExpressionPrepass.prepare("SELECT sha2(custom_fn(s), 256) FROM src", caseSensitive = false)
     }
     intercept[IllegalArgumentException] {
-      SparkExpressionPrepass.prepare("SELECT (s) RLIKE 'p' FROM src")
+      SparkExpressionPrepass.prepare("SELECT (s) RLIKE 'p' FROM src", caseSensitive = false)
     }
   }
 
@@ -57,7 +57,7 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
         |SHA2(TO_JSON(NAMED_STRUCT('Odd Name',s,'nested',NAMED_STRUCT('Mixed',id)),
         |MAP('ignoreNullFields','false')),256) AS nested_hash
         |FROM src""".stripMargin
-      val prepared = SparkExpressionPrepass.prepare(original)
+      val prepared = SparkExpressionPrepass.prepare(original, caseSensitive = false)
       val compiled = compiler.compile(
         CompileRequest(
           "prepass_probe",
@@ -85,7 +85,7 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
         """SELECT id, TO_JSON(STRUCT(id AS `Camel Name`, LOWER(s) AS value),
           |MAP('ignoreNullFields','false')) AS body FROM src""".stripMargin
       ).foreach { query =>
-        val probe = SparkExpressionPrepass.prepare(query)
+        val probe = SparkExpressionPrepass.prepare(query, caseSensitive = false)
         val result = compiler.compile(
           CompileRequest(
             "prepass_scope",
@@ -100,6 +100,66 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
         actual.exceptAll(expected).count() shouldBe 0L
         expected.exceptAll(actual).count() shouldBe 0L
       }
+      spark.sql("SELECT id, named_struct('MiXeD Field', s) AS profile FROM src").createOrReplaceTempView("nested_src")
+      val nestedQuery = "SELECT n.id, LOWER(n.profile.`MiXeD Field`) AS lowered FROM nested_src n"
+      val nestedProbe = SparkExpressionPrepass.prepare(nestedQuery, caseSensitive = false)
+      val nestedResult = compiler.compile(
+        CompileRequest(
+          "prepass_nested",
+          nestedProbe.sql,
+          Map("nested_src" -> StructType.fromDDL("id STRING, profile STRUCT<`MiXeD Field`: STRING>"))
+        )
+      )
+      val nestedInitial = nestedProbe.markers.restore(nestedResult.initialLoadSql)
+      val nestedActual  = spark.sql(nestedInitial)
+      nestedProbe.markers.requireAllSeen()
+      nestedProbe.markers.resetSeen()
+      nestedProbe.markers.restore(nestedResult.sql)
+      nestedProbe.markers.requireAllSeen()
+      nestedResult.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      val nestedExpected = spark.sql(nestedQuery)
+      nestedActual.exceptAll(nestedExpected).count() shouldBe 0L
+      nestedExpected.exceptAll(nestedActual).count() shouldBe 0L
+    } finally {
+      spark.stop()
+      compiler.close()
+      Files.deleteIfExists(wrapper)
+    }
+  }
+
+  it should "reject native changes to case-sensitive nested field access" in {
+    assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
+    val cli       = sys.env("OPENIVM_CLI_PATH")
+    val extension = sys.env("OPENIVM_EXTENSION_PATH")
+    val wrapper   = Files.createTempFile("openivm-nested-cli-", ".sh")
+    Files.write(
+      wrapper,
+      s"""#!/bin/sh
+         |(echo "LOAD '${extension.replace(
+          "'",
+          "''"
+        )}'; SET GLOBAL openivm_spark_expression_markers=true;"; cat) | '${cli.replace("'", "'\\''")}' "$$@"
+         |""".stripMargin.getBytes(StandardCharsets.UTF_8)
+    )
+    require(wrapper.toFile.setExecutable(true))
+    val compiler = OpenIvmCompiler.build(cliPath = wrapper.toString)
+    val spark    = SparkSession.builder().master("local[1]").appName("SparkNestedFieldSpec").getOrCreate()
+    try {
+      spark.conf.set("spark.sql.caseSensitive", "true")
+      spark.sql("SELECT 'id' AS id, named_struct('MiXeD Field', 'S') AS profile").createOrReplaceTempView("nested_src")
+      val query = "SELECT n.id, LOWER(n.profile.`MiXeD Field`) AS lowered FROM nested_src n"
+      val probe = SparkExpressionPrepass.prepare(query, caseSensitive = true)
+      val result = compiler.compile(
+        CompileRequest(
+          "prepass_nested_case",
+          probe.sql,
+          Map("nested_src" -> StructType.fromDDL("id STRING, profile STRUCT<`MiXeD Field`: STRING>"))
+        )
+      )
+      val error = intercept[IllegalStateException] {
+        probe.markers.restore(result.initialLoadSql)
+      }
+      error.getMessage should include("case-sensitive Spark attribute")
     } finally {
       spark.stop()
       compiler.close()

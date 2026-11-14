@@ -81,7 +81,7 @@ private[compiler] object SparkExpressionPrepass {
     "InSet"
   )
 
-  def prepare(sql: String): Prepared = {
+  def prepare(sql: String, caseSensitive: Boolean): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType)]
 
@@ -121,7 +121,7 @@ private[compiler] object SparkExpressionPrepass {
       .map { case (expr, result) =>
         val span      = expressionSpan(sql, expr)
         val arguments = mutable.ArrayBuffer.empty[String]
-        val body      = template(sql, expr, span, arguments)
+        val body      = template(sql, expr, span, arguments, caseSensitive)
         val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq
         val encoded   = markers.encode(inputs, result)(args => body(args))
         span -> encoded
@@ -168,7 +168,8 @@ private[compiler] object SparkExpressionPrepass {
       sql: String,
       expr: Expression,
       span: Span,
-      arguments: mutable.ArrayBuffer[String]
+      arguments: mutable.ArrayBuffer[String],
+      caseSensitive: Boolean
   ): Seq[String] => String = {
     val edits = mutable.ArrayBuffer.empty[Edit]
     def visit(node: Expression): Unit = node match {
@@ -181,7 +182,23 @@ private[compiler] object SparkExpressionPrepass {
         }
         val index = arguments.size
         arguments += value
-        edits += Edit(location, args => args(index))
+        edits += Edit(
+          location,
+          args => {
+            val rewritten = args(index)
+            if (caseSensitive) {
+              CatalystSqlParser.parseExpression(rewritten) match {
+                case parsed: UnresolvedAttribute =>
+                  val suffixLength = math.min(parsed.nameParts.size, attr.nameParts.size)
+                  if (parsed.nameParts.takeRight(suffixLength) != attr.nameParts.takeRight(suffixLength))
+                    throw new IllegalStateException("Native compiler changed a case-sensitive Spark attribute")
+                case _ =>
+                  throw new IllegalStateException("Native compiler changed a case-sensitive Spark attribute expression")
+              }
+            }
+            rewritten
+          }
+        )
       case struct: CreateNamedStruct =>
         val location = originSpan(sql, struct)
         val names = struct.nameExprs.zip(struct.valExprs).map { case (name, value) =>
@@ -199,7 +216,7 @@ private[compiler] object SparkExpressionPrepass {
             case other        => other
           }
           val valueSpan = expressionSpan(sql, inner)
-          template(sql, inner, valueSpan, arguments)
+          template(sql, inner, valueSpan, arguments, caseSensitive)
         }
         edits += Edit(
           location,
