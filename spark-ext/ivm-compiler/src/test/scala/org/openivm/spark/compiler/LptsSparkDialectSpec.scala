@@ -29,6 +29,21 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val sql = "SELECT max_by(struct(a), struct(k AS f1)) FROM t"
       SparkFunctionShimSql.rewriteStructMaxBy(sql) shouldBe sql
     }
+
+    it("round-trips nested named structs with scalar and structured ordering keys") {
+      val sql = """SELECT named_struct('Mixed "name"', named_struct('inner''s', x)) AS k,
+        |max_by(named_struct('value', x), score),
+        |max_by(named_struct('value', x), named_struct('outer', named_struct('timestamp', ts)))
+        |FROM t""".stripMargin
+      val native = OpenIvmCompiler.normalizeSparkSqlForDuckdb(sql)
+      native should include("""struct_pack("Mixed ""name""" := struct_pack("inner's" := x))""")
+      native should include("""arg_max(struct_pack("value" := x), score)""")
+      native should include("""arg_max(struct_pack("value" := x), struct_pack("outer" := struct_pack("timestamp" := ts)))""")
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'76616c7565' AS STRING), x), score)")
+      restored should include("named_struct(CAST(X'6f75746572' AS STRING), named_struct(CAST(X'74696d657374616d70' AS STRING), ts))")
+      restored should include("CAST(X'4d6978656420226e616d6522' AS STRING)")
+    }
   }
 
   describe("quoted null cast types in native fallback queries") {

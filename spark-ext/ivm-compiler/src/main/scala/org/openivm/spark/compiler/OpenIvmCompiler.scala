@@ -591,7 +591,9 @@ class OpenIvmCompiler private (
     val literalsRewritten = SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql)
     val tokensRewritten   = SparkFunctionShimSql.rewriteDuckdbIncompatibleTokens(literalsRewritten)
     val renamedFns =
-      SparkFunctionShimSql.rewriteStructMaxBy(OpenIvmCompiler.renameSparkFunctionShimCalls(tokensRewritten))
+      SparkFunctionShimSql.rewriteStructMaxBy(
+        SparkFunctionShimSql.rewriteNamedStructs(OpenIvmCompiler.renameSparkFunctionShimCalls(tokensRewritten))
+      )
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"

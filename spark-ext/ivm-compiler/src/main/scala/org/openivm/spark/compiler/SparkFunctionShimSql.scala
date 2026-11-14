@@ -263,6 +263,24 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
+  private[compiler] def rewriteNamedStructs(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "named_struct").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+          val fields = args.grouped(2).map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (name.matches("'(?:[^']|'')+'") && value.nonEmpty) {
+              val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+              Some(s""""$decoded" := ${rewriteNamedStructs(value)}""")
+            } else None
+          }.toSeq
+          if (fields.forall(_.isDefined)) Some(call.closeParen + 1 -> s"struct_pack(${fields.flatten.mkString(", ")})")
+          else None
+        }
+      }
+    }
+
   private[compiler] def rewriteStructMaxBy(sql: String): String =
     rewriteOutsideProtected(sql, protectBackticks = true) { i =>
       var before = i - 1
@@ -271,8 +289,19 @@ private[compiler] object SparkFunctionShimSql {
       else
         parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
           splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
-            val structs = ranges.map { case (start, end) => namedStructPack(sql.substring(start, end).trim) }
-            if (structs.forall(_.isDefined)) Some((call.closeParen + 1, s"arg_max(${structs.flatten.mkString(", ")})"))
+            val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+            val structs = args.map { arg =>
+              namedStructPack(arg).orElse {
+                if (arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1))
+                  Some(arg)
+                else None
+              }
+            }
+            val unsupportedStruct = args.zip(structs).exists { case (arg, converted) =>
+              converted.isEmpty && arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct").isDefined
+            }
+            if (structs.exists(_.isDefined) && !unsupportedStruct)
+              Some((call.closeParen + 1, s"arg_max(${args.zip(structs).map { case (arg, converted) => converted.getOrElse(arg) }.mkString(", ")})"))
             else None
           }
         }
@@ -284,7 +313,7 @@ private[compiler] object SparkFunctionShimSql {
         splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
           val structs = ranges.map { case (start, end) => sql.substring(start, end).trim }
           if (
-            structs.forall(arg =>
+            structs.exists(arg =>
               arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1)
             )
           )
