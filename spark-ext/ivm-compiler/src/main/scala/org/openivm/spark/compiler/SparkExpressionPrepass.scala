@@ -174,7 +174,7 @@ private[spark] object SparkExpressionPrepass {
       cases.toMap
     }
 
-    val parsed  = CatalystSqlParser.parsePlan(sql)
+    val parsed = CatalystSqlParser.parsePlan(sql)
 
     def normalized(name: String): String = if (caseSensitive) name else name.toLowerCase(Locale.ROOT)
     val keyRefs                          = mutable.Set.empty[String]

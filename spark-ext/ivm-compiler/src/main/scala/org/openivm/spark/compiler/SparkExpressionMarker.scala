@@ -25,13 +25,13 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
     markers.put(id, Marker(args.size, result, render))
     if (opaque) {
       val seed = result match {
-        case Text      => "CAST(NULL AS STRING)"
-        case Integer   => "CAST(NULL AS INTEGER)"
-        case Long      => "CAST(NULL AS BIGINT)"
-        case Boolean   => "CAST(NULL AS BOOLEAN)"
-        case TextArray => "string_split('openivm_type', ',')"
-        case Timestamp => "CAST(NULL AS TIMESTAMP)"
-        case DateBound => "CAST(NULL AS DATE)"
+        case Text         => "CAST(NULL AS STRING)"
+        case Integer      => "CAST(NULL AS INTEGER)"
+        case Long         => "CAST(NULL AS BIGINT)"
+        case Boolean      => "CAST(NULL AS BOOLEAN)"
+        case TextArray    => "string_split('openivm_type', ',')"
+        case Timestamp    => "CAST(NULL AS TIMESTAMP)"
+        case DateBound    => "CAST(NULL AS DATE)"
         case Struct(seed) => seed
       }
       s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
@@ -206,13 +206,13 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
 
 private[compiler] object SparkExpressionMarker {
   sealed trait ResultType
-  case object Text      extends ResultType
-  case object Integer   extends ResultType
-  case object Long      extends ResultType
-  case object Boolean   extends ResultType
-  case object TextArray extends ResultType
-  case object Timestamp extends ResultType
-  case object DateBound extends ResultType
+  case object Text                      extends ResultType
+  case object Integer                   extends ResultType
+  case object Long                      extends ResultType
+  case object Boolean                   extends ResultType
+  case object TextArray                 extends ResultType
+  case object Timestamp                 extends ResultType
+  case object DateBound                 extends ResultType
   final case class Struct(seed: String) extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
