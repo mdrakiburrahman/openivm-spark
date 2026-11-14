@@ -14,7 +14,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
-    it("preserves correlated anti-join expressions during refresh") {
+    ignore("incrementally maintains correlated anti-join expressions") { /* TODO: native emits no real delta without the bridge too. */
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_anti_source (id INT, txt STRING) USING DELTA")
       sql("CREATE TABLE expr_anti_blocked (txt STRING) USING DELTA")
@@ -30,6 +30,27 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       sql("INSERT INTO expr_anti_source VALUES (4, 'C')")
       refreshMv("expr_anti_mv")
       assertMvCorrect("expr_anti_mv", query)
+    }
+
+    it("classifies a correlated anti-join with no real delta as an intentional full refresh") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_anti_full_source (id INT, txt STRING) USING DELTA")
+      sql("CREATE TABLE expr_anti_full_blocked (txt STRING) USING DELTA")
+      sql("INSERT INTO expr_anti_full_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
+      sql("INSERT INTO expr_anti_full_blocked VALUES ('a')")
+      val query = """SELECT t.id, t.txt FROM expr_anti_full_source t
+        |WHERE NOT EXISTS (SELECT 1 FROM expr_anti_full_blocked u WHERE u.txt = lower(t.txt))""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_anti_full_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_full_mv")
+      val meta = MvCatalog.lookup(spark, id).get
+      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+      meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
+      meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("no_real_delta")
+      assertMvCorrect("expr_anti_full_mv", query)
+      sql("INSERT INTO expr_anti_full_blocked VALUES ('b')")
+      sql("INSERT INTO expr_anti_full_source VALUES (4, 'C')")
+      refreshMv("expr_anti_full_mv")
+      assertMvCorrect("expr_anti_full_mv", query)
     }
 
     it("preserves pinned-source identity while incrementally refreshing a live join") {
