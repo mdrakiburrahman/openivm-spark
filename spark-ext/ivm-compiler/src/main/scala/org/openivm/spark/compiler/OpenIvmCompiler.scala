@@ -7,6 +7,10 @@ import java.security.MessageDigest
 import java.util.{Comparator, Locale, UUID}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnresolvedWith}
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{
   DeltaShape,
@@ -880,7 +884,8 @@ class OpenIvmCompiler private (
     // tables, so fall back to the original user-supplied view body instead.
     if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
-    LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
+    val translated = LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
+    OpenIvmCompiler.reattachBareInitialLoadSources(translated, req)
   }
 
   /** Spark's rewrite program addresses one logical MV; native catalog keys are
@@ -1198,6 +1203,74 @@ object OpenIvmCompiler {
         case None =>
           qualifiedByShort.getOrElse(key, short)
       }
+    }
+  }
+
+  /** Native fallback CTAS bodies can retain bare source names instead of
+    * memory.main references. Bind only parsed relation nodes, never aliases,
+    * expressions, literals or CTE references.
+    */
+  private[compiler] def reattachBareInitialLoadSources(sql: String, req: CompileRequest): String = {
+    val qualified = req.sourceQualifiedNames.map { case (short, full) => short.toLowerCase(Locale.ROOT) -> full }
+    val pins =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName.toLowerCase(Locale.ROOT) -> pin.clause).toMap
+    val paths = req.sourceSnapshotPinnedPaths.map { case (short, path) => short.toLowerCase(Locale.ROOT) -> path }
+    if (qualified.isEmpty && pins.isEmpty) return sql
+
+    val edits = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, String)]
+    def sourceName(short: String): Option[String] = pins.get(short) match {
+      case Some(clause) =>
+        val path = paths.getOrElse(
+          short,
+          throw new PinnedSourcePathMissingException(
+            s"initial-load emission for view '${req.viewName}' has no verified Delta path for snapshot-pinned source '$short'"
+          )
+        )
+        Some(s"delta.`${path.replace("`", "``")}` $clause")
+      case None => qualified.get(short)
+    }
+    def visit(plan: LogicalPlan, visibleCtes: Set[String]): Unit = plan match {
+      case withCtes: UnresolvedWith =>
+        var scope = visibleCtes
+        withCtes.cteRelations.foreach { case (name, body) =>
+          visit(body, scope)
+          scope += name.toLowerCase(Locale.ROOT)
+        }
+        visit(withCtes.child, scope)
+      case relation: UnresolvedRelation if relation.multipartIdentifier.size == 1 =>
+        val name = relation.multipartIdentifier.head
+        val key  = name.toLowerCase(Locale.ROOT)
+        if (visibleCtes.contains(key) && (qualified.contains(key) || pins.contains(key))) {
+          throw new IllegalStateException(
+            s"initial-load source '$name' in view '${req.viewName}' is ambiguous with a CTE; refusing to bind it"
+          )
+        }
+        if (!visibleCtes.contains(key)) sourceName(key).foreach { bound =>
+          val start = relation.origin.startIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          )
+          val stop = relation.origin.stopIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          ) + 1
+          val original = sql.substring(start, stop)
+          if (
+            !(original.equalsIgnoreCase(name) || original.equalsIgnoreCase(s"`$name`") ||
+              original.equalsIgnoreCase("\"" + name + "\""))
+          ) {
+            throw new IllegalStateException(s"initial-load source '$name' has an unexpected source span: $original")
+          }
+          edits += ((start, stop, bound))
+        }
+      case other =>
+        other.children.foreach(visit(_, visibleCtes))
+        other.expressions.foreach(_.foreach {
+          case subquery: SubqueryExpression => visit(subquery.plan, visibleCtes)
+          case _                            => ()
+        })
+    }
+    visit(CatalystSqlParser.parsePlan(sql), Set.empty)
+    edits.sortBy(-_._1).iterator.foldLeft(sql) { case (text, (start, end, bound)) =>
+      text.substring(0, start) + bound + text.substring(end)
     }
   }
 

@@ -38,6 +38,50 @@ class OpenIvmCompilerInitialLoadPinSpec extends AnyFunSpec with Matchers {
   private def countOf(needle: String, haystack: String): Int =
     java.util.regex.Pattern.quote(needle).r.findAllMatchIn(haystack).size
 
+  describe("bare initial-load source binding") {
+    it("qualifies source relations in CTEs and subqueries without touching CTE references or literals") {
+      val sql = """WITH latest AS (SELECT id FROM parent WHERE payload = 'parent')
+        |SELECT * FROM latest WHERE id IN (SELECT id FROM parent)""".stripMargin
+      val out = OpenIvmCompiler.reattachBareInitialLoadSources(
+        sql,
+        req(
+          viewSql = "SELECT * FROM db.parent",
+          qualified = Map("parent" -> "db.parent")
+        )
+      )
+      out should include("FROM db.parent WHERE payload = 'parent'")
+      out should include("FROM latest")
+      out should include("SELECT id FROM db.parent)")
+    }
+
+    it("binds bare pinned sources to verified physical paths") {
+      val out = OpenIvmCompiler.reattachBareInitialLoadSources(
+        "SELECT id FROM accounts",
+        req(
+          "SELECT id FROM db.accounts VERSION AS OF 5",
+          qualified = Map("accounts" -> "db.accounts"),
+          pinnedPaths = Map("accounts" -> path("accounts"))
+        )
+      )
+      out shouldBe s"SELECT id FROM delta.`${path("accounts")}` VERSION AS OF 5"
+    }
+
+    it("refuses ambiguous CTE shadowing rather than binding the wrong source") {
+      an[IllegalStateException] should be thrownBy OpenIvmCompiler.reattachBareInitialLoadSources(
+        "WITH parent AS (SELECT id FROM other) SELECT * FROM parent",
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      )
+    }
+
+    it("does not rewrite already qualified sources") {
+      val sql = "SELECT * FROM db.parent"
+      OpenIvmCompiler.reattachBareInitialLoadSources(
+        sql,
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      ) shouldBe sql
+    }
+  }
+
   describe("reattachInitialLoadSourceReads") {
     it("path-binds a pinned initial-load read to its verified Delta path (VERSION)") {
       val out = OpenIvmCompiler.reattachInitialLoadSourceReads(
