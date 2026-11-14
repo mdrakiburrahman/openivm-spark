@@ -72,6 +72,8 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated should include("element_at")
     translated should include("size(")
     translated should not include SparkFunctionShimSql.SizeMarker
+    r.initialLoadSql should include("element_at(")
+    r.initialLoadSql should not include "list_extract"
   }
 
   "Spark-only identifiers and null-safe comparisons" should "compile without losing incremental maintenance" in {

@@ -194,6 +194,7 @@ private[compiler] object SparkFunctionShimSql {
       parseMakeIntervalShim(sql, i)
         .orElse(parseArraySizeShim(sql, i))
         .orElse(parseGetJsonObjectShim(sql, i))
+        .orElse(parseFunctionRewrite(sql, i, "list_extract", "element_at"))
         .orElse(parseCastTemporalShim(sql, i))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
