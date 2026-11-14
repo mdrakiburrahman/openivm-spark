@@ -2,11 +2,16 @@ package org.openivm.spark.parity
 
 import org.apache.logging.log4j.{Level, LogManager}
 import org.apache.logging.log4j.core.config.Configurator
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-generator") {
   self: IvmParityMode =>
+  override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
+    FeatureGate.GroupedWindowStateEnabledKey -> "true",
+    FeatureGate.CompileClassificationCacheEnabledKey -> "true"
+  )
 
   it("incrementally expands daily date sequences and preserves invalid bounds") {
     Seq("UTC", "America/Los_Angeles", "Pacific/Apia").zipWithIndex.foreach { case (zone, index) =>
@@ -19,7 +24,8 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
         |(2, NULL, DATE '2024-03-11'),
         |(3, DATE '2024-11-02', DATE '2024-11-04'),
         |(6, DATE '2011-12-29', DATE '2011-12-31')""".stripMargin)
-      val query = s"""SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
+      val interval = if (index == 1) "INTERVAL 1 DAY" else "INTERVAL '1' DAY"
+      val query = s"""SELECT t.id, explode(sequence(t.start_date, t.end_date, $interval)) AS d
         |FROM $source t""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
       val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
@@ -45,7 +51,7 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     sql("CREATE TABLE date_gen_window_source (id INT, start_date DATE, end_date DATE) USING DELTA")
     sql("INSERT INTO date_gen_window_source VALUES (1, DATE '2024-01-01', DATE '2024-01-03')")
     val query = """WITH expanded AS (
-      | SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
+      | SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL 1 DAY)) AS d
       | FROM date_gen_window_source t
       |) SELECT id, d, row_number() OVER (PARTITION BY id ORDER BY d) AS rn FROM expanded""".stripMargin
     sql(s"CREATE MATERIALIZED VIEW date_gen_window_mv AS $query")
@@ -59,6 +65,29 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     sql("DELETE FROM date_gen_window_source WHERE id = 1")
     refreshMv("date_gen_window_mv")
     assertMvCorrect("date_gen_window_mv", query)
+  }
+
+  it("maintains two daily generators in separate CTEs") {
+    sql("CREATE TABLE date_gen_left (id INT, start_date DATE, end_date DATE) USING DELTA")
+    sql("CREATE TABLE date_gen_right (id INT, start_date DATE, end_date DATE) USING DELTA")
+    sql("INSERT INTO date_gen_left VALUES (1, DATE '2024-01-01', DATE '2024-01-02')")
+    sql("INSERT INTO date_gen_right VALUES (1, DATE '2024-02-01', DATE '2024-02-02')")
+    val query = """WITH l AS (
+      | SELECT id, explode(sequence(start_date, end_date, INTERVAL 1 DAY)) AS ld FROM date_gen_left
+      |), r AS (
+      | SELECT id, explode(sequence(start_date, end_date, INTERVAL 1 DAY)) AS rd FROM date_gen_right
+      |) SELECT l.id, l.ld, r.rd FROM l JOIN r ON l.id = r.id""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW date_gen_join_mv AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("date_gen_join_mv")
+    MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+    assertMvCorrect("date_gen_join_mv", query)
+    sql("UPDATE date_gen_left SET end_date = DATE '2024-01-03' WHERE id = 1")
+    sql("INSERT INTO date_gen_right VALUES (1, DATE '2024-02-03', DATE '2024-02-03')")
+    refreshMv("date_gen_join_mv")
+    assertMvCorrect("date_gen_join_mv", query)
+    sql("DELETE FROM date_gen_right WHERE start_date = DATE '2024-02-01'")
+    refreshMv("date_gen_join_mv")
+    assertMvCorrect("date_gen_join_mv", query)
   }
 }
 

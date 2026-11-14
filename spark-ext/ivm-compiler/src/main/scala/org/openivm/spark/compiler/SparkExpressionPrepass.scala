@@ -342,7 +342,7 @@ private[spark] object SparkExpressionPrepass {
                     expressionSpan(sql, sequence.arguments(2)).end
                   )
                   .trim
-                  .matches("(?i)INTERVAL\\s*'1'\\s+DAY") =>
+                  .matches("(?i)INTERVAL(?:\\s*'1'|\\s+1)\\s+DAY") =>
             generators += ((explode, sequence))
           case _ => explode.children.foreach(child => expressions(child, scope))
         }
@@ -433,7 +433,8 @@ private[spark] object SparkExpressionPrepass {
         }
         span -> encoded
       }
-    val generatorEdits = generators.distinct.map { case (explode, sequence) =>
+    val generatorEdits = generators.groupBy { case (explode, _) => expressionSpan(sql, explode) }.toSeq
+      .sortBy(_._1.start).map(_._2.head).map { case (explode, sequence) =>
       val bounds = sequence.arguments.take(2).map { arg =>
         val span      = expressionSpan(sql, arg)
         val arguments = mutable.ArrayBuffer.empty[String]
