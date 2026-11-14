@@ -37,11 +37,13 @@ conflicting bound requests fail closed. No new request, global/session binding o
 thread-local rebinding occurs; the lifecycle owner still ENDs, exports and RELEASEs
 the original capture. Omitting FOR REQUEST retains thread-bound behavior.
 
-## Generated pattern-match dialect
+## Generated SQL dialect
 
 The Spark SQL generation boundary translates DuckDB pattern operators `~~`,
 `!~~`, `~~*` and `!~~*` to LIKE, NOT LIKE, ILIKE and NOT ILIKE. String literals,
 quoted identifiers and comments are protected; source business SQL is unchanged.
+The native infinity literal `1e1000` is restored as a Spark DOUBLE infinity;
+the native `main.trim` builtin is restored as an unqualified Spark `trim` call.
 
 For native binding failures, unqualified-column `UNIX_TIMESTAMP`, boolean `LOWER`, and
 `TIMESTAMPDIFF(SECOND, ...)` calls are retried through a Spark-evaluated bridge.
