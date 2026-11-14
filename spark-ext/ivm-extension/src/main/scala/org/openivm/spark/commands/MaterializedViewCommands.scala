@@ -5409,6 +5409,56 @@ case class RefreshMaterializedViewCommand(
         0L
       )
 
+      lazy val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
+        q.split("\\.").last -> schema
+      }
+      lazy val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
+        refreshResolvedPins,
+        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
+      )
+      lazy val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
+        refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
+        preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
+      }
+      lazy val constraintFacts = WorkloadFactsRegistry
+        .forRefresh()
+        .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
+      lazy val cacheTierFacts = WorkloadFacts(
+        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+        assumeInsertOnly = insertOnlyAggregate ||
+          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
+            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+        deltaShape = sourceDeltaShape,
+        fkRelations = constraintFacts.fkRelations,
+        uniqueKeys = constraintFacts.uniqueKeys,
+        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
+      )
+      lazy val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
+        OpenIvmCompilers.forSession(spark)
+      }
+      lazy val originalCompileRequest = CompileRequest(
+        viewName = name.table,
+        viewSql = meta.querySql,
+        sources = compileSchemas,
+        sourceQualifiedNames = shortToQual,
+        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
+        facts = cacheTierFacts
+      )
+      lazy val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
+      lazy val expressionBridge =
+        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+          Some(
+            SparkExpressionPrepass.prepare(
+              meta.querySql,
+              spark.sessionState.conf.caseSensitiveAnalysis,
+              Some(originalCompileTier.split(":").last)
+            )
+          )
+        else None
+      lazy val compileRequest =
+        originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
+
       // -----------------------------------------------------------------------
       // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
       // A REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
@@ -5438,36 +5488,50 @@ case class RefreshMaterializedViewCommand(
         // DELTA_INSERT_COLUMN_ARITY_MISMATCH. Use the compiled initial-load SQL
         // (which reproduces the hidden columns) for any non-FULL_REFRESH MV; a
         // genuinely FULL_REFRESH MV has no hidden columns and uses its body.
-        if (
-          sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1") &&
-          meta.refreshType != RefreshTypeCode.FullRefresh &&
-          !meta.properties.contains(SparkExpressionPrepass.RestoredInitialLoadProperty) &&
-          SparkExpressionPrepass
-            .prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis)
-            .sql != meta.querySql
-        )
-          throw new IllegalStateException(
-            "Cannot rebaseline a legacy MV requiring Spark expression restoration without recompiling its initial load"
-          )
         val fullRefreshSql = {
           val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
-          if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
-            meta.properties
-              .get(SparkExpressionPrepass.RestoredInitialLoadProperty)
-              .getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
-          else
-            // UserFullQuery surface at REFRESH: path-bind the user body's pinned
-            // reads to their verified Delta paths so the recompute reads the frozen
-            // snapshot directly rather than re-resolving the alias.
-            MvCommandHelper.pathBindUserFullQuery(
-              name,
-              meta.querySql,
-              refreshBinding,
-              meta.sourceTables,
-              refreshResolvedPins
-            )
+          val restoredInitialLoad  = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
+          val legacyBridge =
+            if (meta.refreshType != RefreshTypeCode.FullRefresh && restoredInitialLoad.isEmpty)
+              expressionBridge.filter(_.sql != meta.querySql)
+            else None
+          legacyBridge match {
+            case Some(bridge) =>
+              val compiled = compiler.compile(compileRequest)
+              if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load is incompatible with its refresh type"
+                )
+              val restored = bridge.markers.restore(
+                org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+              )
+              bridge.markers.requireAllSeen()
+              val resultSchema = spark.sql(restored).schema
+              val targetSchema = spark.read.format("delta").load(meta.location).schema
+              if (
+                resultSchema.fieldNames.toSeq != targetSchema.fieldNames.toSeq ||
+                !org.apache.spark.sql.types.DataType.equalsIgnoreNullability(resultSchema, targetSchema)
+              )
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load does not match the stored data schema"
+                )
+              restored
+            case None if meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty =>
+              restoredInitialLoad.getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
+            case None =>
+              // UserFullQuery surface at REFRESH: path-bind the user body's pinned
+              // reads to their verified Delta paths so the recompute reads the frozen
+              // snapshot directly rather than re-resolving the alias.
+              MvCommandHelper.pathBindUserFullQuery(
+                name,
+                meta.querySql,
+                refreshBinding,
+                meta.sourceTables,
+                refreshResolvedPins
+              )
+          }
         }
         val fullRefreshTarget =
           if (meta.usesBackingDataTable) dataTableId(name) else name
@@ -5700,59 +5764,8 @@ case class RefreshMaterializedViewCommand(
       // Incremental path — recompile, register source temp views, rewrite the
       // openivm-emitted multi-statement program, execute it.
       // -----------------------------------------------------------------------
-      val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
-        q.split("\\.").last -> schema
-      }
-      val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
-        refreshResolvedPins,
-        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
-      )
       val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
-      // Pinned and source-advance schemas can describe a historical snapshot;
-      // discover their current constraint metadata through the existing path.
-      val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
-        refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
-        preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
-      }
-      // Compile and rewrite use one fresh fact set owned by this REFRESH, never a cross-command cache.
-      val constraintFacts = WorkloadFactsRegistry
-        .forRefresh()
-        .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
-      val cacheTierFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
-        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-        assumeInsertOnly = insertOnlyAggregate ||
-          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
-            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
-        deltaShape = sourceDeltaShape,
-        fkRelations = constraintFacts.fkRelations,
-        uniqueKeys = constraintFacts.uniqueKeys,
-        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
-      )
-      val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
-        OpenIvmCompilers.forSession(spark)
-      }
-      val originalCompileRequest = CompileRequest(
-        viewName = name.table,
-        viewSql = meta.querySql,
-        sources = compileSchemas,
-        sourceQualifiedNames = shortToQual,
-        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-        facts = cacheTierFacts
-      )
-      val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
-      val expressionBridge =
-        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-          Some(
-            SparkExpressionPrepass.prepare(
-              meta.querySql,
-              spark.sessionState.conf.caseSensitiveAnalysis,
-              Some(originalCompileTier.split(":").last)
-            )
-          )
-        else None
-      val compileRequest   = originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
-      val compileCacheTier = compiler.compileCacheTier(compileRequest)
+      val compileCacheTier    = compiler.compileCacheTier(compileRequest)
       var refreshProperties =
         if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
         else meta.properties
