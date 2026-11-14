@@ -65,7 +65,11 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       sql("INSERT INTO expr_anti_full_blocked VALUES ('a')")
       val query = """SELECT t.id, t.txt FROM expr_anti_full_source t
         |WHERE NOT EXISTS (SELECT 1 FROM expr_anti_full_blocked u WHERE u.txt = lower(t.txt))""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_anti_full_mv AS $query")
+      val logger        = "org.openivm.spark.commands.CreateMaterializedViewCommand"
+      val previousLevel = LogManager.getLogger(logger).getLevel
+      Configurator.setLevel(logger, Level.FATAL)
+      try sql(s"CREATE MATERIALIZED VIEW expr_anti_full_mv AS $query")
+      finally Configurator.setLevel(logger, previousLevel)
       val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_full_mv")
       val meta = MvCatalog.lookup(spark, id).get
       meta.refreshType shouldBe RefreshTypeCode.FullRefresh
