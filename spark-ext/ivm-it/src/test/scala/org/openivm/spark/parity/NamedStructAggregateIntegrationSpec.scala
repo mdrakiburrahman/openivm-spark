@@ -30,6 +30,26 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
       MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
       assertMvCorrect(name, query)
     }
+    val cteQuery = s"""WITH base AS (SELECT grp, id, name, ts FROM nsagg_source),
+      |keyed AS (SELECT *, named_struct('first', CAST(ts AS TIMESTAMP),
+      |  'second', CAST(ts AS TIMESTAMP), 'text', coalesce(name, ''),
+      |  'number1', coalesce(CAST(id AS DECIMAL(38,0)), CAST(0 AS DECIMAL(38,0))),
+      |  'number2', coalesce(CAST(id AS DECIMAL(38,0)), CAST(0 AS DECIMAL(38,0))),
+      |  'last', coalesce(name, '')) AS ordering_key FROM base),
+      |p1 AS (SELECT grp, id, name, ordering_key FROM keyed),
+      |p2 AS (SELECT grp, id, name, ordering_key, CASE WHEN id > 1 THEN 1 ELSE 0 END AS rank FROM keyed),
+      |p3 AS (SELECT grp, id, name, ordering_key FROM keyed WHERE id IS NOT NULL),
+      |p4 AS (SELECT grp, id, name, ordering_key FROM keyed WHERE name IS NOT NULL),
+      |s1 AS (SELECT grp, max_by($value, ordering_key) AS chosen FROM p1 GROUP BY grp),
+      |s2 AS (SELECT grp, max_by($value, named_struct('rank', rank, 'key', ordering_key)) AS chosen FROM p2 GROUP BY grp),
+      |s3 AS (SELECT grp, max_by($value, ordering_key) AS chosen FROM p3 GROUP BY grp),
+      |s4 AS (SELECT grp, max_by($value, ordering_key) AS chosen FROM p4 GROUP BY grp)
+      |SELECT a.grp, a.chosen.arbitrary_field AS v1, b.chosen.arbitrary_field AS v2,
+      |  c.chosen.arbitrary_field AS v3, d.chosen.arbitrary_field AS v4
+      |FROM s1 a LEFT JOIN s2 b ON a.grp = b.grp LEFT JOIN s3 c ON a.grp = c.grp
+      |  LEFT JOIN s4 d ON a.grp = d.grp""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW nsagg_cte_mv AS $cteQuery")
+    assertMvCorrect("nsagg_cte_mv", cteQuery)
     sql("UPDATE nsagg_source SET ts = TIMESTAMP '2024-03-01 00:00:00' WHERE id = 2")
     sql("DELETE FROM nsagg_source WHERE id = 1")
     sql("INSERT INTO nsagg_source VALUES ('a', 4, 'later', TIMESTAMP '2024-04-01 00:00:00'), ('c', 5, NULL, NULL)")
@@ -37,9 +57,11 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
       refreshMv(name)
       assertMvCorrect(name, query)
     }
+    refreshMv("nsagg_cte_mv")
+    assertMvCorrect("nsagg_cte_mv", cteQuery)
   }
 
 }
 
-class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode

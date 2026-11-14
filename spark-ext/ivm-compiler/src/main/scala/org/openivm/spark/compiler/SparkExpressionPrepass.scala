@@ -123,13 +123,31 @@ private[spark] object SparkExpressionPrepass {
           if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
             function.arguments.size == 2 =>
         scanExpression(function.arguments.head, inKey = false)
-        scanExpression(function.arguments(1), inKey = true)
+        scanOrdering(function.arguments(1))
         function.filter.foreach(child => scanExpression(child, inKey = false))
       case subquery: SubqueryExpression =>
         unsupportedPlan = true
         scanPlan(subquery.plan)
         subquery.children.foreach(child => scanExpression(child, inKey))
       case other => other.children.foreach(child => scanExpression(child, inKey))
+    }
+
+    def scanOrdering(expr: Expression): Unit = expr match {
+      case attr: UnresolvedAttribute if attr.nameParts.size == 1 =>
+        keyRefs += normalized(attr.nameParts.head)
+      case struct: CreateNamedStruct =>
+        struct.valExprs.foreach {
+          case alias: Alias => scanOrdering(alias.child)
+          case value        => scanOrdering(value)
+        }
+      case function: UnresolvedFunction
+          if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("named_struct") &&
+            function.arguments.size % 2 == 0 =>
+        function.arguments.grouped(2).foreach { pair =>
+          scanExpression(pair.head, inKey = false)
+          scanOrdering(pair(1))
+        }
+      case other => scanExpression(other, inKey = false)
     }
 
     def scanPlan(plan: LogicalPlan): Unit =
