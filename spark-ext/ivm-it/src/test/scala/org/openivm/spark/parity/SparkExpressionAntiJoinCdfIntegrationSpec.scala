@@ -60,5 +60,58 @@ abstract class SparkExpressionAntiJoinIntegrationScenarios extends IvmParitySpec
   }
 }
 
-class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with CdfMode
+class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with CdfMode {
+  it("preserves upstream and downstream identities through correlated anti-join changes") {
+    assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+    sql("CREATE TABLE expr_chain_left (id INT, txt STRING) USING DELTA")
+    sql("CREATE TABLE expr_chain_right (txt STRING) USING DELTA")
+    sql("INSERT INTO expr_chain_left VALUES (1, 'A'), (2, 'B'), (3, NULL)")
+    sql("INSERT INTO expr_chain_right VALUES ('a')")
+    sql("CREATE MATERIALIZED VIEW expr_chain_u1 AS SELECT id, txt FROM expr_chain_left")
+    sql("CREATE MATERIALIZED VIEW expr_chain_u2 AS SELECT txt FROM expr_chain_right")
+    val query = """SELECT t.id, t.txt FROM expr_chain_u1 t
+      |WHERE NOT EXISTS (SELECT 1 FROM expr_chain_u2 u WHERE u.txt = lower(t.txt))""".stripMargin
+    val expected = """SELECT t.id, t.txt FROM expr_chain_left t
+      |WHERE NOT EXISTS (SELECT 1 FROM expr_chain_right u WHERE u.txt = lower(t.txt))""".stripMargin
+    val logger        = "org.openivm.spark.commands.CreateMaterializedViewCommand"
+    val previousLevel = LogManager.getLogger(logger).getLevel
+    Configurator.setLevel(logger, Level.FATAL)
+    try sql(s"CREATE MATERIALIZED VIEW expr_chain_t AS $query")
+    finally Configurator.setLevel(logger, previousLevel)
+    sql("CREATE MATERIALIZED VIEW expr_chain_m1 AS SELECT id, txt FROM expr_chain_t")
+    val views = Seq("expr_chain_u1", "expr_chain_u2", "expr_chain_t", "expr_chain_m1")
+    def identity(name: String): (String, String) = {
+      val id       = spark.sessionState.sqlParser.parseTableIdentifier(name)
+      val location = MvCatalog.lookup(spark, id).get.location
+      val detail   = sql(s"DESCRIBE DETAIL delta.`${location.replace("`", "``")}`").head()
+      val properties = detail.getAs[Map[String, String]]("properties")
+      properties.get("delta.enableChangeDataFeed").map(_.toLowerCase) shouldBe Some("true")
+      location -> detail.getAs[String]("id")
+    }
+    val identities = views.map(identity)
+    def verify(): Unit = {
+      assertMvCorrect("expr_chain_u1", "SELECT id, txt FROM expr_chain_left")
+      assertMvCorrect("expr_chain_u2", "SELECT txt FROM expr_chain_right")
+      assertMvCorrect("expr_chain_t", expected)
+      assertMvCorrect("expr_chain_m1", expected)
+      views.map(identity) shouldBe identities
+    }
+    def refresh(): Unit = views.foreach(refreshMv)
+    val tId = spark.sessionState.sqlParser.parseTableIdentifier("expr_chain_t")
+    val meta = MvCatalog.lookup(spark, tId).get
+    meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
+    meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+    meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("no_real_delta")
+    verify()
+    sql("INSERT INTO expr_chain_right VALUES ('b')")
+    refresh()
+    verify()
+    sql("DELETE FROM expr_chain_right WHERE txt = 'b'")
+    refresh()
+    verify()
+    sql("INSERT INTO expr_chain_left VALUES (4, 'C')")
+    refresh()
+    verify()
+  }
+}
 class SparkExpressionAntiJoinInterceptIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with InterceptMode
