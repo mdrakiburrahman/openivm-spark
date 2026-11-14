@@ -884,8 +884,7 @@ class OpenIvmCompiler private (
     // tables, so fall back to the original user-supplied view body instead.
     if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
-    val translated = LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
-    OpenIvmCompiler.reattachBareInitialLoadSources(translated, req)
+    LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
   }
 
   /** Spark's rewrite program addresses one logical MV; native catalog keys are
@@ -1210,7 +1209,7 @@ object OpenIvmCompiler {
     * memory.main references. Bind only parsed relation nodes, never aliases,
     * expressions, literals or CTE references.
     */
-  private[compiler] def reattachBareInitialLoadSources(sql: String, req: CompileRequest): String = {
+  private[spark] def reattachBareInitialLoadSources(sql: String, req: CompileRequest): String = {
     val qualified = req.sourceQualifiedNames.map { case (short, full) => short.toLowerCase(Locale.ROOT) -> full }
     val pins =
       SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName.toLowerCase(Locale.ROOT) -> pin.clause).toMap

@@ -3269,7 +3269,8 @@ case class CreateMaterializedViewCommand(
         val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
         val restored   = expressionBridge.markers.restore(translated)
         expressionBridge.markers.requireAllSeen()
-        restored
+        org.openivm.spark.compiler.OpenIvmCompiler
+          .reattachBareInitialLoadSources(restored, originalCreateCompileRequest)
       }
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
@@ -5503,7 +5504,9 @@ case class RefreshMaterializedViewCommand(
                 org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
               )
               bridge.markers.requireAllSeen()
-              val resultSchema = spark.sql(restored).schema
+              val bound =
+                org.openivm.spark.compiler.OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
+              val resultSchema = spark.sql(bound).schema
               val targetSchema = spark.read.format("delta").load(meta.location).schema
               if (
                 resultSchema.fieldNames.toSeq != targetSchema.fieldNames.toSeq ||
@@ -5512,7 +5515,7 @@ case class RefreshMaterializedViewCommand(
                 throw new IllegalStateException(
                   s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load does not match the stored data schema"
                 )
-              restored
+              bound
             case None if meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty =>
               restoredInitialLoad.getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
             case None =>
