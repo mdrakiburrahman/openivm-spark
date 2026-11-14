@@ -7,15 +7,15 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.openivm.refresh.windowRunningIncremental.enabled" -> "true",
-    "spark.openivm.refresh.groupedWindowState.enabled" -> "true",
-    "spark.openivm.compile.classificationCache.enabled" -> "true",
-    FeatureGate.ProfileRefreshKey -> "true",
+    "spark.openivm.refresh.windowRunningIncremental.enabled"          -> "true",
+    "spark.openivm.refresh.groupedWindowState.enabled"                -> "true",
+    "spark.openivm.compile.classificationCache.enabled"               -> "true",
+    FeatureGate.ProfileRefreshKey                                     -> "true",
     "spark.databricks.delta.properties.defaults.enableChangeDataFeed" -> "true",
-    "spark.sql.session.timeZone" -> "UTC",
-    "spark.sql.caseSensitive" -> "false",
-    "spark.sql.ansi.enabled" -> "false",
-    "spark.sql.legacy.sizeOfNull" -> "true"
+    "spark.sql.session.timeZone"                                      -> "UTC",
+    "spark.sql.caseSensitive"                                         -> "false",
+    "spark.sql.ansi.enabled"                                          -> "false",
+    "spark.sql.legacy.sizeOfNull"                                     -> "true"
   )
 
   it("maintains named struct values with scalar and nullable nested ordering keys") {
@@ -81,5 +81,5 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
 
 }
 
-class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode
