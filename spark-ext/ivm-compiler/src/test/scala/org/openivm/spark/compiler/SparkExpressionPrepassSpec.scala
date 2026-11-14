@@ -50,7 +50,7 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
       |GROUP BY g""".stripMargin
     val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
     CatalystSqlParser.parsePlan(prepared.sql)
-    val id = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r.findFirstMatchIn(prepared.sql).get.group(1)
+    val id       = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r.findFirstMatchIn(prepared.sql).get.group(1)
     val restored = prepared.markers.restore(s"__openivm_spark_expression('$id', {'a': NULL, 'b': NULL}, ts, v)")
     restored shouldBe "named_struct('a', CAST(ts AS TIMESTAMP), 'b', coalesce(v, ''))"
     prepared.markers.requireAllSeen()

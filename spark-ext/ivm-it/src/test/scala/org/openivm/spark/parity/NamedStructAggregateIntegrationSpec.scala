@@ -67,5 +67,5 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
 
 }
 
-class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode
