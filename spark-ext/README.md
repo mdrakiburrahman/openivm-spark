@@ -47,6 +47,12 @@ For native binding failures, unqualified-column `UNIX_TIMESTAMP`, boolean `LOWER
 `TIMESTAMPDIFF(SECOND, ...)` calls are retried through a Spark-evaluated bridge.
 Other argument shapes are not covered by this retry.
 
+The expression bridge preserves Spark evaluation for supported expressions
+while the native compiler classifies the view. Daily `EXPLODE(SEQUENCE(...))`
+with DATE column bounds and `INTERVAL 1 DAY` is supported, including multiple
+generators. Struct ordering keys are bridged only for bounded `MAX_BY` shapes;
+this is not a general translation of Spark struct ordering to DuckDB.
+
 ## Native streaming status lookup diagnostics
 
 Targeted SHOW analyzes the exact target without suppressing native catalog/storage
