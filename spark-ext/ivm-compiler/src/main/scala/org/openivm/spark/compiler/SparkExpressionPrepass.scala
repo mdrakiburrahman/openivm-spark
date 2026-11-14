@@ -95,14 +95,15 @@ private[spark] object SparkExpressionPrepass {
       sql: String,
       caseSensitive: Boolean,
       stableToken: Option[String] = None,
-      analyzedPlan: Option[LogicalPlan] = None
+      analyzedPlan: => Option[LogicalPlan] = None
   ): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
-    val coercedCases = mutable.Map.empty[(Int, Int), ResultType]
-    val visitedAnalyzedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+    lazy val coercedCases: Map[(Int, Int), ResultType] = {
+      val cases = mutable.Map.empty[(Int, Int), ResultType]
+      val visitedAnalyzedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
 
-    def analyzedExpressions(expr: Expression): Unit = {
+      def analyzedExpressions(expr: Expression): Unit = {
       expr match {
         case subquery: SubqueryExpression => analyzedPlans(subquery.plan)
         case branch: CaseWhen =>
@@ -121,7 +122,13 @@ private[spark] object SparkExpressionPrepass {
             stop <- branch.origin.stopIndex
             kind <- result
             if inputTypes.contains(StringType) && inputTypes.contains(TimestampType)
-          } coercedCases.update((start, stop), kind)
+          } {
+            val span = (start, stop)
+            cases.get(span).foreach { existing =>
+              if (existing != kind) throw new IllegalArgumentException("Conflicting analyzed CASE result types")
+            }
+            cases.update(span, kind)
+          }
         case _ =>
       }
       expr.children.foreach(analyzedExpressions)
@@ -135,6 +142,8 @@ private[spark] object SparkExpressionPrepass {
       }
     }
     analyzedPlan.foreach(analyzedPlans)
+      cases.toMap
+    }
 
     def target(expr: Expression): Option[ResultType] = expr match {
       case _: RLike => Some(Boolean)
