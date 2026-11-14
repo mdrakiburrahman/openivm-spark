@@ -92,14 +92,14 @@ private[spark] object SparkExpressionPrepass {
   def prepare(sql: String, caseSensitive: Boolean, stableToken: Option[String] = None): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
-    val parsed = CatalystSqlParser.parsePlan(sql)
+    val parsed  = CatalystSqlParser.parsePlan(sql)
 
     def normalized(name: String): String = if (caseSensitive) name else name.toLowerCase(Locale.ROOT)
-    val keyRefs = mutable.Set.empty[String]
-    val otherRefs = mutable.Set.empty[String]
-    val aliasCounts = mutable.Map.empty[String, Int].withDefaultValue(0)
-    var hasStar = false
-    val scannedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+    val keyRefs                          = mutable.Set.empty[String]
+    val otherRefs                        = mutable.Set.empty[String]
+    val aliasCounts                      = mutable.Map.empty[String, Int].withDefaultValue(0)
+    var hasStar                          = false
+    val scannedPlans                     = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
 
     def scanExpression(expr: Expression, inKey: Boolean): Unit = expr match {
       case _: UnresolvedStar => hasStar = true
@@ -139,11 +139,11 @@ private[spark] object SparkExpressionPrepass {
       case struct: CreateNamedStruct =>
         struct.valExprs.forall {
           case alias: Alias => canTemplate(alias.child)
-          case other => canTemplate(other)
+          case other        => canTemplate(other)
         }
       case f: UnresolvedFunction =>
         f.nameParts.size == 1 && allowedFunctions.contains(f.nameParts.head.toLowerCase(Locale.ROOT)) &&
-          !f.isDistinct && f.filter.isEmpty && !f.ignoreNulls && f.children.forall(canTemplate)
+        !f.isDistinct && f.filter.isEmpty && !f.ignoreNulls && f.children.forall(canTemplate)
       case other => allowedNodes.contains(other.getClass.getSimpleName) && other.children.forall(canTemplate)
     }
 
@@ -168,7 +168,7 @@ private[spark] object SparkExpressionPrepass {
         val span = expressionSpan(sql, alias.child)
         SparkFunctionShimSql.namedStructTypeSeed(sql.substring(span.start, span.end)) match {
           case Some(seed) => targets += ((alias.child, Struct(seed), scope))
-          case None => expressions(alias.child, scope)
+          case None       => expressions(alias.child, scope)
         }
       case subquery: SubqueryExpression =>
         plans(subquery.plan)

@@ -328,17 +328,23 @@ private[compiler] object SparkFunctionShimSql {
     if (sql.isEmpty) return None
     parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
       splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
-        val fields = args.grouped(2).map { pair =>
-          val name = sql.substring(pair.head._1, pair.head._2).trim
-          val value = sql.substring(pair.last._1, pair.last._2).trim
-          if (!translateSparkStringLiteralEscapes(name).matches("'(?:[^']|'')+'") ||
-            value.isEmpty || value.equalsIgnoreCase("NULL")) None
-          else {
-            val seed = if (parseFunctionCallAt(value, 0, "named_struct").isDefined) namedStructTypeSeed(value)
-            else Some(s"CASE WHEN FALSE THEN $value ELSE NULL END")
-            seed.map(v => s"$name, $v")
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (
+              !translateSparkStringLiteralEscapes(name).matches("'(?:[^']|'')+'") ||
+              value.isEmpty || value.equalsIgnoreCase("NULL")
+            ) None
+            else {
+              val seed =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined) namedStructTypeSeed(value)
+                else Some(s"CASE WHEN FALSE THEN $value ELSE NULL END")
+              seed.map(v => s"$name, $v")
+            }
           }
-        }.toSeq
+          .toSeq
         if (fields.forall(_.isDefined)) Some(s"named_struct(${fields.flatten.mkString(", ")})") else None
       }
     }
@@ -348,18 +354,22 @@ private[compiler] object SparkFunctionShimSql {
     if (sql.isEmpty) return None
     parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
       splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
-        val fields = args.grouped(2).map { pair =>
-          val name = sql.substring(pair.head._1, pair.head._2).trim
-          val value = sql.substring(pair.last._1, pair.last._2).trim
-          if (!name.matches("'(?:[^']|'')+'") || value.isEmpty) None
-          else {
-            val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
-            val converted = if (parseFunctionCallAt(value, 0, "named_struct").isDefined)
-              markerStructSeedToPack(value)
-            else Some(value)
-            converted.map(v => s""""$decoded" := $v""")
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (!name.matches("'(?:[^']|'')+'") || value.isEmpty) None
+            else {
+              val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+              val converted =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined)
+                  markerStructSeedToPack(value)
+                else Some(value)
+              converted.map(v => s""""$decoded" := $v""")
+            }
           }
-        }.toSeq
+          .toSeq
         if (fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})") else None
       }
     }

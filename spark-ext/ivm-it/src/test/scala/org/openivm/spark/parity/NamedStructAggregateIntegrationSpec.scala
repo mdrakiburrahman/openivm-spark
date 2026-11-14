@@ -18,9 +18,10 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
       "nsagg_nested_mv" -> s"""SELECT grp, max_by($value,
         |named_struct('rank', 1, 'sort key', named_struct('timestamp', ts))) AS picked
         |FROM nsagg_source GROUP BY grp""".stripMargin,
-      "nsagg_key_mv" -> s"""SELECT grp, max_by($value, ordering_key) AS picked FROM
+      "nsagg_key_mv" -> s"""SELECT grp, max_by($value, ordering_key) AS picked,
+        |max_by($value, named_struct('rank', 1, 'key', ordering_key)) AS nested_picked FROM
         |(SELECT grp, id, name, ts, named_struct('when', CAST(ts AS TIMESTAMP),
-        |'id', coalesce(id, 0)) AS ordering_key FROM nsagg_source) s GROUP BY grp""".stripMargin,
+        |'when2', CAST(ts AS TIMESTAMP), 'id', coalesce(id, 0)) AS ordering_key FROM nsagg_source) s GROUP BY grp""".stripMargin,
       "nsagg_bare_mv" -> "SELECT grp, max_by(struct(id, name, ts), struct(ts)) AS picked FROM nsagg_source GROUP BY grp"
     )
     queries.foreach { case (name, query) =>
@@ -40,5 +41,5 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
 
 }
 
-class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode
