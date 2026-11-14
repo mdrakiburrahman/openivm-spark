@@ -5,7 +5,7 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction}
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction, UnresolvedStar}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   CaseWhen,
@@ -20,7 +20,8 @@ import org.apache.spark.sql.catalyst.expressions.{
   SubqueryExpression
 }
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.{NaturalJoin, UsingJoin}
+import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, Project, UnresolvedWith}
 import org.apache.spark.sql.types.{ArrayType, DateType, StringType, TimestampType}
 import org.openivm.spark.compiler.SparkExpressionMarker._
 
@@ -173,6 +174,127 @@ private[spark] object SparkExpressionPrepass {
       cases.toMap
     }
 
+    val parsed = CatalystSqlParser.parsePlan(sql)
+
+    def normalized(name: String): String = if (caseSensitive) name else name.toLowerCase(Locale.ROOT)
+    val keyRefs                          = mutable.Set.empty[String]
+    val otherRefs                        = mutable.Set.empty[String]
+    val aliasCounts                      = mutable.Map.empty[String, Int].withDefaultValue(0)
+    val starOwners                       = mutable.ArrayBuffer.empty[Set[String]]
+    var hasStar                          = false
+    var unsupportedPlan                  = false
+    val scannedPlans                     = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+
+    def outputPlan(plan: LogicalPlan): LogicalPlan = plan match {
+      case withCtes: UnresolvedWith => outputPlan(withCtes.child)
+      case other                    => other
+    }
+    val rootOutput = outputPlan(parsed)
+
+    def scanExpression(expr: Expression, allowMaxBy: Boolean = false): Unit = expr match {
+      case _: UnresolvedStar => hasStar = true
+      case other
+          if (other.getClass.getSimpleName.startsWith("Unresolved") &&
+            other.getClass.getSimpleName.contains("Star")) || other.getClass.getSimpleName == "UnresolvedRegex" =>
+        hasStar = true
+      case attr: UnresolvedAttribute =>
+        attr.nameParts.foreach(part => otherRefs += normalized(part))
+      case alias: Alias =>
+        val name = normalized(alias.name)
+        aliasCounts.update(name, aliasCounts(name) + 1)
+        scanExpression(alias.child, allowMaxBy)
+      case function: UnresolvedFunction
+          if allowMaxBy && function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
+            function.arguments.size == 2 && !function.isDistinct && function.filter.isEmpty && !function.ignoreNulls =>
+        scanExpression(function.arguments.head)
+        scanOrdering(function.arguments(1))
+      case subquery: SubqueryExpression =>
+        unsupportedPlan = true
+        scanPlan(subquery.plan)
+        subquery.children.foreach(child => scanExpression(child))
+      case other => other.children.foreach(child => scanExpression(child, allowMaxBy))
+    }
+
+    // Only direct or nested-struct MAX_BY keys are safe; arbitrary expressions may compare structs natively.
+    def scanOrdering(expr: Expression): Unit = expr match {
+      case attr: UnresolvedAttribute if attr.nameParts.size == 1 =>
+        keyRefs += normalized(attr.nameParts.head)
+      case struct: CreateNamedStruct =>
+        struct.valExprs.foreach {
+          case alias: Alias => scanOrdering(alias.child)
+          case value        => scanOrdering(value)
+        }
+      case function: UnresolvedFunction
+          if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("named_struct") &&
+            function.arguments.size % 2 == 0 =>
+        function.arguments.grouped(2).foreach { pair =>
+          scanExpression(pair.head)
+          scanOrdering(pair(1))
+        }
+      case other => scanExpression(other)
+    }
+
+    def scanPlan(plan: LogicalPlan): Unit =
+      if (!scannedPlans.containsKey(plan)) {
+        scannedPlans.put(plan, java.lang.Boolean.TRUE)
+        plan match {
+          case project: Project =>
+            val structAliases = project.projectList.flatMap {
+              case alias: Alias
+                  if alias.child.isInstanceOf[CreateNamedStruct] ||
+                    (alias.child match {
+                      case f: UnresolvedFunction =>
+                        f.nameParts.size == 1 && f.nameParts.head.equalsIgnoreCase("named_struct")
+                      case _ => false
+                    }) =>
+                Some(normalized(alias.name))
+              case _ => None
+            }.toSet
+            project.projectList.foreach {
+              case _: UnresolvedStar if project eq rootOutput => hasStar = true
+              case _: UnresolvedStar                          => starOwners += structAliases
+              case attr: UnresolvedAttribute if (project ne rootOutput) && attr.nameParts.size == 1 =>
+              case alias: Alias if project eq rootOutput =>
+                otherRefs += normalized(alias.name)
+                scanExpression(alias)
+              case expr => scanExpression(expr)
+            }
+          case join: Join =>
+            join.joinType match {
+              case _: NaturalJoin | _: UsingJoin => unsupportedPlan = true
+              case _                             =>
+            }
+            join.expressions.foreach(expr => scanExpression(expr))
+          case other =>
+            if (
+              !Set("UnresolvedWith", "SubqueryAlias", "UnresolvedRelation", "Aggregate", "Filter", "OneRowRelation")
+                .contains(other.getClass.getSimpleName)
+            ) unsupportedPlan = true
+            val isAggregate = other.getClass.getSimpleName == "Aggregate"
+            other.expressions.foreach(expr => scanExpression(expr, allowMaxBy = isAggregate))
+        }
+        plan.children.foreach(scanPlan)
+        plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(scanPlan)
+      }
+
+    scanPlan(parsed)
+    val safeKeyAliases =
+      if (hasStar || unsupportedPlan) Set.empty[String]
+      else keyRefs.diff(otherRefs).filter(name => aliasCounts(name) == 1 && starOwners.forall(_.contains(name))).toSet
+
+    def canTemplate(expr: Expression): Boolean = expr match {
+      case _: UnresolvedAttribute => true
+      case struct: CreateNamedStruct =>
+        struct.valExprs.forall {
+          case alias: Alias => canTemplate(alias.child)
+          case other        => canTemplate(other)
+        }
+      case f: UnresolvedFunction =>
+        f.nameParts.size == 1 && allowedFunctions.contains(f.nameParts.head.toLowerCase(Locale.ROOT)) &&
+        !f.isDistinct && f.filter.isEmpty && !f.ignoreNulls && f.children.forall(canTemplate)
+      case other => allowedNodes.contains(other.getClass.getSimpleName) && other.children.forall(canTemplate)
+    }
+
     def target(expr: Expression): Option[ResultType] = expr match {
       case _: RLike => Some(Boolean)
       case f: UnresolvedFunction if f.nameParts.size == 1 =>
@@ -190,6 +312,12 @@ private[spark] object SparkExpressionPrepass {
     var nextScope    = 0
     val visitedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
     def expressions(expr: Expression, scope: Int): Unit = expr match {
+      case alias: Alias if safeKeyAliases.contains(normalized(alias.name)) && canTemplate(alias.child) =>
+        val span = expressionSpan(sql, alias.child)
+        SparkFunctionShimSql.namedStructTypeSeed(sql.substring(span.start, span.end)) match {
+          case Some(seed) => targets += ((alias.child, Struct(seed), scope))
+          case None       => expressions(alias.child, scope)
+        }
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
         subquery.children.foreach(child => expressions(child, scope))
@@ -275,7 +403,7 @@ private[spark] object SparkExpressionPrepass {
       }
     }
 
-    plans(CatalystSqlParser.parsePlan(sql))
+    plans(parsed)
     val uniqueTargets = mutable.LinkedHashMap.empty[Span, (Expression, ResultType, Int)]
     targets.foreach { case (expr, result, scope) =>
       val span = expressionSpan(sql, expr)
