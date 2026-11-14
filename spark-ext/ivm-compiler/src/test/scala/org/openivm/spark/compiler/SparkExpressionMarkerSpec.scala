@@ -79,14 +79,15 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
       val spark = SparkSession.builder().master("local[1]").appName("SparkExpressionMarkerNativeSpec").getOrCreate()
       try {
         spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
-        spark.sql("SELECT * FROM VALUES (1, CAST(NULL AS STRING)), (2, 'a,b') AS src(id, txt)")
+        spark
+          .sql("SELECT * FROM VALUES (1, CAST(NULL AS STRING)), (2, 'a,b') AS src(id, txt)")
           .createOrReplaceTempView("src")
         val expected = """SELECT id, regexp_like('Ä', '(?i)ä') AS re, size(split(txt, ',')) AS n,
           |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('other', id))), 256) AS digest
           |FROM src""".stripMargin
         Seq(false, true).foreach { ansi =>
           spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
-          val actual = spark.sql(initial).select("id", "re", "n", "digest")
+          val actual  = spark.sql(initial).select("id", "re", "n", "digest")
           val correct = spark.sql(expected)
           actual.exceptAll(correct).count() shouldBe 0L
           correct.exceptAll(actual).count() shouldBe 0L

@@ -1,6 +1,7 @@
 package org.openivm.spark.compiler
 
 import java.util.UUID
+import java.nio.charset.StandardCharsets
 
 import scala.collection.mutable
 
@@ -70,7 +71,7 @@ private[compiler] final class SparkExpressionMarker {
     if (args.size != marker.arity)
       throw new IllegalStateException("Native compiler changed a Spark expression marker's arity")
     seen += id
-    marker.render(args.map(restore))
+    marker.render(args.map(arg => restoreStructPacks(restore(arg))))
   }
 
   private def parsePayload(text: String): Option[(String, Seq[String])] = {
@@ -113,6 +114,53 @@ private[compiler] object SparkExpressionMarker {
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
+
+  private def restoreStructPacks(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseCall(sql, i, "struct_pack").map { call =>
+        val fields = call.args.flatMap { arg =>
+          val field = arg.trim
+          val split =
+            if (field.startsWith("\"") || field.startsWith("`")) {
+              val quote = field.head
+              var pos = 1
+              var closed = false
+              while (pos < field.length && !closed) {
+                if (field.charAt(pos) == quote) {
+                  pos += 1
+                  if (pos < field.length && field.charAt(pos) == quote) pos += 1
+                  else closed = true
+                } else pos += 1
+              }
+              if (!closed) throw new IllegalStateException("Unterminated struct field name in native SQL")
+              pos
+            } else {
+              val pos = field.indexOf(":=")
+              if (pos < 0) throw new IllegalStateException("Missing struct field assignment in native SQL")
+              pos
+            }
+          val identifier = field.substring(0, split).trim
+          val tail = field.substring(split).trim
+          if (!tail.startsWith(":="))
+            throw new IllegalStateException("Missing struct field assignment in native SQL")
+          val name = if (identifier.startsWith("\"") || identifier.startsWith("`")) {
+            val quote = identifier.head
+            if (identifier.length < 2 || identifier.last != quote)
+              throw new IllegalStateException("Invalid struct field name in native SQL")
+            identifier.substring(1, identifier.length - 1).replace(s"$quote$quote", quote.toString)
+          } else {
+            if (identifier.isEmpty || !identifier.forall(c => c.isLetterOrDigit || c == '_' || c == '$'))
+              throw new IllegalStateException("Invalid struct field name in native SQL")
+            identifier
+          }
+          val value = tail.substring(2).trim
+          if (value.isEmpty) throw new IllegalStateException("Missing struct field value in native SQL")
+          val hex = name.getBytes(StandardCharsets.UTF_8).map(b => f"${b & 0xff}%02x").mkString
+          Seq(s"decode(unhex('$hex'), 'UTF-8')", restoreStructPacks(value))
+        }
+        call.end -> s"named_struct(${fields.mkString(", ")})"
+      }
+    }
 
   /** Parses one function call without interpreting quoted SQL or comments. */
   private def parseCall(sql: String, start: Int, name: String): Option[Call] = {
