@@ -34,6 +34,148 @@ private[compiler] object SparkFunctionShimSql {
   private val OneArgToDateLiteral      = "'%Y-%m-%d'"
   private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
 
+  /** DuckDB binds LEAD/LAG offsets to BIGINT. Restore int-range literal offsets
+    * before Spark resolves their window frames, otherwise a later offset type
+    * coercion makes the automatically assigned frame inconsistent.
+    */
+  def restoreWindowOffsetLiterals(sql: String): String = {
+    val offsetCast   = """(?is)CAST\s*\(\s*([+-]?\d{1,10})\s+AS\s+BIGINT\s*\)""".r
+    val replacements = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, String)]
+    val _ = rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val possibleName = sql.charAt(i) == 'l' || sql.charAt(i) == 'L'
+      val qualified =
+        if (!possibleName) true
+        else {
+          var before = i - 1
+          while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+          before >= 0 && sql.charAt(before) == '.'
+        }
+      if (!qualified) {
+        Seq("lead", "lag").foreach { name =>
+          parseFunctionCallAt(sql, i, name)
+            .filter(call => hasOverClause(sql, call.closeParen + 1))
+            .filter(call => !sql.substring(call.openParen, call.closeParen).contains('`'))
+            .flatMap(call => splitTopLevelArgs(sql, call))
+            .filter(args => args.size == 2 || args.size == 3)
+            .foreach { args =>
+              val (start, end) = args(1)
+              sql.substring(start, end).trim match {
+                case offsetCast(value) if value.toLong >= Int.MinValue && value.toLong <= Int.MaxValue =>
+                  replacements += ((start, end, value))
+                case _ =>
+              }
+            }
+        }
+      }
+      None
+    }
+    replacements.sortBy(-_._1).iterator.foldLeft(sql) { case (text, (start, end, value)) =>
+      text.substring(0, start) + value + text.substring(end)
+    }
+  }
+
+  /** Carries direct-column Spark calls through native planning without evaluating them there. */
+  private[compiler] final class ScalarDialectMarkers {
+    private val prefix = "__openivm_scalar_" + java.util.UUID.randomUUID().toString.replace("-", "") + "_"
+    private val calls  = scala.collection.mutable.Map.empty[String, (String, Int)]
+    private val seen   = scala.collection.mutable.Set.empty[String]
+    private val column =
+      """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")(?:(?:\s*\.\s*)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"))*""".r
+    private val unqualifiedColumn = """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")""".r
+    private var unsafeArguments   = false
+
+    def nonEmpty: Boolean           = calls.nonEmpty
+    def hasUnsafeArguments: Boolean = unsafeArguments
+
+    def rewrite(sql: String): String =
+      rewriteOutsideProtected(sql) { i =>
+        Seq("unix_timestamp", "timestampdiff", "lower").iterator
+          .flatMap { name =>
+            parseFunctionCallAt(sql, i, name).flatMap { call =>
+              var before = i - 1
+              while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+              if (before >= 0 && sql.charAt(before) == '.') None
+              else {
+                splitTopLevelArgs(sql, call).flatMap { ranges =>
+                  val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+                  val values =
+                    if (name == "timestampdiff" && args.size == 3 && args.head.equalsIgnoreCase("SECOND"))
+                      args.tail
+                    else if (name != "timestampdiff" && args.size == 1) args
+                    else Seq.empty
+                  val keywords = Set("TRUE", "FALSE", "NULL", "CURRENT_DATE", "CURRENT_TIMESTAMP")
+                  if (
+                    values.isEmpty || !values.forall(arg =>
+                      column.pattern.matcher(arg).matches() && !keywords.contains(arg.toUpperCase(Locale.ROOT))
+                    )
+                  ) {
+                    unsafeArguments = true
+                    None
+                  } else if (!values.forall(arg => unqualifiedColumn.pattern.matcher(arg).matches())) {
+                    unsafeArguments = true
+                    None
+                  } else {
+                    val id = prefix + calls.size + "__"
+                    calls.put(id, name -> values.size)
+                    val payload = s"concat('$id', CAST(row(${values.mkString(", ")}) AS VARCHAR))"
+                    val encoded = if (name == "lower") payload else s"CAST($payload AS BIGINT)"
+                    Some(call.closeParen + 1 -> encoded)
+                  }
+                }
+              }
+            }
+          }
+          .take(1)
+          .toSeq
+          .headOption
+      }
+
+    def restore(sql: String): String = {
+      val restored = rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+        parseFunctionCallAt(sql, i, "concat").flatMap { call =>
+          splitTopLevelArgs(sql, call).flatMap {
+            case Seq(markerRange, castRange) =>
+              val literal = sql.substring(markerRange._1, markerRange._2).trim
+              val id =
+                if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
+                  literal.substring(1, literal.length - 1)
+                else ""
+              calls.get(id).flatMap { case (name, arity) =>
+                parseSingleFunctionCallInRange(sql, castRange, "cast").flatMap { cast =>
+                  val begin = cast.openParen + 1
+                  findTopLevelKeyword(sql, begin, cast.closeParen, "AS").flatMap { as =>
+                    val target = sql.substring(as + 2, cast.closeParen).trim
+                    if (!target.equalsIgnoreCase("VARCHAR") && !target.equalsIgnoreCase("STRING")) None
+                    else
+                      parseSingleFunctionCallInRange(sql, (begin, as), "row").flatMap { row =>
+                        splitTopLevelArgs(sql, row).filter(_.size == arity).map { ranges =>
+                          val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+                          seen += id
+                          val rendered =
+                            if (name == "timestampdiff") s"timestampdiff(SECOND, ${args.mkString(", ")})"
+                            else s"$name(${args.mkString(", ")})"
+                          call.closeParen + 1 -> rendered
+                        }
+                      }
+                  }
+                }
+              }
+            case _ => None
+          }
+        }
+      }
+      if (restored.contains(prefix))
+        throw new IllegalStateException("Unresolved Spark scalar marker in native SQL")
+      restored
+    }
+
+    def requireAllSeen(): Unit =
+      if (calls.keySet.exists(id => !seen.contains(id)))
+        throw new IllegalStateException("Native compiler lost a Spark scalar marker")
+
+    def clearSeen(): Unit = seen.clear()
+  }
+
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
     "to_date" -> RenameRule(
       Map(
@@ -51,6 +193,12 @@ private[compiler] object SparkFunctionShimSql {
       Map(
         1 -> "__sparkfn_date_format"
       )
+    ),
+    "date_add" -> RenameRule(
+      Map(1 -> "__sparkfn_date_add")
+    ),
+    "date_sub" -> RenameRule(
+      Map(1 -> "__sparkfn_date_sub")
     ),
     "make_interval" -> RenameRule(
       Map(
@@ -84,6 +232,21 @@ private[compiler] object SparkFunctionShimSql {
     )
   )
 
+  def rewriteDuckdbIncompatibleTokens(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val collation = "collation"
+      val end       = i + collation.length
+      if (sql.startsWith("<=>", i)) Some((i + 3) -> " IS NOT DISTINCT FROM ")
+      else if (
+        hasLeftIdentifierBoundary(sql, i) && end <= sql.length &&
+        sql.regionMatches(true, i, collation, 0, collation.length) && hasRightIdentifierBoundary(sql, end)
+      ) {
+        val next = skipTriviaForward(sql, end, sql.length)
+        if (next < sql.length && sql.charAt(next) == '(') None
+        else Some(end -> ("\"" + sql.substring(i, end) + "\""))
+      } else None
+    }
+
   /** Pre-pass for the compile bridge: rename Spark function spellings that
     * DuckDB would otherwise parse or bind incompatibly to collision-free
     * `__sparkfn_*` spellings before the SQL reaches DuckDB.
@@ -96,6 +259,7 @@ private[compiler] object SparkFunctionShimSql {
     *   - 1-arg / 2-arg `to_date(...)`
     *   - 1-arg / 2-arg `to_timestamp(...)`
     *   - 2-arg `date_format(...)`
+    *   - 2-arg `date_add(...)` / `date_sub(...)`
     *   - 7-arg `make_interval(...)`
     *   - 2-arg `get_json_object(...)`
     *   - 2-arg `last_value(expr, true|false)`
@@ -117,6 +281,205 @@ private[compiler] object SparkFunctionShimSql {
                 .flatMap(call => rule.replacementFor(call).map(replacement => identEnd -> replacement))
             }
           }
+      }
+    }
+
+  private val nonColumnKeywords = Set(
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "USER",
+    "CURRENT_ROLE",
+    "CURRENT_SCHEMA",
+    "CURRENT_CATALOG"
+  )
+
+  private def isSimpleColumn(value: String): Boolean = {
+    val ident = """(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")"""
+    value.matches(s"$ident(?:\\s*\\.\\s*$ident)*") &&
+    !nonColumnKeywords.contains(value.toUpperCase(Locale.ROOT))
+  }
+
+  private def namedStructPack(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).flatMap { ranges =>
+        val fields = ranges.map { case (start, end) =>
+          findTopLevelKeywordRespectingCase(sql, start, end, "AS") match {
+            case Some(as) =>
+              val value = sql.substring(start, as).trim
+              val name  = sql.substring(as + 2, end).trim
+              val validName = name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
+                name.matches("\"(?:[^\"]|\"\")+\"")
+              if (value.nonEmpty && validName) Some(s"$name := $value") else None
+            case None =>
+              val value = sql.substring(start, end).trim
+              val ident = """(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")"""
+              if (isSimpleColumn(value)) {
+                val name = (s"""$ident$$""").r.findFirstIn(value).get
+                Some(s"$name := $value")
+              } else None
+          }
+        }
+        if (fields.nonEmpty && fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})")
+        else None
+      }
+    }
+  }
+
+  private def rewriteNamedStructs(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      var before = i - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      if (before >= 0 && sql.charAt(before) == '.') None
+      else
+        parseFunctionCallAt(sql, i, "named_struct").flatMap { call =>
+          splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+            val fields = args
+              .grouped(2)
+              .map { pair =>
+                val name  = sql.substring(pair.head._1, pair.head._2).trim
+                val value = rewriteNamedStructs(sql.substring(pair.last._1, pair.last._2).trim)
+                val simpleValue = isSimpleColumn(value) ||
+                  Set("NULL", "TRUE", "FALSE").contains(value.toUpperCase(Locale.ROOT)) ||
+                  value.matches("'(?:[^']|'')*'") || value.matches("[+-]?[0-9]+(?:\\.[0-9]+)?") ||
+                  (value.nonEmpty && Seq("struct_pack", "__openivm_spark_expression")
+                    .exists(fn => parseFunctionCallAt(value, 0, fn).exists(_.closeParen == value.length - 1)))
+                if (name.matches("'(?:[^']|'')+'") && simpleValue) {
+                  val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+                  Some(s""""$decoded" := $value""")
+                } else None
+              }
+              .toSeq
+            if (fields.forall(_.isDefined))
+              Some(call.closeParen + 1 -> s"struct_pack(${fields.flatten.mkString(", ")})")
+            else None
+          }
+        }
+    }
+
+  private[compiler] def namedStructTypeSeed(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (
+              !translateSparkStringLiteralEscapes(name).matches("'(?:[^']|'')+'") ||
+              value.isEmpty || value.equalsIgnoreCase("NULL")
+            ) None
+            else {
+              val seed =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined) namedStructTypeSeed(value)
+                else Some(s"CASE WHEN FALSE THEN $value ELSE NULL END")
+              seed.map(v => s"$name, $v")
+            }
+          }
+          .toSeq
+        if (fields.forall(_.isDefined)) Some(s"named_struct(${fields.flatten.mkString(", ")})") else None
+      }
+    }
+  }
+
+  private def markerStructSeedToPack(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (!name.matches("'(?:[^']|'')+'") || value.isEmpty) None
+            else {
+              val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+              val converted =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined)
+                  markerStructSeedToPack(value)
+                else Some(value)
+              converted.map(v => s""""$decoded" := $v""")
+            }
+          }
+          .toSeq
+        if (fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})") else None
+      }
+    }
+  }
+
+  private def rewriteStructMarkerSeeds(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "__openivm_spark_expression").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size >= 3).flatMap { ranges =>
+          val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+          markerStructSeedToPack(args(1)).map { seed =>
+            call.closeParen + 1 -> s"__openivm_spark_expression(${(args.take(1) ++ Seq(seed) ++ args.drop(2)).mkString(", ")})"
+          }
+        }
+      }
+    }
+
+  private[compiler] def rewriteStructMaxBy(sql: String): String = rewriteStructMaxByCalls(rewriteStructMarkerSeeds(sql))
+
+  private def rewriteStructMaxByCalls(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      var before = i - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      if (before >= 0 && sql.charAt(before) == '.') None
+      else
+        parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
+          splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+            val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+            val structs = args.map { arg =>
+              namedStructPack(arg).orElse {
+                if (
+                  arg.nonEmpty && parseFunctionCallAt(arg, 0, "named_struct").exists(_.closeParen == arg.length - 1)
+                ) {
+                  val converted = rewriteNamedStructs(arg)
+                  if (parseFunctionCallAt(converted, 0, "struct_pack").exists(_.closeParen == converted.length - 1))
+                    Some(converted)
+                  else None
+                } else None
+              }
+            }
+            val unsupportedStruct = args.zip(structs).exists { case (arg, converted) =>
+              converted.isEmpty && arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct").isDefined
+            }
+            if (structs.exists(_.isDefined) && !unsupportedStruct)
+              Some(
+                (
+                  call.closeParen + 1,
+                  s"arg_max(${args.zip(structs).map { case (arg, converted) => converted.getOrElse(arg) }.mkString(", ")})"
+                )
+              )
+            else None
+          }
+        }
+    }
+
+  private[compiler] def restoreStructMaxBy(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "arg_max").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+          val structs = ranges.map { case (start, end) => sql.substring(start, end).trim }
+          if (
+            structs.exists(arg =>
+              arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1)
+            )
+          )
+            Some(
+              (call.closeParen + 1, s"max_by(${structs.map(SparkExpressionMarker.restoreStructPacks).mkString(", ")})")
+            )
+          else None
+        }
       }
     }
 
@@ -807,7 +1170,11 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private[compiler] def rewriteOutsideProtected(sql: String, protectBackticks: Boolean = false)(
+  private[compiler] def rewriteOutsideProtected(
+      sql: String,
+      protectBackticks: Boolean = false,
+      protectSingleQuotes: Boolean = true
+  )(
       matcher: Int => Option[(Int, String)]
   ): String = {
     val out = new StringBuilder(sql.length)
@@ -816,7 +1183,7 @@ private[compiler] object SparkFunctionShimSql {
       val next =
         if (startsLineComment(sql, i)) Some(consumeLineComment(sql, i))
         else if (startsBlockComment(sql, i)) Some(consumeBlockComment(sql, i))
-        else if (sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
+        else if (protectSingleQuotes && sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
         else if (sql.charAt(i) == '"') Some(consumeDoubleQuoted(sql, i))
         else if (protectBackticks && sql.charAt(i) == '`') {
           var end    = i + 1

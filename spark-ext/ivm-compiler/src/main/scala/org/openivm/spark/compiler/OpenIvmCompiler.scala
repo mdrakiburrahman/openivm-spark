@@ -7,6 +7,10 @@ import java.security.MessageDigest
 import java.util.{Comparator, Locale, UUID}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnresolvedWith}
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{
   DeltaShape,
@@ -229,17 +233,46 @@ class OpenIvmCompiler private (
       }
       lastStdout = stdout
       lastStderr = stderr
-      val nativeViewName = stdout.linesIterator
+      var resultStdout                                               = stdout
+      var resultDir                                                  = tmpDir
+      var markers: Option[SparkFunctionShimSql.ScalarDialectMarkers] = None
+      val partial =
+        try {
+          parseCompileResult(stdout, req.viewName, stderr)
+        } catch {
+          case first: OpenIvmCompileException if {
+                val error = stderr.toLowerCase(Locale.ROOT)
+                error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
+              } =>
+            val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
+            val rewritten = candidate.rewrite(normalizedViewSql)
+            if (!candidate.nonEmpty || candidate.hasUnsafeArguments) throw first
+            resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
+            val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
+            val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+              runCli(retry, resultDir)
+            }
+            resultStdout = retryStdout
+            lastStdout = retryStdout
+            lastStderr = retryStderr
+            markers = Some(candidate)
+            parseCompileResult(retryStdout, req.viewName, retryStderr)
+        }
+      val nativeViewName = resultStdout.linesIterator
         .find(_.contains("\"openivm_bridge_view_key\""))
         .map { line =>
           val key = "\"openivm_bridge_view_key\""
           decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
         }
         .getOrElse(req.viewName)
-      val partial  = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
+      val restore: String => String = sql => markers.fold(sql)(_.restore(sql))
+      val initLoad                  = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      if (initLoad.nonEmpty && partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
+      markers.foreach(_.clearSeen())
+      val resultSql = restore(normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName))
+      if (partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       partial.copy(
-        sql = normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName),
+        sql = resultSql,
         initialLoadSql = initLoad
       )
     } catch {
@@ -319,10 +352,14 @@ class OpenIvmCompiler private (
       req: CompileRequest,
       tableDdls: Seq[(String, String)],
       tmpDir: Path,
-      normalizedViewSql: String
+      normalizedViewSql: String,
+      preserveScalarMarkers: Boolean = false
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
+    if (preserveScalarMarkers)
+      sb ++= "SET disabled_optimizers='expression_rewriter,common_subexpressions';\n"
+    sb ++= "SET GLOBAL openivm_spark_expression_markers=true;\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -556,7 +593,9 @@ class OpenIvmCompiler private (
     val leftSemi          = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
     val leftAnti          = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
     val literalsRewritten = SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql)
-    val renamedFns        = OpenIvmCompiler.renameSparkFunctionShimCalls(literalsRewritten)
+    val tokensRewritten   = SparkFunctionShimSql.rewriteDuckdbIncompatibleTokens(literalsRewritten)
+    val renamedFns =
+      SparkFunctionShimSql.rewriteStructMaxBy(OpenIvmCompiler.renameSparkFunctionShimCalls(tokensRewritten))
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
@@ -819,7 +858,12 @@ class OpenIvmCompiler private (
     * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
     * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
-  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeViewName: String = ""): String = {
+  private[compiler] def parseInitialLoadSql(
+      tmpDir: Path,
+      req: CompileRequest,
+      nativeViewName: String = "",
+      restore: String => String = identity
+  ): String = {
     import java.util.regex.Pattern
     val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
     val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
@@ -833,7 +877,7 @@ class OpenIvmCompiler private (
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    val extracted = m.group(1).trim
+    val extracted = restore(m.group(1).trim)
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
@@ -1161,6 +1205,76 @@ object OpenIvmCompiler {
     }
   }
 
+  /** Native fallback CTAS bodies can retain bare source names instead of
+    * memory.main references. Bind only parsed relation nodes, never aliases,
+    * expressions, literals or CTE references.
+    */
+  private[spark] def reattachBareInitialLoadSources(sql: String, req: CompileRequest): String = {
+    val qualified = req.sourceQualifiedNames.map { case (short, full) => short.toLowerCase(Locale.ROOT) -> full }
+    val pins =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName.toLowerCase(Locale.ROOT) -> pin.clause).toMap
+    val paths = req.sourceSnapshotPinnedPaths.map { case (short, path) => short.toLowerCase(Locale.ROOT) -> path }
+    if (qualified.isEmpty && pins.isEmpty) return sql
+
+    val edits = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, String)]
+    def sourceName(short: String): Option[String] = pins.get(short) match {
+      case Some(clause) =>
+        val path = paths.getOrElse(
+          short,
+          throw new PinnedSourcePathMissingException(
+            s"initial-load emission for view '${req.viewName}' has no verified Delta path for snapshot-pinned source '$short'"
+          )
+        )
+        Some(s"delta.`${path.replace("`", "``")}` $clause")
+      case None => qualified.get(short)
+    }
+    def visit(plan: LogicalPlan, visibleCtes: Set[String]): Unit = plan match {
+      case withCtes: UnresolvedWith =>
+        var scope = visibleCtes
+        withCtes.cteRelations.foreach { cte =>
+          val name = cte._1
+          val body = cte._2
+          visit(body, scope)
+          scope += name.toLowerCase(Locale.ROOT)
+        }
+        visit(withCtes.child, scope)
+      case relation: UnresolvedRelation if relation.multipartIdentifier.size == 1 =>
+        val name = relation.multipartIdentifier.head
+        val key  = name.toLowerCase(Locale.ROOT)
+        if (visibleCtes.contains(key) && (qualified.contains(key) || pins.contains(key))) {
+          throw new IllegalStateException(
+            s"initial-load source '$name' in view '${req.viewName}' is ambiguous with a CTE; refusing to bind it"
+          )
+        }
+        if (!visibleCtes.contains(key)) sourceName(key).foreach { bound =>
+          val start = relation.origin.startIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          )
+          val stop = relation.origin.stopIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          ) + 1
+          val original = sql.substring(start, stop)
+          if (
+            !(original.equalsIgnoreCase(name) || original.equalsIgnoreCase(s"`$name`") ||
+              original.equalsIgnoreCase("\"" + name + "\""))
+          ) {
+            throw new IllegalStateException(s"initial-load source '$name' has an unexpected source span: $original")
+          }
+          edits += ((start, stop, bound))
+        }
+      case other =>
+        other.children.foreach(visit(_, visibleCtes))
+        other.expressions.foreach(_.foreach {
+          case subquery: SubqueryExpression => visit(subquery.plan, visibleCtes)
+          case _                            => ()
+        })
+    }
+    visit(CatalystSqlParser.parsePlan(sql), Set.empty)
+    edits.sortBy(-_._1).iterator.foldLeft(sql) { case (text, (start, end, bound)) =>
+      text.substring(0, start) + bound + text.substring(end)
+    }
+  }
+
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would
     * otherwise reject. The set is driven by the dbt-server corpus (TPC-DI
@@ -1211,6 +1325,8 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_add(d, days) AS CAST(d AS DATE) + CAST(days AS INTEGER);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_sub(d, days) AS CAST(d AS DATE) - CAST(days AS INTEGER);",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The
       // interval fallback keeps the DuckDB macro type- and value-correct.

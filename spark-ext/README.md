@@ -37,11 +37,23 @@ conflicting bound requests fail closed. No new request, global/session binding o
 thread-local rebinding occurs; the lifecycle owner still ENDs, exports and RELEASEs
 the original capture. Omitting FOR REQUEST retains thread-bound behavior.
 
-## Generated pattern-match dialect
+## Generated SQL dialect
 
 The Spark SQL generation boundary translates DuckDB pattern operators `~~`,
 `!~~`, `~~*` and `!~~*` to LIKE, NOT LIKE, ILIKE and NOT ILIKE. String literals,
 quoted identifiers and comments are protected; source business SQL is unchanged.
+The native infinity literal `1e1000` is restored as a Spark DOUBLE infinity;
+the native `main.trim` builtin is restored as an unqualified Spark `trim` call.
+
+For native binding failures, unqualified-column `UNIX_TIMESTAMP`, boolean `LOWER`, and
+`TIMESTAMPDIFF(SECOND, ...)` calls are retried through a Spark-evaluated bridge.
+Other argument shapes are not covered by this retry.
+
+The expression bridge preserves Spark evaluation for supported expressions
+while the native compiler classifies the view. Daily `EXPLODE(SEQUENCE(...))`
+with DATE column bounds and `INTERVAL 1 DAY` is supported, including multiple
+generators. Struct ordering keys are bridged only for bounded `MAX_BY` shapes;
+this is not a general translation of Spark struct ordering to DuckDB.
 
 ## Native streaming status lookup diagnostics
 
@@ -86,6 +98,9 @@ Spark SQL extension delivering **OpenIVM incremental view maintenance** without 
 | `spark-4.1` | 4.1.0 | 4.2.0 | 2.13.17 | 21   | `ivmextension-spark-4.1_2.13` |
 
 Spark 3.5 remains the default for every developer command that omits `--target`.
+
+Assembly jars bundle a Linux x86-64 native compiler built and smoke-tested on
+Ubuntu 22.04 with its system glibc and libstdc++.
 
 ## Documentation
 

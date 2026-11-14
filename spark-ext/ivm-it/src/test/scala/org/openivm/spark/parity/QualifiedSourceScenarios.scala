@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{MvCatalog, StagingCatalog}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, StagingCatalog}
 
 import java.io.File
 
@@ -25,6 +25,8 @@ import java.io.File
   */
 abstract class QualifiedSourceScenarios extends IvmParitySpecBase("qualified-source") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] = Map(FeatureGate.ProfileRefreshKey -> "true")
 
   override def beforeAll(): Unit = {
     super.beforeAll()
@@ -130,5 +132,30 @@ abstract class QualifiedSourceScenarios extends IvmParitySpecBase("qualified-sou
       refreshMv("mv_qs3")
       assertMvCorrect("mv_qs3", expected)
     }
+  }
+
+  it("binds a qualified parent MV in a downstream struct aggregate CTE") {
+    sql("CREATE TABLE qualified_src_db.events_qs4(id INT, event_time TIMESTAMP, payload STRING) USING DELTA")
+    sql("""INSERT INTO qualified_src_db.events_qs4 VALUES
+      |(1, TIMESTAMP '2024-01-01 10:00:00', 'one'),
+      |(2, TIMESTAMP '2024-01-02 10:00:00', 'two')""".stripMargin)
+    sql("""CREATE MATERIALIZED VIEW qualified_src_db.parent_qs4 AS
+      |SELECT id, MAX(event_time) AS event_time, MAX(payload) AS payload
+      |FROM qualified_src_db.events_qs4 GROUP BY id""".stripMargin)
+    val query = """WITH latest AS (
+      | SELECT id, MAX_BY(NAMED_STRUCT('event_time', event_time, 'payload', payload),
+      |   NAMED_STRUCT('event_time', event_time)) AS item
+      | FROM qualified_src_db.parent_qs4 GROUP BY id
+      |) SELECT id, item.event_time AS event_time, item.payload AS payload FROM latest""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW mv_qs4 AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("mv_qs4")
+    MvCatalog.lookup(spark, id).get.refreshType should not be org.openivm.spark.common.RefreshTypeCode.FullRefresh
+    assertMvCorrect("mv_qs4", query)
+    sql("INSERT INTO qualified_src_db.events_qs4 VALUES (1, TIMESTAMP '2024-01-03 10:00:00', 'three')")
+    refreshMv("qualified_src_db.parent_qs4")
+    RefreshProfileCatalog.removeAll(spark)
+    refreshMv("mv_qs4")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+    assertMvCorrect("mv_qs4", query)
   }
 }
