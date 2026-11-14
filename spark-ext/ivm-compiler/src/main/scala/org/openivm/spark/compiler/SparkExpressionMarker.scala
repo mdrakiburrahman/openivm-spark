@@ -63,10 +63,10 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
             markers.get(id).flatMap { marker =>
               val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
               val allowed = marker.result match {
-                case Text    => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
-                case Integer => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
-                case Long    => Set("CAST(NULLASBIGINT)")
-                case Boolean => Set("CAST(NULLASBOOLEAN)")
+                case Text      => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
+                case Integer   => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
+                case Long      => Set("CAST(NULLASBIGINT)")
+                case Boolean   => Set("CAST(NULLASBOOLEAN)")
                 case Timestamp => Set("CAST(NULLASTIMESTAMP)")
                 case TextArray =>
                   Set(

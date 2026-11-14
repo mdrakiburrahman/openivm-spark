@@ -18,7 +18,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       Seq(false, true).foreach { ansi =>
         spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
         val source = s"expr_case_coercion_$ansi"
-        val mv = s"expr_case_coercion_mv_$ansi"
+        val mv     = s"expr_case_coercion_mv_$ansi"
         sql(s"CREATE TABLE $source (id INT, ts TIMESTAMP, text STRING) USING DELTA")
         sql(s"""INSERT INTO $source VALUES
           |(1, TIMESTAMP '2000-01-01 00:00:00', NULL),
