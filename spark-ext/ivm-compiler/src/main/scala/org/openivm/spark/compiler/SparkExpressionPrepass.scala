@@ -12,6 +12,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Cast,
   CreateNamedStruct,
   Expression,
+  Explode,
   If,
   Literal,
   NamePlaceholder,
@@ -20,7 +21,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 }
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.types.{StringType, TimestampType}
+import org.apache.spark.sql.types.{ArrayType, DateType, StringType, TimestampType}
 import org.openivm.spark.compiler.SparkExpressionMarker._
 
 private[spark] object SparkExpressionPrepass {
@@ -99,6 +100,33 @@ private[spark] object SparkExpressionPrepass {
   ): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
+    val generators = mutable.ArrayBuffer.empty[(UnresolvedFunction, UnresolvedFunction)]
+    lazy val dateGenerators: Set[(Int, Int)] = {
+      val spans = mutable.Set.empty[(Int, Int)]
+      val visited = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+      def collectExpression(expr: Expression): Unit = {
+        expr match {
+          case subquery: SubqueryExpression => collectPlan(subquery.plan)
+          case explode: Explode if (explode.child.dataType match {
+                case ArrayType(DateType, _) => true
+                case _ => false
+              }) =>
+            for (start <- explode.origin.startIndex; stop <- explode.origin.stopIndex) spans += ((start, stop))
+          case _ =>
+        }
+        expr.children.foreach(collectExpression)
+      }
+      def collectPlan(plan: LogicalPlan): Unit = {
+        if (!visited.containsKey(plan)) {
+          visited.put(plan, java.lang.Boolean.TRUE)
+          plan.expressions.foreach(collectExpression)
+          plan.children.foreach(collectPlan)
+          plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(collectPlan)
+        }
+      }
+      analyzedPlan.foreach(collectPlan)
+      spans.toSet
+    }
     lazy val coercedCases: Map[(Int, Int), ResultType] = {
       val cases                = mutable.Map.empty[(Int, Int), ResultType]
       val visitedAnalyzedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
@@ -165,6 +193,21 @@ private[spark] object SparkExpressionPrepass {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
         subquery.children.foreach(child => expressions(child, scope))
+      case explode: UnresolvedFunction
+          if explode.nameParts.size == 1 && explode.nameParts.head.equalsIgnoreCase("explode") &&
+            explode.arguments.size == 1 && !explode.isDistinct && explode.filter.isEmpty && !explode.ignoreNulls &&
+            explode.origin.startIndex.isDefined && explode.origin.stopIndex.isDefined &&
+            dateGenerators.contains((explode.origin.startIndex.get, explode.origin.stopIndex.get)) =>
+        explode.arguments.head match {
+          case sequence: UnresolvedFunction
+              if sequence.nameParts.size == 1 && sequence.nameParts.head.equalsIgnoreCase("sequence") &&
+                sequence.arguments.size == 3 && sequence.arguments.take(2).forall(_.isInstanceOf[UnresolvedAttribute]) &&
+                !sequence.isDistinct && sequence.filter.isEmpty && !sequence.ignoreNulls &&
+                sql.substring(expressionSpan(sql, sequence.arguments(2)).start, expressionSpan(sql, sequence.arguments(2)).end)
+                  .trim.matches("(?i)INTERVAL\\s*'1'\\s+DAY") =>
+            generators += ((explode, sequence))
+          case _ => explode.children.foreach(child => expressions(child, scope))
+        }
       case branch: CaseWhen
           if branch.branches.size == 1 && branch.branches.head._2.isInstanceOf[UnresolvedAttribute] &&
             branch.elseValue.exists(_.isInstanceOf[UnresolvedAttribute]) &&
@@ -252,10 +295,20 @@ private[spark] object SparkExpressionPrepass {
         }
         span -> encoded
       }
-      .sortBy(_._1.start)
+    val generatorEdits = generators.distinct.map { case (explode, sequence) =>
+      val bounds = sequence.arguments.take(2).map { arg =>
+        val span = expressionSpan(sql, arg)
+        val arguments = mutable.ArrayBuffer.empty[String]
+        val body = template(sql, arg, span, arguments, caseSensitive)
+        markers.encode(arguments.toSeq, DateBound)(body)
+      }
+      expressionSpan(sql, explode) ->
+        s"CAST(UNNEST(GENERATE_SERIES(${bounds.mkString(", ")}, to_days(1))) AS DATE)"
+    }
+    val edits = (replacements ++ generatorEdits).sortBy(_._1.start)
     var cursor = 0
     val output = new StringBuilder
-    replacements.foreach { case (span, encoded) =>
+    edits.foreach { case (span, encoded) =>
       if (span.start < cursor) throw new IllegalArgumentException("Overlapping Spark expression spans")
       output ++= sql.substring(cursor, span.start)
       output ++= encoded
