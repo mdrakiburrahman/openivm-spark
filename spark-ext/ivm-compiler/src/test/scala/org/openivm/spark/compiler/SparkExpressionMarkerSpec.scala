@@ -46,6 +46,17 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     bridge.requireAllSeen()
   }
 
+  it should "preserve explicit timestamp casts on date arithmetic markers" in {
+    val bridge = new SparkExpressionMarker(opaque = true)
+    val value  = bridge.encode(Seq("d", "n"), DateValue)(args => s"date_add(${args.mkString(", ")})")
+    val bound  = bridge.encode(Seq("d"), DateBound)(_.head)
+    val sql = s"SELECT CAST($value AS TIMESTAMP), " +
+      s"unnest(sequence(CAST($bound AS TIMESTAMP), CAST($bound AS TIMESTAMP), INTERVAL '1 DAY'))"
+    bridge.restore(sql) shouldBe
+      "SELECT CAST(date_add(d, n) AS TIMESTAMP), explode(sequence(d, d, INTERVAL '1 DAY'))"
+    bridge.requireAllSeen()
+  }
+
   it should "reject missing or malformed markers" in {
     val bridge = new SparkExpressionMarker
     val marker = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")

@@ -32,6 +32,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case TextArray    => "string_split('openivm_type', ',')"
         case Timestamp    => "CAST(NULL AS TIMESTAMP)"
         case DateBound    => "CAST(NULL AS DATE)"
+        case DateValue    => "CAST(NULL AS DATE)"
         case Struct(seed) => seed
       }
       s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
@@ -45,6 +46,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case TextArray => s"string_split($payload, '${id}separator')"
         case Timestamp => s"CAST($payload AS TIMESTAMP)"
         case DateBound => s"CAST($payload AS DATE)"
+        case DateValue => s"CAST($payload AS DATE)"
         case _: Struct => throw new IllegalArgumentException("Struct markers require opaque mode")
       }
     }
@@ -116,6 +118,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
                     case Boolean   => Set("CAST(NULLASBOOLEAN)").contains(seed)
                     case Timestamp => Set("CAST(NULLASTIMESTAMP)").contains(seed)
                     case DateBound => Set("CAST(NULLASDATE)").contains(seed)
+                    case DateValue => Set("CAST(NULLASDATE)").contains(seed)
                     case TextArray =>
                       Set(
                         "STRING_SPLIT('OPENIVM_TYPE',',')",
@@ -213,6 +216,7 @@ private[compiler] object SparkExpressionMarker {
   case object TextArray                 extends ResultType
   case object Timestamp                 extends ResultType
   case object DateBound                 extends ResultType
+  case object DateValue                 extends ResultType
   final case class Struct(seed: String) extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
