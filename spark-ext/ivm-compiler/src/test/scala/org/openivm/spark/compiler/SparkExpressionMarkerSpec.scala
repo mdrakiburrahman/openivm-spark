@@ -37,6 +37,10 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     val marker = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
     intercept[IllegalStateException](bridge.restore(marker.replace("row(", "other(")))
     intercept[IllegalStateException](bridge.requireAllSeen())
+    val opaque = new SparkExpressionMarker(opaque = true)
+    intercept[IllegalArgumentException] {
+      opaque.encode(Seq("""struct_pack("Odd Name" := id)"""), Text)(_.head)
+    }
   }
 
   it should "survive native compilation of nested projection expressions" in {
@@ -62,12 +66,13 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
       val regex  = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
       val split  = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
       val size   = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
-      val json =
-        bridge.encode(Seq("struct_pack(\"Odd Name\" := txt, nested := struct_pack(other := id))"), Text)(args =>
-          s"to_json(${args.head})"
-        )
-      val hash   = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
-      val quoted = bridge.encode(Seq("""struct_pack("O'Brien\Name" := txt)"""), Text)(args => s"to_json(${args.head})")
+      val json = bridge.encode(Seq("txt", "id"), Text)(args =>
+        s"to_json(named_struct('Odd Name', ${args.head}, 'nested', named_struct('other', ${args(1)})))"
+      )
+      val hash = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
+      val quoted = bridge.encode(Seq("txt"), Text)(args =>
+        s"to_json(named_struct(concat('O', chr(39), 'Brien', chr(92), 'Name'), ${args.head}))"
+      )
       val flattened = bridge.encode(Seq("txt", "id"), Text)(args =>
         s"to_json(named_struct('dup', ${args.head}, 'dup', named_struct('nested', ${args(1)})), " +
           "map('ignoreNullFields', 'false'))"

@@ -19,6 +19,7 @@ private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
 
   def encode(args: Seq[String], result: ResultType)(render: Seq[String] => String): String = {
     require(args.nonEmpty, "A marker must carry at least one argument")
+    require(!opaque || !args.exists(hasStructConstructor), "Opaque marker struct arguments must be flattened")
     val id = prefix + markers.size + "__"
     markers.put(id, Marker(args.size, result, render))
     if (opaque) {
@@ -155,6 +156,16 @@ private[compiler] object SparkExpressionMarker {
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
+
+  private def hasStructConstructor(sql: String): Boolean = {
+    var found = false
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      if (Seq("struct_pack", "named_struct", "struct", "row").exists(name => parseCall(sql, i, name).isDefined))
+        found = true
+      None
+    }
+    found
+  }
 
   private def restoreStructPacks(sql: String): String =
     SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
