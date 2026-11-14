@@ -51,10 +51,16 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
       meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("no_real_delta")
       assertMvCorrect("expr_anti_full_mv", query)
+      val downstreamQuery = "SELECT id, txt FROM expr_anti_full_mv WHERE id > 1"
+      val downstreamExpected = s"SELECT id, txt FROM ($query) filtered WHERE id > 1"
+      sql(s"CREATE MATERIALIZED VIEW expr_anti_full_downstream AS $downstreamQuery")
+      assertMvCorrect("expr_anti_full_downstream", downstreamExpected)
       sql("INSERT INTO expr_anti_full_blocked VALUES ('b')")
       sql("INSERT INTO expr_anti_full_source VALUES (4, 'C')")
       refreshMv("expr_anti_full_mv")
+      refreshMv("expr_anti_full_downstream")
       assertMvCorrect("expr_anti_full_mv", query)
+      assertMvCorrect("expr_anti_full_downstream", downstreamExpected)
     }
 
     it("preserves pinned-source identity while incrementally refreshing a live join") {
