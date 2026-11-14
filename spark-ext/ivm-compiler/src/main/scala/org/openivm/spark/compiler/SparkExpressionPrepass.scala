@@ -211,7 +211,7 @@ private[spark] object SparkExpressionPrepass {
                     expressionSpan(sql, sequence.arguments(2)).end
                   )
                   .trim
-                  .matches("(?i)INTERVAL\\s*'1'\\s+DAY") =>
+                  .matches("(?i)INTERVAL(?:\\s*'1'|\\s+1)\\s+DAY") =>
             generators += ((explode, sequence))
           case _ => explode.children.foreach(child => expressions(child, scope))
         }
