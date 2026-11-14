@@ -39,6 +39,27 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
       } finally Configurator.setRootLevel(level)
     }
   }
+
+  it("maintains a window above an expanded date CTE") {
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    sql("CREATE TABLE date_gen_window_source (id INT, start_date DATE, end_date DATE) USING DELTA")
+    sql("INSERT INTO date_gen_window_source VALUES (1, DATE '2024-01-01', DATE '2024-01-03')")
+    val query = """WITH expanded AS (
+      | SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
+      | FROM date_gen_window_source t
+      |) SELECT id, d, row_number() OVER (PARTITION BY id ORDER BY d) AS rn FROM expanded""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW date_gen_window_mv AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("date_gen_window_mv")
+    MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+    assertMvCorrect("date_gen_window_mv", query)
+    sql("UPDATE date_gen_window_source SET end_date = DATE '2024-01-04' WHERE id = 1")
+    sql("INSERT INTO date_gen_window_source VALUES (2, DATE '2024-02-01', DATE '2024-02-02')")
+    refreshMv("date_gen_window_mv")
+    assertMvCorrect("date_gen_window_mv", query)
+    sql("DELETE FROM date_gen_window_source WHERE id = 1")
+    refreshMv("date_gen_window_mv")
+    assertMvCorrect("date_gen_window_mv", query)
+  }
 }
 
 class SparkDateGeneratorCdfIntegrationSpec extends SparkDateGeneratorScenarios with CdfMode
