@@ -100,48 +100,48 @@ private[spark] object SparkExpressionPrepass {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
     lazy val coercedCases: Map[(Int, Int), ResultType] = {
-      val cases = mutable.Map.empty[(Int, Int), ResultType]
+      val cases                = mutable.Map.empty[(Int, Int), ResultType]
       val visitedAnalyzedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
 
       def analyzedExpressions(expr: Expression): Unit = {
-      expr match {
-        case subquery: SubqueryExpression => analyzedPlans(subquery.plan)
-        case branch: CaseWhen =>
-          val values = branch.branches.map(_._2) ++ branch.elseValue.toSeq
-          val inputTypes = values.map {
-            case cast: Cast => cast.child.dataType
-            case value      => value.dataType
-          }.toSet
-          val result = branch.dataType match {
-            case StringType    => Some(Text)
-            case TimestampType => Some(Timestamp)
-            case _             => None
-          }
-          for {
-            start <- branch.origin.startIndex
-            stop <- branch.origin.stopIndex
-            kind <- result
-            if inputTypes.contains(StringType) && inputTypes.contains(TimestampType)
-          } {
-            val span = (start, stop)
-            cases.get(span).foreach { existing =>
-              if (existing != kind) throw new IllegalArgumentException("Conflicting analyzed CASE result types")
+        expr match {
+          case subquery: SubqueryExpression => analyzedPlans(subquery.plan)
+          case branch: CaseWhen =>
+            val values = branch.branches.map(_._2) ++ branch.elseValue.toSeq
+            val inputTypes = values.map {
+              case cast: Cast => cast.child.dataType
+              case value      => value.dataType
+            }.toSet
+            val result = branch.dataType match {
+              case StringType    => Some(Text)
+              case TimestampType => Some(Timestamp)
+              case _             => None
             }
-            cases.update(span, kind)
-          }
-        case _ =>
+            for {
+              start <- branch.origin.startIndex
+              stop  <- branch.origin.stopIndex
+              kind  <- result
+              if inputTypes.contains(StringType) && inputTypes.contains(TimestampType)
+            } {
+              val span = (start, stop)
+              cases.get(span).foreach { existing =>
+                if (existing != kind) throw new IllegalArgumentException("Conflicting analyzed CASE result types")
+              }
+              cases.update(span, kind)
+            }
+          case _ =>
+        }
+        expr.children.foreach(analyzedExpressions)
       }
-      expr.children.foreach(analyzedExpressions)
-    }
-    def analyzedPlans(plan: LogicalPlan): Unit = {
-      if (!visitedAnalyzedPlans.containsKey(plan)) {
-        visitedAnalyzedPlans.put(plan, java.lang.Boolean.TRUE)
-        plan.expressions.foreach(analyzedExpressions)
-        plan.children.foreach(analyzedPlans)
-        plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(analyzedPlans)
+      def analyzedPlans(plan: LogicalPlan): Unit = {
+        if (!visitedAnalyzedPlans.containsKey(plan)) {
+          visitedAnalyzedPlans.put(plan, java.lang.Boolean.TRUE)
+          plan.expressions.foreach(analyzedExpressions)
+          plan.children.foreach(analyzedPlans)
+          plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(analyzedPlans)
+        }
       }
-    }
-    analyzedPlan.foreach(analyzedPlans)
+      analyzedPlan.foreach(analyzedPlans)
       cases.toMap
     }
 
