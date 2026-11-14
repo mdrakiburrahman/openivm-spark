@@ -24,13 +24,14 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           |(1, TIMESTAMP '2000-01-01 00:00:00', NULL),
           |(2, TIMESTAMP '2000-01-02 00:00:00', '2000-02-01')""".stripMargin)
         val query = s"""SELECT s.id,
-          |CASE WHEN CAST(s.text AS TIMESTAMP) IS NULL THEN s.ts ELSE s.text END AS v FROM $source s""".stripMargin
+          |CAST(CASE WHEN CAST(s.text AS TIMESTAMP) IS NULL THEN s.ts ELSE s.text END AS STRING) AS v FROM $source s""".stripMargin
         sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
         val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
         MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
         assertMvCorrect(mv, query)
         sql(s"UPDATE $source SET text = '2000-03-01' WHERE id = 1")
         sql(s"INSERT INTO $source VALUES (3, TIMESTAMP '2000-04-01 00:00:00', NULL)")
+        if (!ansi) sql(s"INSERT INTO $source VALUES (4, TIMESTAMP '2000-05-01 00:00:00', 'invalid')")
         refreshMv(mv)
         assertMvCorrect(mv, query)
       }
