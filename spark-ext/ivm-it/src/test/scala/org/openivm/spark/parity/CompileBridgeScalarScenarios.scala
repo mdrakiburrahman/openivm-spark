@@ -1,10 +1,45 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.MvCatalog
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog}
 import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 
 abstract class CompileBridgeScalarScenarios extends IvmParitySpecBase("compile-bridge-scalar") {
   self: IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] = Map(FeatureGate.ProfileRefreshKey -> "true")
+
+  it("preserves infinity and trim predicates through incremental refresh") {
+    val src       = s"cbs_${modeLabel}_nonfinite_src"
+    val aggregate = s"cbs_${modeLabel}_nonfinite_mv"
+    val grouped   = s"cbs_${modeLabel}_trim_mv"
+    sql(s"CREATE TABLE $src (id STRING, quantity DOUBLE) USING DELTA")
+    sql(s"""INSERT INTO $src VALUES
+      |(' a ', 5D), (' a ', CAST('Infinity' AS DOUBLE)), ('b', CAST('-Infinity' AS DOUBLE)),
+      |('', 9D), (NULL, 10D), ('c', CAST('NaN' AS DOUBLE)), ('d', NULL)""".stripMargin)
+    val queries = Seq(
+      aggregate -> s"""SELECT id, SUM(IF(quantity IS NOT NULL AND NOT ISNAN(quantity)
+        |AND ABS(quantity) != CAST('Infinity' AS DOUBLE), quantity, NULL)) AS total
+        |FROM $src GROUP BY id""".stripMargin,
+      grouped -> s"""SELECT NULLIF(TRIM(CAST(id AS STRING)), '') AS key, COUNT(DISTINCT quantity) AS total
+        |FROM $src WHERE NULLIF(TRIM(id), '') IS NOT NULL GROUP BY NULLIF(TRIM(CAST(id AS STRING)), '')""".stripMargin
+    )
+    queries.foreach { case (name, query) =>
+      sql(s"CREATE MATERIALIZED VIEW $name AS $query")
+      MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(name))
+        .get
+        .refreshTypeName should not equal "FULL_REFRESH"
+      assertMvCorrect(name, query)
+    }
+    sql(s"INSERT INTO $src VALUES (' a ', 7D), ('e', CAST('Infinity' AS DOUBLE)), ('f', -3D)")
+    sql(s"DELETE FROM $src WHERE id = 'b'")
+    queries.foreach { case (name, query) =>
+      RefreshProfileCatalog.removeAll(spark)
+      refreshMv(name)
+      RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+      assertMvCorrect(name, query)
+    }
+  }
 
   describe("Spark scalar expressions in a window view") {
     it("preserves boolean and timestamp semantics through initial load and refresh") {

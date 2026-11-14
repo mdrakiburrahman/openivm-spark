@@ -134,22 +134,24 @@ object LptsSparkDialect {
   def translate(sql: String): String =
     rewriteBareBackslashLiterals(
       rewriteTrimTwoArg(
-        rewriteDoubleQuotedIdentifiers(
-          rewriteErrorFn(
-            rewriteCountStar(
-              rewriteIntervalLiterals(
-                rewriteToTemporalUnit(
-                  rewriteGenerateSeries(
-                    rewriteBareHugeIntCast(
-                      rewriteBareVarcharCast(
-                        rewritePostfixCasts(
-                          rewriteStructExtract(
-                            rewriteTimestampWithTimeZone(
-                              rewriteSparkFunctionInlinings(
-                                rewriteToTimestampDoubleCast(
-                                  SparkFunctionShimSql.restoreStructMaxBy(
-                                    SparkFunctionShimSql.restoreWindowOffsetLiterals(
-                                      rewriteNowTimestamp(rewriteLikeOperators(sql))
+        rewriteNativeInfinityAndTrim(
+          rewriteDoubleQuotedIdentifiers(
+            rewriteErrorFn(
+              rewriteCountStar(
+                rewriteIntervalLiterals(
+                  rewriteToTemporalUnit(
+                    rewriteGenerateSeries(
+                      rewriteBareHugeIntCast(
+                        rewriteBareVarcharCast(
+                          rewritePostfixCasts(
+                            rewriteStructExtract(
+                              rewriteTimestampWithTimeZone(
+                                rewriteSparkFunctionInlinings(
+                                  rewriteToTimestampDoubleCast(
+                                    SparkFunctionShimSql.restoreStructMaxBy(
+                                      SparkFunctionShimSql.restoreWindowOffsetLiterals(
+                                        rewriteNowTimestamp(rewriteLikeOperators(sql))
+                                      )
                                     )
                                   )
                                 )
@@ -167,6 +169,36 @@ object LptsSparkDialect {
         )
       )
     )
+
+  private val NativeMainTrim = """(?i)main\s*\.\s*(`trim`|trim)\s*(?=\()""".r.pattern
+
+  /** Restore DuckDB's non-finite double literal and its qualified builtin trim. */
+  private[compiler] def rewriteNativeInfinityAndTrim(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
+      def tokenChar(c: Char): Boolean = c.isLetterOrDigit || c == '_' || c == '$' || c == '.'
+      val infinity                    = "1e1000"
+      val end                         = index + infinity.length
+      val leftBoundary                = index == 0 || !tokenChar(sql.charAt(index - 1))
+      val rightBoundary               = end >= sql.length || !tokenChar(sql.charAt(end))
+      if (
+        leftBoundary && end <= sql.length && rightBoundary && sql.regionMatches(
+          true,
+          index,
+          infinity,
+          0,
+          infinity.length
+        )
+      )
+        Some(end -> "CAST('Infinity' AS DOUBLE)")
+      else if (sql.charAt(index) == 'm' || sql.charAt(index) == 'M') {
+        var before = index - 1
+        while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+        val unqualified = leftBoundary && (before < 0 || sql.charAt(before) != '.')
+        val matcher     = NativeMainTrim.matcher(sql).region(index, sql.length)
+        if (unqualified && matcher.lookingAt()) Some(matcher.end() -> matcher.group(1))
+        else None
+      } else None
+    }
 
   /** Normalize DuckDB pattern operators without changing literals or identifiers.
     *

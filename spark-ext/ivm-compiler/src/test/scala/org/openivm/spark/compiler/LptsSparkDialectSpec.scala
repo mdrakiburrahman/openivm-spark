@@ -10,6 +10,35 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("native infinity and trim restoration") {
+    it("restores infinity literals without rewriting identifiers or protected text") {
+      val sql = """SELECT abs(q) != 1e1000, -1E1000, 1e10001, x1e1000, `1e1000`,
+        |'1e1000', 'main.trim(x)' -- 1e1000
+        |/* 1e1000 */ FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("abs(q) != CAST('Infinity' AS DOUBLE)")
+      translated should include("-CAST('Infinity' AS DOUBLE)")
+      translated should include("1e10001, x1e1000, `1e1000`")
+      translated should include("'1e1000', 'main.trim(x)' -- 1e1000")
+      translated should include("/* 1e1000 */")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("unqualifies native main trim calls only") {
+      val sql = """SELECT nullif(main."trim"(x), ''), main.trim(y), other.trim(z),
+        |catalog.main.trim(z), `main.trim`(z), 'main.trim(z)' -- main.trim(z)
+        |/* main.trim(z) */ FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("nullif(`trim`(x), '')")
+      translated should include("trim(y)")
+      translated should include("other.trim(z)")
+      translated should include("catalog.main.trim(z)")
+      translated should include("`main.trim`(z), 'main.trim(z)' -- main.trim(z)")
+      translated should include("/* main.trim(z) */")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+  }
+
   describe("window offset restoration") {
     it("restores only int-range literal offsets of unqualified LEAD and LAG windows") {
       val sql = """SELECT lead(coalesce(a, b), CAST(2 AS BIGINT), 0) OVER (ORDER BY a),
