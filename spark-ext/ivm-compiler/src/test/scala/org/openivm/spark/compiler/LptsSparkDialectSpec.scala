@@ -26,8 +26,17 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
 
     it("leaves unsupported struct field shapes unchanged") {
-      val sql = "SELECT max_by(struct(a), struct(k AS f1)) FROM t"
+      val sql = "SELECT max_by(struct(a + 1), struct(k AS f1)) FROM t"
       SparkFunctionShimSql.rewriteStructMaxBy(sql) shouldBe sql
+    }
+
+    it("preserves inferred field names in bare-column struct aggregates") {
+      val sql = """SELECT max_by(struct(t.id, t.name), struct(t.ts)) FROM t"""
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native shouldBe "SELECT arg_max(struct_pack(id := t.id, name := t.name), struct_pack(ts := t.ts)) FROM t"
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'6964' AS STRING), t.id,")
+      restored should include("named_struct(CAST(X'7473' AS STRING), t.ts)")
     }
 
     it("round-trips nested named structs with scalar and structured ordering keys") {
@@ -35,8 +44,8 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         |max_by(named_struct('value', x), score),
         |max_by(named_struct('value', x), named_struct('outer', named_struct('timestamp', ts)))
         |FROM t""".stripMargin
-      val native = OpenIvmCompiler.normalizeSparkSqlForDuckdb(sql)
-      native should include("""struct_pack("Mixed ""name""" := struct_pack("inner's" := x))""")
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(SparkFunctionShimSql.rewriteNamedStructs(sql))
+      native should include("struct_pack(\"Mixed \"\"name\"\"\" := struct_pack(\"inner's\" := x))")
       native should include("""arg_max(struct_pack("value" := x), score)""")
       native should include("""arg_max(struct_pack("value" := x), struct_pack("outer" := struct_pack("timestamp" := ts)))""")
       val restored = LptsSparkDialect.translate(native)
@@ -769,7 +778,10 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val expected = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, concat(chr(92)) -- 'comment\text'
                        |/* 'comment\text' */ FROM src""".stripMargin
       LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe expected
-      LptsSparkDialect.translate(sql) shouldBe expected
+      LptsSparkDialect.translate(sql) shouldBe expected.replace(
+        """struct_pack("O'Brien\Name" := txt)""",
+        "named_struct(CAST(X'4f27427269656e5c4e616d65' AS STRING), txt)"
+      )
     }
 
     it("rewrites a bare backslash literal to a concat(chr(92)) expression") {

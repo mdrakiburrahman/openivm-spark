@@ -249,12 +249,20 @@ private[compiler] object SparkFunctionShimSql {
     parseFunctionCallAt(sql, 0, "struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
       splitTopLevelArgs(sql, call).flatMap { ranges =>
         val fields = ranges.map { case (start, end) =>
-          findTopLevelKeywordRespectingCase(sql, start, end, "AS").flatMap { as =>
-            val value = sql.substring(start, as).trim
-            val name  = sql.substring(as + 2, end).trim
-            val validName = name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
-              name.matches("\"(?:[^\"]|\"\")+\"")
-            if (value.nonEmpty && validName) Some(s"$name := $value") else None
+          findTopLevelKeywordRespectingCase(sql, start, end, "AS") match {
+            case Some(as) =>
+              val value = sql.substring(start, as).trim
+              val name  = sql.substring(as + 2, end).trim
+              val validName = name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
+                name.matches("\"(?:[^\"]|\"\")+\"")
+              if (value.nonEmpty && validName) Some(s"$name := $value") else None
+            case None =>
+              val value = sql.substring(start, end).trim
+              val ident = """(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")"""
+              if (value.matches(s"$ident(?:\\s*\\.\\s*$ident)*")) {
+                val name = (s"""$ident$$""").r.findFirstIn(value).get
+                Some(s"$name := $value")
+              } else None
           }
         }
         if (fields.nonEmpty && fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})")
