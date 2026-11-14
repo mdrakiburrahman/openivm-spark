@@ -3187,11 +3187,10 @@ case class CreateMaterializedViewCommand(
       upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
       rawHavingPred = rawHavingPred,
       aggregateHavingDataColumns = aggregateHavingDataColumns,
-      authoritativeClassification = authoritativeClassification.orElse {
-        if (hiveSources.nonEmpty)
+      authoritativeClassification =
+        if (authoritativeClassification.isEmpty && hiveSources.nonEmpty)
           Some(authoritativeFullRefreshClassification(compiled.refreshTypeName, "unversioned_hive_source"))
-        else None
-      }
+        else authoritativeClassification
     )
     val effectiveRefreshType     = classification.refreshType
     val classifyReason           = classification.reason
@@ -4577,7 +4576,7 @@ case class RefreshMaterializedViewCommand(
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
       if (meta.properties.get("_ivm_has_hive_source").contains("true")) {
         // Hive file listings and partition metadata may have changed outside this Spark session.
-        meta.sourceTables.foreach(spark.catalog.refreshTable)
+        meta.sourceTables.foreach(source => spark.catalog.refreshTable(source))
       }
       val compileRefreshType = meta.properties
         .get(MvMetadata.CompileRefreshTypeKey)
