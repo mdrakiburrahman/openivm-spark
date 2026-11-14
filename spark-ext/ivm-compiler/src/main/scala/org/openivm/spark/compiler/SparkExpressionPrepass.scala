@@ -52,6 +52,7 @@ private[spark] object SparkExpressionPrepass {
     "rpad",
     "lpad",
     "replace",
+    "date_format",
     "concat",
     "concat_ws",
     "coalesce",
