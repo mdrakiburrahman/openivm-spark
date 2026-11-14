@@ -68,6 +68,35 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     assertMvCorrect("date_gen_window_mv", query)
   }
 
+  it("maintains daily dates following complex LEAD windows") {
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    sql("CREATE TABLE date_gen_lead (id INT, ts TIMESTAMP, deleted BOOLEAN, version INT, event_id INT) USING DELTA")
+    sql("""INSERT INTO date_gen_lead VALUES
+      |(1, TIMESTAMP '2024-01-01 10:00:00', false, 1, 1),
+      |(1, TIMESTAMP '2024-01-03 10:00:00', NULL, 2, 2),
+      |(1, TIMESTAMP '2024-01-04 10:00:00', true, 3, 3)""".stripMargin)
+    val query = """WITH events AS (
+      | SELECT id, ts, deleted,
+      | LEAD(CAST(ts AS TIMESTAMP)) OVER (PARTITION BY id ORDER BY CAST(ts AS TIMESTAMP),
+      |   COALESCE(deleted, FALSE), COALESCE(CAST(version AS STRING), ''),
+      |   COALESCE(CAST(event_id AS STRING), '')) AS next_ts,
+      | LEAD(COALESCE(deleted, FALSE), 2) OVER (PARTITION BY id ORDER BY CAST(ts AS TIMESTAMP),
+      |   COALESCE(deleted, FALSE), COALESCE(CAST(version AS STRING), ''),
+      |   COALESCE(CAST(event_id AS STRING), '')) AS next_deleted
+      | FROM date_gen_lead
+      |), bounds AS (
+      | SELECT id, ts, next_deleted, CAST(ts AS DATE) AS start_date,
+      |   CAST(COALESCE(next_ts, ts) AS DATE) AS end_date FROM events
+      |) SELECT id, ts, next_deleted, explode(sequence(start_date, end_date, INTERVAL 1 DAY)) AS d FROM bounds""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW date_gen_lead_mv AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("date_gen_lead_mv")
+    MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+    assertMvCorrect("date_gen_lead_mv", query)
+    sql("INSERT INTO date_gen_lead VALUES (1, TIMESTAMP '2024-01-05 10:00:00', false, 4, 4)")
+    refreshMv("date_gen_lead_mv")
+    assertMvCorrect("date_gen_lead_mv", query)
+  }
+
   it("maintains two daily generators in separate CTEs") {
     sql("CREATE TABLE date_gen_left (id INT, start_date DATE, end_date DATE) USING DELTA")
     sql("CREATE TABLE date_gen_right (id INT, start_date DATE, end_date DATE) USING DELTA")
