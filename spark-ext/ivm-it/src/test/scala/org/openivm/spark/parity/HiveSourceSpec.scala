@@ -38,6 +38,30 @@ abstract class HiveSourceScenarios extends IvmParitySpecBase("hive-source") {
   }
 
   describe("Hive source compilation and refresh") {
+    it("keeps a Delta-only view incremental") {
+      sql("CREATE TABLE hsrc_control (id BIGINT, label STRING) USING DELTA")
+      sql("INSERT INTO hsrc_control VALUES (1, 'first')")
+      val query = "SELECT id, label FROM hsrc_control"
+      sql(s"CREATE MATERIALIZED VIEW hivesource.hsrc_control_mv AS $query")
+      val meta = MvCatalog.lookup(spark, TableIdentifier("hsrc_control_mv", Some("hivesource"))).get
+      meta.properties(MvMetadata.CompileRefreshTypeKey) should not be "COMPILE_FAILED"
+      meta.refreshType should not be RefreshTypeCode.FullRefresh
+      sql("INSERT INTO hsrc_control VALUES (2, 'second')")
+      refreshMv("hivesource.hsrc_control_mv")
+      assertMvCorrect("hivesource.hsrc_control_mv", query)
+    }
+
+    it("recomputes converted Hive Parquet relations after Hive writes") {
+      sql("CREATE TABLE hsrc_converted (id BIGINT, label STRING) STORED AS PARQUET")
+      sql("INSERT INTO hsrc_converted VALUES (1, 'first')")
+      val query = "SELECT id, label FROM hsrc_converted"
+      sql(s"CREATE MATERIALIZED VIEW hivesource.hsrc_converted_mv AS $query")
+      checkClassification("hsrc_converted_mv")
+      externalWrite("INSERT INTO hivesource.hsrc_converted VALUES (2, 'second')")
+      refreshMv("hivesource.hsrc_converted_mv")
+      assertMvCorrect("hivesource.hsrc_converted_mv", query)
+    }
+
     it("compiles a qualified Hive seed and observes external changes on every refresh") {
       sql("CREATE TABLE hivesource.hsrc_seed (id BIGINT, label STRING)")
       externalWrite("INSERT INTO hivesource.hsrc_seed VALUES (1, 'first')")
