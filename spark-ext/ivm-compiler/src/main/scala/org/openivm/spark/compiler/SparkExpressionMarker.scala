@@ -10,7 +10,7 @@ import scala.collection.mutable
   * This helper only encodes and decodes expressions; callers must preserve them
   * throughout native planning and reject any compilation that loses a marker.
   */
-private[compiler] final class SparkExpressionMarker {
+private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
   import SparkExpressionMarker._
 
   private val prefix  = "__openivm_expr_" + UUID.randomUUID().toString.replace("-", "") + "_"
@@ -21,13 +21,24 @@ private[compiler] final class SparkExpressionMarker {
     require(args.nonEmpty, "A marker must carry at least one argument")
     val id = prefix + markers.size + "__"
     markers.put(id, Marker(args.size, result, render))
-    val payload = s"concat('$id', CAST(row(${args.mkString(", ")}) AS VARCHAR))"
-    result match {
-      case Text      => payload
-      case Integer   => s"CAST($payload AS INTEGER)"
-      case Long      => s"CAST($payload AS BIGINT)"
-      case Boolean   => s"CAST($payload AS BOOLEAN)"
-      case TextArray => s"string_split($payload, '${id}separator')"
+    if (opaque) {
+      val resultType = result match {
+        case Text      => "VARCHAR"
+        case Integer   => "INTEGER"
+        case Long      => "BIGINT"
+        case Boolean   => "BOOLEAN"
+        case TextArray => "VARCHAR[]"
+      }
+      s"__openivm_spark_expression('$id', CAST(NULL AS $resultType), ${args.mkString(", ")})"
+    } else {
+      val payload = s"concat('$id', CAST(row(${args.mkString(", ")}) AS VARCHAR))"
+      result match {
+        case Text      => payload
+        case Integer   => s"CAST($payload AS INTEGER)"
+        case Long      => s"CAST($payload AS BIGINT)"
+        case Boolean   => s"CAST($payload AS BOOLEAN)"
+        case TextArray => s"string_split($payload, '${id}separator')"
+      }
     }
   }
 
@@ -36,15 +47,39 @@ private[compiler] final class SparkExpressionMarker {
     */
   def restore(sql: String): String = {
     val out = SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
-      parseCall(sql, i, "string_split")
+      parseCall(sql, i, "__openivm_spark_expression")
         .flatMap { call =>
-          if (call.args.size != 2) None
-          else
-            parsePayload(call.args.head).flatMap { case (id, args) =>
-              val marker = markers(id)
-              if (marker.result != TextArray || call.args(1).trim != s"'${id}separator'") None
-              else Some(call.end -> renderMarker(id, args))
+          if (call.args.size < 3) None
+          else {
+            val idLiteral = call.args.head.trim
+            val id =
+              if (idLiteral.length >= 2 && idLiteral.head == '\'' && idLiteral.last == '\'')
+                idLiteral.substring(1, idLiteral.length - 1)
+              else ""
+            markers.get(id).flatMap { marker =>
+              val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
+              val allowed = marker.result match {
+                case Text      => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
+                case Integer   => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
+                case Long      => Set("CAST(NULLASBIGINT)")
+                case Boolean   => Set("CAST(NULLASBOOLEAN)")
+                case TextArray => Set("CAST(NULLASVARCHAR[])", "CAST(NULLASSTRING[])")
+              }
+              if (!allowed.contains(seed)) None
+              else Some(call.end -> renderMarker(id, call.args.drop(2)))
             }
+          }
+        }
+        .orElse {
+          parseCall(sql, i, "string_split").flatMap { call =>
+            if (call.args.size != 2) None
+            else
+              parsePayload(call.args.head).flatMap { case (id, args) =>
+                val marker = markers(id)
+                if (marker.result != TextArray || call.args(1).trim != s"'${id}separator'") None
+                else Some(call.end -> renderMarker(id, args))
+              }
+          }
         }
         .orElse {
           parseCall(sql, i, "concat").flatMap { call =>
