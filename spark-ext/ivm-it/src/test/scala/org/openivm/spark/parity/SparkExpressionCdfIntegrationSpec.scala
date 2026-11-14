@@ -14,6 +14,30 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
+    it("incrementally maintains max_by with struct values and ordering keys") {
+      sql("CREATE TABLE expr_struct_source (grp STRING, id INT, name STRING, ts TIMESTAMP) USING DELTA")
+      sql("""INSERT INTO expr_struct_source VALUES
+        |('a', 1, 'dated', TIMESTAMP '2024-01-01 00:00:00'), ('a', 2, 'null-key', NULL),
+        |('b', 3, NULL, TIMESTAMP '2024-02-01 00:00:00')""".stripMargin)
+      val query = """SELECT grp, max_by(struct(id AS f1, name AS f2, ts AS f3),
+        |struct(ts AS f1)) AS picked FROM expr_struct_source GROUP BY grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_struct_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_struct_mv")
+      MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
+      assertMvCorrect("expr_struct_mv", query)
+      sql("INSERT INTO expr_struct_source VALUES ('a', 4, 'later', TIMESTAMP '2024-03-01 00:00:00')")
+      refreshMv("expr_struct_mv")
+      assertMvCorrect("expr_struct_mv", query)
+      sql("DELETE FROM expr_struct_source WHERE id = 4")
+      sql("UPDATE expr_struct_source SET ts = NULL WHERE id = 3")
+      sql("INSERT INTO expr_struct_source VALUES ('c', 5, NULL, NULL)")
+      refreshMv("expr_struct_mv")
+      assertMvCorrect("expr_struct_mv", query)
+      sql("DELETE FROM expr_struct_source WHERE id = 1")
+      refreshMv("expr_struct_mv")
+      assertMvCorrect("expr_struct_mv", query)
+    }
+
     it("preserves qualified epoch conversion and conditional errors") {
       sql("CREATE TABLE expr_epoch_source (id INT, ts TIMESTAMP, txt STRING, invalid BOOLEAN) USING DELTA")
       sql("INSERT INTO expr_epoch_source VALUES (1, TIMESTAMP '2024-01-01 01:02:03', 'A', false)")

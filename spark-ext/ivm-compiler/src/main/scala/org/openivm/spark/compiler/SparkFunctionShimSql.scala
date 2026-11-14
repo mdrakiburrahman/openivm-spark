@@ -244,6 +244,48 @@ private[compiler] object SparkFunctionShimSql {
       }
     }
 
+  private def namedStructPack(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).flatMap { ranges =>
+        val fields = ranges.map { case (start, end) =>
+          findTopLevelKeywordRespectingCase(sql, start, end, "AS").flatMap { as =>
+            val value = sql.substring(start, as).trim
+            val name  = sql.substring(as + 2, end).trim
+            val validName = name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
+              name.matches("\"(?:[^\"]|\"\")+\"")
+            if (value.nonEmpty && validName) Some(s"$name := $value") else None
+          }
+        }
+        if (fields.nonEmpty && fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})")
+        else None
+      }
+    }
+  }
+
+  private[compiler] def rewriteStructMaxBy(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+          val structs = ranges.map { case (start, end) => namedStructPack(sql.substring(start, end).trim) }
+          if (structs.forall(_.isDefined)) Some((call.closeParen + 1, s"arg_max(${structs.flatten.mkString(", ")})"))
+          else None
+        }
+      }
+    }
+
+  private[compiler] def restoreStructMaxBy(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "arg_max").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+          val structs = ranges.map { case (start, end) => sql.substring(start, end).trim }
+          if (structs.forall(arg => arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1)))
+            Some((i + "arg_max".length, "max_by"))
+          else None
+        }
+      }
+    }
+
   /** Post-pass for the LPTS serializer: reverse the inlined DuckDB macro bodies
     * back to Spark's original shim spellings.
     *
