@@ -829,7 +829,11 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private[compiler] def rewriteOutsideProtected(sql: String, protectBackticks: Boolean = false)(
+  private[compiler] def rewriteOutsideProtected(
+      sql: String,
+      protectBackticks: Boolean = false,
+      protectSingleQuotes: Boolean = true
+  )(
       matcher: Int => Option[(Int, String)]
   ): String = {
     val out = new StringBuilder(sql.length)
@@ -838,7 +842,7 @@ private[compiler] object SparkFunctionShimSql {
       val next =
         if (startsLineComment(sql, i)) Some(consumeLineComment(sql, i))
         else if (startsBlockComment(sql, i)) Some(consumeBlockComment(sql, i))
-        else if (sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
+        else if (protectSingleQuotes && sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
         else if (sql.charAt(i) == '"') Some(consumeDoubleQuoted(sql, i))
         else if (protectBackticks && sql.charAt(i) == '`') {
           var end    = i + 1

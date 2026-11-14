@@ -727,6 +727,15 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
   }
 
   describe("rewriteBareBackslashLiterals") {
+    it("preserves quoted identifiers and comments while rewriting actual literals") {
+      val sql = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, '\' -- 'comment\text'
+                  |/* 'comment\text' */ FROM src""".stripMargin
+      val expected = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, concat(chr(92)) -- 'comment\text'
+                       |/* 'comment\text' */ FROM src""".stripMargin
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe expected
+      LptsSparkDialect.translate(sql) shouldBe expected
+    }
+
     it("rewrites a bare backslash literal to a concat(chr(92)) expression") {
       val sql = "REPLACE(s, '\\', '_')"
       LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
