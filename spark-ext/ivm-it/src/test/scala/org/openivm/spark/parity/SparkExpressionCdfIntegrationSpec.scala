@@ -1,15 +1,16 @@
 package org.openivm.spark.parity
 
 import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
-import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
+import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
-class SparkExpressionCdfIntegrationSpec extends IvmParitySpecBase("expression-cdf") with CdfMode {
+abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("expression-bridge") {
+  self: IvmParityMode =>
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.CompileClassificationCacheEnabledKey -> "true",
     FeatureGate.ProfileRefreshKey                    -> "true"
   )
 
-  describe("Spark expression bridge over CDF") {
+  describe("Spark expression bridge") {
     it("preserves incremental results for mixed changes") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
@@ -55,6 +56,9 @@ class SparkExpressionCdfIntegrationSpec extends IvmParitySpecBase("expression-cd
           .getString(0)
         detail should include("compile_cache_hit=true")
       }
+
+      class SparkExpressionCdfIntegrationSpec       extends SparkExpressionIntegrationScenarios with CdfMode
+      class SparkExpressionInterceptIntegrationSpec extends SparkExpressionIntegrationScenarios with InterceptMode
     }
   }
 }
