@@ -18,6 +18,13 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
         """SELECT nullif(regexp_replace(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), '/$', ''), '') AS k,
         |count(*) AS n FROM expr_key_group
         |GROUP BY nullif(regexp_replace(regexp_replace(lower(trim(cast(txt AS STRING))), '/+', '/'), '/$', ''), '')""".stripMargin
+      val explained =
+        sql(s"EXPLAIN CREATE MATERIALIZED VIEW expr_key_group_explain AS $query").collect().head.getString(0)
+      explained should include(""""compile_refresh_type_name":"AGGREGATE_GROUP"""")
+      val dryProgram =
+        sql(s"SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW expr_key_group_show AS $query").collect().head.getString(0)
+      dryProgram.toLowerCase should include("regexp_replace")
+      dryProgram should not include "__openivm_spark_expression"
       sql(s"CREATE MATERIALIZED VIEW expr_key_group_mv AS $query")
       checkIncremental("expr_key_group_mv")
       assertMvCorrect("expr_key_group_mv", query)

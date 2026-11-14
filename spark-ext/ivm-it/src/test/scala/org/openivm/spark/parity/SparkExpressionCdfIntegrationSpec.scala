@@ -96,6 +96,10 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           |SELECT 8, 'x/y', TIMESTAMP '2024-03-01 01:02:03', 8L, false""".stripMargin)
         refreshMv(mv)
         assertMvCorrect(mv, query)
+        MvCatalog.lookup(spark, identifier).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
+        sql(s"INSERT INTO $source VALUES (9, 'a/b', NULL, 9, false)")
+        refreshMv(mv)
+        assertMvCorrect(mv, query)
       }
     }
   }
