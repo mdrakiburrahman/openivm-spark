@@ -48,7 +48,7 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
         val path   = s"$warehouse/$mv"
         val expected = s"""SELECT id, txt RLIKE '(?i)ä' AS re, size(split(txt, '/')) AS n,
           |element_at(split(txt, '/'), -1) AS leaf,
-          |sha2(to_json(named_struct('O\'Brien', txt, 'Odd Name', txt, 'nested', named_struct('Mixed', id)),
+          |sha2(to_json(named_struct('O\\'Brien', txt, 'Odd Name', txt, 'nested', named_struct('Mixed', id)),
           |map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS digest FROM $source
           |WHERE txt IS NULL OR CAST(txt AS STRING) RLIKE '(?i)ä' OR txt LIKE '%/%'""".stripMargin
         val prepared = SparkExpressionPrepass.prepare(expected)
