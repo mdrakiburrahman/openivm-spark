@@ -2480,6 +2480,11 @@ private[commands] object MvCommandHelper {
       emitsCascadeViewDelta = false
     )
 
+  def classifyHiveSources(sources: Set[String], classification: EffectiveClassification): EffectiveClassification =
+    if (sources.nonEmpty && classification.compileRefreshTypeName != "COMPILE_FAILED")
+      authoritativeFullRefreshClassification(classification.compileRefreshTypeName, "unversioned_hive_source")
+    else classification
+
   /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
     * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
     * Read-only: `LIMIT 0` triggers no scan/write.
@@ -3179,7 +3184,7 @@ case class CreateMaterializedViewCommand(
     // INFO-level for "kept" so the per-MV decision is always visible during
     // normal operation; ERROR-level for any demotion so even
     // production-tuned log filters surface it.
-    val classification = classifyEffectiveRefreshType(
+    val classification = classifyHiveSources(hiveSources, classifyEffectiveRefreshType(
       compiled = compiled,
       viewShortName = name.table,
       topKViewSpec = topKViewSpec,
@@ -3187,11 +3192,8 @@ case class CreateMaterializedViewCommand(
       upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
       rawHavingPred = rawHavingPred,
       aggregateHavingDataColumns = aggregateHavingDataColumns,
-      authoritativeClassification =
-        if (authoritativeClassification.isEmpty && hiveSources.nonEmpty)
-          Some(authoritativeFullRefreshClassification(compiled.refreshTypeName, "unversioned_hive_source"))
-        else authoritativeClassification
-    )
+      authoritativeClassification = authoritativeClassification
+    ))
     val effectiveRefreshType     = classification.refreshType
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
