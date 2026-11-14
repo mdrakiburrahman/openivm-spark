@@ -112,6 +112,9 @@ private[spark] object SparkExpressionPrepass {
 
     def scanExpression(expr: Expression, allowMaxBy: Boolean = false): Unit = expr match {
       case _: UnresolvedStar => hasStar = true
+      case other if (other.getClass.getSimpleName.startsWith("Unresolved") &&
+            other.getClass.getSimpleName.contains("Star")) || other.getClass.getSimpleName == "UnresolvedRegex" =>
+        hasStar = true
       case attr: UnresolvedAttribute =>
         attr.nameParts.foreach(part => otherRefs += normalized(part))
       case alias: Alias =>
@@ -120,10 +123,9 @@ private[spark] object SparkExpressionPrepass {
         scanExpression(alias.child, allowMaxBy)
       case function: UnresolvedFunction
           if allowMaxBy && function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
-            function.arguments.size == 2 =>
+            function.arguments.size == 2 && !function.isDistinct && function.filter.isEmpty && !function.ignoreNulls =>
         scanExpression(function.arguments.head)
         scanOrdering(function.arguments(1))
-        function.filter.foreach(child => scanExpression(child))
       case subquery: SubqueryExpression =>
         unsupportedPlan = true
         scanPlan(subquery.plan)
@@ -131,6 +133,7 @@ private[spark] object SparkExpressionPrepass {
       case other => other.children.foreach(child => scanExpression(child, allowMaxBy))
     }
 
+    // Only direct or nested-struct MAX_BY keys are safe; arbitrary expressions may compare structs natively.
     def scanOrdering(expr: Expression): Unit = expr match {
       case attr: UnresolvedAttribute if attr.nameParts.size == 1 =>
         keyRefs += normalized(attr.nameParts.head)
