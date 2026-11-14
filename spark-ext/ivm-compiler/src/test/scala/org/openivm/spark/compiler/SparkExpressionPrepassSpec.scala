@@ -30,11 +30,16 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
     }
   }
 
-  it should "rewrite a marked expression used in BETWEEN once" in {
-    val query = "SELECT size(split(s, '/')) BETWEEN 1 AND 2 FROM src"
-    val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
-    CatalystSqlParser.parsePlan(prepared.sql)
-    prepared.sql.split("__openivm_spark_expression", -1).length shouldBe 2
+  it should "rewrite marked expressions duplicated by Catalyst only once" in {
+    val queries = Seq(
+      "SELECT size(split(s, '/')) BETWEEN 1 AND 2 FROM src",
+      "SELECT CASE lower(element_at(split(s, '/'), -1)) WHEN 'x' THEN 'a' WHEN 'y' THEN 'b' END FROM src"
+    )
+    queries.foreach { query =>
+      val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
+      CatalystSqlParser.parsePlan(prepared.sql)
+      prepared.sql.split("__openivm_spark_expression", -1).length shouldBe 2
+    }
   }
 
   "Spark expression prepass" should "share marker identity only for equivalent expressions in the same scope" in {
