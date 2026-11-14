@@ -709,12 +709,10 @@ object LptsSparkDialect {
     * copied through unchanged. A no-op for the overwhelming majority of
     * literals, which contain neither character.
     */
-  private[compiler] def rewriteBareBackslashLiterals(sql: String): String = {
-    val out = new StringBuilder(sql.length)
-    var i   = 0
-    while (i < sql.length) {
-      if (sql.charAt(i) == '\'') {
-        i += 1
+  private[compiler] def rewriteBareBackslashLiterals(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true, protectSingleQuotes = false) { start =>
+      if (sql.charAt(start) == '\'') {
+        var i       = start + 1
         val content = new StringBuilder
         var closed  = false
         while (i < sql.length && !closed) {
@@ -727,20 +725,12 @@ object LptsSparkDialect {
           }
         }
         val text = content.toString
-        if (text.indexOf('\\') < 0 && text.indexOf('\'') < 0) {
-          out += '\''
-          out ++= text
-          out += '\''
-        } else {
-          out ++= unsafeLiteralToConcatExpr(text)
-        }
-      } else {
-        out += sql.charAt(i)
-        i += 1
-      }
+        val replacement =
+          if (text.indexOf('\\') < 0 && text.indexOf('\'') < 0) sql.substring(start, i)
+          else unsafeLiteralToConcatExpr(text)
+        Some(i -> replacement)
+      } else None
     }
-    out.toString
-  }
 
   /** Renders a decoded literal VALUE (containing at least one backslash or
     * quote character) as a `concat(...)` expression: runs of ordinary
