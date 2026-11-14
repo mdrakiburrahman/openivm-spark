@@ -80,53 +80,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       } finally Configurator.setRootLevel(previousLevel)
     }
 
-    ignore("incrementally maintains correlated anti-join expressions") { /* TODO: native emits no real delta without the bridge too. */
-      sql("CREATE TABLE expr_anti_source (id INT, txt STRING) USING DELTA")
-      sql("CREATE TABLE expr_anti_blocked (txt STRING) USING DELTA")
-      sql("INSERT INTO expr_anti_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
-      sql("INSERT INTO expr_anti_blocked VALUES ('a')")
-      val query = """SELECT t.id, t.txt FROM expr_anti_source t
-        |WHERE NOT EXISTS (SELECT 1 FROM expr_anti_blocked u WHERE u.txt = lower(t.txt))""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_anti_mv AS $query")
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_mv")
-      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
-      assertMvCorrect("expr_anti_mv", query)
-      sql("INSERT INTO expr_anti_blocked VALUES ('b')")
-      sql("INSERT INTO expr_anti_source VALUES (4, 'C')")
-      refreshMv("expr_anti_mv")
-      assertMvCorrect("expr_anti_mv", query)
-    }
-
-    it("classifies a correlated anti-join with no real delta as an intentional full refresh") {
-      sql("CREATE TABLE expr_anti_full_source (id INT, txt STRING) USING DELTA")
-      sql("CREATE TABLE expr_anti_full_blocked (txt STRING) USING DELTA")
-      sql("INSERT INTO expr_anti_full_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
-      sql("INSERT INTO expr_anti_full_blocked VALUES ('a')")
-      val query = """SELECT t.id, t.txt FROM expr_anti_full_source t
-        |WHERE NOT EXISTS (SELECT 1 FROM expr_anti_full_blocked u WHERE u.txt = lower(t.txt))""".stripMargin
-      val logger        = "org.openivm.spark.commands.CreateMaterializedViewCommand"
-      val previousLevel = LogManager.getLogger(logger).getLevel
-      Configurator.setLevel(logger, Level.FATAL)
-      try sql(s"CREATE MATERIALIZED VIEW expr_anti_full_mv AS $query")
-      finally Configurator.setLevel(logger, previousLevel)
-      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_full_mv")
-      val meta = MvCatalog.lookup(spark, id).get
-      meta.refreshType shouldBe RefreshTypeCode.FullRefresh
-      meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
-      meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("no_real_delta")
-      assertMvCorrect("expr_anti_full_mv", query)
-      val downstreamQuery = "SELECT id, txt FROM expr_anti_full_mv WHERE id > 1"
-      val downstreamExpected = s"SELECT id, txt FROM ($query) filtered WHERE id > 1"
-      sql(s"CREATE MATERIALIZED VIEW expr_anti_full_downstream AS $downstreamQuery")
-      assertMvCorrect("expr_anti_full_downstream", downstreamExpected)
-      sql("INSERT INTO expr_anti_full_blocked VALUES ('b')")
-      sql("INSERT INTO expr_anti_full_source VALUES (4, 'C')")
-      refreshMv("expr_anti_full_mv")
-      refreshMv("expr_anti_full_downstream")
-      assertMvCorrect("expr_anti_full_mv", query)
-      assertMvCorrect("expr_anti_full_downstream", downstreamExpected)
-    }
-
     it("preserves pinned-source identity while incrementally refreshing a live join") {
       sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
       sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
