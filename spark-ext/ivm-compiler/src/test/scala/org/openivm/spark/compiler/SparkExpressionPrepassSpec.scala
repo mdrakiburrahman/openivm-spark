@@ -44,6 +44,51 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "protect projected struct keys used only by max_by" in {
+    val query = """SELECT g, max_by(named_struct('value', v), k) FROM
+      |(SELECT g, v, named_struct('a', CAST(ts AS TIMESTAMP), 'b', coalesce(v, '')) AS k FROM src) s
+      |GROUP BY g""".stripMargin
+    val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
+    CatalystSqlParser.parsePlan(prepared.sql)
+    val id       = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r.findFirstMatchIn(prepared.sql).get.group(1)
+    val restored = prepared.markers.restore(s"__openivm_spark_expression('$id', {'a': NULL, 'b': NULL}, ts, v)")
+    restored shouldBe "named_struct('a', CAST(ts AS TIMESTAMP), 'b', coalesce(v, ''))"
+    prepared.markers.requireAllSeen()
+
+    val alsoCompared = query.replace("GROUP BY g", "WHERE k > k GROUP BY g")
+    SparkExpressionPrepass.prepare(alsoCompared, caseSensitive = false).sql shouldBe alsoCompared
+  }
+
+  it should "follow projected struct keys through simple CTE projections without exposing them" in {
+    val query = """WITH base AS (SELECT g, v, ts FROM src),
+      |keyed AS (SELECT *, named_struct('a', CAST(ts AS TIMESTAMP)) AS k FROM base),
+      |projected AS (SELECT g, v, k FROM keyed)
+      |SELECT g, max_by(named_struct('v', v), k) FROM projected GROUP BY g""".stripMargin
+    val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
+    prepared.sql should include("__openivm_spark_expression")
+    CatalystSqlParser.parsePlan(prepared.sql)
+
+    val unsafe = Seq(
+      query.replace("SELECT g, v, k FROM keyed", "SELECT * FROM keyed"),
+      query.replace("SELECT g, max_by", "SELECT g, k, max_by").replace("GROUP BY g", "GROUP BY g, k"),
+      query.replace("SELECT g, v, k FROM keyed", "SELECT DISTINCT g, v, k FROM keyed"),
+      query.replace("SELECT g, v, k FROM keyed", "SELECT g, v, k FROM keyed UNION SELECT g, v, k FROM keyed"),
+      query.replace("SELECT g, v, k FROM keyed", "SELECT *, named_struct('b', v) AS other FROM keyed"),
+      query.replace("FROM keyed)", "FROM keyed NATURAL JOIN src)"),
+      query.replace("FROM projected GROUP BY g", "FROM projected WHERE k IN (SELECT k FROM keyed) GROUP BY g"),
+      query.replace("), k) FROM projected", "), CASE WHEN k > k THEN k ELSE k END) FROM projected"),
+      query.replace("SELECT g, v, k FROM keyed", "SELECT g, v, k.a FROM keyed"),
+      query.replace("AS k FROM base", "AS k, named_struct('a', ts) AS k FROM base"),
+      query.replace(
+        "SELECT g, max_by(named_struct('v', v), k) FROM projected GROUP BY g",
+        "SELECT g, max_by(named_struct('v', v), k) OVER (PARTITION BY g) FROM projected"
+      )
+    )
+    unsafe.foreach { sql =>
+      SparkExpressionPrepass.prepare(sql, caseSensitive = false).sql shouldBe sql
+    }
+  }
+
   "Spark expression prepass" should "share marker identity only for equivalent expressions in the same scope" in {
     val marker = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r
     def ids(sql: String): Seq[String] =
