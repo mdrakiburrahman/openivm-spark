@@ -5493,11 +5493,15 @@ case class RefreshMaterializedViewCommand(
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
           val restoredInitialLoad  = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
-          val legacyBridge =
-            if (meta.refreshType != RefreshTypeCode.FullRefresh && restoredInitialLoad.isEmpty)
-              expressionBridge.filter(_.sql != meta.querySql)
+          // ADVANCE SOURCE VERSIONS changes the pinned query but not CREATE's stored initial load.
+          val recompileBridge =
+            if (
+              meta.refreshType != RefreshTypeCode.FullRefresh &&
+              (restoredInitialLoad.isEmpty || refreshResolvedPins.nonEmpty)
+            )
+              expressionBridge.filter(bridge => bridge.sql != meta.querySql || refreshResolvedPins.nonEmpty)
             else None
-          legacyBridge match {
+          recompileBridge match {
             case Some(bridge) =>
               val compiled = compiler.compile(compileRequest)
               if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
