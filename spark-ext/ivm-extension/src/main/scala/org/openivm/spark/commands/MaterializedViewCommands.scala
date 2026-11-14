@@ -2996,7 +2996,8 @@ case class CreateMaterializedViewCommand(
       SparkExpressionPrepass.prepare(
         originalQueryText,
         spark.sessionState.conf.caseSensitiveAnalysis,
-        Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last)
+        Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last),
+        Some(analyzed)
       )
     val createCompileRequest = originalCreateCompileRequest.copy(
       viewSql = expressionBridge.sql
@@ -5442,7 +5443,8 @@ case class RefreshMaterializedViewCommand(
         SparkExpressionPrepass.prepare(
           meta.querySql,
           spark.sessionState.conf.caseSensitiveAnalysis,
-          Some(originalCompileTier.split(":").last)
+          Some(originalCompileTier.split(":").last),
+          Some(spark.sql(meta.querySql).queryExecution.analyzed)
         )
       lazy val compileRequest =
         originalCompileRequest.copy(viewSql = expressionBridge.sql)

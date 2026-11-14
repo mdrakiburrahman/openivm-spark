@@ -14,6 +14,28 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
+    it("preserves Spark timestamp and string CASE coercion") {
+      Seq(false, true).foreach { ansi =>
+        spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
+        val source = s"expr_case_coercion_$ansi"
+        val mv = s"expr_case_coercion_mv_$ansi"
+        sql(s"CREATE TABLE $source (id INT, ts TIMESTAMP, text STRING) USING DELTA")
+        sql(s"""INSERT INTO $source VALUES
+          |(1, TIMESTAMP '2000-01-01 00:00:00', NULL),
+          |(2, TIMESTAMP '2000-01-02 00:00:00', '2000-02-01')""".stripMargin)
+        val query = s"""SELECT s.id,
+          |CASE WHEN CAST(s.text AS TIMESTAMP) IS NULL THEN s.ts ELSE s.text END AS v FROM $source s""".stripMargin
+        sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+        val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
+        MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
+        assertMvCorrect(mv, query)
+        sql(s"UPDATE $source SET text = '2000-03-01' WHERE id = 1")
+        sql(s"INSERT INTO $source VALUES (3, TIMESTAMP '2000-04-01 00:00:00', NULL)")
+        refreshMv(mv)
+        assertMvCorrect(mv, query)
+      }
+    }
+
     it("incrementally maintains max_by with struct values and ordering keys") {
       sql("CREATE TABLE expr_struct_source (grp STRING, id INT, name STRING, ts TIMESTAMP) USING DELTA")
       sql("""INSERT INTO expr_struct_source VALUES

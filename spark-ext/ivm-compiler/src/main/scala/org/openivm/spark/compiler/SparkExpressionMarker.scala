@@ -30,6 +30,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Long      => "CAST(NULL AS BIGINT)"
         case Boolean   => "CAST(NULL AS BOOLEAN)"
         case TextArray => "string_split('openivm_type', ',')"
+        case Timestamp => "CAST(NULL AS TIMESTAMP)"
       }
       s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
     } else {
@@ -40,6 +41,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Long      => s"CAST($payload AS BIGINT)"
         case Boolean   => s"CAST($payload AS BOOLEAN)"
         case TextArray => s"string_split($payload, '${id}separator')"
+        case Timestamp => s"CAST($payload AS TIMESTAMP)"
       }
     }
   }
@@ -65,6 +67,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
                 case Integer => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
                 case Long    => Set("CAST(NULLASBIGINT)")
                 case Boolean => Set("CAST(NULLASBOOLEAN)")
+                case Timestamp => Set("CAST(NULLASTIMESTAMP)")
                 case TextArray =>
                   Set(
                     "STRING_SPLIT('OPENIVM_TYPE',',')",
@@ -156,6 +159,7 @@ private[compiler] object SparkExpressionMarker {
   case object Long      extends ResultType
   case object Boolean   extends ResultType
   case object TextArray extends ResultType
+  case object Timestamp extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
