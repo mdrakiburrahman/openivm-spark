@@ -25,7 +25,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
     markers.put(id, Marker(args.size, result, render))
     if (opaque) {
       val seed = result match {
-        case Text      => "CAST(NULL AS VARCHAR)"
+        case Text      => "CAST(NULL AS STRING)"
         case Integer   => "CAST(NULL AS INTEGER)"
         case Long      => "CAST(NULL AS BIGINT)"
         case Boolean   => "CAST(NULL AS BOOLEAN)"

@@ -14,6 +14,28 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
+    it("preserves pinned-source identity while incrementally refreshing a live join") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
+      sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
+      val pinned = sql("DESCRIBE HISTORY expr_pin_dim").selectExpr("max(version)").head().getLong(0)
+      sql("UPDATE expr_pin_dim SET label = 'CHANGED' WHERE id = 1")
+      sql("INSERT INTO expr_pin_dim VALUES (3, 'NEW')")
+      sql("CREATE TABLE expr_pin_fact (id INT, dim_id INT) USING DELTA")
+      sql("INSERT INTO expr_pin_fact VALUES (10, 1)")
+      val query = s"""SELECT f.id, lower(d.label) AS label
+        |FROM expr_pin_dim VERSION AS OF $pinned d JOIN expr_pin_fact f ON d.id = f.dim_id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_pin_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_pin_mv")
+      val meta = MvCatalog.lookup(spark, id).get
+      meta.properties.get(MvMetadata.CompileRefreshTypeKey) should not be Some("COMPILE_FAILED")
+      meta.refreshType should not be RefreshTypeCode.FullRefresh
+      assertMvCorrect("expr_pin_mv", query)
+      sql("INSERT INTO expr_pin_fact VALUES (11, 2), (12, 3)")
+      refreshMv("expr_pin_mv")
+      assertMvCorrect("expr_pin_mv", query)
+    }
+
     ignore("maintains native map lookup") { /* TODO: Spark cannot GROUP BY MAP in the native delta program. */
       sql("CREATE TABLE expr_baseline_source (id INT, txt STRING, m MAP<STRING, INT>) USING DELTA")
       sql("INSERT INTO expr_baseline_source VALUES (1, 'ABC', map('a', 1)), (2, NULL, map('a', 2))")

@@ -4,11 +4,20 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types.StructType
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
+  "Spark expression prepass" should "produce Spark-parseable SQL with pinned sources" in {
+    val query = "SELECT lower(d.label) FROM dim VERSION AS OF 1 d JOIN fact f ON d.id = f.id"
+    val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
+    prepared.sql should include("__openivm_spark_expression")
+    CatalystSqlParser.parsePlan(prepared.sql)
+    SparkTimeTravelSql.stripSnapshotPins(prepared.sql).toUpperCase should not include "VERSION AS OF"
+  }
+
   "Spark expression prepass" should "leave non-target map lookups and unreachable expressions unchanged" in {
     val queries = Seq(
       "SELECT element_at(m, 'a') FROM src",

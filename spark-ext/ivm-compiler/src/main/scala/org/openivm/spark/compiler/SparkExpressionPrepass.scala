@@ -48,6 +48,7 @@ private[spark] object SparkExpressionPrepass {
     "substr",
     "rpad",
     "lpad",
+    "replace",
     "concat",
     "concat_ws",
     "coalesce",
