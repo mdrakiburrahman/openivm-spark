@@ -247,10 +247,7 @@ private[spark] object SparkExpressionPrepass {
                         f.nameParts.size == 1 && f.nameParts.head.equalsIgnoreCase("named_struct")
                       case _ => false
                     }) =>
-                val span = expressionSpan(sql, alias.child)
-                if (SparkFunctionShimSql.namedStructTypeSeed(sql.substring(span.start, span.end)).isDefined)
-                  Some(normalized(alias.name))
-                else None
+                Some(normalized(alias.name))
               case _ => None
             }.toSet
             project.projectList.foreach {
