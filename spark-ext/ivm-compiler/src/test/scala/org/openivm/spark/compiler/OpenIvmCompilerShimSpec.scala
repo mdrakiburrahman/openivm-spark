@@ -76,7 +76,8 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   "Spark scalar dialect calls" should "survive native compilation in the reported expression chains" in {
     val r = compileBody(
       viewName = "shim_scalar_calls",
-      sources = Map("scalar_src" -> StructType.fromDDL("id STRING, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")),
+      sources =
+        Map("scalar_src" -> StructType.fromDDL("id STRING, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")),
       body = """WITH discovery AS (
         |  SELECT id, flag, start_ts, end_ts,
         |    ROW_NUMBER() OVER (PARTITION BY id ORDER BY start_ts DESC, end_ts DESC) AS rn
@@ -93,6 +94,32 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     translated.toLowerCase(Locale.ROOT) should include("timestampdiff(second,")
     translated.toLowerCase(Locale.ROOT) should include("lower(")
     translated should not include "__openivm_scalar_"
+  }
+
+  it should "retry each unsupported call independently" in {
+    val schema = StructType.fromDDL("id INT, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")
+    val expressions = Seq(
+      "lower(flag)"                             -> "lower(",
+      "unix_timestamp(start_ts)"                -> "unix_timestamp(",
+      "timestampdiff(SECOND, start_ts, end_ts)" -> "timestampdiff(second,"
+    )
+    expressions.zipWithIndex.foreach { case ((expr, expected), index) =>
+      val r = compileBody(s"shim_scalar_$index", Map("scalar_src" -> schema), s"SELECT id, $expr AS x FROM scalar_src")
+      r.refreshTypeName should equal("SIMPLE_PROJECTION")
+      val translated = LptsSparkDialect.translate(r.sql) + "\n" + r.initialLoadSql
+      translated.toLowerCase(Locale.ROOT) should include(expected)
+      translated should not include "__openivm_scalar_"
+    }
+  }
+
+  it should "keep a time-dependent predicate classified as full refresh after scalar retry" in {
+    val r = compileBody(
+      viewName = "shim_scalar_current_date",
+      sources = Map("scalar_src" -> StructType.fromDDL("id INT, flag BOOLEAN, d DATE")),
+      body = "SELECT id, LOWER(flag) AS f FROM scalar_src WHERE d >= date_sub(current_date(), 7)"
+    )
+    r.refreshTypeName should equal("FULL_REFRESH")
+    r.sql should not be empty
   }
 
   "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {

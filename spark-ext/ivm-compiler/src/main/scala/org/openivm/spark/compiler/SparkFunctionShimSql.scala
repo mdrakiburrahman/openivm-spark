@@ -39,37 +39,47 @@ private[compiler] object SparkFunctionShimSql {
     private val prefix = "__openivm_scalar_" + java.util.UUID.randomUUID().toString.replace("-", "") + "_"
     private val calls  = scala.collection.mutable.Map.empty[String, (String, Int)]
     private val seen   = scala.collection.mutable.Set.empty[String]
-    private val column = """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")(?:(?:\s*\.\s*)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"))*""".r
+    private val column =
+      """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")(?:(?:\s*\.\s*)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"))*""".r
 
     def nonEmpty: Boolean = calls.nonEmpty
 
     def rewrite(sql: String): String =
       rewriteOutsideProtected(sql) { i =>
-        Seq("unix_timestamp", "timestampdiff", "lower").iterator.flatMap { name =>
-          parseFunctionCallAt(sql, i, name).flatMap { call =>
-            var before = i - 1
-            while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
-            if (before >= 0 && sql.charAt(before) == '.') None
-            else {
-              splitTopLevelArgs(sql, call).flatMap { ranges =>
-                val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
-                val values =
-                  if (name == "timestampdiff" && args.size == 3 && args.head.equalsIgnoreCase("SECOND"))
-                    args.tail
-                  else if (name != "timestampdiff" && args.size == 1) args
-                  else Seq.empty
-                if (values.isEmpty || !values.forall(arg => column.pattern.matcher(arg).matches())) None
-                else {
-                  val id = prefix + calls.size + "__"
-                  calls.put(id, name -> values.size)
-                  val payload = s"concat('$id', CAST(row(${values.mkString(", ")}) AS VARCHAR))"
-                  val encoded = if (name == "lower") payload else s"CAST($payload AS BIGINT)"
-                  Some(call.closeParen + 1 -> encoded)
+        Seq("unix_timestamp", "timestampdiff", "lower").iterator
+          .flatMap { name =>
+            parseFunctionCallAt(sql, i, name).flatMap { call =>
+              var before = i - 1
+              while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+              if (before >= 0 && sql.charAt(before) == '.') None
+              else {
+                splitTopLevelArgs(sql, call).flatMap { ranges =>
+                  val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+                  val values =
+                    if (name == "timestampdiff" && args.size == 3 && args.head.equalsIgnoreCase("SECOND"))
+                      args.tail
+                    else if (name != "timestampdiff" && args.size == 1) args
+                    else Seq.empty
+                  val keywords = Set("TRUE", "FALSE", "NULL", "CURRENT_DATE", "CURRENT_TIMESTAMP")
+                  if (
+                    values.isEmpty || !values.forall(arg =>
+                      column.pattern.matcher(arg).matches() && !keywords.contains(arg.toUpperCase(Locale.ROOT))
+                    )
+                  ) None
+                  else {
+                    val id = prefix + calls.size + "__"
+                    calls.put(id, name -> values.size)
+                    val payload = s"concat('$id', CAST(row(${values.mkString(", ")}) AS VARCHAR))"
+                    val encoded = if (name == "lower") payload else s"CAST($payload AS BIGINT)"
+                    Some(call.closeParen + 1 -> encoded)
+                  }
                 }
               }
             }
           }
-        }.take(1).toSeq.headOption
+          .take(1)
+          .toSeq
+          .headOption
       }
 
     def restore(sql: String): String = {
@@ -78,9 +88,10 @@ private[compiler] object SparkFunctionShimSql {
           splitTopLevelArgs(sql, call).flatMap {
             case Seq(markerRange, castRange) =>
               val literal = sql.substring(markerRange._1, markerRange._2).trim
-              val id = if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
-                literal.substring(1, literal.length - 1)
-              else ""
+              val id =
+                if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
+                  literal.substring(1, literal.length - 1)
+                else ""
               calls.get(id).flatMap { case (name, arity) =>
                 parseSingleFunctionCallInRange(sql, castRange, "cast").flatMap { cast =>
                   val begin = cast.openParen + 1
@@ -113,6 +124,8 @@ private[compiler] object SparkFunctionShimSql {
     def requireAllSeen(): Unit =
       if (calls.keySet.exists(id => !seen.contains(id)))
         throw new IllegalStateException("Native compiler lost a Spark scalar marker")
+
+    def clearSeen(): Unit = seen.clear()
   }
 
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(

@@ -229,30 +229,31 @@ class OpenIvmCompiler private (
       }
       lastStdout = stdout
       lastStderr = stderr
-      var resultStdout = stdout
-      var resultDir    = tmpDir
+      var resultStdout                                               = stdout
+      var resultDir                                                  = tmpDir
       var markers: Option[SparkFunctionShimSql.ScalarDialectMarkers] = None
-      val partial = try {
-        parseCompileResult(stdout, req.viewName, stderr)
-      } catch {
-        case first: OpenIvmCompileException if {
-              val error = stderr.toLowerCase(Locale.ROOT)
-              error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
-            } =>
-          val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
-          val rewritten = candidate.rewrite(normalizedViewSql)
-          if (!candidate.nonEmpty) throw first
-          resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
-          val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
-          val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-            runCli(retry, resultDir)
-          }
-          resultStdout = retryStdout
-          lastStdout = retryStdout
-          lastStderr = retryStderr
-          markers = Some(candidate)
-          parseCompileResult(retryStdout, req.viewName, retryStderr)
-      }
+      val partial =
+        try {
+          parseCompileResult(stdout, req.viewName, stderr)
+        } catch {
+          case first: OpenIvmCompileException if {
+                val error = stderr.toLowerCase(Locale.ROOT)
+                error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
+              } =>
+            val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
+            val rewritten = candidate.rewrite(normalizedViewSql)
+            if (!candidate.nonEmpty) throw first
+            resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
+            val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
+            val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+              runCli(retry, resultDir)
+            }
+            resultStdout = retryStdout
+            lastStdout = retryStdout
+            lastStderr = retryStderr
+            markers = Some(candidate)
+            parseCompileResult(retryStdout, req.viewName, retryStderr)
+        }
       val nativeViewName = resultStdout.linesIterator
         .find(_.contains("\"openivm_bridge_view_key\""))
         .map { line =>
@@ -261,7 +262,9 @@ class OpenIvmCompiler private (
         }
         .getOrElse(req.viewName)
       val restore: String => String = sql => markers.fold(sql)(_.restore(sql))
-      val initLoad = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      val initLoad                  = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      if (initLoad.nonEmpty && partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
+      markers.foreach(_.clearSeen())
       val resultSql = restore(normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName))
       if (partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       partial.copy(

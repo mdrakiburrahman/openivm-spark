@@ -22,14 +22,18 @@ class CompileBridgeScalarSpec extends IvmParitySpecBase("compile-bridge-scalar")
                    |FROM latest""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW cbs_mv AS $body")
       val id = spark.sessionState.sqlParser.parseTableIdentifier("cbs_mv")
-      MvCatalog.lookup(spark, id).getOrElse(fail("Missing MV metadata")).refreshTypeName should equal("WINDOW_PARTITION")
+      MvCatalog.lookup(spark, id).getOrElse(fail("Missing MV metadata")).refreshTypeName should equal(
+        "WINDOW_PARTITION"
+      )
       assertMvCorrect("cbs_mv", body)
       sql("""INSERT INTO cbs_src VALUES
             |('a', false, TIMESTAMP'2024-01-01 00:00:00.900', TIMESTAMP'2024-01-01 00:00:01.100'),
             |('d', true, TIMESTAMP'2024-01-01 00:00:03', TIMESTAMP'2024-01-01 00:00:02')""".stripMargin)
       sql("DELETE FROM cbs_src WHERE id = 'b'")
       refreshMv("cbs_mv")
-      MvCatalog.lookup(spark, id).getOrElse(fail("Missing MV metadata")).refreshTypeName should equal("WINDOW_PARTITION")
+      MvCatalog.lookup(spark, id).getOrElse(fail("Missing MV metadata")).refreshTypeName should equal(
+        "WINDOW_PARTITION"
+      )
       assertMvCorrect("cbs_mv", body)
     }
   }

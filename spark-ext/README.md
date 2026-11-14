@@ -43,6 +43,10 @@ The Spark SQL generation boundary translates DuckDB pattern operators `~~`,
 `!~~`, `~~*` and `!~~*` to LIKE, NOT LIKE, ILIKE and NOT ILIKE. String literals,
 quoted identifiers and comments are protected; source business SQL is unchanged.
 
+For native binding failures, direct-column `UNIX_TIMESTAMP`, boolean `LOWER`, and
+`TIMESTAMPDIFF(SECOND, ...)` calls are retried through a Spark-evaluated bridge.
+Other argument shapes are not covered by this retry.
+
 ## Native streaming status lookup diagnostics
 
 Targeted SHOW analyzes the exact target without suppressing native catalog/storage
