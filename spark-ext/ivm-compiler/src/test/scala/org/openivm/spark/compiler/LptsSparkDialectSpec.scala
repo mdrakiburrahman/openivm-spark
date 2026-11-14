@@ -10,6 +10,27 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("struct max_by native translation") {
+    it("round-trips explicit field names without touching strings or unrelated structs") {
+      val sql = """SELECT max_by(struct(t.a AS f1, t.b AS "Mixed Name"), struct(t.k AS f1)),
+        |'max_by(struct(x AS f), struct(y AS f))', struct(other) FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("""arg_max(struct_pack(f1 := t.a, "Mixed Name" := t.b), struct_pack(f1 := t.k))""")
+      native should include("'max_by(struct(x AS f), struct(y AS f))'")
+      native should include("struct(other)")
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'6631' AS STRING), t.a,")
+      restored should include("CAST(X'4d69786564204e616d65' AS STRING), t.b)")
+      restored should include("'max_by(struct(x AS f), struct(y AS f))'")
+      restored should include("struct(other)")
+    }
+
+    it("leaves unsupported struct field shapes unchanged") {
+      val sql = "SELECT max_by(struct(a), struct(k AS f1)) FROM t"
+      SparkFunctionShimSql.rewriteStructMaxBy(sql) shouldBe sql
+    }
+  }
+
   describe("quoted null cast types in native fallback queries") {
     it("unquotes type names while preserving literals and quoted column aliases") {
       val query    = "SELECT CAST(NULL AS \"DATE\"), CAST(NULL AS `TIMESTAMP`), 'CAST(NULL AS \"DATE\")' AS \"DATE\""

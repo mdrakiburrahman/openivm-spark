@@ -265,7 +265,10 @@ private[compiler] object SparkFunctionShimSql {
 
   private[compiler] def rewriteStructMaxBy(sql: String): String =
     rewriteOutsideProtected(sql, protectBackticks = true) { i =>
-      parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
+      var before = i - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      if (before >= 0 && sql.charAt(before) == '.') None
+      else parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
         splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
           val structs = ranges.map { case (start, end) => namedStructPack(sql.substring(start, end).trim) }
           if (structs.forall(_.isDefined)) Some((call.closeParen + 1, s"arg_max(${structs.flatten.mkString(", ")})"))
@@ -280,7 +283,9 @@ private[compiler] object SparkFunctionShimSql {
         splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
           val structs = ranges.map { case (start, end) => sql.substring(start, end).trim }
           if (structs.forall(arg => arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1)))
-            Some((i + "arg_max".length, "max_by"))
+            Some((call.closeParen + 1,
+              s"max_by(${structs.map(SparkExpressionMarker.restoreStructPacks).mkString(", ")})"
+            ))
           else None
         }
       }
