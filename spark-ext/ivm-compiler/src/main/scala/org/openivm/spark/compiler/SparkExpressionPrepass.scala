@@ -105,6 +105,7 @@ private[spark] object SparkExpressionPrepass {
     }
 
     var nextScope = 0
+    val visitedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
     def expressions(expr: Expression, scope: Int): Unit = expr match {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
@@ -153,11 +154,14 @@ private[spark] object SparkExpressionPrepass {
     }
 
     def plans(plan: LogicalPlan): Unit = {
-      val scope = nextScope
-      nextScope += 1
-      plan.expressions.foreach(expr => expressions(expr, scope))
-      plan.children.foreach(plans)
-      plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(plans)
+      if (!visitedPlans.containsKey(plan)) {
+        visitedPlans.put(plan, java.lang.Boolean.TRUE)
+        val scope = nextScope
+        nextScope += 1
+        plan.expressions.foreach(expr => expressions(expr, scope))
+        plan.children.foreach(plans)
+        plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(plans)
+      }
     }
 
     plans(CatalystSqlParser.parsePlan(sql))
