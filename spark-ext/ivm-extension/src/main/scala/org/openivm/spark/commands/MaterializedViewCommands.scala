@@ -3184,16 +3184,19 @@ case class CreateMaterializedViewCommand(
     // INFO-level for "kept" so the per-MV decision is always visible during
     // normal operation; ERROR-level for any demotion so even
     // production-tuned log filters surface it.
-    val classification = classifyHiveSources(hiveSources, classifyEffectiveRefreshType(
-      compiled = compiled,
-      viewShortName = name.table,
-      topKViewSpec = topKViewSpec,
-      simpleProjectionHasDataApply = simpleProjectionHasDataApply,
-      upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
-      rawHavingPred = rawHavingPred,
-      aggregateHavingDataColumns = aggregateHavingDataColumns,
-      authoritativeClassification = authoritativeClassification
-    ))
+    val classification = classifyHiveSources(
+      hiveSources,
+      classifyEffectiveRefreshType(
+        compiled = compiled,
+        viewShortName = name.table,
+        topKViewSpec = topKViewSpec,
+        simpleProjectionHasDataApply = simpleProjectionHasDataApply,
+        upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
+        rawHavingPred = rawHavingPred,
+        aggregateHavingDataColumns = aggregateHavingDataColumns,
+        authoritativeClassification = authoritativeClassification
+      )
+    )
     val effectiveRefreshType     = classification.refreshType
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
@@ -3231,7 +3234,7 @@ case class CreateMaterializedViewCommand(
           s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
           MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
           classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
-      if (classification.isDemotionToFullRefresh)
+      if (classification.isDemotionToFullRefresh && classifyReason != "unversioned_hive_source")
         logError(msg)
       else
         logInfo(msg)
