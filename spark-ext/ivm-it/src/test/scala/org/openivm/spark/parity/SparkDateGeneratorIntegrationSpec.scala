@@ -12,7 +12,7 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     Seq("UTC", "America/Los_Angeles", "Pacific/Apia").zipWithIndex.foreach { case (zone, index) =>
       spark.conf.set("spark.sql.session.timeZone", zone)
       val source = s"date_gen_source_$index"
-      val mv = s"date_gen_mv_$index"
+      val mv     = s"date_gen_mv_$index"
       sql(s"CREATE TABLE $source (id INT, start_date DATE, end_date DATE) USING DELTA")
       sql(s"""INSERT INTO $source VALUES
         |(1, DATE '2024-03-09', DATE '2024-03-12'),
@@ -62,5 +62,5 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
   }
 }
 
-class SparkDateGeneratorCdfIntegrationSpec extends SparkDateGeneratorScenarios with CdfMode
+class SparkDateGeneratorCdfIntegrationSpec       extends SparkDateGeneratorScenarios with CdfMode
 class SparkDateGeneratorInterceptIntegrationSpec extends SparkDateGeneratorScenarios with InterceptMode

@@ -13,6 +13,14 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     FeatureGate.ProfileRefreshKey                    -> "true"
   )
 
+  private def withoutExpectedLedgerWarning[A](body: => A): A = {
+    val logger        = "org.openivm.spark.analyzer.SourceChangeLedger"
+    val previousLevel = LogManager.getLogger(logger).getLevel
+    Configurator.setLevel(logger, Level.FATAL)
+    try body
+    finally Configurator.setLevel(logger, previousLevel)
+  }
+
   describe("Spark expression bridge") {
     it("preserves Spark timestamp and string CASE coercion") {
       Seq(false, true).foreach { ansi =>
@@ -38,43 +46,44 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("preserves analyzed CASE coercion through cached and advanced pinned CTEs") {
-      spark.conf.set("spark.sql.ansi.enabled", "false")
-      sql("CREATE TABLE expr_case_dim (id INT, ts TIMESTAMP, text STRING) USING DELTA")
-      sql("INSERT INTO expr_case_dim VALUES (1, TIMESTAMP '2000-01-01 00:00:00', NULL)")
-      val oldVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
-      sql("CREATE TABLE expr_case_fact (id INT, dim_id INT) USING DELTA")
-      sql("INSERT INTO expr_case_fact VALUES (10, 1)")
-      def query(version: Long): String =
-        s"""WITH c AS (
+      withoutExpectedLedgerWarning {
+        spark.conf.set("spark.sql.ansi.enabled", "false")
+        sql("CREATE TABLE expr_case_dim (id INT, ts TIMESTAMP, text STRING) USING DELTA")
+        sql("INSERT INTO expr_case_dim VALUES (1, TIMESTAMP '2000-01-01 00:00:00', NULL)")
+        val oldVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
+        sql("CREATE TABLE expr_case_fact (id INT, dim_id INT) USING DELTA")
+        sql("INSERT INTO expr_case_fact VALUES (10, 1)")
+        def query(version: Long): String =
+          s"""WITH c AS (
            |  SELECT d.id, CAST(CASE WHEN CAST(d.text AS TIMESTAMP) IS NULL
            |    THEN d.ts ELSE d.text END AS STRING) AS v
            |  FROM expr_case_dim VERSION AS OF $version d
            |) SELECT f.id, c.v FROM expr_case_fact f JOIN c ON f.dim_id = c.id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_case_pin_mv AS ${query(oldVersion)}")
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_case_pin_mv")
-      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
-      assertMvCorrect("expr_case_pin_mv", query(oldVersion))
-      sql("INSERT INTO expr_case_fact VALUES (11, 1)")
-      refreshMv("expr_case_pin_mv")
-      sql("INSERT INTO expr_case_fact VALUES (12, 1)")
-      refreshMv("expr_case_pin_mv")
-      assertMvCorrect("expr_case_pin_mv", query(oldVersion))
-      val detail = sql("SHOW OPENIVM REFRESH PROFILE")
-        .where("view_name IN ('expr_case_pin_mv','default.expr_case_pin_mv') AND step_name = 'generate_refresh_sql.compile'")
-        .select("detail").collect().last.getString(0)
-      detail should include("compile_cache_hit=true")
-      val logger = "org.openivm.spark.analyzer.SourceChangeLedger"
-      val previousLevel = LogManager.getLogger(logger).getLevel
-      Configurator.setLevel(logger, Level.FATAL)
-      val newVersion = try {
+        sql(s"CREATE MATERIALIZED VIEW expr_case_pin_mv AS ${query(oldVersion)}")
+        val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_case_pin_mv")
+        MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+        assertMvCorrect("expr_case_pin_mv", query(oldVersion))
+        sql("INSERT INTO expr_case_fact VALUES (11, 1)")
+        refreshMv("expr_case_pin_mv")
+        sql("INSERT INTO expr_case_fact VALUES (12, 1)")
+        refreshMv("expr_case_pin_mv")
+        assertMvCorrect("expr_case_pin_mv", query(oldVersion))
+        val detail = sql("SHOW OPENIVM REFRESH PROFILE")
+          .where(
+            "view_name IN ('expr_case_pin_mv','default.expr_case_pin_mv') AND step_name = 'generate_refresh_sql.compile'"
+          )
+          .select("detail")
+          .collect()
+          .last
+          .getString(0)
+        detail should include("compile_cache_hit=true")
         sql("UPDATE expr_case_dim SET text = '2000-02-01' WHERE id = 1")
-        val version = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
-        sql(s"ALTER MATERIALIZED VIEW expr_case_pin_mv ADVANCE SOURCE VERSIONS (expr_case_dim = $version)")
+        val newVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
+        sql(s"ALTER MATERIALIZED VIEW expr_case_pin_mv ADVANCE SOURCE VERSIONS (expr_case_dim = $newVersion)")
         sql("INSERT OVERWRITE TABLE expr_case_fact SELECT 10, 1")
         refreshMv("expr_case_pin_mv")
-        version
-      } finally Configurator.setLevel(logger, previousLevel)
-      assertMvCorrect("expr_case_pin_mv", query(newVersion))
+        assertMvCorrect("expr_case_pin_mv", query(newVersion))
+      }
     }
 
     it("incrementally maintains max_by with struct values and ordering keys") {
@@ -144,24 +153,26 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("preserves pinned-source identity while incrementally refreshing a live join") {
-      sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
-      sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
-      val pinned = sql("DESCRIBE HISTORY expr_pin_dim").selectExpr("max(version)").head().getLong(0)
-      sql("UPDATE expr_pin_dim SET label = 'CHANGED' WHERE id = 1")
-      sql("INSERT INTO expr_pin_dim VALUES (3, 'NEW')")
-      sql("CREATE TABLE expr_pin_fact (id INT, dim_id INT) USING DELTA")
-      sql("INSERT INTO expr_pin_fact VALUES (10, 1)")
-      val query = s"""SELECT f.id, lower(d.label) AS label
+      withoutExpectedLedgerWarning {
+        sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
+        sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
+        val pinned = sql("DESCRIBE HISTORY expr_pin_dim").selectExpr("max(version)").head().getLong(0)
+        sql("UPDATE expr_pin_dim SET label = 'CHANGED' WHERE id = 1")
+        sql("INSERT INTO expr_pin_dim VALUES (3, 'NEW')")
+        sql("CREATE TABLE expr_pin_fact (id INT, dim_id INT) USING DELTA")
+        sql("INSERT INTO expr_pin_fact VALUES (10, 1)")
+        val query = s"""SELECT f.id, lower(d.label) AS label
         |FROM expr_pin_dim VERSION AS OF $pinned d JOIN expr_pin_fact f ON d.id = f.dim_id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_pin_mv AS $query")
-      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_pin_mv")
-      val meta = MvCatalog.lookup(spark, id).get
-      meta.properties.get(MvMetadata.CompileRefreshTypeKey) should not be Some("COMPILE_FAILED")
-      meta.refreshType should not be RefreshTypeCode.FullRefresh
-      assertMvCorrect("expr_pin_mv", query)
-      sql("INSERT INTO expr_pin_fact VALUES (11, 2), (12, 3)")
-      refreshMv("expr_pin_mv")
-      assertMvCorrect("expr_pin_mv", query)
+        sql(s"CREATE MATERIALIZED VIEW expr_pin_mv AS $query")
+        val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_pin_mv")
+        val meta = MvCatalog.lookup(spark, id).get
+        meta.properties.get(MvMetadata.CompileRefreshTypeKey) should not be Some("COMPILE_FAILED")
+        meta.refreshType should not be RefreshTypeCode.FullRefresh
+        assertMvCorrect("expr_pin_mv", query)
+        sql("INSERT INTO expr_pin_fact VALUES (11, 2), (12, 3)")
+        refreshMv("expr_pin_mv")
+        assertMvCorrect("expr_pin_mv", query)
+      }
     }
 
     ignore("maintains native map lookup") { /* TODO: Spark cannot GROUP BY MAP in the native delta program. */
@@ -246,52 +257,50 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("keeps pinned sources frozen when rebaselining a legacy MV") {
-      sql("CREATE TABLE expr_legacy_dim (id INT, label STRING) USING DELTA")
-      sql("INSERT INTO expr_legacy_dim VALUES (1, 'OLD')")
-      val version = sql("DESCRIBE HISTORY expr_legacy_dim").selectExpr("max(version)").head().getLong(0)
-      sql("UPDATE expr_legacy_dim SET label = 'NEW' WHERE id = 1")
-      sql("CREATE TABLE expr_legacy_fact (id INT, amount INT) USING DELTA")
-      sql("INSERT INTO expr_legacy_fact VALUES (1, 10)")
-      val query = s"""SELECT lower(d.label) AS label, f.amount FROM expr_legacy_dim VERSION AS OF $version d
+      withoutExpectedLedgerWarning {
+        sql("CREATE TABLE expr_legacy_dim (id INT, label STRING) USING DELTA")
+        sql("INSERT INTO expr_legacy_dim VALUES (1, 'OLD')")
+        val version = sql("DESCRIBE HISTORY expr_legacy_dim").selectExpr("max(version)").head().getLong(0)
+        sql("UPDATE expr_legacy_dim SET label = 'NEW' WHERE id = 1")
+        sql("CREATE TABLE expr_legacy_fact (id INT, amount INT) USING DELTA")
+        sql("INSERT INTO expr_legacy_fact VALUES (1, 10)")
+        val query = s"""SELECT lower(d.label) AS label, f.amount FROM expr_legacy_dim VERSION AS OF $version d
                      |JOIN expr_legacy_fact f ON f.id = d.id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_legacy_pin_mv AS $query")
-      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_pin_mv")
-      val meta = MvCatalog.lookup(spark, id).get
-      meta.refreshType should not be RefreshTypeCode.FullRefresh
-      MvCatalog.updateProperties(spark, id, meta.properties - SparkExpressionPrepass.RestoredInitialLoadProperty)
-      sql("INSERT OVERWRITE TABLE expr_legacy_fact SELECT 1, 20")
-      refreshMv("expr_legacy_pin_mv")
-      assertMvCorrect("expr_legacy_pin_mv", query)
-      sql("INSERT INTO expr_legacy_fact VALUES (1, 30)")
-      refreshMv("expr_legacy_pin_mv")
-      assertMvCorrect("expr_legacy_pin_mv", query)
+        sql(s"CREATE MATERIALIZED VIEW expr_legacy_pin_mv AS $query")
+        val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_pin_mv")
+        val meta = MvCatalog.lookup(spark, id).get
+        meta.refreshType should not be RefreshTypeCode.FullRefresh
+        MvCatalog.updateProperties(spark, id, meta.properties - SparkExpressionPrepass.RestoredInitialLoadProperty)
+        sql("INSERT OVERWRITE TABLE expr_legacy_fact SELECT 1, 20")
+        refreshMv("expr_legacy_pin_mv")
+        assertMvCorrect("expr_legacy_pin_mv", query)
+        sql("INSERT INTO expr_legacy_fact VALUES (1, 30)")
+        refreshMv("expr_legacy_pin_mv")
+        assertMvCorrect("expr_legacy_pin_mv", query)
+      }
     }
 
     it("rebaselines against advanced pinned sources") {
-      sql("CREATE TABLE expr_advance_dim (id INT, label STRING) USING DELTA")
-      sql("INSERT INTO expr_advance_dim VALUES (1, 'OLD')")
-      val oldVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
-      sql("CREATE TABLE expr_advance_fact (id INT, amount INT) USING DELTA")
-      sql("INSERT INTO expr_advance_fact VALUES (1, 10)")
-      def query(version: Long): String =
-        s"""SELECT lower(d.label) AS label, f.amount FROM expr_advance_dim VERSION AS OF $version d
+      withoutExpectedLedgerWarning {
+        sql("CREATE TABLE expr_advance_dim (id INT, label STRING) USING DELTA")
+        sql("INSERT INTO expr_advance_dim VALUES (1, 'OLD')")
+        val oldVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
+        sql("CREATE TABLE expr_advance_fact (id INT, amount INT) USING DELTA")
+        sql("INSERT INTO expr_advance_fact VALUES (1, 10)")
+        def query(version: Long): String =
+          s"""SELECT lower(d.label) AS label, f.amount FROM expr_advance_dim VERSION AS OF $version d
            |JOIN expr_advance_fact f ON f.id = d.id""".stripMargin
-      sql(s"CREATE MATERIALIZED VIEW expr_advance_mv AS ${query(oldVersion)}")
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_advance_mv")
-      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
-      val logger = "org.openivm.spark.analyzer.SourceChangeLedger"
-      val previousLevel = LogManager.getLogger(logger).getLevel
-      Configurator.setLevel(logger, Level.FATAL)
-      val newVersion = try {
+        sql(s"CREATE MATERIALIZED VIEW expr_advance_mv AS ${query(oldVersion)}")
+        val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_advance_mv")
+        MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
         sql("UPDATE expr_advance_dim SET label = 'NEW' WHERE id = 1")
-        val version = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
-        sql(s"ALTER MATERIALIZED VIEW expr_advance_mv ADVANCE SOURCE VERSIONS (expr_advance_dim = $version)")
-        assertMvCorrect("expr_advance_mv", query(version))
+        val newVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
+        sql(s"ALTER MATERIALIZED VIEW expr_advance_mv ADVANCE SOURCE VERSIONS (expr_advance_dim = $newVersion)")
+        assertMvCorrect("expr_advance_mv", query(newVersion))
         sql("INSERT OVERWRITE TABLE expr_advance_fact SELECT 1, 20")
         refreshMv("expr_advance_mv")
-        version
-      } finally Configurator.setLevel(logger, previousLevel)
-      assertMvCorrect("expr_advance_mv", query(newVersion))
+        assertMvCorrect("expr_advance_mv", query(newVersion))
+      }
     }
 
     it("retains a real native compile-failure receipt through create and refresh") {

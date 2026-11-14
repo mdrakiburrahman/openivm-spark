@@ -64,59 +64,70 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
               if (idLiteral.length >= 2 && idLiteral.head == '\'' && idLiteral.last == '\'')
                 idLiteral.substring(1, idLiteral.length - 1)
               else ""
-            if (markers.get(id).exists(_.result == DateBound) &&
-                body.substring(nested.end).trim.equalsIgnoreCase("AS TIMESTAMP"))
+            if (
+              markers.get(id).exists(_.result == DateBound) &&
+              body.substring(nested.end).trim.equalsIgnoreCase("AS TIMESTAMP")
+            )
               Some(body.substring(0, nested.end))
             else None
           }
         }
       }
     }
+    val hasDateBounds = markers.valuesIterator.exists(_.result == DateBound)
     val out = SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
-      parseCall(sql, i, "unnest").flatMap { unnest =>
-        if (unnest.args.size != 1) None
-        else {
-          val arg = unnest.args.head.trim
-          parseCall(arg, 0, "sequence").filter(seq =>
-            seq.end == arg.length && seq.args.size == 3 && seq.args.take(2).forall(dateBound(_).isDefined)
-          ).map(_ => unnest.end -> s"explode(${restore(arg)})")
-        }
-      }.orElse {
-        parseCall(sql, i, "cast").flatMap(cast =>
-          dateBound(sql.substring(i, cast.end)).map(marker => cast.end -> restore(marker))
-        )
-      }
-        .orElse(parseCall(sql, i, "__openivm_spark_expression")
-        .flatMap { call =>
-          if (call.args.size < 3) None
+      (if (hasDateBounds) parseCall(sql, i, "unnest") else None)
+        .flatMap { unnest =>
+          if (unnest.args.size != 1) None
           else {
-            val idLiteral = call.args.head.trim
-            val id =
-              if (idLiteral.length >= 2 && idLiteral.head == '\'' && idLiteral.last == '\'')
-                idLiteral.substring(1, idLiteral.length - 1)
-              else ""
-            markers.get(id).flatMap { marker =>
-              val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
-              val allowed = marker.result match {
-                case Text      => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
-                case Integer   => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
-                case Long      => Set("CAST(NULLASBIGINT)")
-                case Boolean   => Set("CAST(NULLASBOOLEAN)")
-                case Timestamp => Set("CAST(NULLASTIMESTAMP)")
-                case DateBound => Set("CAST(NULLASDATE)")
-                case TextArray =>
-                  Set(
-                    "STRING_SPLIT('OPENIVM_TYPE',',')",
-                    "SPLIT('OPENIVM_TYPE',',')",
-                    "ARRAY('OPENIVM_TYPE')",
-                    "LIST_VALUE('OPENIVM_TYPE')"
-                  )
-              }
-              if (!allowed.contains(seed)) None
-              else Some(call.end -> renderMarker(id, call.args.drop(2)))
-            }
+            val arg = unnest.args.head.trim
+            parseCall(arg, 0, "sequence")
+              .filter(seq =>
+                seq.end == arg.length && seq.args.size == 3 && seq.args.take(2).forall(dateBound(_).isDefined)
+              )
+              .map(_ => unnest.end -> s"explode(${restore(arg)})")
           }
-        })
+        }
+        .orElse {
+          if (hasDateBounds)
+            parseCall(sql, i, "cast").flatMap(cast =>
+              dateBound(sql.substring(i, cast.end)).map(marker => cast.end -> restore(marker))
+            )
+          else None
+        }
+        .orElse(
+          parseCall(sql, i, "__openivm_spark_expression")
+            .flatMap { call =>
+              if (call.args.size < 3) None
+              else {
+                val idLiteral = call.args.head.trim
+                val id =
+                  if (idLiteral.length >= 2 && idLiteral.head == '\'' && idLiteral.last == '\'')
+                    idLiteral.substring(1, idLiteral.length - 1)
+                  else ""
+                markers.get(id).flatMap { marker =>
+                  val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
+                  val allowed = marker.result match {
+                    case Text      => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
+                    case Integer   => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
+                    case Long      => Set("CAST(NULLASBIGINT)")
+                    case Boolean   => Set("CAST(NULLASBOOLEAN)")
+                    case Timestamp => Set("CAST(NULLASTIMESTAMP)")
+                    case DateBound => Set("CAST(NULLASDATE)")
+                    case TextArray =>
+                      Set(
+                        "STRING_SPLIT('OPENIVM_TYPE',',')",
+                        "SPLIT('OPENIVM_TYPE',',')",
+                        "ARRAY('OPENIVM_TYPE')",
+                        "LIST_VALUE('OPENIVM_TYPE')"
+                      )
+                  }
+                  if (!allowed.contains(seed)) None
+                  else Some(call.end -> renderMarker(id, call.args.drop(2)))
+                }
+              }
+            }
+        )
         .orElse {
           parseCall(sql, i, "string_split").flatMap { call =>
             if (call.args.size != 2) None
