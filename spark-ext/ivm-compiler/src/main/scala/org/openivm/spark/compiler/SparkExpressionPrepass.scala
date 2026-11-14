@@ -100,6 +100,7 @@ private[spark] object SparkExpressionPrepass {
       case _ => None
     }
 
+    var nextScope = 0
     def expressions(expr: Expression, scope: Int): Unit = expr match {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
@@ -111,7 +112,6 @@ private[spark] object SparkExpressionPrepass {
         }
     }
 
-    var nextScope = 0
     def plans(plan: LogicalPlan): Unit = {
       val scope = nextScope
       nextScope += 1
