@@ -2,11 +2,16 @@ package org.openivm.spark.parity
 
 import org.apache.logging.log4j.{Level, LogManager}
 import org.apache.logging.log4j.core.config.Configurator
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-generator") {
   self: IvmParityMode =>
+  override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
+    FeatureGate.GroupedWindowStateEnabledKey -> "true",
+    FeatureGate.CompileClassificationCacheEnabledKey -> "true"
+  )
 
   it("incrementally expands daily date sequences and preserves invalid bounds") {
     Seq("UTC", "America/Los_Angeles", "Pacific/Apia").zipWithIndex.foreach { case (zone, index) =>
