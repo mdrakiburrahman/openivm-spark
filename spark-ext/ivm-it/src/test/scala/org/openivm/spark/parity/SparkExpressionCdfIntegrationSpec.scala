@@ -241,10 +241,15 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
       sql("UPDATE expr_advance_dim SET label = 'NEW' WHERE id = 1")
       val newVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
-      sql(s"ALTER MATERIALIZED VIEW expr_advance_mv ADVANCE SOURCE VERSIONS (expr_advance_dim = $newVersion)")
-      assertMvCorrect("expr_advance_mv", query(newVersion))
-      sql("INSERT OVERWRITE TABLE expr_advance_fact SELECT 1, 20")
-      refreshMv("expr_advance_mv")
+      val logger = "org.openivm.spark.analyzer.SourceChangeLedger"
+      val previousLevel = LogManager.getLogger(logger).getLevel
+      Configurator.setLevel(logger, Level.FATAL)
+      try {
+        sql(s"ALTER MATERIALIZED VIEW expr_advance_mv ADVANCE SOURCE VERSIONS (expr_advance_dim = $newVersion)")
+        assertMvCorrect("expr_advance_mv", query(newVersion))
+        sql("INSERT OVERWRITE TABLE expr_advance_fact SELECT 1, 20")
+        refreshMv("expr_advance_mv")
+      } finally Configurator.setLevel(logger, previousLevel)
       assertMvCorrect("expr_advance_mv", query(newVersion))
     }
 

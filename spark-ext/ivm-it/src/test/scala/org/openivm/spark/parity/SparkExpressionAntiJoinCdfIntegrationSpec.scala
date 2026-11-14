@@ -10,7 +10,6 @@ abstract class SparkExpressionAntiJoinIntegrationScenarios extends IvmParitySpec
 
   describe("Spark expression bridge anti-join") {
     ignore("incrementally maintains correlated anti-join expressions") { /* TODO: native emits no real delta without the bridge too. */
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_anti_source (id INT, txt STRING) USING DELTA")
       sql("CREATE TABLE expr_anti_blocked (txt STRING) USING DELTA")
       sql("INSERT INTO expr_anti_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
@@ -28,7 +27,6 @@ abstract class SparkExpressionAntiJoinIntegrationScenarios extends IvmParitySpec
     }
 
     it("classifies a correlated anti-join with no real delta as an intentional full refresh") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_anti_full_source (id INT, txt STRING) USING DELTA")
       sql("CREATE TABLE expr_anti_full_blocked (txt STRING) USING DELTA")
       sql("INSERT INTO expr_anti_full_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
@@ -62,7 +60,6 @@ abstract class SparkExpressionAntiJoinIntegrationScenarios extends IvmParitySpec
 
 class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with CdfMode {
   it("preserves upstream and downstream identities through correlated anti-join changes") {
-    assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
     spark.conf.set("spark.openivm.refresh.windowRunningIncremental.enabled", "true")
     spark.conf.set("spark.openivm.refresh.groupedWindowState.enabled", "true")
     spark.conf.set("spark.openivm.compile.classificationCache.enabled", "true")
