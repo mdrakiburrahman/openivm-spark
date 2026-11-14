@@ -13,8 +13,6 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
-  import SparkExpressionMarker._
-
   "Opaque Spark markers" should "preserve projection results across mixed incremental DML" in {
     assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
     val cli       = sys.env("OPENIVM_CLI_PATH")
@@ -45,23 +43,18 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
       spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
       Seq(false, true).foreach { ansi =>
         spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
-        val source    = s"marker_src_$ansi"
-        val mv        = s"marker_mv_$ansi"
-        val path      = s"$warehouse/$mv"
-        val bridge    = new SparkExpressionMarker(opaque = true)
-        val regex     = bridge.encode(Seq("txt", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
-        val split     = bridge.encode(Seq("txt", "'/'"), TextArray)(args => s"split(${args.mkString(", ")})")
-        val size      = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
-        val splitLeaf = bridge.encode(Seq("txt", "'/'"), TextArray)(args => s"split(${args.mkString(", ")})")
-        val leaf      = bridge.encode(Seq(splitLeaf, "-1"), Text)(args => s"element_at(${args.mkString(", ")})")
-        val json = bridge.encode(Seq("id", "txt"), Text)(args =>
-          s"to_json(named_struct('Odd Name', ${args(1)}, 'nested', named_struct('Mixed', ${args.head})), " +
-            "map('ignoreNullFields', 'false', 'timeZone', 'UTC'))"
-        )
-        val hash = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
+        val source = s"marker_src_$ansi"
+        val mv     = s"marker_mv_$ansi"
+        val path   = s"$warehouse/$mv"
+        val expected = s"""SELECT id, txt RLIKE '(?i)ä' AS re, size(split(txt, '/')) AS n,
+          |element_at(split(txt, '/'), -1) AS leaf,
+          |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', id)),
+          |map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS digest FROM $source""".stripMargin
+        val prepared = SparkExpressionPrepass.prepare(expected)
+        val bridge   = prepared.markers
         val request = CompileRequest(
           mv,
-          s"SELECT id, $regex AS re, $size AS n, $leaf AS leaf, $hash AS digest FROM $source",
+          prepared.sql,
           Map(source -> StructType.fromDDL("id INT, txt STRING"))
         )
         val compiled = compiler.compile(request)
@@ -71,10 +64,6 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
         bridge.resetSeen()
         val program = bridge.restore(compiled.sql)
         bridge.requireAllSeen()
-        val expected = s"""SELECT id, regexp_like(txt, '(?i)ä') AS re, size(split(txt, '/')) AS n,
-          |element_at(split(txt, '/'), -1) AS leaf,
-          |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', id)),
-          |map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS digest FROM $source""".stripMargin
         spark.sql(s"CREATE TABLE $source (id INT, txt STRING) USING DELTA")
         spark.sql(s"INSERT INTO $source VALUES (1, NULL), (2, 'Ä'), (3, 'a/b')")
         spark.sql(s"CREATE TABLE $mv USING DELTA LOCATION '$path' AS $initial")

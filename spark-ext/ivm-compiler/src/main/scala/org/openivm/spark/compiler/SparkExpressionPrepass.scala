@@ -85,7 +85,7 @@ private[compiler] object SparkExpressionPrepass {
           f.arguments.headOption match {
             case Some(a: UnresolvedFunction) if a.nameParts.size == 1 && a.nameParts.head.equalsIgnoreCase("split") =>
               Some(Text)
-            case _ => None
+            case _ => throw new IllegalArgumentException("Cannot infer element_at result type")
           }
         } else resultTypes.get(name)
       case _ => None
@@ -167,7 +167,11 @@ private[compiler] object SparkExpressionPrepass {
       case attr: UnresolvedAttribute =>
         val location = originSpan(sql, attr)
         val value    = sql.substring(location.start, location.end)
-        val index    = arguments.size
+        CatalystSqlParser.parseExpression(value) match {
+          case parsed: UnresolvedAttribute if parsed.nameParts == attr.nameParts =>
+          case _ => throw new IllegalArgumentException("Invalid Spark attribute source span")
+        }
+        val index = arguments.size
         arguments += value
         edits += Edit(location, args => args(index))
       case struct: CreateNamedStruct =>
