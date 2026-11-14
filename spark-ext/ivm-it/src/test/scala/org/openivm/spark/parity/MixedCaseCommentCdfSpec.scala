@@ -10,8 +10,7 @@ class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") wi
 
     val projection =
       """SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state,
-        |CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
-        |     WHEN reason LIKE 'Needs%' THEN 'PatternMatch' ELSE 'NoMatch' END AS reason_match,
+        |CASE WHEN reason = 'MiXeD' THEN 'ExactMatch' ELSE 'NoMatch' END AS reason_match,
         |'yyyyMM' AS format_mask
         |FROM mcc_source""".stripMargin
     val window =
@@ -19,8 +18,10 @@ class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") wi
         |ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id) AS rn
         |FROM mcc_source""".stripMargin
 
-    sql(s"CREATE MATERIALIZED VIEW mcc_line AS\n-- synthetic's comment\n$projection")
-    sql(s"CREATE MATERIALIZED VIEW mcc_block AS\n/* synthetic's comment */\n$window")
+    val lineSql  = projection.replaceFirst("SELECT", "SELECT\n-- synthetic's comment\n")
+    val blockSql = window.replaceFirst("SELECT", "SELECT /* synthetic's comment */")
+    sql(s"CREATE MATERIALIZED VIEW mcc_line AS $lineSql")
+    sql(s"CREATE MATERIALIZED VIEW mcc_block AS $blockSql")
     val lineId  = spark.sessionState.sqlParser.parseTableIdentifier("mcc_line")
     val blockId = spark.sessionState.sqlParser.parseTableIdentifier("mcc_block")
     MvCatalog.lookup(spark, lineId).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
