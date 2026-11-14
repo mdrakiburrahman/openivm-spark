@@ -86,6 +86,29 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       assertMvCorrect("expr_legacy_agg_mv", query)
     }
 
+    it("keeps pinned sources frozen when rebaselining a legacy MV") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_legacy_dim (id INT, label STRING) USING DELTA")
+      sql("INSERT INTO expr_legacy_dim VALUES (1, 'OLD')")
+      val version = sql("DESCRIBE HISTORY expr_legacy_dim").selectExpr("max(version)").head().getLong(0)
+      sql("UPDATE expr_legacy_dim SET label = 'NEW' WHERE id = 1")
+      sql("CREATE TABLE expr_legacy_fact (id INT, amount INT) USING DELTA")
+      sql("INSERT INTO expr_legacy_fact VALUES (1, 10)")
+      val query = s"""SELECT lower(d.label) AS label, f.amount FROM expr_legacy_dim VERSION AS OF $version d
+                     |JOIN expr_legacy_fact f ON f.id = d.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_legacy_pin_mv AS $query")
+      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_pin_mv")
+      val meta = MvCatalog.lookup(spark, id).get
+      meta.refreshType should not be RefreshTypeCode.FullRefresh
+      MvCatalog.updateProperties(spark, id, meta.properties - SparkExpressionPrepass.RestoredInitialLoadProperty)
+      sql("INSERT OVERWRITE TABLE expr_legacy_fact SELECT 1, 20")
+      refreshMv("expr_legacy_pin_mv")
+      assertMvCorrect("expr_legacy_pin_mv", query)
+      sql("INSERT INTO expr_legacy_fact VALUES (1, 30)")
+      refreshMv("expr_legacy_pin_mv")
+      assertMvCorrect("expr_legacy_pin_mv", query)
+    }
+
     it("retains a real native compile-failure receipt through create and refresh") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_bad_source (id INT) USING DELTA")
