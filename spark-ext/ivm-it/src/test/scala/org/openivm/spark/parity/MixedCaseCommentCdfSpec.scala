@@ -22,10 +22,14 @@ class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") wi
     val blockSql = window.replaceFirst("SELECT", "SELECT /* synthetic's comment */")
     sql(s"CREATE MATERIALIZED VIEW mcc_line AS $lineSql")
     sql(s"CREATE MATERIALIZED VIEW mcc_block AS $blockSql")
-    val lineId  = spark.sessionState.sqlParser.parseTableIdentifier("mcc_line")
-    val blockId = spark.sessionState.sqlParser.parseTableIdentifier("mcc_block")
-    MvCatalog.lookup(spark, lineId).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
-    MvCatalog.lookup(spark, blockId).get.refreshType shouldBe RefreshTypeCode.WindowPartition
+    val lineId    = spark.sessionState.sqlParser.parseTableIdentifier("mcc_line")
+    val blockId   = spark.sessionState.sqlParser.parseTableIdentifier("mcc_block")
+    val lineMeta  = MvCatalog.lookup(spark, lineId).get
+    val blockMeta = MvCatalog.lookup(spark, blockId).get
+    lineMeta.querySql should include("-- synthetic's comment")
+    blockMeta.querySql should include("/* synthetic's comment */")
+    lineMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
+    blockMeta.refreshType shouldBe RefreshTypeCode.WindowPartition
     assertMvCorrect("mcc_line", projection)
     assertMvCorrect("mcc_block", window)
 
