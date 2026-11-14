@@ -60,11 +60,12 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
         bridge.encode(Seq("struct_pack(\"Odd Name\" := txt, nested := struct_pack(other := id))"), Text)(args =>
           s"to_json(${args.head})"
         )
-      val hash = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
+      val hash   = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
+      val quoted = bridge.encode(Seq("""struct_pack("O'Brien\Name" := txt)"""), Text)(args => s"to_json(${args.head})")
       val compiled = compiler.compile(
         CompileRequest(
           "marker_probe",
-          s"SELECT id, $regex AS re, $size AS n, $hash AS digest FROM src",
+          s"SELECT id, $regex AS re, $size AS n, $hash AS digest, $quoted AS quoted FROM src",
           Map("src" -> StructType.fromDDL("id INT, txt STRING"))
         )
       )
@@ -83,11 +84,12 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
           .sql("SELECT * FROM VALUES (1, CAST(NULL AS STRING)), (2, 'a,b') AS src(id, txt)")
           .createOrReplaceTempView("src")
         val expected = """SELECT id, regexp_like('Ä', '(?i)ä') AS re, size(split(txt, ',')) AS n,
-          |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('other', id))), 256) AS digest
+          |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('other', id))), 256) AS digest,
+          |to_json(named_struct(concat('O', chr(39), 'Brien', chr(92), 'Name'), txt)) AS quoted
           |FROM src""".stripMargin
         Seq(false, true).foreach { ansi =>
           spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
-          val actual  = spark.sql(initial).select("id", "re", "n", "digest")
+          val actual  = spark.sql(initial).select("id", "re", "n", "digest", "quoted")
           val correct = spark.sql(expected)
           actual.exceptAll(correct).count() shouldBe 0L
           correct.exceptAll(actual).count() shouldBe 0L
