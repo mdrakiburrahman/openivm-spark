@@ -63,6 +63,14 @@ abstract class SparkExpressionAntiJoinIntegrationScenarios extends IvmParitySpec
 class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with CdfMode {
   it("preserves upstream and downstream identities through correlated anti-join changes") {
     assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+    spark.conf.set("spark.openivm.refresh.windowRunningIncremental.enabled", "true")
+    spark.conf.set("spark.openivm.refresh.groupedWindowState.enabled", "true")
+    spark.conf.set("spark.openivm.compile.classificationCache.enabled", "true")
+    spark.conf.set("spark.databricks.delta.properties.defaults.enableChangeDataFeed", "true")
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set("spark.sql.caseSensitive", "false")
+    spark.conf.set("spark.sql.ansi.enabled", "false")
+    spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
     sql("CREATE TABLE expr_chain_left (id INT, txt STRING) USING DELTA")
     sql("CREATE TABLE expr_chain_right (txt STRING) USING DELTA")
     sql("INSERT INTO expr_chain_left VALUES (1, 'A'), (2, 'B'), (3, NULL)")
