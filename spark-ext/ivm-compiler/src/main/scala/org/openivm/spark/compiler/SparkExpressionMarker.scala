@@ -122,8 +122,8 @@ private[compiler] object SparkExpressionMarker {
           val field = arg.trim
           val split =
             if (field.startsWith("\"") || field.startsWith("`")) {
-              val quote = field.head
-              var pos = 1
+              val quote  = field.head
+              var pos    = 1
               var closed = false
               while (pos < field.length && !closed) {
                 if (field.charAt(pos) == quote) {
@@ -140,7 +140,7 @@ private[compiler] object SparkExpressionMarker {
               pos
             }
           val identifier = field.substring(0, split).trim
-          val tail = field.substring(split).trim
+          val tail       = field.substring(split).trim
           if (!tail.startsWith(":="))
             throw new IllegalStateException("Missing struct field assignment in native SQL")
           val name = if (identifier.startsWith("\"") || identifier.startsWith("`")) {
@@ -156,7 +156,7 @@ private[compiler] object SparkExpressionMarker {
           val value = tail.substring(2).trim
           if (value.isEmpty) throw new IllegalStateException("Missing struct field value in native SQL")
           val hex = name.getBytes(StandardCharsets.UTF_8).map(b => f"${b & 0xff}%02x").mkString
-          Seq(s"decode(unhex('$hex'), 'UTF-8')", restoreStructPacks(value))
+          Seq(s"CAST(X'$hex' AS STRING)", restoreStructPacks(value))
         }
         call.end -> s"named_struct(${fields.mkString(", ")})"
       }
