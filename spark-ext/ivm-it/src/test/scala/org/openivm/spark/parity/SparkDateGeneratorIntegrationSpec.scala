@@ -24,7 +24,8 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
         |(2, NULL, DATE '2024-03-11'),
         |(3, DATE '2024-11-02', DATE '2024-11-04'),
         |(6, DATE '2011-12-29', DATE '2011-12-31')""".stripMargin)
-      val query = s"""SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
+      val interval = if (index == 1) "INTERVAL 1 DAY" else "INTERVAL '1' DAY"
+      val query = s"""SELECT t.id, explode(sequence(t.start_date, t.end_date, $interval)) AS d
         |FROM $source t""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
       val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
@@ -50,7 +51,7 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     sql("CREATE TABLE date_gen_window_source (id INT, start_date DATE, end_date DATE) USING DELTA")
     sql("INSERT INTO date_gen_window_source VALUES (1, DATE '2024-01-01', DATE '2024-01-03')")
     val query = """WITH expanded AS (
-      | SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
+      | SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL 1 DAY)) AS d
       | FROM date_gen_window_source t
       |) SELECT id, d, row_number() OVER (PARTITION BY id ORDER BY d) AS rn FROM expanded""".stripMargin
     sql(s"CREATE MATERIALIZED VIEW date_gen_window_mv AS $query")

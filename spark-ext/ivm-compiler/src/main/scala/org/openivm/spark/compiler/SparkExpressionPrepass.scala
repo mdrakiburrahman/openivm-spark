@@ -204,7 +204,7 @@ private[spark] object SparkExpressionPrepass {
                 sequence.arguments.size == 3 && sequence.arguments.take(2).forall(_.isInstanceOf[UnresolvedAttribute]) &&
                 !sequence.isDistinct && sequence.filter.isEmpty && !sequence.ignoreNulls &&
                 sql.substring(expressionSpan(sql, sequence.arguments(2)).start, expressionSpan(sql, sequence.arguments(2)).end)
-                  .trim.matches("(?i)INTERVAL\\s*'1'\\s+DAY") =>
+                  .trim.matches("(?i)INTERVAL(?:\\s*'1'|\\s+1)\\s+DAY") =>
             generators += ((explode, sequence))
           case _ => explode.children.foreach(child => expressions(child, scope))
         }
