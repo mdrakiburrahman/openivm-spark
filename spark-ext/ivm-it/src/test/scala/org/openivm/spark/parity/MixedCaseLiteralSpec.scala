@@ -9,8 +9,12 @@ class MixedCaseLiteralSpec extends IvmParitySpecBase("mixed-case-literals") with
     Map("spark.openivm.compile.classificationCache.enabled" -> "true")
 
   it("preserves mixed-case literals in a two-source composite ROW_NUMBER MV on create and refresh") {
-    sql("CREATE TABLE mcl_flag_base (row_id INT, org_id STRING, contract_id STRING, changed_at TIMESTAMP, is_blocked BOOLEAN, needs_review BOOLEAN, is_clear BOOLEAN, reason STRING) USING DELTA")
-    sql("CREATE TABLE mcl_sku_base (row_id INT, org_id STRING, contract_id STRING, changed_at TIMESTAMP, family STRING, model STRING) USING DELTA")
+    sql(
+      "CREATE TABLE mcl_flag_base (row_id INT, org_id STRING, contract_id STRING, changed_at TIMESTAMP, is_blocked BOOLEAN, needs_review BOOLEAN, is_clear BOOLEAN, reason STRING) USING DELTA"
+    )
+    sql(
+      "CREATE TABLE mcl_sku_base (row_id INT, org_id STRING, contract_id STRING, changed_at TIMESTAMP, family STRING, model STRING) USING DELTA"
+    )
     sql(
       "INSERT INTO mcl_flag_base VALUES " +
         "(1, 'org-a', 'contract-1', TIMESTAMP'2024-01-01 00:00:00', false, false, true, 'MiXeD'), " +
