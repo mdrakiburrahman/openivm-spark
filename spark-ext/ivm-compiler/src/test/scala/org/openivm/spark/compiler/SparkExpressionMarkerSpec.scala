@@ -62,10 +62,14 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
         )
       val hash   = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
       val quoted = bridge.encode(Seq("""struct_pack("O'Brien\Name" := txt)"""), Text)(args => s"to_json(${args.head})")
+      val flattened = bridge.encode(Seq("txt", "id"), Text)(args =>
+        s"to_json(named_struct('dup', ${args.head}, 'dup', named_struct('nested', ${args(1)})), " +
+          "map('ignoreNullFields', 'false'))"
+      )
       val compiled = compiler.compile(
         CompileRequest(
           "marker_probe",
-          s"SELECT id, $regex AS re, $size AS n, $hash AS digest, $quoted AS quoted FROM src",
+          s"SELECT id, $regex AS re, $size AS n, $hash AS digest, $quoted AS quoted, $flattened AS flattened FROM src",
           Map("src" -> StructType.fromDDL("id INT, txt STRING"))
         )
       )
@@ -85,11 +89,13 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
           .createOrReplaceTempView("src")
         val expected = """SELECT id, regexp_like('Ä', '(?i)ä') AS re, size(split(txt, ',')) AS n,
           |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('other', id))), 256) AS digest,
-          |to_json(named_struct(concat('O', chr(39), 'Brien', chr(92), 'Name'), txt)) AS quoted
+          |to_json(named_struct(concat('O', chr(39), 'Brien', chr(92), 'Name'), txt)) AS quoted,
+          |to_json(named_struct('dup', txt, 'dup', named_struct('nested', id)),
+          |map('ignoreNullFields', 'false')) AS flattened
           |FROM src""".stripMargin
         Seq(false, true).foreach { ansi =>
           spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
-          val actual  = spark.sql(initial).select("id", "re", "n", "digest", "quoted")
+          val actual  = spark.sql(initial).select("id", "re", "n", "digest", "quoted", "flattened")
           val correct = spark.sql(expected)
           actual.exceptAll(correct).count() shouldBe 0L
           correct.exceptAll(actual).count() shouldBe 0L
