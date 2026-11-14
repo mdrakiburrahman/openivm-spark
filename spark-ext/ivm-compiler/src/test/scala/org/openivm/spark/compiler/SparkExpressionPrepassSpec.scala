@@ -11,7 +11,7 @@ import org.scalatest.matchers.should.Matchers
 
 class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
   "Spark expression prepass" should "produce Spark-parseable SQL with pinned sources" in {
-    val query = "SELECT lower(d.label) FROM dim VERSION AS OF 1 d JOIN fact f ON d.id = f.id"
+    val query    = "SELECT lower(d.label) FROM dim VERSION AS OF 1 d JOIN fact f ON d.id = f.id"
     val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
     prepared.sql should include("__openivm_spark_expression")
     CatalystSqlParser.parsePlan(prepared.sql)

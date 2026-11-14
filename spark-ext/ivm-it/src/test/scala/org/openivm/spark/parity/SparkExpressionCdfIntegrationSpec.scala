@@ -25,7 +25,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       val query = s"""SELECT f.id, lower(d.label) AS label
         |FROM expr_pin_dim VERSION AS OF $pinned d JOIN expr_pin_fact f ON d.id = f.dim_id""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW expr_pin_mv AS $query")
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_pin_mv")
+      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_pin_mv")
       val meta = MvCatalog.lookup(spark, id).get
       meta.properties.get(MvMetadata.CompileRefreshTypeKey) should not be Some("COMPILE_FAILED")
       meta.refreshType should not be RefreshTypeCode.FullRefresh

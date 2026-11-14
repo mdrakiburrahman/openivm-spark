@@ -119,7 +119,7 @@ object MvDryCompile {
         case _: Throwable => WorkloadFacts()
       }
 
-    val compiler = OpenIvmCompilers.forSession(spark)
+    val compiler         = OpenIvmCompilers.forSession(spark)
     val expressionBridge = SparkExpressionPrepass.prepare(queryText, spark.sessionState.conf.caseSensitiveAnalysis)
     val compiled =
       compiler.compile(

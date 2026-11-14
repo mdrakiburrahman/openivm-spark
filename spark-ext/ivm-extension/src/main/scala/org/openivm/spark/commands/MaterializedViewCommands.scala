@@ -3266,7 +3266,7 @@ case class CreateMaterializedViewCommand(
         )
       else {
         val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
-        val restored = expressionBridge.markers.restore(translated)
+        val restored   = expressionBridge.markers.restore(translated)
         expressionBridge.markers.requireAllSeen()
         restored
       }
