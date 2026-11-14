@@ -8,6 +8,35 @@ abstract class CompileBridgeScalarScenarios extends IvmParitySpecBase("compile-b
 
   override protected def extraSparkConf: Map[String, String] = Map(FeatureGate.ProfileRefreshKey -> "true")
 
+  it("recomputes multi-CTE grouped views with trim predicates and projections") {
+    val src = s"cbs_${modeLabel}_trim_probe_src"
+    val mv  = s"cbs_${modeLabel}_trim_probe_mv"
+    sql(s"CREATE TABLE $src (id STRING, quantity INT) USING DELTA")
+    sql(s"INSERT INTO $src VALUES (' a ', 5), (' a ', 6), ('b', 8), ('', 9), (NULL, 10)")
+    val body = s"""WITH source_rows AS (
+      | SELECT id, quantity, NULLIF(TRIM(CAST(id AS STRING)), '') AS normalized FROM $src
+      |), candidates AS (
+      | SELECT * FROM source_rows WHERE NULLIF(TRIM(id), '') IS NOT NULL
+      |), base_rows AS (
+      | SELECT id, MAX_BY(NAMED_STRUCT('quantity', quantity), quantity) AS winner FROM source_rows GROUP BY id
+      |), link_rows AS (
+      | SELECT id, MAX_BY(NAMED_STRUCT('normalized', normalized), quantity) AS winner FROM candidates GROUP BY id
+      |)
+      |SELECT b.id, b.winner.quantity AS amount, l.winner.normalized AS normalized
+      |FROM base_rows b LEFT JOIN link_rows l ON b.id = l.id""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW $mv AS $body")
+    MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get.refreshTypeName should equal(
+      "GROUP_RECOMPUTE"
+    )
+    assertMvCorrect(mv, body)
+    sql(s"INSERT INTO $src VALUES (' a ', 7), ('e', 8)")
+    sql(s"DELETE FROM $src WHERE id = 'b'")
+    RefreshProfileCatalog.removeAll(spark)
+    refreshMv(mv)
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+    assertMvCorrect(mv, body)
+  }
+
   it("preserves infinity and trim predicates through incremental refresh") {
     val src       = s"cbs_${modeLabel}_nonfinite_src"
     val aggregate = s"cbs_${modeLabel}_nonfinite_mv"
