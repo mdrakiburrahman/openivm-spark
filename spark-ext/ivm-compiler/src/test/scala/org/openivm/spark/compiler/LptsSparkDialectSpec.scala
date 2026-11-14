@@ -26,8 +26,45 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
 
     it("leaves unsupported struct field shapes unchanged") {
-      val sql = "SELECT max_by(struct(a), struct(k AS f1)) FROM t"
+      val sql = "SELECT max_by(struct(a + 1), struct(k AS f1)) FROM t"
       SparkFunctionShimSql.rewriteStructMaxBy(sql) shouldBe sql
+    }
+
+    it("preserves inferred field names in bare-column struct aggregates") {
+      val sql    = """SELECT max_by(struct(t.id, t.name), struct(t.ts)) FROM t"""
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native shouldBe "SELECT arg_max(struct_pack(id := t.id, name := t.name), struct_pack(ts := t.ts)) FROM t"
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'6964' AS STRING), t.id,")
+      restored should include("named_struct(CAST(X'7473' AS STRING), t.ts)")
+    }
+
+    it("round-trips nested named structs with scalar and structured ordering keys") {
+      val sql = """SELECT named_struct('Mixed "name"', named_struct('inner''s', x)) AS k,
+        |max_by(named_struct('Mixed "name"', x), score),
+        |max_by(named_struct('value', x), named_struct('outer', named_struct('timestamp', ts)))
+        |FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("""named_struct('Mixed "name"', named_struct('inner''s', x))""")
+      native should include("arg_max(struct_pack(\"Mixed \"\"name\"\"\" := x), score)")
+      native should include(
+        """arg_max(struct_pack("value" := x), struct_pack("outer" := struct_pack("timestamp" := ts)))"""
+      )
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'4d6978656420226e616d6522' AS STRING), x), score)")
+      restored should include(
+        "named_struct(CAST(X'6f75746572' AS STRING), named_struct(CAST(X'74696d657374616d70' AS STRING), ts))"
+      )
+      restored should include("""named_struct('Mixed "name"', named_struct(concat('inner', chr(39), 's'), x))""")
+    }
+
+    it("does not translate named structs inside unrelated scalar expressions") {
+      val sql = """SELECT max_by(named_struct('value', x),
+        |CASE WHEN named_struct('k', NULL) > named_struct('k', 1) THEN 1 ELSE 0 END) FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("CASE WHEN named_struct('k', NULL) > named_struct('k', 1)")
+      val comparison = "SELECT named_struct('k', NULL) > named_struct('k', 1) FROM t"
+      SparkFunctionShimSql.rewriteStructMaxBy(comparison) shouldBe comparison
     }
   }
 
