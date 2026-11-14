@@ -41,17 +41,24 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
     it("round-trips nested named structs with scalar and structured ordering keys") {
       val sql = """SELECT named_struct('Mixed "name"', named_struct('inner''s', x)) AS k,
-        |max_by(named_struct('value', x), score),
+        |max_by(named_struct('Mixed "name"', x), score),
         |max_by(named_struct('value', x), named_struct('outer', named_struct('timestamp', ts)))
         |FROM t""".stripMargin
-      val native = SparkFunctionShimSql.rewriteStructMaxBy(SparkFunctionShimSql.rewriteNamedStructs(sql))
-      native should include("struct_pack(\"Mixed \"\"name\"\"\" := struct_pack(\"inner's\" := x))")
-      native should include("""arg_max(struct_pack("value" := x), score)""")
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("""named_struct('Mixed "name"', named_struct('inner''s', x))""")
+      native should include("arg_max(struct_pack(\"Mixed \"\"name\"\"\" := x), score)")
       native should include("""arg_max(struct_pack("value" := x), struct_pack("outer" := struct_pack("timestamp" := ts)))""")
       val restored = LptsSparkDialect.translate(native)
-      restored should include("max_by(named_struct(CAST(X'76616c7565' AS STRING), x), score)")
+      restored should include("max_by(named_struct(CAST(X'4d6978656420226e616d6522' AS STRING), x), score)")
       restored should include("named_struct(CAST(X'6f75746572' AS STRING), named_struct(CAST(X'74696d657374616d70' AS STRING), ts))")
-      restored should include("CAST(X'4d6978656420226e616d6522' AS STRING)")
+      restored should include("""named_struct('Mixed "name"', named_struct(concat('inner', chr(39), 's'), x))""")
+    }
+
+    it("does not translate named structs inside unrelated scalar expressions") {
+      val sql = """SELECT max_by(named_struct('value', x),
+        |CASE WHEN named_struct('k', NULL) > named_struct('k', 1) THEN 1 ELSE 0 END) FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("CASE WHEN named_struct('k', NULL) > named_struct('k', 1)")
     }
   }
 
@@ -778,10 +785,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       val expected = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, concat(chr(92)) -- 'comment\text'
                        |/* 'comment\text' */ FROM src""".stripMargin
       LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe expected
-      LptsSparkDialect.translate(sql) shouldBe expected.replace(
-        """struct_pack("O'Brien\Name" := txt)""",
-        "named_struct(CAST(X'4f27427269656e5c4e616d65' AS STRING), txt)"
-      )
+      LptsSparkDialect.translate(sql) shouldBe expected
     }
 
     it("rewrites a bare backslash literal to a concat(chr(92)) expression") {
