@@ -2218,7 +2218,7 @@ private[commands] object MvCommandHelper {
       table.identifier.database.fold(table.identifier.table)(db => s"$db.${table.identifier.table}")
     def collect(plan: LogicalPlan): Seq[String] = plan match {
       case view: View if MvProjectionSource.isProjection(view) => Nil
-      case relation: HiveTableRelation => Seq(qualified(relation.tableMeta))
+      case relation: HiveTableRelation                         => Seq(qualified(relation.tableMeta))
       case relation: LogicalRelation =>
         relation.catalogTable.filter(_.provider.exists(_.equalsIgnoreCase("hive"))).map(qualified).toSeq
       case other =>

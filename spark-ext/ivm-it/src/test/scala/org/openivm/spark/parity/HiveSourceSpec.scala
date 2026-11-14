@@ -10,7 +10,7 @@ abstract class HiveSourceScenarios extends IvmParitySpecBase("hive-source") {
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.sql.catalogImplementation" -> "hive",
+    "spark.sql.catalogImplementation"           -> "hive",
     "spark.sql.legacy.createHiveTableByDefault" -> "true",
     "javax.jdo.option.ConnectionURL" -> s"jdbc:derby:memory:hivesource${UUID.randomUUID().toString.replace("-", "")};create=true"
   )
@@ -70,5 +70,5 @@ abstract class HiveSourceScenarios extends IvmParitySpecBase("hive-source") {
   }
 }
 
-class HiveSourceSpec extends HiveSourceScenarios with InterceptMode
+class HiveSourceSpec    extends HiveSourceScenarios with InterceptMode
 class HiveSourceCdfSpec extends HiveSourceScenarios with CdfMode

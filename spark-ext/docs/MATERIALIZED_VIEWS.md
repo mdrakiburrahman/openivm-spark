@@ -23,6 +23,19 @@ MIN/MAX grouped aggregates use the `AGGREGATE_GROUP` affected-groups path
 AGGREGATE_GROUP or SIMPLE_PROJECTION path (`JoinsSpec`). MV-over-MV chains are
 supported at depth ≤ 2 (`ChainedSpec`); depth > 2 is out of scope.
 
+## Hive-backed sources
+
+Hive tables, including partitioned tables and joins with Delta sources, are
+registered with the native compiler. Since Hive has no Delta change feed or
+versioned snapshots, a view directly referencing a Hive table is classified
+as `FULL_REFRESH` with reason `unversioned_hive_source` and recomputed on
+every refresh in both intercept and CDF modes. Native compilation failures
+remain separately reported as `COMPILE_FAILED`. Refresh invalidates Spark's
+cached source metadata before reading; external writers must finish and make
+their partitions visible in the Hive metastore before refresh starts.
+Downstream views receive the normal replacement notification. Delta-only views
+retain their existing incremental behavior.
+
 ## Opt-in running-window refresh
 
 Set `spark.openivm.refresh.windowRunningIncremental.enabled=true` before starting
