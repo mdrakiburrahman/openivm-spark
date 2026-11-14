@@ -125,8 +125,9 @@ private[spark] object SparkExpressionPrepass {
       case branch: If =>
         expressions(branch.predicate, scope)
         branch.predicate match {
-          case literal: Literal if literal.value == false || literal.value == null => expressions(branch.falseValue, scope)
-          case literal: Literal if literal.value == true                           => expressions(branch.trueValue, scope)
+          case literal: Literal if literal.value == false || literal.value == null =>
+            expressions(branch.falseValue, scope)
+          case literal: Literal if literal.value == true => expressions(branch.trueValue, scope)
           case _ =>
             expressions(branch.trueValue, scope)
             expressions(branch.falseValue, scope)

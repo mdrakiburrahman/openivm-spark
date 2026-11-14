@@ -5442,7 +5442,9 @@ case class RefreshMaterializedViewCommand(
           sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1") &&
           meta.refreshType != RefreshTypeCode.FullRefresh &&
           !meta.properties.contains(SparkExpressionPrepass.RestoredInitialLoadProperty) &&
-          SparkExpressionPrepass.prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis).sql != meta.querySql
+          SparkExpressionPrepass
+            .prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis)
+            .sql != meta.querySql
         )
           throw new IllegalStateException(
             "Cannot rebaseline a legacy MV requiring Spark expression restoration without recompiling its initial load"
@@ -5749,7 +5751,7 @@ case class RefreshMaterializedViewCommand(
             )
           )
         else None
-      val compileRequest = originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
+      val compileRequest   = originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
       val compileCacheTier = compiler.compileCacheTier(compileRequest)
       var refreshProperties =
         if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
