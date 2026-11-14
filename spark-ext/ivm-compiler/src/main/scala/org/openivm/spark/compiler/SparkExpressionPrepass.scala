@@ -19,7 +19,7 @@ import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.openivm.spark.compiler.SparkExpressionMarker._
 
-private[compiler] object SparkExpressionPrepass {
+private[spark] object SparkExpressionPrepass {
   final case class Prepared(sql: String, markers: SparkExpressionMarker)
   private final case class Span(start: Int, end: Int)
   private final case class Edit(span: Span, render: Seq[String] => String)

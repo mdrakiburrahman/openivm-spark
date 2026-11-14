@@ -10,7 +10,7 @@ import scala.collection.mutable
   * This helper only encodes and decodes expressions; callers must preserve them
   * throughout native planning and reject any compilation that loses a marker.
   */
-private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
+private[spark] final class SparkExpressionMarker(opaque: Boolean = false) {
   import SparkExpressionMarker._
 
   private val prefix  = "__openivm_expr_" + UUID.randomUUID().toString.replace("-", "") + "_"

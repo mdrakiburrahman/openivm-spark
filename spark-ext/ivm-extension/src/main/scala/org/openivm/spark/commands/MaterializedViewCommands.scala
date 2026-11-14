@@ -41,7 +41,13 @@ import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, St
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
+import org.openivm.spark.compiler.{
+  CompiledRefresh,
+  CompileRequest,
+  OpenIvmCompiler,
+  SparkExpressionPrepass,
+  SparkTimeTravelSql
+}
 import org.openivm.spark.insights.OpenIvmInsightsBroker
 import org.openivm.spark.streaming.{
   StreamingInsightEvents,
@@ -2978,9 +2984,13 @@ case class CreateMaterializedViewCommand(
       )
     }
     val compiler = OpenIvmCompilers.forSession(spark)
+    val expressionBridge =
+      if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+        Some(SparkExpressionPrepass.prepare(originalQueryText, spark.sessionState.conf.caseSensitiveAnalysis))
+      else None
     val createCompileRequest = CompileRequest(
       viewName = name.table,
-      viewSql = originalQueryText,
+      viewSql = expressionBridge.map(_.sql).getOrElse(originalQueryText),
       sources = compileSchemas,
       sourceQualifiedNames = pinBinding.friendlyByShort,
       sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(pinBinding),
@@ -3249,8 +3259,16 @@ case class CreateMaterializedViewCommand(
           qualNames,
           pinBinding.resolvedPins
         )
-      else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+      else {
+        val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        expressionBridge match {
+          case Some(bridge) =>
+            val restored = bridge.markers.restore(translated)
+            bridge.markers.requireAllSeen()
+            restored
+          case None => translated
+        }
+      }
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
     }
@@ -5662,7 +5680,9 @@ case class RefreshMaterializedViewCommand(
         refreshResolvedPins,
         freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
       )
-      val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
+      val compileCacheEnabled =
+        FeatureGate
+          .compileClassificationCacheEnabled(spark) && !sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1")
       // Pinned and source-advance schemas can describe a historical snapshot;
       // discover their current constraint metadata through the existing path.
       val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
@@ -5687,9 +5707,13 @@ case class RefreshMaterializedViewCommand(
       val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
         OpenIvmCompilers.forSession(spark)
       }
+      val expressionBridge =
+        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+          Some(SparkExpressionPrepass.prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis))
+        else None
       val compileRequest = CompileRequest(
         viewName = name.table,
-        viewSql = meta.querySql,
+        viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql),
         sources = compileSchemas,
         sourceQualifiedNames = shortToQual,
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
@@ -6114,10 +6138,12 @@ case class RefreshMaterializedViewCommand(
               SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
             val withSkewFanout =
               SparkRefreshRewriter.injectSkewFanoutBroadcastHints(withSelectiveBroadcast, skewFanoutDeltaBroadcasts)
-            if (FeatureGate.scd2RangeAccelEnabled(spark))
-              SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
-            else
-              withSkewFanout
+            val processed =
+              if (FeatureGate.scd2RangeAccelEnabled(spark))
+                SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
+              else
+                withSkewFanout
+            expressionBridge.map(_.markers.restore(processed)).getOrElse(processed)
           }
 
           val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)
@@ -6197,6 +6223,7 @@ case class RefreshMaterializedViewCommand(
               )
             }
           }
+          expressionBridge.foreach(_.markers.requireAllSeen())
 
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
