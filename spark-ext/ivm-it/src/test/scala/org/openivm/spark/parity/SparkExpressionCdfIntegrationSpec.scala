@@ -38,6 +38,23 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       assertMvCorrect("expr_struct_mv", query)
     }
 
+    it("incrementally maintains struct aggregate fields containing Spark expressions") {
+      sql("CREATE TABLE expr_struct_marker_source (grp STRING, id INT, name STRING, ts TIMESTAMP) USING DELTA")
+      sql("""INSERT INTO expr_struct_marker_source VALUES
+        |('a', 1, 'FIRST', TIMESTAMP '2024-01-01 00:00:00'),
+        |('a', 2, 'SECOND', TIMESTAMP '2024-02-01 00:00:00')""".stripMargin)
+      val query = """SELECT grp, max_by(struct(id AS f1, lower(name) AS f2),
+        |struct(ts AS f1)) AS picked FROM expr_struct_marker_source GROUP BY grp""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_struct_marker_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_struct_marker_mv")
+      MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
+      assertMvCorrect("expr_struct_marker_mv", query)
+      sql("UPDATE expr_struct_marker_source SET name = 'UPDATED' WHERE id = 2")
+      sql("INSERT INTO expr_struct_marker_source VALUES ('b', 3, 'THIRD', NULL)")
+      refreshMv("expr_struct_marker_mv")
+      assertMvCorrect("expr_struct_marker_mv", query)
+    }
+
     it("preserves qualified epoch conversion and conditional errors") {
       sql("CREATE TABLE expr_epoch_source (id INT, ts TIMESTAMP, txt STRING, invalid BOOLEAN) USING DELTA")
       sql("INSERT INTO expr_epoch_source VALUES (1, TIMESTAMP '2024-01-01 01:02:03', 'A', false)")
