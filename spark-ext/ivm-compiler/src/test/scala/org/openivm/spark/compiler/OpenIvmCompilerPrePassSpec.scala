@@ -5,6 +5,24 @@ import org.scalatest.matchers.should.Matchers
 
 class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
 
+  describe("Spark scalar markers") {
+    it("round-trips only direct column calls and rejects lost markers") {
+      val markers = new SparkFunctionShimSql.ScalarDialectMarkers
+      val input = """SELECT lower(s.flag), unix_timestamp(s.ts), timestampdiff(SECOND, s.ts, s.end_ts),
+                    |lower(concat(s.flag, 'x')), my_schema.lower(s.flag), 'lower(s.flag)' FROM src s""".stripMargin
+      val rewritten = markers.rewrite(input)
+      rewritten should include("lower(concat(s.flag, 'x'))")
+      rewritten should include("my_schema.lower(s.flag)")
+      rewritten should include("'lower(s.flag)'")
+      intercept[IllegalStateException](markers.requireAllSeen())
+      val restored = markers.restore(rewritten)
+      restored should include("lower(s.flag)")
+      restored should include("unix_timestamp(s.ts)")
+      restored should include("timestampdiff(SECOND, s.ts, s.end_ts)")
+      markers.requireAllSeen()
+    }
+  }
+
   describe("DuckDB-incompatible tokens") {
     it("rewrites null-safe equality and the reserved column name only outside protected text") {
       val input = """SELECT s.collation, collation(x), 'collation <=>', "collation",

@@ -34,6 +34,87 @@ private[compiler] object SparkFunctionShimSql {
   private val OneArgToDateLiteral      = "'%Y-%m-%d'"
   private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
 
+  /** Carries direct-column Spark calls through native planning without evaluating them there. */
+  private[compiler] final class ScalarDialectMarkers {
+    private val prefix = "__openivm_scalar_" + java.util.UUID.randomUUID().toString.replace("-", "") + "_"
+    private val calls  = scala.collection.mutable.Map.empty[String, (String, Int)]
+    private val seen   = scala.collection.mutable.Set.empty[String]
+    private val column = """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")(?:(?:\s*\.\s*)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"))*""".r
+
+    def nonEmpty: Boolean = calls.nonEmpty
+
+    def rewrite(sql: String): String =
+      rewriteOutsideProtected(sql) { i =>
+        Seq("unix_timestamp", "timestampdiff", "lower").iterator.flatMap { name =>
+          parseFunctionCallAt(sql, i, name).flatMap { call =>
+            var before = i - 1
+            while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+            if (before >= 0 && sql.charAt(before) == '.') None
+            else {
+              splitTopLevelArgs(sql, call).flatMap { ranges =>
+                val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+                val values =
+                  if (name == "timestampdiff" && args.size == 3 && args.head.equalsIgnoreCase("SECOND"))
+                    args.tail
+                  else if (name != "timestampdiff" && args.size == 1) args
+                  else Seq.empty
+                if (values.isEmpty || !values.forall(arg => column.pattern.matcher(arg).matches())) None
+                else {
+                  val id = prefix + calls.size + "__"
+                  calls.put(id, name -> values.size)
+                  val payload = s"concat('$id', CAST(row(${values.mkString(", ")}) AS VARCHAR))"
+                  val encoded = if (name == "lower") payload else s"CAST($payload AS BIGINT)"
+                  Some(call.closeParen + 1 -> encoded)
+                }
+              }
+            }
+          }
+        }.take(1).toSeq.headOption
+      }
+
+    def restore(sql: String): String = {
+      val restored = rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+        parseFunctionCallAt(sql, i, "concat").flatMap { call =>
+          splitTopLevelArgs(sql, call).flatMap {
+            case Seq(markerRange, castRange) =>
+              val literal = sql.substring(markerRange._1, markerRange._2).trim
+              val id = if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
+                literal.substring(1, literal.length - 1)
+              else ""
+              calls.get(id).flatMap { case (name, arity) =>
+                parseSingleFunctionCallInRange(sql, castRange, "cast").flatMap { cast =>
+                  val begin = cast.openParen + 1
+                  findTopLevelKeyword(sql, begin, cast.closeParen, "AS").flatMap { as =>
+                    val target = sql.substring(as + 2, cast.closeParen).trim
+                    if (!target.equalsIgnoreCase("VARCHAR") && !target.equalsIgnoreCase("STRING")) None
+                    else
+                      parseSingleFunctionCallInRange(sql, (begin, as), "row").flatMap { row =>
+                        splitTopLevelArgs(sql, row).filter(_.size == arity).map { ranges =>
+                          val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+                          seen += id
+                          val rendered =
+                            if (name == "timestampdiff") s"timestampdiff(SECOND, ${args.mkString(", ")})"
+                            else s"$name(${args.mkString(", ")})"
+                          call.closeParen + 1 -> rendered
+                        }
+                      }
+                  }
+                }
+              }
+            case _ => None
+          }
+        }
+      }
+      if (restored.contains(prefix))
+        throw new IllegalStateException("Unresolved Spark scalar marker in native SQL")
+      restored
+    }
+
+    def requireAllSeen(): Unit =
+      if (calls.keySet.exists(id => !seen.contains(id)))
+        throw new IllegalStateException("Native compiler lost a Spark scalar marker")
+  }
+
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
     "to_date" -> RenameRule(
       Map(

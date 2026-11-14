@@ -1,5 +1,7 @@
 package org.openivm.spark.compiler
 
+import java.util.Locale
+
 import org.apache.spark.sql.types._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -69,6 +71,28 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     )
     r.refreshTypeName should not equal "FULL_REFRESH"
     r.sql should not be empty
+  }
+
+  "Spark scalar dialect calls" should "survive native compilation in the reported expression chains" in {
+    val r = compileBody(
+      viewName = "shim_scalar_calls",
+      sources = Map("scalar_src" -> StructType.fromDDL("id STRING, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")),
+      body = """WITH discovery AS (
+        |  SELECT id, flag, start_ts, end_ts,
+        |    ROW_NUMBER() OVER (PARTITION BY id ORDER BY start_ts DESC, end_ts DESC) AS rn
+        |  FROM scalar_src
+        |), latest AS (SELECT * FROM discovery WHERE rn = 1)
+        |SELECT id, CASE WHEN LOWER(flag) = 'true' THEN 1 ELSE 0 END AS f,
+        |  CASE WHEN UNIX_TIMESTAMP(start_ts) = 0 THEN CAST(NULL AS TIMESTAMP) ELSE start_ts END AS t,
+        |  CAST(COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, start_ts, end_ts), 0), -1) AS INT) AS d
+        |FROM latest""".stripMargin
+    )
+    r.refreshTypeName should equal("WINDOW_PARTITION")
+    val translated = LptsSparkDialect.translate(r.sql) + "\n" + r.initialLoadSql
+    translated.toLowerCase(Locale.ROOT) should include("unix_timestamp(")
+    translated.toLowerCase(Locale.ROOT) should include("timestampdiff(second,")
+    translated.toLowerCase(Locale.ROOT) should include("lower(")
+    translated should not include "__openivm_scalar_"
   }
 
   "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {

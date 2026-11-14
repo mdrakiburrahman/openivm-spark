@@ -229,17 +229,43 @@ class OpenIvmCompiler private (
       }
       lastStdout = stdout
       lastStderr = stderr
-      val nativeViewName = stdout.linesIterator
+      var resultStdout = stdout
+      var resultDir    = tmpDir
+      var markers: Option[SparkFunctionShimSql.ScalarDialectMarkers] = None
+      val partial = try {
+        parseCompileResult(stdout, req.viewName, stderr)
+      } catch {
+        case first: OpenIvmCompileException if {
+              val error = stderr.toLowerCase(Locale.ROOT)
+              error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
+            } =>
+          val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
+          val rewritten = candidate.rewrite(normalizedViewSql)
+          if (!candidate.nonEmpty) throw first
+          resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
+          val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
+          val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+            runCli(retry, resultDir)
+          }
+          resultStdout = retryStdout
+          lastStdout = retryStdout
+          lastStderr = retryStderr
+          markers = Some(candidate)
+          parseCompileResult(retryStdout, req.viewName, retryStderr)
+      }
+      val nativeViewName = resultStdout.linesIterator
         .find(_.contains("\"openivm_bridge_view_key\""))
         .map { line =>
           val key = "\"openivm_bridge_view_key\""
           decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
         }
         .getOrElse(req.viewName)
-      val partial  = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
+      val restore: String => String = sql => markers.fold(sql)(_.restore(sql))
+      val initLoad = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      val resultSql = restore(normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName))
+      if (partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       partial.copy(
-        sql = normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName),
+        sql = resultSql,
         initialLoadSql = initLoad
       )
     } catch {
@@ -319,10 +345,13 @@ class OpenIvmCompiler private (
       req: CompileRequest,
       tableDdls: Seq[(String, String)],
       tmpDir: Path,
-      normalizedViewSql: String
+      normalizedViewSql: String,
+      preserveScalarMarkers: Boolean = false
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
+    if (preserveScalarMarkers)
+      sb ++= "SET disabled_optimizers='expression_rewriter,common_subexpressions';\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -820,7 +849,12 @@ class OpenIvmCompiler private (
     * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
     * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
-  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeViewName: String = ""): String = {
+  private[compiler] def parseInitialLoadSql(
+      tmpDir: Path,
+      req: CompileRequest,
+      nativeViewName: String = "",
+      restore: String => String = identity
+  ): String = {
     import java.util.regex.Pattern
     val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
     val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
@@ -834,7 +868,7 @@ class OpenIvmCompiler private (
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    val extracted = m.group(1).trim
+    val extracted = restore(m.group(1).trim)
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
