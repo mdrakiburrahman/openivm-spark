@@ -18,7 +18,8 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_baseline_source (id INT, txt STRING, m MAP<STRING, INT>) USING DELTA")
       sql("INSERT INTO expr_baseline_source VALUES (1, 'ABC', map('a', 1)), (2, NULL, map('a', 2))")
-      val query = "SELECT id, element_at(m, 'a') AS n, CASE WHEN false THEN lower(txt) ELSE 'x' END AS v FROM expr_baseline_source"
+      val query =
+        "SELECT id, element_at(m, 'a') AS n, CASE WHEN false THEN lower(txt) ELSE 'x' END AS v FROM expr_baseline_source"
       sql(s"CREATE MATERIALIZED VIEW expr_baseline_mv AS $query")
       val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_baseline_mv")
       MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
@@ -43,18 +44,46 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       MvCatalog.lookup(spark, id) shouldBe None
     }
 
-    it("fails closed when a legacy MV requires rebaseline") {
+    it("recompiles a legacy MV when it requires rebaseline") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_legacy_source (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_legacy_source VALUES (1, 'A')")
       sql("CREATE MATERIALIZED VIEW expr_legacy_mv AS SELECT id, lower(txt) AS v FROM expr_legacy_source")
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_mv")
+      val id         = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_mv")
       val properties = MvCatalog.lookup(spark, id).get.properties - SparkExpressionPrepass.RestoredInitialLoadProperty
       MvCatalog.updateProperties(spark, id, properties)
       sql("INSERT OVERWRITE TABLE expr_legacy_source SELECT 2, 'B'")
-      val error = intercept[IllegalStateException] { refreshMv("expr_legacy_mv") }
-      error.getMessage should include("Cannot rebaseline a legacy MV")
-      assertMvCorrect("expr_legacy_mv", "SELECT 1 AS id, 'a' AS v")
+      refreshMv("expr_legacy_mv")
+      assertMvCorrect("expr_legacy_mv", "SELECT id, lower(txt) AS v FROM expr_legacy_source")
+      MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      sql("INSERT INTO expr_legacy_source VALUES (3, 'C')")
+      refreshMv("expr_legacy_mv")
+      assertMvCorrect("expr_legacy_mv", "SELECT id, lower(txt) AS v FROM expr_legacy_source")
+    }
+
+    it("preserves aggregate bookkeeping when rebaselining a legacy MV") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_legacy_agg_source (id INT, txt STRING) USING DELTA")
+      sql("INSERT INTO expr_legacy_agg_source VALUES (1, 'A'), (2, 'A')")
+      val query = "SELECT lower(txt) AS v, SUM(id) AS total FROM expr_legacy_agg_source GROUP BY lower(txt)"
+      sql(s"CREATE MATERIALIZED VIEW expr_legacy_agg_mv AS $query")
+      val id     = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_agg_mv")
+      val before = MvCatalog.lookup(spark, id).get
+      before.refreshType shouldBe RefreshTypeCode.AggregateGroup
+      MvCatalog.updateProperties(spark, id, before.properties - SparkExpressionPrepass.RestoredInitialLoadProperty)
+      sql("INSERT OVERWRITE TABLE expr_legacy_agg_source SELECT 4, 'B' UNION ALL SELECT 5, 'B'")
+      refreshMv("expr_legacy_agg_mv")
+      assertMvCorrect("expr_legacy_agg_mv", query)
+      val meta = MvCatalog.lookup(spark, id).get
+      meta.refreshType shouldBe RefreshTypeCode.AggregateGroup
+      val actual = spark.read.format("delta").load(meta.location).select("v", "total", "openivm_count_star")
+      val expected = sql("""SELECT lower(txt) AS v, SUM(id) AS total, COUNT(*) AS openivm_count_star
+                           |FROM expr_legacy_agg_source GROUP BY lower(txt)""".stripMargin)
+      actual.exceptAll(expected).count() shouldBe 0L
+      expected.exceptAll(actual).count() shouldBe 0L
+      sql("INSERT INTO expr_legacy_agg_source VALUES (6, 'B')")
+      refreshMv("expr_legacy_agg_mv")
+      assertMvCorrect("expr_legacy_agg_mv", query)
     }
 
     it("retains a real native compile-failure receipt through create and refresh") {
@@ -138,9 +167,9 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
         if (!ansi) {
           val meta = MvCatalog.lookup(spark, identifier).get
           val tier = detail.split(";").find(_.startsWith("compile_cache_tier=")).get.stripPrefix("compile_cache_tier=")
-          val cached = MvMetadata.cachedCompiledSql(meta.properties, meta.sourceSchemaFingerprint, tier).get
-          val token = "__openivm_expr_([0-9a-f]{64})_[0-9]+__".r.findFirstMatchIn(cached).get.group(1)
-          val legacyTier = tier.takeWhile(_ != ':') + ":" + token
+          val cached      = MvMetadata.cachedCompiledSql(meta.properties, meta.sourceSchemaFingerprint, tier).get
+          val token       = "__openivm_expr_([0-9a-f]{64})_[0-9]+__".r.findFirstMatchIn(cached).get.group(1)
+          val legacyTier  = tier.takeWhile(_ != ':') + ":" + token
           val fingerprint = meta.sourceSchemaFingerprint
           val currentKeys = Seq(
             MvMetadata.compileCacheSqlKey(fingerprint, tier),
@@ -149,7 +178,12 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
             MvMetadata.compileCacheRefreshTypeNameKey(fingerprint, tier)
           )
           val stale = MvMetadata.compiledProperties(
-            fingerprint, legacyTier, "SELECT stale_legacy_cache", "", RefreshTypeCode.SimpleProjection, "SIMPLE_PROJECTION"
+            fingerprint,
+            legacyTier,
+            "SELECT stale_legacy_cache",
+            "",
+            RefreshTypeCode.SimpleProjection,
+            "SIMPLE_PROJECTION"
           )
           MvCatalog.updateProperties(spark, identifier, (meta.properties -- currentKeys) ++ stale)
           sql(s"DELETE FROM $source WHERE id = 5")
