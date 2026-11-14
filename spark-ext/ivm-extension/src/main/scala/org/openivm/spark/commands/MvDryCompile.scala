@@ -9,6 +9,7 @@ import org.openivm.spark.compiler.{
   CompileRequest,
   LptsSparkDialect,
   OpenIvmCompileException,
+  SparkExpressionPrepass,
   SparkTimeTravelSql
 }
 
@@ -120,12 +121,16 @@ object MvDryCompile {
       }
 
     val compiler = OpenIvmCompilers.forSession(spark)
+    val expressionBridge =
+      if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+        Some(SparkExpressionPrepass.prepare(queryText, spark.sessionState.conf.caseSensitiveAnalysis))
+      else None
     val compiled =
       try
         compiler.compile(
           CompileRequest(
             viewName = name.table,
-            viewSql = queryText,
+            viewSql = expressionBridge.map(_.sql).getOrElse(queryText),
             sources = compileSchemas,
             sourceQualifiedNames = pinBinding.friendlyByShort,
             sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding),
@@ -133,6 +138,7 @@ object MvDryCompile {
           )
         )
       catch {
+        case e: OpenIvmCompileException if expressionBridge.nonEmpty => throw e
         case _: OpenIvmCompileException =>
           CompiledRefresh(RefreshTypeCode.FullRefresh, "FULL_REFRESH", "", "")
       }
@@ -184,7 +190,8 @@ object MvDryCompile {
         queryText,
         qualSchemas,
         pinBinding.friendlyByShort,
-        pinBinding.resolvedPins
+        pinBinding.resolvedPins,
+        expressionBridge
       )
 
     DryCompileResult(name, classification, compiled, qualNames, rewrittenStatements, outputSchema)
@@ -205,12 +212,14 @@ object MvDryCompile {
       queryText: String,
       qualSchemas: Map[String, StructType],
       shortToQual: Map[String, String],
-      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin],
+      expressionBridge: Option[SparkExpressionPrepass.Prepared]
   ): Seq[String] = {
     import MvCommandHelper._
     if (classification.refreshType == RefreshTypeCode.FullRefresh) {
       val body =
-        if (compiled.initialLoadSql.nonEmpty) LptsSparkDialect.translate(compiled.initialLoadSql)
+        if (expressionBridge.nonEmpty) queryText
+        else if (compiled.initialLoadSql.nonEmpty) LptsSparkDialect.translate(compiled.initialLoadSql)
         else queryText
       SparkMergeAssembler
         .assemble(
@@ -231,7 +240,7 @@ object MvDryCompile {
         if (classification.refreshType == RefreshTypeCode.AggregateHaving || topKViewSpec.suffixSql.nonEmpty)
           dataTableId(name)
         else name
-      SparkRefreshRewriter
+      val rewritten = SparkRefreshRewriter
         .rewrite(
           compiledSql = compiled.sql,
           mvName = writeTarget,
@@ -239,7 +248,10 @@ object MvDryCompile {
           viewLogicalName = name.table,
           sourceTempViews = Map.empty,
           viewDeltaPath = viewDeltaPath,
-          postProcess = LptsSparkDialect.translate,
+          postProcess = sql => {
+            val translated = LptsSparkDialect.translate(sql)
+            expressionBridge.map(_.markers.restore(translated)).getOrElse(translated)
+          },
           sourceSchemas = qualSchemas.map { case (qual, schema) =>
             qual.split("\\.").last -> schema.fieldNames.toSeq
           },
@@ -267,6 +279,8 @@ object MvDryCompile {
           windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark)
         )
         .statements
+      expressionBridge.foreach(_.markers.requireAllSeen())
+      rewritten
     }
   }
 }
