@@ -14,7 +14,6 @@ import org.scalatest.matchers.should.Matchers
 
 class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
   "Opaque Spark markers" should "preserve projection results across mixed incremental DML" in {
-    assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
     val cli       = sys.env("OPENIVM_CLI_PATH")
     val extension = sys.env("OPENIVM_EXTENSION_PATH")
     val wrapper   = Files.createTempFile("openivm-opaque-cli-", ".sh")

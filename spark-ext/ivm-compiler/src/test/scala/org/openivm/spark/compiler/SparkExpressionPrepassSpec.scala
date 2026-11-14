@@ -64,7 +64,6 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "preserve monitoring expression shapes through native initial-load compilation" in {
-    assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
     val cli       = sys.env("OPENIVM_CLI_PATH")
     val extension = sys.env("OPENIVM_EXTENSION_PATH")
     val wrapper   = Files.createTempFile("openivm-prepass-cli-", ".sh")
@@ -170,7 +169,6 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "preserve or reject case-sensitive nested field access" in {
-    assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
     val cli       = sys.env("OPENIVM_CLI_PATH")
     val extension = sys.env("OPENIVM_EXTENSION_PATH")
     val wrapper   = Files.createTempFile("openivm-nested-cli-", ".sh")

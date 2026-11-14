@@ -51,12 +51,8 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     val cli        = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
     val escapedCli = cli.replace("'", "'\\''")
     val wrapper    = Files.createTempFile("openivm-marker-cli-", ".sh")
-    val opaque     = sys.env.get("OPENIVM_MARKER_TEST").contains("1")
-    val settings =
-      if (opaque) {
-        val extension = sys.env.getOrElse("OPENIVM_EXTENSION_PATH", "/opt/openivm/openivm.duckdb_extension")
-        s"LOAD '${extension.replace("'", "''")}'; SET GLOBAL openivm_spark_expression_markers=true;"
-      } else "SET disabled_optimizers='expression_rewriter,common_subexpressions';"
+    val extension  = sys.env.getOrElse("OPENIVM_EXTENSION_PATH", "/opt/openivm/openivm.duckdb_extension")
+    val settings   = s"LOAD '${extension.replace("'", "''")}'; SET GLOBAL openivm_spark_expression_markers=true;"
     Files.write(
       wrapper,
       s"""#!/bin/sh
@@ -66,7 +62,7 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     require(wrapper.toFile.setExecutable(true), "Could not make native CLI wrapper executable")
     val compiler = OpenIvmCompiler.build(cliPath = wrapper.toString)
     try {
-      val bridge = new SparkExpressionMarker(opaque = opaque)
+      val bridge = new SparkExpressionMarker(opaque = true)
       val regex  = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
       val split  = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
       val size   = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
