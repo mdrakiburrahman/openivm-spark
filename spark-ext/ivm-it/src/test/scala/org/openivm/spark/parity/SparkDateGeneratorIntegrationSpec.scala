@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import org.apache.logging.log4j.{Level, LogManager}
 import org.apache.logging.log4j.core.config.Configurator
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-generator") {
@@ -10,7 +10,8 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.WindowRunningIncrementalEnabledKey   -> "true",
     FeatureGate.GroupedWindowStateEnabledKey         -> "true",
-    FeatureGate.CompileClassificationCacheEnabledKey -> "true"
+    FeatureGate.CompileClassificationCacheEnabledKey -> "true",
+    FeatureGate.ProfileRefreshKey                    -> "true"
   )
 
   it("incrementally expands daily date sequences and preserves invalid bounds") {
@@ -83,10 +84,14 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     assertMvCorrect("date_gen_join_mv", query)
     sql("UPDATE date_gen_left SET end_date = DATE '2024-01-03' WHERE id = 1")
     sql("INSERT INTO date_gen_right VALUES (1, DATE '2024-02-03', DATE '2024-02-03')")
+    RefreshProfileCatalog.removeAll(spark)
     refreshMv("date_gen_join_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
     assertMvCorrect("date_gen_join_mv", query)
     sql("DELETE FROM date_gen_right WHERE start_date = DATE '2024-02-01'")
+    RefreshProfileCatalog.removeAll(spark)
     refreshMv("date_gen_join_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
     assertMvCorrect("date_gen_join_mv", query)
   }
 }
