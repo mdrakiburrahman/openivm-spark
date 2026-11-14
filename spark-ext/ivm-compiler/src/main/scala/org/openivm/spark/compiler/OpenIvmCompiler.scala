@@ -242,7 +242,7 @@ class OpenIvmCompiler private (
               } =>
             val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
             val rewritten = candidate.rewrite(normalizedViewSql)
-            if (!candidate.nonEmpty) throw first
+            if (!candidate.nonEmpty || candidate.hasUnsafeArguments) throw first
             resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
             val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
             val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {

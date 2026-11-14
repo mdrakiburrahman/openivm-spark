@@ -8,19 +8,32 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
   describe("Spark scalar markers") {
     it("round-trips only direct column calls and rejects lost markers") {
       val markers = new SparkFunctionShimSql.ScalarDialectMarkers
-      val input = """SELECT lower(s.flag), unix_timestamp(s.ts), timestampdiff(SECOND, s.ts, s.end_ts),
-                    |lower(concat(s.flag, 'x')), lower(true), my_schema.lower(s.flag), 'lower(s.flag)' FROM src s""".stripMargin
+      val input = """SELECT lower(flag), unix_timestamp(ts), timestampdiff(SECOND, ts, end_ts),
+                    |my_schema.lower(s.flag), 'lower(s.flag)' FROM src s""".stripMargin
       val rewritten = markers.rewrite(input)
-      rewritten should include("lower(concat(s.flag, 'x'))")
-      rewritten should include("lower(true)")
+      markers.hasUnsafeArguments shouldBe false
       rewritten should include("my_schema.lower(s.flag)")
       rewritten should include("'lower(s.flag)'")
       intercept[IllegalStateException](markers.requireAllSeen())
       val restored = markers.restore(rewritten)
-      restored should include("lower(s.flag)")
-      restored should include("unix_timestamp(s.ts)")
-      restored should include("timestampdiff(SECOND, s.ts, s.end_ts)")
+      restored should include("lower(flag)")
+      restored should include("unix_timestamp(ts)")
+      restored should include("timestampdiff(SECOND, ts, end_ts)")
       markers.requireAllSeen()
+    }
+
+    it("declines retries with qualified arguments that may be case-sensitive struct fields") {
+      val markers = new SparkFunctionShimSql.ScalarDialectMarkers
+      markers.rewrite("""SELECT unix_timestamp(ts), lower(n.profile."MiXeD Field") FROM src n""")
+      markers.nonEmpty shouldBe true
+      markers.hasUnsafeArguments shouldBe true
+    }
+
+    it("declines retries containing other unsupported call shapes") {
+      val markers = new SparkFunctionShimSql.ScalarDialectMarkers
+      markers.rewrite("SELECT unix_timestamp(ts), lower(concat(flag, 'x')) FROM src")
+      markers.nonEmpty shouldBe true
+      markers.hasUnsafeArguments shouldBe true
     }
   }
 

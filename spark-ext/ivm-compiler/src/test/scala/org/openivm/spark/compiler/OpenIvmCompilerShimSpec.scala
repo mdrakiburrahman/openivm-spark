@@ -122,6 +122,22 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     r.sql should not be empty
   }
 
+  it should "refuse a retry that could change a nested field name" in {
+    val schema = StructType(
+      Seq(
+        StructField("ts", TimestampType),
+        StructField("profile", StructType(Seq(StructField("MiXeD Field", StringType))))
+      )
+    )
+    intercept[OpenIvmCompileException] {
+      compileBody(
+        "shim_scalar_nested",
+        Map("scalar_src" -> schema),
+        "SELECT UNIX_TIMESTAMP(ts), LOWER(n.profile.`MiXeD Field`) FROM scalar_src n"
+      )
+    }
+  }
+
   "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {
     val r = compileBody(
       viewName = "shim_date_offset",

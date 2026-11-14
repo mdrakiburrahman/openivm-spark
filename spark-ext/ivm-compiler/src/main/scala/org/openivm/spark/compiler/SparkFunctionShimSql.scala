@@ -41,8 +41,11 @@ private[compiler] object SparkFunctionShimSql {
     private val seen   = scala.collection.mutable.Set.empty[String]
     private val column =
       """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")(?:(?:\s*\.\s*)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"))*""".r
+    private val unqualifiedColumn = """(?s)(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")""".r
+    private var unsafeArguments   = false
 
-    def nonEmpty: Boolean = calls.nonEmpty
+    def nonEmpty: Boolean           = calls.nonEmpty
+    def hasUnsafeArguments: Boolean = unsafeArguments
 
     def rewrite(sql: String): String =
       rewriteOutsideProtected(sql) { i =>
@@ -65,8 +68,13 @@ private[compiler] object SparkFunctionShimSql {
                     values.isEmpty || !values.forall(arg =>
                       column.pattern.matcher(arg).matches() && !keywords.contains(arg.toUpperCase(Locale.ROOT))
                     )
-                  ) None
-                  else {
+                  ) {
+                    unsafeArguments = true
+                    None
+                  } else if (!values.forall(arg => unqualifiedColumn.pattern.matcher(arg).matches())) {
+                    unsafeArguments = true
+                    None
+                  } else {
                     val id = prefix + calls.size + "__"
                     calls.put(id, name -> values.size)
                     val payload = s"concat('$id', CAST(row(${values.mkString(", ")}) AS VARCHAR))"
