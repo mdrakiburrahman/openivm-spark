@@ -107,7 +107,7 @@ private[spark] object SparkExpressionPrepass {
       case _ => None
     }
 
-    var nextScope = 0
+    var nextScope    = 0
     val visitedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
     def expressions(expr: Expression, scope: Int): Unit = expr match {
       case subquery: SubqueryExpression =>

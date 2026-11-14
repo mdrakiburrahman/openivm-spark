@@ -70,7 +70,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       Configurator.setLevel(logger, Level.FATAL)
       try sql(s"CREATE MATERIALIZED VIEW expr_anti_full_mv AS $query")
       finally Configurator.setLevel(logger, previousLevel)
-      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_full_mv")
+      val id   = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_full_mv")
       val meta = MvCatalog.lookup(spark, id).get
       meta.refreshType shouldBe RefreshTypeCode.FullRefresh
       meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
