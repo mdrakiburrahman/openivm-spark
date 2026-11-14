@@ -7,9 +7,9 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
   import SparkExpressionMarker._
 
   "Spark expression markers" should "restore nested arguments without losing casts or nulls" in {
-    val bridge = new SparkExpressionMarker
-    val split = bridge.encode(Seq("CAST(id AS VARCHAR)", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
-    val size = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
+    val bridge  = new SparkExpressionMarker
+    val split   = bridge.encode(Seq("CAST(id AS VARCHAR)", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
+    val size    = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
     val emitted = size.replace(" AS VARCHAR", " AS STRING")
     bridge.restore(emitted) shouldBe "CAST(size(split(CAST(id AS STRING), ',')) AS INTEGER)"
     bridge.requireAllSeen()

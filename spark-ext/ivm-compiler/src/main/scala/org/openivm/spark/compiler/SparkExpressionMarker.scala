@@ -12,9 +12,9 @@ import scala.collection.mutable
 private[compiler] final class SparkExpressionMarker {
   import SparkExpressionMarker._
 
-  private val prefix = "__openivm_expr_" + UUID.randomUUID().toString.replace("-", "") + "_"
+  private val prefix  = "__openivm_expr_" + UUID.randomUUID().toString.replace("-", "") + "_"
   private val markers = mutable.Map.empty[String, Marker]
-  private val seen = mutable.Set.empty[String]
+  private val seen    = mutable.Set.empty[String]
 
   def encode(args: Seq[String], result: ResultType)(render: Seq[String] => String): String = {
     require(args.nonEmpty, "A marker must carry at least one argument")
@@ -22,11 +22,11 @@ private[compiler] final class SparkExpressionMarker {
     markers.put(id, Marker(args.size, result, render))
     val payload = s"concat('$id', CAST(row(${args.mkString(", ")}) AS VARCHAR))"
     result match {
-      case Text       => payload
-      case Integer    => s"CAST($payload AS INTEGER)"
-      case Long       => s"CAST($payload AS BIGINT)"
-      case Boolean    => s"CAST($payload AS BOOLEAN)"
-      case TextArray  => s"string_split($payload, '${id}separator')"
+      case Text      => payload
+      case Integer   => s"CAST($payload AS INTEGER)"
+      case Long      => s"CAST($payload AS BIGINT)"
+      case Boolean   => s"CAST($payload AS BOOLEAN)"
+      case TextArray => s"string_split($payload, '${id}separator')"
     }
   }
 
@@ -35,21 +35,24 @@ private[compiler] final class SparkExpressionMarker {
     */
   def restore(sql: String): String = {
     val out = SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
-      parseCall(sql, i, "string_split").flatMap { call =>
-        if (call.args.size != 2) None
-        else parsePayload(call.args.head).flatMap { case (id, args) =>
-          val marker = markers(id)
-          if (marker.result != TextArray || call.args(1).trim != s"'${id}separator'") None
-          else Some(call.end -> renderMarker(id, args))
+      parseCall(sql, i, "string_split")
+        .flatMap { call =>
+          if (call.args.size != 2) None
+          else
+            parsePayload(call.args.head).flatMap { case (id, args) =>
+              val marker = markers(id)
+              if (marker.result != TextArray || call.args(1).trim != s"'${id}separator'") None
+              else Some(call.end -> renderMarker(id, args))
+            }
         }
-      }.orElse {
-        parseCall(sql, i, "concat").flatMap { call =>
-          parsePayload(sql.substring(i, call.end)).flatMap { case (id, args) =>
-            if (markers(id).result == TextArray) None
-            else Some(call.end -> renderMarker(id, args))
+        .orElse {
+          parseCall(sql, i, "concat").flatMap { call =>
+            parsePayload(sql.substring(i, call.end)).flatMap { case (id, args) =>
+              if (markers(id).result == TextArray) None
+              else Some(call.end -> renderMarker(id, args))
+            }
           }
         }
-      }
     }
     if (out.contains(prefix))
       throw new IllegalStateException("Unresolved Spark expression marker in native SQL")
@@ -76,9 +79,10 @@ private[compiler] final class SparkExpressionMarker {
       if (concat.args.size != 2) None
       else {
         val literal = concat.args.head.trim
-        val id = if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
-          literal.substring(1, literal.length - 1)
-        else ""
+        val id =
+          if (literal.length >= 2 && literal.head == '\'' && literal.last == '\'')
+            literal.substring(1, literal.length - 1)
+          else ""
         if (!markers.contains(id)) None
         else {
           val cast = concat.args(1).trim
@@ -101,10 +105,10 @@ private[compiler] final class SparkExpressionMarker {
 
 private[compiler] object SparkExpressionMarker {
   sealed trait ResultType
-  case object Text extends ResultType
-  case object Integer extends ResultType
-  case object Long extends ResultType
-  case object Boolean extends ResultType
+  case object Text      extends ResultType
+  case object Integer   extends ResultType
+  case object Long      extends ResultType
+  case object Boolean   extends ResultType
   case object TextArray extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
@@ -120,9 +124,9 @@ private[compiler] object SparkExpressionMarker {
     if (i >= sql.length || sql.charAt(i) != '(') return None
     i += 1
     var argStart = i
-    var depth = 1
+    var depth    = 1
     var brackets = 0
-    val args = mutable.ArrayBuffer.empty[String]
+    val args     = mutable.ArrayBuffer.empty[String]
     while (i < sql.length) {
       val c = sql.charAt(i)
       if (c == '\'' || c == '"' || c == '`') {
@@ -139,7 +143,7 @@ private[compiler] object SparkExpressionMarker {
         if (!closed) return None
       } else if (i + 1 < sql.length && sql.startsWith("--", i)) {
         i = sql.indexOf('\n', i + 2) match {
-          case -1 => sql.length
+          case -1  => sql.length
           case end => end + 1
         }
       } else if (i + 1 < sql.length && sql.startsWith("/*", i)) {
