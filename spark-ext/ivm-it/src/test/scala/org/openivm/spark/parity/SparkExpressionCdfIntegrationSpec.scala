@@ -1,9 +1,14 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class SparkExpressionCdfIntegrationSpec extends IvmParitySpecBase("expression-cdf") with CdfMode {
+  override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.CompileClassificationCacheEnabledKey -> "true",
+    FeatureGate.ProfileRefreshKey                    -> "true"
+  )
+
   describe("Spark expression bridge over CDF") {
     it("preserves incremental results for mixed changes") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
@@ -37,6 +42,18 @@ class SparkExpressionCdfIntegrationSpec extends IvmParitySpecBase("expression-cd
         sql(s"INSERT INTO $source VALUES (4, 'ä', NULL, 4, false)")
         refreshMv(mv)
         assertMvCorrect(mv, query)
+        sql(s"DELETE FROM $source WHERE id = 4")
+        sql(s"UPDATE $source SET txt = 'z/q' WHERE id = 3")
+        sql(s"INSERT INTO $source VALUES (5, 'ä', NULL, 5, false)")
+        refreshMv(mv)
+        assertMvCorrect(mv, query)
+        val detail = sql("SHOW OPENIVM REFRESH PROFILE")
+          .where(s"view_name IN ('$mv','default.$mv') AND step_name = 'generate_refresh_sql.compile'")
+          .select("detail")
+          .collect()
+          .last
+          .getString(0)
+        detail should include("compile_cache_hit=true")
       }
     }
   }

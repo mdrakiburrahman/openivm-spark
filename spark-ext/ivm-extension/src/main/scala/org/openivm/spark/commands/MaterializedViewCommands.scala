@@ -2984,17 +2984,26 @@ case class CreateMaterializedViewCommand(
       )
     }
     val compiler = OpenIvmCompilers.forSession(spark)
-    val expressionBridge =
-      if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-        Some(SparkExpressionPrepass.prepare(originalQueryText, spark.sessionState.conf.caseSensitiveAnalysis))
-      else None
-    val createCompileRequest = CompileRequest(
+    val originalCreateCompileRequest = CompileRequest(
       viewName = name.table,
-      viewSql = expressionBridge.map(_.sql).getOrElse(originalQueryText),
+      viewSql = originalQueryText,
       sources = compileSchemas,
       sourceQualifiedNames = pinBinding.friendlyByShort,
       sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(pinBinding),
       facts = workloadFacts
+    )
+    val expressionBridge =
+      if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+        Some(
+          SparkExpressionPrepass.prepare(
+            originalQueryText,
+            spark.sessionState.conf.caseSensitiveAnalysis,
+            Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last)
+          )
+        )
+      else None
+    val createCompileRequest = originalCreateCompileRequest.copy(
+      viewSql = expressionBridge.map(_.sql).getOrElse(originalQueryText)
     )
     var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
@@ -5680,9 +5689,7 @@ case class RefreshMaterializedViewCommand(
         refreshResolvedPins,
         freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
       )
-      val compileCacheEnabled =
-        FeatureGate
-          .compileClassificationCacheEnabled(spark) && !sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1")
+      val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
       // Pinned and source-advance schemas can describe a historical snapshot;
       // discover their current constraint metadata through the existing path.
       val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
@@ -5707,19 +5714,26 @@ case class RefreshMaterializedViewCommand(
       val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
         OpenIvmCompilers.forSession(spark)
       }
-      val expressionBridge =
-        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-          Some(SparkExpressionPrepass.prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis))
-        else None
-      val compileRequest = CompileRequest(
+      val originalCompileRequest = CompileRequest(
         viewName = name.table,
-        viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql),
+        viewSql = meta.querySql,
         sources = compileSchemas,
         sourceQualifiedNames = shortToQual,
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
         facts = cacheTierFacts
       )
-      val compileCacheTier = compiler.compileCacheTier(compileRequest)
+      val compileCacheTier = compiler.compileCacheTier(originalCompileRequest)
+      val expressionBridge =
+        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+          Some(
+            SparkExpressionPrepass.prepare(
+              meta.querySql,
+              spark.sessionState.conf.caseSensitiveAnalysis,
+              Some(compileCacheTier.split(":").last)
+            )
+          )
+        else None
+      val compileRequest = originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
       var refreshProperties =
         if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
         else meta.properties

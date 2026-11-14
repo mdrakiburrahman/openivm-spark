@@ -81,8 +81,8 @@ private[spark] object SparkExpressionPrepass {
     "InSet"
   )
 
-  def prepare(sql: String, caseSensitive: Boolean): Prepared = {
-    val markers = new SparkExpressionMarker(opaque = true)
+  def prepare(sql: String, caseSensitive: Boolean, stableToken: Option[String] = None): Prepared = {
+    val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType)]
 
     def target(expr: Expression): Option[ResultType] = expr match {
