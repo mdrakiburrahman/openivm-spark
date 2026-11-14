@@ -302,7 +302,8 @@ private[spark] object SparkExpressionPrepass {
         }
         span -> encoded
       }
-    val generatorEdits = generators.distinct.map { case (explode, sequence) =>
+    val generatorEdits = generators.groupBy { case (explode, _) => expressionSpan(sql, explode) }.toSeq
+      .sortBy(_._1.start).map(_._2.head).map { case (explode, sequence) =>
       val bounds = sequence.arguments.take(2).map { arg =>
         val span      = expressionSpan(sql, arg)
         val arguments = mutable.ArrayBuffer.empty[String]
