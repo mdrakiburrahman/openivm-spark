@@ -1232,7 +1232,9 @@ object OpenIvmCompiler {
     def visit(plan: LogicalPlan, visibleCtes: Set[String]): Unit = plan match {
       case withCtes: UnresolvedWith =>
         var scope = visibleCtes
-        withCtes.cteRelations.foreach { case (name, body) =>
+        withCtes.cteRelations.foreach { cte =>
+          val name = cte._1
+          val body = cte._2
           visit(body, scope)
           scope += name.toLowerCase(Locale.ROOT)
         }

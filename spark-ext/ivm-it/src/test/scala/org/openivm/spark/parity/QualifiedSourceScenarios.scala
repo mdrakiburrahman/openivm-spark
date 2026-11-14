@@ -26,6 +26,8 @@ import java.io.File
 abstract class QualifiedSourceScenarios extends IvmParitySpecBase("qualified-source") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
+  override protected def extraSparkConf: Map[String, String] = Map(FeatureGate.ProfileRefreshKey -> "true")
+
   override def beforeAll(): Unit = {
     super.beforeAll()
     spark = SparkSession
@@ -133,7 +135,6 @@ abstract class QualifiedSourceScenarios extends IvmParitySpecBase("qualified-sou
   }
 
   it("binds a qualified parent MV in a downstream struct aggregate CTE") {
-    spark.conf.set(FeatureGate.ProfileRefreshKey, "true")
     sql("CREATE TABLE qualified_src_db.events_qs4(id INT, event_time TIMESTAMP, payload STRING) USING DELTA")
     sql("""INSERT INTO qualified_src_db.events_qs4 VALUES
       |(1, TIMESTAMP '2024-01-01 10:00:00', 'one'),
