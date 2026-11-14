@@ -35,7 +35,9 @@ private[spark] object SparkExpressionPrepass {
     "to_json"        -> Text,
     "lower"          -> Text,
     "split"          -> TextArray,
-    "size"           -> Integer
+    "size"           -> Integer,
+    "unix_timestamp" -> Long,
+    "raise_error"    -> Text
   )
 
   private val allowedFunctions = resultTypes.keySet ++ Set(
