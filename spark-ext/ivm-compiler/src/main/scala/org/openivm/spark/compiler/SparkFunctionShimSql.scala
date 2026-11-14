@@ -15,6 +15,7 @@ private[compiler] object SparkFunctionShimSql {
   private[compiler] val MakeIntervalMarker: String  = "__openivm_spark_make_interval__"
   private[compiler] val GetJsonObjectMarker: String = "__openivm_spark_get_json_object__"
   private[compiler] val MarkerArgSeparator: String  = "|"
+  private[compiler] val SizeMarker: String          = "__openivm_spark_array_size__"
 
   private final case class FunctionCall(
       openParen: Int,
@@ -57,6 +58,9 @@ private[compiler] object SparkFunctionShimSql {
     ),
     "date_sub" -> RenameRule(
       Map(1 -> "__sparkfn_date_sub")
+    ),
+    "size" -> RenameRule(
+      Map(0 -> "__sparkfn_array_size")
     ),
     "make_interval" -> RenameRule(
       Map(
@@ -133,6 +137,7 @@ private[compiler] object SparkFunctionShimSql {
         val lower    = sql.substring(i, identEnd).toLowerCase(Locale.ROOT)
         parseSparkWindowLiteralBoolRewrite(sql, i, identEnd, "last_value")
           .orElse(parseSparkWindowLiteralBoolRewrite(sql, i, identEnd, "first_value"))
+          .orElse(parseElementAtSplitRename(sql, i, identEnd))
           .orElse {
             sparkFunctionRenameRules.get(lower).flatMap { rule =>
               parseFunctionCall(sql, identEnd)
@@ -141,6 +146,20 @@ private[compiler] object SparkFunctionShimSql {
           }
       }
     }
+
+  private def parseElementAtSplitRename(sql: String, start: Int, nameEnd: Int): Option[(Int, String)] =
+    if (!sql.substring(start, nameEnd).equalsIgnoreCase("element_at")) None
+    else
+      parseFunctionCall(sql, nameEnd)
+        .filter(_.topLevelCommaCount == 1)
+        .flatMap(splitTopLevelArgs(sql, _))
+        .flatMap {
+          case Seq(array, _) =>
+            parseSingleFunctionCallInRange(sql, array, "split")
+              .filter(_.topLevelCommaCount == 1)
+              .map(_ => nameEnd -> "__sparkfn_element_at_array")
+          case _ => None
+        }
 
   /** Post-pass for the LPTS serializer: reverse the inlined DuckDB macro bodies
     * back to Spark's original shim spellings.
@@ -173,6 +192,7 @@ private[compiler] object SparkFunctionShimSql {
   def rewriteInlinedSparkShimCalls(sql: String): String =
     rewriteOutsideProtected(sql) { i =>
       parseMakeIntervalShim(sql, i)
+        .orElse(parseArraySizeShim(sql, i))
         .orElse(parseGetJsonObjectShim(sql, i))
         .orElse(parseCastTemporalShim(sql, i))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
@@ -436,6 +456,37 @@ private[compiler] object SparkFunctionShimSql {
           case Seq(markerRange, _) =>
             parseMakeIntervalMarkerArgs(sql, markerRange).map { args =>
               call.closeParen + 1 -> s"make_interval(${args.mkString(", ")})"
+            }
+          case _ => None
+        }
+      }
+
+  private def parseArraySizeShim(sql: String, start: Int): Option[(Int, String)] =
+    parseFunctionCallAt(sql, start, "coalesce")
+      .filter(_.topLevelCommaCount == 1)
+      .flatMap { call =>
+        splitTopLevelArgs(sql, call).flatMap {
+          case Seq(markerRange, _) =>
+            parseSingleFunctionCallInRange(sql, markerRange, "try_cast").flatMap { castCall =>
+              val bodyStart = castCall.openParen + 1
+              val bodyEnd   = castCall.closeParen
+              findTopLevelKeyword(sql, bodyStart, bodyEnd, "AS").flatMap { asStart =>
+                val typeStart = skipTriviaForward(sql, asStart + 2, bodyEnd)
+                val typeEnd   = readIdentifierEnd(sql, typeStart)
+                if (
+                  !sql.substring(typeStart, typeEnd).equalsIgnoreCase("INTEGER") ||
+                  !isTriviaOnly(sql, typeEnd, bodyEnd)
+                ) None
+                else
+                  parseSingleFunctionCallInRange(sql, (bodyStart, asStart), "concat")
+                    .filter(_.topLevelCommaCount == 1)
+                    .flatMap(splitTopLevelArgs(sql, _))
+                    .flatMap {
+                      case Seq(marker, arg) if argEqualsSingleQuotedLiteral(sql, marker, s"'$SizeMarker'") =>
+                        Some(call.closeParen + 1 -> s"size(${restoreSerializedStringArg(sql, arg)})")
+                      case _ => None
+                    }
+              }
             }
           case _ => None
         }
