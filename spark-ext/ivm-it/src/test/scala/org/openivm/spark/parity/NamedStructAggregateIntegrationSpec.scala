@@ -1,10 +1,22 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, RefreshProfileCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-struct-aggregate") {
   self: IvmParityMode =>
+
+  override protected def extraSparkConf: Map[String, String] = Map(
+    "spark.openivm.refresh.windowRunningIncremental.enabled" -> "true",
+    "spark.openivm.refresh.groupedWindowState.enabled" -> "true",
+    "spark.openivm.compile.classificationCache.enabled" -> "true",
+    FeatureGate.ProfileRefreshKey -> "true",
+    "spark.databricks.delta.properties.defaults.enableChangeDataFeed" -> "true",
+    "spark.sql.session.timeZone" -> "UTC",
+    "spark.sql.caseSensitive" -> "false",
+    "spark.sql.ansi.enabled" -> "false",
+    "spark.sql.legacy.sizeOfNull" -> "true"
+  )
 
   it("maintains named struct values with scalar and nullable nested ordering keys") {
     sql("CREATE TABLE nsagg_source (grp STRING, id INT, name STRING, ts TIMESTAMP) USING DELTA")
@@ -61,11 +73,13 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
       refreshMv(name)
       assertMvCorrect(name, query)
     }
+    RefreshProfileCatalog.removeAll(spark)
     refreshMv("nsagg_cte_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
     assertMvCorrect("nsagg_cte_mv", cteQuery)
   }
 
 }
 
-class NamedStructAggregateCdfIntegrationSpec       extends NamedStructAggregateScenarios with CdfMode
+class NamedStructAggregateCdfIntegrationSpec extends NamedStructAggregateScenarios with CdfMode
 class NamedStructAggregateInterceptIntegrationSpec extends NamedStructAggregateScenarios with InterceptMode
