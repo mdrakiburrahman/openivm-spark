@@ -1,6 +1,7 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, RefreshTypeCode}
+import org.openivm.spark.compiler.OpenIvmCompileException
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("expression-bridge") {
@@ -11,6 +12,29 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
+    it("retains a real native compile-failure receipt through create and refresh") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_bad_source (id INT) USING DELTA")
+      sql("INSERT INTO expr_bad_source VALUES (1)")
+      val query = "SELECT id, reflect('java.lang.Math', 'abs', id) AS v FROM expr_bad_source"
+      intercept[OpenIvmCompileException] {
+        sql(s"EXPLAIN CREATE MATERIALIZED VIEW expr_bad_explain AS $query").collect()
+      }
+      sql(s"CREATE MATERIALIZED VIEW expr_bad_mv AS $query")
+      val identifier = spark.sessionState.sqlParser.parseTableIdentifier("expr_bad_mv")
+      def checkFailureReceipt(): Unit = {
+        val meta = MvCatalog.lookup(spark, identifier).get
+        meta.refreshType shouldBe RefreshTypeCode.FullRefresh
+        meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("COMPILE_FAILED")
+        meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("compile_failed")
+      }
+      checkFailureReceipt()
+      sql("INSERT INTO expr_bad_source VALUES (-2)")
+      refreshMv("expr_bad_mv")
+      checkFailureReceipt()
+      assertMvCorrect("expr_bad_mv", query)
+    }
+
     it("preserves incremental results for mixed changes") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
@@ -34,6 +58,13 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           |(1, NULL, TIMESTAMP '2024-01-01 01:02:03', 1, false),
           |(2, 'Ä', TIMESTAMP '2024-02-01 01:02:03', 2, true),
           |(3, 'a/b', NULL, NULL, NULL)""".stripMargin)
+        val explained =
+          sql(s"EXPLAIN CREATE MATERIALIZED VIEW expr_explain_$ansi AS $query").collect().head.getString(0)
+        explained should include(""""compile_refresh_type_name":"SIMPLE_PROJECTION"""")
+        val dryProgram =
+          sql(s"SHOW REFRESH SQL FOR CREATE MATERIALIZED VIEW expr_show_$ansi AS $query").collect().head.getString(0)
+        dryProgram.toLowerCase should include("regexp_replace")
+        dryProgram should not include "__openivm_spark_expression"
         sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
         val identifier = spark.sessionState.sqlParser.parseTableIdentifier(mv)
         MvCatalog.lookup(spark, identifier).get.refreshType shouldBe RefreshTypeCode.SimpleProjection

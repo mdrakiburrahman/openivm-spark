@@ -84,7 +84,7 @@ private[spark] object SparkExpressionPrepass {
 
   def prepare(sql: String, caseSensitive: Boolean, stableToken: Option[String] = None): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
-    val targets = mutable.ArrayBuffer.empty[(Expression, ResultType)]
+    val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
 
     def target(expr: Expression): Option[ResultType] = expr match {
       case _: RLike => Some(Boolean)
@@ -100,33 +100,42 @@ private[spark] object SparkExpressionPrepass {
       case _ => None
     }
 
-    def expressions(expr: Expression): Unit = expr match {
+    def expressions(expr: Expression, scope: Int): Unit = expr match {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
-        subquery.children.foreach(expressions)
+        subquery.children.foreach(child => expressions(child, scope))
       case _ =>
         target(expr) match {
-          case Some(result) => targets += expr -> result
-          case None         => expr.children.foreach(expressions)
+          case Some(result) => targets += ((expr, result, scope))
+          case None         => expr.children.foreach(child => expressions(child, scope))
         }
     }
 
+    var nextScope = 0
     def plans(plan: LogicalPlan): Unit = {
-      plan.expressions.foreach(expressions)
+      val scope = nextScope
+      nextScope += 1
+      plan.expressions.foreach(expr => expressions(expr, scope))
       plan.children.foreach(plans)
       plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(plans)
     }
 
     plans(CatalystSqlParser.parsePlan(sql))
-    val encodedExpressions = mutable.Map.empty[(String, ResultType, Vector[String]), String]
+    val encodedExpressions = mutable.Map.empty[(Int, String, ResultType, Vector[String]), (Expression, String)]
     val replacements = targets
-      .map { case (expr, result) =>
+      .map { case (expr, result, scope) =>
         val span      = expressionSpan(sql, expr)
         val arguments = mutable.ArrayBuffer.empty[String]
         val body      = template(sql, expr, span, arguments, caseSensitive)
         val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq
-        val key       = (sql.substring(span.start, span.end), result, inputs.toVector)
-        val encoded   = encodedExpressions.getOrElseUpdate(key, markers.encode(inputs, result)(args => body(args)))
+        val key       = (scope, sql.substring(span.start, span.end), result, inputs.toVector)
+        val encoded = encodedExpressions.get(key) match {
+          case Some((previous, existing)) if expr.semanticEquals(previous) => existing
+          case _ =>
+            val created = markers.encode(inputs, result)(args => body(args))
+            encodedExpressions.update(key, expr -> created)
+            created
+        }
         span -> encoded
       }
       .sortBy(_._1.start)

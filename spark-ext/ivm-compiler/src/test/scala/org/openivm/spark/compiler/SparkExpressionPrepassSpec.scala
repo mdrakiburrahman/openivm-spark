@@ -9,6 +9,27 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
+  "Spark expression prepass" should "share marker identity only for equivalent expressions in the same scope" in {
+    val marker = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r
+    def ids(sql: String): Seq[String] =
+      marker.findAllMatchIn(SparkExpressionPrepass.prepare(sql, caseSensitive = false).sql).map(_.group(1)).toSeq
+
+    val grouped = ids("SELECT regexp_replace(s, 'a', 'b'), count(*) FROM t GROUP BY regexp_replace(s, 'a', 'b')")
+    grouped.size shouldBe 2
+    grouped.distinct.size shouldBe 1
+    val qualified =
+      ids("SELECT regexp_replace(l.s, 'a', 'b'), regexp_replace(r.s, 'a', 'b') FROM l JOIN r ON l.id = r.id")
+    qualified.distinct.size shouldBe 2
+    val patterns = ids("SELECT regexp_replace(s, 'a', 'b'), regexp_replace(s, 'c', 'b') FROM t")
+    patterns.distinct.size shouldBe 2
+    val scopes = ids(
+      "WITH x AS (SELECT regexp_replace(s, 'a', 'b') AS v FROM t1), " +
+        "y AS (SELECT regexp_replace(s, 'a', 'b') AS v FROM t2) SELECT x.v, y.v FROM x JOIN y ON x.v = y.v"
+    )
+    scopes.size shouldBe 2
+    scopes.distinct.size shouldBe 2
+  }
+
   "Spark expression prepass" should "reject nondeterministic and unsupported marker expressions" in {
     intercept[IllegalArgumentException] {
       SparkExpressionPrepass.prepare("SELECT sha2(rand(), 256) FROM src", caseSensitive = false)
@@ -127,7 +148,7 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
     }
   }
 
-  it should "reject native changes to case-sensitive nested field access" in {
+  it should "preserve or reject case-sensitive nested field access" in {
     assume(sys.env.get("OPENIVM_MARKER_TEST").contains("1"))
     val cli       = sys.env("OPENIVM_CLI_PATH")
     val extension = sys.env("OPENIVM_EXTENSION_PATH")
@@ -156,10 +177,20 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
           Map("nested_src" -> StructType.fromDDL("id STRING, profile STRUCT<`MiXeD Field`: STRING>"))
         )
       )
-      val error = intercept[IllegalStateException] {
-        probe.markers.restore(result.initialLoadSql)
+      val restored =
+        try Some(probe.markers.restore(result.initialLoadSql))
+        catch {
+          case error: IllegalStateException =>
+            error.getMessage should include("case-sensitive Spark attribute")
+            None
+        }
+      restored.foreach { sql =>
+        probe.markers.requireAllSeen()
+        val actual   = spark.sql(sql)
+        val expected = spark.sql(query)
+        actual.exceptAll(expected).count() shouldBe 0L
+        expected.exceptAll(actual).count() shouldBe 0L
       }
-      error.getMessage should include("case-sensitive Spark attribute")
     } finally {
       spark.stop()
       compiler.close()
