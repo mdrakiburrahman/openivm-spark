@@ -244,6 +244,205 @@ private[compiler] object SparkFunctionShimSql {
       }
     }
 
+  private val nonColumnKeywords = Set(
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "USER",
+    "CURRENT_ROLE",
+    "CURRENT_SCHEMA",
+    "CURRENT_CATALOG"
+  )
+
+  private def isSimpleColumn(value: String): Boolean = {
+    val ident = """(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")"""
+    value.matches(s"$ident(?:\\s*\\.\\s*$ident)*") &&
+    !nonColumnKeywords.contains(value.toUpperCase(Locale.ROOT))
+  }
+
+  private def namedStructPack(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).flatMap { ranges =>
+        val fields = ranges.map { case (start, end) =>
+          findTopLevelKeywordRespectingCase(sql, start, end, "AS") match {
+            case Some(as) =>
+              val value = sql.substring(start, as).trim
+              val name  = sql.substring(as + 2, end).trim
+              val validName = name.matches("[A-Za-z_][A-Za-z0-9_$]*") ||
+                name.matches("\"(?:[^\"]|\"\")+\"")
+              if (value.nonEmpty && validName) Some(s"$name := $value") else None
+            case None =>
+              val value = sql.substring(start, end).trim
+              val ident = """(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")"""
+              if (isSimpleColumn(value)) {
+                val name = (s"""$ident$$""").r.findFirstIn(value).get
+                Some(s"$name := $value")
+              } else None
+          }
+        }
+        if (fields.nonEmpty && fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})")
+        else None
+      }
+    }
+  }
+
+  private def rewriteNamedStructs(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      var before = i - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      if (before >= 0 && sql.charAt(before) == '.') None
+      else
+        parseFunctionCallAt(sql, i, "named_struct").flatMap { call =>
+          splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+            val fields = args
+              .grouped(2)
+              .map { pair =>
+                val name  = sql.substring(pair.head._1, pair.head._2).trim
+                val value = rewriteNamedStructs(sql.substring(pair.last._1, pair.last._2).trim)
+                val simpleValue = isSimpleColumn(value) ||
+                  Set("NULL", "TRUE", "FALSE").contains(value.toUpperCase(Locale.ROOT)) ||
+                  value.matches("'(?:[^']|'')*'") || value.matches("[+-]?[0-9]+(?:\\.[0-9]+)?") ||
+                  (value.nonEmpty && Seq("struct_pack", "__openivm_spark_expression")
+                    .exists(fn => parseFunctionCallAt(value, 0, fn).exists(_.closeParen == value.length - 1)))
+                if (name.matches("'(?:[^']|'')+'") && simpleValue) {
+                  val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+                  Some(s""""$decoded" := $value""")
+                } else None
+              }
+              .toSeq
+            if (fields.forall(_.isDefined))
+              Some(call.closeParen + 1 -> s"struct_pack(${fields.flatten.mkString(", ")})")
+            else None
+          }
+        }
+    }
+
+  private[compiler] def namedStructTypeSeed(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (
+              !translateSparkStringLiteralEscapes(name).matches("'(?:[^']|'')+'") ||
+              value.isEmpty || value.equalsIgnoreCase("NULL")
+            ) None
+            else {
+              val seed =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined) namedStructTypeSeed(value)
+                else Some(s"CASE WHEN FALSE THEN $value ELSE NULL END")
+              seed.map(v => s"$name, $v")
+            }
+          }
+          .toSeq
+        if (fields.forall(_.isDefined)) Some(s"named_struct(${fields.flatten.mkString(", ")})") else None
+      }
+    }
+  }
+
+  private def markerStructSeedToPack(sql: String): Option[String] = {
+    if (sql.isEmpty) return None
+    parseFunctionCallAt(sql, 0, "named_struct").filter(_.closeParen == sql.length - 1).flatMap { call =>
+      splitTopLevelArgs(sql, call).filter(args => args.nonEmpty && args.size % 2 == 0).flatMap { args =>
+        val fields = args
+          .grouped(2)
+          .map { pair =>
+            val name  = sql.substring(pair.head._1, pair.head._2).trim
+            val value = sql.substring(pair.last._1, pair.last._2).trim
+            if (!name.matches("'(?:[^']|'')+'") || value.isEmpty) None
+            else {
+              val decoded = name.substring(1, name.length - 1).replace("''", "'").replace("\"", "\"\"")
+              val converted =
+                if (parseFunctionCallAt(value, 0, "named_struct").isDefined)
+                  markerStructSeedToPack(value)
+                else Some(value)
+              converted.map(v => s""""$decoded" := $v""")
+            }
+          }
+          .toSeq
+        if (fields.forall(_.isDefined)) Some(s"struct_pack(${fields.flatten.mkString(", ")})") else None
+      }
+    }
+  }
+
+  private def rewriteStructMarkerSeeds(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "__openivm_spark_expression").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size >= 3).flatMap { ranges =>
+          val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+          markerStructSeedToPack(args(1)).map { seed =>
+            call.closeParen + 1 -> s"__openivm_spark_expression(${(args.take(1) ++ Seq(seed) ++ args.drop(2)).mkString(", ")})"
+          }
+        }
+      }
+    }
+
+  private[compiler] def rewriteStructMaxBy(sql: String): String = rewriteStructMaxByCalls(rewriteStructMarkerSeeds(sql))
+
+  private def rewriteStructMaxByCalls(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      var before = i - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      if (before >= 0 && sql.charAt(before) == '.') None
+      else
+        parseFunctionCallAt(sql, i, "max_by").flatMap { call =>
+          splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+            val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
+            val structs = args.map { arg =>
+              namedStructPack(arg).orElse {
+                if (
+                  arg.nonEmpty && parseFunctionCallAt(arg, 0, "named_struct").exists(_.closeParen == arg.length - 1)
+                ) {
+                  val converted = rewriteNamedStructs(arg)
+                  if (parseFunctionCallAt(converted, 0, "struct_pack").exists(_.closeParen == converted.length - 1))
+                    Some(converted)
+                  else None
+                } else None
+              }
+            }
+            val unsupportedStruct = args.zip(structs).exists { case (arg, converted) =>
+              converted.isEmpty && arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct").isDefined
+            }
+            if (structs.exists(_.isDefined) && !unsupportedStruct)
+              Some(
+                (
+                  call.closeParen + 1,
+                  s"arg_max(${args.zip(structs).map { case (arg, converted) => converted.getOrElse(arg) }.mkString(", ")})"
+                )
+              )
+            else None
+          }
+        }
+    }
+
+  private[compiler] def restoreStructMaxBy(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      parseFunctionCallAt(sql, i, "arg_max").flatMap { call =>
+        splitTopLevelArgs(sql, call).filter(_.size == 2).flatMap { ranges =>
+          val structs = ranges.map { case (start, end) => sql.substring(start, end).trim }
+          if (
+            structs.exists(arg =>
+              arg.nonEmpty && parseFunctionCallAt(arg, 0, "struct_pack").exists(_.closeParen == arg.length - 1)
+            )
+          )
+            Some(
+              (call.closeParen + 1, s"max_by(${structs.map(SparkExpressionMarker.restoreStructPacks).mkString(", ")})")
+            )
+          else None
+        }
+      }
+    }
+
   /** Post-pass for the LPTS serializer: reverse the inlined DuckDB macro bodies
     * back to Spark's original shim spellings.
     *
