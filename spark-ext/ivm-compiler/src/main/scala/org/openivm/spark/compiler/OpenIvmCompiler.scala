@@ -1214,8 +1214,6 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_add(d, days) AS CAST(d AS DATE) + CAST(days AS INTEGER);",
       "CREATE OR REPLACE MACRO __sparkfn_date_sub(d, days) AS CAST(d AS DATE) - CAST(days AS INTEGER);",
-      "CREATE OR REPLACE MACRO __sparkfn_element_at_array(x, i) AS list_extract(x, i);",
-      s"CREATE OR REPLACE MACRO __sparkfn_array_size(x) AS COALESCE(TRY_CAST(concat('${SparkFunctionShimSql.SizeMarker}', CAST(x AS VARCHAR)) AS INTEGER), CAST(array_length(x) AS INTEGER));",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The
       // interval fallback keeps the DuckDB macro type- and value-correct.

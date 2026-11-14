@@ -61,21 +61,6 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
   private val billingJsonSchema: StructType =
     StructType.fromDDL("usageuploadtime TIMESTAMP, azureresourceid STRING, additionalinfo STRING")
 
-  "Spark array functions" should "compile split, element_at and size without losing incremental maintenance" in {
-    val r = compileBody(
-      viewName = "shim_split_array",
-      sources = Map("split_src" -> StructType.fromDDL("id INT, raw STRING")),
-      body = "SELECT id, element_at(split(raw, '/'), -1) AS last, size(split(raw, ',')) AS n FROM split_src"
-    )
-    r.refreshTypeName should not equal "FULL_REFRESH"
-    val translated = LptsSparkDialect.translate(r.sql)
-    translated should include("element_at")
-    translated should include("size(")
-    translated should not include SparkFunctionShimSql.SizeMarker
-    r.initialLoadSql should include("element_at(")
-    r.initialLoadSql should not include "list_extract"
-  }
-
   "Spark-only identifiers and null-safe comparisons" should "compile without losing incremental maintenance" in {
     val r = compileBody(
       viewName = "shim_nullsafe_collation",
