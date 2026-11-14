@@ -93,7 +93,15 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
     assertMvCorrect("date_gen_lead_mv", query)
     sql("INSERT INTO date_gen_lead VALUES (1, TIMESTAMP '2024-01-05 10:00:00', false, 4, 4)")
+    sql("UPDATE date_gen_lead SET deleted = true WHERE event_id = 2")
+    RefreshProfileCatalog.removeAll(spark)
     refreshMv("date_gen_lead_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+    assertMvCorrect("date_gen_lead_mv", query)
+    sql("DELETE FROM date_gen_lead WHERE event_id = 3")
+    RefreshProfileCatalog.removeAll(spark)
+    refreshMv("date_gen_lead_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
     assertMvCorrect("date_gen_lead_mv", query)
   }
 

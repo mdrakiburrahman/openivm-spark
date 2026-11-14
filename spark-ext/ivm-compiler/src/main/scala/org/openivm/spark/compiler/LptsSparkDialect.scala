@@ -148,7 +148,9 @@ object LptsSparkDialect {
                               rewriteSparkFunctionInlinings(
                                 rewriteToTimestampDoubleCast(
                                   SparkFunctionShimSql.restoreStructMaxBy(
-                                    rewriteNowTimestamp(rewriteLikeOperators(sql))
+                                    SparkFunctionShimSql.restoreWindowOffsetLiterals(
+                                      rewriteNowTimestamp(rewriteLikeOperators(sql))
+                                    )
                                   )
                                 )
                               )

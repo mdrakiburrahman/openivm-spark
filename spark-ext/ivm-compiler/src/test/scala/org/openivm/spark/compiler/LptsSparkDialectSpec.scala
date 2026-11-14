@@ -10,6 +10,25 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("window offset restoration") {
+    it("restores only int-range literal offsets of unqualified LEAD and LAG windows") {
+      val sql = """SELECT lead(coalesce(a, b), CAST(2 AS BIGINT), 0) OVER (ORDER BY a),
+        |lag(a, CAST(-3 AS BIGINT)) OVER (ORDER BY a),
+        |lead(a, CAST(2147483648 AS BIGINT)) OVER (ORDER BY a),
+        |lead(a, CAST(x AS BIGINT)) OVER (ORDER BY a),
+        |other.lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a),
+        |'lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a)' FROM t""".stripMargin
+      val restored = LptsSparkDialect.translate(sql)
+      restored should include("lead(coalesce(a, b),2, 0) OVER")
+      restored should include("lag(a,-3) OVER")
+      restored should include("lead(a, CAST(2147483648 AS BIGINT)) OVER")
+      restored should include("lead(a, CAST(x AS BIGINT)) OVER")
+      restored should include("other.lead(a, CAST(2 AS BIGINT)) OVER")
+      restored should include("'lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a)'")
+      LptsSparkDialect.translate(restored) shouldBe restored
+    }
+  }
+
   describe("struct max_by native translation") {
     it("round-trips explicit field names without touching strings or unrelated structs") {
       val sql = """SELECT max_by(struct(t.a AS f1, t.b AS "Mixed Name"), struct(t.k AS f1)),

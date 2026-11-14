@@ -34,6 +34,46 @@ private[compiler] object SparkFunctionShimSql {
   private val OneArgToDateLiteral      = "'%Y-%m-%d'"
   private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
 
+  /** DuckDB binds LEAD/LAG offsets to BIGINT. Restore int-range literal offsets
+    * before Spark resolves their window frames, otherwise a later offset type
+    * coercion makes the automatically assigned frame inconsistent.
+    */
+  def restoreWindowOffsetLiterals(sql: String): String = {
+    val offsetCast   = """(?is)CAST\s*\(\s*([+-]?\d{1,10})\s+AS\s+BIGINT\s*\)""".r
+    val replacements = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, String)]
+    val _ = rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val possibleName = sql.charAt(i) == 'l' || sql.charAt(i) == 'L'
+      val qualified =
+        if (!possibleName) true
+        else {
+          var before = i - 1
+          while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+          before >= 0 && sql.charAt(before) == '.'
+        }
+      if (!qualified) {
+        Seq("lead", "lag").foreach { name =>
+          parseFunctionCallAt(sql, i, name)
+            .filter(call => hasOverClause(sql, call.closeParen + 1))
+            .filter(call => !sql.substring(call.openParen, call.closeParen).contains('`'))
+            .flatMap(call => splitTopLevelArgs(sql, call))
+            .filter(args => args.size == 2 || args.size == 3)
+            .foreach { args =>
+              val (start, end) = args(1)
+              sql.substring(start, end).trim match {
+                case offsetCast(value) if value.toLong >= Int.MinValue && value.toLong <= Int.MaxValue =>
+                  replacements += ((start, end, value))
+                case _ =>
+              }
+            }
+        }
+      }
+      None
+    }
+    replacements.sortBy(-_._1).iterator.foldLeft(sql) { case (text, (start, end, value)) =>
+      text.substring(0, start) + value + text.substring(end)
+    }
+  }
+
   /** Carries direct-column Spark calls through native planning without evaluating them there. */
   private[compiler] final class ScalarDialectMarkers {
     private val prefix = "__openivm_scalar_" + java.util.UUID.randomUUID().toString.replace("-", "") + "_"
