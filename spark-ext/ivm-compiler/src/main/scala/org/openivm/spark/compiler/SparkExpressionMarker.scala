@@ -170,7 +170,7 @@ private[compiler] object SparkExpressionMarker {
     found
   }
 
-  private def restoreStructPacks(sql: String): String =
+  private[compiler] def restoreStructPacks(sql: String): String =
     SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
       parseCall(sql, i, "struct_pack").map { call =>
         val fields = call.args.flatMap { arg =>

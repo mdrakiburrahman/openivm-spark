@@ -146,9 +146,9 @@ object LptsSparkDialect {
                           rewriteStructExtract(
                             rewriteTimestampWithTimeZone(
                               rewriteSparkFunctionInlinings(
-                                rewriteToTimestampDoubleCast(
+                                SparkExpressionMarker.restoreStructPacks(SparkFunctionShimSql.restoreStructMaxBy(rewriteToTimestampDoubleCast(
                                   rewriteNowTimestamp(rewriteLikeOperators(sql))
-                                )
+                                )))
                               )
                             )
                           )
