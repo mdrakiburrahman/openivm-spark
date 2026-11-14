@@ -9,7 +9,7 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
   self: IvmParityMode =>
 
   it("incrementally expands daily date sequences and preserves invalid bounds") {
-    Seq("UTC", "America/Los_Angeles").zipWithIndex.foreach { case (zone, index) =>
+    Seq("UTC", "America/Los_Angeles", "Pacific/Apia").zipWithIndex.foreach { case (zone, index) =>
       spark.conf.set("spark.sql.session.timeZone", zone)
       val source = s"date_gen_source_$index"
       val mv = s"date_gen_mv_$index"
@@ -17,7 +17,8 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
       sql(s"""INSERT INTO $source VALUES
         |(1, DATE '2024-03-09', DATE '2024-03-12'),
         |(2, NULL, DATE '2024-03-11'),
-        |(3, DATE '2024-11-02', DATE '2024-11-04')""".stripMargin)
+        |(3, DATE '2024-11-02', DATE '2024-11-04'),
+        |(6, DATE '2011-12-29', DATE '2011-12-31')""".stripMargin)
       val query = s"""SELECT t.id, explode(sequence(t.start_date, t.end_date, INTERVAL '1' DAY)) AS d
         |FROM $source t""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW $mv AS $query")

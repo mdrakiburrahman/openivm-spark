@@ -100,15 +100,17 @@ private[spark] object SparkExpressionPrepass {
   ): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
-    val generators = mutable.ArrayBuffer.empty[UnresolvedFunction]
+    val generators = mutable.ArrayBuffer.empty[(UnresolvedFunction, UnresolvedFunction)]
     lazy val dateGenerators: Set[(Int, Int)] = {
       val spans = mutable.Set.empty[(Int, Int)]
       val visited = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
       def collectExpression(expr: Expression): Unit = {
         expr match {
           case subquery: SubqueryExpression => collectPlan(subquery.plan)
-          case explode: Explode if explode.child.dataType.isInstanceOf[ArrayType] &&
-              explode.child.dataType.asInstanceOf[ArrayType].elementType == DateType =>
+          case explode: Explode if (explode.child.dataType match {
+                case ArrayType(DateType, _) => true
+                case _ => false
+              }) =>
             for (start <- explode.origin.startIndex; stop <- explode.origin.stopIndex) spans += ((start, stop))
           case _ =>
         }
@@ -203,7 +205,7 @@ private[spark] object SparkExpressionPrepass {
                 !sequence.isDistinct && sequence.filter.isEmpty && !sequence.ignoreNulls &&
                 sql.substring(expressionSpan(sql, sequence.arguments(2)).start, expressionSpan(sql, sequence.arguments(2)).end)
                   .trim.matches("(?i)INTERVAL\\s*'1'\\s+DAY") =>
-            generators += explode
+            generators += ((explode, sequence))
           case _ => explode.children.foreach(child => expressions(child, scope))
         }
       case branch: CaseWhen
@@ -293,14 +295,15 @@ private[spark] object SparkExpressionPrepass {
         }
         span -> encoded
       }
-    val generatorEdits = generators.map { explode =>
-      val sequence = explode.arguments.head.asInstanceOf[UnresolvedFunction]
-      val args = sequence.arguments.map { arg =>
+    val generatorEdits = generators.distinct.map { case (explode, sequence) =>
+      val bounds = sequence.arguments.take(2).map { arg =>
         val span = expressionSpan(sql, arg)
-        sql.substring(span.start, span.end)
+        val input = sql.substring(span.start, span.end)
+        markers.encode(Seq(input), DateBound)(_.head)
       }
-      expressionSpan(sql, explode) -> s"CAST(UNNEST(GENERATE_SERIES(${args.mkString(", ")})) AS DATE)"
-    }.distinct
+      expressionSpan(sql, explode) ->
+        s"CAST(UNNEST(GENERATE_SERIES(${bounds.mkString(", ")}, to_days(1))) AS DATE)"
+    }
     val edits = (replacements ++ generatorEdits).sortBy(_._1.start)
     var cursor = 0
     val output = new StringBuilder

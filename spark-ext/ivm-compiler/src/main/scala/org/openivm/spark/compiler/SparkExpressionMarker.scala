@@ -31,6 +31,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Boolean   => "CAST(NULL AS BOOLEAN)"
         case TextArray => "string_split('openivm_type', ',')"
         case Timestamp => "CAST(NULL AS TIMESTAMP)"
+        case DateBound => "CAST(NULL AS DATE)"
       }
       s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
     } else {
@@ -42,6 +43,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Boolean   => s"CAST($payload AS BOOLEAN)"
         case TextArray => s"string_split($payload, '${id}separator')"
         case Timestamp => s"CAST($payload AS TIMESTAMP)"
+        case DateBound => s"CAST($payload AS DATE)"
       }
     }
   }
@@ -51,7 +53,25 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
     */
   def restore(sql: String): String = {
     val out = SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
-      parseCall(sql, i, "__openivm_spark_expression")
+      parseCall(sql, i, "cast")
+        .flatMap { cast =>
+          if (cast.args.size != 1) None
+          else {
+            val body = cast.args.head.trim
+            parseCall(body, 0, "__openivm_spark_expression").flatMap { nested =>
+              val idLiteral = nested.args.headOption.map(_.trim).getOrElse("")
+              val id =
+                if (idLiteral.length >= 2 && idLiteral.head == '\'' && idLiteral.last == '\'')
+                  idLiteral.substring(1, idLiteral.length - 1)
+                else ""
+              if (markers.get(id).exists(_.result == DateBound) &&
+                  body.substring(nested.end).trim.equalsIgnoreCase("AS TIMESTAMP"))
+                Some(cast.end -> restore(body.substring(0, nested.end)))
+              else None
+            }
+          }
+        }
+        .orElse(parseCall(sql, i, "__openivm_spark_expression")
         .flatMap { call =>
           if (call.args.size < 3) None
           else {
@@ -68,6 +88,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
                 case Long      => Set("CAST(NULLASBIGINT)")
                 case Boolean   => Set("CAST(NULLASBOOLEAN)")
                 case Timestamp => Set("CAST(NULLASTIMESTAMP)")
+                case DateBound => Set("CAST(NULLASDATE)")
                 case TextArray =>
                   Set(
                     "STRING_SPLIT('OPENIVM_TYPE',',')",
@@ -80,7 +101,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
               else Some(call.end -> renderMarker(id, call.args.drop(2)))
             }
           }
-        }
+        })
         .orElse {
           parseCall(sql, i, "string_split").flatMap { call =>
             if (call.args.size != 2) None
@@ -160,6 +181,7 @@ private[compiler] object SparkExpressionMarker {
   case object Boolean   extends ResultType
   case object TextArray extends ResultType
   case object Timestamp extends ResultType
+  case object DateBound extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
