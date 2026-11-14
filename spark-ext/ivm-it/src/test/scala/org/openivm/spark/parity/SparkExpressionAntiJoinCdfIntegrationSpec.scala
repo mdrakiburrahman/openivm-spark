@@ -89,9 +89,9 @@ class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinI
     sql("CREATE MATERIALIZED VIEW expr_chain_m1 AS SELECT id, txt FROM expr_chain_t")
     val views = Seq("expr_chain_u1", "expr_chain_u2", "expr_chain_t", "expr_chain_m1")
     def identity(name: String): (String, String) = {
-      val id       = spark.sessionState.sqlParser.parseTableIdentifier(name)
-      val location = MvCatalog.lookup(spark, id).get.location
-      val detail   = sql(s"DESCRIBE DETAIL delta.`${location.replace("`", "``")}`").head()
+      val id         = spark.sessionState.sqlParser.parseTableIdentifier(name)
+      val location   = MvCatalog.lookup(spark, id).get.location
+      val detail     = sql(s"DESCRIBE DETAIL delta.`${location.replace("`", "``")}`").head()
       val properties = detail.getAs[Map[String, String]]("properties")
       properties.get("delta.enableChangeDataFeed").map(_.toLowerCase) shouldBe Some("true")
       location -> detail.getAs[String]("id")
@@ -105,8 +105,8 @@ class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinI
       views.map(identity) shouldBe identities
     }
     def refresh(): Unit = views.foreach(refreshMv)
-    val tId = spark.sessionState.sqlParser.parseTableIdentifier("expr_chain_t")
-    val meta = MvCatalog.lookup(spark, tId).get
+    val tId             = spark.sessionState.sqlParser.parseTableIdentifier("expr_chain_t")
+    val meta            = MvCatalog.lookup(spark, tId).get
     meta.properties.get(MvMetadata.CompileRefreshTypeKey) shouldBe Some("SEMI_ANTI_RECOMPUTE")
     meta.refreshType shouldBe RefreshTypeCode.FullRefresh
     meta.properties.get(MvMetadata.RefreshReasonKey) shouldBe Some("no_real_delta")
@@ -122,4 +122,6 @@ class SparkExpressionAntiJoinCdfIntegrationSpec extends SparkExpressionAntiJoinI
     verify()
   }
 }
-class SparkExpressionAntiJoinInterceptIntegrationSpec extends SparkExpressionAntiJoinIntegrationScenarios with InterceptMode
+class SparkExpressionAntiJoinInterceptIntegrationSpec
+    extends SparkExpressionAntiJoinIntegrationScenarios
+    with InterceptMode
