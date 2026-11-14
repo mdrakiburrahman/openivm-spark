@@ -9,6 +9,18 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
+  "Spark expression prepass" should "leave non-target map lookups and unreachable expressions unchanged" in {
+    val queries = Seq(
+      "SELECT element_at(m, 'a') FROM src",
+      "SELECT CASE WHEN false THEN lower(s) ELSE 'x' END FROM src",
+      "SELECT CASE WHEN true THEN 'x' ELSE lower(s) END FROM src",
+      "SELECT IF(false, lower(s), 'x') FROM src"
+    )
+    queries.foreach { query =>
+      SparkExpressionPrepass.prepare(query, caseSensitive = false).sql shouldBe query
+    }
+  }
+
   "Spark expression prepass" should "share marker identity only for equivalent expressions in the same scope" in {
     val marker = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r
     def ids(sql: String): Seq[String] =

@@ -132,6 +132,17 @@ private[spark] object SparkExpressionPrepass {
             expressions(branch.trueValue, scope)
             expressions(branch.falseValue, scope)
         }
+      case branch: UnresolvedFunction
+          if branch.nameParts.size == 1 && branch.nameParts.head.equalsIgnoreCase("if") &&
+            branch.arguments.size == 3 && !branch.isDistinct && branch.filter.isEmpty && !branch.ignoreNulls =>
+        expressions(branch.arguments.head, scope)
+        branch.arguments.head match {
+          case literal: Literal if literal.value == false || literal.value == null =>
+            expressions(branch.arguments(2), scope)
+          case literal: Literal if literal.value == true => expressions(branch.arguments(1), scope)
+          case _ =>
+            branch.arguments.tail.foreach(child => expressions(child, scope))
+        }
       case _ =>
         target(expr) match {
           case Some(result) => targets += ((expr, result, scope))
