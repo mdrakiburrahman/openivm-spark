@@ -1,5 +1,7 @@
 package org.openivm.spark.parity
 
+import org.apache.logging.log4j.{Level, LogManager}
+import org.apache.logging.log4j.core.config.Configurator
 import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, RefreshTypeCode}
 import org.openivm.spark.compiler.OpenIvmCompileException
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
@@ -20,7 +22,11 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       intercept[OpenIvmCompileException] {
         sql(s"EXPLAIN CREATE MATERIALIZED VIEW expr_bad_explain AS $query").collect()
       }
-      sql(s"CREATE MATERIALIZED VIEW expr_bad_mv AS $query")
+      val logger        = "org.openivm.spark.commands.CreateMaterializedViewCommand"
+      val previousLevel = LogManager.getLogger(logger).getLevel
+      Configurator.setLevel(logger, Level.FATAL)
+      try sql(s"CREATE MATERIALIZED VIEW expr_bad_mv AS $query")
+      finally Configurator.setLevel(logger, previousLevel)
       val identifier = spark.sessionState.sqlParser.parseTableIdentifier("expr_bad_mv")
       def checkFailureReceipt(): Unit = {
         val meta = MvCatalog.lookup(spark, identifier).get
