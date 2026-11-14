@@ -1,9 +1,15 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") with CdfMode {
+  override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.WindowRunningIncrementalEnabledKey   -> "true",
+    FeatureGate.GroupedWindowStateEnabledKey         -> "true",
+    FeatureGate.CompileClassificationCacheEnabledKey -> "true"
+  )
+
   it("preserves literals after apostrophes in line and block comments on create and CDF refresh") {
     sql("CREATE TABLE mcc_source (id INT, flag BOOLEAN, reason STRING) USING DELTA")
     sql("INSERT INTO mcc_source VALUES (1, true, 'MiXeD'), (2, false, 'Needs Review')")
