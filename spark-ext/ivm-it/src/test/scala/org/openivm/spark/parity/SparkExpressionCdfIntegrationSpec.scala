@@ -63,15 +63,16 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
         .where("view_name IN ('expr_case_pin_mv','default.expr_case_pin_mv') AND step_name = 'generate_refresh_sql.compile'")
         .select("detail").collect().last.getString(0)
       detail should include("compile_cache_hit=true")
-      sql("UPDATE expr_case_dim SET text = '2000-02-01' WHERE id = 1")
-      val newVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
       val logger = "org.openivm.spark.analyzer.SourceChangeLedger"
       val previousLevel = LogManager.getLogger(logger).getLevel
       Configurator.setLevel(logger, Level.FATAL)
-      try {
-        sql(s"ALTER MATERIALIZED VIEW expr_case_pin_mv ADVANCE SOURCE VERSIONS (expr_case_dim = $newVersion)")
+      val newVersion = try {
+        sql("UPDATE expr_case_dim SET text = '2000-02-01' WHERE id = 1")
+        val version = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
+        sql(s"ALTER MATERIALIZED VIEW expr_case_pin_mv ADVANCE SOURCE VERSIONS (expr_case_dim = $version)")
         sql("INSERT OVERWRITE TABLE expr_case_fact SELECT 10, 1")
         refreshMv("expr_case_pin_mv")
+        version
       } finally Configurator.setLevel(logger, previousLevel)
       assertMvCorrect("expr_case_pin_mv", query(newVersion))
     }
