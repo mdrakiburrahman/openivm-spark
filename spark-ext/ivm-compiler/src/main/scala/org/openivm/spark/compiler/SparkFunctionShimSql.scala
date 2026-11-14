@@ -101,7 +101,7 @@ private[compiler] object SparkFunctionShimSql {
       ) {
         val next = skipTriviaForward(sql, end, sql.length)
         if (next < sql.length && sql.charAt(next) == '(') None
-        else Some(end -> s"\"${sql.substring(i, end)}\"")
+        else Some(end -> ("\"" + sql.substring(i, end) + "\""))
       } else None
     }
 
