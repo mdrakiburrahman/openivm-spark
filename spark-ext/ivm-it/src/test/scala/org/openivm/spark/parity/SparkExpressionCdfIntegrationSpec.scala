@@ -37,6 +37,45 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       }
     }
 
+    it("preserves analyzed CASE coercion through cached and advanced pinned CTEs") {
+      spark.conf.set("spark.sql.ansi.enabled", "false")
+      sql("CREATE TABLE expr_case_dim (id INT, ts TIMESTAMP, text STRING) USING DELTA")
+      sql("INSERT INTO expr_case_dim VALUES (1, TIMESTAMP '2000-01-01 00:00:00', NULL)")
+      val oldVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
+      sql("CREATE TABLE expr_case_fact (id INT, dim_id INT) USING DELTA")
+      sql("INSERT INTO expr_case_fact VALUES (10, 1)")
+      def query(version: Long): String =
+        s"""WITH c AS (
+           |  SELECT d.id, CAST(CASE WHEN CAST(d.text AS TIMESTAMP) IS NULL
+           |    THEN d.ts ELSE d.text END AS STRING) AS v
+           |  FROM expr_case_dim VERSION AS OF $version d
+           |) SELECT f.id, c.v FROM expr_case_fact f JOIN c ON f.dim_id = c.id""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_case_pin_mv AS ${query(oldVersion)}")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_case_pin_mv")
+      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+      assertMvCorrect("expr_case_pin_mv", query(oldVersion))
+      sql("INSERT INTO expr_case_fact VALUES (11, 1)")
+      refreshMv("expr_case_pin_mv")
+      sql("INSERT INTO expr_case_fact VALUES (12, 1)")
+      refreshMv("expr_case_pin_mv")
+      assertMvCorrect("expr_case_pin_mv", query(oldVersion))
+      val detail = sql("SHOW OPENIVM REFRESH PROFILE")
+        .where("view_name IN ('expr_case_pin_mv','default.expr_case_pin_mv') AND step_name = 'generate_refresh_sql.compile'")
+        .select("detail").collect().last.getString(0)
+      detail should include("compile_cache_hit=true")
+      sql("UPDATE expr_case_dim SET text = '2000-02-01' WHERE id = 1")
+      val newVersion = sql("DESCRIBE HISTORY expr_case_dim").selectExpr("max(version)").head().getLong(0)
+      val logger = "org.openivm.spark.analyzer.SourceChangeLedger"
+      val previousLevel = LogManager.getLogger(logger).getLevel
+      Configurator.setLevel(logger, Level.FATAL)
+      try {
+        sql(s"ALTER MATERIALIZED VIEW expr_case_pin_mv ADVANCE SOURCE VERSIONS (expr_case_dim = $newVersion)")
+        sql("INSERT OVERWRITE TABLE expr_case_fact SELECT 10, 1")
+        refreshMv("expr_case_pin_mv")
+      } finally Configurator.setLevel(logger, previousLevel)
+      assertMvCorrect("expr_case_pin_mv", query(newVersion))
+    }
+
     it("incrementally maintains max_by with struct values and ordering keys") {
       sql("CREATE TABLE expr_struct_source (grp STRING, id INT, name STRING, ts TIMESTAMP) USING DELTA")
       sql("""INSERT INTO expr_struct_source VALUES
