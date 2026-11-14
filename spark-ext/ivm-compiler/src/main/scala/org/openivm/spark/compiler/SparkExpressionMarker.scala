@@ -30,6 +30,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Long      => "CAST(NULL AS BIGINT)"
         case Boolean   => "CAST(NULL AS BOOLEAN)"
         case TextArray => "string_split('openivm_type', ',')"
+        case Struct(seed) => seed
       }
       s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
     } else {
@@ -40,6 +41,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
         case Long      => s"CAST($payload AS BIGINT)"
         case Boolean   => s"CAST($payload AS BOOLEAN)"
         case TextArray => s"string_split($payload, '${id}separator')"
+        case _: Struct => throw new IllegalArgumentException("Struct markers require opaque mode")
       }
     }
   }
@@ -61,19 +63,22 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
             markers.get(id).flatMap { marker =>
               val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
               val allowed = marker.result match {
-                case Text    => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
-                case Integer => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
-                case Long    => Set("CAST(NULLASBIGINT)")
-                case Boolean => Set("CAST(NULLASBOOLEAN)")
+                case Text    => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)").contains(seed)
+                case Integer => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)").contains(seed)
+                case Long    => Set("CAST(NULLASBIGINT)").contains(seed)
+                case Boolean => Set("CAST(NULLASBOOLEAN)").contains(seed)
                 case TextArray =>
                   Set(
                     "STRING_SPLIT('OPENIVM_TYPE',',')",
                     "SPLIT('OPENIVM_TYPE',',')",
                     "ARRAY('OPENIVM_TYPE')",
                     "LIST_VALUE('OPENIVM_TYPE')"
-                  )
+                  ).contains(seed)
+                case _: Struct =>
+                  (seed.startsWith("{") && seed.endsWith("}")) ||
+                  seed.startsWith("STRUCT_PACK(") || seed.startsWith("NAMED_STRUCT(")
               }
-              if (!allowed.contains(seed)) None
+              if (!allowed) None
               else Some(call.end -> renderMarker(id, call.args.drop(2)))
             }
           }
@@ -156,6 +161,7 @@ private[compiler] object SparkExpressionMarker {
   case object Long      extends ResultType
   case object Boolean   extends ResultType
   case object TextArray extends ResultType
+  final case class Struct(seed: String) extends ResultType
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
@@ -229,6 +235,7 @@ private[compiler] object SparkExpressionMarker {
     var argStart = i
     var depth    = 1
     var brackets = 0
+    var braces   = 0
     val args     = mutable.ArrayBuffer.empty[String]
     while (i < sql.length) {
       val c = sql.charAt(i)
@@ -265,7 +272,9 @@ private[compiler] object SparkExpressionMarker {
             }
           case '[' => brackets += 1
           case ']' => brackets -= 1
-          case ',' if depth == 1 && brackets == 0 =>
+          case '{' => braces += 1
+          case '}' => braces -= 1
+          case ',' if depth == 1 && brackets == 0 && braces == 0 =>
             args += sql.substring(argStart, i).trim
             argStart = i + 1
           case _ =>

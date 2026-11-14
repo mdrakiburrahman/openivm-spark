@@ -5,7 +5,7 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction}
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction, UnresolvedStar}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   CaseWhen,
@@ -92,6 +92,60 @@ private[spark] object SparkExpressionPrepass {
   def prepare(sql: String, caseSensitive: Boolean, stableToken: Option[String] = None): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
+    val parsed = CatalystSqlParser.parsePlan(sql)
+
+    def normalized(name: String): String = if (caseSensitive) name else name.toLowerCase(Locale.ROOT)
+    val keyRefs = mutable.Set.empty[String]
+    val otherRefs = mutable.Set.empty[String]
+    val aliasCounts = mutable.Map.empty[String, Int].withDefaultValue(0)
+    var hasStar = false
+    val scannedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+
+    def scanExpression(expr: Expression, inKey: Boolean): Unit = expr match {
+      case _: UnresolvedStar => hasStar = true
+      case attr: UnresolvedAttribute =>
+        (if (inKey) keyRefs else otherRefs) += normalized(attr.nameParts.last)
+      case alias: Alias =>
+        val name = normalized(alias.name)
+        aliasCounts.update(name, aliasCounts(name) + 1)
+        scanExpression(alias.child, inKey)
+      case function: UnresolvedFunction
+          if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
+            function.arguments.size == 2 =>
+        scanExpression(function.arguments.head, inKey = false)
+        scanExpression(function.arguments(1), inKey = true)
+        function.filter.foreach(child => scanExpression(child, inKey = false))
+      case subquery: SubqueryExpression =>
+        scanPlan(subquery.plan)
+        subquery.children.foreach(child => scanExpression(child, inKey))
+      case other => other.children.foreach(child => scanExpression(child, inKey))
+    }
+
+    def scanPlan(plan: LogicalPlan): Unit =
+      if (!scannedPlans.containsKey(plan)) {
+        scannedPlans.put(plan, java.lang.Boolean.TRUE)
+        plan.expressions.foreach(expr => scanExpression(expr, inKey = false))
+        plan.children.foreach(scanPlan)
+        plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(scanPlan)
+      }
+
+    scanPlan(parsed)
+    val safeKeyAliases =
+      if (hasStar) Set.empty[String]
+      else keyRefs.diff(otherRefs).filter(name => aliasCounts(name) == 1).toSet
+
+    def canTemplate(expr: Expression): Boolean = expr match {
+      case _: UnresolvedAttribute => true
+      case struct: CreateNamedStruct =>
+        struct.valExprs.forall {
+          case alias: Alias => canTemplate(alias.child)
+          case other => canTemplate(other)
+        }
+      case f: UnresolvedFunction =>
+        f.nameParts.size == 1 && allowedFunctions.contains(f.nameParts.head.toLowerCase(Locale.ROOT)) &&
+          !f.isDistinct && f.filter.isEmpty && !f.ignoreNulls && f.children.forall(canTemplate)
+      case other => allowedNodes.contains(other.getClass.getSimpleName) && other.children.forall(canTemplate)
+    }
 
     def target(expr: Expression): Option[ResultType] = expr match {
       case _: RLike => Some(Boolean)
@@ -110,6 +164,12 @@ private[spark] object SparkExpressionPrepass {
     var nextScope    = 0
     val visitedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
     def expressions(expr: Expression, scope: Int): Unit = expr match {
+      case alias: Alias if safeKeyAliases.contains(normalized(alias.name)) && canTemplate(alias.child) =>
+        val span = expressionSpan(sql, alias.child)
+        SparkFunctionShimSql.namedStructTypeSeed(sql.substring(span.start, span.end)) match {
+          case Some(seed) => targets += ((alias.child, Struct(seed), scope))
+          case None => expressions(alias.child, scope)
+        }
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
         subquery.children.foreach(child => expressions(child, scope))
@@ -167,7 +227,7 @@ private[spark] object SparkExpressionPrepass {
       }
     }
 
-    plans(CatalystSqlParser.parsePlan(sql))
+    plans(parsed)
     val uniqueTargets = mutable.LinkedHashMap.empty[Span, (Expression, ResultType, Int)]
     targets.foreach { case (expr, result, scope) =>
       val span = expressionSpan(sql, expr)
