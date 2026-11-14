@@ -2,6 +2,8 @@ package org.openivm.spark.parity
 
 import java.util.UUID
 
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.core.config.Configurator
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
@@ -16,6 +18,7 @@ abstract class HiveSourceScenarios extends IvmParitySpecBase("hive-source") {
   )
 
   override def beforeAll(): Unit = {
+    Configurator.setLevel("org.apache.hadoop.hive", Level.ERROR)
     super.beforeAll()
     sql("CREATE DATABASE hivesource")
     spark.catalog.setCurrentDatabase("hivesource")
@@ -56,14 +59,14 @@ abstract class HiveSourceScenarios extends IvmParitySpecBase("hive-source") {
       sql("CREATE TABLE hsrc_delta (id BIGINT, amount INT) USING DELTA")
       sql("INSERT INTO hsrc_delta VALUES (1, 10), (2, 20)")
       val query = "SELECT h.id, h.label, h.part, d.amount FROM hsrc_partitioned h JOIN hsrc_delta d ON h.id = d.id"
-      sql(s"CREATE MATERIALIZED VIEW hsrc_join_mv AS $query")
+      sql(s"CREATE MATERIALIZED VIEW hivesource.hsrc_join_mv AS $query")
       checkClassification("hsrc_join_mv")
-      sql("CREATE MATERIALIZED VIEW hsrc_downstream AS SELECT id, label, part, amount FROM hsrc_join_mv")
+      sql("CREATE MATERIALIZED VIEW hivesource.hsrc_downstream AS SELECT id, label, part, amount FROM hsrc_join_mv")
       assertMvCorrect("hsrc_join_mv", query)
 
       externalWrite("INSERT INTO hivesource.hsrc_partitioned PARTITION (part='b') SELECT 2L, 'second'")
-      refreshMv("hsrc_join_mv")
-      refreshMv("hsrc_downstream")
+      refreshMv("hivesource.hsrc_join_mv")
+      refreshMv("hivesource.hsrc_downstream")
       assertMvCorrect("hsrc_join_mv", query)
       assertMvCorrect("hsrc_downstream", query)
     }
