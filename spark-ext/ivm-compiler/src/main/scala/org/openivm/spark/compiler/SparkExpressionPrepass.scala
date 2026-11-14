@@ -37,6 +37,7 @@ private[spark] object SparkExpressionPrepass {
     "split"          -> TextArray,
     "size"           -> Integer,
     "unix_timestamp" -> Long,
+    "unix_micros"    -> Long,
     "raise_error"    -> Text
   )
 

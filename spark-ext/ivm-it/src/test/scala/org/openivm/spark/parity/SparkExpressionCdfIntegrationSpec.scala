@@ -41,7 +41,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     it("preserves qualified epoch conversion and conditional errors") {
       sql("CREATE TABLE expr_epoch_source (id INT, ts TIMESTAMP, txt STRING, invalid BOOLEAN) USING DELTA")
       sql("INSERT INTO expr_epoch_source VALUES (1, TIMESTAMP '2024-01-01 01:02:03', 'A', false)")
-      val query = """SELECT s.id, unix_timestamp(s.ts) AS epoch,
+      val query = """SELECT s.id, unix_timestamp(s.ts) AS epoch, unix_micros(s.ts) AS micros,
                     |CASE WHEN s.invalid THEN CAST(raise_error('invalid') AS STRING) ELSE s.txt END AS text_value,
                     |CASE WHEN s.invalid THEN CAST(raise_error('invalid') AS TIMESTAMP) ELSE s.ts END AS time_value
                     |FROM expr_epoch_source s""".stripMargin
@@ -50,7 +50,7 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
       assertMvCorrect("expr_epoch_mv", query)
       sql("UPDATE expr_epoch_source SET txt = 'B' WHERE id = 1")
-      sql("INSERT INTO expr_epoch_source VALUES (2, TIMESTAMP '2024-02-01 01:02:03', 'C', false)")
+      sql("INSERT INTO expr_epoch_source VALUES (2, TIMESTAMP '2024-02-01 01:02:03.123456', 'C', false)")
       refreshMv("expr_epoch_mv")
       assertMvCorrect("expr_epoch_mv", query)
       sql("INSERT INTO expr_epoch_source VALUES (3, TIMESTAMP '2024-03-01 01:02:03', 'D', true)")
