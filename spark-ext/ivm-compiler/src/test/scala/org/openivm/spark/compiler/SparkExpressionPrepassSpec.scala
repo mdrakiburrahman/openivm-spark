@@ -33,7 +33,9 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
   it should "rewrite marked expressions duplicated by Catalyst only once" in {
     val queries = Seq(
       "SELECT size(split(s, '/')) BETWEEN 1 AND 2 FROM src",
-      "SELECT CASE lower(element_at(split(s, '/'), -1)) WHEN 'x' THEN 'a' WHEN 'y' THEN 'b' END FROM src"
+      "SELECT CASE lower(element_at(split(s, '/'), -1)) WHEN 'x' THEN 'a' WHEN 'y' THEN 'b' END FROM src",
+      "SELECT s FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.s = lower(t.s))",
+      "SELECT s FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.s = element_at(split(t.s, '/'), -1))"
     )
     queries.foreach { query =>
       val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)

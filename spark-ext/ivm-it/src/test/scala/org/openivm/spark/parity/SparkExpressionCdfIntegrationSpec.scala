@@ -39,6 +39,24 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
       } finally Configurator.setRootLevel(previousLevel)
     }
 
+    it("preserves correlated anti-join expressions during refresh") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_anti_source (id INT, txt STRING) USING DELTA")
+      sql("CREATE TABLE expr_anti_blocked (txt STRING) USING DELTA")
+      sql("INSERT INTO expr_anti_source VALUES (1, 'A'), (2, 'B'), (3, NULL)")
+      sql("INSERT INTO expr_anti_blocked VALUES ('a')")
+      val query = """SELECT t.id, t.txt FROM expr_anti_source t
+        |WHERE NOT EXISTS (SELECT 1 FROM expr_anti_blocked u WHERE u.txt = lower(t.txt))""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW expr_anti_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_anti_mv")
+      MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+      assertMvCorrect("expr_anti_mv", query)
+      sql("INSERT INTO expr_anti_blocked VALUES ('b')")
+      sql("INSERT INTO expr_anti_source VALUES (4, 'C')")
+      refreshMv("expr_anti_mv")
+      assertMvCorrect("expr_anti_mv", query)
+    }
+
     it("preserves pinned-source identity while incrementally refreshing a live join") {
       sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
       sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
