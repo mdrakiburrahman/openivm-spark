@@ -32,6 +32,21 @@ abstract class DateFormatGroupRecomputeScenarios extends IvmParitySpecBase("date
     RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
     assertMvCorrect("dfgr_mv", query)
   }
+
+  it("preserves Spark date formats for constant expressions") {
+    sql("CREATE TABLE dfgr_const_source (id INT) USING DELTA")
+    sql("INSERT INTO dfgr_const_source VALUES (1)")
+    val query = "SELECT id, date_format(TIMESTAMP '2024-01-02 03:04:05', 'yyyy-MM-dd') AS day FROM dfgr_const_source"
+    sql(s"CREATE MATERIALIZED VIEW dfgr_const_mv AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("dfgr_const_mv")
+    MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+    assertMvCorrect("dfgr_const_mv", query)
+    sql("INSERT INTO dfgr_const_source VALUES (2)")
+    RefreshProfileCatalog.removeAll(spark)
+    refreshMv("dfgr_const_mv")
+    RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+    assertMvCorrect("dfgr_const_mv", query)
+  }
 }
 
 class DateFormatGroupRecomputeCdfIntegrationSpec extends DateFormatGroupRecomputeScenarios with CdfMode
