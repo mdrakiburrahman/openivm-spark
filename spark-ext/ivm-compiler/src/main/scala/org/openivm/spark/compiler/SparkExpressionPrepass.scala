@@ -42,7 +42,8 @@ private[spark] object SparkExpressionPrepass {
     "size"           -> Integer,
     "unix_timestamp" -> Long,
     "unix_micros"    -> Long,
-    "raise_error"    -> Text
+    "raise_error"    -> Text,
+    "date_format"    -> Text
   )
 
   private val allowedFunctions = resultTypes.keySet ++ Set(
@@ -56,7 +57,8 @@ private[spark] object SparkExpressionPrepass {
     "rpad",
     "lpad",
     "replace",
-    "date_format",
+    "date_add",
+    "date_sub",
     "concat",
     "concat_ws",
     "coalesce",
