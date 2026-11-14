@@ -27,7 +27,6 @@ object LptsSparkDialect {
     * (e.g. `my_generate_series(`) are not rewritten.
     */
   private val GenSeriesRe = """(?i)\bgenerate_series\s*\(""".r
-  private val UnnestSequenceRe = """(?i)unnest\s*\(\s*sequence\s*\(""".r.pattern
 
   /** `<expr>::TYPE[(...)]` on the placeholder-substituted string.
     *
@@ -412,17 +411,8 @@ object LptsSparkDialect {
     NowTsRe.replaceAllIn(sql, "current_timestamp()")
 
   /** Rewrites `generate_series(a, b[, c])` to `sequence(a, b[, c])`. */
-  private[compiler] def rewriteGenerateSeries(sql: String): String = {
-    val rewritten = GenSeriesRe.replaceAllIn(sql, "sequence(")
-    SparkFunctionShimSql.rewriteOutsideProtected(rewritten, protectBackticks = true) { index =>
-      val matcher = UnnestSequenceRe.matcher(rewritten)
-      matcher.region(index, rewritten.length)
-      if ((index == 0 || !Character.isLetterOrDigit(rewritten.charAt(index - 1)) &&
-          rewritten.charAt(index - 1) != '_') && matcher.lookingAt())
-        Some((index + 6, "explode"))
-      else None
-    }
-  }
+  private[compiler] def rewriteGenerateSeries(sql: String): String =
+    GenSeriesRe.replaceAllIn(sql, "sequence(")
 
   /** Rewrites DuckDB postfix casts (`<expr>::TYPE`) to Spark
     * `CAST(<expr> AS TYPE)`, skipping occurrences that are inside

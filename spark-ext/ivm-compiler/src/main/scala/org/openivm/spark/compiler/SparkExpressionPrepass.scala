@@ -298,8 +298,9 @@ private[spark] object SparkExpressionPrepass {
     val generatorEdits = generators.distinct.map { case (explode, sequence) =>
       val bounds = sequence.arguments.take(2).map { arg =>
         val span = expressionSpan(sql, arg)
-        val input = sql.substring(span.start, span.end)
-        markers.encode(Seq(input), DateBound)(_.head)
+        val arguments = mutable.ArrayBuffer.empty[String]
+        val body = template(sql, arg, span, arguments, caseSensitive)
+        markers.encode(arguments.toSeq, DateBound)(body)
       }
       expressionSpan(sql, explode) ->
         s"CAST(UNNEST(GENERATE_SERIES(${bounds.mkString(", ")}, to_days(1))) AS DATE)"
