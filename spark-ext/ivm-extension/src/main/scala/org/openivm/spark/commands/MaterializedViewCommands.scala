@@ -3369,8 +3369,13 @@ case class CreateMaterializedViewCommand(
     // independent of the compile-cache feature flag. Only the per-(fingerprint,tier)
     // cache properties are gated by the flag.
     val initialLoadProps =
-      if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
-      else Map.empty[String, String]
+      if (compiled.initialLoadSql.nonEmpty) {
+        val restored =
+          if (expressionBridge.nonEmpty && effectiveRefreshType != RefreshTypeCode.FullRefresh)
+            Map(SparkExpressionPrepass.RestoredInitialLoadProperty -> viewBodySql)
+          else Map.empty[String, String]
+        Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql) ++ restored
+      } else Map.empty[String, String]
     val cacheCompiledProps =
       if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
         Map.empty[String, String]
@@ -5438,7 +5443,9 @@ case class RefreshMaterializedViewCommand(
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
           if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
-            org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
+            meta.properties
+              .get(SparkExpressionPrepass.RestoredInitialLoadProperty)
+              .getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
           else
             // UserFullQuery surface at REFRESH: path-bind the user body's pinned
             // reads to their verified Delta paths so the recompute reads the frozen

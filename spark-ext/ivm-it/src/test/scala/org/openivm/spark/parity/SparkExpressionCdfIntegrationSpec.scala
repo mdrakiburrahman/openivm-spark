@@ -55,6 +55,10 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           .last
           .getString(0)
         detail should include("compile_cache_hit=true")
+        sql(s"""INSERT OVERWRITE TABLE $source
+          |SELECT 8, 'x/y', TIMESTAMP '2024-03-01 01:02:03', 8L, false""".stripMargin)
+        refreshMv(mv)
+        assertMvCorrect(mv, query)
       }
     }
   }
