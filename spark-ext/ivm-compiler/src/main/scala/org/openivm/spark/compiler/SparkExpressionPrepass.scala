@@ -6,7 +6,15 @@ import java.util.Locale
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction}
-import org.apache.spark.sql.catalyst.expressions.{CreateNamedStruct, Expression, Literal, RLike, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{
+  Alias,
+  CreateNamedStruct,
+  Expression,
+  Literal,
+  NamePlaceholder,
+  RLike,
+  SubqueryExpression
+}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.openivm.spark.compiler.SparkExpressionMarker._
@@ -176,15 +184,22 @@ private[compiler] object SparkExpressionPrepass {
         edits += Edit(location, args => args(index))
       case struct: CreateNamedStruct =>
         val location = originSpan(sql, struct)
-        val names = struct.nameExprs.map {
-          case lit: Literal if lit.value != null =>
-            val hex = lit.value.toString.getBytes(StandardCharsets.UTF_8).map(b => f"${b & 0xff}%02x").mkString
-            s"CAST(X'$hex' AS STRING)"
-          case _ => throw new IllegalArgumentException("Struct field name is not a literal")
+        val names = struct.nameExprs.zip(struct.valExprs).map { case (name, value) =>
+          val fieldName = (name, value) match {
+            case (lit: Literal, _) if lit.value != null => lit.value.toString
+            case (NamePlaceholder, alias: Alias)        => alias.name
+            case _ => throw new IllegalArgumentException("Struct field name is not a literal or explicit alias")
+          }
+          val hex = fieldName.getBytes(StandardCharsets.UTF_8).map(b => f"${b & 0xff}%02x").mkString
+          s"CAST(X'$hex' AS STRING)"
         }
         val values = struct.valExprs.map { value =>
-          val valueSpan = expressionSpan(sql, value)
-          template(sql, value, valueSpan, arguments)
+          val inner = value match {
+            case alias: Alias => alias.child
+            case other        => other
+          }
+          val valueSpan = expressionSpan(sql, inner)
+          template(sql, inner, valueSpan, arguments)
         }
         edits += Edit(
           location,

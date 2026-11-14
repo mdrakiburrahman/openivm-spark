@@ -79,6 +79,27 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
         actual.exceptAll(expected).count() shouldBe 0L
         expected.exceptAll(actual).count() shouldBe 0L
       }
+      Seq(
+        """WITH filtered AS (SELECT id, s FROM src WHERE s IS NOT NULL)
+          |SELECT f.id, LOWER(f.s) AS lowered FROM filtered f""".stripMargin,
+        """SELECT id, TO_JSON(STRUCT(id AS `Camel Name`, LOWER(s) AS value),
+          |MAP('ignoreNullFields','false')) AS body FROM src""".stripMargin
+      ).foreach { query =>
+        val probe = SparkExpressionPrepass.prepare(query)
+        val result = compiler.compile(
+          CompileRequest(
+            "prepass_scope",
+            probe.sql,
+            Map("src" -> StructType.fromDDL("s STRING, id STRING, t TIMESTAMP, n BIGINT, deleted BOOLEAN"))
+          )
+        )
+        val restored = probe.markers.restore(result.initialLoadSql)
+        probe.markers.requireAllSeen()
+        val actual   = spark.sql(restored)
+        val expected = spark.sql(query)
+        actual.exceptAll(expected).count() shouldBe 0L
+        expected.exceptAll(actual).count() shouldBe 0L
+      }
     } finally {
       spark.stop()
       compiler.close()
