@@ -48,7 +48,7 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
         val path   = s"$warehouse/$mv"
         val expected = s"""SELECT id, txt RLIKE '(?i)ä' AS re, size(split(txt, '/')) AS n,
           |element_at(split(txt, '/'), -1) AS leaf,
-          |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', id)),
+          |sha2(to_json(named_struct('O\'Brien', txt, 'Odd Name', txt, 'nested', named_struct('Mixed', id)),
           |map('ignoreNullFields', 'false', 'timeZone', 'UTC')), 256) AS digest FROM $source
           |WHERE txt IS NULL OR CAST(txt AS STRING) RLIKE '(?i)ä' OR txt LIKE '%/%'""".stripMargin
         val prepared = SparkExpressionPrepass.prepare(expected)
@@ -63,8 +63,6 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
         val initial = bridge.restore(compiled.initialLoadSql)
         bridge.requireAllSeen()
         bridge.resetSeen()
-        val program = bridge.restore(compiled.sql)
-        bridge.requireAllSeen()
         spark.sql(s"CREATE TABLE $source (id INT, txt STRING) USING DELTA")
         spark.sql(s"INSERT INTO $source VALUES (1, NULL), (2, 'Ä'), (3, 'a/b')")
         spark.sql(s"CREATE TABLE $mv USING DELTA LOCATION '$path' AS $initial")
@@ -84,15 +82,16 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
           |AS changes(id, txt, openivm_multiplicity)""".stripMargin)
           .createOrReplaceTempView(s"openivm_delta_$source")
         val rewritten = SparkRefreshRewriter.rewrite(
-          compiledSql = program,
+          compiledSql = compiled.sql,
           mvName = TableIdentifier(mv),
           mvLocation = path,
           viewLogicalName = mv,
           sourceTempViews = Map(source -> s"openivm_delta_$source"),
           viewDeltaPath = s"$warehouse/${mv}_delta",
-          postProcess = LptsSparkDialect.translate,
+          postProcess = sql => bridge.restore(LptsSparkDialect.translate(sql)),
           sourceSchemas = Map(source -> Seq("id", "txt"))
         )
+        bridge.requireAllSeen()
         rewritten.statements.foreach(stmt => spark.sql(stmt))
         verify()
       }
