@@ -6,7 +6,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, HiveTableRelation}
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
@@ -2185,10 +2185,6 @@ private[commands] object MvCommandHelper {
           val id        = r.catalogTable.get.identifier
           val qualified = id.database.fold(id.table)(db => s"$db.${id.table}")
           Seq((qualified, id.table, r.schema))
-        case r: HiveTableRelation =>
-          val id        = r.tableMeta.identifier
-          val qualified = id.database.fold(id.table)(db => s"$db.${id.table}")
-          Seq((qualified, id.table, r.schema))
         case r: DataSourceV2Relation if r.identifier.isDefined =>
           val ident     = r.identifier.get
           val ns        = ident.namespace()
@@ -2210,22 +2206,6 @@ private[commands] object MvCommandHelper {
     val shortToQual: Map[String, String] =
       sources.map { case (qualified, short, _) => short -> qualified }.toMap
     (qualNames, qualSchemas, compileSchemas, shortToQual)
-  }
-
-  /** Hive tables have no versioned change feed; include converted Hive file relations as well. */
-  def hiveSourceNames(analyzed: LogicalPlan): Set[String] = {
-    def qualified(table: CatalogTable): String =
-      table.identifier.database.fold(table.identifier.table)(db => s"$db.${table.identifier.table}")
-    def collect(plan: LogicalPlan): Seq[String] = plan match {
-      case view: View if MvProjectionSource.isProjection(view) => Nil
-      case relation: HiveTableRelation                         => Seq(qualified(relation.tableMeta))
-      case relation: LogicalRelation =>
-        relation.catalogTable.filter(_.provider.exists(_.equalsIgnoreCase("hive"))).map(qualified).toSeq
-      case other =>
-        val subqueries = other.expressions.flatMap(_.collect { case s: SubqueryExpression => s.plan })
-        (other.children ++ subqueries).flatMap(collect)
-    }
-    collect(analyzed).toSet
   }
 
   /** Extract the GROUP BY key column names from an analyzed LogicalPlan. */
@@ -2479,11 +2459,6 @@ private[commands] object MvCommandHelper {
       reason = refreshReason,
       emitsCascadeViewDelta = false
     )
-
-  def classifyHiveSources(sources: Set[String], classification: EffectiveClassification): EffectiveClassification =
-    if (sources.nonEmpty && classification.compileRefreshTypeName != "COMPILE_FAILED")
-      authoritativeFullRefreshClassification(classification.compileRefreshTypeName, "unversioned_hive_source")
-    else classification
 
   /** AGGREGATE_HAVING data-table columns, discovered by a schema-only (`LIMIT 0`)
     * probe of the incremental view body. Empty for non-AGGREGATE_HAVING views.
@@ -2924,7 +2899,6 @@ case class CreateMaterializedViewCommand(
       profile.timeStep("create_resolve_sources") {
         collectSourceSchemas(analyzed)
       }
-    val hiveSources = hiveSourceNames(analyzed)
 
     // Resolve the body's snapshot pins to their operational sources by physical
     // Delta identity ONCE, and reuse the result for the compiler overlay and
@@ -2955,7 +2929,7 @@ case class CreateMaterializedViewCommand(
     // CREATE so users see a clear error before paying for the openivm
     // compile + initial CTAS.
     profile.timeStep("create_validate_sources") {
-      propagation.validateSources(spark, qualNames.filterNot(hiveSources.contains))
+      propagation.validateSources(spark, qualNames)
     }
 
     // Snapshot-pin telemetry contract.  Derived from the USER's body plus this
@@ -3184,18 +3158,15 @@ case class CreateMaterializedViewCommand(
     // INFO-level for "kept" so the per-MV decision is always visible during
     // normal operation; ERROR-level for any demotion so even
     // production-tuned log filters surface it.
-    val classification = classifyHiveSources(
-      hiveSources,
-      classifyEffectiveRefreshType(
-        compiled = compiled,
-        viewShortName = name.table,
-        topKViewSpec = topKViewSpec,
-        simpleProjectionHasDataApply = simpleProjectionHasDataApply,
-        upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
-        rawHavingPred = rawHavingPred,
-        aggregateHavingDataColumns = aggregateHavingDataColumns,
-        authoritativeClassification = authoritativeClassification
-      )
+    val classification = classifyEffectiveRefreshType(
+      compiled = compiled,
+      viewShortName = name.table,
+      topKViewSpec = topKViewSpec,
+      simpleProjectionHasDataApply = simpleProjectionHasDataApply,
+      upstreamSnapshotTriggerDetail = upstreamSnapshotTriggerDetail,
+      rawHavingPred = rawHavingPred,
+      aggregateHavingDataColumns = aggregateHavingDataColumns,
+      authoritativeClassification = authoritativeClassification
     )
     val effectiveRefreshType     = classification.refreshType
     val classifyReason           = classification.reason
@@ -3234,7 +3205,7 @@ case class CreateMaterializedViewCommand(
           s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
           MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
           classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
-      if (classification.isDemotionToFullRefresh && classifyReason != "unversioned_hive_source")
+      if (classification.isDemotionToFullRefresh)
         logError(msg)
       else
         logInfo(msg)
@@ -3324,8 +3295,7 @@ case class CreateMaterializedViewCommand(
     val havingPred: Option[String] = if (isHavingViewIncremental) rawHavingPred else None
 
     // Persist internal metadata alongside any user-provided properties.
-    val baseProps = Map("_ivm_group_keys" -> groupKeys.mkString(",")) ++
-      (if (hiveSources.nonEmpty) Map("_ivm_has_hive_source" -> "true") else Map.empty)
+    val baseProps  = Map("_ivm_group_keys" -> groupKeys.mkString(","))
     val countProp  = countStarAlias.map(a => "_ivm_count_col" -> a).toMap
     val havingProp = havingPred.map(p => "_ivm_having_pred" -> p).toMap
     val backingViewProp =
@@ -4579,10 +4549,6 @@ case class RefreshMaterializedViewCommand(
           )
         }
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
-      if (meta.properties.get("_ivm_has_hive_source").contains("true")) {
-        // Hive file listings and partition metadata may have changed outside this Spark session.
-        meta.sourceTables.foreach(source => spark.catalog.refreshTable(source))
-      }
       val compileRefreshType = meta.properties
         .get(MvMetadata.CompileRefreshTypeKey)
         .map(_.trim)
