@@ -66,6 +66,29 @@ abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-gener
     refreshMv("date_gen_window_mv")
     assertMvCorrect("date_gen_window_mv", query)
   }
+
+  it("maintains two daily generators in separate CTEs") {
+    sql("CREATE TABLE date_gen_left (id INT, start_date DATE, end_date DATE) USING DELTA")
+    sql("CREATE TABLE date_gen_right (id INT, start_date DATE, end_date DATE) USING DELTA")
+    sql("INSERT INTO date_gen_left VALUES (1, DATE '2024-01-01', DATE '2024-01-02')")
+    sql("INSERT INTO date_gen_right VALUES (1, DATE '2024-02-01', DATE '2024-02-02')")
+    val query = """WITH l AS (
+      | SELECT id, explode(sequence(start_date, end_date, INTERVAL 1 DAY)) AS ld FROM date_gen_left
+      |), r AS (
+      | SELECT id, explode(sequence(start_date, end_date, INTERVAL 1 DAY)) AS rd FROM date_gen_right
+      |) SELECT l.id, l.ld, r.rd FROM l JOIN r ON l.id = r.id""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW date_gen_join_mv AS $query")
+    val id = spark.sessionState.sqlParser.parseTableIdentifier("date_gen_join_mv")
+    MvCatalog.lookup(spark, id).get.refreshType should not be RefreshTypeCode.FullRefresh
+    assertMvCorrect("date_gen_join_mv", query)
+    sql("UPDATE date_gen_left SET end_date = DATE '2024-01-03' WHERE id = 1")
+    sql("INSERT INTO date_gen_right VALUES (1, DATE '2024-02-03', DATE '2024-02-03')")
+    refreshMv("date_gen_join_mv")
+    assertMvCorrect("date_gen_join_mv", query)
+    sql("DELETE FROM date_gen_right WHERE start_date = DATE '2024-02-01'")
+    refreshMv("date_gen_join_mv")
+    assertMvCorrect("date_gen_join_mv", query)
+  }
 }
 
 class SparkDateGeneratorCdfIntegrationSpec       extends SparkDateGeneratorScenarios with CdfMode
