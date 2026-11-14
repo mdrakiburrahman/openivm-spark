@@ -108,6 +108,8 @@ private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
       throw new IllegalStateException(s"Native compiler lost ${missing.size} Spark expression marker(s)")
   }
 
+  def resetSeen(): Unit = seen.clear()
+
   private def renderMarker(id: String, args: Seq[String]): String = {
     val marker = markers(id)
     if (args.size != marker.arity)

@@ -67,6 +67,8 @@ class SparkOpaqueMarkerRefreshSpec extends AnyFlatSpec with Matchers {
         val compiled = compiler.compile(request)
         compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"
         val initial = bridge.restore(compiled.initialLoadSql)
+        bridge.requireAllSeen()
+        bridge.resetSeen()
         val program = bridge.restore(compiled.sql)
         bridge.requireAllSeen()
         val expected = s"""SELECT id, regexp_like(txt, '(?i)ä') AS re, size(split(txt, '/')) AS n,

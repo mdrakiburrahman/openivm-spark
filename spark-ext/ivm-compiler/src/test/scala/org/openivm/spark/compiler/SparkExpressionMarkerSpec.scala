@@ -37,6 +37,10 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     val marker = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
     intercept[IllegalStateException](bridge.restore(marker.replace("row(", "other(")))
     intercept[IllegalStateException](bridge.requireAllSeen())
+    bridge.restore(marker)
+    bridge.requireAllSeen()
+    bridge.resetSeen()
+    intercept[IllegalStateException](bridge.requireAllSeen())
     val opaque = new SparkExpressionMarker(opaque = true)
     intercept[IllegalArgumentException] {
       opaque.encode(Seq("""struct_pack("Odd Name" := id)"""), Text)(_.head)
@@ -86,6 +90,8 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
       )
       compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"
       val sql = bridge.restore(compiled.sql)
+      bridge.requireAllSeen()
+      bridge.resetSeen()
       compiled.initialLoadSql should not be empty
       val initial = bridge.restore(compiled.initialLoadSql)
       bridge.requireAllSeen()
