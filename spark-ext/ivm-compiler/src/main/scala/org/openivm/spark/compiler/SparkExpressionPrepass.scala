@@ -8,8 +8,10 @@ import scala.collection.mutable
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
+  CaseWhen,
   CreateNamedStruct,
   Expression,
+  If,
   Literal,
   NamePlaceholder,
   RLike,
@@ -94,7 +96,7 @@ private[spark] object SparkExpressionPrepass {
           f.arguments.headOption match {
             case Some(a: UnresolvedFunction) if a.nameParts.size == 1 && a.nameParts.head.equalsIgnoreCase("split") =>
               Some(Text)
-            case _ => throw new IllegalArgumentException("Cannot infer element_at result type")
+            case _ => None
           }
         } else resultTypes.get(name)
       case _ => None
@@ -105,6 +107,30 @@ private[spark] object SparkExpressionPrepass {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
         subquery.children.foreach(child => expressions(child, scope))
+      case branch: CaseWhen =>
+        var reachable = true
+        branch.branches.foreach { case (condition, value) =>
+          if (reachable) {
+            expressions(condition, scope)
+            condition match {
+              case literal: Literal if literal.value == false || literal.value == null =>
+              case literal: Literal if literal.value == true =>
+                expressions(value, scope)
+                reachable = false
+              case _ => expressions(value, scope)
+            }
+          }
+        }
+        if (reachable) branch.elseValue.foreach(child => expressions(child, scope))
+      case branch: If =>
+        expressions(branch.predicate, scope)
+        branch.predicate match {
+          case literal: Literal if literal.value == false || literal.value == null => expressions(branch.falseValue, scope)
+          case literal: Literal if literal.value == true                           => expressions(branch.trueValue, scope)
+          case _ =>
+            expressions(branch.trueValue, scope)
+            expressions(branch.falseValue, scope)
+        }
       case _ =>
         target(expr) match {
           case Some(result) => targets += ((expr, result, scope))

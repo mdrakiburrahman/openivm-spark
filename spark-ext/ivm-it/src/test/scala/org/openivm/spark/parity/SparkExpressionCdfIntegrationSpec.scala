@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.apache.logging.log4j.{Level, LogManager}
 import org.apache.logging.log4j.core.config.Configurator
 import org.openivm.spark.common.{FeatureGate, MvCatalog, MvMetadata, RefreshTypeCode}
-import org.openivm.spark.compiler.OpenIvmCompileException
+import org.openivm.spark.compiler.{OpenIvmCompileException, SparkExpressionPrepass}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("expression-bridge") {
@@ -14,6 +14,49 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
   )
 
   describe("Spark expression bridge") {
+    it("preserves native map lookup and unreachable branches") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_baseline_source (id INT, txt STRING, m MAP<STRING, INT>) USING DELTA")
+      sql("INSERT INTO expr_baseline_source VALUES (1, 'ABC', map('a', 1)), (2, NULL, map('a', 2))")
+      val query = "SELECT id, element_at(m, 'a') AS n, CASE WHEN false THEN lower(txt) ELSE 'x' END AS v FROM expr_baseline_source"
+      sql(s"CREATE MATERIALIZED VIEW expr_baseline_mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_baseline_mv")
+      MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
+      assertMvCorrect("expr_baseline_mv", query)
+      sql("UPDATE expr_baseline_source SET m = map('a', 3) WHERE id = 1")
+      sql("INSERT INTO expr_baseline_source VALUES (3, 'XYZ', map('a', 4))")
+      refreshMv("expr_baseline_mv")
+      assertMvCorrect("expr_baseline_mv", query)
+    }
+
+    it("fails closed for unsupported marker expressions") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_unsupported_source (id INT) USING DELTA")
+      val query = "SELECT id, sha2(CAST(rand() AS STRING), 256) AS h FROM expr_unsupported_source"
+      intercept[IllegalArgumentException] {
+        sql(s"EXPLAIN CREATE MATERIALIZED VIEW expr_unsupported_explain AS $query").collect()
+      }
+      intercept[IllegalArgumentException] {
+        sql(s"CREATE MATERIALIZED VIEW expr_unsupported_mv AS $query")
+      }
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_unsupported_mv")
+      MvCatalog.lookup(spark, id) shouldBe None
+    }
+
+    it("fails closed when a legacy MV requires rebaseline") {
+      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
+      sql("CREATE TABLE expr_legacy_source (id INT, txt STRING) USING DELTA")
+      sql("INSERT INTO expr_legacy_source VALUES (1, 'A')")
+      sql("CREATE MATERIALIZED VIEW expr_legacy_mv AS SELECT id, lower(txt) AS v FROM expr_legacy_source")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier("expr_legacy_mv")
+      val properties = MvCatalog.lookup(spark, id).get.properties - SparkExpressionPrepass.RestoredInitialLoadProperty
+      MvCatalog.updateProperties(spark, id, properties)
+      sql("INSERT OVERWRITE TABLE expr_legacy_source SELECT 2, 'B'")
+      val error = intercept[IllegalStateException] { refreshMv("expr_legacy_mv") }
+      error.getMessage should include("Cannot rebaseline a legacy MV")
+      assertMvCorrect("expr_legacy_mv", "SELECT 1 AS id, 'a' AS v")
+    }
+
     it("retains a real native compile-failure receipt through create and refresh") {
       assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_bad_source (id INT) USING DELTA")
@@ -92,6 +135,37 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
           .last
           .getString(0)
         detail should include("compile_cache_hit=true")
+        if (!ansi) {
+          val meta = MvCatalog.lookup(spark, identifier).get
+          val tier = detail.split(";").find(_.startsWith("compile_cache_tier=")).get.stripPrefix("compile_cache_tier=")
+          val cached = MvMetadata.cachedCompiledSql(meta.properties, meta.sourceSchemaFingerprint, tier).get
+          val token = "__openivm_expr_([0-9a-f]{64})_[0-9]+__".r.findFirstMatchIn(cached).get.group(1)
+          val legacyTier = tier.takeWhile(_ != ':') + ":" + token
+          val fingerprint = meta.sourceSchemaFingerprint
+          val currentKeys = Seq(
+            MvMetadata.compileCacheSqlKey(fingerprint, tier),
+            MvMetadata.compileCacheInitialLoadSqlKey(fingerprint, tier),
+            MvMetadata.compileCacheRefreshTypeKey(fingerprint, tier),
+            MvMetadata.compileCacheRefreshTypeNameKey(fingerprint, tier)
+          )
+          val stale = MvMetadata.compiledProperties(
+            fingerprint, legacyTier, "SELECT stale_legacy_cache", "", RefreshTypeCode.SimpleProjection, "SIMPLE_PROJECTION"
+          )
+          MvCatalog.updateProperties(spark, identifier, (meta.properties -- currentKeys) ++ stale)
+          sql(s"DELETE FROM $source WHERE id = 5")
+          sql(s"UPDATE $source SET txt = 'x/y' WHERE id = 3")
+          sql(s"INSERT INTO $source VALUES (6, 'a/b', NULL, 6, false)")
+          refreshMv(mv)
+          assertMvCorrect(mv, query)
+          val migratedDetail = sql("SHOW OPENIVM REFRESH PROFILE")
+            .where(s"view_name IN ('$mv','default.$mv') AND step_name = 'generate_refresh_sql.compile'")
+            .select("detail")
+            .collect()
+            .last
+            .getString(0)
+          migratedDetail should include("compile_cache_hit=false")
+          migratedDetail should include(s"compile_cache_tier=$tier")
+        }
         sql(s"""INSERT OVERWRITE TABLE $source
           |SELECT 8, 'x/y', TIMESTAMP '2024-03-01 01:02:03', 8L, false""".stripMargin)
         refreshMv(mv)

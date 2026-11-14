@@ -5438,6 +5438,15 @@ case class RefreshMaterializedViewCommand(
         // DELTA_INSERT_COLUMN_ARITY_MISMATCH. Use the compiled initial-load SQL
         // (which reproduces the hidden columns) for any non-FULL_REFRESH MV; a
         // genuinely FULL_REFRESH MV has no hidden columns and uses its body.
+        if (
+          sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1") &&
+          meta.refreshType != RefreshTypeCode.FullRefresh &&
+          !meta.properties.contains(SparkExpressionPrepass.RestoredInitialLoadProperty) &&
+          SparkExpressionPrepass.prepare(meta.querySql, spark.sessionState.conf.caseSensitiveAnalysis).sql != meta.querySql
+        )
+          throw new IllegalStateException(
+            "Cannot rebaseline a legacy MV requiring Spark expression restoration without recompiling its initial load"
+          )
         val fullRefreshSql = {
           val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
@@ -5729,18 +5738,19 @@ case class RefreshMaterializedViewCommand(
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
         facts = cacheTierFacts
       )
-      val compileCacheTier = compiler.compileCacheTier(originalCompileRequest)
+      val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
       val expressionBridge =
         if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
           Some(
             SparkExpressionPrepass.prepare(
               meta.querySql,
               spark.sessionState.conf.caseSensitiveAnalysis,
-              Some(compileCacheTier.split(":").last)
+              Some(originalCompileTier.split(":").last)
             )
           )
         else None
       val compileRequest = originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
+      val compileCacheTier = compiler.compileCacheTier(compileRequest)
       var refreshProperties =
         if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
         else meta.properties
