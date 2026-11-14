@@ -8,8 +8,8 @@ import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, Ivm
 abstract class SparkDateGeneratorScenarios extends IvmParitySpecBase("date-generator") {
   self: IvmParityMode =>
   override protected def extraSparkConf: Map[String, String] = Map(
-    FeatureGate.WindowRunningIncrementalEnabledKey -> "true",
-    FeatureGate.GroupedWindowStateEnabledKey -> "true",
+    FeatureGate.WindowRunningIncrementalEnabledKey   -> "true",
+    FeatureGate.GroupedWindowStateEnabledKey         -> "true",
     FeatureGate.CompileClassificationCacheEnabledKey -> "true"
   )
 

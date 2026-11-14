@@ -33,11 +33,11 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "restore date generator bounds and struct markers in the same program" in {
-    val bridge = new SparkExpressionMarker(opaque = true)
-    val start  = bridge.encode(Seq("start_date"), DateBound)(_.head)
-    val end    = bridge.encode(Seq("end_date"), DateBound)(_.head)
-    val seed   = "named_struct('k', CAST(NULL AS INT))"
-    val struct = bridge.encode(Seq("id"), Struct(seed))(args => s"named_struct('k', ${args.head})")
+    val bridge       = new SparkExpressionMarker(opaque = true)
+    val start        = bridge.encode(Seq("start_date"), DateBound)(_.head)
+    val end          = bridge.encode(Seq("end_date"), DateBound)(_.head)
+    val seed         = "named_struct('k', CAST(NULL AS INT))"
+    val struct       = bridge.encode(Seq("id"), Struct(seed))(args => s"named_struct('k', ${args.head})")
     val nativeStruct = struct.replace(seed, "{'k': NULL, 'nested': {'x': NULL}}")
     val sql = s"SELECT unnest(sequence(CAST($start AS TIMESTAMP), CAST($end AS TIMESTAMP), " +
       s"INTERVAL '1 DAY')), $nativeStruct"
