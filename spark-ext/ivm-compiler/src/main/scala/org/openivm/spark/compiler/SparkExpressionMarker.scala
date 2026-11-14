@@ -22,14 +22,14 @@ private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
     val id = prefix + markers.size + "__"
     markers.put(id, Marker(args.size, result, render))
     if (opaque) {
-      val resultType = result match {
-        case Text      => "VARCHAR"
-        case Integer   => "INTEGER"
-        case Long      => "BIGINT"
-        case Boolean   => "BOOLEAN"
-        case TextArray => "VARCHAR[]"
+      val seed = result match {
+        case Text      => "CAST(NULL AS VARCHAR)"
+        case Integer   => "CAST(NULL AS INTEGER)"
+        case Long      => "CAST(NULL AS BIGINT)"
+        case Boolean   => "CAST(NULL AS BOOLEAN)"
+        case TextArray => "string_split('openivm_type', ',')"
       }
-      s"__openivm_spark_expression('$id', CAST(NULL AS $resultType), ${args.mkString(", ")})"
+      s"__openivm_spark_expression('$id', $seed, ${args.mkString(", ")})"
     } else {
       val payload = s"concat('$id', CAST(row(${args.mkString(", ")}) AS VARCHAR))"
       result match {
@@ -59,11 +59,17 @@ private[compiler] final class SparkExpressionMarker(opaque: Boolean = false) {
             markers.get(id).flatMap { marker =>
               val seed = call.args(1).replaceAll("\\s+", "").toUpperCase(java.util.Locale.ROOT)
               val allowed = marker.result match {
-                case Text      => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
-                case Integer   => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
-                case Long      => Set("CAST(NULLASBIGINT)")
-                case Boolean   => Set("CAST(NULLASBOOLEAN)")
-                case TextArray => Set("CAST(NULLASVARCHAR[])", "CAST(NULLASSTRING[])")
+                case Text    => Set("CAST(NULLASVARCHAR)", "CAST(NULLASSTRING)")
+                case Integer => Set("CAST(NULLASINTEGER)", "CAST(NULLASINT)")
+                case Long    => Set("CAST(NULLASBIGINT)")
+                case Boolean => Set("CAST(NULLASBOOLEAN)")
+                case TextArray =>
+                  Set(
+                    "STRING_SPLIT('OPENIVM_TYPE',',')",
+                    "SPLIT('OPENIVM_TYPE',',')",
+                    "ARRAY('OPENIVM_TYPE')",
+                    "LIST_VALUE('OPENIVM_TYPE')"
+                  )
               }
               if (!allowed.contains(seed)) None
               else Some(call.end -> renderMarker(id, call.args.drop(2)))
