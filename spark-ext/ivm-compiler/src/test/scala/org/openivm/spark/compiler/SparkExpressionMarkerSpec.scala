@@ -40,9 +40,9 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "survive native compilation of nested projection expressions" in {
-    val cli = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
+    val cli        = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
     val escapedCli = cli.replace("'", "'\\''")
-    val wrapper = Files.createTempFile("openivm-marker-cli-", ".sh")
+    val wrapper    = Files.createTempFile("openivm-marker-cli-", ".sh")
     Files.write(
       wrapper,
       s"""#!/bin/sh
@@ -53,12 +53,13 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     val compiler = OpenIvmCompiler.build(cliPath = wrapper.toString)
     try {
       val bridge = new SparkExpressionMarker
-      val regex = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
-      val split = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
-      val size = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
-      val json = bridge.encode(Seq("struct_pack(\"Odd Name\" := txt, nested := struct_pack(other := id))"), Text)(
-        args => s"to_json(${args.head})"
-      )
+      val regex  = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
+      val split  = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
+      val size   = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
+      val json =
+        bridge.encode(Seq("struct_pack(\"Odd Name\" := txt, nested := struct_pack(other := id))"), Text)(args =>
+          s"to_json(${args.head})"
+        )
       val hash = bridge.encode(Seq(json, "256"), Text)(args => s"sha2(${args.mkString(", ")})")
       val compiled = compiler.compile(
         CompileRequest(
@@ -82,29 +83,37 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
 
   it should "preserve Spark results for constants, nulls and nested hashes" in {
     val bridge = new SparkExpressionMarker
-    val regex = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
-    val split = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
-    val size = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
+    val regex  = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
+    val split  = bridge.encode(Seq("txt", "','"), TextArray)(args => s"split(${args.mkString(", ")})")
+    val size   = bridge.encode(Seq(split), Integer)(args => s"size(${args.head})")
     val hash = bridge.encode(
-      Seq("to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', txt)), map('ignoreNullFields', 'false'))", "256"),
+      Seq(
+        "to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', txt)), map('ignoreNullFields', 'false'))",
+        "256"
+      ),
       Text
     )(args => s"sha2(${args.mkString(", ")})")
-    val restored = bridge.restore(s"SELECT $regex AS re, $size AS n, $hash AS digest FROM marker_src")
+    val restored = bridge.restore(s"SELECT txt, $regex AS re, $size AS n, $hash AS digest FROM marker_src")
     bridge.requireAllSeen()
     val expected =
-      """SELECT regexp_like('Ä', '(?i)ä') AS re, size(split(txt, ',')) AS n,
+      """SELECT txt, regexp_like('Ä', '(?i)ä') AS re, size(split(txt, ',')) AS n,
         |sha2(to_json(named_struct('Odd Name', txt, 'nested', named_struct('Mixed', txt)),
         |map('ignoreNullFields', 'false')), 256) AS digest FROM marker_src""".stripMargin
     val spark = SparkSession.builder().master("local[1]").appName("SparkExpressionMarkerSpec").getOrCreate()
     try {
-      spark.sql("SELECT * FROM VALUES (CAST(NULL AS STRING)), ('a,b') AS marker_src(txt)")
+      spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
+      spark
+        .sql("SELECT * FROM VALUES (CAST(NULL AS STRING)), ('a,b') AS marker_src(txt)")
         .createOrReplaceTempView("marker_src")
       Seq(false, true).foreach { ansi =>
         spark.conf.set("spark.sql.ansi.enabled", ansi.toString)
-        val actual = spark.sql(restored)
+        val actual  = spark.sql(restored)
         val correct = spark.sql(expected)
         actual.exceptAll(correct).count() shouldBe 0L
         correct.exceptAll(actual).count() shouldBe 0L
+        val nullSize = actual.where("txt IS NULL").select("n").head()
+        if (ansi) nullSize.isNullAt(0) shouldBe true
+        else nullSize.getInt(0) shouldBe -1
       }
       spark.sql("SELECT regexp_like('Ä', '(?i)ä')").head().getBoolean(0) shouldBe false
     } finally spark.stop()
