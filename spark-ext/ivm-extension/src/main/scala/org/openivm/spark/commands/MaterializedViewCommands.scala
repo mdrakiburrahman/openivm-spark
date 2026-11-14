@@ -2993,17 +2993,13 @@ case class CreateMaterializedViewCommand(
       facts = workloadFacts
     )
     val expressionBridge =
-      if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-        Some(
-          SparkExpressionPrepass.prepare(
-            originalQueryText,
-            spark.sessionState.conf.caseSensitiveAnalysis,
-            Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last)
-          )
-        )
-      else None
+      SparkExpressionPrepass.prepare(
+        originalQueryText,
+        spark.sessionState.conf.caseSensitiveAnalysis,
+        Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last)
+      )
     val createCompileRequest = originalCreateCompileRequest.copy(
-      viewSql = expressionBridge.map(_.sql).getOrElse(originalQueryText)
+      viewSql = expressionBridge.sql
     )
     var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
@@ -3270,13 +3266,9 @@ case class CreateMaterializedViewCommand(
         )
       else {
         val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
-        expressionBridge match {
-          case Some(bridge) =>
-            val restored = bridge.markers.restore(translated)
-            bridge.markers.requireAllSeen()
-            restored
-          case None => translated
-        }
+        val restored = expressionBridge.markers.restore(translated)
+        expressionBridge.markers.requireAllSeen()
+        restored
       }
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
@@ -3371,7 +3363,7 @@ case class CreateMaterializedViewCommand(
     val initialLoadProps =
       if (compiled.initialLoadSql.nonEmpty) {
         val restored =
-          if (expressionBridge.nonEmpty && effectiveRefreshType != RefreshTypeCode.FullRefresh)
+          if (effectiveRefreshType != RefreshTypeCode.FullRefresh)
             Map(SparkExpressionPrepass.RestoredInitialLoadProperty -> viewBodySql)
           else Map.empty[String, String]
         Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql) ++ restored
@@ -5447,17 +5439,13 @@ case class RefreshMaterializedViewCommand(
       )
       lazy val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
       lazy val expressionBridge =
-        if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-          Some(
-            SparkExpressionPrepass.prepare(
-              meta.querySql,
-              spark.sessionState.conf.caseSensitiveAnalysis,
-              Some(originalCompileTier.split(":").last)
-            )
-          )
-        else None
+        SparkExpressionPrepass.prepare(
+          meta.querySql,
+          spark.sessionState.conf.caseSensitiveAnalysis,
+          Some(originalCompileTier.split(":").last)
+        )
       lazy val compileRequest =
-        originalCompileRequest.copy(viewSql = expressionBridge.map(_.sql).getOrElse(meta.querySql))
+        originalCompileRequest.copy(viewSql = expressionBridge.sql)
 
       // -----------------------------------------------------------------------
       // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
@@ -5497,9 +5485,10 @@ case class RefreshMaterializedViewCommand(
           val recompileBridge =
             if (
               meta.refreshType != RefreshTypeCode.FullRefresh &&
-              (restoredInitialLoad.isEmpty || refreshResolvedPins.nonEmpty)
+              (restoredInitialLoad.isEmpty || refreshResolvedPins.nonEmpty) &&
+              (expressionBridge.sql != meta.querySql || refreshResolvedPins.nonEmpty)
             )
-              expressionBridge.filter(bridge => bridge.sql != meta.querySql || refreshResolvedPins.nonEmpty)
+              Some(expressionBridge)
             else None
           recompileBridge match {
             case Some(bridge) =>
@@ -6193,7 +6182,7 @@ case class RefreshMaterializedViewCommand(
                 SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
               else
                 withSkewFanout
-            expressionBridge.map(_.markers.restore(processed)).getOrElse(processed)
+            expressionBridge.markers.restore(processed)
           }
 
           val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)
@@ -6273,7 +6262,7 @@ case class RefreshMaterializedViewCommand(
               )
             }
           }
-          expressionBridge.foreach(_.markers.requireAllSeen())
+          expressionBridge.markers.requireAllSeen()
 
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {

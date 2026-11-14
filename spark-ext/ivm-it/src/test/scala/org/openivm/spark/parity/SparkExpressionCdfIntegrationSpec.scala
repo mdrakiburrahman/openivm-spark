@@ -15,7 +15,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
 
   describe("Spark expression bridge") {
     it("preserves pinned-source identity while incrementally refreshing a live join") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_pin_dim (id INT, label STRING) USING DELTA")
       sql("INSERT INTO expr_pin_dim VALUES (1, 'FIRST'), (2, 'SECOND')")
       val pinned = sql("DESCRIBE HISTORY expr_pin_dim").selectExpr("max(version)").head().getLong(0)
@@ -51,7 +50,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("preserves an eliminated constant branch") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_branch_source (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_branch_source VALUES (1, 'ABC'), (2, NULL)")
       val query = "SELECT id, CASE WHEN false THEN lower(txt) ELSE 'x' END AS v FROM expr_branch_source"
@@ -66,7 +64,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("fails closed for unsupported marker expressions") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_unsupported_source (id INT) USING DELTA")
       val query = "SELECT id, sha2(CAST(rand() AS STRING), 256) AS h FROM expr_unsupported_source"
       intercept[IllegalArgumentException] {
@@ -80,7 +77,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("recompiles a legacy MV when it requires rebaseline") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_legacy_source (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_legacy_source VALUES (1, 'A')")
       sql("CREATE MATERIALIZED VIEW expr_legacy_mv AS SELECT id, lower(txt) AS v FROM expr_legacy_source")
@@ -97,7 +93,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("preserves aggregate bookkeeping when rebaselining a legacy MV") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_legacy_agg_source (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_legacy_agg_source VALUES (1, 'A'), (2, 'A')")
       val query = "SELECT lower(txt) AS v, SUM(id) AS total FROM expr_legacy_agg_source GROUP BY lower(txt)"
@@ -122,7 +117,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("keeps pinned sources frozen when rebaselining a legacy MV") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_legacy_dim (id INT, label STRING) USING DELTA")
       sql("INSERT INTO expr_legacy_dim VALUES (1, 'OLD')")
       val version = sql("DESCRIBE HISTORY expr_legacy_dim").selectExpr("max(version)").head().getLong(0)
@@ -145,7 +139,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("rebaselines against advanced pinned sources") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_advance_dim (id INT, label STRING) USING DELTA")
       sql("INSERT INTO expr_advance_dim VALUES (1, 'OLD')")
       val oldVersion = sql("DESCRIBE HISTORY expr_advance_dim").selectExpr("max(version)").head().getLong(0)
@@ -167,7 +160,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("retains a real native compile-failure receipt through create and refresh") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_bad_source (id INT) USING DELTA")
       sql("INSERT INTO expr_bad_source VALUES (1)")
       val query = "SELECT id, reflect('java.lang.Math', 'abs', id) AS v FROM expr_bad_source"
@@ -194,7 +186,6 @@ abstract class SparkExpressionIntegrationScenarios extends IvmParitySpecBase("ex
     }
 
     it("preserves incremental results for mixed changes") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       spark.conf.set("spark.sql.legacy.sizeOfNull", "true")
       spark.conf.set("spark.sql.session.timeZone", "UTC")
       Seq(false, true).foreach { ansi =>

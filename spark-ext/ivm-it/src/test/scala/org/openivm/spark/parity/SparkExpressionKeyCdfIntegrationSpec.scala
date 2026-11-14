@@ -11,7 +11,6 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
     }
 
     it("maintains a grouped expression") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_key_group (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_key_group VALUES (1, 'a//b'), (2, 'a/b'), (3, 'c')")
       val query =
@@ -36,7 +35,6 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
     }
 
     it("maintains expressions in join conditions") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_key_left (id INT, txt STRING) USING DELTA")
       sql("CREATE TABLE expr_key_right (id INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_key_left VALUES (1, 'a//b'), (2, 'c')")
@@ -53,7 +51,6 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
     }
 
     it("maintains expressions in window partition keys") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_key_window (id INT, grp INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_key_window VALUES (1, 1, 'a//b'), (2, 1, 'a/b'), (3, 1, 'c')")
       val query = """SELECT id, row_number() OVER (
@@ -69,7 +66,6 @@ class SparkExpressionKeyCdfIntegrationSpec extends IvmParitySpecBase("expression
     }
 
     it("maintains expressions in window order keys") {
-      assume(sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
       sql("CREATE TABLE expr_key_order (id INT, grp INT, txt STRING) USING DELTA")
       sql("INSERT INTO expr_key_order VALUES (1, 1, 'a//b'), (2, 1, 'a/b'), (3, 1, 'c')")
       val query = """SELECT id, row_number() OVER (

@@ -355,8 +355,7 @@ class OpenIvmCompiler private (
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
     if (preserveScalarMarkers)
       sb ++= "SET disabled_optimizers='expression_rewriter,common_subexpressions';\n"
-    if (sys.env.get("OPENIVM_MARKER_INTEGRATION_TEST").contains("1"))
-      sb ++= "SET GLOBAL openivm_spark_expression_markers=true;\n"
+    sb ++= "SET GLOBAL openivm_spark_expression_markers=true;\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
