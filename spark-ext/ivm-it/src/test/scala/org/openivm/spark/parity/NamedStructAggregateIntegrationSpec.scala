@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{MvCatalog, MvMetadata, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-struct-aggregate") {
@@ -49,6 +49,8 @@ abstract class NamedStructAggregateScenarios extends IvmParitySpecBase("named-st
       |FROM s1 a LEFT JOIN s2 b ON a.grp = b.grp LEFT JOIN s3 c ON a.grp = c.grp
       |  LEFT JOIN s4 d ON a.grp = d.grp""".stripMargin
     sql(s"CREATE MATERIALIZED VIEW nsagg_cte_mv AS $cteQuery")
+    val cteId = spark.sessionState.sqlParser.parseTableIdentifier("nsagg_cte_mv")
+    MvCatalog.lookup(spark, cteId).get.properties(MvMetadata.CompileRefreshTypeKey) should not be "COMPILE_FAILED"
     assertMvCorrect("nsagg_cte_mv", cteQuery)
     sql("UPDATE nsagg_source SET ts = TIMESTAMP '2024-03-01 00:00:00' WHERE id = 2")
     sql("DELETE FROM nsagg_source WHERE id = 1")

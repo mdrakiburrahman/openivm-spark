@@ -77,7 +77,12 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
       query.replace("FROM keyed)", "FROM keyed NATURAL JOIN src)"),
       query.replace("FROM projected GROUP BY g", "FROM projected WHERE k IN (SELECT k FROM keyed) GROUP BY g"),
       query.replace("), k) FROM projected", "), CASE WHEN k > k THEN k ELSE k END) FROM projected"),
-      query.replace("SELECT g, v, k FROM keyed", "SELECT g, v, k.a FROM keyed")
+      query.replace("SELECT g, v, k FROM keyed", "SELECT g, v, k.a FROM keyed"),
+      query.replace("AS k FROM base", "AS k, named_struct('a', ts) AS k FROM base"),
+      query.replace(
+        "SELECT g, max_by(named_struct('v', v), k) FROM projected GROUP BY g",
+        "SELECT g, max_by(named_struct('v', v), k) OVER (PARTITION BY g) FROM projected"
+      )
     )
     unsafe.foreach { sql =>
       SparkExpressionPrepass.prepare(sql, caseSensitive = false).sql shouldBe sql

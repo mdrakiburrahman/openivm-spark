@@ -110,26 +110,25 @@ private[spark] object SparkExpressionPrepass {
     }
     val rootOutput = outputPlan(parsed)
 
-    def scanExpression(expr: Expression, inKey: Boolean): Unit = expr match {
+    def scanExpression(expr: Expression, allowMaxBy: Boolean = false): Unit = expr match {
       case _: UnresolvedStar => hasStar = true
       case attr: UnresolvedAttribute =>
-        if (inKey) keyRefs += normalized(attr.nameParts.last)
-        else attr.nameParts.foreach(part => otherRefs += normalized(part))
+        attr.nameParts.foreach(part => otherRefs += normalized(part))
       case alias: Alias =>
         val name = normalized(alias.name)
         aliasCounts.update(name, aliasCounts(name) + 1)
-        scanExpression(alias.child, inKey)
+        scanExpression(alias.child, allowMaxBy)
       case function: UnresolvedFunction
-          if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
+          if allowMaxBy && function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("max_by") &&
             function.arguments.size == 2 =>
-        scanExpression(function.arguments.head, inKey = false)
+        scanExpression(function.arguments.head)
         scanOrdering(function.arguments(1))
-        function.filter.foreach(child => scanExpression(child, inKey = false))
+        function.filter.foreach(child => scanExpression(child))
       case subquery: SubqueryExpression =>
         unsupportedPlan = true
         scanPlan(subquery.plan)
-        subquery.children.foreach(child => scanExpression(child, inKey))
-      case other => other.children.foreach(child => scanExpression(child, inKey))
+        subquery.children.foreach(child => scanExpression(child))
+      case other => other.children.foreach(child => scanExpression(child, allowMaxBy))
     }
 
     def scanOrdering(expr: Expression): Unit = expr match {
@@ -144,10 +143,10 @@ private[spark] object SparkExpressionPrepass {
           if function.nameParts.size == 1 && function.nameParts.head.equalsIgnoreCase("named_struct") &&
             function.arguments.size % 2 == 0 =>
         function.arguments.grouped(2).foreach { pair =>
-          scanExpression(pair.head, inKey = false)
+          scanExpression(pair.head)
           scanOrdering(pair(1))
         }
-      case other => scanExpression(other, inKey = false)
+      case other => scanExpression(other)
     }
 
     def scanPlan(plan: LogicalPlan): Unit =
@@ -169,22 +168,27 @@ private[spark] object SparkExpressionPrepass {
               case _ => None
             }.toSet
             project.projectList.foreach {
+              case _: UnresolvedStar if project eq rootOutput => hasStar = true
               case _: UnresolvedStar => starOwners += structAliases
               case attr: UnresolvedAttribute if (project ne rootOutput) && attr.nameParts.size == 1 =>
-              case expr => scanExpression(expr, inKey = false)
+              case alias: Alias if project eq rootOutput =>
+                otherRefs += normalized(alias.name)
+                scanExpression(alias)
+              case expr => scanExpression(expr)
             }
           case join: Join =>
             join.joinType match {
               case _: NaturalJoin | _: UsingJoin => unsupportedPlan = true
               case _                             =>
             }
-            join.expressions.foreach(expr => scanExpression(expr, inKey = false))
+            join.expressions.foreach(expr => scanExpression(expr))
           case other =>
             if (
               !Set("UnresolvedWith", "SubqueryAlias", "UnresolvedRelation", "Aggregate", "Filter", "OneRowRelation")
                 .contains(other.getClass.getSimpleName)
             ) unsupportedPlan = true
-            other.expressions.foreach(expr => scanExpression(expr, inKey = false))
+            val isAggregate = other.getClass.getSimpleName == "Aggregate"
+            other.expressions.foreach(expr => scanExpression(expr, allowMaxBy = isAggregate))
         }
         plan.children.foreach(scanPlan)
         plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(scanPlan)
