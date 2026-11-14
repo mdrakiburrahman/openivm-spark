@@ -9,6 +9,7 @@ import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFu
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   CaseWhen,
+  Cast,
   CreateNamedStruct,
   Expression,
   If,
@@ -19,6 +20,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 }
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.types.{StringType, TimestampType}
 import org.openivm.spark.compiler.SparkExpressionMarker._
 
 private[spark] object SparkExpressionPrepass {
@@ -89,9 +91,50 @@ private[spark] object SparkExpressionPrepass {
     "InSet"
   )
 
-  def prepare(sql: String, caseSensitive: Boolean, stableToken: Option[String] = None): Prepared = {
+  def prepare(
+      sql: String,
+      caseSensitive: Boolean,
+      stableToken: Option[String] = None,
+      analyzedPlan: Option[LogicalPlan] = None
+  ): Prepared = {
     val markers = new SparkExpressionMarker(opaque = true, stableToken = stableToken)
     val targets = mutable.ArrayBuffer.empty[(Expression, ResultType, Int)]
+    val coercedCases = mutable.Map.empty[(Int, Int), ResultType]
+    val visitedAnalyzedPlans = new java.util.IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+
+    def analyzedExpressions(expr: Expression): Unit = {
+      expr match {
+        case subquery: SubqueryExpression => analyzedPlans(subquery.plan)
+        case branch: CaseWhen =>
+          val values = branch.branches.map(_._2) ++ branch.elseValue.toSeq
+          val inputTypes = values.map {
+            case cast: Cast => cast.child.dataType
+            case value      => value.dataType
+          }.toSet
+          val result = branch.dataType match {
+            case StringType    => Some(Text)
+            case TimestampType => Some(Timestamp)
+            case _             => None
+          }
+          for {
+            start <- branch.origin.startIndex
+            stop <- branch.origin.stopIndex
+            kind <- result
+            if inputTypes.contains(StringType) && inputTypes.contains(TimestampType)
+          } coercedCases.update((start, stop), kind)
+        case _ =>
+      }
+      expr.children.foreach(analyzedExpressions)
+    }
+    def analyzedPlans(plan: LogicalPlan): Unit = {
+      if (!visitedAnalyzedPlans.containsKey(plan)) {
+        visitedAnalyzedPlans.put(plan, java.lang.Boolean.TRUE)
+        plan.expressions.foreach(analyzedExpressions)
+        plan.children.foreach(analyzedPlans)
+        plan.innerChildren.collect { case child: LogicalPlan => child }.foreach(analyzedPlans)
+      }
+    }
+    analyzedPlan.foreach(analyzedPlans)
 
     def target(expr: Expression): Option[ResultType] = expr match {
       case _: RLike => Some(Boolean)
@@ -113,6 +156,12 @@ private[spark] object SparkExpressionPrepass {
       case subquery: SubqueryExpression =>
         plans(subquery.plan)
         subquery.children.foreach(child => expressions(child, scope))
+      case branch: CaseWhen
+          if branch.branches.size == 1 && branch.branches.head._2.isInstanceOf[UnresolvedAttribute] &&
+            branch.elseValue.exists(_.isInstanceOf[UnresolvedAttribute]) &&
+            branch.origin.startIndex.isDefined && branch.origin.stopIndex.isDefined &&
+            coercedCases.contains((branch.origin.startIndex.get, branch.origin.stopIndex.get)) =>
+        targets += ((branch, coercedCases((branch.origin.startIndex.get, branch.origin.stopIndex.get)), scope))
       case branch: CaseWhen =>
         var reachable = true
         branch.branches.foreach { case (condition, value) =>
