@@ -59,6 +59,8 @@ private[spark] object SparkExpressionPrepass {
     "replace",
     "date_add",
     "date_sub",
+    "to_date",
+    "to_timestamp",
     "concat",
     "concat_ws",
     "coalesce",
@@ -308,6 +310,7 @@ private[spark] object SparkExpressionPrepass {
             case _ => None
           }
         } else if (Set("date_add", "date_sub").contains(name) && canTemplate(f)) Some(DateValue)
+        else if (name == "date_format" && !canTemplate(f)) None
         else resultTypes.get(name)
       case _ => None
     }

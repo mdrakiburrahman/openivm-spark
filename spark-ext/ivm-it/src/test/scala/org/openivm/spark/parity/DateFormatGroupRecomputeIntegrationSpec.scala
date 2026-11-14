@@ -7,15 +7,17 @@ abstract class DateFormatGroupRecomputeScenarios extends IvmParitySpecBase("date
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    FeatureGate.ProfileRefreshKey                       -> "true",
-    "spark.openivm.compile.classificationCache.enabled" -> "true",
+    FeatureGate.ProfileRefreshKey                            -> "true",
+    "spark.openivm.compile.classificationCache.enabled"      -> "true",
     "spark.openivm.refresh.windowRunningIncremental.enabled" -> "true",
-    "spark.openivm.refresh.groupedWindowState.enabled" -> "true",
-    "spark.sql.session.timeZone"                        -> "UTC"
+    "spark.openivm.refresh.groupedWindowState.enabled"       -> "true",
+    "spark.sql.session.timeZone"                             -> "UTC"
   )
 
   it("restores date expressions around projected struct ordering keys") {
-    sql("CREATE TABLE dfgr_events (id STRING, event_time TIMESTAMP, version INT, payload STRING, year_month STRING) USING DELTA")
+    sql(
+      "CREATE TABLE dfgr_events (id STRING, event_time TIMESTAMP, version INT, payload STRING, year_month STRING) USING DELTA"
+    )
     sql("""INSERT INTO dfgr_events VALUES
       |('a', TIMESTAMP '2023-12-29 12:00:00', 1, 'older', '202312'),
       |('a', TIMESTAMP '2024-01-01 12:00:00', 2, 'newer', '202401'),
@@ -96,5 +98,5 @@ abstract class DateFormatGroupRecomputeScenarios extends IvmParitySpecBase("date
   }
 }
 
-class DateFormatGroupRecomputeCdfIntegrationSpec extends DateFormatGroupRecomputeScenarios with CdfMode
+class DateFormatGroupRecomputeCdfIntegrationSpec       extends DateFormatGroupRecomputeScenarios with CdfMode
 class DateFormatGroupRecomputeInterceptIntegrationSpec extends DateFormatGroupRecomputeScenarios with InterceptMode
