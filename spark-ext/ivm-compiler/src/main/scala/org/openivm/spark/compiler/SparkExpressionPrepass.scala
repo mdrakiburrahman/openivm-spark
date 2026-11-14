@@ -307,7 +307,8 @@ private[spark] object SparkExpressionPrepass {
               Some(Text)
             case _ => None
           }
-        } else resultTypes.get(name)
+        } else if (Set("date_add", "date_sub").contains(name) && canTemplate(f)) Some(DateValue)
+        else resultTypes.get(name)
       case _ => None
     }
 

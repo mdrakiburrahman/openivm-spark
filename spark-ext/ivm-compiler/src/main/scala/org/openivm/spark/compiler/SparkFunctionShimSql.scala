@@ -476,8 +476,6 @@ private[compiler] object SparkFunctionShimSql {
       parseMakeIntervalShim(sql, i)
         .orElse(parseGetJsonObjectShim(sql, i))
         .orElse(parseCastTemporalShim(sql, i))
-        .orElse(parseFunctionRewrite(sql, i, "__sparkfn_date_add", "date_add"))
-        .orElse(parseFunctionRewrite(sql, i, "__sparkfn_date_sub", "date_sub"))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "last_value"))
