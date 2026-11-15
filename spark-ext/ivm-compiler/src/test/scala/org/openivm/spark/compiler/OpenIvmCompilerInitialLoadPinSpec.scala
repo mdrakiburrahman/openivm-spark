@@ -1,5 +1,7 @@
 package org.openivm.spark.compiler
 
+import java.nio.file.Files
+
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common.PinnedSourcePathMissingException
@@ -37,6 +39,48 @@ class OpenIvmCompilerInitialLoadPinSpec extends AnyFunSpec with Matchers {
 
   private def countOf(needle: String, haystack: String): Int =
     java.util.regex.Pattern.quote(needle).r.findAllMatchIn(haystack).size
+
+  private def initialLoad(sidecar: String): String = {
+    val directory = Files.createTempDirectory("openivm-initial-load-statements")
+    val file      = directory.resolve("openivm_compiled_queries_mv_stg.sql")
+    try {
+      Files.write(file, sidecar.getBytes("UTF-8"))
+      OpenIvmCompiler.parseInitialLoadSql(
+        directory,
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      )
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(directory)
+    }
+  }
+
+  describe("initial-load statement extraction") {
+    it("preserves literal semicolons and stops before the next sidecar statement") {
+      initialLoad(
+        """create table openivm_data_mv_stg as
+          |SELECT id, 'alpha; beta; gamma' AS coverage_scope, 'left;middle;right' AS compact_scope
+          |FROM memory.main.parent;
+          |CREATE TABLE unrelated (id INT);""".stripMargin
+      ) shouldBe
+        """SELECT id, 'alpha; beta; gamma' AS coverage_scope, 'left;middle;right' AS compact_scope
+          |FROM db.parent""".stripMargin
+    }
+
+    it("ignores semicolons in comments and escaped-quote literals") {
+      val out = initialLoad(
+        """create table openivm_data_mv_stg as SELECT id,
+          |-- documentation; not a terminator
+          |'a;''b; c' AS coverage_scope /* outer; /* inner; */ still outer; */
+          |FROM memory.main.parent; SELECT 'not part of initial load';""".stripMargin
+      )
+      out should include("documentation; not a terminator")
+      out should include("concat('a;', chr(39), 'b; c')")
+      out should include("/* outer; /* inner; */ still outer; */")
+      out should endWith("FROM db.parent")
+      out should not include "not part of initial load"
+    }
+  }
 
   describe("bare initial-load source binding") {
     it("qualifies source relations in CTEs and subqueries without touching CTE references or literals") {

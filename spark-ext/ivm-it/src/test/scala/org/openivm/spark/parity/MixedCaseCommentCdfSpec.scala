@@ -10,6 +10,35 @@ class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") wi
     FeatureGate.CompileClassificationCacheEnabledKey -> "true"
   )
 
+  it("preserves semicolon literals through initial population and incremental CDF refresh") {
+    sql("CREATE TABLE mcc_literal_source (id INT, amount INT) USING DELTA")
+    sql("INSERT INTO mcc_literal_source VALUES (1, 10)")
+    val projection =
+      """SELECT id, 'alpha; beta; gamma' AS coverage_scope,
+        |'left;middle;right' AS compact_scope FROM mcc_literal_source""".stripMargin
+    val grouped =
+      """SELECT id, SUM(amount) AS total,
+        |'retained_source_landing_months; no business-time filter; observed inputs only' AS coverage_scope
+        |FROM mcc_literal_source GROUP BY id""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW mcc_literal_projection AS $projection")
+    sql(s"CREATE MATERIALIZED VIEW mcc_literal_group AS $grouped")
+    Seq("mcc_literal_projection" -> projection, "mcc_literal_group" -> grouped).foreach { case (name, query) =>
+      val id = spark.sessionState.sqlParser.parseTableIdentifier(name)
+      MvCatalog.lookup(spark, id).get.querySql shouldBe query
+      assertMvCorrect(name, query)
+    }
+    val projectionId = spark.sessionState.sqlParser.parseTableIdentifier("mcc_literal_projection")
+    val groupId      = spark.sessionState.sqlParser.parseTableIdentifier("mcc_literal_group")
+    MvCatalog.lookup(spark, projectionId).get.refreshType shouldBe RefreshTypeCode.SimpleProjection
+    MvCatalog.lookup(spark, groupId).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
+
+    sql("INSERT INTO mcc_literal_source VALUES (2, 20)")
+    refreshMv("mcc_literal_projection")
+    refreshMv("mcc_literal_group")
+    assertMvCorrect("mcc_literal_projection", projection)
+    assertMvCorrect("mcc_literal_group", grouped)
+  }
+
   it("preserves literals after apostrophes in line and block comments on create and CDF refresh") {
     sql("CREATE TABLE mcc_source (id INT, flag BOOLEAN, reason STRING) USING DELTA")
     sql("INSERT INTO mcc_source VALUES (1, true, 'MiXeD'), (2, false, 'Needs Review')")
