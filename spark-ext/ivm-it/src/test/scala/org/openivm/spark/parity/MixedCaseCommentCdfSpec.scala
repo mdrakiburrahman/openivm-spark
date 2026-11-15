@@ -1,10 +1,11 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
+    FeatureGate.ProfileRefreshKey                    -> "true",
     FeatureGate.WindowRunningIncrementalEnabledKey   -> "true",
     FeatureGate.GroupedWindowStateEnabledKey         -> "true",
     FeatureGate.CompileClassificationCacheEnabledKey -> "true"
@@ -33,10 +34,14 @@ class MixedCaseCommentCdfSpec extends IvmParitySpecBase("mixed-case-comment") wi
     MvCatalog.lookup(spark, groupId).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
 
     sql("INSERT INTO mcc_literal_source VALUES (2, 20)")
-    refreshMv("mcc_literal_projection")
-    refreshMv("mcc_literal_group")
-    assertMvCorrect("mcc_literal_projection", projection)
-    assertMvCorrect("mcc_literal_group", grouped)
+    Seq("mcc_literal_projection" -> projection, "mcc_literal_group" -> grouped).foreach { case (name, query) =>
+      RefreshProfileCatalog.removeAll(spark)
+      refreshMv(name)
+      val spans = RefreshProfileCatalog.scanAll(spark).filter(_.stepName == "command_span")
+      spans should have size 1
+      spans.head.detail should include("outcome=incremental_executed")
+      assertMvCorrect(name, query)
+    }
   }
 
   it("preserves literals after apostrophes in line and block comments on create and CDF refresh") {
