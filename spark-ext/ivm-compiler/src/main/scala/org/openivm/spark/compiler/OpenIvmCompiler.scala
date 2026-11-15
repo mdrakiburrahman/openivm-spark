@@ -871,13 +871,22 @@ class OpenIvmCompiler private (
     val content = normalizeCompiledViewNames(new String(Files.readAllBytes(file), "UTF-8"), nativeName, req.viewName)
 
     val pat = Pattern.compile(
-      s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
+      s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+(?=WITH\\b|SELECT\\b)",
       Pattern.DOTALL
     )
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    val extracted = restore(m.group(1).trim)
+    val body       = content.substring(m.end())
+    var terminated = false
+    val statement = SparkFunctionShimSql.rewriteOutsideProtected(body, protectBackticks = true) { i =>
+      if (body.charAt(i) == ';') {
+        terminated = true
+        Some(body.length -> "")
+      } else None
+    }
+    if (!terminated) return ""
+    val extracted = restore(statement.trim)
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
