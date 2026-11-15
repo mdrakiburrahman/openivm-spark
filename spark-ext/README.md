@@ -45,6 +45,11 @@ quoted identifiers and comments are protected; source business SQL is unchanged.
 The native infinity literal `1e1000` is restored as a Spark DOUBLE infinity;
 the native `main.trim` builtin is restored as an unqualified Spark `trim` call.
 
+Native compilation preserves semicolons inside string literals and quoted
+identifiers. Initial-load statement extraction recognizes terminators only
+outside quoted regions and comments, preserving literal values through CREATE
+and incremental REFRESH.
+
 For native binding failures, unqualified-column `UNIX_TIMESTAMP`, boolean `LOWER`, and
 `TIMESTAMPDIFF(SECOND, ...)` calls are retried through a Spark-evaluated bridge.
 Other argument shapes are not covered by this retry.
