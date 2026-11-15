@@ -23,6 +23,50 @@ class StreamingSqlOperationalOptionsSpec extends AnyFunSpec with StreamingSqlTes
 
   describe("operational Delta change-commit tolerances") {
 
+    it("applies TBLPROPERTIES writer controls to finite runs and rebuild policy") {
+      val source = "strsql_properties_source"
+      val name   = "strsql_properties_target"
+      createDeltaSource(source, "id INT, value STRING, part STRING")
+      insertRows(source, "(1, 'one', 'p'), (2, 'two', 'p')")
+
+      def declaration(filter: String = "", onQueryChange: String = "fail"): String =
+        s"""CREATE STREAMING TABLE ${quoteIdentifier(name)}
+           |TBLPROPERTIES (
+           |  'trigger' = 'availableNow',
+           |  'outputMode' = 'append',
+           |  'onQueryChange' = '$onQueryChange'
+           |)
+           |AS SELECT id, value, part
+           |FROM STREAM ${quoteIdentifier(source)}$filter""".stripMargin
+
+      val first = createStreamingSqlToCompletion(declaration())
+      first.inputRows shouldBe 2L
+      manifest(name).operationalJson should include("\"trigger\":\"availablenow\"")
+      assertBagEqual(name, "SELECT 1 AS id, 'one' AS value, 'p' AS part UNION ALL SELECT 2, 'two', 'p'")
+
+      val resumed = createStreamingSqlToCompletion(declaration())
+      resumed.status.queryId shouldBe first.status.queryId
+      resumed.status.runId should not be first.status.runId
+      resumed.inputRows shouldBe 0L
+      assertBagEqual(name, "SELECT 1 AS id, 'one' AS value, 'p' AS part UNION ALL SELECT 2, 'two', 'p'")
+
+      insertRows(source, "(3, 'three', 'p')")
+      val extended = createStreamingSqlToCompletion(declaration())
+      extended.status.queryId shouldBe first.status.queryId
+      extended.inputRows shouldBe 1L
+      assertBagEqual(
+        name,
+        "SELECT 1 AS id, 'one' AS value, 'p' AS part UNION ALL " +
+          "SELECT 2, 'two', 'p' UNION ALL SELECT 3, 'three', 'p'"
+      )
+
+      val originalGeneration = target(name).deltaTableId
+      val rebuilt            = createStreamingSqlToCompletion(declaration(" WHERE id = 3", onQueryChange = "rebuild"))
+      rebuilt.status.queryId should not be first.status.queryId
+      target(name).deltaTableId should not be originalGeneration
+      assertBagEqual(name, "SELECT 3 AS id, 'three' AS value, 'p' AS part")
+    }
+
     it("resumes the same checkpoint when ignoreDeletes is added after a retention delete fails the query") {
       val source = "strsql_tolerance_delete_source"
       val name   = "strsql_tolerance_delete_target"

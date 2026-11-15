@@ -24,7 +24,7 @@ import org.openivm.spark.commands.ReleaseOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.ShowOpenIvmInsightsCommand
 import org.openivm.spark.parser.gen.IvmSqlBaseBaseVisitor
 import org.openivm.spark.parser.gen.IvmSqlBaseParser
-import org.openivm.spark.streaming.StreamingTableSpec
+import org.openivm.spark.streaming.{StreamingRuntimeOptions, StreamingTableSpec}
 
 import scala.jdk.CollectionConverters._
 
@@ -221,6 +221,7 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
         .map(clause => buildUniqueProperties(clause.tableProperties(), "OPTIONS")),
       "OPTIONS"
     ).getOrElse(Map.empty)
+    val (userTableProperties, mergedOptions) = streamingRuntimeOptionsFromProperties(tableProperties, options)
 
     val queryText = extractQueryBody(ctx.queryBody())
     val queryPlan = StreamingQuerySql.parse(queryText, delegate)
@@ -232,8 +233,8 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
         provider = provider,
         location = location,
         partitionColumns = partitionColumns,
-        tableProperties = tableProperties,
-        options = options,
+        tableProperties = userTableProperties,
+        options = mergedOptions,
         ifNotExists = ctx.IF() != null,
         clusterColumns = clusterColumns
       )
@@ -399,6 +400,20 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       parseError(s"$clauseName names option '$key' more than once")
     }
     entries.toMap
+  }
+
+  private def streamingRuntimeOptionsFromProperties(
+      properties: Map[String, String],
+      options: Map[String, String]
+  ): (Map[String, String], Map[String, String]) = {
+    val runtimeProperties = properties.filter { case (key, _) => StreamingRuntimeOptions.isExtensionOptionKey(key) }
+    val duplicate = runtimeProperties.keys.find { propertyKey =>
+      options.keys.exists(_.trim.equalsIgnoreCase(propertyKey.trim))
+    }
+    duplicate.foreach { key =>
+      parseError(s"Streaming-table runtime setting '$key' must not appear in both TBLPROPERTIES and OPTIONS")
+    }
+    (properties -- runtimeProperties.keySet, options ++ runtimeProperties)
   }
 
   private def singleClause[T](values: Seq[T], clauseName: String): Option[T] =

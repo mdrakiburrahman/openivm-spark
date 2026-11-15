@@ -37,6 +37,15 @@ collide. When omitted, the target table name is used. Changing only
 `displayName` restarts the native writer on its existing checkpoint without
 rebuilding the target or replaying committed input.
 
+For Spark hosts whose SQL parser rejects `OPTIONS` on this statement, the five
+OpenIVM writer controls (`outputMode`, `trigger`, `triggerInterval`,
+`onQueryChange`, and `displayName`) may instead be supplied in `TBLPROPERTIES`.
+OpenIVM consumes these keys as runtime controls rather than persisting them as
+Delta table properties; unrelated `TBLPROPERTIES` continue to be applied
+normally. A runtime key may appear in only one of `OPTIONS` or `TBLPROPERTIES`;
+declaring it in both is an error. Runtime values receive the same validation
+regardless of clause.
+
 ## Destination layouts
 
 Hive-style partitioning and Delta liquid clustering are separate, mutually
