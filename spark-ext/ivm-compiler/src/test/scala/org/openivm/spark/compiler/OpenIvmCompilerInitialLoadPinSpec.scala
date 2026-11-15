@@ -45,10 +45,13 @@ class OpenIvmCompilerInitialLoadPinSpec extends AnyFunSpec with Matchers {
     val file      = directory.resolve("openivm_compiled_queries_mv_stg.sql")
     try {
       Files.write(file, sidecar.getBytes("UTF-8"))
-      OpenIvmCompiler.parseInitialLoadSql(
-        directory,
-        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
-      )
+      val compiler = OpenIvmCompiler.build(extensionPath = file.toString, cliPath = file.toString)
+      try
+        compiler.parseInitialLoadSql(
+          directory,
+          req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+        )
+      finally compiler.close()
     } finally {
       Files.deleteIfExists(file)
       Files.deleteIfExists(directory)
