@@ -55,10 +55,24 @@ schema, `input_file_name()`, reader-option validation and post-commit file
 cleanup are preserved. Other table/view boundaries retain catalog resolution.
 The source path, schema and semantic reader options remain checkpoint
 fingerprint inputs. Reissuing the same declaration resumes its checkpoint;
-changing a catalog/view source to a direct path is not a checkpoint migration.
-With `onQueryChange='fail'`, incompatible source/options changes fail without
-resetting the checkpoint. Native asynchronous archive cleanup is not a durable
-cleanup queue and is not guaranteed to finish before the driver exits.
+incompatible source/options changes fail under `onQueryChange='fail'` without
+resetting the checkpoint.
+
+A single native TEXT reader previously exposed through a DataFrame temporary
+view can adopt the direct-path representation without the old session view.
+OpenIVM requires the same physical source identity, occurrence, provider and
+schema, and identical semantic reader options except equivalent Hadoop
+qualification of `path` and `sourceArchiveDir`. It reconstructs the legacy
+representation only as an in-memory logical plan and requires its **entire**
+semantic definition to match the saved definition, including projection,
+time zone, output/target schemas, sink settings, partitioning and watermarks.
+Only a proven representation change is atomically recorded under the existing
+lifecycle locks; the target generation, query ID and native checkpoint remain
+unchanged. Other view/catalog rewrites or actual query/options drift are not
+adopted. This does not enable the analyzer-drift bypass or rebuild the target.
+
+Native asynchronous archive cleanup is not a durable cleanup queue and is not
+guaranteed to finish before the driver exits.
 
 `displayName` controls the friendly Structured Streaming query label shown in
 the Spark UI and micro-batch job descriptions. OpenIVM sanitizes the label and

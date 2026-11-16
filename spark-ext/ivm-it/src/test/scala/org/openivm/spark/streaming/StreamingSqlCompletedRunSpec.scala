@@ -96,6 +96,79 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
       assertBagEqual(target, "SELECT 'event' AS value")
     }
 
+    it("adopts only an equivalent legacy TEXT view representation without replaying its checkpoint") {
+      val inbox      = Files.createDirectories(Paths.get(scratchPath("completed-text-upgrade")))
+      val elsewhere  = Files.createDirectories(Paths.get(scratchPath("completed-text-other")))
+      val archive    = Paths.get(scratchPath("completed-text-upgrade-archive"))
+      val working    = Paths.get("").toAbsolutePath
+      val oldInbox   = working.relativize(inbox).toString
+      val oldArchive = working.relativize(archive).toString
+      val view       = "strsql_completed_text_legacy_view"
+      val target     = "strsql_completed_text_upgrade_target"
+      val payload    = """{"eventTime":"2026-01-01T00:00:00Z"}"""
+      Files.write(inbox.resolve("event.json"), s"$payload\n".getBytes(StandardCharsets.UTF_8))
+      spark.readStream
+        .format("text")
+        .option("pathGlobFilter", "*.json")
+        .option("cleanSource", "archive")
+        .option("sourceArchiveDir", oldArchive)
+        .load(oldInbox)
+        .createOrReplaceTempView(view)
+      def declaration(source: String): String =
+        s"""CREATE STREAMING TABLE $target PARTITIONED BY (event_year_month)
+           |TBLPROPERTIES ('trigger' = 'availableNow', 'outputMode' = 'append', 'onQueryChange' = 'fail')
+           |AS SELECT value AS request_body,
+           |coalesce(date_format(try_cast(get_json_object(value, '$$.eventTime') AS TIMESTAMP),
+           |'yyyyMM'), '000000') AS event_year_month FROM $source""".stripMargin
+      val direct =
+        s"""STREAM(text.`$inbox`) WITH ('pathGlobFilter' = '*.json',
+           |'cleanSource' = 'archive', 'sourceArchiveDir' = '$archive')""".stripMargin
+      val initial = createStreamingSqlToCompletion(declaration(view))
+      spark.catalog.dropTempView(view) shouldBe true
+      val originalTarget   = targetState(target)
+      val originalManifest = manifest(target)
+      val expected         = s"""SELECT '$payload' AS request_body, '202601' AS event_year_month"""
+      assertBagEqual(target, expected)
+
+      def reject(sql: String): Unit = {
+        val failure = the[AnalysisException] thrownBy createStreamingSql(sql)
+        failure.getMessage should include("onQueryChange")
+        manifest(target).definitionHash shouldBe originalManifest.definitionHash
+        targetState(target) shouldBe originalTarget
+        assertBagEqual(target, expected)
+      }
+      val compatible = declaration(direct)
+      Seq(
+        compatible.replace("value AS request_body", "upper(value) AS request_body"),
+        compatible.replace(inbox.toString, elsewhere.toString),
+        compatible.replace("*.json", "*.txt"),
+        compatible.replace(archive.toString, archive.toString + "-different"),
+        compatible.replace("PARTITIONED BY (event_year_month)", "")
+      ).foreach(reject)
+      val timezone = spark.conf.get("spark.sql.session.timeZone")
+      try {
+        spark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+        reject(compatible)
+      } finally spark.conf.set("spark.sql.session.timeZone", timezone)
+
+      val adopted = createStreamingSqlToCompletion(compatible)
+      adopted.status.queryId shouldBe initial.status.queryId
+      adopted.status.checkpointLocation shouldBe initial.status.checkpointLocation
+      adopted.status.definitionHash should not be initial.status.definitionHash
+      adopted.inputRows shouldBe 0L
+      targetState(target) shouldBe originalTarget
+      manifest(target).definitionHash shouldBe adopted.status.definitionHash
+      assertBagEqual(target, expected)
+
+      Files.write(inbox.resolve("later.json"), s"$payload\n".getBytes(StandardCharsets.UTF_8))
+      val appended = createStreamingSqlToCompletion(compatible)
+      appended.status.queryId shouldBe initial.status.queryId
+      appended.status.definitionHash shouldBe adopted.status.definitionHash
+      appended.inputRows shouldBe 1L
+      targetState(target).deltaTableId shouldBe originalTarget.deltaTableId
+      assertBagEqual(target, expected + " UNION ALL " + expected)
+    }
+
     it("performs no source-row or target-data work when the source is unchanged") {
       val source = "strsql_completed_noop_source"
       val target = "strsql_completed_noop_target"
