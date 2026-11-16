@@ -2375,7 +2375,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val translated = LptsSparkDialect.translate(refreshSql)
       translated should fullyMatch regex
         "(?s).*projection_materialized_for_join[^)]*\\) AS \\(\\s*SELECT DISTINCT.*"
-      spark.sql("EXPLAIN FORMATTED " + translated).collect().mkString("\n") should include("HashAggregate")
+      val initialSql = MvCatalog
+        .lookup(spark, TableIdentifier("anti_mv_t10"))
+        .get
+        .properties(MvMetadata.CompiledInitialLoadSqlKey)
+      val initialPlanSql = "EXPLAIN FORMATTED " + LptsSparkDialect.translate(initialSql)
+      val initialPlan = spark.sql(initialPlanSql).collect().mkString("\n")
+      initialPlan should include("LeftAnti")
       assertSqlBagEqual("SELECT id, name FROM anti_mv_t10", query)
 
       spark.sql("DELETE FROM anti_trades_t10 WHERE account_id = 11")
