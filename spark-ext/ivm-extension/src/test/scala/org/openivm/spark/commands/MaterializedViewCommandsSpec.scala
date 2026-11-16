@@ -2374,7 +2374,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val refreshSql = MvDryCompile.dryCompile(spark, TableIdentifier("anti_mv_dry_t10"), query).compiled.sql
       val translated = LptsSparkDialect.translate(refreshSql)
       translated should fullyMatch regex
-        "(?s).*projection_materialized_for_join[^)]*\\) AS \\(\\s*SELECT DISTINCT.*"
+        "(?is).*LEFT JOIN \\(SELECT DISTINCT \\*, TRUE AS _lpts_matched FROM t[0-9]+_projection\\).*"
       val initialSql = MvCatalog
         .lookup(spark, TableIdentifier("anti_mv_t10"))
         .get
