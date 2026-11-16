@@ -66,7 +66,6 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
@@ -221,8 +220,8 @@ private[spark] object RefreshMutex {
   private case object Write extends LockMode
   private final case class LockRequest(key: String, mode: LockMode)
 
-  private val locks: java.util.Map[String, ReentrantReadWriteLock] =
-    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantReadWriteLock]())
+  private val locks: java.util.Map[String, LifecycleReadWriteLock] =
+    Collections.synchronizedMap(new java.util.HashMap[String, LifecycleReadWriteLock]())
 
   def withLock[A](mvKey: String)(body: => A): A =
     withGuard(mvKey, Write, None)(body)
@@ -286,7 +285,7 @@ private[spark] object RefreshMutex {
           val again = locks.get(key)
           if (again != null) again
           else {
-            val created = new ReentrantReadWriteLock(true)
+            val created = new LifecycleReadWriteLock(true)
             locks.put(key, created)
             created
           }

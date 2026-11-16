@@ -15,6 +15,10 @@ private[spark] object LifecycleDeadlineContext {
   val Unspecified: LifecycleDeadlineContext = LifecycleDeadlineContext("lifecycle")
 }
 
+private[spark] final class LifecycleReadWriteLock(fair: Boolean = true) extends ReentrantReadWriteLock(fair) {
+  private[spark] def writerThreadName: Option[String] = Option(getOwner).map(_.getName)
+}
+
 final class LifecycleLockTimeoutException private (
     val target: String,
     val timeout: FiniteDuration,
@@ -143,12 +147,18 @@ private[spark] final class LifecycleDeadline private (
     finally lock.unlock()
   }
 
+  private def writerThread(lock: ReentrantReadWriteLock): Option[String] =
+    lock match {
+      case tracked: LifecycleReadWriteLock => tracked.writerThreadName
+      case _                               => None
+    }
+
   def withReadLock[A](lock: ReentrantReadWriteLock, target: String)(body: => A): A =
     withTimedLock(
       lock.readLock(),
       target,
       reentrant = lock.getReadHoldCount > 0 || lock.isWriteLockedByCurrentThread,
-      ownerThread = None
+      ownerThread = writerThread(lock)
     )(body)
 
   def withWriteLock[A](lock: ReentrantReadWriteLock, target: String)(body: => A): A = {
@@ -158,7 +168,7 @@ private[spark] final class LifecycleDeadline private (
       lock.writeLock(),
       target,
       reentrant = lock.isWriteLockedByCurrentThread,
-      ownerThread = None
+      ownerThread = writerThread(lock)
     )(body)
   }
 
