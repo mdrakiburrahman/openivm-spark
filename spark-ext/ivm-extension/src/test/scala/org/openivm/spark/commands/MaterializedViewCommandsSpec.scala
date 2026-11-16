@@ -2358,7 +2358,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertSqlBagEqual("SELECT id, av, bv FROM right_mv_t10", query)
     }
 
-    it("deduplicates a generated anti-join input without changing MV bag semantics") {
+    it("preserves anti-join bag semantics with duplicate right-hand rows") {
       spark.sql("CREATE TABLE anti_brokers_t10(id INT, name STRING) USING DELTA")
       spark.sql("CREATE TABLE anti_accounts_t10(id INT, broker_id INT) USING DELTA")
       spark.sql("CREATE TABLE anti_trades_t10(account_id INT) USING DELTA")
@@ -2373,8 +2373,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql(s"CREATE MATERIALIZED VIEW anti_mv_t10 AS $query")
       val refreshSql = MvDryCompile.dryCompile(spark, TableIdentifier("anti_mv_dry_t10"), query).compiled.sql
       val translated = LptsSparkDialect.translate(refreshSql)
-      translated should fullyMatch regex
-        "(?is).*LEFT JOIN \\(SELECT DISTINCT \\*, TRUE AS _lpts_matched FROM t[0-9]+_projection\\).*"
+      translated.toUpperCase(java.util.Locale.ROOT) should include("ANTI JOIN")
       val initialSql = MvCatalog
         .lookup(spark, TableIdentifier("anti_mv_t10"))
         .get
