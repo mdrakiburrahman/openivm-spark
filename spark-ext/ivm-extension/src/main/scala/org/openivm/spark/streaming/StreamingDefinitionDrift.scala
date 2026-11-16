@@ -8,6 +8,7 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.plans.logical.{SubqueryAlias, View}
 import org.apache.spark.sql.openivm.StreamingDatasetAccess
+import org.openivm.spark.commands.CreateStreamingTableCommand
 
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
@@ -79,8 +80,14 @@ private[streaming] object StreamingDefinitionDrift {
 
     val query = textField(Mapper.readTree(manifest.diagnosticJson), "normalizedQuery")
     if (query.isEmpty) return false
-    val previousQuery = spark.sessionState.sqlParser.parseQuery(query.get)
-    val previous      = previousQuery.collect { case relation: UnresolvedRelation => relation }
+    // Spark 3.5's bare parseQuery bypasses the DDL body's STREAM/WITH adapter.
+    val previousQuery = spark.sessionState.sqlParser.parsePlan(
+      s"CREATE STREAMING TABLE ${StreamingTableMetadata.quoteMultipart(spec.name)} AS ${query.get}"
+    ) match {
+      case command: CreateStreamingTableCommand => command.spec.query
+      case _                                    => return false
+    }
+    val previous = previousQuery.collect { case relation: UnresolvedRelation => relation }
     if (
       previous.size != 1 || previous.head.isStreaming || previous.head.multipartIdentifier.size != 1 ||
       !previous.head.options.asCaseSensitiveMap().isEmpty
