@@ -2926,68 +2926,66 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     CreatePublicationMutex.withLock(commandName) {
-      try {
-        val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
-          isolated =>
-            MvCatalog.ensureTables(isolated)
-            if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
-            else {
-              val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
-              val sourceNames = collectSourceSchemas(analyzed)._1
-              computeUpstreamMvByQual(isolated, sourceNames).values
-                .map(meta => metaName(meta.name))
-                .toSeq
-                .distinct
-                .sorted
-            }
-        }
-        val lockWaitT0 = System.nanoTime()
-        val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
-          try {
-            val threadName = Thread.currentThread().getName
-            val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
-            profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-            val outcome =
-              org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-                OpenIvmMetrics.CreateInflight.incrementAndGet()
-                try {
-                  CommandConcurrencyInjection.maybePauseBeforeCreate()
-                  DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                    runCreate(
-                      isolated,
-                      profile,
-                      sqlLog,
-                      createUpstreamReadKeys.toSet,
-                      classification => createInsightClassification = Some(classification)
-                    )
-                  }
-                } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
-              }
-            // An existing view is only looked up; there is no state change to publish.
-            if (finalizeUnderLock) {
-              if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
-              createOutcome = outcome
-            }
-            outcome
-          } finally {
-            if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
+      val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
+        isolated =>
+          MvCatalog.ensureTables(isolated)
+          if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+          else {
+            val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
+            val sourceNames = collectSourceSchemas(analyzed)._1
+            computeUpstreamMvByQual(isolated, sourceNames).values
+              .map(meta => metaName(meta.name))
+              .toSeq
+              .distinct
+              .sorted
           }
-        }
-        if (!finalizeUnderLock) {
-          if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
-          createOutcome = outcome
-        }
-        if (outcome == "create_executed")
-          createInsightClassification.foreach { classification =>
-            OpenIvmMaterializedViewInsightEvents.createCompleted(
-              spark,
-              profile.refreshId,
-              commandName,
-              classification
-            )
-          }
-        Seq.empty
       }
+      val lockWaitT0 = System.nanoTime()
+      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
+        try {
+          val threadName = Thread.currentThread().getName
+          val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+          profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
+          val outcome =
+            org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+              OpenIvmMetrics.CreateInflight.incrementAndGet()
+              try {
+                CommandConcurrencyInjection.maybePauseBeforeCreate()
+                DriverHeavyOperationAdmission.withPermit(spark, "create") {
+                  runCreate(
+                    isolated,
+                    profile,
+                    sqlLog,
+                    createUpstreamReadKeys.toSet,
+                    classification => createInsightClassification = Some(classification)
+                  )
+                }
+              } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+            }
+          // An existing view is only looked up; there is no state change to publish.
+          if (finalizeUnderLock) {
+            if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
+            createOutcome = outcome
+          }
+          outcome
+        } finally {
+          if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
+        }
+      }
+      if (!finalizeUnderLock) {
+        if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
+        createOutcome = outcome
+      }
+      if (outcome == "create_executed")
+        createInsightClassification.foreach { classification =>
+          OpenIvmMaterializedViewInsightEvents.createCompleted(
+            spark,
+            profile.refreshId,
+            commandName,
+            classification
+          )
+        }
+      Seq.empty
     } {
       try finalizeCreate()
       finally {
