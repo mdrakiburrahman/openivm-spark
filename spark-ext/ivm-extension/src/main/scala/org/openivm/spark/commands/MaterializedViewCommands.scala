@@ -4551,7 +4551,7 @@ case class RefreshMaterializedViewCommand(
           totalMs
         )
         profile.completeSpan(outcome, threadName)
-        profile.flush()
+        profile.flush(deferExecutionSpanEmission = true)
         sqlLog.flush()
       }
     }
@@ -7377,7 +7377,7 @@ case class RefreshMaterializedViewCommand(
         }
     } finally {
       try {
-        if (!endEmitted) profile.flush()
+        if (!endEmitted) profile.flush(deferExecutionSpanEmission = true)
       } finally sqlLog.finish(queryLogOutcome)
     }
   }

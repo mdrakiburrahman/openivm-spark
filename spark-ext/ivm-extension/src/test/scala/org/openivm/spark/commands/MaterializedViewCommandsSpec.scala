@@ -1765,6 +1765,15 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       refresh.path("compile_refresh_type").asText() shouldBe create.path("compile_refresh_type").asText()
       refresh.path("effective_refresh_type").asText() shouldBe create.path("effective_refresh_type").asText()
       refresh.path("refresh_reason").asText() shouldBe create.path("refresh_reason").asText()
+      val refreshLocks = refresh.path("lock_acquisitions").elements().asScala.toSeq
+      refreshLocks should have size 1
+      val refreshLock = refreshLocks.head
+      refreshLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      refreshLock.path("lock_kind").asText() shouldBe "mv_data"
+      refreshLock.path("mode").asText() shouldBe "write"
+      refreshLock.path("released_epoch_ms").asLong() should be >= refreshLock.path("acquired_epoch_ms").asLong()
+      refreshLock.path("request_id").asText() shouldBe "request-t5aa-refresh"
+      refreshLocks.map(_.path("wait_ms").asLong()).sum shouldBe refresh.path("same_mv_lock_wait_ms").asLong()
       Instant.parse(refresh.path("engine_completed_at").asText()) should be >=
         Instant.parse(refresh.path("engine_started_at").asText())
 
