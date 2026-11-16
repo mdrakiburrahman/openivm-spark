@@ -1,9 +1,13 @@
 package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.actions.{AddFile, RemoveFile}
 import org.scalatest.funspec.AnyFunSpec
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
 
 private[streaming] final case class CompletedTargetState(
     path: String,
@@ -15,6 +19,83 @@ private[streaming] final case class CompletedTargetState(
 class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSupport {
 
   describe("reissuing CREATE after AvailableNow completion") {
+    it("streams catalog-free TEXT paths with native filtering, archives and checkpoint-safe reruns") {
+      val inbox   = Files.createDirectories(Paths.get(scratchPath("completed-text-inbox")))
+      val archive = scratchPath("completed-text-archive")
+      val target  = "strsql_completed_text_target"
+      Files.write(inbox.resolve("01.json"), "one\n".getBytes(StandardCharsets.UTF_8))
+      Files.write(inbox.resolve("02.json"), "two\n".getBytes(StandardCharsets.UTF_8))
+      Files.write(inbox.resolve("ignored.txt"), "ignored\n".getBytes(StandardCharsets.UTF_8))
+
+      def declaration(glob: String = "*.json", path: String = inbox.toString): String =
+        s"""CREATE STREAMING TABLE $target
+           |TBLPROPERTIES ('trigger' = 'availableNow', 'outputMode' = 'append', 'onQueryChange' = 'fail')
+           |AS SELECT value, regexp_extract(input_file_name(), '([^/]+)$$', 1) AS source_file
+           |FROM STREAM(text.`$path`)
+           |WITH ('pathGlobFilter' = '$glob', 'maxFilesPerTrigger' = '1',
+           |      'cleanSource' = 'archive', 'sourceArchiveDir' = '$archive')""".stripMargin
+
+      val cleanerThreads = spark.conf.get("spark.sql.streaming.fileSource.cleaner.numThreads")
+      spark.conf.set("spark.sql.streaming.fileSource.cleaner.numThreads", "0")
+      try {
+        val initial       = createStreamingSqlToCompletion(declaration())
+        val initialTarget = targetState(target)
+        val expected =
+          "SELECT 'one' AS value, '01.json' AS source_file UNION ALL SELECT 'two', '02.json'"
+        initial.inputRows shouldBe 2L
+        assertBagEqual(target, expected)
+        (Files.exists(inbox.resolve("01.json")) && Files.exists(inbox.resolve("02.json"))) shouldBe false
+        val archivePath = new Path(archive)
+        archivePath
+          .getFileSystem(spark.sessionState.newHadoopConf())
+          .listFiles(archivePath, true)
+          .hasNext shouldBe true
+        manifest(target).semanticJson should include("\"cleansource\":\"archive\"")
+        manifest(target).semanticJson should include("\"pathglobfilter\":\"*.json\"")
+
+        val replay = createStreamingSqlToCompletion(declaration())
+        assertStableResume(initial, replay, initialTarget, targetState(target))
+        replay.inputRows shouldBe 0L
+        assertBagEqual(target, expected)
+
+        Files.write(inbox.resolve("03.json"), "three\n".getBytes(StandardCharsets.UTF_8))
+        val appended = createStreamingSqlToCompletion(declaration())
+        assertStableResume(initial, appended, initialTarget, targetState(target))
+        appended.inputRows shouldBe 1L
+        assertBagEqual(target, expected + " UNION ALL SELECT 'three', '03.json'")
+
+        Seq(declaration(glob = "*.txt"), declaration(path = inbox.toUri.toString)).foreach { changed =>
+          val failure = the[AnalysisException] thrownBy createStreamingSql(changed)
+          failure.getMessage should include("onQueryChange")
+          targetState(target).deltaTableId shouldBe initialTarget.deltaTableId
+          manifest(target).definitionHash shouldBe initial.status.definitionHash
+          assertBagEqual(target, expected + " UNION ALL SELECT 'three', '03.json'")
+        }
+      } finally {
+        spark.conf.set("spark.sql.streaming.fileSource.cleaner.numThreads", cleanerThreads)
+      }
+    }
+
+    it("accepts qualified TEXT file URIs and preserves native missing-path errors") {
+      val inbox  = Files.createDirectories(Paths.get(scratchPath("completed-text-uri")))
+      val target = "strsql_completed_text_uri_target"
+      Files.write(inbox.resolve("event.json"), "event\n".getBytes(StandardCharsets.UTF_8))
+      def declaration(path: String): String =
+        s"""CREATE STREAMING TABLE $target
+           |TBLPROPERTIES ('trigger' = 'availableNow')
+           |AS SELECT value FROM STREAM(text.`$path`) WITH ('pathGlobFilter' = '*.json')""".stripMargin
+
+      val failure = the[AnalysisException] thrownBy createStreamingSql(
+        declaration(inbox.resolve("missing").toUri.toString)
+      )
+      failure.getMessage should include("PATH_NOT_FOUND")
+      spark.catalog.tableExists(target) shouldBe false
+
+      val completed = createStreamingSqlToCompletion(declaration(inbox.toUri.toString))
+      completed.inputRows shouldBe 1L
+      assertBagEqual(target, "SELECT 'event' AS value")
+    }
+
     it("performs no source-row or target-data work when the source is unchanged") {
       val source = "strsql_completed_noop_source"
       val target = "strsql_completed_noop_target"

@@ -30,6 +30,36 @@ streaming source can carry its own case-insensitive `WITH (...)` reader options;
 duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
 rejected before Spark receives the native options.
 
+For a catalog-free TEXT file source, use `STREAM(text.` followed by a
+backtick-quoted absolute Hadoop path or URI:
+
+```sql
+CREATE STREAMING TABLE monitoring.raw_events
+TBLPROPERTIES (
+  'trigger' = 'availableNow',
+  'outputMode' = 'append',
+  'onQueryChange' = 'fail'
+)
+AS SELECT value AS request_body, input_file_name() AS source_file
+FROM STREAM(text.`abfss://container@account.dfs.core.windows.net/inbox`)
+WITH (
+  'pathGlobFilter' = '*.json',
+  'cleanSource' = 'archive',
+  'sourceArchiveDir' = 'abfss://container@account.dfs.core.windows.net/archive'
+);
+```
+
+This boundary uses Spark's native TEXT streaming reader on both supported Spark
+lines; it needs neither a catalog TEXT table nor a session view. Native TEXT
+schema, `input_file_name()`, reader-option validation and post-commit file
+cleanup are preserved. Other table/view boundaries retain catalog resolution.
+The source path, schema and semantic reader options remain checkpoint
+fingerprint inputs. Reissuing the same declaration resumes its checkpoint;
+changing a catalog/view source to a direct path is not a checkpoint migration.
+With `onQueryChange='fail'`, incompatible source/options changes fail without
+resetting the checkpoint. Native asynchronous archive cleanup is not a durable
+cleanup queue and is not guaranteed to finish before the driver exits.
+
 `displayName` controls the friendly Structured Streaming query label shown in
 the Spark UI and micro-batch job descriptions. OpenIVM sanitizes the label and
 appends a stable target-identity suffix so independently active tables cannot
