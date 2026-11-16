@@ -202,7 +202,7 @@ final class RefreshProfile private (
     try persist()
     finally {
       executionSpan.complete(outcome, threadName)
-      if (deferExecutionSpanEmission) RefreshProfile.clearActive(this)
+      if (deferExecutionSpanEmission) RefreshProfile.clearActive(this, clearExecutionSpan = false)
       else
         try executionSpan.emitIfNeeded("failed_before_end", threadName)
         finally RefreshProfile.clearActive(this)
@@ -264,9 +264,9 @@ object RefreshProfile {
 
   private val current = new ThreadLocal[RefreshProfile]()
 
-  private[commands] def clearActive(profile: RefreshProfile): Unit = {
+  private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
     if (current.get() eq profile) current.remove()
-    OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
+    if (clearExecutionSpan) OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
   }
 
   def flushActive(outcomeOverride: Option[String] = None): Unit =
