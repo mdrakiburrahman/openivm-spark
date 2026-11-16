@@ -159,8 +159,11 @@ private[commands] object OpenIvmCompilers {
 
     extract("/openivm-native/openivm.duckdb_extension", ext)
     extract("/openivm-native/duckdb", cli)
-    extract("/openivm-native/libstdc++.so.6", new java.io.File(localDir, "libstdc++.so.6"))
-    extract("/openivm-native/libgcc_s.so.1", new java.io.File(localDir, "libgcc_s.so.1"))
+    Seq("libstdc++.so.6", "libgcc_s.so.1").foreach { name =>
+      val resource = s"/openivm-native/$name"
+      if (getClass.getResource(resource) != null)
+        extract(resource, new java.io.File(localDir, name))
+    }
     cli.setExecutable(true, /* ownerOnly = */ false)
     (ext.getAbsolutePath, cli.getAbsolutePath)
   }
