@@ -3,7 +3,6 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, MvMetadata, StagingCatalog}
-import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.openivm.spark.testkit.{ParkedCommandBarrier, TestPools}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -12,7 +11,7 @@ import org.scalatest.matchers.should.Matchers
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -122,13 +121,18 @@ class FabricPinCdfBarrierSpec extends AnyFunSpec with Matchers with BeforeAndAft
       )
     }
 
-  /** Block until `predicate` holds or `budget` elapses; returns the final value
-    * of the predicate. Used to observe the deterministic `refresh.queued`
-    * transition rather than race a wall clock. */
-  private def awaitTrue(budget: FiniteDuration)(predicate: => Boolean): Boolean = {
-    val deadline = System.nanoTime() + budget.toNanos
-    while (!predicate && System.nanoTime() < deadline) Thread.sleep(25L)
-    predicate
+  private def lockKey(meta: MvMetadata): String = meta.name.table
+
+  private def awaitQueued(mvKey: String, thread: AtomicReference[Thread]): Unit = {
+    val deadline = System.nanoTime() + ObservationBudget.toNanos
+    while (
+      (thread.get() == null || !RefreshMutex.hasQueuedThread(mvKey, thread.get())) &&
+      System.nanoTime() < deadline
+    ) Thread.`yield`()
+    withClue(s"thread did not queue for MV lock $mvKey: ") {
+      thread.get() should not be null
+      RefreshMutex.hasQueuedThread(mvKey, thread.get()) shouldBe true
+    }
   }
 
   private def createPinnedUpstream(pinned: String, live: String, upMv: String, downMv: String): Unit = {
@@ -182,14 +186,14 @@ class FabricPinCdfBarrierSpec extends AnyFunSpec with Matchers with BeforeAndAft
             withClue(s"upstream must reach the pre-gate hook (${barrier.describe}): ") {
               barrier.awaitEntered() shouldBe true
             }
-            val queuedBefore = OpenIvmMetrics.RefreshQueued.get()
-
             // The downstream consumer must not observe the intermediate commit:
             // it has to queue on the shared up_mv lock the parked upstream holds.
-            val downstream = Future(spark.sql("REFRESH MATERIALIZED VIEW down_mv").collect())
-            withClue("downstream refresh must queue on the shared upstream MV lock: ") {
-              awaitTrue(ObservationBudget)(OpenIvmMetrics.RefreshQueued.get() > queuedBefore) shouldBe true
+            val downstreamThread = new AtomicReference[Thread]()
+            val downstream = Future {
+              downstreamThread.set(Thread.currentThread())
+              spark.sql("REFRESH MATERIALIZED VIEW down_mv").collect()
             }
+            awaitQueued(lockKey(lookup("up_mv")), downstreamThread)
             assertStillParked(barrier, upstream)
             downstream.isCompleted shouldBe false
             total("down_mv") shouldBe 15L
@@ -233,11 +237,12 @@ class FabricPinCdfBarrierSpec extends AnyFunSpec with Matchers with BeforeAndAft
             withClue(s"upstream must reach the pre-gate hook (${barrier.describe}): ") {
               barrier.awaitEntered() shouldBe true
             }
-            val queuedBefore = OpenIvmMetrics.RefreshQueued.get()
-            val downstream   = Future(spark.sql("REFRESH MATERIALIZED VIEW down2_mv").collect())
-            withClue("downstream refresh must queue on the shared upstream MV lock: ") {
-              awaitTrue(ObservationBudget)(OpenIvmMetrics.RefreshQueued.get() > queuedBefore) shouldBe true
+            val downstreamThread = new AtomicReference[Thread]()
+            val downstream = Future {
+              downstreamThread.set(Thread.currentThread())
+              spark.sql("REFRESH MATERIALIZED VIEW down2_mv").collect()
             }
+            awaitQueued(lockKey(lookup("up2_mv")), downstreamThread)
             assertStillParked(barrier, upstream)
             downstream.isCompleted shouldBe false
 

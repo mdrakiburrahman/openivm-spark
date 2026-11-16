@@ -46,7 +46,7 @@ import java.io.File
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, CyclicBarrier, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import scala.jdk.CollectionConverters._
 import scala.concurrent.duration._
@@ -1735,6 +1735,28 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       create.path("compile_refresh_type").asText() should not be empty
       create.path("effective_refresh_type").asText() should not be empty
       create.path("refresh_reason").asText() should not be empty
+      val createLocks = create.path("lock_acquisitions").elements().asScala.toSeq
+      createLocks should have size 2
+      createLocks.count(_.path("lock_kind").asText() == "mv_data") shouldBe 1
+      createLocks.count(_.path("lock_kind").asText() == "create_publication") shouldBe 1
+      createLocks.foreach { entry =>
+        entry.path("requested_epoch_ms").asLong() should be > 0L
+        entry.path("acquired_epoch_ms").asLong() should be >= entry.path("requested_epoch_ms").asLong()
+        entry.path("released_epoch_ms").asLong() should be >= entry.path("acquired_epoch_ms").asLong()
+        entry.path("wait_ms").asLong() should be >= 0L
+        entry.path("hold_ms").asLong() should be >= 0L
+      }
+      val createDataLock = createLocks.find(_.path("lock_kind").asText() == "mv_data").get
+      createDataLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createDataLock.path("mode").asText() shouldBe "write"
+      createDataLock.path("request_id").asText() shouldBe "request-t5aa-create"
+      createDataLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
+      val createPublicationLock = createLocks.find(_.path("lock_kind").asText() == "create_publication").get
+      createPublicationLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createPublicationLock.path("mode").asText() shouldBe "write"
+      createPublicationLock.path("request_id").asText() shouldBe "request-t5aa-create"
+      createPublicationLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
+      createLocks.map(_.path("wait_ms").asLong()).sum shouldBe create.path("same_mv_lock_wait_ms").asLong()
 
       val refresh = byOperation("refresh")
       refresh.path("request_id").asText() shouldBe "request-t5aa-refresh"
@@ -2507,56 +2529,65 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
-    it("serializes dependency siblings on their shared upstream guard and records its wait") {
-      val upstream = "default.lock_source"
-      val left     = "default.lock_child_left"
-      val right    = "default.lock_child_right"
-      val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
-      val owner    = new AtomicReference[Thread]()
-      val worker   = new AtomicReference[Thread]()
-      val started  = new CountDownLatch(1)
+    it("lets sibling refreshes hold shared upstream reads concurrently and emits per-key lock telemetry") {
+      val upstream    = "default.lock_source"
+      val left        = "default.lock_child_left"
+      val right       = "default.lock_child_right"
+      val bothEntered = new CyclicBarrier(2)
 
       val payloads = withLogCapture { appender =>
         withPool(2) { implicit ec =>
-          barrier.use {
-            val holder = Future {
-              owner.set(Thread.currentThread())
-              RefreshMutex.withLocks(Seq(left, upstream))(barrier.park())
+          val leftRefresh = Future {
+            RefreshMutex.withLocks(Seq(upstream), Seq(left)) {
+              bothEntered.await(10L, TimeUnit.SECONDS)
+              ()
             }
-            barrier.awaitEntered() shouldBe true
-            val sibling = Future {
-              val span = OpenIvmExecutionSpan.start(right, "refresh")
-              try {
-                worker.set(Thread.currentThread())
-                started.countDown()
-                RefreshMutex.withLocks(Seq(right, upstream)) {
-                  span.complete("refresh_done", Thread.currentThread().getName)
-                }
-              } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
-            }
-            started.await(10L, TimeUnit.SECONDS) shouldBe true
-            def blockedOnHolder: Boolean = {
-              val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
-              info != null && info.getThreadState == Thread.State.WAITING &&
-              info.getLockOwnerId == owner.get().getId
-            }
-            val deadline = 10.seconds.fromNow
-            while (!blockedOnHolder && deadline.hasTimeLeft())
-              Thread.sleep(1L)
-            blockedOnHolder shouldBe true
-            sibling.isCompleted shouldBe false
-            assertStillParked(barrier, holder)
-            RefreshMutex.withLock("default.lock_unrelated")(()) shouldBe (())
-            barrier.release()
-            awaitResult(holder, 15.seconds)
-            awaitResult(sibling, 15.seconds)
           }
+          val rightRefresh = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-reader-right",
+              "openivm.node_id"    -> "model.reader.right"
+            ) {
+              val span = OpenIvmExecutionSpan.start(spark, right, "refresh")
+              try
+                RefreshMutex.withLocks(Seq(upstream), Seq(right)) {
+                  bothEntered.await(10L, TimeUnit.SECONDS)
+                  span.complete("incremental_executed", Thread.currentThread().getName)
+                }
+              finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+            }
+          }
+          awaitResult(leftRefresh, 15.seconds)
+          awaitResult(rightRefresh, 15.seconds)
         }
         executionSpanPayloads(appender.messages, right)
       }
 
       payloads should have size 1
-      payloads.head.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      val span = payloads.head
+      span.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      val acquisitions = span.path("lock_acquisitions")
+      acquisitions.isArray shouldBe true
+      val entries = acquisitions.elements().asScala.toSeq
+      entries should have size 2
+      val upstreamRead = entries.find(_.path("mv_key").asText() == upstream).get
+      upstreamRead.path("mode").asText() shouldBe "read"
+      upstreamRead.path("lock_kind").asText() shouldBe "mv_data"
+      val targetWrite = entries.find(_.path("mv_key").asText() == right).get
+      targetWrite.path("mode").asText() shouldBe "write"
+      targetWrite.path("lock_kind").asText() shouldBe "mv_data"
+      span.path("same_mv_lock_wait_ms").asLong() shouldBe entries.map(_.path("wait_ms").asLong()).sum
+      entries.foreach { entry =>
+        entry.path("requested_epoch_ms").asLong() should be > 0L
+        entry.path("acquired_epoch_ms").asLong() should be >= entry.path("requested_epoch_ms").asLong()
+        entry.path("released_epoch_ms").asLong() should be >= entry.path("acquired_epoch_ms").asLong()
+        entry.path("wait_ms").asLong() should be >= 0L
+        entry.path("hold_ms").asLong() should be >= 0L
+        entry.path("thread").asText() should not be empty
+        entry.path("lock_kind").asText() shouldBe "mv_data"
+        entry.path("request_id").asText() shouldBe "req-reader-right"
+        entry.path("dbt_node_id").asText() shouldBe "model.reader.right"
+      }
     }
 
     it("emit one primary span per CREATE and capture queued same-MV lock waits") {
@@ -2607,7 +2638,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       byRequest("req-create-1").head.path("dbt_node_id").asText() shouldBe "model.create.one"
       val waitingCreate = byRequest("req-create-2").head
       waitingCreate.path("dbt_node_id").asText() shouldBe "model.create.two"
-      waitingCreate.path("same_mv_lock_wait_ms").asLong() should be > 0L
+      val waitingLocks = waitingCreate.path("lock_acquisitions").elements().asScala.toSeq
+      waitingLocks should have size 2
+      val publicationWait = waitingLocks.find(_.path("lock_kind").asText() == "create_publication").get
+      publicationWait.path("mode").asText() shouldBe "write"
+      publicationWait.path("wait_ms").asLong() should be > 0L
+      waitingLocks.find(_.path("lock_kind").asText() == "mv_data").get.path("wait_ms").asLong() shouldBe 0L
+      waitingCreate.path("same_mv_lock_wait_ms").asLong() shouldBe waitingLocks.map(_.path("wait_ms").asLong()).sum
 
       assertBagEqual("mv_t14a_create_span", createSql)
     }
@@ -2635,38 +2672,54 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
 
       val payloads = withLogCapture { appender =>
-        withPool(2) { implicit ec =>
-          val refresh1 = Future {
-            withSparkLocalProperties(
-              "openivm.request_id" -> "req-refresh-1",
-              "openivm.node_id"    -> "model.refresh.one"
-            ) {
-              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+        val barrier   = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+        val parkFirst = new AtomicBoolean(true)
+        CommandConcurrencyInjection.withBeforeRefreshFinalize({
+          if (parkFirst.compareAndSet(true, false)) barrier.park()
+        }) {
+          withPool(2) { implicit ec =>
+            barrier.use {
+              val refresh1 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-refresh-1",
+                  "openivm.node_id"    -> "model.refresh.one"
+                ) {
+                  spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+                }
+              }
+              withClue(s"first REFRESH never reached the finalize hook (${barrier.describe}): ") {
+                barrier.awaitEntered() shouldBe true
+              }
+              val refresh2Thread = new AtomicReference[Thread]()
+              val refresh2 = Future {
+                refresh2Thread.set(Thread.currentThread())
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-refresh-2",
+                  "openivm.node_id"    -> "model.refresh.two"
+                ) {
+                  spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+                }
+              }
+              val queueDeadline = System.nanoTime() + 30.seconds.toNanos
+              def refresh2Queued: Boolean =
+                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("mv_t15_serial", _))
+              while (!refresh2Queued && System.nanoTime() < queueDeadline) Thread.`yield`()
+              refresh2Queued shouldBe true
+              assertStillParked(barrier, refresh1)
+              spark.sql(
+                "INSERT INTO sales_t15 " +
+                  "SELECT CASE " +
+                  "  WHEN id % 4 = 0 THEN 'east' " +
+                  "  WHEN id % 4 = 1 THEN 'west' " +
+                  "  WHEN id % 4 = 2 THEN 'north' " +
+                  "  ELSE 'south' END AS region, " +
+                  "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+              )
+              barrier.release()
+              awaitResult(refresh1, 600.seconds)
+              awaitResult(refresh2, 600.seconds)
             }
           }
-          Thread.sleep(150L)
-          val refresh2 = Future {
-            withSparkLocalProperties(
-              "openivm.request_id" -> "req-refresh-2",
-              "openivm.node_id"    -> "model.refresh.two"
-            ) {
-              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
-            }
-          }
-          Thread.sleep(150L)
-          spark.sql(
-            "INSERT INTO sales_t15 " +
-              "SELECT CASE " +
-              "  WHEN id % 4 = 0 THEN 'east' " +
-              "  WHEN id % 4 = 1 THEN 'west' " +
-              "  WHEN id % 4 = 2 THEN 'north' " +
-              "  ELSE 'south' END AS region, " +
-              "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
-          )
-
-          awaitResult(refresh1, 600.seconds)
-          refresh2.isCompleted shouldBe false
-          awaitResult(refresh2, 600.seconds)
         }
         executionSpanPayloads(appender.messages, "mv_t15_serial")
       }
