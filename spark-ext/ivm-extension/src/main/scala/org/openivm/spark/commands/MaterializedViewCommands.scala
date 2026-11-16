@@ -118,14 +118,14 @@ private[commands] object OpenIvmCompilers {
       OpenIvmCompiler.build(
         extensionPath = extEnv,
         cliPath = cliEnv,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(Option(new java.io.File(cliEnv).getParent))
       )
     else {
       val (extPath, cliPath) = extractBundledAssets(spark)
       OpenIvmCompiler.build(
         extensionPath = extPath,
         cliPath = cliPath,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(Option(new java.io.File(cliPath).getParent))
       )
     }
   }
@@ -159,6 +159,8 @@ private[commands] object OpenIvmCompilers {
 
     extract("/openivm-native/openivm.duckdb_extension", ext)
     extract("/openivm-native/duckdb", cli)
+    extract("/openivm-native/libstdc++.so.6", new java.io.File(localDir, "libstdc++.so.6"))
+    extract("/openivm-native/libgcc_s.so.1", new java.io.File(localDir, "libgcc_s.so.1"))
     cli.setExecutable(true, /* ownerOnly = */ false)
     (ext.getAbsolutePath, cli.getAbsolutePath)
   }
@@ -2925,6 +2927,8 @@ case class CreateMaterializedViewCommand(
         )
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
+          val compileCause = Option(e.getMessage).getOrElse(e.toString).replace('\n', ' ').take(512)
+          profile.timeStep("create_compile_failure", s"cause=$compileCause") { () }
           val compileFailedClassification =
             authoritativeFullRefreshClassification(
               compileRefreshTypeName = "COMPILE_FAILED",
@@ -3103,6 +3107,10 @@ case class CreateMaterializedViewCommand(
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
     val emitsCascadeViewDelta    = classification.emitsCascadeViewDelta
+    profile.timeStep(
+      "create_compiler_verdict",
+      s"compiled=${classification.compileRefreshTypeName};effective=$effectiveRefreshTypeName;reason=$classifyReason"
+    ) { () }
     OpenIvmExecutionSpan.recordActiveRefreshClassification(
       compileRefreshType = Some(classification.compileRefreshTypeName),
       effectiveRefreshType = Some(effectiveRefreshTypeName),

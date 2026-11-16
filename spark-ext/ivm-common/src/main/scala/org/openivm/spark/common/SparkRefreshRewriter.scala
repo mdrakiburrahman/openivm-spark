@@ -612,7 +612,8 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      RewrittenRefresh(withSemiJoinRewrite.map(postProcess), hasRunningWindowProgram)
+      val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+      RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram)
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
@@ -2006,8 +2007,9 @@ object SparkRefreshRewriter {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
-    val qcol      = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
-    val tsLiteral = "(?:'[^']*+'::\\s*+TIMESTAMP|CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\))"
+    val qcol = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
+    val tsLiteral =
+      "(?:'[^']*+'::\\s*+TIMESTAMP|CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\)|TIMESTAMP\\s++'[^']*+')"
     val metadataTable =
       "(?:(?:`?memory`?\\s*+\\.\\s*+`?main`?\\s*+\\.\\s*+)?`?openivm_delta_tables`?)"
     val metadataHorizon =
@@ -2015,10 +2017,12 @@ object SparkRefreshRewriter {
         "view_name\\s*+=\\s*+'[^']*+'\\s++AND\\s++table_name\\s*+=\\s*+'[^']*+'\\s*+\\)"
     val refreshHorizon = "(?:" + tsLiteral + "|(?>" + metadataHorizon + "))"
     val cmp            = "\\s*+(?:>=|>|<=|<|=)\\s*+"
-    // LPTS rewrites parenthesises each WHERE conjunct
-    // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either
-    // wrapped in a balanced paren pair or bare (pre-merge single-line form).
-    val tsPred = "(?:\\(\\s*" + qcol + cmp + refreshHorizon + "\\s*\\)|" + qcol + cmp + refreshHorizon + ")"
+    // DuckDB 2.0 can parenthesize the column, TIMESTAMP literal, and whole
+    // predicate independently: `((openivm_timestamp) >= (TIMESTAMP '...'))`.
+    val colExpr     = "(?:\\(\\s*+" + qcol + "\\s*+\\)|" + qcol + ")"
+    val horizonExpr = "(?:\\(\\s*+" + refreshHorizon + "\\s*+\\)|" + refreshHorizon + ")"
+    val comparison  = colExpr + cmp + horizonExpr
+    val tsPred      = "(?:\\(\\s*+" + comparison + "\\s*+\\)|" + comparison + ")"
     // Case 1: standalone `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)]`
     val standalone = ("(?i)\\s+WHERE\\s+" + tsPred).r
     // Case 3a: leading `WHERE [(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
@@ -3645,6 +3649,47 @@ object SparkRefreshRewriter {
       stmt,
       java.util.regex.Matcher.quoteReplacement(s"INSERT INTO ${backtickMvName(mvName)}")
     )
+  }
+
+  /** A full-table recompute has already written exactly the rows in openivm_new.
+    * Read those published rows for the positive cascade delta instead of running
+    * the entire recompute a second time. A partition/group replacement cannot
+    * use this path because its target also contains unaffected rows.
+    */
+  private def reuseFullyReplacedTargetInCascade(
+      statements: Seq[String],
+      mvName: TableIdentifier,
+      viewLogicalName: String
+  ): Seq[String] = {
+    val target     = backtickMvName(mvName)
+    val newView    = s"openivm_new_$viewLogicalName"
+    val fullDelete = s"DELETE FROM $target"
+    val fullInsert = s"INSERT INTO $target SELECT * FROM $newView"
+    def fromScratch(name: String) =
+      ("(?i)\\bFROM\\s+(?:`" + java.util.regex.Pattern.quote(name) + "`|" +
+        java.util.regex.Pattern.quote(name) + ")(?![\\w`])").r
+    val newSource = fromScratch(newView)
+    val oldSource = fromScratch(s"openivm_old_$viewLogicalName")
+
+    statements.indices
+      .collectFirst {
+        case insertIdx
+            if insertIdx > 0 && insertIdx + 1 < statements.size &&
+              statements(insertIdx - 1).trim.equalsIgnoreCase(fullDelete) &&
+              statements(insertIdx).trim.equalsIgnoreCase(fullInsert) &&
+              statements(insertIdx + 1).trim.toUpperCase.startsWith("CREATE OR REPLACE TABLE DELTA.") &&
+              oldSource.findFirstIn(statements(insertIdx + 1)).isDefined &&
+              newSource.findAllIn(statements(insertIdx + 1)).size == 1 =>
+          val cascade = statements(insertIdx + 1)
+          statements.updated(
+            insertIdx + 1,
+            newSource.replaceFirstIn(
+              cascade,
+              java.util.regex.Matcher.quoteReplacement(s"FROM $target")
+            )
+          )
+      }
+      .getOrElse(statements)
   }
 
   private def rewriteCurrentSnapshotDrop(viewLogicalName: String): String =

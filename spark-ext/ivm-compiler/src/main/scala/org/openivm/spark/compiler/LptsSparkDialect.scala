@@ -110,6 +110,9 @@ object LptsSparkDialect {
   private val ToTimestampDoubleCastRe =
     """(?is)\bto_timestamp\s*\(\s*CAST\s*\(\s*('(?:''|[^'])*')\s*AS\s*DOUBLE\s*\)\s*\)""".r
 
+  private val AntiJoinProjectionRe =
+    """(?i)\bANTI\s+JOIN\s+(t\d+_projection_materialized_for_join)\s+ON\b""".r
+
   // ── Public API ───────────────────────────────────────────────────────────────
 
   /** Run all post-processing passes in order.
@@ -124,12 +127,11 @@ object LptsSparkDialect {
     *   - [[rewriteTrimTwoArg]] must run before [[rewriteBareBackslashLiterals]]
     *     so the latter sees the (possibly relocated, never mutated) literal
     *     arguments in their final position.
-    *   - [[rewriteBareBackslashLiterals]] runs LAST (outermost), after every
-    *     other pass has finished producing the final literal text, so it
+    *   - [[rewriteBareBackslashLiterals]] runs after all literal rewrites, so it
     *     sees the exact string-literal content Spark's parser will receive.
     */
-  def translate(sql: String): String =
-    rewriteBareBackslashLiterals(
+  def translate(sql: String): String = {
+    val translated = rewriteBareBackslashLiterals(
       rewriteTrimTwoArg(
         rewriteDoubleQuotedIdentifiers(
           rewriteErrorFn(
@@ -144,7 +146,17 @@ object LptsSparkDialect {
                             rewriteTimestampWithTimeZone(
                               rewriteSparkFunctionInlinings(
                                 rewriteToTimestampDoubleCast(
-                                  rewriteNowTimestamp(rewriteLikeOperators(rewriteQuotedCastTypes(sql)))
+                                  rewriteNowTimestamp(
+                                    rewriteLikeOperators(
+                                      SparkFunctionShimSql.rewriteOffsetWindowFrames(
+                                        SparkFunctionShimSql.rewriteOffsetLiteralCasts(
+                                          rewriteQuotedCastTypes(
+                                            SparkFunctionShimSql.rewriteQualifiedSystemIntervals(sql)
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
                                 )
                               )
                             )
@@ -160,6 +172,32 @@ object LptsSparkDialect {
         )
       )
     )
+    deduplicateAntiJoinProjectionInputs(translated)
+  }
+
+  /** Spark keeps DISTINCT on a generated anti-join RHS as a hash aggregate.
+    * The DuckDB 2.0 optimizer omits it because the anti join is semantically
+    * unchanged, but duplicate RHS keys make Spark shuffle far more rows.
+    * Preserve bag semantics when the CTE is also referenced outside anti joins.
+    */
+  private[compiler] def deduplicateAntiJoinProjectionInputs(sql: String): String = {
+    val rhsNames = AntiJoinProjectionRe.findAllMatchIn(sql).map(_.group(1)).toVector.distinct
+    rhsNames.foldLeft(sql) { (current, name) =>
+      val allUses  = ("(?i)\\b" + java.util.regex.Pattern.quote(name) + "\\b(?!\\s*\\.)").r.findAllIn(current).length
+      val antiUses = AntiJoinProjectionRe.findAllMatchIn(current).count(_.group(1).equalsIgnoreCase(name))
+      if (allUses != antiUses + 1) current
+      else {
+        val header =
+          ("(?im)^([ \\t]*(?:WITH\\s+)?" + java.util.regex.Pattern.quote(name) +
+            "\\s*\\([^)]*\\)\\s+AS\\s*\\(\\s*)SELECT(?!\\s+DISTINCT\\b)").r
+        header.findFirstMatchIn(current) match {
+          case Some(m) =>
+            current.substring(0, m.start) + m.group(1) + "SELECT DISTINCT" + current.substring(m.end)
+          case None => current
+        }
+      }
+    }
+  }
 
   /** Normalize DuckDB pattern operators without changing literals or identifiers.
     *
@@ -264,87 +302,9 @@ object LptsSparkDialect {
     }
   }
 
-  /** Rewrites DuckDB's `to_<unit>(N)` interval constructors to Spark's
-    * `INTERVAL N <UNIT>` syntax. openivm emits these forms when a user view
-    * body uses `INTERVAL N <unit>` and the LPTS pipeline serializes the
-    * bound AST in DuckDB's preferred form (e.g. `INTERVAL 1 MILLISECOND`
-    * round-trips as `to_milliseconds(CAST(1 AS DOUBLE))`).
-    *
-    * Supported units (matching DuckDB's interval-helper functions):
-    *   - to_milliseconds(N)  → INTERVAL N MILLISECOND
-    *   - to_seconds(N)       → INTERVAL N SECOND
-    *   - to_minutes(N)       → INTERVAL N MINUTE
-    *   - to_hours(N)         → INTERVAL N HOUR
-    *   - to_days(N)          → INTERVAL N DAY
-    *   - to_months(N)        → INTERVAL N MONTH
-    *   - to_years(N)         → INTERVAL N YEAR
-    *
-    * The argument can be any expression with balanced parentheses (e.g.
-    * `1`, `CAST(1 AS DOUBLE)`, `<column>`). Spark's `INTERVAL <expr> <UNIT>`
-    * accepts any numeric expression as long as the value can be evaluated to
-    * a numeric constant — for column refs, the user should use multiplication
-    * `<col> * INTERVAL 1 MILLISECOND` instead, but the LPTS-emitted form
-    * never uses column args here, just CAST'd literals.
-    */
-  private[compiler] def rewriteToTemporalUnit(sql: String): String = {
-    val unitMap = Seq(
-      "milliseconds" -> "MILLISECOND",
-      "seconds"      -> "SECOND",
-      "minutes"      -> "MINUTE",
-      "hours"        -> "HOUR",
-      "days"         -> "DAY",
-      "months"       -> "MONTH",
-      "years"        -> "YEAR"
-    )
-    // Helper: extract the balanced-paren argument starting at `start` (which
-    // should be the opening `(` index). Returns the argument substring and
-    // the index just past the closing `)`, or (None, -1) if unbalanced.
-    def extractBalancedArg(s: String, openIdx: Int): (Option[String], Int) = {
-      if (openIdx >= s.length || s.charAt(openIdx) != '(') return (None, -1)
-      var depth    = 1
-      var i        = openIdx + 1
-      val argStart = i
-      while (i < s.length && depth > 0) {
-        s.charAt(i) match {
-          case '(' => depth += 1
-          case ')' => depth -= 1
-          case _   => ()
-        }
-        if (depth > 0) i += 1
-      }
-      if (depth != 0) (None, -1)
-      else (Some(s.substring(argStart, i)), i + 1)
-    }
-    var s = sql
-    for ((fn, unit) <- unitMap) {
-      val callRe  = ("(?i)\\bto_" + fn + "\\s*(?=\\()").r
-      var changed = true
-      while (changed) {
-        changed = false
-        callRe.findFirstMatchIn(s) match {
-          case None =>
-            ()
-          case Some(m) =>
-            val (argOpt, endIdx) = extractBalancedArg(s, m.end)
-            argOpt match {
-              case Some(arg) =>
-                val before = s.substring(0, m.start)
-                val after  = s.substring(endIdx)
-                // Use Spark's `<expr> * INTERVAL 1 <UNIT>` form because Spark
-                // 3.5's `INTERVAL <expr> <UNIT>` requires the expression to be
-                // a literal — openivm/lpts emits `to_milliseconds(CAST(1 AS
-                // DOUBLE))` for `INTERVAL 1 MILLISECOND`, so the arg is rarely
-                // a bare literal.
-                val argTrim = arg.trim
-                s = s"${before}(($argTrim) * INTERVAL 1 $unit)$after"
-                changed = true
-              case None => ()
-            }
-        }
-      }
-    }
-    s
-  }
+  /** Rewrites DuckDB interval constructors using the shared quote-aware SQL scanner. */
+  private[compiler] def rewriteToTemporalUnit(sql: String): String =
+    SparkFunctionShimSql.rewriteTemporalUnitConstructors(sql)
 
   // ── Individual passes ────────────────────────────────────────────────────────
 

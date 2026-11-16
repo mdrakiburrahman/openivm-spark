@@ -34,6 +34,155 @@ private[compiler] object SparkFunctionShimSql {
   private val OneArgToDateLiteral      = "'%Y-%m-%d'"
   private val OneArgToTimestampLiteral = "'%Y-%m-%d %H:%M:%S'"
 
+  private val QualifiedSystemAdd =
+    """(?i)(?:"system"|`system`|system)\s*\.\s*(?:"main"|`main`|main)\s*\.\s*(?:"add"|`add`|add)""".r.pattern
+  private val QualifiedSystemInterval =
+    """(?i)(?:"system"|`system`|system)\s*\.\s*(?:"main"|`main`|main)\s*\.\s*(?:"(to_(?:microseconds|milliseconds|seconds|minutes|hours|days|months|years))"|`(to_(?:microseconds|milliseconds|seconds|minutes|hours|days|months|years))`|(to_(?:microseconds|milliseconds|seconds|minutes|hours|days|months|years)))""".r.pattern
+  private val QualifiedSystemFunction =
+    """(?i)(?:"system"|`system`|system)\s*\.\s*(?:"main"|`main`|main)\s*\.\s*(?:"([a-z_][a-z_0-9]*)"|`([a-z_][a-z_0-9]*)`|([a-z_][a-z_0-9]*))""".r.pattern
+
+  /** DuckDB 2.0 qualifies built-in functions with system.main. Restore the
+    * unqualified calls before Spark dialect rewrites, including interval
+    * arithmetic that must become an infix expression.
+    */
+  private[compiler] def rewriteQualifiedSystemIntervals(sql: String): String =
+    rewriteOutsideProtected(sql, protectDoubleQuotes = false) { i =>
+      val boundary =
+        i == 0 || !(sql.charAt(i - 1).isLetterOrDigit || sql.charAt(i - 1) == '_' || sql.charAt(i - 1) == '.')
+      if (!boundary) None
+      else {
+        val add = QualifiedSystemAdd.matcher(sql).region(i, sql.length)
+        if (add.lookingAt()) {
+          parseFunctionCall(sql, add.end()).filter(_.topLevelCommaCount == 1).flatMap { call =>
+            splitTopLevelArgs(sql, call).collect { case Seq(left, right) =>
+              val lhs = rewriteQualifiedSystemIntervals(sql.substring(left._1, left._2).trim)
+              val rhs = rewriteQualifiedSystemIntervals(sql.substring(right._1, right._2).trim)
+              (call.closeParen + 1, s"(($lhs) + ($rhs))")
+            }
+          }
+        } else {
+          val unit = QualifiedSystemInterval.matcher(sql).region(i, sql.length)
+          if (unit.lookingAt() && parseFunctionCall(sql, unit.end()).isDefined)
+            Some(unit.end() -> Seq(unit.group(1), unit.group(2), unit.group(3)).find(_ != null).get)
+          else {
+            val builtin = QualifiedSystemFunction.matcher(sql).region(i, sql.length)
+            if (builtin.lookingAt() && parseFunctionCall(sql, builtin.end()).isDefined)
+              Some(builtin.end() -> Seq(builtin.group(1), builtin.group(2), builtin.group(3)).find(_ != null).get)
+            else None
+          }
+        }
+      }
+    }
+
+  private val OffsetWindowFunction = "(?i)(?:lag|lead)".r.pattern
+  private val CastOffsetLiteral =
+    """(?i)^CAST\s*\(\s*([+-]?[0-9]+)\s+AS\s+(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|HUGEINT)\s*\)$""".r
+
+  /** Spark requires an integer literal as LAG/LEAD's offset. LPTS renders a
+    * literal source offset as CAST(1 AS BIGINT), which Spark's analyzer rejects
+    * with a misleading window-frame error.
+    */
+  private[compiler] def rewriteOffsetLiteralCasts(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val boundary = i == 0 || !(sql.charAt(i - 1).isLetterOrDigit || sql.charAt(i - 1) == '_')
+      if (!boundary) None
+      else {
+        val offset = OffsetWindowFunction.matcher(sql).region(i, sql.length)
+        if (!offset.lookingAt()) None
+        else
+          parseFunctionCall(sql, offset.end()).flatMap { call =>
+            splitTopLevelArgs(sql, call).flatMap(_.lift(1)).flatMap { case (start, end) =>
+              val raw = sql.substring(start, end)
+              CastOffsetLiteral.findFirstMatchIn(raw.trim).map { literal =>
+                val leading  = raw.takeWhile(_.isWhitespace)
+                val trailing = raw.reverse.takeWhile(_.isWhitespace).reverse
+                val replacement = sql.substring(i, start) + leading + literal.group(1) + trailing +
+                  sql.substring(end, call.closeParen + 1)
+                (call.closeParen + 1, replacement)
+              }
+            }
+          }
+      }
+    }
+
+  /** DuckDB serializes a frame for LAG/LEAD even though these functions do
+    * not use it. Spark rejects any explicit frame on either function.
+    */
+  private[compiler] def rewriteOffsetWindowFrames(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val boundary = i == 0 || !(sql.charAt(i - 1).isLetterOrDigit || sql.charAt(i - 1) == '_')
+      if (!boundary) None
+      else {
+        val offset = OffsetWindowFunction.matcher(sql).region(i, sql.length)
+        if (!offset.lookingAt()) None
+        else
+          parseFunctionCall(sql, offset.end()).flatMap { args =>
+            val overStart = skipTriviaForward(sql, args.closeParen + 1, sql.length)
+            val overEnd   = overStart + 4
+            if (
+              overEnd > sql.length || !sql.regionMatches(true, overStart, "OVER", 0, 4) ||
+              !hasRightIdentifierBoundary(sql, overEnd)
+            ) None
+            else
+              parseFunctionCall(sql, overEnd).flatMap { window =>
+                var cursor = window.openParen + 1
+                var frame  = Option.empty[Int]
+                while (cursor < window.closeParen && frame.isEmpty) {
+                  val next = Seq("ROWS", "RANGE", "GROUPS")
+                    .flatMap(unit => findTopLevelKeyword(sql, cursor, window.closeParen, unit).map(_ -> unit))
+                    .sortBy(_._1)
+                    .headOption
+                  next match {
+                    case Some((start, unit)) =>
+                      val after = skipTriviaForward(sql, start + unit.length, window.closeParen)
+                      val beginsFrame = after < window.closeParen &&
+                        (Seq("BETWEEN", "UNBOUNDED", "CURRENT").exists(startsWithKeyword(sql, after, _)) ||
+                          sql.charAt(after).isDigit)
+                      if (beginsFrame) frame = Some(start)
+                      else cursor = start + unit.length
+                    case None => cursor = window.closeParen
+                  }
+                }
+                frame.map { start =>
+                  val prefix = sql.substring(i, start).reverse.dropWhile(_.isWhitespace).reverse
+                  (window.closeParen + 1, prefix + ")")
+                }
+              }
+          }
+      }
+    }
+
+  private val TemporalUnitCall =
+    """(?i)to_(microseconds|milliseconds|seconds|minutes|hours|days|weeks|months|years)""".r.pattern
+
+  private[compiler] def rewriteTemporalUnitConstructors(sql: String): String =
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val boundary =
+        i == 0 || !(sql.charAt(i - 1).isLetterOrDigit || sql.charAt(i - 1) == '_' || sql.charAt(i - 1) == '.')
+      if (!boundary) None
+      else {
+        val unit = TemporalUnitCall.matcher(sql).region(i, sql.length)
+        if (!unit.lookingAt()) None
+        else
+          parseFunctionCall(sql, unit.end()).filter(_.topLevelCommaCount == 0).map { call =>
+            val arg   = rewriteTemporalUnitConstructors(call.args(sql)).trim
+            val parts = Array.fill(7)("0")
+            unit.group(1).toLowerCase(Locale.ROOT) match {
+              case "years"        => parts(0) = arg
+              case "months"       => parts(1) = arg
+              case "weeks"        => parts(2) = arg
+              case "days"         => parts(3) = arg
+              case "hours"        => parts(4) = arg
+              case "minutes"      => parts(5) = arg
+              case "seconds"      => parts(6) = arg
+              case "milliseconds" => parts(6) = s"(($arg) / 1000.0)"
+              case "microseconds" => parts(6) = s"(($arg) / 1000000.0)"
+            }
+            (call.closeParen + 1, s"make_interval(${parts.mkString(", ")})")
+          }
+      }
+    }
+
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
     "try_to_timestamp" -> RenameRule(Map(1 -> "__sparkfn_try_to_timestamp")),
     "to_date" -> RenameRule(

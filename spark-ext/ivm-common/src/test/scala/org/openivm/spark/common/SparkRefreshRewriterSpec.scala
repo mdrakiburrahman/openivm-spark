@@ -736,6 +736,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("keeps staged source rows visible in DuckDB 2.0 simple projection SQL") {
+      val duckdb2Sql = simpleProjectionInput.replace(
+        "openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP",
+        "((openivm_timestamp) >= (TIMESTAMP '2026-05-16 10:00:55'))"
+      )
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = duckdb2Sql,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath
+      )
+      rewritten.statements should not be empty
+      rewritten.statements.foreach(_ should not include "TIMESTAMP '2026-05-16 10:00:55'")
+      rewritten.statements.head should include("openivm_delta_users")
+    }
+
     it("strips trailing `AND openivm_timestamp >= '...'::TIMESTAMP` from a compound WHERE (CTE-with-filter pattern)") {
       val cteInput = {
         val scanLine =
@@ -1331,6 +1349,51 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
+    it("reads the published target for a full replacement cascade, without changing partial replacement") {
+      val input =
+        """CREATE OR REPLACE TEMP TABLE openivm_old_mv_r AS SELECT * FROM openivm_data_mv_r;
+          |CREATE OR REPLACE TEMP TABLE openivm_new_mv_r AS SELECT id, region, amount FROM memory.main.sales;
+          |DELETE FROM openivm_data_mv_r;
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DROP TABLE IF EXISTS openivm_old_mv_r;
+          |DROP TABLE IF EXISTS openivm_new_mv_r;
+          |""".stripMargin
+      def rewrite(sql: String) = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = sql,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          mvVersionBeforeRefresh = Some(7L)
+        )
+        .statements
+
+      val full = rewrite(input)
+      val cascade = full
+        .find(_.startsWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`"))
+        .getOrElse(fail("signed cascade missing"))
+      cascade should include("FROM openivm_old_mv_r")
+      cascade should include("FROM `mydb`.`mv_r`")
+      cascade should not include "FROM openivm_new_mv_r"
+      full should contain("INSERT INTO `mydb`.`mv_r` SELECT * FROM openivm_new_mv_r")
+
+      val partial = rewrite(
+        input.replace(
+          "DELETE FROM openivm_data_mv_r;",
+          "DELETE FROM openivm_data_mv_r WHERE region = 'west';"
+        )
+      )
+      val partialCascade = partial
+        .find(_.startsWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`"))
+        .getOrElse(fail("partial signed cascade missing"))
+      partialCascade should include("FROM openivm_new_mv_r")
+    }
+
     it("canonicalizes NULL-safe materialized window keys for cascade reuse") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -2659,6 +2722,19 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           "openivm_multiplicity, region FROM x)"
       val out = SparkRefreshRewriter.deduplicateCteColumnAliases(sql)
       out should include("scan_0 (t3_mul, t3_mul_1, t3_region) AS (")
+    }
+
+    it("strips DuckDB 2.0 parenthesized timestamp literals from source delta scans") {
+      val cutoff = "((openivm_timestamp) >= (TIMESTAMP '2026-11-05 22:32:21.6993'))"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM openivm_delta_staging_holding_history WHERE $cutoff"
+      ) shouldBe "SELECT * FROM openivm_delta_staging_holding_history"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM t WHERE amount > 100 AND $cutoff"
+      ) shouldBe "SELECT * FROM t WHERE amount > 100"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM t WHERE $cutoff AND amount > 100"
+      ) shouldBe "SELECT * FROM t WHERE amount > 100"
     }
 
     it("is a no-op when there are no duplicate column aliases") {
