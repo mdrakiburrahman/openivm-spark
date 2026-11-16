@@ -2380,7 +2380,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         .get
         .properties(MvMetadata.CompiledInitialLoadSqlKey)
       val initialPlanSql = "EXPLAIN FORMATTED " + LptsSparkDialect.translate(initialSql)
-      val initialPlan = spark.sql(initialPlanSql).collect().mkString("\n")
+      val initialPlan    = spark.sql(initialPlanSql).collect().mkString("\n")
       initialPlan should include("LeftAnti")
       assertSqlBagEqual("SELECT id, name FROM anti_mv_t10", query)
 
