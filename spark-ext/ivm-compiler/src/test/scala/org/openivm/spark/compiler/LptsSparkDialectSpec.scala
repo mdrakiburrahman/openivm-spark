@@ -1,8 +1,8 @@
 package org.openivm.spark.compiler
 
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
-import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 
 /** Unit tests for [[LptsSparkDialect]].
   *
@@ -879,6 +879,10 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
     it("rewrites a literal containing both a raw backslash and an escaped quote") {
       val sql = "REPLACE(s, '\\''', '_')"
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
+        "REPLACE(s, concat(chr(92), chr(39)), '_')"
+    }
+
     it("deduplicates an anti-join projection used only as its RHS") {
       val sql =
         """WITH t8_projection_materialized_for_join (scalar_0, sk_broker_id) AS (
@@ -893,10 +897,6 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
       val reused = sql + " UNION ALL SELECT sk_broker_id FROM t8_projection_materialized_for_join"
       LptsSparkDialect.translate(reused) shouldBe reused
-    }
-
-      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
-        "REPLACE(s, concat(chr(92), chr(39)), '_')"
     }
 
     it("preserves surrounding plain-text segments around an embedded quote") {
