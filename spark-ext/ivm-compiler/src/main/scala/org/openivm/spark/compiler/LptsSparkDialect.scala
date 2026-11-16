@@ -113,6 +113,8 @@ object LptsSparkDialect {
   private val AntiJoinProjectionRe =
     """(?i)\bANTI\s+JOIN\s+(t\d+_projection_materialized_for_join)\s+ON\b""".r
 
+  private val BareWhereParenRe = """(?i)WHERE\s+\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)""".r
+
   // ── Public API ───────────────────────────────────────────────────────────────
 
   /** Run all post-processing passes in order.
@@ -172,8 +174,24 @@ object LptsSparkDialect {
         )
       )
     )
-    deduplicateAntiJoinProjectionInputs(translated)
+    deduplicateAntiJoinProjectionInputs(rewriteParenthesizedBareWhere(translated))
   }
+
+  /** Spark analyzes `WHERE (flag)` as a row expression in generated CTEs,
+    * producing an alias-arity error when the source has multiple columns.
+    * The parentheses around one boolean column carry no SQL semantics.
+    */
+  private[compiler] def rewriteParenthesizedBareWhere(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
+      if (
+        !sql.regionMatches(true, index, "WHERE", 0, 5) ||
+        (index > 0 && (Character.isLetterOrDigit(sql.charAt(index - 1)) || sql.charAt(index - 1) == '_'))
+      ) None
+      else {
+        val matcher = BareWhereParenRe.pattern.matcher(sql).region(index, sql.length)
+        if (matcher.lookingAt()) Some((matcher.end(), s"WHERE ${matcher.group(1)}")) else None
+      }
+    }
 
   /** Spark keeps DISTINCT on a generated anti-join RHS as a hash aggregate.
     * The DuckDB 2.0 optimizer omits it because the anti join is semantically

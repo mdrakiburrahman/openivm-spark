@@ -11,6 +11,22 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("parenthesized boolean scan filters") {
+    it("removes redundant parentheses that Spark misanalyzes in generated CTEs") {
+      val sql        = "WITH r(flag) AS (SELECT flag FROM source WHERE   (flag)) SELECT * FROM r"
+      val translated = LptsSparkDialect.translate(sql)
+      translated shouldBe "WITH r(flag) AS (SELECT flag FROM source WHERE flag) SELECT * FROM r"
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("does not rewrite strings, comments, identifiers, or compound predicates") {
+      val sql = "SELECT 'WHERE (flag)', `WHERE (flag)` FROM t WHERE (a AND b) -- WHERE (flag)\n" +
+        "/* WHERE (flag) */ SELECT * FROM t WHERE (flag)"
+      LptsSparkDialect.rewriteParenthesizedBareWhere(sql) shouldBe
+        sql.replace("SELECT * FROM t WHERE (flag)", "SELECT * FROM t WHERE flag")
+    }
+  }
+
   describe("DuckDB 2.0 qualified interval functions") {
     it("translates the initial-load interval expression without catalog-qualified functions") {
       val sql = """SELECT ts - "system".main."add"("system".main."add"(
