@@ -66,7 +66,7 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.{ReentrantLock, ReentrantReadWriteLock}
+import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
