@@ -2864,7 +2864,7 @@ case class CreateMaterializedViewCommand(
           MvCatalog.ensureTables(isolated)
           if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
           else {
-            val analyzed = isolated.sql(originalQueryText).queryExecution.analyzed
+            val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
             val sourceNames = collectSourceSchemas(analyzed)._1
             computeUpstreamMvByQual(isolated, sourceNames).values.map(meta => metaName(meta.name)).toSeq.distinct.sorted
           }
