@@ -42,7 +42,8 @@ WORKDIR /src
 
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . \
-    && git checkout "${OPENIVM_COMMIT}" \
+    && git fetch --depth 1 origin "${OPENIVM_COMMIT}" \
+    && git checkout --detach "${OPENIVM_COMMIT}" \
     && git config --global url."https://github.com/".insteadOf "git@github.com:" \
     && git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" \
     && git submodule sync --recursive \

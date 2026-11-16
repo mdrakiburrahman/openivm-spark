@@ -61,7 +61,8 @@ WORKDIR /src
 # submodules. Check the redundant pins in pins.env rather than overriding them.
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . && \
-    git checkout "${OPENIVM_COMMIT}" && \
+    git fetch --depth 1 origin "${OPENIVM_COMMIT}" && \
+    git checkout --detach "${OPENIVM_COMMIT}" && \
     git config --global url."https://github.com/".insteadOf "git@github.com:" && \
     git submodule update --init --recursive --depth 1 duckdb extension-ci-tools third_party/lpts && \
     test "$(git -C duckdb rev-parse HEAD)" = "${DUCKDB_COMMIT}" && \
