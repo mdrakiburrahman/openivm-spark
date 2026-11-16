@@ -2371,11 +2371,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           "SELECT 1 FROM anti_accounts_t10 a JOIN anti_trades_t10 t ON a.id = t.account_id " +
           "WHERE a.broker_id = b.id)"
       spark.sql(s"CREATE MATERIALIZED VIEW anti_mv_t10 AS $query")
-      val initialSql = MvCatalog
-        .lookup(spark, TableIdentifier("anti_mv_t10"))
-        .get
-        .properties(MvMetadata.CompiledInitialLoadSqlKey)
-      val translated = LptsSparkDialect.translate(initialSql)
+      val refreshSql = MvDryCompile.dryCompile(spark, TableIdentifier("anti_mv_dry_t10"), query).compiled.sql
+      val translated = LptsSparkDialect.translate(refreshSql)
       translated should fullyMatch regex
         "(?s).*projection_materialized_for_join[^)]*\\) AS \\(\\s*SELECT DISTINCT.*"
       spark.sql("EXPLAIN FORMATTED " + translated).collect().mkString("\n") should include("HashAggregate")

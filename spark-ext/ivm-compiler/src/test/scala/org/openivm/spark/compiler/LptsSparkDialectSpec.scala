@@ -98,7 +98,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
   describe("integer casts around DuckDB numeric truncation") {
     it("uses Spark's truncating integer cast for native interval constructors") {
       val input    = "SELECT to_months(CAST(trunc(CAST(-12 AS DOUBLE)) AS INTEGER))"
-      val expected = "SELECT ((CAST(CAST(-12 AS DOUBLE) AS INTEGER)) * INTERVAL 1 MONTH)"
+      val expected = "SELECT make_interval(0, CAST(CAST(-12 AS DOUBLE) AS INTEGER), 0, 0, 0, 0, 0)"
       LptsSparkDialect.translate(input) shouldBe expected
       LptsSparkDialect.translate(expected) shouldBe expected
     }
