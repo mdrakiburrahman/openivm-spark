@@ -64,13 +64,13 @@ class RefreshMutexDeadlineSpec extends AnyFunSpec with Matchers {
     }
 
     it("allows concurrent readers and gives queued writers priority over later readers") {
-      val key                = "issue67_rw_fairness"
-      val readersEntered     = new CountDownLatch(2)
-      val releaseReaders     = new CountDownLatch(1)
-      val writerEntered      = new CountDownLatch(1)
-      val releaseWriter      = new CountDownLatch(1)
-      val lateReaderEntered  = new CountDownLatch(1)
-      val workerFailure      = new AtomicReference[Throwable]()
+      val key               = "issue67_rw_fairness"
+      val readersEntered    = new CountDownLatch(2)
+      val releaseReaders    = new CountDownLatch(1)
+      val writerEntered     = new CountDownLatch(1)
+      val releaseWriter     = new CountDownLatch(1)
+      val lateReaderEntered = new CountDownLatch(1)
+      val workerFailure     = new AtomicReference[Throwable]()
       val readers = (1 to 2).map { index =>
         new Thread(
           () => {
@@ -137,10 +137,11 @@ class RefreshMutexDeadlineSpec extends AnyFunSpec with Matchers {
       val writerEntered = new CountDownLatch(1)
       val releaseWriter = new CountDownLatch(1)
       val writer = new Thread(
-        () => RefreshMutex.withLock(key) {
-          writerEntered.countDown()
-          releaseWriter.await()
-        },
+        () =>
+          RefreshMutex.withLock(key) {
+            writerEntered.countDown()
+            releaseWriter.await()
+          },
         "issue67-rw-timeout-writer"
       )
       writer.start()
@@ -173,10 +174,10 @@ class RefreshMutexDeadlineSpec extends AnyFunSpec with Matchers {
       val writeKey = "issue67_rw_mixed_b"
       RefreshMutex.withLocks(Seq(readKey, writeKey), Seq(readKey))(true) shouldBe true
 
-      val ready          = new CountDownLatch(2)
-      val start           = new CountDownLatch(1)
-      val finished        = new CountDownLatch(2)
-      val failure         = new AtomicReference[Throwable]()
+      val ready    = new CountDownLatch(2)
+      val start    = new CountDownLatch(1)
+      val finished = new CountDownLatch(2)
+      val failure  = new AtomicReference[Throwable]()
       val workers = Seq(
         Seq("issue67_rw_order_a", "issue67_rw_order_b"),
         Seq("issue67_rw_order_b", "issue67_rw_order_a")

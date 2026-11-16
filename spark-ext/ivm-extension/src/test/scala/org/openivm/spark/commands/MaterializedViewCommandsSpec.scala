@@ -2719,9 +2719,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
 
     it("lets sibling refreshes hold shared upstream reads concurrently and emits per-key lock telemetry") {
-      val upstream = "default.lock_source"
-      val left     = "default.lock_child_left"
-      val right    = "default.lock_child_right"
+      val upstream    = "default.lock_source"
+      val left        = "default.lock_child_left"
+      val right       = "default.lock_child_right"
       val bothEntered = new CyclicBarrier(2)
 
       val payloads = withLogCapture { appender =>
