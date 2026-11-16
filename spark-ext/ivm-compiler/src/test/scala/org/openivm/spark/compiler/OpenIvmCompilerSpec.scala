@@ -292,7 +292,9 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       )
     )
     val sql = LptsSparkDialect.translate(result.initialLoadSql)
-    sql.toLowerCase(java.util.Locale.ROOT) should include("lag(th_dts) over")
+    // DuckDB 2.0 may serialize LAG's implicit offset and default explicitly.
+    sql.toLowerCase(java.util.Locale.ROOT) should fullyMatch regex
+      "(?s).*lag\\(th_dts(?:, 1, cast\\(null as timestamp\\))?\\) over.*"
     noException should be thrownBy org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(sql)
     val spark = SparkSession
       .builder()
