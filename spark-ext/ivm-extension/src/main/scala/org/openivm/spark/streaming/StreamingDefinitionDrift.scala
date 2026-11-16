@@ -114,7 +114,7 @@ private[streaming] object StreamingDefinitionDrift {
 
   private def textOptions(node: JsonNode): Option[Map[String, String]] =
     Option(node).filter(_.isObject).filter(_.elements().asScala.forall(_.isTextual)).map { options =>
-      options.fields().asScala.map(entry => entry.getKey -> entry.getValue.asText()).toMap
+      options.fieldNames().asScala.map(key => key -> options.get(key).asText()).toMap
     }
 
   private def qualifiedTextOptions(spark: SparkSession, options: Map[String, String]): Map[String, String] =
