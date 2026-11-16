@@ -46,7 +46,7 @@ import java.io.File
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, TimeUnit}
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, CyclicBarrier, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import scala.jdk.CollectionConverters._
 import scala.concurrent.duration._
@@ -2718,56 +2718,61 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
-    it("serializes dependency siblings on their shared upstream guard and records its wait") {
+    it("lets sibling refreshes hold shared upstream reads concurrently and emits per-key lock telemetry") {
       val upstream = "default.lock_source"
       val left     = "default.lock_child_left"
       val right    = "default.lock_child_right"
-      val barrier  = ParkedCommandBarrier.forObservation(15.seconds)
-      val owner    = new AtomicReference[Thread]()
-      val worker   = new AtomicReference[Thread]()
-      val started  = new CountDownLatch(1)
+      val bothEntered = new CyclicBarrier(2)
 
       val payloads = withLogCapture { appender =>
         withPool(2) { implicit ec =>
-          barrier.use {
-            val holder = Future {
-              owner.set(Thread.currentThread())
-              RefreshMutex.withLocks(Seq(left, upstream))(barrier.park())
+          val leftRefresh = Future {
+            RefreshMutex.withLocks(Seq(upstream), Seq(left)) {
+              bothEntered.await(10L, TimeUnit.SECONDS)
+              ()
             }
-            barrier.awaitEntered() shouldBe true
-            val sibling = Future {
-              val span = OpenIvmExecutionSpan.start(right, "refresh")
-              try {
-                worker.set(Thread.currentThread())
-                started.countDown()
-                RefreshMutex.withLocks(Seq(right, upstream)) {
-                  span.complete("refresh_done", Thread.currentThread().getName)
-                }
-              } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
-            }
-            started.await(10L, TimeUnit.SECONDS) shouldBe true
-            def blockedOnHolder: Boolean = {
-              val info = java.lang.management.ManagementFactory.getThreadMXBean.getThreadInfo(worker.get().getId)
-              info != null && info.getThreadState == Thread.State.WAITING &&
-              info.getLockOwnerId == owner.get().getId
-            }
-            val deadline = 10.seconds.fromNow
-            while (!blockedOnHolder && deadline.hasTimeLeft())
-              Thread.sleep(1L)
-            blockedOnHolder shouldBe true
-            sibling.isCompleted shouldBe false
-            assertStillParked(barrier, holder)
-            RefreshMutex.withLock("default.lock_unrelated")(()) shouldBe (())
-            barrier.release()
-            awaitResult(holder, 15.seconds)
-            awaitResult(sibling, 15.seconds)
           }
+          val rightRefresh = Future {
+            withSparkLocalProperties(
+              "openivm.request_id" -> "req-reader-right",
+              "openivm.node_id"    -> "model.reader.right"
+            ) {
+              val span = OpenIvmExecutionSpan.start(spark, right, "refresh")
+              try
+                RefreshMutex.withLocks(Seq(upstream), Seq(right)) {
+                  bothEntered.await(10L, TimeUnit.SECONDS)
+                  span.complete("incremental_executed", Thread.currentThread().getName)
+                }
+              finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+            }
+          }
+          awaitResult(leftRefresh, 15.seconds)
+          awaitResult(rightRefresh, 15.seconds)
         }
         executionSpanPayloads(appender.messages, right)
       }
 
       payloads should have size 1
-      payloads.head.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      val span = payloads.head
+      span.path("same_mv_lock_wait_ms").asLong(-1L) should be >= 0L
+      val acquisitions = span.path("lock_acquisitions")
+      acquisitions.isArray shouldBe true
+      val entries = acquisitions.elements().asScala.toSeq
+      entries should have size 2
+      val upstreamRead = entries.find(_.path("mv_key").asText() == upstream).get
+      upstreamRead.path("mode").asText() shouldBe "read"
+      val targetWrite = entries.find(_.path("mv_key").asText() == right).get
+      targetWrite.path("mode").asText() shouldBe "write"
+      entries.foreach { entry =>
+        entry.path("requested_epoch_ms").asLong() should be > 0L
+        entry.path("acquired_epoch_ms").asLong() should be >= entry.path("requested_epoch_ms").asLong()
+        entry.path("released_epoch_ms").asLong() should be >= entry.path("acquired_epoch_ms").asLong()
+        entry.path("wait_ms").asLong() should be >= 0L
+        entry.path("hold_ms").asLong() should be >= 0L
+        entry.path("thread").asText() should not be empty
+        entry.path("request_id").asText() shouldBe "req-reader-right"
+        entry.path("dbt_node_id").asText() shouldBe "model.reader.right"
+      }
     }
 
     it("emit one primary span per CREATE and capture queued same-MV lock waits") {

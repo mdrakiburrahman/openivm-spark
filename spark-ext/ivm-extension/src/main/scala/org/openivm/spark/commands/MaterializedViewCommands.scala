@@ -233,6 +233,14 @@ private[spark] object RefreshMutex {
   def withReadLock[A](mvKey: String)(body: => A): A =
     withGuard(mvKey, Read, None)(body)
 
+  def withReadLock[A](mvKey: String, deadline: LifecycleDeadline)(body: => A): A =
+    withGuard(mvKey, Read, Some(deadline))(body)
+
+  private[commands] def hasQueuedThread(mvKey: String, thread: Thread): Boolean = {
+    val key = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
+    Option(locks.get(key)).exists(_.hasQueuedThread(thread))
+  }
+
   def withLocks[A](mvKeys: Seq[String])(body: => A): A =
     withLockRequests(mvKeys.map(_ -> Write))(body)
 
