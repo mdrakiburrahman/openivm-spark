@@ -1946,6 +1946,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       create.path("compile_refresh_type").asText() should not be empty
       create.path("effective_refresh_type").asText() should not be empty
       create.path("refresh_reason").asText() should not be empty
+      val createLocks = create.path("lock_acquisitions").elements().asScala.toSeq
+      createLocks should have size 1
+      createLocks.head.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createLocks.head.path("mode").asText() shouldBe "write"
+      createLocks.head.path("request_id").asText() shouldBe "request-t5aa-create"
+      createLocks.head.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
 
       val refresh = byOperation("refresh")
       refresh.path("request_id").asText() shouldBe "request-t5aa-refresh"

@@ -2837,13 +2837,13 @@ case class CreateMaterializedViewCommand(
       Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
     val finalizeUnderLock = OpenIvmExecutionSpan.hasActiveExport
 
-    def finalizeCreate(): Unit =
+    def finalizeCreate(deferExecutionSpanEmission: Boolean = false): Unit =
       if (!createFinalizationAttempted) {
         createFinalizationAttempted = true
         val totalMs = (System.nanoTime() - createT0) / 1000000L
         profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
         profile.completeSpan(createOutcome, Thread.currentThread().getName)
-        profile.flush()
+        profile.flush(deferExecutionSpanEmission = deferExecutionSpanEmission)
         sqlLog.flush()
       }
 
@@ -2898,7 +2898,7 @@ case class CreateMaterializedViewCommand(
           }
           outcome
         } finally {
-          if (finalizeUnderLock) finalizeCreate()
+          if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
         }
       }
       if (!finalizeUnderLock) {
