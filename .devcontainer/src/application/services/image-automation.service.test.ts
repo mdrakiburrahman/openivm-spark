@@ -22,7 +22,7 @@ import { ContentHashService } from './content-hash.service.js';
 import { ImageAutomationService } from './image-automation.service.js';
 import { ImageReferenceService } from './image-reference.service.js';
 
-const reference = `ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:${'a'.repeat(64)}`;
+const reference = `ghcr.io/openivm/openivm-spark-devcontainer:${'a'.repeat(64)}`;
 
 test('an existing remote manifest skips build and push after authentication', () => {
   const calls: CommandSpec[] = [];

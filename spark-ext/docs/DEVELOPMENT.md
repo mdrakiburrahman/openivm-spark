@@ -152,7 +152,7 @@ running it on an already-aligned tree is a no-op.
 | `openivm.test.forks` (`-D`) | `32`               | sbt JVM | Direct system-property override, for example `spark-ext:verify -- -Dopenivm.test.forks=8`.                 |
 
 The normal development and CI image is
-`ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:<content-hash>`. The tag
+`ghcr.io/openivm/openivm-spark-devcontainer:<content-hash>`. The tag
 covers the devcontainer definition, npm lockfile, SBT build definitions, native
 pins, and target pins. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env`
 explicitly select DuckDB v1.5.2 for both the CLI and native extension; do not

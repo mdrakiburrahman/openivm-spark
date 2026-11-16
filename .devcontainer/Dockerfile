@@ -103,7 +103,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 LABEL org.opencontainers.image.description="OpenIVM Spark development and CI toolchain" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://github.com/mdrakiburrahman/openivm-spark" \
+      org.opencontainers.image.source="https://github.com/openivm/openivm-spark" \
       org.opencontainers.image.title="openivm-spark-devcontainer"
 
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
