@@ -330,6 +330,12 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
     }
   }
 
+  private def manifest(name: String): StreamingTableManifest =
+    StreamingTableMetadata.readManifest(
+      spark,
+      StreamingTableMetadata.resolveDeltaTarget(spark, Seq(name), requireTableIdMarker = true)
+    )
+
   private def projectionDeclaration(source: String, target: String, readerOptions: Option[String] = None): String = {
     val withClause = readerOptions.map(options => s" WITH ($options)").getOrElse("")
     s"""CREATE STREAMING TABLE ${quoteIdentifier(target)}
