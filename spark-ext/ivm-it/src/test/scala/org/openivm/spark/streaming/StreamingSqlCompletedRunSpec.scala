@@ -9,6 +9,8 @@ import org.scalatest.funspec.AnyFunSpec
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 
+import scala.jdk.CollectionConverters._
+
 private[streaming] final case class CompletedTargetState(
     path: String,
     deltaTableId: String,
@@ -127,7 +129,21 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
       spark.catalog.dropTempView(view) shouldBe true
       val originalTarget   = targetState(target)
       val originalManifest = manifest(target)
-      val expected         = s"""SELECT '$payload' AS request_body, '202601' AS event_year_month"""
+      val checkpoint       = Paths.get(new Path(initial.status.checkpointLocation).toUri.getPath)
+      val history = Seq("sources", "offsets", "commits").flatMap { directory =>
+        val files = Files.walk(checkpoint.resolve(directory))
+        try
+          files
+            .iterator()
+            .asScala
+            .filter(path => Files.isRegularFile(path))
+            .map { path =>
+              path -> Files.readAllBytes(path).toSeq
+            }
+            .toVector
+        finally files.close()
+      }.toMap
+      val expected = s"""SELECT '$payload' AS request_body, '202601' AS event_year_month"""
       assertBagEqual(target, expected)
 
       def reject(sql: String): Unit = {
@@ -158,6 +174,8 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
       adopted.inputRows shouldBe 0L
       targetState(target) shouldBe originalTarget
       manifest(target).definitionHash shouldBe adopted.status.definitionHash
+      manifest(target).target shouldBe originalManifest.target
+      history.foreach { case (path, bytes) => Files.readAllBytes(path).toSeq shouldBe bytes }
       assertBagEqual(target, expected)
 
       Files.write(inbox.resolve("later.json"), s"$payload\n".getBytes(StandardCharsets.UTF_8))
@@ -167,6 +185,33 @@ class StreamingSqlCompletedRunSpec extends AnyFunSpec with StreamingSqlTestSuppo
       appended.inputRows shouldBe 1L
       targetState(target).deltaTableId shouldBe originalTarget.deltaTableId
       assertBagEqual(target, expected + " UNION ALL " + expected)
+    }
+
+    it("rejects hidden legacy TEXT view transformations despite identical source and output schemas") {
+      val inbox  = Files.createDirectories(Paths.get(scratchPath("completed-text-hidden-view")))
+      val view   = "strsql_completed_text_hidden_view"
+      val target = "strsql_completed_text_hidden_target"
+      Files.write(inbox.resolve("event.json"), "keep\ndrop\n".getBytes(StandardCharsets.UTF_8))
+      spark.readStream
+        .format("text")
+        .load(inbox.toString)
+        .selectExpr("upper(value) AS value")
+        .where("value <> 'DROP'")
+        .createOrReplaceTempView(view)
+      def declaration(source: String): String =
+        s"""CREATE STREAMING TABLE $target
+           |TBLPROPERTIES ('trigger' = 'availableNow', 'onQueryChange' = 'fail')
+           |AS SELECT value FROM $source""".stripMargin
+      val initial = createStreamingSqlToCompletion(declaration(view))
+      spark.catalog.dropTempView(view) shouldBe true
+      val originalTarget = targetState(target)
+      val failure = the[AnalysisException] thrownBy createStreamingSql(
+        declaration(s"STREAM(text.`$inbox`)")
+      )
+      failure.getMessage should include("onQueryChange")
+      targetState(target) shouldBe originalTarget
+      manifest(target).definitionHash shouldBe initial.status.definitionHash
+      assertBagEqual(target, "SELECT 'KEEP' AS value")
     }
 
     it("performs no source-row or target-data work when the source is unchanged") {
