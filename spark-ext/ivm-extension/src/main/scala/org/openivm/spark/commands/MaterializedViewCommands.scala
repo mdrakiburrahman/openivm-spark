@@ -2985,7 +2985,7 @@ case class CreateMaterializedViewCommand(
             classification
           )
         }
-      Seq.empty
+      Seq.empty[org.apache.spark.sql.Row]
     } {
       try finalizeCreate()
       finally {
