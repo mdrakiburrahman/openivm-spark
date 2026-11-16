@@ -217,7 +217,7 @@ private[commands] object OpenIvmCompilers {
 private[spark] object RefreshMutex {
 
   private sealed trait LockMode
-  private case object Read extends LockMode
+  private case object Read  extends LockMode
   private case object Write extends LockMode
   private final case class LockRequest(key: String, mode: LockMode)
 
@@ -262,14 +262,14 @@ private[spark] object RefreshMutex {
       deadline: Option[LifecycleDeadline] = None
   )(body: => A): A = {
     val merged = requested.foldLeft(Map.empty[String, LockMode]) { case (byKey, (rawKey, mode)) =>
-      val key = StreamingDependencyCatalog.lifecycleLockKey(rawKey)
+      val key        = StreamingDependencyCatalog.lifecycleLockKey(rawKey)
       val mergedMode = if (mode == Write || byKey.get(key).contains(Write)) Write else Read
       byKey.updated(key, mergedMode)
     }
     val ordered = merged.toSeq.sortBy(_._1).map { case (key, mode) => LockRequest(key, mode) }
     def acquire(remaining: List[LockRequest]): A = remaining match {
       case LockRequest(key, mode) :: tail => withGuard(key, mode, deadline)(acquire(tail))
-      case Nil                           => body
+      case Nil                            => body
     }
     acquire(ordered.toList)
   }
@@ -303,11 +303,11 @@ private[spark] object RefreshMutex {
       case Write => lock.isWriteLockedByCurrentThread
     }
     OpenIvmMetrics.RefreshQueued.incrementAndGet()
-    val waitStarted       = System.nanoTime()
-    val requestedEpochMs  = System.currentTimeMillis()
-    var acquiredAtNanos   = 0L
-    var acquiredEpochMs   = 0L
-    var admitted          = false
+    val waitStarted      = System.nanoTime()
+    val requestedEpochMs = System.currentTimeMillis()
+    var acquiredAtNanos  = 0L
+    var acquiredEpochMs  = 0L
+    var admitted         = false
     def entered: A = {
       admitted = true
       acquiredAtNanos = System.nanoTime()
@@ -2859,8 +2859,18 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     try {
+      val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
+        isolated =>
+          MvCatalog.ensureTables(isolated)
+          if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+          else {
+            val analyzed = isolated.sql(originalQueryText).queryExecution.analyzed
+            val sourceNames = collectSourceSchemas(analyzed)._1
+            computeUpstreamMvByQual(isolated, sourceNames).values.map(meta => metaName(meta.name)).toSeq.distinct.sorted
+          }
+      }
       val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLock(commandName) {
+      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
         try {
           val threadName = Thread.currentThread().getName
           val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
@@ -2875,6 +2885,7 @@ case class CreateMaterializedViewCommand(
                     isolated,
                     profile,
                     sqlLog,
+                    createUpstreamReadKeys.toSet,
                     classification => createInsightClassification = Some(classification)
                   )
                 }
@@ -2917,6 +2928,7 @@ case class CreateMaterializedViewCommand(
       spark: SparkSession,
       profile: RefreshProfile,
       sqlLog: RefreshSqlLog,
+      expectedUpstreamMvLockKeys: Set[String],
       recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit
   ): String = {
     import MvCommandHelper._
@@ -3189,6 +3201,12 @@ case class CreateMaterializedViewCommand(
     val upstreamMvByQual: Map[String, MvMetadata] = profile.timeStep("create_resolve_upstream_mvs") {
       computeUpstreamMvByQual(spark, qualNames)
     }
+    val actualUpstreamMvLockKeys = upstreamMvByQual.values.map(meta => metaName(meta.name)).toSet
+    if (actualUpstreamMvLockKeys != expectedUpstreamMvLockKeys)
+      throw new AnalysisException(
+        "_LEGACY_ERROR_TEMP_2273",
+        Map("message" -> s"Managed materialized-view sources for '${metaName(name)}' changed during CREATE admission")
+      )
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
     val distinctUpstreamMvCount: Int =
       upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
@@ -4055,25 +4073,27 @@ case class RefreshMaterializedViewCommand(
       // legacy map; the parsed deps are re-verified by physical identity UNDER the
       // acquired locks (validateUpstreamMvDependenciesUnderLock).
       val (upstreamMvSourceKeys, upstreamMvDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
-      val downstreamWriteKeys = sourceVersionAdvance.map { _ =>
-        // The advance path additionally holds its downstream consumer keys so the
-        // pinned-source-advance cascade into them stays atomic. Consumers are
-        // discovered by the SAME authoritative dependency map (each candidate's
-        // persisted map referencing this MV's key) — never a lexical source-name
-        // scan. A catalog read failure fails the advance closed.
-        (try MvCatalog.list(spark)
-        catch {
-          case NonFatal(readFailure) =>
-            mvDependencyMapFailClosed(
-              viewMeta,
-              s"downstream consumers could not be enumerated for the source-version-advance cascade " +
-                s"(${readFailure.getMessage})"
-            )
-        })
-          .filter(meta => metaName(meta.name) != viewMeta)
-          .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
-          .map(meta => metaName(meta.name))
-      }.getOrElse(Seq.empty)
+      val downstreamWriteKeys = sourceVersionAdvance
+        .map { _ =>
+          // The advance path additionally holds its downstream consumer keys so the
+          // pinned-source-advance cascade into them stays atomic. Consumers are
+          // discovered by the SAME authoritative dependency map (each candidate's
+          // persisted map referencing this MV's key) — never a lexical source-name
+          // scan. A catalog read failure fails the advance closed.
+          (try MvCatalog.list(spark)
+          catch {
+            case NonFatal(readFailure) =>
+              mvDependencyMapFailClosed(
+                viewMeta,
+                s"downstream consumers could not be enumerated for the source-version-advance cascade " +
+                  s"(${readFailure.getMessage})"
+              )
+          })
+            .filter(meta => metaName(meta.name) != viewMeta)
+            .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
+            .map(meta => metaName(meta.name))
+        }
+        .getOrElse(Seq.empty)
       val writeKeys = viewMeta +: downstreamWriteKeys
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         // Under the acquired upstream locks, re-verify each upstream MV still has
@@ -9265,10 +9285,13 @@ case class DropMaterializedViewCommand(
           targetRelation = Some(viewName)
         )
       )
-      val rows: Seq[Row] = RefreshMutex.withLock(
-        StreamingDependencyCatalog.materializedIdentity(viewName),
-        admissionDeadline
-      ) {
+      val rootIdentity = StreamingDependencyCatalog.materializedIdentity(viewName)
+      val preflight = MvCatalog.lookup(spark, name).map { meta =>
+        val descendants = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+        (meta, descendants, MvCatalog.mvIdentity(meta), mvBackingIdentity(spark, meta))
+      }
+      val lockKeys = rootIdentity +: preflight.toSeq.flatMap(_._2.map(_.identity))
+      val rows: Seq[Row] = RefreshMutex.withLocks(lockKeys, admissionDeadline) {
         MvCatalog.lookup(spark, name) match {
           case None if ifExists =>
             outcome = "drop_missing_ignored"
@@ -9279,9 +9302,30 @@ case class DropMaterializedViewCommand(
               Map("relationName" -> sqlIdent(name))
             )
           case Some(meta) =>
-            val descendants   = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+            val (plannedMeta, descendants, plannedMvIdentity, plannedBackingIdentity) = preflight.getOrElse {
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map("message" -> s"Materialized view '$viewName' appeared during DROP admission")
+              )
+            }
+            if (
+              meta.location != plannedMeta.location ||
+              MvCatalog.mvIdentity(meta) != plannedMvIdentity ||
+              mvBackingIdentity(spark, meta) != plannedBackingIdentity
+            )
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map("message" -> s"Materialized view '$viewName' changed during DROP admission")
+              )
+            val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+            if (verified != descendants)
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map(
+                  "message" -> s"Materialized view '$viewName' dependencies changed during DROP admission"
+                )
+              )
             val cascadeReason = OpenIvmMaterializedViewInsightEvents.dropReason(spark, viewName)
-            val identity      = StreamingDependencyCatalog.materializedIdentity(viewName)
             OpenIvmInsightEvents.decision(
               spark,
               operationId,
@@ -9300,37 +9344,26 @@ case class DropMaterializedViewCommand(
                     "kind"      -> target.kind,
                     "name"      -> target.name.mkString("."),
                     "identity"  -> target.identity,
-                    "caused_by" -> target.causedBy.getOrElse(identity),
+                    "caused_by" -> target.causedBy.getOrElse(rootIdentity),
                     "reason"    -> cascadeReason
                   )
                 }
               )
             )
-            RefreshMutex.withLocks(descendants.map(_.identity), admissionDeadline) {
-              StreamingTableManager.withCascadeLocks(spark, descendants, admissionDeadline) {
-                val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
-                if (verified != descendants)
-                  throw new AnalysisException(
-                    "_LEGACY_ERROR_TEMP_2273",
-                    Map(
-                      "message" ->
-                        s"Materialized view '$viewName' dependencies changed during DROP admission"
-                    )
-                  )
-                StreamingTableManager.dropResolvedCascade(
-                  spark,
-                  descendants,
-                  org.openivm.spark.streaming.StreamingArchiveContext(
-                    action = "cascade",
-                    operationId = operationId,
-                    rootTarget = identity,
-                    causedBy = Some(identity)
-                  ),
-                  stopDeadline
-                )
-                MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
-                Seq.empty[Row]
-              }
+            StreamingTableManager.withCascadeLocks(spark, descendants, admissionDeadline) {
+              StreamingTableManager.dropResolvedCascade(
+                spark,
+                descendants,
+                org.openivm.spark.streaming.StreamingArchiveContext(
+                  action = "cascade",
+                  operationId = operationId,
+                  rootTarget = rootIdentity,
+                  causedBy = Some(rootIdentity)
+                ),
+                stopDeadline
+              )
+              MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
+              Seq.empty[Row]
             }
         }
       }

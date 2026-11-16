@@ -26,3 +26,11 @@ when `operation=create`; the schema's operation/outcome map is authoritative.
 Reusable successes require a nonempty `source_versions` array that is unique
 and ascending by lower-cased canonical relation key. The internal duration may
 differ from the timestamp interval by at most 5 ms.
+
+When present, `lock_acquisitions` reports each canonical MV lifecycle key held
+by the command: `mv_key`, `mode` (`read` or `write`), requested/acquired/released
+epoch milliseconds, `wait_ms`, `hold_ms`, `thread`, and the available
+`dbt_node_id` and `request_id`. Refresh writes its target and reads each
+authoritative direct upstream; lifecycle mutations retain write locks. The
+legacy `same_mv_lock_wait_ms` remains the sum of per-key waits, while
+`driver_admission_wait_ms` continues to report admission separately.
