@@ -187,10 +187,11 @@ object StreamingTableManager {
         descendants
           .filter(_.kind == "streaming")
           .map(target => StreamingTableRegistry.lifecycleLockKey(target.identity)))
-    val globalLockKeys    = identity +: (dependencySources.map(_.parentIdentity) ++ descendants.map(_.identity))
+    val readLockKeys      = dependencySources.map(_.parentIdentity)
+    val writeLockKeys     = identity +: descendants.map(_.identity)
     val admissionDeadline = insight.startAdmission()
 
-    RefreshMutex.withLocks(globalLockKeys, admissionDeadline) {
+    RefreshMutex.withLocks(readLockKeys, writeLockKeys, admissionDeadline) {
       StreamingTableRegistry.withTargetLocks(spark, lockKeys, admissionDeadline) {
         val verifiedDependencySources = resolveManagedDependencySources(spark, definition)
         if (verifiedDependencySources != dependencySources)

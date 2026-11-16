@@ -1,5 +1,7 @@
 package org.openivm.spark.compiler
 
+import java.util.Locale
+
 import org.apache.spark.sql.types._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -60,6 +62,106 @@ class OpenIvmCompilerShimSpec extends AnyFlatSpec with Matchers with BeforeAndAf
     StructType.fromDDL("dim_date_billing_usage_event_key STRING, dim_time_billing_usage_event_key INT")
   private val billingJsonSchema: StructType =
     StructType.fromDDL("usageuploadtime TIMESTAMP, azureresourceid STRING, additionalinfo STRING")
+
+  "Spark-only identifiers and null-safe comparisons" should "compile without losing incremental maintenance" in {
+    val r = compileBody(
+      viewName = "shim_nullsafe_collation",
+      sources = Map("token_src" -> StructType.fromDDL("id INT, collation STRING, previous STRING")),
+      body = "SELECT id, collation FROM token_src WHERE NOT (previous <=> collation)"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+    r.sql should not be empty
+  }
+
+  "Spark scalar dialect calls" should "survive native compilation in the reported expression chains" in {
+    val r = compileBody(
+      viewName = "shim_scalar_calls",
+      sources =
+        Map("scalar_src" -> StructType.fromDDL("id STRING, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")),
+      body = """WITH discovery AS (
+        |  SELECT id, flag, start_ts, end_ts,
+        |    ROW_NUMBER() OVER (PARTITION BY id ORDER BY start_ts DESC, end_ts DESC) AS rn
+        |  FROM scalar_src
+        |), latest AS (SELECT * FROM discovery WHERE rn = 1)
+        |SELECT id, CASE WHEN LOWER(flag) = 'true' THEN 1 ELSE 0 END AS f,
+        |  CASE WHEN UNIX_TIMESTAMP(start_ts) = 0 THEN CAST(NULL AS TIMESTAMP) ELSE start_ts END AS t,
+        |  CAST(COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, start_ts, end_ts), 0), -1) AS INT) AS d
+        |FROM latest""".stripMargin
+    )
+    r.refreshTypeName should equal("WINDOW_PARTITION")
+    val translated = LptsSparkDialect.translate(r.sql) + "\n" + r.initialLoadSql
+    translated.toLowerCase(Locale.ROOT) should include("unix_timestamp(")
+    translated.toLowerCase(Locale.ROOT) should include("timestampdiff(second,")
+    translated.toLowerCase(Locale.ROOT) should include("lower(")
+    translated should not include "__openivm_scalar_"
+  }
+
+  it should "retry each unsupported call independently" in {
+    val schema = StructType.fromDDL("id INT, flag BOOLEAN, start_ts TIMESTAMP, end_ts TIMESTAMP")
+    val expressions = Seq(
+      "lower(flag)"                             -> "lower(",
+      "unix_timestamp(start_ts)"                -> "unix_timestamp(",
+      "timestampdiff(SECOND, start_ts, end_ts)" -> "timestampdiff(second,"
+    )
+    expressions.zipWithIndex.foreach { case ((expr, expected), index) =>
+      val r = compileBody(s"shim_scalar_$index", Map("scalar_src" -> schema), s"SELECT id, $expr AS x FROM scalar_src")
+      r.refreshTypeName should equal("SIMPLE_PROJECTION")
+      val translated = LptsSparkDialect.translate(r.sql) + "\n" + r.initialLoadSql
+      translated.toLowerCase(Locale.ROOT) should include(expected)
+      translated should not include "__openivm_scalar_"
+    }
+  }
+
+  it should "keep a time-dependent predicate classified as full refresh after scalar retry" in {
+    val r = compileBody(
+      viewName = "shim_scalar_current_date",
+      sources = Map("scalar_src" -> StructType.fromDDL("id INT, flag BOOLEAN, d DATE")),
+      body = "SELECT id, LOWER(flag) AS f FROM scalar_src WHERE d >= date_sub(current_date(), 7)"
+    )
+    r.refreshTypeName should equal("FULL_REFRESH")
+    r.sql should not be empty
+  }
+
+  it should "refuse a retry that could change a nested field name" in {
+    val schema = StructType(
+      Seq(
+        StructField("ts", TimestampType),
+        StructField("profile", StructType(Seq(StructField("MiXeD Field", StringType))))
+      )
+    )
+    intercept[OpenIvmCompileException] {
+      compileBody(
+        "shim_scalar_nested",
+        Map("scalar_src" -> schema),
+        "SELECT UNIX_TIMESTAMP(ts), LOWER(n.profile.`MiXeD Field`) FROM scalar_src n"
+      )
+    }
+  }
+
+  "Spark date arithmetic" should "compile both day offsets without losing incremental maintenance" in {
+    val r = compileBody(
+      viewName = "shim_date_offset",
+      sources = Map("offsetsrc" -> StructType.fromDDL("id INT, d DATE, n INT")),
+      body = "SELECT id, date_sub(d, n) AS earlier, date_add(d, -n) AS shifted FROM offsetsrc"
+    )
+    r.refreshTypeName should not equal "FULL_REFRESH"
+    val translated = LptsSparkDialect.translate(r.sql)
+    translated should not include "__sparkfn_date_sub"
+    translated should not include "__sparkfn_date_add"
+  }
+
+  it should "compile Monitoring's current-date filter without disguising its full refresh classification" in {
+    val r = compileBody(
+      viewName = "shim_date_offset_current",
+      sources = Map("offsetsrc" -> StructType.fromDDL("id INT, YearMonth STRING, EVENTTIME TIMESTAMP")),
+      body = """SELECT id FROM offsetsrc s
+        |WHERE s.YearMonth >= DATE_FORMAT(DATE_SUB(CURRENT_DATE(), 6), 'yyyyMM')
+        |  AND s.EVENTTIME >= CAST(DATE_SUB(CURRENT_DATE(), 6) AS TIMESTAMP)
+        |  AND s.EVENTTIME < CAST(DATE_ADD(CURRENT_DATE(), 1) AS TIMESTAMP)""".stripMargin
+    )
+    r.refreshTypeName should equal("FULL_REFRESH")
+    r.sql should not be empty
+  }
 
   "shim regexp_like(s, p)" should "compile and emit a non-FULL_REFRESH classification" in {
     val r = compileBody(

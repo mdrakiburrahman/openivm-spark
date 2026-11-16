@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.{Lock, ReentrantLock, ReentrantReadWriteLock}
 import scala.concurrent.duration.{FiniteDuration, NANOSECONDS}
 
 private[spark] final case class LifecycleDeadlineContext(
@@ -13,6 +13,10 @@ private[spark] final case class LifecycleDeadlineContext(
 
 private[spark] object LifecycleDeadlineContext {
   val Unspecified: LifecycleDeadlineContext = LifecycleDeadlineContext("lifecycle")
+}
+
+private[spark] final class LifecycleReadWriteLock(fair: Boolean = true) extends ReentrantReadWriteLock(fair) {
+  private[spark] def writerThreadName: Option[String] = Option(getOwner).map(_.getName)
 }
 
 final class LifecycleLockTimeoutException private (
@@ -137,6 +141,65 @@ private[spark] final class LifecycleDeadline private (
         elapsedSince(waitStarted, failedAt),
         elapsedSince(startedAt, failedAt),
         LifecycleDeadline.ownerThread(lock)
+      )
+    }
+    try body
+    finally lock.unlock()
+  }
+
+  private def writerThread(lock: ReentrantReadWriteLock): Option[String] =
+    lock match {
+      case tracked: LifecycleReadWriteLock => tracked.writerThreadName
+      case _                               => None
+    }
+
+  def withReadLock[A](lock: ReentrantReadWriteLock, target: String)(body: => A): A =
+    withTimedLock(
+      lock.readLock(),
+      target,
+      reentrant = lock.getReadHoldCount > 0 || lock.isWriteLockedByCurrentThread,
+      ownerThread = writerThread(lock)
+    )(body)
+
+  def withWriteLock[A](lock: ReentrantReadWriteLock, target: String)(body: => A): A = {
+    if (lock.getReadHoldCount > 0 && !lock.isWriteLockedByCurrentThread)
+      throw new IllegalStateException(s"Cannot upgrade a held lifecycle read lock to write for $target")
+    withTimedLock(
+      lock.writeLock(),
+      target,
+      reentrant = lock.isWriteLockedByCurrentThread,
+      ownerThread = writerThread(lock)
+    )(body)
+  }
+
+  private def withTimedLock[A](
+      lock: Lock,
+      target: String,
+      reentrant: Boolean,
+      ownerThread: Option[String]
+  )(body: => A): A = {
+    val waitStarted = nanoTime()
+    val remaining   = remainingNanos
+    val acquired =
+      if (reentrant) {
+        lock.lock()
+        true
+      } else
+        try remaining > 0L && lock.tryLock(remaining, TimeUnit.NANOSECONDS)
+        catch {
+          case interrupted: InterruptedException =>
+            Thread.currentThread().interrupt()
+            throw interrupted
+        }
+    if (!acquired) {
+      val failedAt = nanoTime()
+      throw LifecycleLockTimeoutException(
+        target,
+        timeout,
+        context,
+        elapsedSince(waitStarted, failedAt),
+        elapsedSince(startedAt, failedAt),
+        ownerThread
       )
     }
     try body

@@ -1,5 +1,7 @@
 package org.openivm.spark.compiler
 
+import java.nio.file.Files
+
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common.PinnedSourcePathMissingException
@@ -37,6 +39,95 @@ class OpenIvmCompilerInitialLoadPinSpec extends AnyFunSpec with Matchers {
 
   private def countOf(needle: String, haystack: String): Int =
     java.util.regex.Pattern.quote(needle).r.findAllMatchIn(haystack).size
+
+  private def initialLoad(sidecar: String): String = {
+    val directory = Files.createTempDirectory("openivm-initial-load-statements")
+    val file      = directory.resolve("openivm_compiled_queries_mv_stg.sql")
+    try {
+      Files.write(file, sidecar.getBytes("UTF-8"))
+      val compiler = OpenIvmCompiler.build(extensionPath = file.toString, cliPath = file.toString)
+      try
+        compiler.parseInitialLoadSql(
+          directory,
+          req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+        )
+      finally compiler.close()
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(directory)
+    }
+  }
+
+  describe("initial-load statement extraction") {
+    it("preserves literal semicolons and stops before the next sidecar statement") {
+      initialLoad(
+        """create table openivm_data_mv_stg as
+          |SELECT id, 'alpha; beta; gamma' AS coverage_scope, 'left;middle;right' AS compact_scope
+          |FROM memory.main.parent;
+          |CREATE TABLE unrelated (id INT);""".stripMargin
+      ) shouldBe
+        """SELECT id, 'alpha; beta; gamma' AS coverage_scope, 'left;middle;right' AS compact_scope
+          |FROM db.parent""".stripMargin
+    }
+
+    it("ignores semicolons in comments and escaped-quote literals") {
+      val out = initialLoad(
+        """create table openivm_data_mv_stg as SELECT id,
+          |-- documentation; not a terminator
+          |'a;''b; c' AS coverage_scope /* outer; /* inner; */ still outer; */
+          |FROM memory.main.parent; SELECT 'not part of initial load';""".stripMargin
+      )
+      out should include("documentation; not a terminator")
+      out should include("concat('a;', chr(39), 'b; c')")
+      out should include("/* outer; /* inner; */ still outer; */")
+      out should endWith("FROM db.parent")
+      out should not include "not part of initial load"
+    }
+  }
+
+  describe("bare initial-load source binding") {
+    it("qualifies source relations in CTEs and subqueries without touching CTE references or literals") {
+      val sql = """WITH latest AS (SELECT id FROM parent WHERE payload = 'parent')
+        |SELECT * FROM latest WHERE id IN (SELECT id FROM parent)""".stripMargin
+      val out = OpenIvmCompiler.reattachBareInitialLoadSources(
+        sql,
+        req(
+          viewSql = "SELECT * FROM db.parent",
+          qualified = Map("parent" -> "db.parent")
+        )
+      )
+      out should include("FROM db.parent WHERE payload = 'parent'")
+      out should include("FROM latest")
+      out should include("SELECT id FROM db.parent)")
+    }
+
+    it("binds bare pinned sources to verified physical paths") {
+      val out = OpenIvmCompiler.reattachBareInitialLoadSources(
+        "SELECT id FROM accounts",
+        req(
+          "SELECT id FROM db.accounts VERSION AS OF 5",
+          qualified = Map("accounts" -> "db.accounts"),
+          pinnedPaths = Map("accounts" -> path("accounts"))
+        )
+      )
+      out shouldBe s"SELECT id FROM delta.`${path("accounts")}` VERSION AS OF 5"
+    }
+
+    it("refuses ambiguous CTE shadowing rather than binding the wrong source") {
+      an[IllegalStateException] should be thrownBy OpenIvmCompiler.reattachBareInitialLoadSources(
+        "WITH parent AS (SELECT id FROM other) SELECT * FROM parent",
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      )
+    }
+
+    it("does not rewrite already qualified sources") {
+      val sql = "SELECT * FROM db.parent"
+      OpenIvmCompiler.reattachBareInitialLoadSources(
+        sql,
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      ) shouldBe sql
+    }
+  }
 
   describe("reattachInitialLoadSourceReads") {
     it("path-binds a pinned initial-load read to its verified Delta path (VERSION)") {

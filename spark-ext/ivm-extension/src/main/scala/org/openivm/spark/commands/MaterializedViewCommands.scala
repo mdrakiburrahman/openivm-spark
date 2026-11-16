@@ -41,7 +41,13 @@ import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, St
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
+import org.openivm.spark.compiler.{
+  CompiledRefresh,
+  CompileRequest,
+  OpenIvmCompiler,
+  SparkExpressionPrepass,
+  SparkTimeTravelSql
+}
 import org.openivm.spark.insights.OpenIvmInsightsBroker
 import org.openivm.spark.streaming.{
   StreamingInsightEvents,
@@ -59,6 +65,7 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import scala.util.control.NonFatal
 
@@ -209,21 +216,67 @@ private[commands] object OpenIvmCompilers {
 // ---------------------------------------------------------------------------
 private[spark] object RefreshMutex {
 
-  private val locks: java.util.Map[String, ReentrantLock] =
-    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantLock]())
+  private sealed trait LockMode
+  private case object Read  extends LockMode
+  private case object Write extends LockMode
+  private final case class LockRequest(key: String, mode: LockMode)
 
-  /** Acquire (creating if absent) the reentrant lock that keys this MV.
-    * The lock identity is the fully-qualified MV name so two
-    * refreshes targeting the SAME logical MV serialise, even if they
-    * originate from different Spark sessions in the same JVM.
-    */
+  private val locks: java.util.Map[String, LifecycleReadWriteLock] =
+    Collections.synchronizedMap(new java.util.HashMap[String, LifecycleReadWriteLock]())
+
   def withLock[A](mvKey: String)(body: => A): A =
-    withGuard(mvKey, None)(body)
+    withGuard(mvKey, Write, None)(body)
 
   def withLock[A](mvKey: String, deadline: LifecycleDeadline)(body: => A): A =
-    withGuard(mvKey, Some(deadline))(body)
+    withGuard(mvKey, Write, Some(deadline))(body)
 
-  private def withGuard[A](mvKey: String, deadline: Option[LifecycleDeadline])(body: => A): A = {
+  def withReadLock[A](mvKey: String)(body: => A): A =
+    withGuard(mvKey, Read, None)(body)
+
+  def withReadLock[A](mvKey: String, deadline: LifecycleDeadline)(body: => A): A =
+    withGuard(mvKey, Read, Some(deadline))(body)
+
+  private[commands] def hasQueuedThread(mvKey: String, thread: Thread): Boolean = {
+    val key = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
+    Option(locks.get(key)).exists(_.hasQueuedThread(thread))
+  }
+
+  def withLocks[A](mvKeys: Seq[String])(body: => A): A =
+    withLockRequests(mvKeys.map(_ -> Write))(body)
+
+  def withLocks[A](mvKeys: Seq[String], deadline: LifecycleDeadline)(body: => A): A =
+    withLockRequests(mvKeys.map(_ -> Write), Some(deadline))(body)
+
+  def withLocks[A](readKeys: Seq[String], writeKeys: Seq[String])(body: => A): A =
+    withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write))(body)
+
+  def withLocks[A](
+      readKeys: Seq[String],
+      writeKeys: Seq[String],
+      deadline: LifecycleDeadline
+  )(body: => A): A =
+    withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write), Some(deadline))(body)
+
+  private def withLockRequests[A](
+      requested: Seq[(String, LockMode)],
+      deadline: Option[LifecycleDeadline] = None
+  )(body: => A): A = {
+    val merged = requested.foldLeft(Map.empty[String, LockMode]) { case (byKey, (rawKey, mode)) =>
+      val key        = StreamingDependencyCatalog.lifecycleLockKey(rawKey)
+      val mergedMode = if (mode == Write || byKey.get(key).contains(Write)) Write else Read
+      byKey.updated(key, mergedMode)
+    }
+    val ordered = merged.toSeq.sortBy(_._1).map { case (key, mode) => LockRequest(key, mode) }
+    def acquire(remaining: List[LockRequest]): A = remaining match {
+      case LockRequest(key, mode) :: tail => withGuard(key, mode, deadline)(acquire(tail))
+      case Nil                            => body
+    }
+    acquire(ordered.toList)
+  }
+
+  private def withGuard[A](mvKey: String, mode: LockMode, deadline: Option[LifecycleDeadline])(
+      body: => A
+  ): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
     val lock =
@@ -233,54 +286,137 @@ private[spark] object RefreshMutex {
           val again = locks.get(key)
           if (again != null) again
           else {
-            val l = new ReentrantLock()
-            locks.put(key, l)
-            l
+            val created = new LifecycleReadWriteLock(true)
+            locks.put(key, created)
+            created
           }
         }
+    if (mode == Write && lock.getReadHoldCount > 0 && !lock.isWriteLockedByCurrentThread)
+      throw new IllegalStateException(s"Cannot upgrade a held lifecycle read lock to write for $key")
+
+    val lockToAcquire = mode match {
+      case Read  => lock.readLock()
+      case Write => lock.writeLock()
+    }
+    val reentrant = mode match {
+      case Read  => lock.getReadHoldCount > 0 || lock.isWriteLockedByCurrentThread
+      case Write => lock.isWriteLockedByCurrentThread
+    }
     OpenIvmMetrics.RefreshQueued.incrementAndGet()
-    val waitStarted = System.nanoTime()
-    var admitted    = false
+    val waitStarted      = System.nanoTime()
+    val requestedEpochMs = System.currentTimeMillis()
+    var acquiredAtNanos  = 0L
+    var acquiredEpochMs  = 0L
+    var admitted         = false
     def entered: A = {
       admitted = true
+      acquiredAtNanos = System.nanoTime()
+      acquiredEpochMs = System.currentTimeMillis()
       OpenIvmMetrics.RefreshQueued.decrementAndGet()
-      OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
+      OpenIvmMetrics.updateTimer("refresh.lock.wait", acquiredAtNanos - waitStarted)
       body
     }
     try
       deadline match {
-        case Some(budget) => budget.withLock(lock, key)(entered)
+        case Some(budget) =>
+          mode match {
+            case Read  => budget.withReadLock(lock, key)(entered)
+            case Write => budget.withWriteLock(lock, key)(entered)
+          }
         case None =>
-          lock.lock()
+          lockToAcquire.lock()
           try entered
-          finally lock.unlock()
+          finally lockToAcquire.unlock()
       }
-    finally
-      if (!admitted) {
+    finally {
+      if (admitted) {
+        val releasedAtNanos = System.nanoTime()
+        val releasedEpochMs = System.currentTimeMillis()
+        OpenIvmExecutionSpan.recordActiveLockAcquisition(
+          key,
+          "mv_data",
+          mode match {
+            case Read  => "read"
+            case Write => "write"
+          },
+          requestedEpochMs,
+          acquiredEpochMs,
+          releasedEpochMs,
+          TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted),
+          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+          Thread.currentThread().getName
+        )
+      } else {
         OpenIvmMetrics.RefreshQueued.decrementAndGet()
         OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
       }
+    }
+  }
+}
+
+private[spark] object CreatePublicationMutex {
+
+  private final class Guard {
+    val lock                = new ReentrantLock(true)
+    val publicationComplete = lock.newCondition()
+    var publicationPending  = false
   }
 
-  /** Acquire several MV locks in canonical order. Re-entrant acquisition of a
-    * lock already held by the current command is safe.
-    */
-  def withLocks[A](mvKeys: Seq[String])(body: => A): A = {
-    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
-    def acquire(remaining: List[String]): A = remaining match {
-      case head :: tail => withLock(head)(acquire(tail))
-      case Nil          => body
-    }
-    acquire(ordered.toList)
-  }
+  private val locks: java.util.Map[String, Guard] =
+    Collections.synchronizedMap(new java.util.HashMap[String, Guard]())
 
-  def withLocks[A](mvKeys: Seq[String], deadline: LifecycleDeadline)(body: => A): A = {
-    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
-    def acquire(remaining: List[String]): A = remaining match {
-      case head :: tail => withLock(head, deadline)(acquire(tail))
-      case Nil          => body
+  def withLock[A](mvKey: String)(body: => A)(afterRelease: => Unit): A = {
+    val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
+    val existing = locks.get(key)
+    val guard =
+      if (existing != null) existing
+      else
+        locks.synchronized {
+          val again = locks.get(key)
+          if (again != null) again
+          else {
+            val created = new Guard
+            locks.put(key, created)
+            created
+          }
+        }
+    val waitStarted      = System.nanoTime()
+    val requestedEpochMs = System.currentTimeMillis()
+    guard.lock.lock()
+    while (guard.publicationPending) guard.publicationComplete.awaitUninterruptibly()
+    val acquiredAtNanos = System.nanoTime()
+    val acquiredEpochMs = System.currentTimeMillis()
+    try body
+    finally {
+      guard.publicationPending = true
+      guard.lock.unlock()
+      val releasedAtNanos = System.nanoTime()
+      val releasedEpochMs = System.currentTimeMillis()
+      val waitMs          = TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted)
+      val thread          = Thread.currentThread().getName
+      OpenIvmMetrics.updateTimer("refresh.lock.wait", acquiredAtNanos - waitStarted)
+      try
+        OpenIvmExecutionSpan.recordActiveLockAcquisition(
+          key,
+          "create_publication",
+          "write",
+          requestedEpochMs,
+          acquiredEpochMs,
+          releasedEpochMs,
+          waitMs,
+          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+          thread
+        )
+      finally
+        try afterRelease
+        finally {
+          guard.lock.lock()
+          try {
+            guard.publicationPending = false
+            guard.publicationComplete.signal()
+          } finally guard.lock.unlock()
+        }
     }
-    acquire(ordered.toList)
   }
 }
 
@@ -2768,13 +2904,13 @@ case class CreateMaterializedViewCommand(
       Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
     val finalizeUnderLock = OpenIvmExecutionSpan.hasActiveExport
 
-    def finalizeCreate(): Unit =
+    def finalizeCreate(deferExecutionSpanEmission: Boolean = false): Unit =
       if (!createFinalizationAttempted) {
         createFinalizationAttempted = true
         val totalMs = (System.nanoTime() - createT0) / 1000000L
         profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
         profile.completeSpan(createOutcome, Thread.currentThread().getName)
-        profile.flush()
+        profile.flush(deferExecutionSpanEmission = deferExecutionSpanEmission)
         sqlLog.flush()
       }
 
@@ -2789,9 +2925,23 @@ case class CreateMaterializedViewCommand(
       sql = originalQueryText,
       durationMs = -1L
     )
-    try {
+    CreatePublicationMutex.withLock(commandName) {
+      val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
+        isolated =>
+          MvCatalog.ensureTables(isolated)
+          if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+          else {
+            val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
+            val sourceNames = collectSourceSchemas(analyzed)._1
+            computeUpstreamMvByQual(isolated, sourceNames).values
+              .map(meta => metaName(meta.name))
+              .toSeq
+              .distinct
+              .sorted
+          }
+      }
       val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLock(commandName) {
+      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
         try {
           val threadName = Thread.currentThread().getName
           val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
@@ -2806,6 +2956,7 @@ case class CreateMaterializedViewCommand(
                     isolated,
                     profile,
                     sqlLog,
+                    createUpstreamReadKeys.toSet,
                     classification => createInsightClassification = Some(classification)
                   )
                 }
@@ -2818,7 +2969,7 @@ case class CreateMaterializedViewCommand(
           }
           outcome
         } finally {
-          if (finalizeUnderLock) finalizeCreate()
+          if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
         }
       }
       if (!finalizeUnderLock) {
@@ -2834,8 +2985,8 @@ case class CreateMaterializedViewCommand(
             classification
           )
         }
-      Seq.empty
-    } finally {
+      Seq.empty[org.apache.spark.sql.Row]
+    } {
       try finalizeCreate()
       finally {
         sqlLog.finish(createOutcome)
@@ -2848,6 +2999,7 @@ case class CreateMaterializedViewCommand(
       spark: SparkSession,
       profile: RefreshProfile,
       sqlLog: RefreshSqlLog,
+      expectedUpstreamMvLockKeys: Set[String],
       recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit
   ): String = {
     import MvCommandHelper._
@@ -2978,13 +3130,23 @@ case class CreateMaterializedViewCommand(
       )
     }
     val compiler = OpenIvmCompilers.forSession(spark)
-    val createCompileRequest = CompileRequest(
+    val originalCreateCompileRequest = CompileRequest(
       viewName = name.table,
       viewSql = originalQueryText,
       sources = compileSchemas,
       sourceQualifiedNames = pinBinding.friendlyByShort,
       sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(pinBinding),
       facts = workloadFacts
+    )
+    val expressionBridge =
+      SparkExpressionPrepass.prepare(
+        originalQueryText,
+        spark.sessionState.conf.caseSensitiveAnalysis,
+        Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last),
+        Some(analyzed)
+      )
+    val createCompileRequest = originalCreateCompileRequest.copy(
+      viewSql = expressionBridge.sql
     )
     var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
@@ -3110,6 +3272,12 @@ case class CreateMaterializedViewCommand(
     val upstreamMvByQual: Map[String, MvMetadata] = profile.timeStep("create_resolve_upstream_mvs") {
       computeUpstreamMvByQual(spark, qualNames)
     }
+    val actualUpstreamMvLockKeys = upstreamMvByQual.values.map(meta => metaName(meta.name)).toSet
+    if (actualUpstreamMvLockKeys != expectedUpstreamMvLockKeys)
+      throw new AnalysisException(
+        "_LEGACY_ERROR_TEMP_2273",
+        Map("message" -> s"Managed materialized-view sources for '${metaName(name)}' changed during CREATE admission")
+      )
     val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
     val distinctUpstreamMvCount: Int =
       upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
@@ -3249,8 +3417,13 @@ case class CreateMaterializedViewCommand(
           qualNames,
           pinBinding.resolvedPins
         )
-      else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+      else {
+        val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val restored   = expressionBridge.markers.restore(translated)
+        expressionBridge.markers.requireAllSeen()
+        org.openivm.spark.compiler.OpenIvmCompiler
+          .reattachBareInitialLoadSources(restored, originalCreateCompileRequest)
+      }
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
     }
@@ -3342,8 +3515,13 @@ case class CreateMaterializedViewCommand(
     // independent of the compile-cache feature flag. Only the per-(fingerprint,tier)
     // cache properties are gated by the flag.
     val initialLoadProps =
-      if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
-      else Map.empty[String, String]
+      if (compiled.initialLoadSql.nonEmpty) {
+        val restored =
+          if (effectiveRefreshType != RefreshTypeCode.FullRefresh)
+            Map(SparkExpressionPrepass.RestoredInitialLoadProperty -> viewBodySql)
+          else Map.empty[String, String]
+        Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql) ++ restored
+      } else Map.empty[String, String]
     val cacheCompiledProps =
       if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
         Map.empty[String, String]
@@ -3966,31 +4144,29 @@ case class RefreshMaterializedViewCommand(
       // legacy map; the parsed deps are re-verified by physical identity UNDER the
       // acquired locks (validateUpstreamMvDependenciesUnderLock).
       val (upstreamMvSourceKeys, upstreamMvDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
-      val lockKeys =
-        if (sourceVersionAdvance.isEmpty)
-          viewMeta +: upstreamMvSourceKeys
-        else {
+      val downstreamWriteKeys = sourceVersionAdvance
+        .map { _ =>
           // The advance path additionally holds its downstream consumer keys so the
           // pinned-source-advance cascade into them stays atomic. Consumers are
           // discovered by the SAME authoritative dependency map (each candidate's
           // persisted map referencing this MV's key) — never a lexical source-name
           // scan. A catalog read failure fails the advance closed.
-          val downstream =
-            (try MvCatalog.list(spark)
-            catch {
-              case NonFatal(readFailure) =>
-                mvDependencyMapFailClosed(
-                  viewMeta,
-                  s"downstream consumers could not be enumerated for the source-version-advance cascade " +
-                    s"(${readFailure.getMessage})"
-                )
-            })
-              .filter(meta => metaName(meta.name) != viewMeta)
-              .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
-              .map(meta => metaName(meta.name))
-          viewMeta +: (downstream ++ upstreamMvSourceKeys)
+          (try MvCatalog.list(spark)
+          catch {
+            case NonFatal(readFailure) =>
+              mvDependencyMapFailClosed(
+                viewMeta,
+                s"downstream consumers could not be enumerated for the source-version-advance cascade " +
+                  s"(${readFailure.getMessage})"
+              )
+          })
+            .filter(meta => metaName(meta.name) != viewMeta)
+            .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
+            .map(meta => metaName(meta.name))
         }
-      val rows = RefreshMutex.withLocks(lockKeys) {
+        .getOrElse(Seq.empty)
+      val writeKeys = viewMeta +: downstreamWriteKeys
+      val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         // Under the acquired upstream locks, re-verify each upstream MV still has
         // the exact physical Delta identity the map recorded at CREATE; a rebind,
         // vanished upstream, or catalog read failure fails the refresh closed.
@@ -5377,6 +5553,53 @@ case class RefreshMaterializedViewCommand(
         0L
       )
 
+      lazy val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
+        q.split("\\.").last -> schema
+      }
+      lazy val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
+        refreshResolvedPins,
+        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
+      )
+      lazy val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
+        refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
+        preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
+      }
+      lazy val constraintFacts = WorkloadFactsRegistry
+        .forRefresh()
+        .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
+      lazy val cacheTierFacts = WorkloadFacts(
+        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+        assumeInsertOnly = insertOnlyAggregate ||
+          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
+            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+        deltaShape = sourceDeltaShape,
+        fkRelations = constraintFacts.fkRelations,
+        uniqueKeys = constraintFacts.uniqueKeys,
+        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
+      )
+      lazy val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
+        OpenIvmCompilers.forSession(spark)
+      }
+      lazy val originalCompileRequest = CompileRequest(
+        viewName = name.table,
+        viewSql = meta.querySql,
+        sources = compileSchemas,
+        sourceQualifiedNames = shortToQual,
+        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
+        facts = cacheTierFacts
+      )
+      lazy val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
+      lazy val expressionBridge =
+        SparkExpressionPrepass.prepare(
+          meta.querySql,
+          spark.sessionState.conf.caseSensitiveAnalysis,
+          Some(originalCompileTier.split(":").last),
+          Some(spark.sql(meta.querySql).queryExecution.analyzed)
+        )
+      lazy val compileRequest =
+        originalCompileRequest.copy(viewSql = expressionBridge.sql)
+
       // -----------------------------------------------------------------------
       // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
       // A REPLACE/OVERWRITE/TRUNCATE on any source invalidates incremental
@@ -5410,19 +5633,53 @@ case class RefreshMaterializedViewCommand(
           val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
-          if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty)
-            org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad)
-          else
-            // UserFullQuery surface at REFRESH: path-bind the user body's pinned
-            // reads to their verified Delta paths so the recompute reads the frozen
-            // snapshot directly rather than re-resolving the alias.
-            MvCommandHelper.pathBindUserFullQuery(
-              name,
-              meta.querySql,
-              refreshBinding,
-              meta.sourceTables,
-              refreshResolvedPins
+          val restoredInitialLoad  = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
+          // ADVANCE SOURCE VERSIONS changes the pinned query but not CREATE's stored initial load.
+          val recompileBridge =
+            if (
+              meta.refreshType != RefreshTypeCode.FullRefresh &&
+              (restoredInitialLoad.isEmpty || refreshResolvedPins.nonEmpty) &&
+              (expressionBridge.sql != meta.querySql || refreshResolvedPins.nonEmpty)
             )
+              Some(expressionBridge)
+            else None
+          recompileBridge match {
+            case Some(bridge) =>
+              val compiled = compiler.compile(compileRequest)
+              if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load is incompatible with its refresh type"
+                )
+              val restored = bridge.markers.restore(
+                org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+              )
+              bridge.markers.requireAllSeen()
+              val bound =
+                org.openivm.spark.compiler.OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
+              val resultSchema = spark.sql(bound).schema
+              val targetSchema = spark.read.format("delta").load(meta.location).schema
+              if (
+                resultSchema.fieldNames.toSeq != targetSchema.fieldNames.toSeq ||
+                !org.apache.spark.sql.types.DataType.equalsIgnoreNullability(resultSchema, targetSchema)
+              )
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load does not match the stored data schema"
+                )
+              bound
+            case None if meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty =>
+              restoredInitialLoad.getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
+            case None =>
+              // UserFullQuery surface at REFRESH: path-bind the user body's pinned
+              // reads to their verified Delta paths so the recompute reads the frozen
+              // snapshot directly rather than re-resolving the alias.
+              MvCommandHelper.pathBindUserFullQuery(
+                name,
+                meta.querySql,
+                refreshBinding,
+                meta.sourceTables,
+                refreshResolvedPins
+              )
+          }
         }
         val fullRefreshTarget =
           if (meta.usesBackingDataTable) dataTableId(name) else name
@@ -5655,47 +5912,8 @@ case class RefreshMaterializedViewCommand(
       // Incremental path — recompile, register source temp views, rewrite the
       // openivm-emitted multi-statement program, execute it.
       // -----------------------------------------------------------------------
-      val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
-        q.split("\\.").last -> schema
-      }
-      val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
-        refreshResolvedPins,
-        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
-      )
       val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
-      // Pinned and source-advance schemas can describe a historical snapshot;
-      // discover their current constraint metadata through the existing path.
-      val currentSourceSchemas = freshSchemas.filterNot { case (source, _) =>
-        refreshResolvedPins.exists(_.operationalSource.alias.equalsIgnoreCase(source)) ||
-        preparedSourceAdvance.flatMap(_.batchFor(source)).nonEmpty
-      }
-      // Compile and rewrite use one fresh fact set owned by this REFRESH, never a cross-command cache.
-      val constraintFacts = WorkloadFactsRegistry
-        .forRefresh()
-        .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
-      val cacheTierFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
-        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-        assumeInsertOnly = insertOnlyAggregate ||
-          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
-            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
-        deltaShape = sourceDeltaShape,
-        fkRelations = constraintFacts.fkRelations,
-        uniqueKeys = constraintFacts.uniqueKeys,
-        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
-      )
-      val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
-        OpenIvmCompilers.forSession(spark)
-      }
-      val compileRequest = CompileRequest(
-        viewName = name.table,
-        viewSql = meta.querySql,
-        sources = compileSchemas,
-        sourceQualifiedNames = shortToQual,
-        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-        facts = cacheTierFacts
-      )
-      val compileCacheTier = compiler.compileCacheTier(compileRequest)
+      val compileCacheTier    = compiler.compileCacheTier(compileRequest)
       var refreshProperties =
         if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
         else meta.properties
@@ -6114,10 +6332,12 @@ case class RefreshMaterializedViewCommand(
               SparkRefreshRewriter.injectSelectiveBroadcastHints(translated, selectiveBroadcastTables)
             val withSkewFanout =
               SparkRefreshRewriter.injectSkewFanoutBroadcastHints(withSelectiveBroadcast, skewFanoutDeltaBroadcasts)
-            if (FeatureGate.scd2RangeAccelEnabled(spark))
-              SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
-            else
-              withSkewFanout
+            val processed =
+              if (FeatureGate.scd2RangeAccelEnabled(spark))
+                SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
+              else
+                withSkewFanout
+            expressionBridge.markers.restore(processed)
           }
 
           val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)
@@ -6197,6 +6417,7 @@ case class RefreshMaterializedViewCommand(
               )
             }
           }
+          expressionBridge.markers.requireAllSeen()
 
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
@@ -9135,10 +9356,13 @@ case class DropMaterializedViewCommand(
           targetRelation = Some(viewName)
         )
       )
-      val rows: Seq[Row] = RefreshMutex.withLock(
-        StreamingDependencyCatalog.materializedIdentity(viewName),
-        admissionDeadline
-      ) {
+      val rootIdentity = StreamingDependencyCatalog.materializedIdentity(viewName)
+      val preflight = MvCatalog.lookup(spark, name).map { meta =>
+        val descendants = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+        (meta, descendants, MvCatalog.mvIdentity(meta), mvBackingIdentity(spark, meta))
+      }
+      val lockKeys = rootIdentity +: preflight.toSeq.flatMap(_._2.map(_.identity))
+      val rows: Seq[Row] = RefreshMutex.withLocks(lockKeys, admissionDeadline) {
         MvCatalog.lookup(spark, name) match {
           case None if ifExists =>
             outcome = "drop_missing_ignored"
@@ -9149,9 +9373,30 @@ case class DropMaterializedViewCommand(
               Map("relationName" -> sqlIdent(name))
             )
           case Some(meta) =>
-            val descendants   = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+            val (plannedMeta, descendants, plannedMvIdentity, plannedBackingIdentity) = preflight.getOrElse {
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map("message" -> s"Materialized view '$viewName' appeared during DROP admission")
+              )
+            }
+            if (
+              meta.location != plannedMeta.location ||
+              MvCatalog.mvIdentity(meta) != plannedMvIdentity ||
+              mvBackingIdentity(spark, meta) != plannedBackingIdentity
+            )
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map("message" -> s"Materialized view '$viewName' changed during DROP admission")
+              )
+            val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
+            if (verified != descendants)
+              throw new AnalysisException(
+                "_LEGACY_ERROR_TEMP_2273",
+                Map(
+                  "message" -> s"Materialized view '$viewName' dependencies changed during DROP admission"
+                )
+              )
             val cascadeReason = OpenIvmMaterializedViewInsightEvents.dropReason(spark, viewName)
-            val identity      = StreamingDependencyCatalog.materializedIdentity(viewName)
             OpenIvmInsightEvents.decision(
               spark,
               operationId,
@@ -9170,37 +9415,26 @@ case class DropMaterializedViewCommand(
                     "kind"      -> target.kind,
                     "name"      -> target.name.mkString("."),
                     "identity"  -> target.identity,
-                    "caused_by" -> target.causedBy.getOrElse(identity),
+                    "caused_by" -> target.causedBy.getOrElse(rootIdentity),
                     "reason"    -> cascadeReason
                   )
                 }
               )
             )
-            RefreshMutex.withLocks(descendants.map(_.identity), admissionDeadline) {
-              StreamingTableManager.withCascadeLocks(spark, descendants, admissionDeadline) {
-                val verified = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
-                if (verified != descendants)
-                  throw new AnalysisException(
-                    "_LEGACY_ERROR_TEMP_2273",
-                    Map(
-                      "message" ->
-                        s"Materialized view '$viewName' dependencies changed during DROP admission"
-                    )
-                  )
-                StreamingTableManager.dropResolvedCascade(
-                  spark,
-                  descendants,
-                  org.openivm.spark.streaming.StreamingArchiveContext(
-                    action = "cascade",
-                    operationId = operationId,
-                    rootTarget = identity,
-                    causedBy = Some(identity)
-                  ),
-                  stopDeadline
-                )
-                MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
-                Seq.empty[Row]
-              }
+            StreamingTableManager.withCascadeLocks(spark, descendants, admissionDeadline) {
+              StreamingTableManager.dropResolvedCascade(
+                spark,
+                descendants,
+                org.openivm.spark.streaming.StreamingArchiveContext(
+                  action = "cascade",
+                  operationId = operationId,
+                  rootTarget = rootIdentity,
+                  causedBy = Some(rootIdentity)
+                ),
+                stopDeadline
+              )
+              MaterializedViewLifecycle.dropOne(spark, name, meta, operationId)
+              Seq.empty[Row]
             }
         }
       }

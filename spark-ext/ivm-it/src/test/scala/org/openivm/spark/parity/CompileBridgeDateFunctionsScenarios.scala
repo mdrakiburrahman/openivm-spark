@@ -25,6 +25,22 @@ abstract class CompileBridgeDateFunctionsScenarios extends IvmParitySpecBase("co
     meta.refreshTypeName should not equal "FULL_REFRESH"
   }
 
+  describe("compile-bridge shim: date arithmetic") {
+    it("preserves date offsets and nulls through incremental refresh") {
+      sql("CREATE TABLE cbdf_offset_src (id INT, d DATE, n INT) USING DELTA")
+      sql("INSERT INTO cbdf_offset_src VALUES (1, DATE'2024-01-03', 2), (2, DATE'2024-02-01', -1), (3, NULL, 1)")
+      val mvName   = "cbdf_mv_offset"
+      val viewBody = "SELECT id, date_sub(d, n) AS earlier, date_add(d, -n) AS shifted FROM cbdf_offset_src"
+      sql(s"CREATE MATERIALIZED VIEW $mvName AS $viewBody")
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+      sql("INSERT INTO cbdf_offset_src VALUES (4, DATE'2024-03-01', 1), (5, DATE'2024-04-01', NULL)")
+      refreshMv(mvName)
+      assertIncremental(mvName)
+      assertMvCorrect(mvName, viewBody)
+    }
+  }
+
   describe("compile-bridge shim: to_date(raw)") {
     it("keeps the MV incremental and correct after INSERT + REFRESH") {
       sql("CREATE TABLE cbdf_to_date_iso_src (id INT, trade_date_raw STRING) USING DELTA")

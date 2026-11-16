@@ -30,7 +30,7 @@ ARG JDK_VERSION=17
 # -----------------------------------------------------------------------------
 # Stage 1: openivm-builder
 # -----------------------------------------------------------------------------
-FROM ubuntu:24.04 AS openivm-builder
+FROM ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c AS openivm-builder
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
@@ -47,11 +47,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
         sed -i "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
-            /etc/apt/sources.list.d/ubuntu.sources; \
+            /etc/apt/sources.list; \
     fi && \
     apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 && \
     apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates \
+        build-essential clang-15 cmake ninja-build git ca-certificates \
         python3 python3-pip libssl-dev pkg-config zip unzip curl && \
     rm -rf /var/lib/apt/lists/*
 
@@ -80,7 +80,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
 # CLI and the loadable .duckdb_extension binary. We bypass the optional
 # third_party/benchbase + sqlstorm benchmarks (heavyweight, not on the test
 # critical path).
-RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
+RUN CC=clang-15 CXX=clang++-15 CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
 
 # Collect deliverables into a stable location.
 RUN mkdir -p /artifacts && \
@@ -88,6 +88,14 @@ RUN mkdir -p /artifacts && \
     cp build/release/duckdb /artifacts/duckdb && \
     chmod +x /artifacts/duckdb && \
     sha256sum /artifacts/openivm.duckdb_extension /artifacts/duckdb > /artifacts/SHA256SUMS
+
+FROM ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c AS native-runtime-check
+COPY --from=openivm-builder /artifacts/ /artifacts/
+RUN /artifacts/duckdb -unsigned -noheader -csv -c "LOAD '/artifacts/openivm.duckdb_extension'; \
+    SET openivm_files_path='/tmp'; CREATE TABLE openivm_runtime_source(id INTEGER); \
+    CREATE OR REPLACE MATERIALIZED VIEW openivm_runtime_probe AS SELECT id FROM openivm_runtime_source; \
+    SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts('openivm_runtime_probe', \
+    '{\"target_dialect\":\"spark\",\"compile_only\":true}');" | grep -Fx SIMPLE_PROJECTION
 
 # -----------------------------------------------------------------------------
 # Stage 2: openivm-tester — `make test` over the OpenIVM source tree.
@@ -153,9 +161,9 @@ RUN mkdir -p /opt/sbt && \
     sbt --version || true   # warm cache on first run; ignore exit code
 
 # Copy openivm artifacts from the builder stage.
-COPY --from=openivm-builder /artifacts/openivm.duckdb_extension /opt/openivm/openivm.duckdb_extension
-COPY --from=openivm-builder /artifacts/duckdb                   /opt/openivm/duckdb
-COPY --from=openivm-builder /artifacts/SHA256SUMS               /opt/openivm/SHA256SUMS
+COPY --from=native-runtime-check /artifacts/openivm.duckdb_extension /opt/openivm/openivm.duckdb_extension
+COPY --from=native-runtime-check /artifacts/duckdb                   /opt/openivm/duckdb
+COPY --from=native-runtime-check /artifacts/SHA256SUMS               /opt/openivm/SHA256SUMS
 
 # Sanity check the artifact landed.
 RUN ls -l /opt/openivm && /opt/openivm/duckdb --version
