@@ -65,7 +65,8 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
-import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.{ReentrantLock, ReentrantReadWriteLock}
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
@@ -215,21 +216,59 @@ private[commands] object OpenIvmCompilers {
 // ---------------------------------------------------------------------------
 private[spark] object RefreshMutex {
 
-  private val locks: java.util.Map[String, ReentrantLock] =
-    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantLock]())
+  private sealed trait LockMode
+  private case object Read extends LockMode
+  private case object Write extends LockMode
+  private final case class LockRequest(key: String, mode: LockMode)
 
-  /** Acquire (creating if absent) the reentrant lock that keys this MV.
-    * The lock identity is the fully-qualified MV name so two
-    * refreshes targeting the SAME logical MV serialise, even if they
-    * originate from different Spark sessions in the same JVM.
-    */
+  private val locks: java.util.Map[String, ReentrantReadWriteLock] =
+    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantReadWriteLock]())
+
   def withLock[A](mvKey: String)(body: => A): A =
-    withGuard(mvKey, None)(body)
+    withGuard(mvKey, Write, None)(body)
 
   def withLock[A](mvKey: String, deadline: LifecycleDeadline)(body: => A): A =
-    withGuard(mvKey, Some(deadline))(body)
+    withGuard(mvKey, Write, Some(deadline))(body)
 
-  private def withGuard[A](mvKey: String, deadline: Option[LifecycleDeadline])(body: => A): A = {
+  def withReadLock[A](mvKey: String)(body: => A): A =
+    withGuard(mvKey, Read, None)(body)
+
+  def withLocks[A](mvKeys: Seq[String])(body: => A): A =
+    withLockRequests(mvKeys.map(_ -> Write))(body)
+
+  def withLocks[A](mvKeys: Seq[String], deadline: LifecycleDeadline)(body: => A): A =
+    withLockRequests(mvKeys.map(_ -> Write), Some(deadline))(body)
+
+  def withLocks[A](readKeys: Seq[String], writeKeys: Seq[String])(body: => A): A =
+    withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write))(body)
+
+  def withLocks[A](
+      readKeys: Seq[String],
+      writeKeys: Seq[String],
+      deadline: LifecycleDeadline
+  )(body: => A): A =
+    withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write), Some(deadline))(body)
+
+  private def withLockRequests[A](
+      requested: Seq[(String, LockMode)],
+      deadline: Option[LifecycleDeadline] = None
+  )(body: => A): A = {
+    val merged = requested.foldLeft(Map.empty[String, LockMode]) { case (byKey, (rawKey, mode)) =>
+      val key = StreamingDependencyCatalog.lifecycleLockKey(rawKey)
+      val mergedMode = if (mode == Write || byKey.get(key).contains(Write)) Write else Read
+      byKey.updated(key, mergedMode)
+    }
+    val ordered = merged.toSeq.sortBy(_._1).map { case (key, mode) => LockRequest(key, mode) }
+    def acquire(remaining: List[LockRequest]): A = remaining match {
+      case LockRequest(key, mode) :: tail => withGuard(key, mode, deadline)(acquire(tail))
+      case Nil                           => body
+    }
+    acquire(ordered.toList)
+  }
+
+  private def withGuard[A](mvKey: String, mode: LockMode, deadline: Option[LifecycleDeadline])(
+      body: => A
+  ): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
     val lock =
@@ -239,54 +278,70 @@ private[spark] object RefreshMutex {
           val again = locks.get(key)
           if (again != null) again
           else {
-            val l = new ReentrantLock()
-            locks.put(key, l)
-            l
+            val created = new ReentrantReadWriteLock(true)
+            locks.put(key, created)
+            created
           }
         }
+    if (mode == Write && lock.getReadHoldCount > 0 && !lock.isWriteLockedByCurrentThread)
+      throw new IllegalStateException(s"Cannot upgrade a held lifecycle read lock to write for $key")
+
+    val lockToAcquire = mode match {
+      case Read  => lock.readLock()
+      case Write => lock.writeLock()
+    }
+    val reentrant = mode match {
+      case Read  => lock.getReadHoldCount > 0 || lock.isWriteLockedByCurrentThread
+      case Write => lock.isWriteLockedByCurrentThread
+    }
     OpenIvmMetrics.RefreshQueued.incrementAndGet()
-    val waitStarted = System.nanoTime()
-    var admitted    = false
+    val waitStarted       = System.nanoTime()
+    val requestedEpochMs  = System.currentTimeMillis()
+    var acquiredAtNanos   = 0L
+    var acquiredEpochMs   = 0L
+    var admitted          = false
     def entered: A = {
       admitted = true
+      acquiredAtNanos = System.nanoTime()
+      acquiredEpochMs = System.currentTimeMillis()
       OpenIvmMetrics.RefreshQueued.decrementAndGet()
-      OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
+      OpenIvmMetrics.updateTimer("refresh.lock.wait", acquiredAtNanos - waitStarted)
       body
     }
     try
       deadline match {
-        case Some(budget) => budget.withLock(lock, key)(entered)
+        case Some(budget) =>
+          mode match {
+            case Read  => budget.withReadLock(lock, key)(entered)
+            case Write => budget.withWriteLock(lock, key)(entered)
+          }
         case None =>
-          lock.lock()
+          lockToAcquire.lock()
           try entered
-          finally lock.unlock()
+          finally lockToAcquire.unlock()
       }
-    finally
-      if (!admitted) {
+    finally {
+      if (admitted) {
+        val releasedAtNanos = System.nanoTime()
+        val releasedEpochMs = System.currentTimeMillis()
+        OpenIvmExecutionSpan.recordActiveLockAcquisition(
+          key,
+          mode match {
+            case Read  => "read"
+            case Write => "write"
+          },
+          requestedEpochMs,
+          acquiredEpochMs,
+          releasedEpochMs,
+          TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted),
+          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+          Thread.currentThread().getName
+        )
+      } else {
         OpenIvmMetrics.RefreshQueued.decrementAndGet()
         OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
       }
-  }
-
-  /** Acquire several MV locks in canonical order. Re-entrant acquisition of a
-    * lock already held by the current command is safe.
-    */
-  def withLocks[A](mvKeys: Seq[String])(body: => A): A = {
-    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
-    def acquire(remaining: List[String]): A = remaining match {
-      case head :: tail => withLock(head)(acquire(tail))
-      case Nil          => body
     }
-    acquire(ordered.toList)
-  }
-
-  def withLocks[A](mvKeys: Seq[String], deadline: LifecycleDeadline)(body: => A): A = {
-    val ordered = mvKeys.map(StreamingDependencyCatalog.lifecycleLockKey).distinct.sorted
-    def acquire(remaining: List[String]): A = remaining match {
-      case head :: tail => withLock(head, deadline)(acquire(tail))
-      case Nil          => body
-    }
-    acquire(ordered.toList)
   }
 }
 
@@ -3992,31 +4047,27 @@ case class RefreshMaterializedViewCommand(
       // legacy map; the parsed deps are re-verified by physical identity UNDER the
       // acquired locks (validateUpstreamMvDependenciesUnderLock).
       val (upstreamMvSourceKeys, upstreamMvDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
-      val lockKeys =
-        if (sourceVersionAdvance.isEmpty)
-          viewMeta +: upstreamMvSourceKeys
-        else {
-          // The advance path additionally holds its downstream consumer keys so the
-          // pinned-source-advance cascade into them stays atomic. Consumers are
-          // discovered by the SAME authoritative dependency map (each candidate's
-          // persisted map referencing this MV's key) — never a lexical source-name
-          // scan. A catalog read failure fails the advance closed.
-          val downstream =
-            (try MvCatalog.list(spark)
-            catch {
-              case NonFatal(readFailure) =>
-                mvDependencyMapFailClosed(
-                  viewMeta,
-                  s"downstream consumers could not be enumerated for the source-version-advance cascade " +
-                    s"(${readFailure.getMessage})"
-                )
-            })
-              .filter(meta => metaName(meta.name) != viewMeta)
-              .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
-              .map(meta => metaName(meta.name))
-          viewMeta +: (downstream ++ upstreamMvSourceKeys)
-        }
-      val rows = RefreshMutex.withLocks(lockKeys) {
+      val downstreamWriteKeys = sourceVersionAdvance.map { _ =>
+        // The advance path additionally holds its downstream consumer keys so the
+        // pinned-source-advance cascade into them stays atomic. Consumers are
+        // discovered by the SAME authoritative dependency map (each candidate's
+        // persisted map referencing this MV's key) — never a lexical source-name
+        // scan. A catalog read failure fails the advance closed.
+        (try MvCatalog.list(spark)
+        catch {
+          case NonFatal(readFailure) =>
+            mvDependencyMapFailClosed(
+              viewMeta,
+              s"downstream consumers could not be enumerated for the source-version-advance cascade " +
+                s"(${readFailure.getMessage})"
+            )
+        })
+          .filter(meta => metaName(meta.name) != viewMeta)
+          .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
+          .map(meta => metaName(meta.name))
+      }.getOrElse(Seq.empty)
+      val writeKeys = viewMeta +: downstreamWriteKeys
+      val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         // Under the acquired upstream locks, re-verify each upstream MV still has
         // the exact physical Delta identity the map recorded at CREATE; a rebind,
         // vanished upstream, or catalog read failure fails the refresh closed.

@@ -11,6 +11,19 @@ import java.util.{LinkedHashMap, UUID}
 import java.util.concurrent.TimeUnit
 import scala.util.control.NonFatal
 
+private[telemetry] final case class LockAcquisitionTelemetry(
+    mvKey: String,
+    mode: String,
+    requestedEpochMs: Long,
+    acquiredEpochMs: Long,
+    releasedEpochMs: Long,
+    waitMs: Long,
+    holdMs: Long,
+    thread: String,
+    dbtNodeId: Option[String],
+    requestId: Option[String]
+)
+
 /** Structured one-line execution-span contract for CREATE / REFRESH MV work. */
 final class OpenIvmExecutionSpan private[telemetry] (
     val materializedView: String,
@@ -30,6 +43,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
   private var timeTravelPinStatus              = Option.empty[String]
   private var timeTravelPinReason              = Option.empty[String]
   private var sameMvLockWaitMs                 = Option.empty[Long]
+  private var lockAcquisitions                 = Vector.empty[LockAcquisitionTelemetry]
   private var driverAdmissionMs                = Option.empty[Long]
   private var catalogPublicationAdmissionWidth = Option.empty[Int]
   private var catalogPublicationAdmissionMs    = Option.empty[Long]
@@ -87,6 +101,31 @@ final class OpenIvmExecutionSpan private[telemetry] (
   def recordSameMvLockWait(durationMs: Long): Unit =
     recordBeforeComplete {
       sameMvLockWaitMs = addDuration(sameMvLockWaitMs, durationMs)
+    }
+
+  def recordLockAcquisition(
+      mvKey: String,
+      mode: String,
+      requestedEpochMs: Long,
+      acquiredEpochMs: Long,
+      releasedEpochMs: Long,
+      waitMs: Long,
+      holdMs: Long,
+      thread: String
+  ): Unit =
+    recordBeforeEmit {
+      lockAcquisitions :+= LockAcquisitionTelemetry(
+        mvKey,
+        mode,
+        requestedEpochMs,
+        acquiredEpochMs,
+        releasedEpochMs,
+        math.max(0L, waitMs),
+        math.max(0L, holdMs),
+        thread,
+        dbtNodeId,
+        requestId
+      )
     }
 
   def recordDriverAdmissionWait(durationMs: Long): Unit =
@@ -316,6 +355,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
               timeTravelPinStatus = timeTravelPinStatus,
               timeTravelPinReason = timeTravelPinReason,
               sameMvLockWaitMs = sameMvLockWaitMs,
+              lockAcquisitions = lockAcquisitions,
               driverAdmissionWaitMs = driverAdmissionMs,
               catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
               catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
@@ -356,6 +396,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 timeTravelPinStatus = timeTravelPinStatus,
                 timeTravelPinReason = timeTravelPinReason,
                 sameMvLockWaitMs = sameMvLockWaitMs,
+                lockAcquisitions = lockAcquisitions,
                 driverAdmissionWaitMs = driverAdmissionMs,
                 catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
                 catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
@@ -423,6 +464,27 @@ final class OpenIvmExecutionSpan private[telemetry] (
 }
 
 object OpenIvmExecutionSpan extends Logging {
+
+  private def renderLockAcquisitions(
+      acquisitions: Seq[LockAcquisitionTelemetry]
+  ): java.util.ArrayList[java.util.Map[String, AnyRef]] = {
+    val result = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+    acquisitions.foreach { acquisition =>
+      val item = new LinkedHashMap[String, AnyRef]()
+      item.put("mv_key", acquisition.mvKey)
+      item.put("mode", acquisition.mode)
+      item.put("requested_epoch_ms", java.lang.Long.valueOf(acquisition.requestedEpochMs))
+      item.put("acquired_epoch_ms", java.lang.Long.valueOf(acquisition.acquiredEpochMs))
+      item.put("released_epoch_ms", java.lang.Long.valueOf(acquisition.releasedEpochMs))
+      item.put("wait_ms", java.lang.Long.valueOf(acquisition.waitMs))
+      item.put("hold_ms", java.lang.Long.valueOf(acquisition.holdMs))
+      item.put("thread", acquisition.thread)
+      acquisition.dbtNodeId.foreach(item.put("dbt_node_id", _))
+      acquisition.requestId.foreach(item.put("request_id", _))
+      result.add(item)
+    }
+    result
+  }
 
   private final case class RenderedPayload(
       logPayload: String,
@@ -654,6 +716,29 @@ object OpenIvmExecutionSpan extends Logging {
   def recordActivePendingDeltaCount(count: Long): Unit =
     Option(current.get()).foreach(_.recordPendingDeltaCount(count))
 
+  def recordActiveLockAcquisition(
+      mvKey: String,
+      mode: String,
+      requestedEpochMs: Long,
+      acquiredEpochMs: Long,
+      releasedEpochMs: Long,
+      waitMs: Long,
+      holdMs: Long,
+      thread: String
+  ): Unit =
+    Option(current.get()).foreach(
+      _.recordLockAcquisition(
+        mvKey,
+        mode,
+        requestedEpochMs,
+        acquiredEpochMs,
+        releasedEpochMs,
+        waitMs,
+        holdMs,
+        thread
+      )
+    )
+
   def allowActiveCompletedExportReuse(): Unit =
     Option(current.get()).foreach(_.allowCompletedExportReuse())
 
@@ -817,6 +902,7 @@ object OpenIvmExecutionSpan extends Logging {
       timeTravelPinStatus: Option[String],
       timeTravelPinReason: Option[String],
       sameMvLockWaitMs: Option[Long],
+      lockAcquisitions: Seq[LockAcquisitionTelemetry],
       driverAdmissionWaitMs: Option[Long],
       catalogPublicationAdmissionWidth: Option[Int],
       catalogPublicationAdmissionWaitMs: Option[Long],
@@ -855,6 +941,8 @@ object OpenIvmExecutionSpan extends Logging {
     timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
     timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
+    if (lockAcquisitions.nonEmpty)
+      fields.put("lock_acquisitions", OpenIvmExecutionSpan.renderLockAcquisitions(lockAcquisitions))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
     catalogPublicationAdmissionWidth.foreach(v =>
       fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
@@ -902,6 +990,7 @@ object OpenIvmExecutionSpan extends Logging {
       timeTravelPinStatus: Option[String],
       timeTravelPinReason: Option[String],
       sameMvLockWaitMs: Option[Long],
+      lockAcquisitions: Seq[LockAcquisitionTelemetry],
       driverAdmissionWaitMs: Option[Long],
       catalogPublicationAdmissionWidth: Option[Int],
       catalogPublicationAdmissionWaitMs: Option[Long],
@@ -960,6 +1049,8 @@ object OpenIvmExecutionSpan extends Logging {
     fields.put("pending_delta_count", java.lang.Long.valueOf(math.max(0L, pendingDeltaCount)))
 
     sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
+    if (lockAcquisitions.nonEmpty)
+      fields.put("lock_acquisitions", OpenIvmExecutionSpan.renderLockAcquisitions(lockAcquisitions))
     driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
     catalogPublicationAdmissionWidth.foreach(v =>
       fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))

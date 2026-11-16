@@ -277,6 +277,72 @@
     "rocksdb_backup_ms": {
       "type": "integer",
       "minimum": 0
+    },
+    "lock_acquisitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mv_key",
+          "mode",
+          "requested_epoch_ms",
+          "acquired_epoch_ms",
+          "released_epoch_ms",
+          "wait_ms",
+          "hold_ms",
+          "thread"
+        ],
+        "properties": {
+          "mv_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write"
+            ]
+          },
+          "requested_epoch_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acquired_epoch_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "released_epoch_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "wait_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "hold_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "thread": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "dbt_node_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      }
     }
   }
 }
