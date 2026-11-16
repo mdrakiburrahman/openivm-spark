@@ -2851,38 +2851,54 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       )
 
       val payloads = withLogCapture { appender =>
-        withPool(2) { implicit ec =>
-          val refresh1 = Future {
-            withSparkLocalProperties(
-              "openivm.request_id" -> "req-refresh-1",
-              "openivm.node_id"    -> "model.refresh.one"
-            ) {
-              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+        val barrier   = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+        val parkFirst = new AtomicBoolean(true)
+        CommandConcurrencyInjection.withBeforeRefreshFinalize({
+          if (parkFirst.compareAndSet(true, false)) barrier.park()
+        }) {
+          withPool(2) { implicit ec =>
+            barrier.use {
+              val refresh1 = Future {
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-refresh-1",
+                  "openivm.node_id"    -> "model.refresh.one"
+                ) {
+                  spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+                }
+              }
+              withClue(s"first REFRESH never reached the finalize hook (${barrier.describe}): ") {
+                barrier.awaitEntered() shouldBe true
+              }
+              val refresh2Thread = new AtomicReference[Thread]()
+              val refresh2 = Future {
+                refresh2Thread.set(Thread.currentThread())
+                withSparkLocalProperties(
+                  "openivm.request_id" -> "req-refresh-2",
+                  "openivm.node_id"    -> "model.refresh.two"
+                ) {
+                  spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+                }
+              }
+              val queueDeadline = System.nanoTime() + CommandObservationBudget.toNanos
+              def refresh2Queued: Boolean =
+                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("default.mv_t15_serial", _))
+              while (!refresh2Queued && System.nanoTime() < queueDeadline) Thread.`yield`()
+              refresh2Queued shouldBe true
+              assertStillParked(barrier, refresh1)
+              spark.sql(
+                "INSERT INTO sales_t15 " +
+                  "SELECT CASE " +
+                  "  WHEN id % 4 = 0 THEN 'east' " +
+                  "  WHEN id % 4 = 1 THEN 'west' " +
+                  "  WHEN id % 4 = 2 THEN 'north' " +
+                  "  ELSE 'south' END AS region, " +
+                  "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
+              )
+              barrier.release()
+              awaitResult(refresh1, 600.seconds)
+              awaitResult(refresh2, 600.seconds)
             }
           }
-          Thread.sleep(150L)
-          val refresh2 = Future {
-            withSparkLocalProperties(
-              "openivm.request_id" -> "req-refresh-2",
-              "openivm.node_id"    -> "model.refresh.two"
-            ) {
-              spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
-            }
-          }
-          Thread.sleep(150L)
-          spark.sql(
-            "INSERT INTO sales_t15 " +
-              "SELECT CASE " +
-              "  WHEN id % 4 = 0 THEN 'east' " +
-              "  WHEN id % 4 = 1 THEN 'west' " +
-              "  WHEN id % 4 = 2 THEN 'north' " +
-              "  ELSE 'south' END AS region, " +
-              "CAST(id + 250000 AS INT) AS amount FROM range(150000)"
-          )
-
-          awaitResult(refresh1, 600.seconds)
-          refresh2.isCompleted shouldBe false
-          awaitResult(refresh2, 600.seconds)
         }
         executionSpanPayloads(appender.messages, "mv_t15_serial")
       }
