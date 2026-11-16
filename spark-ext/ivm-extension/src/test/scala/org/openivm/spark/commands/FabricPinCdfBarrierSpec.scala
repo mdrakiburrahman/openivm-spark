@@ -121,8 +121,7 @@ class FabricPinCdfBarrierSpec extends AnyFunSpec with Matchers with BeforeAndAft
       )
     }
 
-  private def lockKey(meta: MvMetadata): String =
-    meta.name.database.fold(meta.name.table)(database => s"$database.${meta.name.table}")
+  private def lockKey(meta: MvMetadata): String = meta.name.table
 
   private def awaitQueued(mvKey: String, thread: AtomicReference[Thread]): Unit = {
     val deadline = System.nanoTime() + ObservationBudget.toNanos

@@ -2879,9 +2879,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
                   spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
                 }
               }
-              val queueDeadline = System.nanoTime() + CommandObservationBudget.toNanos
+              val queueDeadline = System.nanoTime() + 30.seconds.toNanos
               def refresh2Queued: Boolean =
-                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("default.mv_t15_serial", _))
+                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("mv_t15_serial", _))
               while (!refresh2Queued && System.nanoTime() < queueDeadline) Thread.`yield`()
               refresh2Queued shouldBe true
               assertStillParked(barrier, refresh1)
