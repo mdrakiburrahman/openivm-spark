@@ -190,7 +190,7 @@
       "minimum": 0
     },
     "same_mv_lock_wait_ms": {
-      "description": "Legacy name: sum of per-monitor MV command entry waits, including dependency keys, with each observation truncated to milliseconds. Excludes dependency discovery, identity validation, admission, and the protected body.",
+      "description": "Legacy total: sum of wait_ms across recorded lock_acquisitions, including dependency keys and CREATE publication guards. Excludes dependency discovery, identity validation, admission, and the protected body.",
       "type": "integer",
       "minimum": 0
     },
@@ -298,6 +298,13 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512
+          },
+          "lock_kind": {
+            "type": "string",
+            "enum": [
+              "mv_data",
+              "create_publication"
+            ]
           },
           "mode": {
             "type": "string",

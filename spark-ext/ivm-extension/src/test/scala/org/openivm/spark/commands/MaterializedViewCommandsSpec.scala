@@ -1947,11 +1947,27 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       create.path("effective_refresh_type").asText() should not be empty
       create.path("refresh_reason").asText() should not be empty
       val createLocks = create.path("lock_acquisitions").elements().asScala.toSeq
-      createLocks should have size 1
-      createLocks.head.path("mv_key").asText() shouldBe "mv_t5aa_export"
-      createLocks.head.path("mode").asText() shouldBe "write"
-      createLocks.head.path("request_id").asText() shouldBe "request-t5aa-create"
-      createLocks.head.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
+      createLocks should have size 2
+      createLocks.count(_.path("lock_kind").asText() == "mv_data") shouldBe 1
+      createLocks.count(_.path("lock_kind").asText() == "create_publication") shouldBe 1
+      createLocks.foreach { entry =>
+        entry.path("requested_epoch_ms").asLong() should be > 0L
+        entry.path("acquired_epoch_ms").asLong() should be >= entry.path("requested_epoch_ms").asLong()
+        entry.path("released_epoch_ms").asLong() should be >= entry.path("acquired_epoch_ms").asLong()
+        entry.path("wait_ms").asLong() should be >= 0L
+        entry.path("hold_ms").asLong() should be >= 0L
+      }
+      val createDataLock = createLocks.find(_.path("lock_kind").asText() == "mv_data").get
+      createDataLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createDataLock.path("mode").asText() shouldBe "write"
+      createDataLock.path("request_id").asText() shouldBe "request-t5aa-create"
+      createDataLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
+      val createPublicationLock = createLocks.find(_.path("lock_kind").asText() == "create_publication").get
+      createPublicationLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createPublicationLock.path("mode").asText() shouldBe "write"
+      createPublicationLock.path("request_id").asText() shouldBe "request-t5aa-create"
+      createPublicationLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
+      createLocks.map(_.path("wait_ms").asLong()).sum shouldBe create.path("same_mv_lock_wait_ms").asLong()
 
       val refresh = byOperation("refresh")
       refresh.path("request_id").asText() shouldBe "request-t5aa-refresh"
@@ -2767,8 +2783,11 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       entries should have size 2
       val upstreamRead = entries.find(_.path("mv_key").asText() == upstream).get
       upstreamRead.path("mode").asText() shouldBe "read"
+      upstreamRead.path("lock_kind").asText() shouldBe "mv_data"
       val targetWrite = entries.find(_.path("mv_key").asText() == right).get
       targetWrite.path("mode").asText() shouldBe "write"
+      targetWrite.path("lock_kind").asText() shouldBe "mv_data"
+      span.path("same_mv_lock_wait_ms").asLong() shouldBe entries.map(_.path("wait_ms").asLong()).sum
       entries.foreach { entry =>
         entry.path("requested_epoch_ms").asLong() should be > 0L
         entry.path("acquired_epoch_ms").asLong() should be >= entry.path("requested_epoch_ms").asLong()
@@ -2776,6 +2795,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         entry.path("wait_ms").asLong() should be >= 0L
         entry.path("hold_ms").asLong() should be >= 0L
         entry.path("thread").asText() should not be empty
+        entry.path("lock_kind").asText() shouldBe "mv_data"
         entry.path("request_id").asText() shouldBe "req-reader-right"
         entry.path("dbt_node_id").asText() shouldBe "model.reader.right"
       }
@@ -2829,7 +2849,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       byRequest("req-create-1").head.path("dbt_node_id").asText() shouldBe "model.create.one"
       val waitingCreate = byRequest("req-create-2").head
       waitingCreate.path("dbt_node_id").asText() shouldBe "model.create.two"
-      waitingCreate.path("same_mv_lock_wait_ms").asLong() should be > 0L
+      val waitingLocks = waitingCreate.path("lock_acquisitions").elements().asScala.toSeq
+      waitingLocks should have size 2
+      val publicationWait = waitingLocks.find(_.path("lock_kind").asText() == "create_publication").get
+      publicationWait.path("mode").asText() shouldBe "write"
+      publicationWait.path("wait_ms").asLong() should be > 0L
+      waitingLocks.find(_.path("lock_kind").asText() == "mv_data").get.path("wait_ms").asLong() shouldBe 0L
+      waitingCreate.path("same_mv_lock_wait_ms").asLong() shouldBe waitingLocks.map(_.path("wait_ms").asLong()).sum
 
       assertBagEqual("mv_t14a_create_span", createSql)
     }

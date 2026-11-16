@@ -334,6 +334,7 @@ private[spark] object RefreshMutex {
         val releasedEpochMs = System.currentTimeMillis()
         OpenIvmExecutionSpan.recordActiveLockAcquisition(
           key,
+          "mv_data",
           mode match {
             case Read  => "read"
             case Write => "write"
@@ -355,27 +356,67 @@ private[spark] object RefreshMutex {
 
 private[spark] object CreatePublicationMutex {
 
-  private val locks: java.util.Map[String, ReentrantLock] =
-    Collections.synchronizedMap(new java.util.HashMap[String, ReentrantLock]())
+  private final class Guard {
+    val lock                = new ReentrantLock(true)
+    val publicationComplete = lock.newCondition()
+    var publicationPending  = false
+  }
 
-  def withLock[A](mvKey: String)(body: => A): A = {
+  private val locks: java.util.Map[String, Guard] =
+    Collections.synchronizedMap(new java.util.HashMap[String, Guard]())
+
+  def withLock[A](mvKey: String)(body: => A)(afterRelease: => Unit): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
-    val lock =
+    val guard =
       if (existing != null) existing
       else
         locks.synchronized {
           val again = locks.get(key)
           if (again != null) again
           else {
-            val created = new ReentrantLock(true)
+            val created = new Guard
             locks.put(key, created)
             created
           }
         }
-    lock.lock()
+    val waitStarted      = System.nanoTime()
+    val requestedEpochMs = System.currentTimeMillis()
+    guard.lock.lock()
+    while (guard.publicationPending) guard.publicationComplete.awaitUninterruptibly()
+    val acquiredAtNanos = System.nanoTime()
+    val acquiredEpochMs = System.currentTimeMillis()
     try body
-    finally lock.unlock()
+    finally {
+      guard.publicationPending = true
+      guard.lock.unlock()
+      val releasedAtNanos = System.nanoTime()
+      val releasedEpochMs = System.currentTimeMillis()
+      val waitMs          = TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted)
+      val thread          = Thread.currentThread().getName
+      OpenIvmMetrics.updateTimer("refresh.lock.wait", acquiredAtNanos - waitStarted)
+      try
+        OpenIvmExecutionSpan.recordActiveLockAcquisition(
+          key,
+          "create_publication",
+          "write",
+          requestedEpochMs,
+          acquiredEpochMs,
+          releasedEpochMs,
+          waitMs,
+          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+          thread
+        )
+      finally
+        try afterRelease
+        finally {
+          guard.lock.lock()
+          try {
+            guard.publicationPending = false
+            guard.publicationComplete.signal()
+          } finally guard.lock.unlock()
+        }
+    }
   }
 }
 
@@ -2946,12 +2987,12 @@ case class CreateMaterializedViewCommand(
             )
           }
         Seq.empty
-      } finally {
-        try finalizeCreate()
-        finally {
-          sqlLog.finish(createOutcome)
-          OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
-        }
+      }
+    } {
+      try finalizeCreate()
+      finally {
+        sqlLog.finish(createOutcome)
+        OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
       }
     }
   }

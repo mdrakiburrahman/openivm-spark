@@ -13,6 +13,7 @@ import scala.util.control.NonFatal
 
 private[telemetry] final case class LockAcquisitionTelemetry(
     mvKey: String,
+    lockKind: String,
     mode: String,
     requestedEpochMs: Long,
     acquiredEpochMs: Long,
@@ -98,13 +99,9 @@ final class OpenIvmExecutionSpan private[telemetry] (
       }
     }
 
-  def recordSameMvLockWait(durationMs: Long): Unit =
-    recordBeforeComplete {
-      sameMvLockWaitMs = addDuration(sameMvLockWaitMs, durationMs)
-    }
-
   def recordLockAcquisition(
       mvKey: String,
+      lockKind: String,
       mode: String,
       requestedEpochMs: Long,
       acquiredEpochMs: Long,
@@ -114,18 +111,21 @@ final class OpenIvmExecutionSpan private[telemetry] (
       thread: String
   ): Unit =
     recordBeforeEmit {
+      val normalizedWaitMs = math.max(0L, waitMs)
       lockAcquisitions :+= LockAcquisitionTelemetry(
         mvKey,
+        lockKind,
         mode,
         requestedEpochMs,
         acquiredEpochMs,
         releasedEpochMs,
-        math.max(0L, waitMs),
+        normalizedWaitMs,
         math.max(0L, holdMs),
         thread,
         dbtNodeId,
         requestId
       )
+      sameMvLockWaitMs = addDuration(sameMvLockWaitMs, normalizedWaitMs)
     }
 
   def recordDriverAdmissionWait(durationMs: Long): Unit =
@@ -472,6 +472,7 @@ object OpenIvmExecutionSpan extends Logging {
     acquisitions.foreach { acquisition =>
       val item = new LinkedHashMap[String, AnyRef]()
       item.put("mv_key", acquisition.mvKey)
+      item.put("lock_kind", acquisition.lockKind)
       item.put("mode", acquisition.mode)
       item.put("requested_epoch_ms", java.lang.Long.valueOf(acquisition.requestedEpochMs))
       item.put("acquired_epoch_ms", java.lang.Long.valueOf(acquisition.acquiredEpochMs))
@@ -718,6 +719,7 @@ object OpenIvmExecutionSpan extends Logging {
 
   def recordActiveLockAcquisition(
       mvKey: String,
+      lockKind: String,
       mode: String,
       requestedEpochMs: Long,
       acquiredEpochMs: Long,
@@ -729,6 +731,7 @@ object OpenIvmExecutionSpan extends Logging {
     Option(current.get()).foreach(
       _.recordLockAcquisition(
         mvKey,
+        lockKind,
         mode,
         requestedEpochMs,
         acquiredEpochMs,
@@ -770,8 +773,7 @@ object OpenIvmExecutionSpan extends Logging {
     if (nanos < 0L) return
     val durationMs = TimeUnit.NANOSECONDS.toMillis(nanos)
     metricName match {
-      case "refresh.lock.wait" =>
-        Option(current.get()).foreach(_.recordSameMvLockWait(durationMs))
+      case "refresh.lock.wait" => ()
       case "driver_admission.create.wait" =>
         withCurrentOrPending("create", durationMs)
       case "driver_admission.refresh.wait" =>
