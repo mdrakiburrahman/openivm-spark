@@ -35,7 +35,7 @@ private[openivm] object OpenIvmStateBarrier {
   }
 
   private[openivm] def withDbOperation[A](dbPath: String)(body: => A): A = {
-    var path = Paths.get(dbPath).toAbsolutePath.normalize()
+    var path                            = Paths.get(dbPath).toAbsolutePath.normalize()
     var barrier: ReentrantReadWriteLock = null
     while (path != null && barrier == null) {
       barrier = barriers.get(path)
