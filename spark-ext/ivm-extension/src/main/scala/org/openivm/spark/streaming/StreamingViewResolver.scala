@@ -1,5 +1,6 @@
 package org.openivm.spark.streaming
 
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
@@ -49,6 +50,12 @@ private[streaming] object StreamingViewResolver {
   }
 
   private def resolveBoundary(spark: SparkSession, relation: UnresolvedRelation): LogicalPlan = {
+    relation.multipartIdentifier match {
+      case Seq(format, path) if format.equalsIgnoreCase("text") && new Path(path).isAbsolute =>
+        val options = relation.options.asCaseSensitiveMap().asScala.toMap
+        return spark.readStream.format("text").options(options).load(path).queryExecution.analyzed
+      case _ =>
+    }
     if (isSessionCatalogTable(spark, relation.multipartIdentifier)) return relation
     val batch =
       try

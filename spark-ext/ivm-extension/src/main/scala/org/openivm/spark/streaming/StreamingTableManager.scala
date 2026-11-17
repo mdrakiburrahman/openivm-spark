@@ -931,17 +931,18 @@ object StreamingTableManager {
   private def resumableDrift(
       spark: SparkSession,
       manifest: StreamingTableManifest,
+      spec: StreamingTableSpec,
       definition: StreamingTableDefinition,
       expandsViews: Boolean
   ): Boolean =
     manifest.definitionHash != definition.fingerprint &&
       !StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, definition.semanticJson) &&
-      StreamingDefinitionDrift.resumable(
+      (StreamingDefinitionDrift.resumable(
         manifest.semanticJson,
         definition,
         expandsViews,
         StreamingDefinitionDrift.ignoreAnalyzedPlanDrift(spark)
-      )
+      ) || StreamingDefinitionDrift.equivalentTextPath(spark, manifest, spec, definition))
 
   private def prepareRebuildAdmission(
       spark: SparkSession,
@@ -959,7 +960,7 @@ object StreamingTableManager {
       val target   = StreamingTableMetadata.resolveDeltaTarget(spark, spec.name, requireTableIdMarker = true)
       val manifest = StreamingTableMetadata.readManifest(spark, target)
       StreamingTableMetadata.verifyOwned(spark, target, manifest)
-      if (compatibleDefinition(manifest, definition) || resumableDrift(spark, manifest, definition, expandsViews))
+      if (compatibleDefinition(manifest, definition) || resumableDrift(spark, manifest, spec, definition, expandsViews))
         None
       else {
         val descendants = StreamingTableMetadata
@@ -984,7 +985,7 @@ object StreamingTableManager {
       expandsViews: Boolean
   ): StreamingTableStatus = {
     reconcileResetJournal(spark, target, storedManifest, definition, runtime)
-    val manifest     = adoptResumableDrift(spark, target, storedManifest, definition, expandsViews)
+    val manifest     = adoptResumableDrift(spark, target, storedManifest, spec, definition, expandsViews)
     val adoptedDrift = manifest ne storedManifest
 
     val exactDefinition            = manifest.definitionHash == definition.fingerprint
@@ -1143,6 +1144,7 @@ object StreamingTableManager {
     * @param spark          active session
     * @param target         owned streaming target
     * @param storedManifest manifest persisted for the target
+    * @param spec           submitted source declaration
     * @param definition     freshly analyzed definition of the submitted declaration
     * @param expandsViews   whether the submitted declaration expanded a view
     * @return the manifest reconciliation continues with
@@ -1151,10 +1153,11 @@ object StreamingTableManager {
       spark: SparkSession,
       target: StreamingTableTarget,
       storedManifest: StreamingTableManifest,
+      spec: StreamingTableSpec,
       definition: StreamingTableDefinition,
       expandsViews: Boolean
   ): StreamingTableManifest =
-    if (resumableDrift(spark, storedManifest, definition, expandsViews))
+    if (resumableDrift(spark, storedManifest, spec, definition, expandsViews))
       StreamingTableMetadata.replaceManifest(spark, target, definition)
     else storedManifest
 

@@ -2,6 +2,13 @@ package org.openivm.spark.streaming
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType}
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+import org.apache.spark.sql.catalyst.plans.logical.{SubqueryAlias, View}
+import org.apache.spark.sql.openivm.StreamingDatasetAccess
+import org.openivm.spark.commands.CreateStreamingTableCommand
 
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
@@ -36,6 +43,93 @@ private[streaming] object StreamingDefinitionDrift {
     */
   def ignoreAnalyzedPlanDrift(spark: SparkSession): Boolean =
     spark.conf.getOption(IgnoreAnalyzedPlanDriftKey).exists(_.trim.equalsIgnoreCase("true"))
+
+  /** Prove a single DataFrame temporary-view TEXT source was only rewritten as a direct path.
+    * Reconstruct the old representation in memory and require its entire semantic definition to
+    * match, rather than deleting view wrappers or ignoring analyzed expressions in the saved plan.
+    */
+  def equivalentTextPath(
+      spark: SparkSession,
+      manifest: StreamingTableManifest,
+      spec: StreamingTableSpec,
+      requested: StreamingTableDefinition
+  ): Boolean = {
+    val stored     = Mapper.readTree(manifest.semanticJson)
+    val next       = Mapper.readTree(requested.semanticJson)
+    val oldSources = Option(stored.get(SourcesField)).filter(node => node.isArray && node.size() == 1)
+    val newSources = Option(next.get(SourcesField)).filter(node => node.isArray && node.size() == 1)
+    val sameSource = for {
+      before <- oldSources.map(_.get(0))
+      after  <- newSources.map(_.get(0))
+      if textField(before, "provider").contains("text") && textField(after, "provider").contains("text")
+      if fieldNames(before, after).filterNot(_ == OptionsField).forall(field => before.get(field) == after.get(field))
+      previous <- textOptions(before.get(OptionsField))
+      current  <- textOptions(after.get(OptionsField))
+      if qualifiedTextOptions(spark, previous) == qualifiedTextOptions(spark, current)
+    } yield previous
+    if (sameSource.isEmpty) return false
+
+    val direct = spec.query.collect { case relation: UnresolvedRelation => relation }
+    if (
+      direct.size != 1 || !direct.head.isStreaming ||
+      !direct.head.multipartIdentifier.headOption.exists(_.equalsIgnoreCase("text")) ||
+      direct.head.multipartIdentifier.size != 2 ||
+      !new org.apache.hadoop.fs.Path(direct.head.multipartIdentifier(1)).isAbsolute ||
+      spec.query.exists(_.expressions.exists(SubqueryExpression.hasSubquery))
+    ) return false
+
+    val query = textField(Mapper.readTree(manifest.diagnosticJson), "normalizedQuery")
+    if (query.isEmpty) return false
+    // Spark 3.5's bare parseQuery bypasses the DDL body's STREAM/WITH adapter.
+    val previousQuery = spark.sessionState.sqlParser.parsePlan(
+      s"CREATE STREAMING TABLE ${StreamingTableMetadata.quoteMultipart(spec.name)} AS ${query.get}"
+    ) match {
+      case command: CreateStreamingTableCommand => command.spec.query
+      case _                                    => return false
+    }
+    val previous = previousQuery.collect { case relation: UnresolvedRelation => relation }
+    if (
+      previous.size != 1 || previous.head.isStreaming || previous.head.multipartIdentifier.size != 1 ||
+      !previous.head.options.asCaseSensitiveMap().isEmpty
+    ) return false
+
+    val options = sameSource.get
+    val path    = options.get("path")
+    if (path.isEmpty) return false
+    val source   = spark.readStream.format("text").options(options - "path").load(path.get)
+    val viewName = previous.head.multipartIdentifier.head
+    val descriptor = CatalogTable(
+      identifier = TableIdentifier(viewName),
+      tableType = CatalogTableType.VIEW,
+      storage = CatalogStorageFormat.empty,
+      schema = source.schema,
+      properties = Map(CatalogTable.VIEW_STORING_ANALYZED_PLAN -> "true")
+    )
+    val view = SubqueryAlias(viewName, View(descriptor, isTempView = true, child = source.queryExecution.analyzed))
+    val declaration = spec.query.transformUp { case _: UnresolvedRelation => previous.head }
+    val rebound     = declaration.transformUp { case _: UnresolvedRelation => view }
+    val frame       = StreamingDatasetAccess.ofRows(spark, rebound)
+    val reconstructed = StreamingTableDefinition.build(
+      spark,
+      spec.copy(query = declaration),
+      frame.queryExecution.analyzed,
+      StreamingTableMetadata.canonicalIdentity(spark, spec.name),
+      StreamingRuntimeOptions.parse(spec.options)
+    )
+    StreamingTableDefinition.semanticallyEquivalent(manifest.semanticJson, reconstructed.semanticJson)
+  }
+
+  private def textOptions(node: JsonNode): Option[Map[String, String]] =
+    Option(node).filter(_.isObject).filter(_.elements().asScala.forall(_.isTextual)).map { options =>
+      options.fieldNames().asScala.map(key => key -> options.get(key).asText()).toMap
+    }
+
+  private def qualifiedTextOptions(spark: SparkSession, options: Map[String, String]): Map[String, String] =
+    options.map {
+      case (key @ ("path" | "sourcearchivedir"), value) =>
+        key -> StreamingTableMetadata.normalizePath(spark, value)
+      case other => other
+    }
 
   /** Whether a stored definition and a requested one describe the same stream although their
     * fingerprints differ.
