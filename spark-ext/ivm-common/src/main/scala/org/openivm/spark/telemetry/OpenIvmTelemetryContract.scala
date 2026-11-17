@@ -128,7 +128,7 @@ object OpenIvmTelemetryContract {
   )
 
   private[telemetry] val AllowedFields: Set[String] =
-    TextFields ++ IntegralFields + "source_versions"
+    TextFields ++ IntegralFields + "source_versions" + "lock_acquisitions"
 
   final case class ExecutionIdentity(
       campaignId: String,

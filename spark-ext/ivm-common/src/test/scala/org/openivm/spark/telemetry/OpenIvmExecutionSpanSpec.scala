@@ -101,8 +101,8 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
     it("attributes MV lock waits to monitor timers rather than barrier preparation") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.lock_metric_mv", "refresh")
-        OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(3L))
-        OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(5L))
+        span.recordLockAcquisition("default.lock_metric_mv", "mv_data", "write", 1L, 2L, 3L, 3L, 1L, "driver-lock")
+        span.recordLockAcquisition("default.lock_metric_mv", "mv_data", "read", 4L, 5L, 6L, 5L, 1L, "driver-lock")
         span.recordProfileStep("acquire_locks", "includes dependency lookup and validation", 10000L)
         span.complete("refresh_done", "driver-lock")
         OpenIvmMetrics.updateTimer("refresh.lock.wait", millis(99L))
@@ -111,7 +111,10 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       }
 
       payloads should have size 1
-      payloads.head.path("same_mv_lock_wait_ms").asLong(-1L) shouldBe 8L
+      val payload = payloads.head
+      payload.path("same_mv_lock_wait_ms").asLong(-1L) shouldBe 8L
+      payload.path("same_mv_lock_wait_ms").asLong() shouldBe
+        payload.path("lock_acquisitions").elements().asScala.map(_.path("wait_ms").asLong()).sum
     }
 
     it("does not infer a monitor wait from a barrier profile without timer observations") {
@@ -139,7 +142,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
           effectiveRefreshType = Some("AGGREGATE_GROUP"),
           refreshReason = Some("kept")
         )
-        OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(3L))
+        span.recordLockAcquisition("default.sales_mv", "mv_data", "write", 1L, 2L, 3L, 3L, 0L, "driver-1")
         OpenIvmExecutionSpan.observeTimer("driver_admission.refresh.wait", millis(7L))
         OpenIvmExecutionSpan.observeTimer("compiler.compile", millis(13L))
         OpenIvmExecutionSpan.observeTimer("catalog.mv_catalog.upsert", millis(5L))
@@ -287,7 +290,7 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
         )
       )
       span.recordPendingDeltaCount(2L)
-      OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(3L))
+      span.recordLockAcquisition(identity.materializedView, "mv_data", "write", 1L, 2L, 3L, 3L, 0L, "driver-schema")
       span.recordProfileStep("create_analyze_query", "", 5L)
       span.recordProfileStep("create_capture_watermarks", "", 7L)
       span.recordProfileStep("create_ctas_total", "", 11L)
@@ -765,7 +768,17 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
                   requestId = requestId,
                   dbtNodeId = dbtNodeId
                 )
-                OpenIvmExecutionSpan.observeTimer("refresh.lock.wait", millis(4L))
+                span.recordLockAcquisition(
+                  "default.concurrent_refresh_mv",
+                  "mv_data",
+                  "write",
+                  1L,
+                  2L,
+                  3L,
+                  4L,
+                  0L,
+                  Thread.currentThread().getName
+                )
                 span.complete("refresh_done", Thread.currentThread().getName)
                 span.emitIfNeeded("failed_before_end", "unused")
               }

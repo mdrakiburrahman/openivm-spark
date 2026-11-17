@@ -134,7 +134,7 @@ final class RefreshProfile private (
     * buffer. Idempotent — a no-op on inactive instances or after a prior
     * flush.
     */
-  def flush(): Unit = {
+  def flush(deferExecutionSpanEmission: Boolean = false): Unit = {
     try {
       completeSpan("failed_before_end", Thread.currentThread().getName)
       if (active) {
@@ -172,8 +172,10 @@ final class RefreshProfile private (
         }
       }
     } finally {
-      executionSpan.emitIfNeeded("failed_before_end", Thread.currentThread().getName)
-      RefreshProfile.clearActive(this)
+      if (deferExecutionSpanEmission) RefreshProfile.clearActive(this, clearExecutionSpan = false)
+      else
+        try executionSpan.emitIfNeeded("failed_before_end", Thread.currentThread().getName)
+        finally RefreshProfile.clearActive(this)
     }
   }
 
@@ -232,9 +234,9 @@ object RefreshProfile {
 
   private val current = new ThreadLocal[RefreshProfile]()
 
-  private[commands] def clearActive(profile: RefreshProfile): Unit = {
+  private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
     if (current.get() eq profile) current.remove()
-    OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
+    if (clearExecutionSpan) OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
   }
 
   def flushActive(): Unit = Option(current.get()).foreach(_.flush())
