@@ -2946,22 +2946,20 @@ case class CreateMaterializedViewCommand(
           val threadName = Thread.currentThread().getName
           val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
           profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-          val outcome = OpenIvmStateBarrier.withMutation(spark) {
-            org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-              OpenIvmMetrics.CreateInflight.incrementAndGet()
-              try {
-                CommandConcurrencyInjection.maybePauseBeforeCreate()
-                DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                  runCreate(
-                    isolated,
-                    profile,
-                    sqlLog,
-                    createUpstreamReadKeys.toSet,
-                    classification => createInsightClassification = Some(classification)
-                  )
-                }
-              } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
-            }
+          val outcome = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+            OpenIvmMetrics.CreateInflight.incrementAndGet()
+            try {
+              CommandConcurrencyInjection.maybePauseBeforeCreate()
+              DriverHeavyOperationAdmission.withPermit(spark, "create") {
+                runCreate(
+                  isolated,
+                  profile,
+                  sqlLog,
+                  createUpstreamReadKeys.toSet,
+                  classification => createInsightClassification = Some(classification)
+                )
+              }
+            } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
           }
           // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
@@ -3948,13 +3946,15 @@ case class CreateMaterializedViewCommand(
           // a `DeltaTable.history` read would submit a Spark job that has to
           // queue behind the concurrent Delta data writes for a task slot.
           val version = DeltaTableVersion.requireLatest(spark, dataLocation)
-          groupedInitial.foreach { initial =>
-            profile.timeStep("create_grouped_window_commit", s"version=$version") {
-              initial.commit(dataLocation, version)
+          OpenIvmStateBarrier.withMutation(spark) {
+            groupedInitial.foreach { initial =>
+              profile.timeStep("create_grouped_window_commit", s"version=$version") {
+                initial.commit(dataLocation, version)
+              }
             }
+            MvCatalog.upsert(spark, meta.copy(lastVersion = version))
+            publicationCommitted = true
           }
-          MvCatalog.upsert(spark, meta.copy(lastVersion = version))
-          publicationCommitted = true
         }
       }
     } catch {
@@ -3962,7 +3962,9 @@ case class CreateMaterializedViewCommand(
         if (!publicationCommitted) {
           cleanupFailedCreatePublicView(spark, name, createdPublicView)
           if (rollbackOwnedArtifactsOnFailure)
-            cleanupFailedCreateArtifacts(spark, name, dataIdent, dataLocation, writtenDataTableId)
+            OpenIvmStateBarrier.withMutation(spark) {
+              cleanupFailedCreateArtifacts(spark, name, dataIdent, dataLocation, writtenDataTableId)
+            }
         }
         throw t
     } finally {
