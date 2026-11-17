@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -1034,6 +1034,47 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     sharedCompiler.declareRelyFkStatements(req) should contain only
       """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
+  }
+
+  it should "apply qualified source delta shapes to the short DuckDB compiler tables" in {
+    val sources = Map(
+      "orders"   -> StructType.fromDDL("order_id INT, product_id INT"),
+      "products" -> StructType.fromDDL("product_id INT, product_name STRING")
+    )
+    val qualifiedFacts = WorkloadFacts(
+      deltaShape = Map("sales.orders" -> DeltaShape.InsertOnly, "catalog.sales.products" -> DeltaShape.Unchanged)
+    )
+    val req = CompileRequest(
+      viewName = "mv_qualified_delta_shape",
+      viewSql =
+        "SELECT o.order_id, p.product_name FROM sales.orders o JOIN catalog.sales.products p ON o.product_id = p.product_id",
+      sources = sources,
+      sourceQualifiedNames = Map("orders" -> "sales.orders", "products" -> "catalog.sales.products"),
+      facts = qualifiedFacts
+    )
+    sharedCompiler.nativeDeltaShape(req) shouldBe Map(
+      "orders"   -> DeltaShape.InsertOnly,
+      "products" -> DeltaShape.Unchanged
+    )
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
+    ) shouldBe Map("other.products" -> DeltaShape.Unchanged)
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts =
+        WorkloadFacts(deltaShape =
+          Map(
+            "catalog.sales.products" -> DeltaShape.Unchanged,
+            "products"               -> DeltaShape.InsertOnly
+          )
+        )
+      )
+    ) shouldBe Map("products" -> DeltaShape.General)
+
+    val compiled = sharedCompiler.compile(req)
+    compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+    val viewDelta = compiled.sql.take(compiled.sql.indexOf("INSERT INTO openivm_delta_mv_qualified_delta_shape"))
+    viewDelta should include("openivm_delta_orders")
+    viewDelta should not include "openivm_delta_products"
   }
 
   it should "terminate a stalled DuckDB CLI within the compilation deadline" in {
