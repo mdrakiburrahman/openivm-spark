@@ -120,7 +120,7 @@ object OpenIvmStateSync {
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
-  @volatile private var beforeCaptureHookForTesting: () => Unit                        = null
+  @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
@@ -365,7 +365,7 @@ object OpenIvmStateSync {
       OpenIvmStateBarrier.withCapture(spark) {
         OpenIvmSnapshotArchive.checkInterrupted()
         val localBase = local.toPath
-        val files = backupFiles(local)
+        val files     = backupFiles(local)
         val databases = files
           .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
           .map(_.getParentFile.toPath)
@@ -392,10 +392,10 @@ object OpenIvmStateSync {
           if (hook != null) hook(file)
         }
       )
-      val archiveBytes = archive.length()
-      val checksum = OpenIvmSnapshotArchive.sha256(archive)
+      val archiveBytes  = archive.length()
+      val checksum      = OpenIvmSnapshotArchive.sha256(archive)
       val remoteArchive = new Path(remoteRoot, "snapshot.zip")
-      val copyHook = copyLocalFileHookForTesting
+      val copyHook      = copyLocalFileHookForTesting
       if (copyHook != null) copyHook(fs, archive, remoteArchive)
       else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
       OpenIvmSnapshotArchive.checkInterrupted()

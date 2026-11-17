@@ -4169,19 +4169,19 @@ case class RefreshMaterializedViewCommand(
       val writeKeys = viewMeta +: downstreamWriteKeys
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         OpenIvmStateBarrier.withMutation(spark) {
-        // Under the acquired upstream locks, re-verify each upstream MV still has
-        // the exact physical Delta identity the map recorded at CREATE; a rebind,
-        // vanished upstream, or catalog read failure fails the refresh closed.
-        validateUpstreamMvDependenciesUnderLock(spark, name, upstreamMvDeps)
-        val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-        OpenIvmMetrics.RefreshInflight.incrementAndGet()
-        try {
-          DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
-            org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-              runUnderLock(cloned, lockAcqMs)
+          // Under the acquired upstream locks, re-verify each upstream MV still has
+          // the exact physical Delta identity the map recorded at CREATE; a rebind,
+          // vanished upstream, or catalog read failure fails the refresh closed.
+          validateUpstreamMvDependenciesUnderLock(spark, name, upstreamMvDeps)
+          val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
+          OpenIvmMetrics.RefreshInflight.incrementAndGet()
+          try {
+            DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
+              org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
+                runUnderLock(cloned, lockAcqMs)
+              }
             }
-          }
-        } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
+          } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
         }
       }
       // In async mode the same publication ordering holds in the background.

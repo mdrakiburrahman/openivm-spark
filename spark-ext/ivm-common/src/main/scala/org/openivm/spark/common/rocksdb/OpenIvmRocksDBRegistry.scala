@@ -397,7 +397,7 @@ object OpenIvmRocksDBRegistry {
       destination: java.nio.file.Path
   ): Unit = {
     val canonicalPath = canonicalLocalPath(dbPath)
-    var completed = false
+    var completed     = false
     while (!completed) {
       val slot = slotFor(canonicalPath)
       try {

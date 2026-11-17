@@ -991,7 +991,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       )
       (1 to 100).foreach { index =>
         val directory = new File(stateRoot, s"_openivm/mvs/root-$index/rocksdb")
-        val db = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
+        val db        = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
         db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8(index.toString)))
       }
       val entered = new CountDownLatch(1)
@@ -1032,7 +1032,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         )
       )
       val directory = new File(stateRoot, "_openivm/mvs/failure/rocksdb")
-      val db = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
+      val db        = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
       db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("value")))
       OpenIvmStateSync.setCopyLocalFileHookForTesting { (_, _, _) =>
         throw new java.io.IOException("packed upload failed")
@@ -1140,8 +1140,8 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         )
       )
       val dbPath = new File(stateRoot, "_openivm/mvs/mutation/rocksdb").getAbsolutePath
-      val db = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
-      val key = RocksDBCodec.utf8("key")
+      val db     = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta"))
+      val key    = RocksDBCodec.utf8("key")
       db.withBatch(batch => db.put(batch, "meta", key, RocksDBCodec.utf8("before")))
       val copies = new AtomicInteger(0)
       OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
@@ -1155,7 +1155,9 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       OpenIvmRocksDBRegistry.closeAll()
       deleteRecursively(new File(stateRoot, "_openivm"))
       OpenIvmStateSync.resetForTesting()
-      OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, Seq("meta")).get("meta", key)
+      OpenIvmRocksDBRegistry
+        .getOrOpen(spark, dbPath, Seq("meta"))
+        .get("meta", key)
         .map(RocksDBCodec.fromUtf8) shouldBe Some("before")
     }
 
@@ -1170,7 +1172,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         )
       )
       val directory = new File(stateRoot, "_openivm/mvs/interrupt/rocksdb")
-      val db = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
+      val db        = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
       db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("value")))
       OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => Thread.currentThread().interrupt())
       try {
@@ -1599,20 +1601,18 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
           FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
         )
       )
-      val paths = Seq("left", "right").map(name =>
-        new File(stateRoot, s"_openivm/mvs/$name/rocksdb").getAbsolutePath
-      )
+      val paths = Seq("left", "right").map(name => new File(stateRoot, s"_openivm/mvs/$name/rocksdb").getAbsolutePath)
       val databases = paths.map(path => OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta")))
-      val key = RocksDBCodec.utf8("key")
+      val key       = RocksDBCodec.utf8("key")
       def write(db: OpenIvmRocksDB, value: String): Unit =
         db.withBatch(batch => db.put(batch, "meta", key, RocksDBCodec.utf8(value)))
       databases.foreach(write(_, "zero"))
-      val halfway = new CountDownLatch(1)
+      val halfway        = new CountDownLatch(1)
       val finishMutation = new CountDownLatch(1)
       val captureStarted = new CountDownLatch(1)
-      val packing = new CountDownLatch(1)
-      val finishPacking = new CountDownLatch(1)
-      val firstFile = new AtomicBoolean(true)
+      val packing        = new CountDownLatch(1)
+      val finishPacking  = new CountDownLatch(1)
+      val firstFile      = new AtomicBoolean(true)
       OpenIvmStateSync.setBeforeCaptureHookForTesting(() => captureStarted.countDown())
       OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { _ =>
         if (firstFile.compareAndSet(true, false)) {
@@ -1648,8 +1648,10 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         deleteRecursively(new File(stateRoot, "_openivm"))
         OpenIvmStateSync.resetForTesting()
         paths.foreach { path =>
-          OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
-            .get("meta", key).map(RocksDBCodec.fromUtf8) shouldBe Some("one")
+          OpenIvmRocksDBRegistry
+            .getOrOpen(spark, path, Seq("meta"))
+            .get("meta", key)
+            .map(RocksDBCodec.fromUtf8) shouldBe Some("one")
         }
       } finally {
         finishMutation.countDown()
@@ -1660,7 +1662,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     }
 
     it("restores coherent shards after backup under sustained concurrent writes") {
-      val stateRoot = newDir("state-sync-concurrent-local")
+      val stateRoot  = newDir("state-sync-concurrent-local")
       val remoteRoot = newDir("state-sync-concurrent-remote")
       val spark = newSpark(
         "state-sync-concurrent-writers",
@@ -1669,16 +1671,14 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
           FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
         )
       )
-      val paths = Seq("left", "right").map(name =>
-        new File(stateRoot, s"_openivm/mvs/$name/rocksdb").getAbsolutePath
-      )
+      val paths = Seq("left", "right").map(name => new File(stateRoot, s"_openivm/mvs/$name/rocksdb").getAbsolutePath)
       val databases = paths.map(path => OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta")))
-      val running = new AtomicBoolean(true)
-      val started = new CountDownLatch(8)
+      val running   = new AtomicBoolean(true)
+      val started   = new CountDownLatch(8)
       withPool(8) { execution =>
         val workers = (0 until 8).map { index =>
           Future {
-            val key = RocksDBCodec.utf8(s"writer-$index")
+            val key     = RocksDBCodec.utf8(s"writer-$index")
             var version = 0
             while (running.get()) {
               version += 1
@@ -1704,7 +1704,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       OpenIvmStateSync.resetForTesting()
       val restored = paths.map(path => OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta")))
       (0 until 8).foreach { index =>
-        val key = RocksDBCodec.utf8(s"writer-$index")
+        val key    = RocksDBCodec.utf8(s"writer-$index")
         val values = restored.map(_.get("meta", key).map(RocksDBCodec.fromUtf8))
         values.head should not be empty
         values.head shouldBe values.last

@@ -59,40 +59,40 @@ case class StagedDmlNode(
   override def run(spark: SparkSession): Seq[Row] =
     OpenIvmStateBarrier.withMutation(spark) {
       StagedDmlNode.withBaseTableMutationLock(baseTable) {
-      val previousBypass = IvmDmlInterceptorRule.bypass.get()
-      IvmDmlInterceptorRule.bypass.set(true)
-      try {
-        val before = SourceChangeLedger.reconcileLocked(spark, baseTable)
-        val preDeltas = stagingOps.map { case (preReadPlan, stagPath, opTyp) =>
-          writeStagingDelta(spark, preReadPlan, stagPath, opTyp)
-        }
+        val previousBypass = IvmDmlInterceptorRule.bypass.get()
+        IvmDmlInterceptorRule.bypass.set(true)
         try {
-          // Execute the original DML. With bypass=true our rule is a no-op so
-          // Delta can lower / plan / execute without re-interception.
-          spark.sessionState.executePlan(dml).executedPlan.executeCollect()
-        } catch {
-          case failure: Throwable =>
-            preDeltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
-            throw failure
-        }
+          val before = SourceChangeLedger.reconcileLocked(spark, baseTable)
+          val preDeltas = stagingOps.map { case (preReadPlan, stagPath, opTyp) =>
+            writeStagingDelta(spark, preReadPlan, stagPath, opTyp)
+          }
+          try {
+            // Execute the original DML. With bypass=true our rule is a no-op so
+            // Delta can lower / plan / execute without re-interception.
+            spark.sessionState.executePlan(dml).executedPlan.executeCollect()
+          } catch {
+            case failure: Throwable =>
+              preDeltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
+              throw failure
+          }
 
-        // Records publish only once complete: if staging the post-DML image fails, nothing is
-        // published and the commit is captured from the Delta log by the next reconciliation.
-        val deltas = mutable.ArrayBuffer.empty[StagingDelta] ++= preDeltas
-        try
-          for ((postReadPlan, stagPath, opTyp) <- postStagingOps)
-            deltas += writeStagingDelta(spark, postReadPlan, stagPath, opTyp)
-        catch {
-          case failure: Throwable =>
-            deltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
-            throw failure
+          // Records publish only once complete: if staging the post-DML image fails, nothing is
+          // published and the commit is captured from the Delta log by the next reconciliation.
+          val deltas = mutable.ArrayBuffer.empty[StagingDelta] ++= preDeltas
+          try
+            for ((postReadPlan, stagPath, opTyp) <- postStagingOps)
+              deltas += writeStagingDelta(spark, postReadPlan, stagPath, opTyp)
+          catch {
+            case failure: Throwable =>
+              deltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
+              throw failure
+          }
+          val published = SourceChangeLedger.publishWrite(spark, baseTable, before, deltas.toVector)
+          if (OpenIvmInsightsBroker.hasActiveRegularSparkCapture(spark))
+            StagedDmlNode.emitChangeCapture(spark, baseTable, published, dependentMaterializedViews)
+        } finally {
+          IvmDmlInterceptorRule.bypass.set(previousBypass)
         }
-        val published = SourceChangeLedger.publishWrite(spark, baseTable, before, deltas.toVector)
-        if (OpenIvmInsightsBroker.hasActiveRegularSparkCapture(spark))
-          StagedDmlNode.emitChangeCapture(spark, baseTable, published, dependentMaterializedViews)
-      } finally {
-        IvmDmlInterceptorRule.bypass.set(previousBypass)
-      }
         Seq.empty
       }
     }

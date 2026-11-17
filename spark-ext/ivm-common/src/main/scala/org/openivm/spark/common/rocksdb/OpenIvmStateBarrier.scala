@@ -17,9 +17,9 @@ private[openivm] object OpenIvmStateBarrier {
   private def forRoot(path: Path): ReentrantReadWriteLock =
     barriers.computeIfAbsent(path, _ => new ReentrantReadWriteLock(true))
 
-  private def withRead[A](barrier: ReentrantReadWriteLock, allowBarge: Boolean = false)(body: => A): A = {
+  private def withRead[A](barrier: ReentrantReadWriteLock)(body: => A): A = {
     val lock = barrier.readLock()
-    if (!allowBarge || !lock.tryLock()) lock.lockInterruptibly()
+    lock.lockInterruptibly()
     try body
     finally lock.unlock()
   }
@@ -42,11 +42,14 @@ private[openivm] object OpenIvmStateBarrier {
       barrier = barriers.get(path)
       path = path.getParent
     }
-    if (barrier == null) body else withRead(barrier, allowBarge = true)(body)
+    if (barrier == null) body else withRead(barrier)(body)
   }
 
   private[rocksdb] def withCapture[A](spark: SparkSession)(body: => A): A = {
-    val lock = forRoot(root(spark)).writeLock()
+    val barrier = forRoot(root(spark))
+    if (barrier.getReadHoldCount > 0 && !barrier.isWriteLockedByCurrentThread)
+      throw new IllegalStateException("OpenIVM state capture cannot run inside a state mutation")
+    val lock = barrier.writeLock()
     lock.lockInterruptibly()
     try body
     finally lock.unlock()

@@ -1,7 +1,13 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, OpenIvmStateBarrier, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{
+  OpenIvmRocksDB,
+  OpenIvmRocksDBBatchOps,
+  OpenIvmRocksDBRegistry,
+  OpenIvmStateBarrier,
+  RocksDBCodec
+}
 
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}

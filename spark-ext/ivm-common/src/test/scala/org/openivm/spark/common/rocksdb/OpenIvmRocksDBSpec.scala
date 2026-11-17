@@ -160,11 +160,11 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
   describe("OpenIvmRocksDB") {
     it("restores a committed checkpoint independently of later writes") {
       for (walEnabled <- Seq(true, false); multiProcess <- Seq(true, false)) {
-        val root = newDbDir(s"checkpoint-$walEnabled-$multiProcess")
-        val conf = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled, multiProcess = multiProcess)
-        val db = new OpenIvmRocksDB(new File(root, "live").getAbsolutePath, conf, Seq("meta", "properties"))
+        val root     = newDbDir(s"checkpoint-$walEnabled-$multiProcess")
+        val conf     = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled, multiProcess = multiProcess)
+        val db       = new OpenIvmRocksDB(new File(root, "live").getAbsolutePath, conf, Seq("meta", "properties"))
         val restored = new OpenIvmRocksDB(new File(root, "snapshot").getAbsolutePath, conf, Seq("meta", "properties"))
-        val key = RocksDBCodec.utf8("key")
+        val key      = RocksDBCodec.utf8("key")
         try {
           db.withBatch { batch =>
             db.put(batch, "meta", key, RocksDBCodec.utf8("before"))

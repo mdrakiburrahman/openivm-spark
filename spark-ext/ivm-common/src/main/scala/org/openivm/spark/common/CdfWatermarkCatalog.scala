@@ -1,7 +1,13 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, OpenIvmStateBarrier, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{
+  OpenIvmRocksDB,
+  OpenIvmRocksDBBatchOps,
+  OpenIvmRocksDBRegistry,
+  OpenIvmStateBarrier,
+  RocksDBCodec
+}
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
