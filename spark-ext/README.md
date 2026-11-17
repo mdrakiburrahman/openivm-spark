@@ -8,11 +8,17 @@ covered failures propagate and a later explicit request can retry. Fair pass
 admission prevents asynchronous work overtaking waiting synchronous requests.
 
 New generations pack the complete state tree into one immutable `snapshot.zip`
-under `.openivm-state-sync/snapshots/<generation>/`. Packing is local; a stable
-generation requires identical path/size/mtime signatures before packing, after
-packing, and after remote upload. Rotation or mutation retries up to 20 passes.
-Each stable generation uses one data-object upload regardless of file count.
-No request succeeds before upload/close, validation and atomic commit publication.
+under `.openivm-state-sync/snapshots/<generation>/`. A local capture barrier
+drains in-flight state mutations and checkpoints each RocksDB shard, including
+its OpenIVM transaction manifests, as one coherent generation. Compression
+and upload run after the barrier is released, so later mutations can proceed.
+Each generation uses one data-object upload regardless of file count.
+No synchronous request succeeds before upload/close, validation and atomic
+commit publication.
+
+The capture barrier coordinates threads within one driver JVM. Existing
+per-database multi-process locking remains in force, but the barrier does not
+provide an atomic cross-process cut or order publishers in different processes.
 
 The closed `OPENIVM_STATE_SNAPSHOT_V2` completion record contains generation,
 archive length and SHA256; same-filesystem rename publishes it under
@@ -22,8 +28,8 @@ publishing local state. Corrupt committed snapshots fail closed, without falling
 back to older or empty state. Incomplete generations are ignored.
 
 V1 committed tree snapshots and legacy flat snapshots remain readable. Older
-readers cannot read V2: downgrades must not silently reuse V2 state. Generations
-are retained; this change adds no garbage collection. Archives are bounded to
+readers cannot read V2: downgrades must not silently reuse V2 state. Old
+generations are pruned according to the configured retention. Archives are bounded to
 100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
 rejected.
 
