@@ -94,8 +94,8 @@ class ConcurrencyStateSyncSpec extends ConcurrencyScenarios with InterceptMode {
     RefreshSqlLogAsyncFlusher.awaitQuiescence(60000L) shouldBe true
     OpenIvmStateSync.backupNow(spark)
     val snapshots = new File(warehouseDir, "state-sync-remote/.openivm-state-sync/snapshots")
-    val newest = snapshots.listFiles().filter(_.isDirectory).sortBy(_.getName).last
-    val archive = new ZipFile(new File(newest, "snapshot.zip"))
+    val newest    = snapshots.listFiles().filter(_.isDirectory).sortBy(_.getName).last
+    val archive   = new ZipFile(new File(newest, "snapshot.zip"))
     try {
       val entries = archive.entries().asScala.map(_.getName).toSet
       entries.exists(_.startsWith("refresh_profile/rocksdb/")) shouldBe true
