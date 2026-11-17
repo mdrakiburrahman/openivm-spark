@@ -8,6 +8,7 @@ import org.openivm.spark.common.rocksdb.{
   OpenIvmRocksDB,
   OpenIvmRocksDBBatchOps,
   OpenIvmRocksDBRegistry,
+  OpenIvmStateBarrier,
   OpenIvmStateSync,
   RocksDBCodec
 }
@@ -856,14 +857,15 @@ object MvCatalog {
   def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
     backend(spark).prepareCreate(spark, name)
 
-  def upsert(spark: SparkSession, meta: MvMetadata): Unit = backend(spark).upsert(spark, meta)
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit =
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
 
   def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
-    backend(spark).viewsForSource(spark, table)
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).viewsForSource(spark, table) }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
     backend(spark).advance(spark, name, newVersion)
@@ -874,7 +876,8 @@ object MvCatalog {
       properties: Map[String, String]
   ): Unit = backend(spark).updateProperties(spark, name, properties)
 
-  def remove(spark: SparkSession, name: TableIdentifier): Unit = backend(spark).remove(spark, name)
+  def remove(spark: SparkSession, name: TableIdentifier): Unit =
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).remove(spark, name) }
 
   def schemaFingerprint(
       sources: Map[String, StructType],

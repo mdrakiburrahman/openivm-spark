@@ -514,7 +514,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private def readCurrentVersion(): Long =
     manifestVersions.lastOption.getOrElse(0L)
 
-  private[rocksdb] def withWriteLock[A](body: => A): A = {
+  private[rocksdb] def withWriteLock[A](body: => A): A = OpenIvmStateBarrier.withDbOperation(normalizedDbPath) {
     writeMutex.lock()
     try body
     finally writeMutex.unlock()
@@ -778,7 +778,12 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * Always holds the in-JVM `writeMutex` so within one JVM concurrent
     * threads serialise; the external lock then mutexes other JVMs.
     */
-  private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A = {
+  private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A =
+    OpenIvmStateBarrier.withDbOperation(normalizedDbPath) {
+      withNativeHandleUnderBarrier(operation)(body)
+    }
+
+  private def withNativeHandleUnderBarrier[A](operation: String)(body: => A): A = {
     if (!OpenIvmRocksDBTelemetry.isActive && !OpenIvmMetrics.enabled) {
       return withWriteLock {
         if (closed) {

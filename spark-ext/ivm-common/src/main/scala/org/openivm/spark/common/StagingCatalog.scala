@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, OpenIvmStateBarrier, RocksDBCodec}
 
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
@@ -275,7 +275,12 @@ object StagingCatalog {
 
   def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     if (viewsByTable.isEmpty) return
+    OpenIvmStateBarrier.withMutation(spark) {
+      pruneFullyConsumedUnderBarrier(spark, viewsByTable)
+    }
+  }
 
+  private def pruneFullyConsumedUnderBarrier(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     val mvDbCache = mutable.HashMap.empty[String, Option[OpenIvmRocksDB]]
 
     def trackedMvDb(viewName: String): Option[OpenIvmRocksDB] =
@@ -401,6 +406,11 @@ object StagingCatalog {
     * @param sources  the view's qualified source names
     */
   def forgetConsumed(spark: SparkSession, viewName: String, sources: Seq[String]): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      forgetConsumedUnderBarrier(spark, viewName, sources)
+    }
+
+  private def forgetConsumedUnderBarrier(spark: SparkSession, viewName: String, sources: Seq[String]): Unit =
     openTrackedMvDb(spark, viewName).foreach { mvDb =>
       val referenced = sources.distinct.iterator.flatMap { source =>
         val dbPath = baseTableDbPath(spark, source)
@@ -423,7 +433,12 @@ object StagingCatalog {
     * path. Used by source-version advancement rollback before the operation is
     * published as committed metadata.
     */
-  def removeStagingPathEverywhere(spark: SparkSession, stagingPath: String): Unit = {
+  def removeStagingPathEverywhere(spark: SparkSession, stagingPath: String): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      removeStagingPathEverywhereUnderBarrier(spark, stagingPath)
+    }
+
+  private def removeStagingPathEverywhereUnderBarrier(spark: SparkSession, stagingPath: String): Unit = {
     OpenIvmStatePaths.existingBaseTableDbPaths(spark).foreach { dbPath =>
       val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
       val victims = baseDb

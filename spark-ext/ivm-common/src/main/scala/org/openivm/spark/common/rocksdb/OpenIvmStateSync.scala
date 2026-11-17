@@ -151,7 +151,7 @@ object OpenIvmStateSync {
     }
 
   private def stateSyncKey(spark: SparkSession, uri: String): String =
-    s"${spark.sparkContext.applicationId}|${canonicalLocalRoot(spark)}|$uri"
+    s"${canonicalLocalRoot(spark)}|$uri"
 
   private def effectiveStateSyncKey(spark: SparkSession, uri: String): String = {
     val hook = stateSyncKeyHookForTesting
@@ -176,7 +176,8 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    val key    = effectiveStateSyncKey(spark, uri)
+    OpenIvmStateBarrier.register(spark)
+    val key    = s"${spark.sparkContext.applicationId}|${effectiveStateSyncKey(spark, uri)}"
     val waiter = new CompletableFuture[Unit]()
     val prior  = restoreStates.putIfAbsent(key, waiter)
     if (prior != null) {
@@ -186,7 +187,9 @@ object OpenIvmStateSync {
     }
 
     try {
-      restoreNow(spark, uri)
+      OpenIvmStateBarrier.withCapture(spark) {
+        restoreNow(spark, uri)
+      }
       waiter.complete(())
     } catch {
       case error: Throwable =>
@@ -352,50 +355,49 @@ object OpenIvmStateSync {
     val remoteRoot = new Path(new Path(controlRoot, "snapshots"), generation)
     if (!fs.mkdirs(remoteRoot))
       throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
-    val localBase    = local.toPath
-    val archive      = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
-    var attempts     = 0
-    var stablePass   = false
-    var archiveBytes = 0L
-    var checksum     = ""
+    OpenIvmStateBarrier.register(spark)
+    val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
+    val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
     try {
-      while (!stablePass && attempts < 20) {
-        attempts += 1
+      OpenIvmStateBarrier.withCapture(spark) {
         OpenIvmSnapshotArchive.checkInterrupted()
-        val files    = backupFiles(local)
-        val initial  = backupSignature(localBase, files)
-        var vanished = false
-        try
-          OpenIvmSnapshotArchive.pack(
-            local,
-            files,
-            archive,
-            file => {
-              val hook = beforeLocalFileCopyHookForTesting
-              if (hook != null) hook(file)
-            }
-          )
-        catch {
-          case NonFatal(error) if !Thread.currentThread().isInterrupted && files.exists(file => !file.isFile) =>
-            vanished = true
+        val localBase = local.toPath
+        val files = backupFiles(local)
+        val databases = files
+          .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
+          .map(_.getParentFile.toPath)
+          .distinct
+          .sortBy(_.toString)
+        databases.foreach { db =>
+          val target = capture.toPath.resolve(localBase.relativize(db))
+          Files.createDirectories(target.getParent)
+          OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
         }
-        stablePass = !vanished && initial == backupSignature(localBase, backupFiles(local))
-        if (stablePass) {
-          archiveBytes = archive.length()
-          checksum = OpenIvmSnapshotArchive.sha256(archive)
-          val remoteArchive = new Path(remoteRoot, "snapshot.zip")
-          val copyHook      = copyLocalFileHookForTesting
-          if (copyHook != null) copyHook(fs, archive, remoteArchive)
-          else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
+        files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
-          if (fs.getFileStatus(remoteArchive).getLen != archiveBytes)
-            throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
-          stablePass = initial == backupSignature(localBase, backupFiles(local))
+          val target = capture.toPath.resolve(localBase.relativize(file.toPath))
+          Files.createDirectories(target.getParent)
+          Files.copy(file.toPath, target)
         }
-        if (!stablePass) Thread.sleep(50L)
       }
-      if (!stablePass)
-        throw new java.io.IOException(s"openivm state-sync: local RocksDB files kept changing while packing '$local'")
+      OpenIvmSnapshotArchive.pack(
+        capture,
+        backupFiles(capture),
+        archive,
+        file => {
+          val hook = beforeLocalFileCopyHookForTesting
+          if (hook != null) hook(file)
+        }
+      )
+      val archiveBytes = archive.length()
+      val checksum = OpenIvmSnapshotArchive.sha256(archive)
+      val remoteArchive = new Path(remoteRoot, "snapshot.zip")
+      val copyHook = copyLocalFileHookForTesting
+      if (copyHook != null) copyHook(fs, archive, remoteArchive)
+      else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
+      OpenIvmSnapshotArchive.checkInterrupted()
+      if (fs.getFileStatus(remoteArchive).getLen != archiveBytes)
+        throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
       val pendingCommit = new Path(commitRoot, s".$generation.pending")
       val committed     = new Path(commitRoot, s"$generation.commit")
       val output        = fs.create(pendingCommit, false)
@@ -410,10 +412,13 @@ object OpenIvmStateSync {
       if (!fs.rename(pendingCommit, committed))
         throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
       log.info(
-        s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes, $attempts passes) at $uri"
+        s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
       pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
-    } finally Files.deleteIfExists(archive.toPath)
+    } finally {
+      try Files.deleteIfExists(archive.toPath)
+      finally deleteStagedTree(capture)
+    }
   }
 
   /** Delete committed generations older than the newest `retain`, then snapshots and pending
@@ -462,15 +467,6 @@ object OpenIvmStateSync {
     listLocalFiles(local)
       .filterNot(file => isTransientRocksDbFile(file.getName))
       .sortBy(_.getAbsolutePath)
-
-  private def backupSignature(localBase: java.nio.file.Path, files: Seq[File]): Seq[(String, Long, Long)] =
-    files.map { file =>
-      (
-        localBase.relativize(file.toPath).toString,
-        file.length(),
-        file.lastModified()
-      )
-    }
 
   private def isTransientRocksDbFile(name: String): Boolean =
     name.endsWith(".crc") ||

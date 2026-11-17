@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, OpenIvmStateBarrier, RocksDBCodec}
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
@@ -196,7 +196,7 @@ object CdfWatermarkCatalog {
     backend(spark).putAll(spark, viewName, versionsBySource)
 
   def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
-    backend(spark).removeForBaseTable(spark, baseTable)
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).removeForBaseTable(spark, baseTable) }
 
   def removeForView(spark: SparkSession, viewName: String): Unit =
     backend(spark).removeForView(spark, viewName)

@@ -3,6 +3,7 @@ package org.openivm.spark.common
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.spark.sql.SparkSession
+import org.openivm.spark.common.rocksdb.OpenIvmStateBarrier
 import org.slf4j.LoggerFactory
 
 import java.util.concurrent.{ExecutorService, Executors}
@@ -40,6 +41,7 @@ object OpenIvmGarbageCollector {
   private final case class Sweep(
       hadoopConf: Configuration,
       warehouse: Path,
+      stateRoot: String,
       protectedPaths: Set[String],
       cutoffMs: Long,
       telemetry: Option[(Path, Long)]
@@ -86,6 +88,11 @@ object OpenIvmGarbageCollector {
     * @param plan  candidates from [[prepare]]
     */
   def collect(spark: SparkSession, plan: Option[Plan]): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      collectUnderBarrier(spark, plan)
+    }
+
+  private def collectUnderBarrier(spark: SparkSession, plan: Option[Plan]): Unit =
     plan.foreach { candidates =>
       try {
         val removed = candidates.tombstoned.filterNot(candidates.referenced.contains).filter { location =>
@@ -104,6 +111,7 @@ object OpenIvmGarbageCollector {
           val sweep = Sweep(
             spark.sessionState.newHadoopConf(),
             new Path(spark.conf.get("spark.sql.warehouse.dir")),
+            OpenIvmStateBarrier.root(spark).toString,
             candidates.referenced ++ candidates.tombstoned,
             now - FeatureGate.gcOrphanGracePeriodMs(spark),
             FeatureGate
@@ -128,6 +136,7 @@ object OpenIvmGarbageCollector {
       Sweep(
         spark.sessionState.newHadoopConf(),
         new Path(spark.conf.get("spark.sql.warehouse.dir")),
+        OpenIvmStateBarrier.root(spark).toString,
         plan.referenced ++ plan.tombstoned,
         nowMs - FeatureGate.gcOrphanGracePeriodMs(spark),
         FeatureGate
@@ -147,7 +156,7 @@ object OpenIvmGarbageCollector {
           if (
             !protectedPaths.contains(path.toString) &&
             lastModified(fs, location) < sweep.cutoffMs &&
-            fs.delete(path, true)
+            OpenIvmStateBarrier.withDbOperation(sweep.stateRoot) { fs.delete(path, true) }
           ) removed += 1
         }
       }
@@ -158,7 +167,8 @@ object OpenIvmGarbageCollector {
           val expired = rootFs
             .listStatus(root)
             .count(status =>
-              status.isFile && status.getModificationTime < expiryMs && rootFs.delete(status.getPath, false)
+              status.isFile && status.getModificationTime < expiryMs &&
+                OpenIvmStateBarrier.withDbOperation(sweep.stateRoot) { rootFs.delete(status.getPath, false) }
             )
           if (expired > 0) log.info(s"openivm gc: deleted $expired expired telemetry span(s) under $root")
         }

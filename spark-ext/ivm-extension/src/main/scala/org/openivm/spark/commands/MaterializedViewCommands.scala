@@ -40,7 +40,7 @@ import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
-import org.openivm.spark.common.rocksdb.OpenIvmStateSync
+import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
 import org.openivm.spark.compiler.{
   CompiledRefresh,
   CompileRequest,
@@ -2946,7 +2946,7 @@ case class CreateMaterializedViewCommand(
           val threadName = Thread.currentThread().getName
           val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
           profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-          val outcome =
+          val outcome = OpenIvmStateBarrier.withMutation(spark) {
             org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
               OpenIvmMetrics.CreateInflight.incrementAndGet()
               try {
@@ -2962,6 +2962,7 @@ case class CreateMaterializedViewCommand(
                 }
               } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
             }
+          }
           // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
             if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
@@ -4167,6 +4168,7 @@ case class RefreshMaterializedViewCommand(
         .getOrElse(Seq.empty)
       val writeKeys = viewMeta +: downstreamWriteKeys
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
+        OpenIvmStateBarrier.withMutation(spark) {
         // Under the acquired upstream locks, re-verify each upstream MV still has
         // the exact physical Delta identity the map recorded at CREATE; a rebind,
         // vanished upstream, or catalog read failure fails the refresh closed.
@@ -4180,6 +4182,7 @@ case class RefreshMaterializedViewCommand(
             }
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
+        }
       }
       // In async mode the same publication ordering holds in the background.
       val garbage = OpenIvmGarbageCollector.prepare(spark)
@@ -9143,7 +9146,7 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       meta: MvMetadata,
       operationId: String,
       probedOwnership: Option[LiveOwnership] = None
-  ): Unit = {
+  ): Unit = OpenIvmStateBarrier.withMutation(spark) {
     import MvCommandHelper._
 
     val viewName  = metaName(name)

@@ -10,6 +10,7 @@ import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.openivm.spark.common.{StagingCatalog, StagingDelta}
+import org.openivm.spark.common.rocksdb.OpenIvmStateBarrier
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
 
 import org.apache.hadoop.fs.Path
@@ -56,7 +57,8 @@ case class StagedDmlNode(
   override lazy val output: Seq[Attribute] = dml.output
 
   override def run(spark: SparkSession): Seq[Row] =
-    StagedDmlNode.withBaseTableMutationLock(baseTable) {
+    OpenIvmStateBarrier.withMutation(spark) {
+      StagedDmlNode.withBaseTableMutationLock(baseTable) {
       val previousBypass = IvmDmlInterceptorRule.bypass.get()
       IvmDmlInterceptorRule.bypass.set(true)
       try {
@@ -91,7 +93,8 @@ case class StagedDmlNode(
       } finally {
         IvmDmlInterceptorRule.bypass.set(previousBypass)
       }
-      Seq.empty
+        Seq.empty
+      }
     }
 
   private def writeStagingDelta(
