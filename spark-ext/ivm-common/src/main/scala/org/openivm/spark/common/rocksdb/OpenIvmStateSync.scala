@@ -120,6 +120,7 @@ object OpenIvmStateSync {
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
+  @volatile private var beforeCaptureHookForTesting: () => Unit                        = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
@@ -359,6 +360,8 @@ object OpenIvmStateSync {
     val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
     try {
+      val captureHook = beforeCaptureHookForTesting
+      if (captureHook != null) captureHook()
       OpenIvmStateBarrier.withCapture(spark) {
         OpenIvmSnapshotArchive.checkInterrupted()
         val localBase = local.toPath
@@ -488,6 +491,9 @@ object OpenIvmStateSync {
   private[rocksdb] def setBeforeLocalFileCopyHookForTesting(hook: File => Unit): Unit =
     beforeLocalFileCopyHookForTesting = hook
 
+  private[rocksdb] def setBeforeCaptureHookForTesting(hook: () => Unit): Unit =
+    beforeCaptureHookForTesting = hook
+
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
 
@@ -607,6 +613,7 @@ object OpenIvmStateSync {
     stateSyncKeyHookForTesting = null
     stateSyncUriHookForTesting = null
     beforeLocalFileCopyHookForTesting = null
+    beforeCaptureHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
     restoreStates.clear()
