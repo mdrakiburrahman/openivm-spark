@@ -1700,9 +1700,18 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         }
       }
       OpenIvmRocksDBRegistry.closeAll()
+      val oldApplicationId = spark.sparkContext.applicationId
+      spark.stop()
       deleteRecursively(new File(stateRoot, "_openivm"))
-      OpenIvmStateSync.resetForTesting()
-      val restored = paths.map(path => OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta")))
+      val fresh = newSpark(
+        "state-sync-concurrent-restore",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      fresh.sparkContext.applicationId should not be oldApplicationId
+      val restored = paths.map(path => OpenIvmRocksDBRegistry.getOrOpen(fresh, path, Seq("meta")))
       (0 until 8).foreach { index =>
         val key    = RocksDBCodec.utf8(s"writer-$index")
         val values = restored.map(_.get("meta", key).map(RocksDBCodec.fromUtf8))

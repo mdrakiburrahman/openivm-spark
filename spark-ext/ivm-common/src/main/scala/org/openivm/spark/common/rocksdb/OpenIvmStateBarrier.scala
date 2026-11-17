@@ -1,9 +1,8 @@
 package org.openivm.spark.common.rocksdb
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{FeatureGate, OpenIvmStatePaths}
 
-import java.io.File
 import java.nio.file.{Path, Paths}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -12,14 +11,14 @@ private[openivm] object OpenIvmStateBarrier {
   private val barriers = new ConcurrentHashMap[Path, ReentrantReadWriteLock]()
 
   private[openivm] def root(spark: SparkSession): Path =
-    new File(FeatureGate.stateWarehouse(spark), "_openivm").getCanonicalFile.toPath
+    OpenIvmStatePaths.openIvmRoot(spark).toFile.getCanonicalFile.toPath
 
   private def forRoot(path: Path): ReentrantReadWriteLock =
     barriers.computeIfAbsent(path, _ => new ReentrantReadWriteLock(true))
 
   private def withRead[A](barrier: ReentrantReadWriteLock)(body: => A): A = {
     val lock = barrier.readLock()
-    lock.lockInterruptibly()
+    lock.lock()
     try body
     finally lock.unlock()
   }

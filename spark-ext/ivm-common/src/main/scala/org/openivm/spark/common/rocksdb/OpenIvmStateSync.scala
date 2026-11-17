@@ -130,7 +130,7 @@ object OpenIvmStateSync {
   }
 
   private def localRoot(spark: SparkSession): File =
-    new File(FeatureGate.stateWarehouse(spark).stripSuffix("/") + "/_openivm")
+    OpenIvmStateBarrier.root(spark).toFile
 
   private def hasLocalStateFiles(root: File): Boolean = {
     if (!root.exists()) return false
