@@ -1,6 +1,7 @@
 package org.openivm.spark.common.rocksdb
 
 import org.rocksdb.{
+  Checkpoint,
   ColumnFamilyDescriptor,
   ColumnFamilyHandle,
   ColumnFamilyOptions,
@@ -917,6 +918,23 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * RocksDB shard in multi-process mode.
     */
   def withSession[A](body: => A): A = withNativeHandle("session")(body)
+
+  private[rocksdb] def checkpointTo(destination: java.nio.file.Path): Unit = withNativeHandle("checkpoint") {
+    val checkpoint = Checkpoint.create(dbHandle)
+    try checkpoint.createCheckpoint(destination.toString)
+    finally checkpoint.close()
+
+    val target = destination.resolve("openivm-manifests")
+    Files.createDirectories(target)
+    val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+    try
+      manifests.iterator().asScala.foreach { manifest =>
+        if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+          throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+        Files.copy(manifest, target.resolve(manifest.getFileName))
+      }
+    finally manifests.close()
+  }
 
   /** The write/session mutex protects both lifetime and cross-family coherence.
     * Check the cached handle under that mutex BEFORE entering withSession:

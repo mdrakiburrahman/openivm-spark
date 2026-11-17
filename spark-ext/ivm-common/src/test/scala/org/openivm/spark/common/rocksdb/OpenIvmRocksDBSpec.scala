@@ -158,6 +158,35 @@ class OpenIvmRocksDBSpec extends AnyFunSpec with Matchers {
   }
 
   describe("OpenIvmRocksDB") {
+    it("restores a committed checkpoint independently of later writes") {
+      for (walEnabled <- Seq(true, false); multiProcess <- Seq(true, false)) {
+        val root = newDbDir(s"checkpoint-$walEnabled-$multiProcess")
+        val conf = OpenIvmRocksDBConf.default.copy(walEnabled = walEnabled, multiProcess = multiProcess)
+        val db = new OpenIvmRocksDB(new File(root, "live").getAbsolutePath, conf, Seq("meta", "properties"))
+        val restored = new OpenIvmRocksDB(new File(root, "snapshot").getAbsolutePath, conf, Seq("meta", "properties"))
+        val key = RocksDBCodec.utf8("key")
+        try {
+          db.withBatch { batch =>
+            db.put(batch, "meta", key, RocksDBCodec.utf8("before"))
+            db.put(batch, "properties", key, RocksDBCodec.utf8("before"))
+          }
+          db.checkpointTo(new File(root, "snapshot").toPath)
+          db.withBatch { batch =>
+            db.put(batch, "meta", key, RocksDBCodec.utf8("after"))
+            db.put(batch, "properties", key, RocksDBCodec.utf8("after"))
+          }
+          restored.currentVersion shouldBe 1L
+          restored.get("meta", key).map(RocksDBCodec.fromUtf8) shouldBe Some("before")
+          restored.get("properties", key).map(RocksDBCodec.fromUtf8) shouldBe Some("before")
+          restored.prefixScan(OpenIvmRocksDB.InternalTxnColumnFamilyName, Array.emptyByteArray).toList shouldBe empty
+        } finally {
+          closeQuietly(restored)
+          closeQuietly(db)
+          deleteRecursively(root)
+        }
+      }
+    }
+
     it("opens and closes cleanly without leaving a stale lock") {
       val dir = newDbDir("open-close")
       val db1 = new OpenIvmRocksDB(dir.getAbsolutePath, OpenIvmRocksDBConf.default, Seq("meta"))
