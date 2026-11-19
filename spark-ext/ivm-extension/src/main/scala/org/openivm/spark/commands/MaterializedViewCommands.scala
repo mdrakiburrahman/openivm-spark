@@ -5449,8 +5449,12 @@ case class RefreshMaterializedViewCommand(
         // state: a failure from here on keeps the write-ahead guard set, since an
         // in-process advance rollback can no longer prove a clean revert.
         preparedSourceAdvance.foreach(_.markFinalizeStarted())
-        consumeFrozenSourceDeltas()
-        val dataVersion = DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        profile.timeObservedStep("finalize_consume_frozen_sources") {
+          consumeFrozenSourceDeltas()
+        }
+        val dataVersion = profile.timeObservedStep("finalize_data_version") {
+          DeltaTableVersion.requireLatest(spark, cleanupMeta.location)
+        }
         runningWindowStateUpdate.foreach { update =>
           profile.timeStep("window_running_state_commit", s"version=$dataVersion") { update.commit(dataVersion) }
         }
@@ -5465,6 +5469,7 @@ case class RefreshMaterializedViewCommand(
           cleanupMeta,
           consumedBatches,
           viewNameStr,
+          profile,
           sqlLog,
           qlogOrder,
           Some(dataVersion),
@@ -9018,6 +9023,7 @@ case class RefreshMaterializedViewCommand(
       meta: MvMetadata,
       changeBatches: Seq[ChangeBatch],
       viewNameStr: String,
+      profile: RefreshProfile,
       sqlLog: RefreshSqlLog = RefreshSqlLog.NoOp,
       qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0),
       committedDataVersion: Option[Long] = None,
@@ -9029,22 +9035,30 @@ case class RefreshMaterializedViewCommand(
     val newVersion = committedDataVersion.getOrElse {
       DeltaTableVersion.requireLatest(spark, meta.location)
     }
-    replacementMeta match {
-      case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
-      case None          => MvCatalog.advance(spark, name, newVersion)
+    profile.timeObservedStep("finalize_catalog_advance") {
+      replacementMeta match {
+        case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
+        case None          => MvCatalog.advance(spark, name, newVersion)
+      }
     }
 
-    propagation.markConsumed(spark, viewNameStr, changeBatches)
+    profile.timeObservedStep("finalize_mark_consumed") {
+      propagation.markConsumed(spark, viewNameStr, changeBatches)
+    }
 
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
     // the downstream MV's next REFRESH naturally sees the new MV-data Delta
     // version when changes are collected.
     if (propagation.requiresDmlInterception) {
-      val allMvs = MvCatalog.list(spark)
-      val viewsByTable = allMvs
-        .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
-        .groupBy(_._1)
-        .map { case (t, pairs) => t -> pairs.map(_._2) }
+      val (allMvs, viewsByTable) = profile.timeObservedStep("finalize_dependency_inventory") {
+        val all = MvCatalog.list(spark)
+        val byTable = all
+          .flatMap(m => m.sourceTables.map(t => t -> metaName(m.name)))
+          .groupBy(_._1)
+          .map { case (t, pairs) => t -> pairs.map(_._2) }
+        (all, byTable)
+      }
+      profile.timeObservedStep("finalize_prune_consumed") {
       propagation.pruneConsumed(spark, viewsByTable)
       StagingCatalog.forgetConsumed(
         spark,
@@ -9052,6 +9066,7 @@ case class RefreshMaterializedViewCommand(
         viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
       )
       if (!viewsByTable.contains(viewNameStr)) StagingCatalog.pruneUnconsumed(spark, viewNameStr)
+      }
 
       if (!meta.emitsCascadeViewDelta && !suppressNonCascadeTrigger) {
         val upstreamShortName = name.identifier
