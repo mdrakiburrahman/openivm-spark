@@ -6364,6 +6364,12 @@ case class RefreshMaterializedViewCommand(
           val mergeTargetId: TableIdentifier =
             if (meta.usesBackingDataTable) dataTableId(name) else name
 
+          lazy val globalWindowCdfMergeEligible: Boolean =
+            FeatureGate.globalWindowCdfMergeEnabled(spark) &&
+              propagation.requiresMvCdf && !propagation.requiresDmlInterception &&
+              downstreamSourceKeysForThisMv.nonEmpty &&
+              CdfChangePropagation.tableHasCdf(spark, sqlIdent(mergeTargetId))
+
           // The exact scalar value to retract must be pinned before any refresh SQL
           // mutates the target. Intercept mode needs an explicit signed cascade
           // table; CDF mode obtains the same pre/post images from Delta CDF.
@@ -6650,13 +6656,17 @@ case class RefreshMaterializedViewCommand(
                 done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
               }
             }
-            def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
-              executeSqlRowsAt(sql, stmtIdx)
+            def executeSqlAt(sql: String, stmtIdx: Int, fullDomainCdfMerge: Boolean = false): Unit = {
+              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge)
               ()
             }
-            def executeSqlRowsAt(sql: String, stmtIdx: Int): Array[Row] = {
+            def executeSqlRowsAt(sql: String, stmtIdx: Int, fullDomainCdfMerge: Boolean = false): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)
-              val kind     = RefreshPerf.classify(sql, viewDeltaPath)
+              val kind =
+                if (fullDomainCdfMerge) "global_window_cdf_merge" else RefreshPerf.classify(sql, viewDeltaPath)
+              val origin =
+                if (fullDomainCdfMerge) "origin_class=executor_helper;credit_reason=full_domain_rewrite"
+                else "origin_class=unknown;credit_reason=unverified_mixed_interval"
               val sqlBytes = sql.length
               val qOrder   = qlogOrder.getAndIncrement()
               profile.timeStep(
@@ -6670,7 +6680,7 @@ case class RefreshMaterializedViewCommand(
                       "execute_refresh_sql_attempt",
                       s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
                         s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
-                        "origin_class=unknown;credit_ns=0;credit_reason=unverified_mixed_interval"
+                        s"$origin;credit_ns=0"
                     ) {
                       val result = spark.sql(sql)
                       result -> result.collect()
@@ -6738,13 +6748,14 @@ case class RefreshMaterializedViewCommand(
               val update = groupedWindowRefresh.get
               val select = update.register(); sourceSnapshotTempViews += update.temporaryView
               val targetSql =
-                if (FeatureGate.globalWindowCdfMergeEnabled(spark) && downstreamSourceKeysForThisMv.nonEmpty)
+                if (globalWindowCdfMergeEligible)
                   globalWindowCdfMerge(spark, meta, mergeTargetId, select)
                 else
                   s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select"
               executeSqlAt(
                 targetSql,
-                0
+                0,
+                fullDomainCdfMerge = globalWindowCdfMergeEligible
               )
               groupedWindowStateUpdate = Some(update)
               profile.appendStep("window_grouped_applied", s"hits=${update.hits};misses=${update.misses}", 0L)
@@ -7164,8 +7175,7 @@ case class RefreshMaterializedViewCommand(
                     rewrittenSql,
                     viewDeltaPath,
                     allowFullSnapshot = !propagation.requiresDmlInterception,
-                    useGlobalCdfMerge = !propagation.requiresDmlInterception &&
-                      FeatureGate.globalWindowCdfMergeEnabled(spark) && downstreamSourceKeysForThisMv.nonEmpty
+                    useGlobalCdfMerge = globalWindowCdfMergeEligible
                   )
                 else None
               lazy val refinedWindowAffectedSql: Option[String] =
@@ -7386,7 +7396,7 @@ case class RefreshMaterializedViewCommand(
                           "outcome='window_single_pass_replace'"
                       )
                       withPlanTimeBroadcastDisabled {
-                        executeSqlAt(plan.directSql, idx)
+                        executeSqlAt(plan.directSql, idx, fullDomainCdfMerge = plan.fullDomainCdfMerge)
                       }
                   }
                 } else if (skipRedundantCdfWindowCascade) {
@@ -8151,7 +8161,8 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowSinglePassWrite(
       directSql: String,
-      cascadeSql: String
+      cascadeSql: String,
+      fullDomainCdfMerge: Boolean = false
   ) extends WindowSinglePassPlan
 
   private case class WindowDeleteMerge(targetCol: String, sourceCol: String, subquery: String)
@@ -8285,8 +8296,14 @@ case class RefreshMaterializedViewCommand(
       val plan = windowSinglePassWrite(spark, meta, targetId, "true", viewDeltaPath)
       return Some(
         if (useGlobalCdfMerge)
-          plan.copy(directSql =
-            globalWindowCdfMerge(spark, meta, targetId, s"SELECT * FROM ${quoteCol(s"openivm_new_${name.table}")}")
+          plan.copy(
+            directSql = globalWindowCdfMerge(
+              spark,
+              meta,
+              targetId,
+              s"SELECT * FROM ${quoteCol(s"openivm_new_${name.table}")}"
+            ),
+            fullDomainCdfMerge = true
           )
         else plan
       )
