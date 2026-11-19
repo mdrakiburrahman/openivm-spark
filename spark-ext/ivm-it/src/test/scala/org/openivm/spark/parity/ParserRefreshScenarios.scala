@@ -129,4 +129,41 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       spark.table("mv_ine_p13").collect().toSet shouldBe before
     }
   }
+
+  describe("guarded refresh") {
+    val hash = "0123456789abcdef0123456789abcdef"
+    def guarded(target: String, expected: String = hash) =
+      sql(s"REFRESH MATERIALIZED VIEW $target EXPECT QUERY HASH '$expected' IF EXISTS").collect()
+
+    it("reports only truly absent names as absent") {
+      val capability = sql("SET spark.openivm.capabilities").collect().head
+      capability.getString(1) should include("ensure_refresh_v1")
+      val absent = guarded("ensure_absent_p14").head
+      absent.getString(0) shouldBe "absent"
+      absent.getString(1) shouldBe hash
+      absent.getString(2) should not be empty
+      (3 to 5).foreach(i => absent.isNullAt(i) shouldBe true)
+      sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
+      intercept[Exception](guarded("ensure_unmanaged_p14"))
+    }
+
+    it("validates the live definition before writing and returns refresh proof") {
+      val key = "dbt.fabricspark.materialized_view.query_hash"
+      sql("CREATE TABLE ensure_src_p15 (id INT) USING DELTA")
+      sql("INSERT INTO ensure_src_p15 VALUES (1)")
+      sql(s"CREATE MATERIALIZED VIEW ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15")
+      sql("INSERT INTO ensure_src_p15 VALUES (2)")
+      intercept[Exception](guarded("ensure_mv_p15", "ffffffffffffffffffffffffffffffff"))
+      spark.table("ensure_mv_p15").count() shouldBe 1L
+      val proof = guarded("ensure_mv_p15").head
+      proof.getString(0) shouldBe "refreshed"
+      proof.getString(1) shouldBe hash
+      (2 to 5).foreach(i => proof.getString(i) should not be empty)
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
+      sql("INSERT INTO ensure_src_p15 VALUES (3)")
+      intercept[Exception](guarded("ensure_mv_p15"))
+      spark.table("ensure_mv_p15").count() shouldBe 2L
+    }
+  }
 }

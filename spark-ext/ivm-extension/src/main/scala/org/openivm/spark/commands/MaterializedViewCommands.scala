@@ -9,6 +9,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
+  Attribute,
   Alias,
   AttributeReference,
   EqualNullSafe,
@@ -37,7 +38,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StringType, StructField, StructType}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
@@ -4135,8 +4136,21 @@ final case class SourceVersionAdvanceRequest(versionsBySource: Map[String, Long]
 
 case class RefreshMaterializedViewCommand(
     name: TableIdentifier,
-    sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None
+    sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None,
+    expectedQueryHash: Option[String] = None
 ) extends LeafRunnableCommand {
+
+  override val output: Seq[Attribute] =
+    if (expectedQueryHash.isDefined)
+      Seq(
+        AttributeReference("status", StringType, nullable = false)(),
+        AttributeReference("query_hash", StringType, nullable = false)(),
+        AttributeReference("target", StringType, nullable = false)(),
+        AttributeReference("target_table_id", StringType, nullable = true)(),
+        AttributeReference("refresh_id", StringType, nullable = true)(),
+        AttributeReference("outcome", StringType, nullable = true)()
+      )
+    else Seq.empty
 
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
@@ -4146,9 +4160,12 @@ case class RefreshMaterializedViewCommand(
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
     val viewMeta = metaName(name)
-    OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
+    if (expectedQueryHash.isEmpty) OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0           = System.nanoTime()
     var commandCompleted = false
+    var absent           = false
+    var targetTableId    = Option.empty[String]
+    var completedRefresh = Option.empty[(String, String)]
     try {
       // Every refresh — ordinary or source-version-advance — deterministically
       // also holds the DIRECT upstream MV keys taken from its AUTHORITATIVE
@@ -4182,7 +4199,19 @@ case class RefreshMaterializedViewCommand(
         .getOrElse(Seq.empty)
       val writeKeys = viewMeta +: downstreamWriteKeys
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
-        OpenIvmStateBarrier.withMutation(spark) {
+        val missing = expectedQueryHash.isDefined && MvCatalog.lookup(spark, name).isEmpty
+        if (missing) {
+          if (spark.catalog.tableExists(sqlIdent(name)))
+            throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
+          absent = true
+          Seq(Row("absent", expectedQueryHash.get, viewMeta, null, null, null))
+        } else OpenIvmStateBarrier.withMutation(spark) {
+          if (expectedQueryHash.isDefined) {
+            val (currentKeys, currentDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
+            if (currentKeys != upstreamMvSourceKeys || currentDeps != upstreamMvDeps)
+              throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} dependencies changed while acquiring locks")
+            OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
+          }
           // Under the acquired upstream locks, re-verify each upstream MV still has
           // the exact physical Delta identity the map recorded at CREATE; a rebind,
           // vanished upstream, or catalog read failure fails the refresh closed.
@@ -4192,11 +4221,20 @@ case class RefreshMaterializedViewCommand(
           try {
             DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
               org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-                runUnderLock(cloned, lockAcqMs)
+                runUnderLock(
+                  cloned,
+                  lockAcqMs,
+                  id => targetTableId = Some(id),
+                  (id, outcome) => completedRefresh = Some(id -> outcome)
+                )
               }
             }
           } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
         }
+      }
+      if (absent) {
+        commandCompleted = true
+        return rows
       }
       // In async mode the same publication ordering holds in the background.
       val garbage = RefreshProfile.timeObservedActiveStep("gc_prepare") {
@@ -4213,7 +4251,14 @@ case class RefreshMaterializedViewCommand(
         OpenIvmGarbageCollector.collect(spark, garbage)
       }
       commandCompleted = true
-      rows
+      expectedQueryHash match {
+        case None => rows
+        case Some(hash) =>
+          val tableId = targetTableId.getOrElse(throw new IllegalStateException("Missing validated target identity"))
+          val (refreshId, outcome) =
+            completedRefresh.getOrElse(throw new IllegalStateException("Missing completed refresh proof"))
+          Seq(Row("refreshed", hash, viewMeta, tableId, refreshId, outcome))
+      }
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
@@ -4569,7 +4614,12 @@ case class RefreshMaterializedViewCommand(
     recovered
   }
 
-  private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
+  private def runUnderLock(
+      spark: SparkSession,
+      lockAcqMs: Long,
+      recordTargetId: String => Unit,
+      recordOutcome: (String, String) => Unit
+  ): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
@@ -4702,6 +4752,7 @@ case class RefreshMaterializedViewCommand(
       if (!endEmitted) {
         endEmitted = true
         queryLogOutcome = outcome
+        recordOutcome(refreshId, outcome)
         refreshInsightClassification.foreach { classification =>
           OpenIvmMaterializedViewInsightEvents.refreshCompleted(
             spark,
@@ -4745,6 +4796,25 @@ case class RefreshMaterializedViewCommand(
             Map("relationName" -> sqlIdent(name))
           )
         }
+      expectedQueryHash.foreach { hash =>
+        profile.timeObservedStep("ensure_refresh_validation") {
+          val ownership = MaterializedViewLifecycle.liveOwnership(spark, name, loadedMeta)
+          if (!ownership.owned)
+            throw new IllegalStateException(
+              s"Materialized view ${sqlIdent(name)} is not the registered live target: ${ownership.reason}"
+            )
+          val key = "dbt.fabricspark.materialized_view.query_hash"
+          val rows = spark.sql(s"SHOW TBLPROPERTIES ${sqlIdent(name)} ('$key')").collect()
+          val liveHash = if (rows.length == 1 && !rows.head.isNullAt(0)) Some(rows.head.getString(0)) else None
+          if (!loadedMeta.properties.get(key).contains(hash) || !liveHash.contains(hash))
+            throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} query hash mismatch")
+          val snapshot = DeltaLog.forTable(spark, new Path(loadedMeta.location)).update()
+          val tableId = Option(snapshot.metadata.id).filter(_.nonEmpty).getOrElse {
+            throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} has no physical Delta table ID")
+          }
+          recordTargetId(tableId)
+        }
+      }
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
       val compileRefreshType = meta.properties
         .get(MvMetadata.CompileRefreshTypeKey)
