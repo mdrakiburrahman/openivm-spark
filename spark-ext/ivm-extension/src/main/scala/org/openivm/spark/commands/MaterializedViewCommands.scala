@@ -9063,13 +9063,13 @@ case class RefreshMaterializedViewCommand(
         (all, byTable)
       }
       profile.timeObservedStep("finalize_prune_consumed") {
-      propagation.pruneConsumed(spark, viewsByTable)
-      StagingCatalog.forgetConsumed(
-        spark,
-        viewNameStr,
-        viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
-      )
-      if (!viewsByTable.contains(viewNameStr)) StagingCatalog.pruneUnconsumed(spark, viewNameStr)
+        propagation.pruneConsumed(spark, viewsByTable)
+        StagingCatalog.forgetConsumed(
+          spark,
+          viewNameStr,
+          viewsByTable.collect { case (table, views) if views.contains(viewNameStr) => table }.toSeq
+        )
+        if (!viewsByTable.contains(viewNameStr)) StagingCatalog.pruneUnconsumed(spark, viewNameStr)
       }
 
       if (!meta.emitsCascadeViewDelta && !suppressNonCascadeTrigger) {
