@@ -68,10 +68,11 @@ object OpenIvmGarbageCollector {
           .flatMap(_.properties.values)
           .filter(value => value.contains("/_ivm/") || value.contains("/_openivm/"))
           .toSet
-        val recorded = StagingCatalog.referencedStagingPaths(spark)
+        val stagingPaths = StagingCatalog.garbageCollectionPaths(spark)
+        val recorded     = stagingPaths.referenced
         Some(
           Plan(
-            StagingCatalog.pendingGarbage(spark),
+            stagingPaths.tombstoned,
             recorded ++ metadataReferences ++ StagingDeltaView.CachedViewDeltaRef.inputsOf(recorded)
           )
         )

@@ -1,7 +1,7 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog, StagingDelta}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually
@@ -134,6 +134,23 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
         .flatMap(dir => Option(dir.listFiles()).toSeq.flatten) shouldBe empty
       StagingCatalog.pendingGarbage(spark) shouldBe empty
       spark.table("gc_leaf").where("name = 'a'").select("n").head().getLong(0) shouldBe 2L
+    }
+
+    it("plans tombstoned and referenced staging paths from the same shard inventory") {
+      val timestamp    = new java.sql.Timestamp(System.currentTimeMillis())
+      val activePath   = s"${warehouse.getAbsolutePath}/_ivm/staging/gc_plan_active/${UUID.randomUUID()}"
+      val prunedPath   = s"${warehouse.getAbsolutePath}/_ivm/staging/gc_plan_pruned/${UUID.randomUUID()}"
+      val activeSource = "default.gc_plan_active"
+      val prunedSource = "default.gc_plan_pruned"
+      StagingCatalog.record(spark, StagingDelta(activeSource, "INSERT", activePath, timestamp, Seq.empty))
+      StagingCatalog.record(spark, StagingDelta(prunedSource, "INSERT", prunedPath, timestamp, Seq.empty))
+      StagingCatalog.pruneUnconsumed(spark, prunedSource)
+
+      val plan = OpenIvmGarbageCollector.prepare(spark).get
+      plan.referenced should contain(activePath)
+      plan.tombstoned should contain(prunedPath)
+      plan.referenced should not contain prunedPath
+      plan.tombstoned should not contain activePath
     }
 
     it("sweeps unreferenced staging locations only after the grace period") {

@@ -360,6 +360,24 @@ object StagingCatalog {
         }
     }
 
+  final case class GarbageCollectionPaths(tombstoned: Set[String], referenced: Set[String])
+
+  /** Read pending deletions and live staging references while enumerating base-table shards once.
+    * The two column families remain independent reads so each set retains its existing meaning.
+    */
+  def garbageCollectionPaths(spark: SparkSession): GarbageCollectionPaths = {
+    val baseDbs = OpenIvmStatePaths
+      .existingBaseTableDbPaths(spark)
+      .map(dbPath => OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies))
+    val referenced = baseDbs.iterator
+      .flatMap(_.prefixScan(StagingCf, Array.emptyByteArray).map { case (key, _) => decodeStagingKey(key)._2 })
+      .toSet
+    val tombstoned = baseDbs.iterator
+      .flatMap(_.prefixScan(GcCf, Array.emptyByteArray).map { case (key, _) => RocksDBCodec.fromUtf8(key) })
+      .toSet
+    GarbageCollectionPaths(tombstoned, referenced)
+  }
+
   /** Staging locations whose records were pruned and that await deletion. A location may only be
     * deleted once a durable state that no longer references it exists: with state sync enabled,
     * after the next published snapshot; otherwise immediately, since local RocksDB is durable.
