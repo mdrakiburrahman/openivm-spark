@@ -54,28 +54,38 @@ object OpenIvmGarbageCollector {
     thread
   }
 
-  /** Read the current garbage candidates, or `None` when collection is disabled or unreadable.
-    *
-    * @param spark active session
+  /** Read a full plan for explicit collection, even when no work is due. */
+  def prepare(spark: SparkSession): Option[Plan] = prepareCandidates(spark, sweepDue = true)
+
+  /** A refresh may omit the entire plan, but must never hand collect incomplete references.
+    * If a sweep becomes due after an idle preflight, a later refresh will plan it instead.
     */
-  def prepare(spark: SparkSession): Option[Plan] =
+  def prepareForRefresh(spark: SparkSession): Option[Plan] =
+    prepareCandidates(spark, isSweepDue(spark, System.currentTimeMillis(), lastSweepMs.get()))
+
+  private[openivm] def prepareForRefresh(spark: SparkSession, nowMs: Long): Option[Plan] =
+    prepareCandidates(spark, isSweepDue(spark, nowMs, lastSweepMs.get()))
+
+  private def isSweepDue(spark: SparkSession, nowMs: Long, lastMs: Long): Boolean =
+    nowMs - lastMs >= FeatureGate.gcOrphanSweepIntervalMs(spark)
+
+  private def prepareCandidates(spark: SparkSession, sweepDue: => Boolean): Option[Plan] =
     if (!FeatureGate.gcEnabled(spark)) None
     else
       try {
-        val metadataReferences = MvCatalog
-          .list(spark)
-          .iterator
-          .flatMap(_.properties.values)
-          .filter(value => value.contains("/_ivm/") || value.contains("/_openivm/"))
-          .toSet
-        val stagingPaths = StagingCatalog.garbageCollectionPaths(spark)
-        val recorded     = stagingPaths.referenced
-        Some(
+        StagingCatalog.garbageCollectionPaths(spark, sweepDue).map { stagingPaths =>
+          val metadataReferences = MvCatalog
+            .list(spark)
+            .iterator
+            .flatMap(_.properties.values)
+            .filter(value => value.contains("/_ivm/") || value.contains("/_openivm/"))
+            .toSet
+          val recorded = stagingPaths.referenced
           Plan(
             stagingPaths.tombstoned,
             recorded ++ metadataReferences ++ StagingDeltaView.CachedViewDeltaRef.inputsOf(recorded)
           )
-        )
+        }
       } catch {
         case NonFatal(error) =>
           log.warn(s"openivm gc: cannot read garbage candidates: $error")
@@ -89,42 +99,43 @@ object OpenIvmGarbageCollector {
     * @param plan  candidates from [[prepare]]
     */
   def collect(spark: SparkSession, plan: Option[Plan]): Unit =
-    OpenIvmStateBarrier.withMutation(spark) {
-      collectUnderBarrier(spark, plan)
-    }
-
-  private def collectUnderBarrier(spark: SparkSession, plan: Option[Plan]): Unit =
     plan.foreach { candidates =>
-      try {
-        val removed = candidates.tombstoned.filterNot(candidates.referenced.contains).filter { location =>
-          try deleteLocation(spark.sessionState.newHadoopConf(), location)
-          catch {
-            case NonFatal(error) =>
-              log.warn(s"openivm gc: cannot delete $location: $error")
-              false
-          }
-        }
-        StagingCatalog.forgetGarbage(spark, removed)
-        if (removed.nonEmpty) log.info(s"openivm gc: deleted ${removed.size} consumed staging location(s)")
-        val now  = System.currentTimeMillis()
-        val last = lastSweepMs.get()
-        if (now - last >= FeatureGate.gcOrphanSweepIntervalMs(spark) && lastSweepMs.compareAndSet(last, now)) {
-          val sweep = Sweep(
-            spark.sessionState.newHadoopConf(),
-            new Path(spark.conf.get("spark.sql.warehouse.dir")),
-            OpenIvmStateBarrier.root(spark).toString,
-            candidates.referenced ++ candidates.tombstoned,
-            now - FeatureGate.gcOrphanGracePeriodMs(spark),
-            FeatureGate
-              .oneLakeTelemetryDir(spark)
-              .map(dir => new Path(dir) -> (now - FeatureGate.telemetryOneLakeRetentionMs(spark)))
-          )
-          executor.execute(() => runSweep(sweep))
-        }
-      } catch {
-        case NonFatal(error) => log.warn(s"openivm gc: collection failed: $error")
+      OpenIvmStateBarrier.withMutation(spark) {
+        collectUnderBarrier(spark, candidates)
       }
     }
+
+  private def collectUnderBarrier(spark: SparkSession, candidates: Plan): Unit = {
+    try {
+      val removed = candidates.tombstoned.filterNot(candidates.referenced.contains).filter { location =>
+        try deleteLocation(spark.sessionState.newHadoopConf(), location)
+        catch {
+          case NonFatal(error) =>
+            log.warn(s"openivm gc: cannot delete $location: $error")
+            false
+        }
+      }
+      StagingCatalog.forgetGarbage(spark, removed)
+      if (removed.nonEmpty) log.info(s"openivm gc: deleted ${removed.size} consumed staging location(s)")
+      val now  = System.currentTimeMillis()
+      val last = lastSweepMs.get()
+      if (isSweepDue(spark, now, last) && lastSweepMs.compareAndSet(last, now)) {
+        val sweep = Sweep(
+          spark.sessionState.newHadoopConf(),
+          new Path(spark.conf.get("spark.sql.warehouse.dir")),
+          OpenIvmStateBarrier.root(spark).toString,
+          candidates.referenced ++ candidates.tombstoned,
+          now - FeatureGate.gcOrphanGracePeriodMs(spark),
+          FeatureGate
+            .oneLakeTelemetryDir(spark)
+            .map(dir => new Path(dir) -> (now - FeatureGate.telemetryOneLakeRetentionMs(spark)))
+        )
+        executor.execute(() => runSweep(sweep))
+      }
+    } catch {
+      case NonFatal(error) => log.warn(s"openivm gc: collection failed: $error")
+    }
+  }
 
   /** Run an orphan sweep synchronously, as [[collect]] does in the background.
     *

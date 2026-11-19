@@ -362,20 +362,29 @@ object StagingCatalog {
 
   final case class GarbageCollectionPaths(tombstoned: Set[String], referenced: Set[String])
 
-  /** Read pending deletions and live staging references while enumerating base-table shards once.
-    * The two column families remain independent reads so each set retains its existing meaning.
+  /** Reuse one shard inventory for both scans; skip live staging reads only if there are no
+    * tombstones and the caller does not need references for a sweep.
     */
-  def garbageCollectionPaths(spark: SparkSession): GarbageCollectionPaths = {
+  private[common] def garbageCollectionPaths(
+      spark: SparkSession,
+      sweepDue: => Boolean
+  ): Option[GarbageCollectionPaths] = {
     val baseDbs = OpenIvmStatePaths
       .existingBaseTableDbPaths(spark)
       .map(dbPath => OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies))
-    val referenced = baseDbs.iterator
-      .flatMap(_.prefixScan(StagingCf, Array.emptyByteArray).map { case (key, _) => decodeStagingKey(key)._2 })
-      .toSet
-    val tombstoned = baseDbs.iterator
-      .flatMap(_.prefixScan(GcCf, Array.emptyByteArray).map { case (key, _) => RocksDBCodec.fromUtf8(key) })
-      .toSet
-    GarbageCollectionPaths(tombstoned, referenced)
+    val tombstones = Set.newBuilder[String]
+    baseDbs.foreach(_.foreachPrefix(GcCf, Array.emptyByteArray) { (key, _) =>
+      tombstones += RocksDBCodec.fromUtf8(key)
+    })
+    val tombstoned = tombstones.result()
+    if (tombstoned.isEmpty && !sweepDue) None
+    else {
+      val referenced = Set.newBuilder[String]
+      baseDbs.foreach(_.foreachPrefix(StagingCf, Array.emptyByteArray) { (key, _) =>
+        referenced += decodeStagingKey(key)._2
+      })
+      Some(GarbageCollectionPaths(tombstoned, referenced.result()))
+    }
   }
 
   /** Staging locations whose records were pruned and that await deletion. A location may only be

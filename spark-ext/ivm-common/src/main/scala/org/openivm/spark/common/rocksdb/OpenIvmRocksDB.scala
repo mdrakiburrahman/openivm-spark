@@ -1045,6 +1045,24 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
     }
 
+  /** Visit a prefix under one native handle, closing the iterator even if the visitor fails. */
+  private[common] def foreachPrefix(columnFamily: String, prefix: Array[Byte])(
+      visit: (Array[Byte], Array[Byte]) => Unit
+  ): Unit = withNativeHandle("prefix_scan") {
+    val iterator = dbHandle.newIterator(cf(columnFamily))
+    try {
+      iterator.seek(prefix)
+      while (iterator.isValid && startsWith(iterator.key(), prefix)) {
+        val key   = iterator.key()
+        val value = iterator.value()
+        OpenIvmMetrics.recordColumnFamilyRead(columnFamily, key.length.toLong + value.length.toLong)
+        visit(key, value)
+        iterator.next()
+      }
+      iterator.status()
+    } finally iterator.close()
+  }
+
   /** Materialize a bounded prefix scan. Exceeding either limit fails the entire
     * read rather than returning incomplete grouped state.
     */

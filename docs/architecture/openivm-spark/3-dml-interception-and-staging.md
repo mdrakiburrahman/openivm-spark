@@ -684,8 +684,10 @@ Records under a key no materialized view reads, such as the view-delta records a
 consumers leaves under its own name, are pruned by that view's refresh (`pruneUnconsumed`); a
 view created later starts after them.
 
-1. Before a refresh publishes its state (`OpenIvmStateSync.backupNow`), `prepare` reads the
-   tombstones and every location still referenced by staging records or MV metadata.
+1. Before a refresh publishes its state, `prepareForRefresh` reads the tombstones. If there are
+   tombstones or the orphan sweep is due, it also reads live references from staging records and
+   MV metadata. Otherwise it returns no plan: if the sweep becomes due during publication, it
+   waits for a later refresh to prepare a full plan. The preflight does not advance the sweep clock.
 1. After the publish returns, `collect` deletes the tombstoned locations nothing references,
    including the inputs of cached view deltas (`openivm-cache:` refs) still awaiting consumers. With
    state sync, the newest published snapshot therefore never references a deleted location;
