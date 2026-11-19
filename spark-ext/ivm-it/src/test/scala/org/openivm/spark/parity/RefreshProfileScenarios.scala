@@ -170,17 +170,20 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       after.getLong(5) should be >= backup.getLong(5)
       rows.count(_.getString(4) == "query_span") shouldBe 1
       rows.count(_.getString(4) == "command_span") shouldBe 1
-      Seq(
+      val commonFinalization = Seq(
         "gc_prepare",
         "sql_log_handoff",
         "state_lag_check",
         "finalize_consume_frozen_sources",
         "finalize_data_version",
         "finalize_catalog_advance",
-        "finalize_mark_consumed",
-        "finalize_dependency_inventory",
-        "finalize_prune_consumed"
-      ).foreach { step =>
+        "finalize_mark_consumed"
+      )
+      val interceptOnly = Seq("finalize_dependency_inventory", "finalize_prune_consumed")
+      if (changeFeedMode == ChangeFeedMode.Cdf) {
+        interceptOnly.foreach(step => detailsForStep(rows, step) shouldBe empty)
+      }
+      (commonFinalization ++ (if (changeFeedMode == ChangeFeedMode.Cdf) Seq.empty else interceptOnly)).foreach { step =>
         val details = detailsForStep(rows, step)
         details should have size 1
         details.head should include("clock_domain_id=")
