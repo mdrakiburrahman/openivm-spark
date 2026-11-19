@@ -207,6 +207,8 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         if (detail.contains("status=skipped")) detail should include("duration_ns=0")
         else {
           detail should include("status=success")
+          detail should include("action_id=")
+          detail should include("credit_ns=0")
           detail should include("query_log_order=")
           detail should include("attempt=0")
         }
@@ -246,6 +248,8 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       attempts should have size 1
       attempts.head should include("status=success")
       attempts.head should include("attempt=0")
+      attempts.head should include("origin_class=executor_helper")
+      attempts.head should include("credit_reason=cleanup")
       attempts.head should include("duration_ns=")
       val wrappers = detailsForStep(rows, "execute_refresh_cleanup_retry")
       wrappers should have size 1
@@ -267,6 +271,8 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       attempts should have size 1
       attempts.head should include("work_class=full_refresh_writer")
       attempts.head should include("status=success")
+      attempts.head should include("origin_class=executor_helper")
+      attempts.head should include("credit_ns=0")
       attempts.head should include("attempt=0")
       attempts.head should include("duration_ns=")
       detailsForStep(rows, "execute_full_refresh_retry") should have size 1

@@ -5897,7 +5897,8 @@ case class RefreshMaterializedViewCommand(
                         profile.timeObservedStep(
                           "execute_full_refresh_attempt",
                           s"statement=${stmtCounter + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
-                            s"stmt_kind=$kind;work_class=full_refresh_writer;segment=statement"
+                            s"stmt_kind=$kind;work_class=full_refresh_writer;segment=statement;" +
+                            s"action_id=$qOrder:${attempt - 1}:statement;origin_class=executor_helper;credit_ns=0"
                         ) {
                           val df = spark.sql(fullRefreshSql)
                           df.write
@@ -6668,7 +6669,8 @@ case class RefreshMaterializedViewCommand(
                     val (df, r) = profile.timeObservedStep(
                       "execute_refresh_sql_attempt",
                       s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
-                        "work_class=incremental_sql;segment=statement"
+                        s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
+                        "origin_class=unknown;credit_ns=0;credit_reason=unverified_mixed_interval"
                     ) {
                       val result = spark.sql(sql)
                       result -> result.collect()
@@ -6795,14 +6797,16 @@ case class RefreshMaterializedViewCommand(
                           val d = profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
-                              "work_class=incremental_sql;segment=fused_analysis"
+                              s"work_class=incremental_sql;segment=fused_analysis;action_id=$qOrder:0:fused_analysis;" +
+                              "origin_class=executor_helper;credit_ns=0;credit_reason=analysis"
                           ) {
                             spark.sql(selectBody)
                           }
                           profile.timeObservedStep(
                             "execute_refresh_fused_setup",
                             s"statement=1;query_log_order=$qOrder;attempt=0;" +
-                              "work_class=incremental_auxiliary;segment=fused_setup"
+                              s"work_class=incremental_auxiliary;segment=fused_setup;action_id=$qOrder:0:fused_setup;" +
+                              "origin_class=executor_helper;credit_ns=0;credit_reason=cache_registration"
                           ) {
                             d.createOrReplaceGlobalTempView(scratchView)
                             spark.catalog.cacheTable(s"global_temp.$scratchView")
@@ -6813,7 +6817,8 @@ case class RefreshMaterializedViewCommand(
                           profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
-                              "work_class=incremental_sql;segment=fused_action"
+                              s"work_class=incremental_sql;segment=fused_action;action_id=$qOrder:0:fused_action;" +
+                              "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization"
                           ) {
                             spark.table(s"global_temp.$scratchView").count()
                           }
@@ -7541,7 +7546,9 @@ case class RefreshMaterializedViewCommand(
                           val (df, r) = profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=${idx + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
-                              "stmt_kind=count_monoid_cleanup;work_class=incremental_cleanup;segment=statement"
+                              s"stmt_kind=count_monoid_cleanup;work_class=incremental_cleanup;segment=statement;" +
+                              s"action_id=$qOrder:${attempt - 1}:statement;origin_class=executor_helper;" +
+                              "credit_ns=0;credit_reason=cleanup"
                           ) {
                             val result = spark.sql(deleteSql)
                             result -> result.collect()

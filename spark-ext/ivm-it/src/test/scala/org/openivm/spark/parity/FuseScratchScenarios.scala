@@ -99,6 +99,8 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
         val matching = attempts.filter(_.contains(s"segment=$segment"))
         matching should have size 1
         matching.head should include("status=success")
+        matching.head should include("action_id=")
+        matching.head should include("credit_ns=0")
         matching.head should include("query_log_order=")
         matching.head should include("duration_ns=")
       }
