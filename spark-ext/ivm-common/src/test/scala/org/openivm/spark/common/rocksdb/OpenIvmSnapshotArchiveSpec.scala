@@ -37,7 +37,7 @@ class OpenIvmSnapshotArchiveSpec extends AnyFunSpec with Matchers {
         directory.mkdirs()
         val file = new File(directory, "CURRENT")
         Files.write(file.toPath, "MANIFEST-1\n".getBytes("UTF-8"))
-        val archive = new File(root, "snapshot.zip")
+        val archive  = new File(root, "snapshot.zip")
         val checksum = OpenIvmSnapshotArchive.pack(source, Seq(file), archive, _ => ())
         checksum.length shouldBe 64
         checksum shouldBe OpenIvmSnapshotArchive.sha256(archive)
@@ -51,7 +51,7 @@ class OpenIvmSnapshotArchiveSpec extends AnyFunSpec with Matchers {
 
     it("hashes the complete empty archive including its final directory") {
       withDirectory { root =>
-        val archive = new File(root, "empty.zip")
+        val archive  = new File(root, "empty.zip")
         val checksum = OpenIvmSnapshotArchive.pack(root, Seq.empty, archive, _ => ())
         checksum shouldBe OpenIvmSnapshotArchive.sha256(archive)
       }

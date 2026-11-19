@@ -25,8 +25,10 @@ private[rocksdb] object OpenIvmSnapshotArchive {
   def pack(root: File, files: Seq[File], archive: File, beforeCopy: File => Unit): String = {
     if (files.size > MaxEntries) throw new IOException("openivm state-sync: archive entry limit exceeded")
     val digest = MessageDigest.getInstance("SHA-256")
-    val output = new ZipOutputStream(new BufferedOutputStream(new DigestOutputStream(new FileOutputStream(archive), digest)))
-    var total  = 0L
+    val output = new ZipOutputStream(
+      new BufferedOutputStream(new DigestOutputStream(new FileOutputStream(archive), digest))
+    )
+    var total = 0L
     try
       files.sortBy(_.toString).foreach { file =>
         checkInterrupted()

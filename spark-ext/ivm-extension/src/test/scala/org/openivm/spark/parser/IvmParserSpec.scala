@@ -360,7 +360,8 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
     }
 
     it("preserves EXPECT as a non-reserved identifier") {
-      val cmd = spark.sessionState.sqlParser.parsePlan("REFRESH MATERIALIZED VIEW expect")
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan("REFRESH MATERIALIZED VIEW expect")
         .asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("expect")
       cmd.expectedQueryHash shouldBe None
