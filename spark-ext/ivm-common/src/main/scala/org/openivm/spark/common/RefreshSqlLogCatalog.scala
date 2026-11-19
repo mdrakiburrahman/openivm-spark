@@ -93,20 +93,22 @@ object RefreshSqlLogCatalog {
       refreshId: String,
       profileTsMicros: Long,
       stmtOrder: Int,
-      attemptIdx: Int
+      attemptIdx: Int,
+      category: String
   ): Array[Byte] =
     RocksDBCodec.compositeKey(
       Seq(
         RocksDBCodec.encodeLongBE(profileTsMicros),
         RocksDBCodec.utf8(refreshId),
         RocksDBCodec.encodeLongBE(stmtOrder.toLong),
-        RocksDBCodec.encodeLongBE(attemptIdx.toLong)
+        RocksDBCodec.encodeLongBE(attemptIdx.toLong),
+        RocksDBCodec.utf8(category)
       )
     )
 
   private def decodeKey(key: Array[Byte]): (Long, String, Int, Int) = {
-    val parts = RocksDBCodec.splitComposite(key, maxParts = 4)
-    require(parts.length == 4, s"Malformed refresh_sql_log key (expected 4 parts, found ${parts.length})")
+    val parts = RocksDBCodec.splitComposite(key, maxParts = 5)
+    require(parts.length == 4 || parts.length == 5, s"Malformed refresh_sql_log key (found ${parts.length} parts)")
     val tsMicros = RocksDBCodec.decodeLongBE(parts(0))
     val refresh  = RocksDBCodec.fromUtf8(parts(1))
     val stmtOrd  = RocksDBCodec.decodeLongBE(parts(2)).toInt
@@ -155,7 +157,8 @@ object RefreshSqlLogCatalog {
           row.refreshId,
           tsToMicros(row.profileTimestamp),
           row.stmtOrder,
-          row.attemptIdx
+          row.attemptIdx,
+          row.category
         )
         val value = encodeValue(row)
         OpenIvmRocksDBBatchOps.put(db, batch, CfName, key, value)
@@ -262,11 +265,14 @@ object RefreshSqlLogCatalog {
   def scanAll(spark: SparkSession): Seq[RefreshSqlLogRow] = {
     val db  = openDb(spark)
     val it  = db.prefixScan(CfName, Array.emptyByteArray)
-    val out = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
+    val out = scala.collection.mutable.LinkedHashMap.empty[(Long, String, Int, Int, String), RefreshSqlLogRow]
     try {
       while (it.hasNext) {
         val (key, value) = it.next()
-        out += decodeRow(key, value)
+        val row = decodeRow(key, value)
+        // A replay of a legacy key may coexist with its category-qualified replacement.
+        // The legacy key sorts first, so the replacement wins without duplicating SHOW rows.
+        out.update((tsToMicros(row.profileTimestamp), row.refreshId, row.stmtOrder, row.attemptIdx, row.category), row)
       }
     } finally {
       it match {
@@ -278,7 +284,7 @@ object RefreshSqlLogCatalog {
     }
     // Composite-key ordering already gives us (ts, refresh, stmt, attempt) order.
     // Sort defensively to make the contract explicit; cheap (≤ thousands of rows).
-    out
+    out.values.toSeq
       .sortBy(r => (r.profileTimestamp.getTime, r.refreshId, r.stmtOrder, r.attemptIdx))
       .toSeq
   }
