@@ -5498,12 +5498,14 @@ case class RefreshMaterializedViewCommand(
                   RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                     val t0 = System.nanoTime()
                     try {
-                      val df = spark.sql(fullRefreshSql)
-                      df.write
-                        .format("delta")
-                        .mode("overwrite")
-                        .option("replaceWhere", "true")
-                        .save(meta.location)
+                      withPlanTimeBroadcastDisabled {
+                        val df = spark.sql(fullRefreshSql)
+                        df.write
+                          .format("delta")
+                          .mode("overwrite")
+                          .option("replaceWhere", "true")
+                          .save(meta.location)
+                      }
                       OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                       val ms = (System.nanoTime() - t0) / 1000000L
                       sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
@@ -6757,7 +6759,12 @@ case class RefreshMaterializedViewCommand(
                     mergeTargetId,
                     rewrittenSql,
                     viewDeltaPath,
-                    allowFullSnapshot = !propagation.requiresDmlInterception
+                    // A whole-target overwrite is classified as Replace by
+                    // CDF consumers, forcing a full recompute of their DAG.
+                    // Retain the native DELETE/INSERT program when consumers
+                    // need its row changes; predicate-scoped replacement stays
+                    // available below for partitioned windows.
+                    allowFullSnapshot = !propagation.requiresDmlInterception && downstreamSourceKeysForThisMv.isEmpty
                   )
                 else None
               lazy val refinedWindowAffectedSql: Option[String] =
@@ -7852,9 +7859,9 @@ case class RefreshMaterializedViewCommand(
     val insertIdx = rewrittenStatements.indexWhere(isWindowNewSnapshotInsertSql(_, targetId))
     if (insertIdx < 0) return None
 
-    // Global windows have one affected domain: the entire result. CDF supplies
-    // the exact downstream change feed from the single replacement commit, so
-    // the old/new cascade table is unnecessary even when consumers exist.
+    // Terminal global windows have one affected domain: the entire result.
+    // Consumers need DELETE/INSERT commits instead: a full-target replacement
+    // is conservatively classified as Replace and recomputes their entire DAG.
     val wholeDeletes = rewrittenStatements.take(insertIdx).count(isWholeWindowDeleteSql(_, targetId))
     if (
       allowFullSnapshot && wholeDeletes == 1 &&

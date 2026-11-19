@@ -1,6 +1,14 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{
+  BatchVerdict,
+  DeltaCommitClassifier,
+  FeatureGate,
+  MvCatalog,
+  RefreshProfileCatalog,
+  RefreshSqlLogCatalog,
+  RefreshTypeCode
+}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pass-replace") with CdfMode {
@@ -19,6 +27,42 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       .exists(_.detail == "phase=cdf_window_net_change_probe")
 
   describe("WINDOW_PARTITION single-pass replacement with a named affected-key view") {
+    it("keeps global window changes incremental for downstream consumers") {
+      sql("CREATE TABLE wspr_global_sales(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO wspr_global_sales VALUES (1, 10), (2, 20), (3, NULL)")
+      sql("CREATE TABLE wspr_global_labels(id INT, label STRING) USING DELTA")
+      sql("INSERT INTO wspr_global_labels VALUES (1, 'one'), (2, 'two')")
+      val viewSql =
+        "SELECT s.id, s.amount, l.label, ROW_NUMBER() OVER (ORDER BY s.id, s.amount) AS rn " +
+          "FROM wspr_global_sales s LEFT JOIN wspr_global_labels l ON s.id = l.id"
+      sql(s"CREATE MATERIALIZED VIEW wspr_global_mv AS $viewSql")
+      MvCatalog
+        .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("wspr_global_mv"))
+        .get
+        .refreshType shouldBe RefreshTypeCode.WindowPartition
+      val downstreamSql = "SELECT amount, SUM(rn) AS rank_sum, COUNT(*) AS n FROM wspr_global_mv GROUP BY amount"
+      sql(s"CREATE MATERIALIZED VIEW wspr_global_downstream AS $downstreamSql")
+
+      Seq(
+        "INSERT INTO wspr_global_sales VALUES (0, 10), (4, NULL), (4, NULL)",
+        "DELETE FROM wspr_global_sales WHERE id = 2"
+      ).foreach { mutation =>
+        val before = mvDataVersion("wspr_global_mv")
+        sql(mutation)
+        RefreshProfileCatalog.removeAll(spark)
+        refreshMv("wspr_global_mv")
+        assertMvCorrect("wspr_global_mv", viewSql)
+        DeltaCommitClassifier.classify(
+          spark,
+          mvDataLocation("wspr_global_mv"),
+          before
+        ) should not be BatchVerdict.Replace
+        refreshMv("wspr_global_downstream")
+        assertMvCorrect("wspr_global_downstream", downstreamSql)
+        RefreshProfileCatalog.scanAll(spark).exists(_.stepName == "execute_full_refresh_writer") shouldBe false
+      }
+    }
+
     it("creates the affected-key view before collecting keys and remains bag-equal") {
       sql("CREATE TABLE wspr_sales(id INT, region STRING, amount INT) USING DELTA")
       sql(
