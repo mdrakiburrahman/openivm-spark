@@ -1,7 +1,7 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
+import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
@@ -282,8 +282,8 @@ final class RefreshProfile private (
 
 object RefreshProfile {
 
-  private val current       = new ThreadLocal[RefreshProfile]()
-  private val clockDomainId = java.util.UUID.randomUUID().toString
+  private val current                 = new ThreadLocal[RefreshProfile]()
+  private[commands] val clockDomainId = MonotonicClockDomain.id
 
   private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
     if (current.get() eq profile) current.remove()

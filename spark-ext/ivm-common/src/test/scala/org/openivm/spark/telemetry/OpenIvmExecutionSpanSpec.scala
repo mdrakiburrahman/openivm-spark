@@ -7,7 +7,7 @@ import org.apache.logging.log4j.core.config.Property
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.apache.logging.log4j.core.{LogEvent, Logger}
 import org.slf4j.MDC
-import org.openivm.spark.common.{TimeTravelPinReason, TimeTravelPinStatus}
+import org.openivm.spark.common.{MonotonicClockDomain, TimeTravelPinReason, TimeTravelPinStatus}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
@@ -98,6 +98,201 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
   }
 
   describe("OpenIvmExecutionSpan") {
+    it("adds bounded state-sync coverage to the existing execution-span wire") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start(
+          "benchmark.state_sync",
+          "refresh",
+          requestId = Some("refresh-request-1"),
+          dbtNodeId = Some("model.benchmark.state_sync")
+        )
+        val request = OpenIvmExecutionSpan.StateSyncRequestEvidence(
+          requestId = "state-sync-request-1",
+          parentRequestId = Some("refresh-request-1"),
+          publicationId = "publication-1",
+          effectiveMode = "synchronous",
+          scope = "model",
+          queueWaitNs = 25L,
+          status = "success",
+          requested = true,
+          captured = true,
+          published = true,
+          snapshotGenerationId = Some("snapshot-1"),
+          acknowledgedSnapshotGenerationId = Some("snapshot-1"),
+          requestStartMonotonicNs = -35L,
+          requestStartUtc = "2026-01-01T00:00:00Z"
+        )
+        val phase = OpenIvmExecutionSpan.StateSyncPhaseEvidence(
+          operation = "spark.backup.commit",
+          status = "success",
+          workClass = "durability",
+          startMonotonicNs = -10L,
+          durationNs = 12L,
+          startUtc = "2026-01-01T00:00:00Z",
+          counts = Map.empty,
+          errorType = None
+        )
+        val publication = OpenIvmExecutionSpan.StateSyncPublicationEvidence(
+          publicationId = "publication-1",
+          effectiveMode = "synchronous",
+          status = "success",
+          startMonotonicNs = -20L,
+          durationNs = 25L,
+          startUtc = "2026-01-01T00:00:00Z",
+          phases = Seq(phase),
+          counts = Map("captured_files" -> Some(1L)),
+          requestedRequests = 1,
+          capturedRequests = 1,
+          publishedRequests = 1,
+          captured = true,
+          published = true,
+          snapshotGenerationId = Some("snapshot-1"),
+          requestIds = Seq("state-sync-request-1"),
+          parentRequestIds = Seq("refresh-request-1")
+        )
+        span.recordStateSyncEvidence(Seq(request), Seq(publication))
+        span.complete("refresh_done", "driver-refresh")
+        span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 1
+      val payload = payloads.head
+      payload.path("operation").asText() shouldBe "refresh"
+      payload.path("request_id").asText() shouldBe "refresh-request-1"
+      payload.has("schema_id") shouldBe false
+      payload.has("run_id") shouldBe false
+      payload.has("operation_id") shouldBe false
+      val stateSync = payload.path("state_sync")
+      val request   = stateSync.path("requests").get(0)
+      request.path("publication_id").asText() shouldBe "publication-1"
+      request.path("request_start_monotonic_ns").asLong() shouldBe -35L
+      request.path("request_start_utc").asText() shouldBe "2026-01-01T00:00:00Z"
+      request.path("clock_domain_id").asText() shouldBe MonotonicClockDomain.id
+      request.path("acknowledged_snapshot_generation_id").asText() shouldBe "snapshot-1"
+      request.path("requested_mutation_generation").isNull shouldBe true
+      val publication = stateSync.path("publications").get(0)
+      publication.path("scope").asText() shouldBe "run"
+      publication.path("snapshot_generation_id").asText() shouldBe "snapshot-1"
+      publication.path("start_monotonic_ns").asLong() shouldBe -20L
+      publication.path("clock_domain_id").asText() shouldBe request.path("clock_domain_id").asText()
+      publication.path("request_ids").get(0).asText() shouldBe "state-sync-request-1"
+      publication.path("parent_request_ids").get(0).asText() shouldBe "refresh-request-1"
+      publication.path("phases").get(0).path("clock_domain_id").asText() shouldBe
+        publication.path("clock_domain_id").asText()
+      publication.path("phases").get(0).path("operation").asText() shouldBe "spark.backup.commit"
+    }
+
+    it("emits late async evidence through the same execution-span wire without acking enqueue") {
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start(
+          "benchmark.async_state_sync",
+          "refresh",
+          requestId = Some("refresh-request-2"),
+          dbtNodeId = Some("model.benchmark.async_state_sync")
+        )
+        span.complete("refresh_done", "driver-refresh")
+        span.emitIfNeeded("failed_before_end", "unused")
+        val request = OpenIvmExecutionSpan.StateSyncRequestEvidence(
+          requestId = "state-sync-request-2",
+          parentRequestId = Some("refresh-request-2"),
+          publicationId = "publication-2",
+          effectiveMode = "asynchronous",
+          scope = "model",
+          queueWaitNs = 30L,
+          status = "success",
+          requested = true,
+          captured = true,
+          published = true,
+          snapshotGenerationId = Some("snapshot-2"),
+          acknowledgedSnapshotGenerationId = None,
+          requestStartMonotonicNs = -140L,
+          requestStartUtc = "2026-01-01T00:00:01Z"
+        )
+        val publication = OpenIvmExecutionSpan.StateSyncPublicationEvidence(
+          publicationId = "publication-2",
+          effectiveMode = "asynchronous",
+          status = "success",
+          startMonotonicNs = -100L,
+          durationNs = 40L,
+          startUtc = "2026-01-01T00:00:01Z",
+          phases = Seq.empty,
+          counts = Map("uploaded_bytes" -> Some(9L)),
+          requestedRequests = 1,
+          capturedRequests = 1,
+          publishedRequests = 1,
+          captured = true,
+          published = true,
+          snapshotGenerationId = Some("snapshot-2"),
+          requestIds = Seq("state-sync-request-2"),
+          parentRequestIds = Seq("refresh-request-2")
+        )
+        span.recordStateSyncEvidence(Seq(request), Seq(publication))
+        spanPayloads(appender.messages)
+      }
+
+      payloads should have size 2
+      payloads.last.path("state_sync_update").asBoolean() shouldBe true
+      payloads.last.path("operation").asText() shouldBe "refresh"
+      payloads.last.path("request_id").asText() shouldBe "refresh-request-2"
+      val request = payloads.last.path("state_sync").path("requests").get(0)
+      request.path("effective_state_sync_mode").asText() shouldBe "asynchronous"
+      request.path("request_start_monotonic_ns").asLong() shouldBe -140L
+      request.path("acknowledged_snapshot_generation_id").isNull shouldBe true
+      payloads.last.has("run_id") shouldBe false
+    }
+    it("writes run-level state-sync evidence to the captured receipt sink without a model span") {
+      OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
+      var receipt = Option.empty[(String, String)]
+      val request = OpenIvmExecutionSpan.StateSyncRequestEvidence(
+        requestId = "state-sync-request-run",
+        parentRequestId = None,
+        publicationId = "publication-run",
+        effectiveMode = "asynchronous",
+        scope = "run",
+        queueWaitNs = 10L,
+        status = "success",
+        requested = true,
+        captured = true,
+        published = true,
+        snapshotGenerationId = Some("snapshot-run"),
+        acknowledgedSnapshotGenerationId = None,
+        requestStartMonotonicNs = -20L,
+        requestStartUtc = "2026-01-01T00:00:02Z"
+      )
+      val publication = OpenIvmExecutionSpan.StateSyncPublicationEvidence(
+        publicationId = "publication-run",
+        effectiveMode = "asynchronous",
+        status = "success",
+        startMonotonicNs = -10L,
+        durationNs = 10L,
+        startUtc = "2026-01-01T00:00:02Z",
+        phases = Seq.empty,
+        counts = Map("captured_files" -> Some(1L)),
+        requestedRequests = 1,
+        capturedRequests = 1,
+        publishedRequests = 1,
+        captured = true,
+        published = true,
+        snapshotGenerationId = Some("snapshot-run"),
+        requestIds = Seq("state-sync-request-run")
+      )
+
+      OpenIvmExecutionSpan.emitRunStateSyncPublication(
+        Seq(request),
+        publication,
+        Some((key, line) => receipt = Some(key -> line))
+      )
+
+      receipt.map(_._1) shouldBe Some("state-sync:publication-run")
+      val written = Json.readTree(receipt.map(_._2).get)
+      written.path("operation").asText() shouldBe "state_sync_backup"
+      written.path("scope").asText() shouldBe "run"
+      written.path("state_sync").path("publications").get(0).path("publication_id").asText() shouldBe
+        "publication-run"
+      written.has("run_id") shouldBe false
+    }
+
     it("attributes MV lock waits to monitor timers rather than barrier preparation") {
       val payloads = withLogCapture { appender =>
         val span = OpenIvmExecutionSpan.start("default.lock_metric_mv", "refresh")
@@ -428,6 +623,52 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       completedAt.toEpochMilli should be <= publisher.publishStartedAtEpochMs
       wallDurationMs should be >= 140L
       engineDuration should be < (wallDurationMs - 100L)
+    }
+
+    it("preserves the original log and export payloads when state-sync augmentation fails") {
+      val identity = OpenIvmTelemetryContract.ExecutionIdentity(
+        campaignId = "state-sync-augmentation-failure",
+        requestId = "request-state-sync-augmentation",
+        correlationId = "correlation-state-sync-augmentation",
+        dbtNodeId = "model.benchmark.state_sync_augmentation",
+        materializedView = "benchmark.state_sync_augmentation",
+        operation = "refresh",
+        phase = "full"
+      )
+      val publisher = new CapturingPublisher()
+      val request = OpenIvmExecutionSpan.StateSyncRequestEvidence(
+        requestId = "state-sync-request-augmentation",
+        parentRequestId = Some(identity.requestId),
+        publicationId = "publication-augmentation",
+        effectiveMode = "synchronous",
+        scope = "model",
+        queueWaitNs = 0L,
+        status = "success",
+        requested = true,
+        captured = true,
+        published = true,
+        snapshotGenerationId = Some("snapshot-augmentation"),
+        acknowledgedSnapshotGenerationId = Some("snapshot-augmentation")
+      )
+      val (payloads, messages) = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.startForTesting(identity, publisher)
+        span.recordStateSyncEvidence(Seq(request), Seq.empty)
+        span.complete("refresh_done", "driver-state-sync-augmentation")
+        OpenIvmExecutionSpan.setStateSyncSerializationHookForTesting(() =>
+          throw new IllegalStateException("injected state-sync serialization failure")
+        )
+
+        noException should be thrownBy span.emitIfNeeded("failed_before_end", "unused")
+        spanPayloads(appender.messages) -> appender.messages
+      }
+
+      payloads should have size 1
+      payloads.head.path("request_id").asText() shouldBe identity.requestId
+      payloads.head.has("state_sync") shouldBe false
+      messages.exists(_.contains("state-sync augmentation failed (IllegalStateException)")) shouldBe true
+      publisher.payloads should have size 1
+      publisher.payloads.head.path("request_id").asText() shouldBe identity.requestId
+      publisher.payloads.head.has("state_sync") shouldBe false
     }
 
     it("surfaces exporter failures to the command path") {

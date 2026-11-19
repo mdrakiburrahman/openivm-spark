@@ -3,12 +3,13 @@ package org.openivm.spark.telemetry
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, TimeTravelPinReason, TimeTravelPinStatus}
+import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, TimeTravelPinReason, TimeTravelPinStatus}
 import org.slf4j.{MDC => Slf4jMdc}
 
 import java.time.Instant
 import java.util.{LinkedHashMap, UUID}
 import java.util.concurrent.TimeUnit
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 private[telemetry] final case class LockAcquisitionTelemetry(
@@ -38,7 +39,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private val oneLakeSink: Option[SpanSink] = None
 ) {
 
-  private val lock = new Object
+  private[spark] def stateSyncEvidenceEnabled: Boolean = enabled
+
+  private[spark] def stateSyncPublicationSinkConfigured: Boolean =
+    enabled && (configuredExport.nonEmpty || oneLakeSink.nonEmpty)
+
+  private val lock                         = new Object
+  private var stateSyncRequests            = Vector.empty[OpenIvmExecutionSpan.StateSyncRequestEvidence]
+  private var stateSyncPublications        = Vector.empty[OpenIvmExecutionSpan.StateSyncPublicationEvidence]
+  private var droppedStateSyncRequests     = 0L
+  private var droppedStateSyncPublications = 0L
+  private var lastLogPayload               = Option.empty[String]
 
   private var refreshClassification            = OpenIvmExecutionSpan.RefreshClassification.empty
   private var timeTravelPinStatus              = Option.empty[String]
@@ -216,6 +227,75 @@ final class OpenIvmExecutionSpan private[telemetry] (
       rocksDbBackupMs = addDuration(rocksDbBackupMs, durationMs)
     }
 
+  private[spark] def stateSyncParentContext: OpenIvmExecutionSpan.StateSyncParentContext =
+    lock.synchronized {
+      val identity = configuredExport.map(_.identity)
+      OpenIvmExecutionSpan.StateSyncParentContext(
+        requestId = requestId,
+        correlationId = identity.map(_.correlationId),
+        campaignId = identity.map(_.campaignId),
+        modelUniqueId = dbtNodeId,
+        materializedView = Option(materializedView).filter(_.nonEmpty),
+        commandOperation = Option(operation).filter(_.nonEmpty),
+        phase = identity.map(_.phase)
+      )
+    }
+
+  private[spark] def recordStateSyncEvidence(
+      requests: Seq[OpenIvmExecutionSpan.StateSyncRequestEvidence],
+      publications: Seq[OpenIvmExecutionSpan.StateSyncPublicationEvidence]
+  ): Unit = {
+    val boundedRequests          = requests.take(OpenIvmExecutionSpan.MaxStateSyncRequests)
+    val boundedPublications      = publications.take(OpenIvmExecutionSpan.MaxStateSyncPublications)
+    val inputDroppedRequests     = (requests.size - boundedRequests.size).toLong
+    val inputDroppedPublications = (publications.size - boundedPublications.size).toLong
+    val supplemental = lock.synchronized {
+      if (!enabled) None
+      else {
+        boundedRequests.foreach { request =>
+          if (stateSyncRequests.size < OpenIvmExecutionSpan.MaxStateSyncRequests) stateSyncRequests :+= request
+          else droppedStateSyncRequests += 1L
+        }
+        boundedPublications.foreach { publication =>
+          if (stateSyncPublications.size < OpenIvmExecutionSpan.MaxStateSyncPublications)
+            stateSyncPublications :+= publication
+          else droppedStateSyncPublications += 1L
+        }
+        if (emitted) {
+          val evidence = OpenIvmExecutionSpan.StateSyncEvidence(
+            boundedRequests,
+            boundedPublications,
+            droppedRequests = inputDroppedRequests,
+            droppedPublications = inputDroppedPublications
+          )
+          lastLogPayload.map(payload => OpenIvmExecutionSpan.withStateSyncBestEffort(payload, evidence, update = true))
+        } else None
+      }
+    }
+    supplemental.foreach { payload =>
+      OpenIvmExecutionSpan.logSpan(payload)
+      val suffix =
+        boundedPublications.headOption.map(_.publicationId).orElse(boundedRequests.headOption.map(_.requestId))
+      suffix.foreach(value =>
+        OpenIvmExecutionSpan.emitStateSyncSupplement(
+          oneLakeSink,
+          s"${requestId.getOrElse(materializedView)}:state-sync:$value",
+          payload
+        )
+      )
+    }
+    val hook = OpenIvmExecutionSpan.stateSyncEvidenceHookForTesting
+    if (hook != null && (boundedRequests.nonEmpty || boundedPublications.nonEmpty))
+      hook(
+        OpenIvmExecutionSpan.StateSyncEvidence(
+          boundedRequests,
+          boundedPublications,
+          inputDroppedRequests,
+          inputDroppedPublications
+        )
+      )
+  }
+
   def recordSourceVersions(values: => Seq[OpenIvmTelemetryContract.SourceVersion]): Unit =
     if (configuredExport.nonEmpty) {
       recordBeforeEmit {
@@ -378,6 +458,13 @@ final class OpenIvmExecutionSpan private[telemetry] (
               rocksDbExternalWaitMs = rocksDbExternalWaitMs,
               rocksDbBackupMs = rocksDbBackupMs
             )
+            val stateSyncEvidence = OpenIvmExecutionSpan.StateSyncEvidence(
+              stateSyncRequests,
+              stateSyncPublications,
+              droppedStateSyncRequests,
+              droppedStateSyncPublications
+            )
+            val finalLogPayload = OpenIvmExecutionSpan.withStateSyncBestEffort(logPayload, stateSyncEvidence)
             val exportPayload = configuredExport.map { export =>
               export -> OpenIvmExecutionSpan.renderExportJson(
                 identity = export.identity,
@@ -422,10 +509,15 @@ final class OpenIvmExecutionSpan private[telemetry] (
                 pendingDeltaCount = pendingDeltaCount
               )
             }
+            val finalExportPayload = exportPayload.map { case (export, payload) =>
+              export -> OpenIvmExecutionSpan.withStateSyncBestEffort(payload, stateSyncEvidence)
+            }
+            val emittedPayload = finalExportPayload.map(_._2).getOrElse(finalLogPayload)
+            lastLogPayload = Some(emittedPayload)
             Some(
               OpenIvmExecutionSpan.RenderedPayload(
-                exportPayload.map(_._2).getOrElse(logPayload),
-                exportPayload,
+                emittedPayload,
+                finalExportPayload,
                 completedExportReuseAllowed
               )
             )
@@ -492,6 +584,358 @@ object OpenIvmExecutionSpan extends Logging {
       exportPayload: Option[(ConfiguredTelemetryExport, String)],
       completedExportReuseAllowed: Boolean
   )
+
+  private[spark] final case class StateSyncParentContext(
+      requestId: Option[String],
+      correlationId: Option[String],
+      campaignId: Option[String],
+      modelUniqueId: Option[String],
+      materializedView: Option[String],
+      commandOperation: Option[String],
+      phase: Option[String]
+  )
+
+  private[spark] final case class StateSyncRequestEvidence(
+      requestId: String,
+      parentRequestId: Option[String],
+      publicationId: String,
+      effectiveMode: String,
+      scope: String,
+      queueWaitNs: Long,
+      status: String,
+      requested: Boolean,
+      captured: Boolean,
+      published: Boolean,
+      snapshotGenerationId: Option[String],
+      acknowledgedSnapshotGenerationId: Option[String],
+      requestStartMonotonicNs: Long = 0L,
+      requestStartUtc: String = ""
+  )
+
+  private[spark] final case class StateSyncPhaseEvidence(
+      operation: String,
+      status: String,
+      workClass: String,
+      startMonotonicNs: Long,
+      durationNs: Long,
+      startUtc: String,
+      counts: Map[String, Long],
+      errorType: Option[String]
+  )
+
+  private[spark] final case class StateSyncPublicationEvidence(
+      publicationId: String,
+      effectiveMode: String,
+      status: String,
+      startMonotonicNs: Long,
+      durationNs: Long,
+      startUtc: String,
+      phases: Seq[StateSyncPhaseEvidence],
+      counts: Map[String, Option[Long]],
+      requestedRequests: Int,
+      capturedRequests: Int,
+      publishedRequests: Int,
+      captured: Boolean,
+      published: Boolean,
+      snapshotGenerationId: Option[String],
+      requestIds: Seq[String] = Seq.empty,
+      parentRequestIds: Seq[String] = Seq.empty,
+      droppedRequestIds: Long = 0L,
+      droppedParentRequestIds: Long = 0L
+  )
+
+  private[spark] final case class StateSyncEvidence(
+      requests: Seq[StateSyncRequestEvidence],
+      publications: Seq[StateSyncPublicationEvidence],
+      droppedRequests: Long,
+      droppedPublications: Long
+  )
+
+  private[spark] val MaxStateSyncRequests = 128
+  private val MaxStateSyncPublications    = 16
+
+  private[spark] type StateSyncReceiptWriter = (String, String) => Unit
+
+  private[spark] def stateSyncCaptureEnabled(
+      spark: SparkSession,
+      active: Option[OpenIvmExecutionSpan]
+  ): Boolean =
+    try
+      active.exists(_.enabled) || FeatureGate.telemetryUri(spark).nonEmpty ||
+        FeatureGate.oneLakeTelemetryDir(spark).nonEmpty || FeatureGate.profileRefreshEnabled(spark)
+    catch {
+      case NonFatal(error) =>
+        logWarning(
+          s"[openivm-telemetry-sink] cannot inspect state-sync capture settings (${error.getClass.getSimpleName})"
+        )
+        false
+    }
+
+  private[spark] def captureStateSyncReceiptWriter(
+      spark: SparkSession,
+      active: Option[OpenIvmExecutionSpan]
+  ): Option[StateSyncReceiptWriter] =
+    try {
+      val sink = active.flatMap(_.oneLakeSink).orElse {
+        FeatureGate
+          .oneLakeTelemetryDir(spark)
+          .map(dir => OneLakeSpanSink.forDir(dir, spark.sessionState.newHadoopConf()))
+      }
+      sink.map(target => (key: String, payload: String) => emitStateSyncSupplement(Some(target), key, payload))
+    } catch {
+      case NonFatal(error) =>
+        logWarning(s"[openivm-telemetry-sink] cannot capture state-sync receipt sink (${error.getClass.getSimpleName})")
+        None
+    }
+
+  private def withStateSyncBestEffort(
+      payload: String,
+      evidence: StateSyncEvidence,
+      update: Boolean = false
+  ): String =
+    try withStateSync(payload, evidence, update)
+    catch {
+      case NonFatal(error) =>
+        logWarning(s"[openivm-telemetry-sink] state-sync augmentation failed (${error.getClass.getSimpleName})")
+        payload
+    }
+
+  private def withStateSync(payload: String, evidence: StateSyncEvidence, update: Boolean = false): String =
+    if (
+      evidence.requests.isEmpty && evidence.publications.isEmpty && evidence.droppedRequests == 0L &&
+      evidence.droppedPublications == 0L
+    ) payload
+    else {
+      val hook = stateSyncSerializationHookForTesting
+      if (hook != null) hook()
+      val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+      root.set("state_sync", Json.valueToTree[com.fasterxml.jackson.databind.JsonNode](renderStateSync(evidence)))
+      if (update) root.put("state_sync_update", true)
+      Json.writeValueAsString(root)
+    }
+
+  private def renderStateSync(evidence: StateSyncEvidence): java.util.Map[String, AnyRef] = {
+    val stateSync = new LinkedHashMap[String, AnyRef]()
+    val requests  = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+    evidence.requests.foreach { request =>
+      val item = new LinkedHashMap[String, AnyRef]()
+      item.put("request_id", request.requestId)
+      request.parentRequestId.foreach(item.put("parent_request_id", _))
+      item.put("publication_id", request.publicationId)
+      item.put("clock_domain_id", MonotonicClockDomain.id)
+      item.put("request_start_monotonic_ns", java.lang.Long.valueOf(request.requestStartMonotonicNs))
+      item.put("request_start_utc", request.requestStartUtc)
+      item.put("effective_state_sync_mode", request.effectiveMode)
+      item.put("scope", request.scope)
+      item.put("queue_wait_ns", java.lang.Long.valueOf(math.max(0L, request.queueWaitNs)))
+      item.put("status", request.status)
+      item.put("requested", java.lang.Boolean.valueOf(request.requested))
+      item.put("captured", java.lang.Boolean.valueOf(request.captured))
+      item.put("published", java.lang.Boolean.valueOf(request.published))
+      item.put("snapshot_generation_id", request.snapshotGenerationId.orNull)
+      item.put("acknowledged_snapshot_generation_id", request.acknowledgedSnapshotGenerationId.orNull)
+      item.put("requested_mutation_generation", null)
+      item.put("captured_mutation_generation", null)
+      item.put("published_mutation_generation", null)
+      requests.add(item)
+    }
+    stateSync.put("requests", requests)
+    val publications = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+    evidence.publications.foreach { publication =>
+      val item             = new LinkedHashMap[String, AnyRef]()
+      val requestIds       = publication.requestIds.take(MaxStateSyncRequests)
+      val parentRequestIds = publication.parentRequestIds.take(MaxStateSyncRequests)
+      item.put("publication_id", publication.publicationId)
+      item.put("clock_domain_id", MonotonicClockDomain.id)
+      item.put("request_ids", requestIds.asJava)
+      item.put("parent_request_ids", parentRequestIds.asJava)
+      item.put(
+        "dropped_request_ids",
+        java.lang.Long.valueOf(
+          math.max(0L, publication.droppedRequestIds) + publication.requestIds.size - requestIds.size
+        )
+      )
+      item.put(
+        "dropped_parent_request_ids",
+        java.lang.Long.valueOf(
+          math.max(0L, publication.droppedParentRequestIds) + publication.parentRequestIds.size - parentRequestIds.size
+        )
+      )
+      item.put("effective_state_sync_mode", publication.effectiveMode)
+      item.put("scope", "run")
+      item.put("status", publication.status)
+      item.put("start_monotonic_ns", java.lang.Long.valueOf(publication.startMonotonicNs))
+      item.put("duration_ns", java.lang.Long.valueOf(math.max(0L, publication.durationNs)))
+      item.put("start_utc", publication.startUtc)
+      item.put("requested_requests", java.lang.Integer.valueOf(publication.requestedRequests))
+      item.put("captured_requests", java.lang.Integer.valueOf(publication.capturedRequests))
+      item.put("published_requests", java.lang.Integer.valueOf(publication.publishedRequests))
+      item.put("captured", java.lang.Boolean.valueOf(publication.captured))
+      item.put("published", java.lang.Boolean.valueOf(publication.published))
+      item.put("snapshot_generation_id", publication.snapshotGenerationId.orNull)
+      item.put("requested_mutation_generation", null)
+      item.put("captured_mutation_generation", null)
+      item.put("published_mutation_generation", null)
+      val counts = new LinkedHashMap[String, AnyRef]()
+      publication.counts.toSeq.sortBy(_._1).foreach { case (name, value) =>
+        counts.put(name, value.map(count => java.lang.Long.valueOf(math.max(0L, count))).orNull)
+      }
+      item.put("counts", counts)
+      val phases = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+      publication.phases.foreach { phase =>
+        val phaseItem = new LinkedHashMap[String, AnyRef]()
+        phaseItem.put("operation", phase.operation)
+        phaseItem.put("clock_domain_id", MonotonicClockDomain.id)
+        phaseItem.put("status", phase.status)
+        phaseItem.put("work_class", phase.workClass)
+        phaseItem.put("start_monotonic_ns", java.lang.Long.valueOf(phase.startMonotonicNs))
+        phaseItem.put("duration_ns", java.lang.Long.valueOf(math.max(0L, phase.durationNs)))
+        phaseItem.put("start_utc", phase.startUtc)
+        val phaseCounts = new LinkedHashMap[String, AnyRef]()
+        phase.counts.toSeq.sortBy(_._1).foreach { case (name, value) =>
+          phaseCounts.put(name, java.lang.Long.valueOf(math.max(0L, value)))
+        }
+        phaseItem.put("counts", phaseCounts)
+        phase.errorType.foreach(phaseItem.put("error_type", _))
+        phases.add(phaseItem)
+      }
+      item.put("phases", phases)
+      publications.add(item)
+    }
+    stateSync.put("publications", publications)
+    stateSync.put("dropped_requests", java.lang.Long.valueOf(math.max(0L, evidence.droppedRequests)))
+    stateSync.put("dropped_publications", java.lang.Long.valueOf(math.max(0L, evidence.droppedPublications)))
+    stateSync
+  }
+
+  private[spark] def emitRunStateSyncPublication(
+      requests: Seq[StateSyncRequestEvidence],
+      publication: StateSyncPublicationEvidence,
+      receiptWriter: Option[StateSyncReceiptWriter] = None
+  ): Unit = {
+    val boundedRequests = requests.take(MaxStateSyncRequests)
+    val evidence = StateSyncEvidence(
+      boundedRequests,
+      Seq(publication),
+      (requests.size - boundedRequests.size).toLong,
+      0L
+    )
+    emitRunStateSyncRecord(
+      evidence,
+      publication.startUtc,
+      publication.durationNs,
+      publication.status,
+      receiptWriter,
+      s"state-sync:${publication.publicationId}"
+    )
+  }
+
+  private[spark] def emitRunStateSyncRequests(
+      requests: Seq[StateSyncRequestEvidence],
+      receiptWriter: Option[StateSyncReceiptWriter]
+  ): Unit =
+    if (requests.nonEmpty) {
+      val boundedRequests = requests.take(MaxStateSyncRequests)
+      val evidence = StateSyncEvidence(
+        boundedRequests,
+        Seq.empty,
+        (requests.size - boundedRequests.size).toLong,
+        0L
+      )
+      val queueWaitNs = requests.iterator.map(_.queueWaitNs).foldLeft(0L)(math.max)
+      emitRunStateSyncRecord(
+        evidence,
+        requests.head.requestStartUtc,
+        queueWaitNs,
+        "state_sync_requested",
+        receiptWriter,
+        s"state-sync-request:${requests.head.requestId}"
+      )
+    }
+
+  private def emitRunStateSyncRecord(
+      evidence: StateSyncEvidence,
+      startUtc: String,
+      durationNs: Long,
+      outcome: String,
+      receiptWriter: Option[StateSyncReceiptWriter],
+      receiptKey: String
+  ): Unit =
+    try {
+      val startedAtEpochMs = Instant.parse(startUtc).toEpochMilli
+      val durationMs       = TimeUnit.NANOSECONDS.toMillis(math.max(0L, durationNs))
+      val base = renderJson(
+        requestId = None,
+        dbtNodeId = None,
+        materializedView = "",
+        operation = "state_sync_backup",
+        startedAtEpochMs = startedAtEpochMs,
+        completedAtEpochMs = startedAtEpochMs + durationMs,
+        durationMs = durationMs,
+        driverThread = "state-sync",
+        outcome = outcome,
+        compileRefreshType = None,
+        effectiveRefreshType = None,
+        refreshReason = None,
+        timeTravelPinStatus = None,
+        timeTravelPinReason = None,
+        sameMvLockWaitMs = None,
+        lockAcquisitions = Seq.empty,
+        driverAdmissionWaitMs = None,
+        catalogPublicationAdmissionWidth = None,
+        catalogPublicationAdmissionWaitMs = None,
+        compilerMs = None,
+        catalogMs = None,
+        rocksDbWriteMs = None,
+        rocksDbWriteCount = 0L,
+        analysisMs = None,
+        watermarkMs = None,
+        ctasMs = None,
+        ctasDataWriteMs = None,
+        hiveCatalogPublicationMs = None,
+        metadataPublicationMs = None,
+        deltaVersionLookupMs = None,
+        deltaVersionLookupCount = 0L,
+        rocksDbFlushMs = None,
+        rocksDbFlushCount = 0L,
+        rocksDbFlushFailures = 0L,
+        rocksDbJvmLockWaitMs = None,
+        rocksDbExternalWaitMs = None,
+        rocksDbBackupMs = None
+      )
+      val payload = withStateSync(base, evidence)
+      val root    = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+      root.put("scope", "run")
+      val runPayload = Json.writeValueAsString(root)
+      logSpan(runPayload)
+      receiptWriter.foreach(writer => writer(receiptKey, runPayload))
+      val hook = stateSyncEvidenceHookForTesting
+      if (hook != null) hook(evidence)
+    } catch {
+      case NonFatal(error) =>
+        logWarning(s"[openivm-telemetry-sink] state-sync span rendering failed (${error.getClass.getSimpleName})")
+    }
+
+  private[spark] def emitStateSyncSupplement(sink: Option[SpanSink], key: String, payload: String): Unit =
+    sink.foreach { target =>
+      try target.write(key, LogPrefix + payload)
+      catch {
+        case NonFatal(error) =>
+          OneLakeSpanSink.recordCallSiteFailure(error)
+          logSinkDropAtEmit(key, error)
+      }
+    }
+
+  private[spark] def setStateSyncEvidenceHookForTesting(hook: StateSyncEvidence => Unit): Unit =
+    stateSyncEvidenceHookForTesting = hook
+
+  private[spark] def setStateSyncSerializationHookForTesting(hook: () => Unit): Unit =
+    stateSyncSerializationHookForTesting = hook
+
+  private[spark] def resetStateSyncForTesting(): Unit = {
+    stateSyncEvidenceHookForTesting = null
+    stateSyncSerializationHookForTesting = null
+  }
 
   private final case class PendingDuration(durationMs: Long, observedAtNanos: Long)
   private final case class RefreshClassification(
@@ -575,7 +1019,9 @@ object OpenIvmExecutionSpan extends Logging {
     }
   }
 
-  private val Json                     = new ObjectMapper()
+  private val Json                                                                 = new ObjectMapper()
+  @volatile private var stateSyncEvidenceHookForTesting: StateSyncEvidence => Unit = null
+  @volatile private var stateSyncSerializationHookForTesting: () => Unit           = null
   private val current                  = new ThreadLocal[OpenIvmExecutionSpan]()
   private val pending                  = new ThreadLocal[PendingDurations]()
   private val RequestIdKeys            = Seq("openivm.request_id", "request_id", "requestId")
@@ -694,6 +1140,37 @@ object OpenIvmExecutionSpan extends Logging {
     Option(current.get()).exists(span => span.configuredExport.nonEmpty || span.oneLakeSink.nonEmpty)
 
   def captureCurrent(): Option[OpenIvmExecutionSpan] = Option(current.get())
+
+  private[spark] def captureStateSyncParent(
+      spark: SparkSession,
+      active: Option[OpenIvmExecutionSpan]
+  ): StateSyncParentContext = {
+    val activeContext              = active.map(_.stateSyncParentContext)
+    val (requestId, modelUniqueId) = correlationIdsFromSpark(spark)
+    def configured(key: String): Option[String] =
+      spark.conf
+        .getOption(key)
+        .orElse(spark.sparkContext.getConf.getOption(key))
+        .filter(value => value != null && value.nonEmpty)
+    val fallback = StateSyncParentContext(
+      requestId = requestId,
+      correlationId = configured(FeatureGate.TelemetryCorrelationIdKey),
+      campaignId = configured(FeatureGate.TelemetryCampaignIdKey),
+      modelUniqueId = modelUniqueId,
+      materializedView = None,
+      commandOperation = None,
+      phase = configured(FeatureGate.TelemetryPhaseKey)
+    )
+    activeContext.fold(fallback) { parent =>
+      parent.copy(
+        requestId = parent.requestId.orElse(fallback.requestId),
+        correlationId = parent.correlationId.orElse(fallback.correlationId),
+        campaignId = parent.campaignId.orElse(fallback.campaignId),
+        modelUniqueId = parent.modelUniqueId.orElse(fallback.modelUniqueId),
+        phase = parent.phase.orElse(fallback.phase)
+      )
+    }
+  }
 
   def recordActiveRefreshClassification(
       compileRefreshType: Option[String] = None,
@@ -822,6 +1299,7 @@ object OpenIvmExecutionSpan extends Logging {
   private[telemetry] def resetForTesting(): Unit = {
     current.remove()
     pending.remove()
+    resetStateSyncForTesting()
   }
 
   private def consumePending(span: OpenIvmExecutionSpan, nowNanos: Long): Unit = {

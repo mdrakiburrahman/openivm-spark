@@ -2,6 +2,7 @@ package org.openivm.spark.commands
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.SparkSession
+import org.openivm.spark.common.MonotonicClockDomain
 import org.openivm.spark.insights.{OpenIvmInsightsBroker, OpenIvmInsightsContract}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -16,6 +17,10 @@ class OpenIvmInsightsCommandsSpec extends AnyFunSpec with Matchers with BeforeAn
   private val mapper              = new ObjectMapper()
   private val warehouse =
     new File(s"target/test-warehouse-insights-command-${UUID.randomUUID().toString.take(8)}")
+
+  it("shares the common monotonic clock domain with state-sync evidence") {
+    RefreshProfile.clockDomainId shouldBe MonotonicClockDomain.id
+  }
 
   override def beforeAll(): Unit = {
     super.beforeAll()
