@@ -4822,8 +4822,7 @@ case class RefreshMaterializedViewCommand(
             else None
           if (!loadedMeta.properties.get(key).contains(hash) || !liveHash.contains(hash))
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} query hash mismatch")
-          val snapshot = DeltaLog.forTable(spark, new Path(loadedMeta.location)).update()
-          val tableId = Option(snapshot.metadata.id).filter(_.nonEmpty).getOrElse {
+          val tableId = ownership.dataTableId.getOrElse {
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} has no physical Delta table ID")
           }
           if (!loadedMeta.properties.get(MvMetadata.TargetDeltaTableIdKey).contains(tableId))
@@ -9213,12 +9212,14 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
     *                    over the OpenIVM backing table
     * @param dataOwned   the Delta table at the registered location carries OpenIVM's CREATE marker
     * @param dataPresent a Delta table exists at the registered location
+    * @param dataTableId the physical Delta identity from the same ownership snapshot
     * @param reason      why the registration is not fully owned; empty when it is
     */
   final case class LiveOwnership(
       publicOwned: Boolean,
       dataOwned: Boolean,
       dataPresent: Boolean,
+      dataTableId: Option[String],
       reason: String
   ) {
     def owned: Boolean = publicOwned && dataOwned
@@ -9262,7 +9263,8 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       else if (!publicExists) s"relation $ident does not exist"
       else if (!publicOwned) s"relation $ident is not $expectedObject"
       else ""
-    LiveOwnership(publicOwned, dataOwned, dataPresent, reason)
+    val dataTableId = if (dataPresent) Option(snapshot.metadata.id).filter(_.nonEmpty) else None
+    LiveOwnership(publicOwned, dataOwned, dataPresent, dataTableId, reason)
   }
 
   /** Drop one registered materialized view and remove its OpenIVM state. Catalog objects and
