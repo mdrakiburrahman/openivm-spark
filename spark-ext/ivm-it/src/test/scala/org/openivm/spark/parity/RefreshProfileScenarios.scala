@@ -160,6 +160,13 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       after.getLong(5) should be >= backup.getLong(5)
       rows.count(_.getString(4) == "query_span") shouldBe 1
       rows.count(_.getString(4) == "command_span") shouldBe 1
+      Seq("gc_prepare", "sql_log_handoff", "state_lag_check").foreach { step =>
+        val details = detailsForStep(rows, step)
+        details should have size 1
+        details.head should include("clock_domain_id=")
+        details.head should include("start_monotonic_ns=")
+        details.head should include("duration_ns=")
+      }
       val stmtDetails = detailsForStep(rows, "execute_refresh_sql_stmt")
       stmtDetails should not be empty
       stmtDetails.exists(_.contains("stmt_kind=")) shouldBe true

@@ -83,6 +83,26 @@ final class RefreshProfile private (
     }
   }
 
+  def timeObservedStep[A](stepName: String)(body: => A): A = {
+    val needsTiming =
+      active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
+    if (!needsTiming) return body
+    val startedEpochMs = System.currentTimeMillis()
+    val startedNanos   = System.nanoTime()
+    var succeeded      = false
+    try {
+      val result = body
+      succeeded = true
+      result
+    } finally {
+      val durationNanos = System.nanoTime() - startedNanos
+      val detail =
+        s"clock_domain_id=${RefreshProfile.clockDomainId};start_epoch_ms=$startedEpochMs;" +
+          s"start_monotonic_ns=$startedNanos;duration_ns=$durationNanos"
+      appendStepInternal(stepName, detail, durationNanos / 1000000L, succeeded)
+    }
+  }
+
   /** Append a row with an explicitly-measured duration. Use for marker-style
     * events (e.g. `total_refresh` at end of lifecycle) or where the duration
     * is computed by an outer scope (e.g. lock-acquisition time measured
@@ -262,7 +282,8 @@ final class RefreshProfile private (
 
 object RefreshProfile {
 
-  private val current = new ThreadLocal[RefreshProfile]()
+  private val current       = new ThreadLocal[RefreshProfile]()
+  private val clockDomainId = java.util.UUID.randomUUID().toString
 
   private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
     if (current.get() eq profile) current.remove()
@@ -275,6 +296,12 @@ object RefreshProfile {
   def timeActiveStep[A](stepName: String)(body: => A): A =
     Option(current.get()) match {
       case Some(profile) => profile.timeStep(stepName)(body)
+      case None          => body
+    }
+
+  def timeObservedActiveStep[A](stepName: String)(body: => A): A =
+    Option(current.get()) match {
+      case Some(profile) => profile.timeObservedStep(stepName)(body)
       case None          => body
     }
 

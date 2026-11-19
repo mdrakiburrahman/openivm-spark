@@ -4187,7 +4187,9 @@ case class RefreshMaterializedViewCommand(
         }
       }
       // In async mode the same publication ordering holds in the background.
-      val garbage = OpenIvmGarbageCollector.prepare(spark)
+      val garbage = RefreshProfile.timeObservedActiveStep("gc_prepare") {
+        OpenIvmGarbageCollector.prepare(spark)
+      }
       if (FeatureGate.stateSyncAsyncEnabled(spark)) {
         RefreshProfile.timeActiveStep("state_backup_enqueue") {
           OpenIvmStateSync.backupForCommand(spark, () => OpenIvmGarbageCollector.collect(spark, garbage))
@@ -4715,7 +4717,9 @@ case class RefreshMaterializedViewCommand(
         profile.timeStep("profile_persist") {
           profile.persist()
         }
-        sqlLog.flush()
+        profile.timeObservedStep("sql_log_handoff") {
+          sqlLog.flush()
+        }
       }
     }
 
@@ -4989,8 +4993,10 @@ case class RefreshMaterializedViewCommand(
       // A restarted driver restores the newest published state snapshot, which can predate a
       // refresh that already committed MV data; incremental apply would then replay its deltas.
       val stateLag: Option[MvStateLag] =
-        if (preparedSourceAdvance.nonEmpty) None
-        else MvStateLag.detect(spark, meta)
+        profile.timeObservedStep("state_lag_check") {
+          if (preparedSourceAdvance.nonEmpty) None
+          else MvStateLag.detect(spark, meta)
+        }
       stateLag.foreach { lag =>
         logWarning(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='state_lag_full_refresh' " +
@@ -5622,6 +5628,17 @@ case class RefreshMaterializedViewCommand(
       lazy val replaceBatch: Boolean =
         hasReplacementBatch(changeBatches, cdfBatchVerdicts.values)
       if (meta.refreshType == RefreshTypeCode.FullRefresh || replaceBatch || stateLag.nonEmpty) {
+        val reason =
+          if (stateLag.nonEmpty) "state_lag"
+          else if (meta.refreshType == RefreshTypeCode.FullRefresh) "persisted_full_refresh"
+          else if (cdfRebaselineReasons.nonEmpty) "cdf_rebaseline"
+          else "replacement_or_unavailable_classifier"
+        profile.appendStep(
+          "full_refresh_decision",
+          s"reason_code=$reason;state_lag=${stateLag.nonEmpty};" +
+            s"cdf_rebaseline=${cdfRebaselineReasons.nonEmpty}",
+          0L
+        )
         if (meta.refreshType != RefreshTypeCode.FullRefresh && stateLag.isEmpty && cdfRebaselineReasons.isEmpty)
           logInfo(
             s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='replace_full_refresh' reason='source_overwritten'"

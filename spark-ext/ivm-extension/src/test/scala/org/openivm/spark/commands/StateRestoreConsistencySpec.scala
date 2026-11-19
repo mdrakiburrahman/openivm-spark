@@ -1,7 +1,7 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.openivm.spark.common.{MvCatalog, StagingCatalog}
+import org.openivm.spark.common.{MvCatalog, RefreshProfileCatalog, StagingCatalog}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBRegistry
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -36,6 +36,7 @@ class StateRestoreConsistencySpec extends AnyFunSpec with BeforeAndAfterAll with
       .config("spark.openivm.changeFeed.mode", "intercept")
       .config("spark.openivm.statePath", state.getAbsolutePath)
       .config("spark.openivm.gc.enabled", "false")
+      .config("spark.openivm.profile.refresh", "true")
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "1")
@@ -139,6 +140,10 @@ class StateRestoreConsistencySpec extends AnyFunSpec with BeforeAndAfterAll with
       spark.sql(s"REFRESH MATERIALIZED VIEW $aggregate")
       crashAndRestore(generation)
       assertMvsMatch(source, projection, aggregate)
+      val decisions = RefreshProfileCatalog
+        .scanAll(spark)
+        .filter(row => row.viewName.endsWith(projection) && row.stepName == "full_refresh_decision")
+      decisions.exists(_.detail.contains("reason_code=state_lag")) shouldBe true
     }
 
     it("cascades a lagging upstream refresh to downstream views from their recorded version") {

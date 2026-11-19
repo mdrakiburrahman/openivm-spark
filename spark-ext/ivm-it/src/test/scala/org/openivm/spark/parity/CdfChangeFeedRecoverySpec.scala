@@ -46,6 +46,7 @@ class CdfChangeFeedRecoverySpec extends IvmParitySpecBase("cdf-change-feed-recov
   private def assertRebaselined(src: String, mv: String, reason: String): Unit = {
     val profile = refreshProfile(mv)
     profile should include("outcome=full_refresh_executed")
+    profile should include("full_refresh_decision:reason_code=cdf_rebaseline")
     profile should include(reason)
     assertMvCorrect(mv, body(src))
     val source = meta(mv).sourceTables.head
