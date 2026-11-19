@@ -3,7 +3,7 @@
 ## Guarded refresh
 
 When the extension and feature gate are enabled, `SET spark.openivm.capabilities`
-advertises `ensure_refresh_v1`. Clients can opt in using
+advertises `ensure_refresh_v2`. Clients can opt in using
 
 ```sql
 REFRESH MATERIALIZED VIEW db.view EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' IF EXISTS
@@ -20,8 +20,10 @@ legacy MVs without this identity fail closed and remain usable through the
 ordinary refresh path.
 
 The single result row contains `status`, `query_hash`, `target`,
-`target_table_id`, `refresh_id`, and `outcome`. The final three fields are null
-for `absent`. A `refreshed` result follows the configured state-sync behavior:
+`target_table_id`, `refresh_id`, and `outcome`. `target` is the input identifier
+rendered with each component backtick-quoted and escaped; it is not resolved to
+a default namespace. One to three identifier components are supported; four or
+more are rejected. The final three fields are null for `absent`. A `refreshed` result follows the configured state-sync behavior:
 asynchronous mode does not imply remote publication has completed. Older JARs
 do not advertise the capability and clients must retain their normal fallback.
 

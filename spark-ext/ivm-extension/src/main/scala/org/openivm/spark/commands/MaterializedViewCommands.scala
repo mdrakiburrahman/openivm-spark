@@ -4210,7 +4210,7 @@ case class RefreshMaterializedViewCommand(
           if (spark.catalog.tableExists(sqlIdent(name)))
             throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
           absent = true
-          Seq(Row("absent", expectedQueryHash.get, viewMeta, null, null, null))
+          Seq(Row("absent", expectedQueryHash.get, sqlIdent(name), null, null, null))
         } else
           OpenIvmStateBarrier.withMutation(spark) {
             if (expectedQueryHash.isDefined) {
@@ -4266,7 +4266,7 @@ case class RefreshMaterializedViewCommand(
           val tableId = targetTableId.getOrElse(throw new IllegalStateException("Missing validated target identity"))
           val (refreshId, outcome) =
             completedRefresh.getOrElse(throw new IllegalStateException("Missing completed refresh proof"))
-          Seq(Row("refreshed", hash, viewMeta, tableId, refreshId, outcome))
+          Seq(Row("refreshed", hash, sqlIdent(name), tableId, refreshId, outcome))
       }
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach

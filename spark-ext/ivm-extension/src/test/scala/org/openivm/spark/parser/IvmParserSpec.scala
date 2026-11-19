@@ -359,6 +359,20 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       cmd.expectedQueryHash shouldBe Some("0123456789abcdefabcdef0123456789")
     }
 
+    it("preserves three-part targets and rejects four-part targets") {
+      val suffix = "EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' IF EXISTS"
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(s"REFRESH MATERIALIZED VIEW `Lakehouse`.`dbo`.`mv` $suffix")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("dbo"), Some("Lakehouse"))
+      val error = intercept[ParseException] {
+        spark.sessionState.sqlParser.parsePlan(
+          s"REFRESH MATERIALIZED VIEW `Workspace`.`Lakehouse`.`dbo`.`mv` $suffix"
+        )
+      }
+      error.getMessage should include("Identifier has too many parts")
+    }
+
     it("preserves EXPECT as a non-reserved identifier") {
       val cmd = spark.sessionState.sqlParser
         .parsePlan("REFRESH MATERIALIZED VIEW expect")

@@ -137,15 +137,15 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
 
     it("reports only truly absent names as absent") {
       val capability = sql("SET spark.openivm.capabilities").collect().head
-      capability.getString(1) should include("ensure_refresh_v1")
+      capability.getString(1) should include("ensure_refresh_v2")
       spark.conf.set("spark.openivm.enabled", "false")
       try {
-        sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v1")
+        sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v2")
       } finally spark.conf.set("spark.openivm.enabled", "true")
       val absent = guarded("ensure_absent_p14").head
       absent.getString(0) shouldBe "absent"
       absent.getString(1) shouldBe hash
-      absent.getString(2) should not be empty
+      absent.getString(2) shouldBe "`ensure_absent_p14`"
       (3 to 5).foreach(i => absent.isNullAt(i) shouldBe true)
       sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
       intercept[Exception](guarded("ensure_unmanaged_p14"))
@@ -162,7 +162,8 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       val proof = guarded("ensure_mv_p15").head
       proof.getString(0) shouldBe "refreshed"
       proof.getString(1) shouldBe hash
-      (2 to 5).foreach(i => proof.getString(i) should not be empty)
+      proof.getString(2) shouldBe "`ensure_mv_p15`"
+      (3 to 5).foreach(i => proof.getString(i) should not be empty)
       assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
       val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15")).get
       try {
