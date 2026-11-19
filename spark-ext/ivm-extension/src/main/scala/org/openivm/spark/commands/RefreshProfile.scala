@@ -83,7 +83,7 @@ final class RefreshProfile private (
     }
   }
 
-  def timeObservedStep[A](stepName: String)(body: => A): A = {
+  def timeObservedStep[A](stepName: String, detail: String = "")(body: => A): A = {
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
     if (!needsTiming) return body
@@ -96,10 +96,26 @@ final class RefreshProfile private (
       result
     } finally {
       val durationNanos = System.nanoTime() - startedNanos
-      val detail =
+      val observedDetail =
         s"clock_domain_id=${RefreshProfile.clockDomainId};start_epoch_ms=$startedEpochMs;" +
-          s"start_monotonic_ns=$startedNanos;duration_ns=$durationNanos"
-      appendStepInternal(stepName, detail, durationNanos / 1000000L, succeeded)
+          s"start_monotonic_ns=$startedNanos;duration_ns=$durationNanos;status=${if (succeeded) "success" else "failed"}" +
+          (if (detail.isEmpty) "" else s";$detail")
+      appendStepInternal(stepName, observedDetail, durationNanos / 1000000L, succeeded)
+    }
+  }
+
+  def appendObservedSkip(stepName: String, detail: String): Unit = {
+    val needsTiming = active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
+    if (needsTiming) {
+      val epochMs = System.currentTimeMillis()
+      val nanos   = System.nanoTime()
+      appendStepInternal(
+        stepName,
+        s"clock_domain_id=${RefreshProfile.clockDomainId};start_epoch_ms=$epochMs;" +
+          s"start_monotonic_ns=$nanos;duration_ns=0;status=skipped;$detail",
+        0L,
+        succeeded = true
+      )
     }
   }
 

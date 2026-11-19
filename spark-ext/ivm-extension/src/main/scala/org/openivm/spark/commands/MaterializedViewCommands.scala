@@ -5332,6 +5332,10 @@ case class RefreshMaterializedViewCommand(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
             "outcome='no_pending_deltas'"
         )
+        profile.appendObservedSkip(
+          "execute_refresh_sql_attempt",
+          "work_class=refresh_sql_skipped;reason=no_pending_deltas"
+        )
         emitEnd("no_pending_deltas", meta.refreshTypeName, 0)
         return Seq.empty
       }
@@ -5436,6 +5440,10 @@ case class RefreshMaterializedViewCommand(
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
             "outcome='noop_fast_exit'"
+        )
+        profile.appendObservedSkip(
+          "execute_refresh_sql_attempt",
+          "work_class=refresh_sql_skipped;reason=noop_fast_exit"
         )
         emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
         return Seq.empty
@@ -5879,32 +5887,43 @@ case class RefreshMaterializedViewCommand(
                   "writer_metrics=unavailable"
               ) {
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
-                  RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                    val t0 = System.nanoTime()
-                    try {
-                      val df = spark.sql(fullRefreshSql)
-                      df.write
-                        .format("delta")
-                        .mode("overwrite")
-                        .option("replaceWhere", "true")
-                        .save(meta.location)
-                      OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
-                      val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
-                      Seq.empty[Row]
-                    } catch {
-                      case t: Throwable =>
+                  profile.timeObservedStep(
+                    "execute_full_refresh_retry",
+                    s"statement=${stmtCounter + 1};query_log_order=$qOrder;work_class=full_refresh_retry"
+                  ) {
+                    RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                      val t0 = System.nanoTime()
+                      try {
+                        profile.timeObservedStep(
+                          "execute_full_refresh_attempt",
+                          s"statement=${stmtCounter + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
+                            s"stmt_kind=$kind;work_class=full_refresh_writer;segment=statement"
+                        ) {
+                          val df = spark.sql(fullRefreshSql)
+                          df.write
+                            .format("delta")
+                            .mode("overwrite")
+                            .option("replaceWhere", "true")
+                            .save(meta.location)
+                        }
+                        OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                         val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record(
-                          "full_refresh_stmt",
-                          qOrder,
-                          attempt - 1,
-                          kind,
-                          writerLog,
-                          ms,
-                          succeeded = false
-                        )
-                        throw t
+                        sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
+                        Seq.empty[Row]
+                      } catch {
+                        case t: Throwable =>
+                          val ms = (System.nanoTime() - t0) / 1000000L
+                          sqlLog.record(
+                            "full_refresh_stmt",
+                            qOrder,
+                            attempt - 1,
+                            kind,
+                            writerLog,
+                            ms,
+                            succeeded = false
+                          )
+                          throw t
+                      }
                     }
                   }
                 }
@@ -6324,6 +6343,10 @@ case class RefreshMaterializedViewCommand(
                 case None =>
                   consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
               }
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                "work_class=refresh_sql_skipped;reason=runtime_empty_delta_skip"
+              )
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
               // Total successful completion of this pinned no-op skip: release this
               // operation's OWN write-ahead guard so the next operation proceeds.
@@ -6642,8 +6665,14 @@ case class RefreshMaterializedViewCommand(
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
                   val t0 = System.nanoTime()
                   try {
-                    val df = spark.sql(sql)
-                    val r  = df.collect()
+                    val (df, r) = profile.timeObservedStep(
+                      "execute_refresh_sql_attempt",
+                      s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
+                        "work_class=incremental_sql;segment=statement"
+                    ) {
+                      val result = spark.sql(sql)
+                      result -> result.collect()
+                    }
                     recordPlanMetrics(df, kind)
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
@@ -6680,6 +6709,10 @@ case class RefreshMaterializedViewCommand(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};stmt_kind=$kind",
                 0L
+              )
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                s"statement=${stmtIdx + 1};stmt_kind=$kind;work_class=incremental_sql;segment=statement"
               )
             }
 
@@ -6721,6 +6754,10 @@ case class RefreshMaterializedViewCommand(
                 "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
                 0L
               )
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                "statement=1;stmt_kind=view_delta_inlined;work_class=incremental_sql;segment=statement"
+              )
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
@@ -6755,13 +6792,31 @@ case class RefreshMaterializedViewCommand(
                       val t0          = System.nanoTime()
                       try {
                         val rowCount = withPlanTimeBroadcastDisabled {
-                          val d = spark.sql(selectBody)
-                          d.createOrReplaceGlobalTempView(scratchView)
-                          spark.catalog.cacheTable(s"global_temp.$scratchView")
+                          val d = profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
+                              "work_class=incremental_sql;segment=fused_analysis"
+                          ) {
+                            spark.sql(selectBody)
+                          }
+                          profile.timeObservedStep(
+                            "execute_refresh_fused_setup",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;" +
+                              "work_class=incremental_auxiliary;segment=fused_setup"
+                          ) {
+                            d.createOrReplaceGlobalTempView(scratchView)
+                            spark.catalog.cacheTable(s"global_temp.$scratchView")
+                          }
                           // Force materialisation so the cache holds the rows before
                           // any negative-row probe / INSERT read. count() is the
                           // cheapest force-eval action that respects the cache.
-                          spark.table(s"global_temp.$scratchView").count()
+                          profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
+                              "work_class=incremental_sql;segment=fused_action"
+                          ) {
+                            spark.table(s"global_temp.$scratchView").count()
+                          }
                         }
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
                         advanceStmtCounterPast(0)
@@ -7476,25 +7531,22 @@ case class RefreshMaterializedViewCommand(
                   s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
                 ) {
                   RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
-                    RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                      val t0 = System.nanoTime()
-                      try {
-                        val df = spark.sql(deleteSql)
-                        val r  = df.collect()
-                        recordPlanMetrics(df, "delete")
-                        val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record(
-                          "count_monoid_cleanup",
-                          qOrder,
-                          attempt - 1,
-                          "delete",
-                          deleteSql,
-                          ms,
-                          succeeded = false
-                        )
-                        r
-                      } catch {
-                        case t: Throwable =>
+                    profile.timeObservedStep(
+                      "execute_refresh_cleanup_retry",
+                      s"statement=${idx + 1};query_log_order=$qOrder;work_class=incremental_cleanup_retry"
+                    ) {
+                      RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                        val t0 = System.nanoTime()
+                        try {
+                          val (df, r) = profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=${idx + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
+                              "stmt_kind=count_monoid_cleanup;work_class=incremental_cleanup;segment=statement"
+                          ) {
+                            val result = spark.sql(deleteSql)
+                            result -> result.collect()
+                          }
+                          recordPlanMetrics(df, "delete")
                           val ms = (System.nanoTime() - t0) / 1000000L
                           sqlLog.record(
                             "count_monoid_cleanup",
@@ -7504,7 +7556,21 @@ case class RefreshMaterializedViewCommand(
                             deleteSql,
                             ms
                           )
-                          throw t
+                          r
+                        } catch {
+                          case t: Throwable =>
+                            val ms = (System.nanoTime() - t0) / 1000000L
+                            sqlLog.record(
+                              "count_monoid_cleanup",
+                              qOrder,
+                              attempt - 1,
+                              "delete",
+                              deleteSql,
+                              ms,
+                              succeeded = false
+                            )
+                            throw t
+                        }
                       }
                     }
                   }

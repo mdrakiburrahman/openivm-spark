@@ -25,11 +25,13 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
     if (changeFeedMode == ChangeFeedMode.Cdf)
       Map(
         // CDF must fuse automatically without either intercept-only opt-in.
+        "spark.openivm.profile.refresh"                  -> "true",
         "spark.openivm.fuseScratch.enabled"              -> "false",
         "spark.openivm.fuseScratch.cascadeCache.enabled" -> "false"
       )
     else
       Map(
+        "spark.openivm.profile.refresh"                  -> "true",
         "spark.openivm.fuseScratch.enabled"              -> "true",
         "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
       )
@@ -88,6 +90,18 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
         } shouldBe true
       }
       assertMvCorrect("fuse_mv_leaf", "SELECT id, name FROM fuse_users_a WHERE age >= 25")
+      val attempts = sql("SHOW OPENIVM REFRESH PROFILE")
+        .collect()
+        .toSeq
+        .filter(row => row.getString(1).contains("fuse_mv_leaf") && row.getString(4) == "execute_refresh_sql_attempt")
+        .map(_.getString(6))
+      Seq("fused_analysis", "fused_action").foreach { segment =>
+        val matching = attempts.filter(_.contains(s"segment=$segment"))
+        matching should have size 1
+        matching.head should include("status=success")
+        matching.head should include("query_log_order=")
+        matching.head should include("duration_ns=")
+      }
     }
 
     it("uses the fused scratch cache as the cascade input when an MV-over-MV chain depends on it") {

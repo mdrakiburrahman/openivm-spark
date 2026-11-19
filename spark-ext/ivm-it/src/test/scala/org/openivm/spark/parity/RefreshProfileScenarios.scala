@@ -91,6 +91,11 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       names should contain("total_refresh")
       names should contain("query_span")
       names should not contain "execute_refresh_sql_stmt"
+      val skips = detailsForStep(rows, "execute_refresh_sql_attempt")
+      skips should have size 1
+      skips.head should include("status=skipped")
+      skips.head should include("duration_ns=0")
+      skips.head should include("reason=no_pending_deltas")
       names should contain("profile_persist")
       names should contain("state_backup")
       names should contain("after_query_span")
@@ -187,6 +192,22 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       stmtDetails.exists(_.contains("stmt_kind=")) shouldBe true
       stmtDetails.exists(_.contains("bytes=")) shouldBe true
 
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+      attempts should not be empty
+      attempts.exists(_.contains("work_class=incremental_sql")) shouldBe true
+      attempts.foreach { detail =>
+        detail should include("clock_domain_id=")
+        detail should include("start_epoch_ms=")
+        detail should include("start_monotonic_ns=")
+        detail should include("duration_ns=")
+        detail should include("work_class=incremental_")
+        if (detail.contains("status=skipped")) detail should include("duration_ns=0")
+        else {
+          detail should include("status=success")
+          detail should include("query_log_order=")
+          detail should include("attempt=0")
+        }
+      }
       val dispatchDetails = detailsForStep(rows, "generate_refresh_sql.dispatch")
       dispatchDetails should not be empty
       dispatchDetails.head should include("refresh_type=")
@@ -206,6 +227,47 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         detail should include("body_ns=")
         detail should not include spark.conf.get("spark.sql.warehouse.dir")
       }
+    }
+
+    it("separates incremental cleanup attempts from their retry wrapper") {
+      sql("CREATE TABLE profile_cleanup_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_cleanup_src VALUES (1, 10), (2, 20)")
+      sql("CREATE MATERIALIZED VIEW profile_cleanup_mv AS SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
+      sql("DELETE FROM profile_cleanup_src WHERE k = 1")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_cleanup_mv").collect()
+      assertMvCorrect("profile_cleanup_mv", "SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
+      val rows = showProfile()
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+        .filter(_.contains("work_class=incremental_cleanup"))
+      attempts should have size 1
+      attempts.head should include("status=success")
+      attempts.head should include("attempt=0")
+      attempts.head should include("duration_ns=")
+      val wrappers = detailsForStep(rows, "execute_refresh_cleanup_retry")
+      wrappers should have size 1
+      wrappers.head should include("work_class=incremental_cleanup_retry")
+      wrappers.head should include("duration_ns=")
+    }
+
+    it("records full writers separately from incremental SQL") {
+      sql("CREATE TABLE profile_full_src (k INT) USING DELTA")
+      sql("INSERT INTO profile_full_src VALUES (1), (2)")
+      val query = "SELECT k FROM profile_full_src INTERSECT ALL SELECT k FROM profile_full_src"
+      sql(s"CREATE MATERIALIZED VIEW profile_full_mv AS $query")
+      sql("INSERT INTO profile_full_src VALUES (3)")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_full_mv").collect()
+      assertMvCorrect("profile_full_mv", query)
+      val rows     = showProfile()
+      val attempts = detailsForStep(rows, "execute_full_refresh_attempt")
+      attempts should have size 1
+      attempts.head should include("work_class=full_refresh_writer")
+      attempts.head should include("status=success")
+      attempts.head should include("attempt=0")
+      attempts.head should include("duration_ns=")
+      detailsForStep(rows, "execute_full_refresh_retry") should have size 1
+      detailsForStep(rows, "execute_refresh_sql_attempt") shouldBe empty
     }
   }
 
