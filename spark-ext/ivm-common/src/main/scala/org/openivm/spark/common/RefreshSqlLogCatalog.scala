@@ -49,6 +49,10 @@ final case class RefreshSqlLogRow(
   * `scanAll`; bench-side exporters tag rows with their batch number at SELECT
   * time, so no on-engine drain is needed.
   *
+  * New keys include the category, preserving SQL and EXPLAIN rows that share
+  * the same timestamp, statement order and attempt. Four-component legacy
+  * keys remain readable; a replay in the new format is returned only once.
+  *
   * Opt-in [[QueryLogExport]] rows are also atomically stored in a separate
   * request-prefixed column family. Releasing that index leaves SHOW unchanged.
   */
@@ -269,7 +273,7 @@ object RefreshSqlLogCatalog {
     try {
       while (it.hasNext) {
         val (key, value) = it.next()
-        val row = decodeRow(key, value)
+        val row          = decodeRow(key, value)
         // A replay of a legacy key may coexist with its category-qualified replacement.
         // The legacy key sorts first, so the replacement wins without duplicating SHOW rows.
         out.update((tsToMicros(row.profileTimestamp), row.refreshId, row.stmtOrder, row.attemptIdx, row.category), row)
