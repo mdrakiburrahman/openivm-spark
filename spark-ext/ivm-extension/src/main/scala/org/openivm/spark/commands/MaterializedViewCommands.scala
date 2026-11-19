@@ -3031,7 +3031,7 @@ case class CreateMaterializedViewCommand(
           }
           return "create_already_exists"
         }
-        return "create_executed"
+        return "create_already_exists"
       case Some(_) =>
         throw new AnalysisException(
           "TABLE_OR_VIEW_ALREADY_EXISTS",

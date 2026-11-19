@@ -1328,20 +1328,29 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("INSERT INTO sales_t1_exists VALUES ('east', 1)").collect()
       val viewSql = "SELECT region, SUM(amount) AS total FROM sales_t1_exists GROUP BY region"
       spark.sql(s"CREATE MATERIALIZED VIEW mv_t1_exists AS $viewSql").collect()
-      val passes    = new java.util.concurrent.atomic.AtomicInteger()
-      val requestId = s"create-exists-${java.util.UUID.randomUUID()}"
+      val passes      = new java.util.concurrent.atomic.AtomicInteger()
+      val requestId   = s"create-exists-${java.util.UUID.randomUUID()}"
+      val asyncBefore = spark.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey)
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/state-sync-create-exists"))
       OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => passes.incrementAndGet(); () }
-      spark
-        .sql(s"OPENIVM INSIGHTS BEGIN REQUEST '$requestId' RUN 'run-exists' NODE 'model.openivm.mv_t1_exists'")
-        .collect()
       try {
         spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t1_exists AS $viewSql").collect()
         passes.get() shouldBe 0
+        spark
+          .sql(s"OPENIVM INSIGHTS BEGIN REQUEST '$requestId' RUN 'run-exists' NODE 'model.openivm.mv_t1_exists'")
+          .collect()
+        try {
+          spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_t1_exists AS $viewSql").collect()
+          passes.get() shouldBe 0
+        } finally spark.sql(s"OPENIVM INSIGHTS END REQUEST '$requestId' STATUS SUCCEEDED").collect()
       } finally {
-        spark.sql(s"OPENIVM INSIGHTS END REQUEST '$requestId' STATUS SUCCEEDED").collect()
         OpenIvmStateSync.setBackupPassHookForTesting(null)
         OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        asyncBefore match {
+          case Some(value) => spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, value)
+          case None        => spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+        }
       }
     }
 
