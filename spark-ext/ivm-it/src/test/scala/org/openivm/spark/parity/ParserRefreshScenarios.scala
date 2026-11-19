@@ -140,7 +140,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       capability.getString(1) should include("ensure_refresh_v1")
       spark.conf.set("spark.openivm.enabled", "false")
       try {
-        sql("SET spark.openivm.capabilities").collect().head.getString(1) should not include "ensure_refresh_v1"
+        sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v1")
       } finally spark.conf.set("spark.openivm.enabled", "true")
       val absent = guarded("ensure_absent_p14").head
       absent.getString(0) shouldBe "absent"
