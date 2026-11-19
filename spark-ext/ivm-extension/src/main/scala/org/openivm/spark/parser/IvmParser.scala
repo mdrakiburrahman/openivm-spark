@@ -46,12 +46,13 @@ class IvmParser(session: SparkSession, override protected val delegate: ParserIn
   // -------------------------------------------------------------------------
 
   override def parsePlan(sqlText: String): LogicalPlan = {
-    val capabilitiesKey = "spark.openivm.capabilities"
-    if (FeatureGate.enabled(session)) {
-      if (!session.conf.getOption(capabilitiesKey).contains("ensure_refresh_v1"))
+    if (sqlText.trim.stripSuffix(";").trim.equalsIgnoreCase("SET spark.openivm.capabilities")) {
+      val capabilitiesKey = "spark.openivm.capabilities"
+      if (FeatureGate.enabled(session)) {
         session.conf.set(capabilitiesKey, "ensure_refresh_v1")
-    } else if (session.conf.getOption(capabilitiesKey).isDefined) {
-      session.conf.unset(capabilitiesKey)
+      } else {
+        session.conf.unset(capabilitiesKey)
+      }
     }
     val streamingStatement = StreamingQuerySql.isStreamingStatement(sqlText)
     if (streamingStatement && FeatureGate.enabled(session)) parseIvmStatement(sqlText)
