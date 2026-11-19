@@ -251,6 +251,7 @@ object MvMetadata {
     * change to downstream materialized views.
     */
   val DefinitionIdentityKey: String = "_ivm_definition_identity"
+  val TargetDeltaTableIdKey: String = "_ivm_target_delta_table_id"
 
   /** Crash-recovery journal for an in-flight source-version advancement. The
     * user query/pin/watermark fields remain unchanged while these keys exist.

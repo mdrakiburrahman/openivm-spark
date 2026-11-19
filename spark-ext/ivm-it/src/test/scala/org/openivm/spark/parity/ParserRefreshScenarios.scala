@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.MvCatalog
+import org.openivm.spark.common.{MvCatalog, MvMetadata}
 
 /** Slice of `ParserSpec` covering REFRESH idempotency, INSERT+DELETE-in-the-
   * same-window net-zero deltas, DROP+recreate with a different body, and
@@ -160,6 +160,16 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       proof.getString(1) shouldBe hash
       (2 to 5).foreach(i => proof.getString(i) should not be empty)
       assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+      val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15")).get
+      try {
+        val identityKey = MvMetadata.TargetDeltaTableIdKey
+        MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+        intercept[Exception](guarded("ensure_mv_p15"))
+        MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
+        intercept[Exception](guarded("ensure_mv_p15"))
+      } finally {
+        MvCatalog.upsert(spark, meta)
+      }
       sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
       sql("INSERT INTO ensure_src_p15 VALUES (3)")
       intercept[Exception](guarded("ensure_mv_p15"))

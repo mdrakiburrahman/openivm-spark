@@ -3958,7 +3958,13 @@ case class CreateMaterializedViewCommand(
                 initial.commit(dataLocation, version)
               }
             }
-            MvCatalog.upsert(spark, meta.copy(lastVersion = version))
+            MvCatalog.upsert(
+              spark,
+              meta.copy(
+                lastVersion = version,
+                properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> writtenDataTableId.get)
+              )
+            )
             publicationCommitted = true
           }
         }
@@ -4805,13 +4811,21 @@ case class RefreshMaterializedViewCommand(
             )
           val key = "dbt.fabricspark.materialized_view.query_hash"
           val rows = spark.sql(s"SHOW TBLPROPERTIES ${sqlIdent(name)} ('$key')").collect()
-          val liveHash = if (rows.length == 1 && !rows.head.isNullAt(0)) Some(rows.head.getString(0)) else None
+          val liveHash =
+            if (rows.length == 1 && rows.head.length == 2 && !rows.head.isNullAt(0) &&
+                rows.head.getString(0) == key && !rows.head.isNullAt(1)) Some(rows.head.getString(1))
+            else None
           if (!loadedMeta.properties.get(key).contains(hash) || !liveHash.contains(hash))
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} query hash mismatch")
           val snapshot = DeltaLog.forTable(spark, new Path(loadedMeta.location)).update()
           val tableId = Option(snapshot.metadata.id).filter(_.nonEmpty).getOrElse {
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} has no physical Delta table ID")
           }
+          if (!loadedMeta.properties.get(MvMetadata.TargetDeltaTableIdKey).contains(tableId))
+            throw new IllegalStateException(
+              s"Materialized view ${sqlIdent(name)} has no matching persisted physical Delta table ID; " +
+                "guarded refresh cannot verify this target"
+            )
           recordTargetId(tableId)
         }
       }
