@@ -6737,8 +6737,13 @@ case class RefreshMaterializedViewCommand(
             if (groupedWindowRefresh.nonEmpty) {
               val update = groupedWindowRefresh.get
               val select = update.register(); sourceSnapshotTempViews += update.temporaryView
+              val targetSql =
+                if (FeatureGate.globalWindowCdfMergeEnabled(spark) && downstreamSourceKeysForThisMv.nonEmpty)
+                  globalWindowCdfMerge(spark, meta, mergeTargetId, select)
+                else
+                  s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select"
               executeSqlAt(
-                s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select",
+                targetSql,
                 0
               )
               groupedWindowStateUpdate = Some(update)
@@ -7158,7 +7163,9 @@ case class RefreshMaterializedViewCommand(
                     mergeTargetId,
                     rewrittenSql,
                     viewDeltaPath,
-                    allowFullSnapshot = !propagation.requiresDmlInterception
+                    allowFullSnapshot = !propagation.requiresDmlInterception,
+                    useGlobalCdfMerge = !propagation.requiresDmlInterception &&
+                      FeatureGate.globalWindowCdfMergeEnabled(spark) && downstreamSourceKeysForThisMv.nonEmpty
                   )
                 else None
               lazy val refinedWindowAffectedSql: Option[String] =
@@ -8261,7 +8268,8 @@ case class RefreshMaterializedViewCommand(
       targetId: TableIdentifier,
       rewrittenStatements: Seq[String],
       viewDeltaPath: String,
-      allowFullSnapshot: Boolean
+      allowFullSnapshot: Boolean,
+      useGlobalCdfMerge: Boolean
   ): Option[WindowSinglePassPlan] = {
     val insertIdx = rewrittenStatements.indexWhere(isWindowNewSnapshotInsertSql(_, targetId))
     if (insertIdx < 0) return None
@@ -8273,7 +8281,16 @@ case class RefreshMaterializedViewCommand(
     if (
       allowFullSnapshot && wholeDeletes == 1 &&
       rewrittenStatements.exists(isRawWindowSnapshotCtas(_, viewDeltaPath))
-    ) return Some(windowSinglePassWrite(spark, meta, targetId, "true", viewDeltaPath))
+    ) {
+      val plan = windowSinglePassWrite(spark, meta, targetId, "true", viewDeltaPath)
+      return Some(
+        if (useGlobalCdfMerge)
+          plan.copy(directSql =
+            globalWindowCdfMerge(spark, meta, targetId, s"SELECT * FROM ${quoteCol(s"openivm_new_${name.table}")}")
+          )
+        else plan
+      )
+    }
 
     val deleteSqls = rewrittenStatements.take(insertIdx).filter(isWindowPartitionDeleteSql(_, targetId))
     if (deleteSqls.isEmpty) return None
@@ -8338,6 +8355,22 @@ case class RefreshMaterializedViewCommand(
     if (predicate.length > WindowReplaceMaxPredicateBytes) return None
 
     Some(windowSinglePassWrite(spark, meta, targetId, predicate, viewDeltaPath))
+  }
+
+  private def globalWindowCdfMerge(
+      spark: SparkSession,
+      meta: MvMetadata,
+      targetId: TableIdentifier,
+      sourceSql: String
+  ): String = {
+    val columns = spark.table(MvCommandHelper.sqlIdent(targetId)).schema.fieldNames.toSeq.map(quoteCol)
+    val target  = s"delta.`${meta.location.replace("`", "``")}`"
+    s"""|MERGE INTO $target AS existing
+        |USING ($sourceSql) AS replacement
+        |ON false
+        |WHEN NOT MATCHED THEN INSERT (${columns.mkString(", ")})
+        |  VALUES (${columns.map(c => s"replacement.$c").mkString(", ")})
+        |WHEN NOT MATCHED BY SOURCE THEN DELETE""".stripMargin
   }
 
   private def windowSinglePassWrite(
