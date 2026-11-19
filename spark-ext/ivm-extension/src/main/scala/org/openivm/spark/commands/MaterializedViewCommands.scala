@@ -2926,8 +2926,8 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     CreatePublicationMutex.withLock(commandName) {
-      val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
-        isolated =>
+      val createUpstreamReadKeys = profile.timeObservedStep("create_guard_discovery") {
+        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
           MvCatalog.ensureTables(isolated)
           if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
           else {
@@ -2939,6 +2939,7 @@ case class CreateMaterializedViewCommand(
               .distinct
               .sorted
           }
+        }
       }
       val lockWaitT0 = System.nanoTime()
       val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
@@ -3017,12 +3018,16 @@ case class CreateMaterializedViewCommand(
     } match {
       case Some(meta) if ifNotExists =>
         if (OpenIvmExecutionSpan.hasActiveExport) {
-          recordExistingCreateTelemetry(spark, meta, profile.refreshId)
+          profile.timeObservedStep("create_guard_validation") {
+            recordExistingCreateTelemetry(spark, meta, profile.refreshId)
+          }
           OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
           return "create_already_exists"
         }
         if (OpenIvmInsightsBroker.hasActiveCapture(spark)) {
-          recordExistingCreateInsights(spark, meta, profile.refreshId)
+          profile.timeObservedStep("create_guard_validation") {
+            recordExistingCreateInsights(spark, meta, profile.refreshId)
+          }
           return "create_already_exists"
         }
         return "create_executed"
@@ -4023,15 +4028,17 @@ case class CreateMaterializedViewCommand(
       emitsCascadeViewDelta = meta.emitsCascadeViewDelta
     )
 
-    val reCreateBinding = requirePinBinding(
-      spark,
-      SparkTimeTravelSql.PinIdentityOperation.IdempotentCreate,
-      name,
-      meta.querySql,
-      meta.sourceTables,
-      Map.empty,
-      meta.properties
-    )
+    val reCreateBinding = RefreshProfile.timeObservedActiveStep("create_guard_pins") {
+      requirePinBinding(
+        spark,
+        SparkTimeTravelSql.PinIdentityOperation.IdempotentCreate,
+        name,
+        meta.querySql,
+        meta.sourceTables,
+        Map.empty,
+        meta.properties
+      )
+    }
     val derivedPin = SparkTimeTravelSql.pinTelemetry(meta.querySql, meta.sourceTables, reCreateBinding.resolvedPins)
     meta.timeTravelPinStatus.foreach { persisted =>
       val pinsAgree = meta.timeTravelPins.isEmpty || meta.timeTravelPins == derivedPin.pins
@@ -4045,7 +4052,9 @@ case class CreateMaterializedViewCommand(
     val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
       source -> version
     }
-    val sourceVersions = telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+    val sourceVersions = RefreshProfile.timeObservedActiveStep("create_guard_source_versions") {
+      telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+    }
     OpenIvmExecutionSpan.recordActiveSourceVersions(sourceVersions)
     if (sourceVersions.nonEmpty)
       OpenIvmInsightEvents.sourceVersions(
@@ -4087,13 +4096,16 @@ case class CreateMaterializedViewCommand(
     val watermarksBySource = meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) =>
       source -> version
     }
+    val sourceVersions = RefreshProfile.timeObservedActiveStep("create_guard_source_versions") {
+      telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+    }
     OpenIvmInsightEvents.sourceVersions(
       spark,
       operationId,
       metaName(name),
       org.openivm.spark.insights.OpenIvmInsightsContract.Operation.Create,
       "source_versions",
-      telemetrySourceVersions(spark, meta.sourceTables, watermarksBySource)
+      sourceVersions
     )
     OpenIvmInsightEvents.pendingDeltas(
       spark,

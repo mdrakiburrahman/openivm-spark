@@ -64,6 +64,11 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       span should include("start_epoch_ms=")
       span should include("end_epoch_ms=")
       span should include("outcome=")
+      clearProfile()
+      sql("CREATE MATERIALIZED VIEW IF NOT EXISTS profile_mv1 AS SELECT k, SUM(v) AS s FROM profile_t1 GROUP BY k")
+      val details = detailsForStep(showProfile(), "create_guard_discovery")
+      details should have size 1
+      details.head should include("start_monotonic_ns=")
     }
   }
 
