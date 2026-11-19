@@ -2,7 +2,7 @@ package org.openivm.spark.common.rocksdb
 
 import java.io.{BufferedInputStream, BufferedOutputStream, File, FileInputStream, FileOutputStream, IOException}
 import java.nio.file.Files
-import java.security.MessageDigest
+import java.security.{DigestOutputStream, MessageDigest}
 import java.util.zip.{CRC32, ZipEntry, ZipFile, ZipOutputStream}
 import scala.jdk.CollectionConverters._
 
@@ -22,9 +22,10 @@ private[rocksdb] object OpenIvmSnapshotArchive {
     )
       throw new IOException(s"openivm state-sync: unsafe archive entry '$name'")
 
-  def pack(root: File, files: Seq[File], archive: File, beforeCopy: File => Unit): Unit = {
+  def pack(root: File, files: Seq[File], archive: File, beforeCopy: File => Unit): String = {
     if (files.size > MaxEntries) throw new IOException("openivm state-sync: archive entry limit exceeded")
-    val output = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(archive)))
+    val digest = MessageDigest.getInstance("SHA-256")
+    val output = new ZipOutputStream(new BufferedOutputStream(new DigestOutputStream(new FileOutputStream(archive), digest)))
     var total  = 0L
     try
       files.sortBy(_.toString).foreach { file =>
@@ -50,6 +51,8 @@ private[rocksdb] object OpenIvmSnapshotArchive {
       }
     finally output.close()
     if (archive.length() > MaxBytes) throw new IOException("openivm state-sync: archive size limit exceeded")
+    checkInterrupted()
+    digest.digest().map(byte => f"${byte & 0xff}%02x").mkString
   }
 
   def sha256(file: File): String = {
