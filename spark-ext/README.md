@@ -1,5 +1,17 @@
 # Spark extension
 
+## Experimental global-window cascades
+
+`spark.openivm.refresh.globalWindowCdfMerge.enabled` is opt-in and defaults to
+`false`. For a global-window recompute with a downstream consumer, actual CDF
+propagation, and a CDF-enabled physical target, it replaces the full target in
+one Delta MERGE. This produces CDF deletes for the old rows and inserts for the
+new rows; the downstream view can consume them incrementally. The full-domain
+rewrite is an executor helper, not generated incremental SQL. It can write a
+large change feed and has not been shown to improve end-to-end performance.
+Unscoped external overwrites and unavailable change history keep their normal
+full-refresh safeguards.
+
 ## Guarded refresh
 
 When the extension and feature gate are enabled, `SET spark.openivm.capabilities`

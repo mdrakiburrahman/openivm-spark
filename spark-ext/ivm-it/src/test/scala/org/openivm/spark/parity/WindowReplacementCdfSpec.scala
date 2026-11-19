@@ -13,7 +13,7 @@ import org.openivm.spark.common.{
   RefreshSqlLogCatalog,
   RefreshTypeCode
 }
-import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
+import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParitySpecBase}
 
 class WindowReplacementCdfSpec extends IvmParitySpecBase("window-replacement-cdf") with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
@@ -276,7 +276,7 @@ class WindowReplacementCdfSpec extends IvmParitySpecBase("window-replacement-cdf
   }
 }
 
-class WindowReplacementInterceptSpec extends IvmParitySpecBase("window-replacement-intercept") {
+class WindowReplacementInterceptSpec extends IvmParitySpecBase("window-replacement-intercept") with InterceptMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.WindowSinglePassReplaceEnabledKey -> "true",
     FeatureGate.QueryLogEnabledKey                -> "true"
