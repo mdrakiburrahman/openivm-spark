@@ -95,6 +95,8 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       skips should have size 1
       skips.head should include("status=skipped")
       skips.head should include("duration_ns=0")
+      skips.head should include("origin_class=unknown")
+      skips.head should include("credit_ns=0")
       skips.head should include("reason=no_pending_deltas")
       names should contain("profile_persist")
       names should contain("state_backup")
@@ -204,8 +206,10 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         detail should include("start_monotonic_ns=")
         detail should include("duration_ns=")
         detail should include("work_class=incremental_")
-        if (detail.contains("status=skipped")) detail should include("duration_ns=0")
-        else {
+        if (detail.contains("status=skipped")) {
+          detail should include("duration_ns=0")
+          detail should include("credit_ns=0")
+        } else {
           detail should include("status=success")
           detail should include("action_id=")
           detail should include("credit_ns=0")

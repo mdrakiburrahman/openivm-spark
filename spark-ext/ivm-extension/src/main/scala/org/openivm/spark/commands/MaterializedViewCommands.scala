@@ -5334,7 +5334,7 @@ case class RefreshMaterializedViewCommand(
         )
         profile.appendObservedSkip(
           "execute_refresh_sql_attempt",
-          "work_class=refresh_sql_skipped;reason=no_pending_deltas"
+          "work_class=refresh_sql_skipped;reason=no_pending_deltas;origin_class=unknown;credit_ns=0"
         )
         emitEnd("no_pending_deltas", meta.refreshTypeName, 0)
         return Seq.empty
@@ -5443,7 +5443,7 @@ case class RefreshMaterializedViewCommand(
         )
         profile.appendObservedSkip(
           "execute_refresh_sql_attempt",
-          "work_class=refresh_sql_skipped;reason=noop_fast_exit"
+          "work_class=refresh_sql_skipped;reason=noop_fast_exit;origin_class=unknown;credit_ns=0"
         )
         emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
         return Seq.empty
@@ -6346,7 +6346,7 @@ case class RefreshMaterializedViewCommand(
               }
               profile.appendObservedSkip(
                 "execute_refresh_sql_attempt",
-                "work_class=refresh_sql_skipped;reason=runtime_empty_delta_skip"
+                "work_class=refresh_sql_skipped;reason=runtime_empty_delta_skip;origin_class=unknown;credit_ns=0"
               )
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
               // Total successful completion of this pinned no-op skip: release this
@@ -6714,7 +6714,8 @@ case class RefreshMaterializedViewCommand(
               )
               profile.appendObservedSkip(
                 "execute_refresh_sql_attempt",
-                s"statement=${stmtIdx + 1};stmt_kind=$kind;work_class=incremental_sql;segment=statement"
+                s"statement=${stmtIdx + 1};stmt_kind=$kind;work_class=incremental_sql;segment=statement;" +
+                  "origin_class=unknown;credit_ns=0"
               )
             }
 
@@ -6758,7 +6759,8 @@ case class RefreshMaterializedViewCommand(
               )
               profile.appendObservedSkip(
                 "execute_refresh_sql_attempt",
-                "statement=1;stmt_kind=view_delta_inlined;work_class=incremental_sql;segment=statement"
+                "statement=1;stmt_kind=view_delta_inlined;work_class=incremental_sql;segment=statement;" +
+                  "origin_class=unknown;credit_ns=0"
               )
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
