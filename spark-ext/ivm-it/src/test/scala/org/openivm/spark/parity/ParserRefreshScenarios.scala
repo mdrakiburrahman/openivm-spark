@@ -147,6 +147,9 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       absent.getString(1) shouldBe hash
       absent.getString(2) shouldBe "`ensure_absent_p14`"
       (3 to 5).foreach(i => absent.isNullAt(i) shouldBe true)
+      val qualified = guarded("`spark_catalog`.`default`.`ensure_absent_p14`").head
+      qualified.getString(0) shouldBe "absent"
+      qualified.getString(2) shouldBe "`spark_catalog`.`default`.`ensure_absent_p14`"
       sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
       intercept[Exception](guarded("ensure_unmanaged_p14"))
     }
