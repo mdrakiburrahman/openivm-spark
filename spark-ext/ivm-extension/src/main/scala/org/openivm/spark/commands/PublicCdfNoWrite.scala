@@ -92,7 +92,7 @@ private[commands] object PublicCdfNoWrite {
     info.operationParameters.get(key).exists(value => value == expected || value == "\"" + expected + "\"")
 
   // Bound the extra work of inspecting the initial commit, and the two physical CDF inputs.
-  private val MaxPlainCommitBytes = 64L * 1024L
+  private val MaxPlainCommitBytes   = 64L * 1024L
   private val MaxPlainDataFileBytes = 8L * 1024L * 1024L
 
   private def provesSingleFileCoverage(
@@ -121,9 +121,9 @@ private[commands] object PublicCdfNoWrite {
     } && check("plain overwrite prior file coverage") {
       // v0 has no earlier state. Replay just its bounded log, and match the actual remove
       // to the sole active AddFile. Replaying the admitted v1 actions leaves only the new file.
-      val lines = log.store.read(baseline.logSegment.deltas.head, log.newDeltaHadoopConf())
+      val lines   = log.store.read(baseline.logSegment.deltas.head, log.newDeltaHadoopConf())
       val actions = lines.take(5).map(Action.fromJson)
-      val files = actions.collect { case add: AddFile => add }
+      val files   = actions.collect { case add: AddFile => add }
       actions.size == 4 && actions.collect { case p: Protocol => p } == Seq(baseline.protocol) &&
       actions.collect { case m: Metadata => m } == Seq(baseline.metadata) &&
       actions.count(_.isInstanceOf[CommitInfo]) == 1 &&
@@ -134,11 +134,16 @@ private[commands] object PublicCdfNoWrite {
   }
 
   // With no explicit CDC files or deletion vectors, Delta reads every data-changing add/remove.
-  private def isPhysicalOverwrite(log: DeltaLog, actions: Seq[Action], baseline: Snapshot, latest: Snapshot): Boolean = {
-    val info = actions.collect { case commit: CommitInfo => commit }
-    val adds = actions.collect { case add: AddFile => add }
+  private def isPhysicalOverwrite(
+      log: DeltaLog,
+      actions: Seq[Action],
+      baseline: Snapshot,
+      latest: Snapshot
+  ): Boolean = {
+    val info    = actions.collect { case commit: CommitInfo => commit }
+    val adds    = actions.collect { case add: AddFile => add }
     val removes = actions.collect { case remove: RemoveFile => remove }
-    val paths = adds.map(_.path) ++ removes.map(_.path)
+    val paths   = adds.map(_.path) ++ removes.map(_.path)
     info.size == 1 && info.head.operation == "WRITE" && info.head.readVersion.contains(baseline.version) &&
     parameter(info.head, "mode", "Overwrite") &&
     adds.nonEmpty && removes.nonEmpty && paths.distinct.size == paths.size &&

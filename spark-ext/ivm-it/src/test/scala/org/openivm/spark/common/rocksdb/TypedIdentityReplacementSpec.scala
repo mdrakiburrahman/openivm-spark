@@ -52,13 +52,13 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
       .map(_.detail)
       .mkString
 
-  private val shapes = Seq((9, 5, 3, 16), (9, 5, 3, 16), (17, 13, 7, 38), (17, 13, 7, 38))
+  private val shapes        = Seq((9, 5, 3, 16), (9, 5, 3, 16), (17, 13, 7, 38), (17, 13, 7, 38))
   private val reproduceOnly = sys.env.contains("TYPED_PLAIN_REPRODUCE")
   private def exercise(index: Int, enabled: Boolean, expectNoWrite: Boolean, changedFirst: Boolean = false): Unit = {
-    val tag                       = s"tir_${index}_${if (enabled) "on" else "off"}${if (changedFirst) "_changed" else ""}"
-    val base                      = s"${tag}_base"
-    val parent                    = s"${tag}_parent"
-    val child                     = s"${tag}_child"
+    val tag    = s"tir_${index}_${if (enabled) "on" else "off"}${if (changedFirst) "_changed" else ""}"
+    val base   = s"${tag}_base"
+    val parent = s"${tag}_parent"
+    val child  = s"${tag}_child"
     val (strings, ints, decimals, width) = shapes(index)
     val types =
       Seq.fill(strings)("STRING") ++ Seq.fill(ints)("INT") ++ Seq.fill(decimals)("DECIMAL(18,2)") ++ Seq("TIMESTAMP")
@@ -107,14 +107,14 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     p0 shouldBe 0L
     p1 shouldBe 1L
     assertMvCorrect(parent, s"SELECT * FROM $base")
-    val delta = DeltaTableVersion.deltaLogFor(spark, path)
-    val log = DeltaCommitClassifier.classify(spark, link, p0)
+    val delta     = DeltaTableVersion.deltaLogFor(spark, path)
+    val log       = DeltaCommitClassifier.classify(spark, link, p0)
     val overwrite = delta.getChanges(p1, failOnDataLoss = true).next()._2
-    val info = overwrite.collect { case c: org.apache.spark.sql.delta.actions.CommitInfo => c }
+    val info      = overwrite.collect { case c: org.apache.spark.sql.delta.actions.CommitInfo => c }
     info.map(_.operation) shouldBe Seq("WRITE")
     info.head.operationParameters.keySet shouldBe Set("mode", "partitionBy")
     val inserted = overwrite.collect { case file: org.apache.spark.sql.delta.actions.AddFile => file }
-    val removed = overwrite.collect { case file: org.apache.spark.sql.delta.actions.RemoveFile => file }
+    val removed  = overwrite.collect { case file: org.apache.spark.sql.delta.actions.RemoveFile => file }
     (inserted.size, removed.size) shouldBe ((1, 1))
     inserted.head.path should not be removed.head.path
     inserted.head.dataChange shouldBe true
@@ -261,32 +261,40 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
 
   private def partialOverwrite(): Unit = {
     val parent = "tir_partial_parent"
-    val child = "tir_partial_child"
+    val child  = "tir_partial_child"
     sql("CREATE TABLE tir_partial_base(k INT, payload STRING) USING DELTA")
     sql("INSERT INTO tir_partial_base VALUES (0, 'replace me'), (1, 'keep me')")
     sql(s"CREATE MATERIALIZED VIEW $parent PARTITIONED BY (k) AS SELECT k, payload FROM tir_partial_base")
     val body = s"SELECT CAST(k AS INT) k, CAST(payload AS STRING) payload FROM $parent"
     sql(s"CREATE MATERIALIZED VIEW $child AS $body")
-    val path = mvDataLocation(parent)
+    val path  = mvDataLocation(parent)
     val delta = DeltaTableVersion.deltaLogFor(spark, path)
-    val p0 = mvDataVersion(parent)
-    val c0 = mvDataVersion(child)
-    val initial = delta.getChanges(p0, failOnDataLoss = true).next()._2.collect {
-      case add: org.apache.spark.sql.delta.actions.AddFile => add.path
-    }.toSet
+    val p0    = mvDataVersion(parent)
+    val c0    = mvDataVersion(child)
+    val initial = delta
+      .getChanges(p0, failOnDataLoss = true)
+      .next()
+      ._2
+      .collect { case add: org.apache.spark.sql.delta.actions.AddFile =>
+        add.path
+      }
+      .toSet
     initial.size shouldBe 2
     sql("SELECT k, payload FROM tir_partial_base WHERE k = 0").write
-      .format("delta").mode("overwrite").option("partitionOverwriteMode", "dynamic").save(path)
+      .format("delta")
+      .mode("overwrite")
+      .option("partitionOverwriteMode", "dynamic")
+      .save(path)
     val p1 = mvDataVersion(parent)
     p1 shouldBe p0 + 1L
-    val actions = delta.getChanges(p1, failOnDataLoss = true).next()._2
-    val removed = actions.collect { case file: org.apache.spark.sql.delta.actions.RemoveFile => file.path }.toSet
+    val actions   = delta.getChanges(p1, failOnDataLoss = true).next()._2
+    val removed   = actions.collect { case file: org.apache.spark.sql.delta.actions.RemoveFile => file.path }.toSet
     val surviving = initial -- removed
     removed.size shouldBe 1
     surviving.size shouldBe 1
-    val link = s"default.$parent"
+    val link    = s"default.$parent"
     val verdict = DeltaCommitClassifier.classify(spark, link, p0)
-    val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
+    val seen    = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
     refreshMv(child)
     val outcome = totalSince(seen)
     outcome should not include "outcome=public_cdf_no_write"
@@ -296,7 +304,11 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     sys.env.get("TYPED_IDENTITY_EVIDENCE").foreach { dir =>
       val commit = Paths.get(new URI(path)).resolve("_delta_log").resolve(f"$p1%020d.json")
       Files.copy(commit, Paths.get(dir).resolve("partial.delta-log"))
-      Files.write(Paths.get(dir).resolve("partial.receipt"), s"$verdict\ninitial=$initial\nremoved=$removed\nsurviving=$surviving\n$outcome\n".getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+      Files.write(
+        Paths.get(dir).resolve("partial.receipt"),
+        s"$verdict\ninitial=$initial\nremoved=$removed\nsurviving=$surviving\n$outcome\n".getBytes(UTF_8),
+        StandardOpenOption.CREATE_NEW
+      )
     }
   }
 
