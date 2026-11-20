@@ -4,6 +4,8 @@ import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
+import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
+import org.apache.spark.sql.delta.util.FileNames
 import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, Metadata, Protocol, RemoveFile}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.functions.{col, count, lit, sum, when}
@@ -86,24 +88,67 @@ private[commands] object PublicCdfNoWrite {
       (EligibleTypes.contains(field.dataType) || (replacement &&
         Set[DataType](StringType, DecimalType(18, 2), TimestampType).contains(field.dataType)))
 
-  // Deliberately admit only the single inferred-CDF commit emitted by the full refresh writer.
+  private def parameter(info: CommitInfo, key: String, expected: String): Boolean =
+    info.operationParameters.get(key).exists(value => value == expected || value == "\"" + expected + "\"")
+
+  // Bound the extra work of inspecting the initial commit, and the two physical CDF inputs.
+  private val MaxPlainCommitBytes = 64L * 1024L
+  private val MaxPlainDataFileBytes = 8L * 1024L * 1024L
+
+  private def provesSingleFileCoverage(
+      log: DeltaLog,
+      baseline: Snapshot,
+      latest: Snapshot,
+      info: CommitInfo,
+      adds: Seq[AddFile],
+      removes: Seq[RemoveFile]
+  ): Boolean = {
+    def boundedLog(snapshot: Snapshot, versions: Seq[Long]): Boolean = {
+      val files = snapshot.logSegment.deltas
+      files.size == versions.size && files.zip(versions).forall { case (file, version) =>
+        FileNames.isDeltaFile(file) && FileNames.deltaVersion(file) == version &&
+        file.getLen > 0L && file.getLen <= MaxPlainCommitBytes
+      }
+    }
+    check("plain overwrite shape") {
+      baseline.version == 0L && latest.version == 1L && info.operationParameters.keySet == Set("mode", "partitionBy") &&
+      parameter(info, "partitionBy", "[]") && baseline.metadata.partitionColumns.isEmpty &&
+      adds.size == 1 && removes.size == 1 && adds.head.partitionValues.isEmpty &&
+      removes.head.partitionValues != null && removes.head.partitionValues.isEmpty &&
+      adds.head.size > 0L && adds.head.size <= MaxPlainDataFileBytes &&
+      boundedLog(baseline, Seq(0L)) && boundedLog(latest, Seq(0L, 1L)) &&
+      baseline.logSegment.deltas.head == latest.logSegment.deltas.head
+    } && check("plain overwrite prior file coverage") {
+      // v0 has no earlier state. Replay just its bounded log, and match the actual remove
+      // to the sole active AddFile. Replaying the admitted v1 actions leaves only the new file.
+      val lines = log.store.read(baseline.logSegment.deltas.head, log.newDeltaHadoopConf())
+      val actions = lines.take(5).map(Action.fromJson)
+      val files = actions.collect { case add: AddFile => add }
+      actions.size == 4 && actions.collect { case p: Protocol => p } == Seq(baseline.protocol) &&
+      actions.collect { case m: Metadata => m } == Seq(baseline.metadata) &&
+      actions.count(_.isInstanceOf[CommitInfo]) == 1 &&
+      files.size == 1 && files.head.dataChange && files.head.deletionVector == null &&
+      files.head.partitionValues.isEmpty && files.head.size > 0L && files.head.size <= MaxPlainDataFileBytes &&
+      files.head.path == removes.head.path && removes.head.size.contains(files.head.size)
+    }
+  }
+
   // With no explicit CDC files or deletion vectors, Delta reads every data-changing add/remove.
-  private def isPhysicalOverwrite(actions: Seq[Action], baseline: Long): Boolean = {
-    val info    = actions.collect { case commit: CommitInfo => commit }
-    val adds    = actions.collect { case add: AddFile => add.path }
-    val removes = actions.collect { case remove: RemoveFile => remove.path }
-    def parameter(info: CommitInfo, key: String, expected: String): Boolean =
-      info.operationParameters.get(key).exists(value => value == expected || value == "\"" + expected + "\"")
-    info.size == 1 && info.head.operation == "WRITE" && info.head.readVersion.contains(baseline) &&
+  private def isPhysicalOverwrite(log: DeltaLog, actions: Seq[Action], baseline: Snapshot, latest: Snapshot): Boolean = {
+    val info = actions.collect { case commit: CommitInfo => commit }
+    val adds = actions.collect { case add: AddFile => add }
+    val removes = actions.collect { case remove: RemoveFile => remove }
+    val paths = adds.map(_.path) ++ removes.map(_.path)
+    info.size == 1 && info.head.operation == "WRITE" && info.head.readVersion.contains(baseline.version) &&
     parameter(info.head, "mode", "Overwrite") &&
-    parameter(info.head, "predicate", "true") &&
-    adds.nonEmpty && removes.nonEmpty && (adds ++ removes).distinct.size == adds.size + removes.size &&
+    adds.nonEmpty && removes.nonEmpty && paths.distinct.size == paths.size &&
     actions.forall {
       case _: CommitInfo      => true
       case add: AddFile       => add.dataChange && add.deletionVector == null
       case remove: RemoveFile => remove.dataChange && remove.deletionVector == null
       case _                  => false
-    }
+    } && (parameter(info.head, "predicate", "true") ||
+      provesSingleFileCoverage(log, baseline, latest, info.head, adds, removes))
   }
 
   private def replacementCancels(public: DataFrame, keys: Seq[Column], end: Long): Boolean = {
@@ -187,6 +232,7 @@ private[commands] object PublicCdfNoWrite {
                 commits.map(_._1) == (start to end) && (if (replacement) {
                                                           val baseline = log.getSnapshotAt(batch.startVersionExclusive)
                                                           val latest   = log.update()
+                                                          baseline.version == batch.startVersionExclusive && latest.version == end &&
                                                           baseline.metadata == latest.metadata && baseline.metadata.id == dependency.deltaTableMetadataId &&
                                                           baseline.protocol == latest.protocol &&
                                                           // Guard against raw CHAR/VARCHAR metadata masked by Spark's public projection.
@@ -197,10 +243,7 @@ private[commands] object PublicCdfNoWrite {
                                                             baseline.metadata.schema.fields
                                                               .exists(b => b.name == f.name && b.dataType == f.dataType)
                                                           ) &&
-                                                          isPhysicalOverwrite(
-                                                            commits.head._2,
-                                                            batch.startVersionExclusive
-                                                          )
+                                                          isPhysicalOverwrite(log, commits.head._2, baseline, latest)
                                                         } else
                                                           commits.forall { case (_, actions) =>
                                                             !actions.exists {

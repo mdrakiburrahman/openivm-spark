@@ -54,8 +54,8 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
 
   private val shapes = Seq((9, 5, 3, 16), (9, 5, 3, 16), (17, 13, 7, 38), (17, 13, 7, 38))
   private val reproduceOnly = sys.env.contains("TYPED_PLAIN_REPRODUCE")
-  private def exercise(index: Int, enabled: Boolean, expectNoWrite: Boolean): Unit = {
-    val tag                       = s"tir_${index}_${if (enabled) "on" else "off"}"
+  private def exercise(index: Int, enabled: Boolean, expectNoWrite: Boolean, changedFirst: Boolean = false): Unit = {
+    val tag                       = s"tir_${index}_${if (enabled) "on" else "off"}${if (changedFirst) "_changed" else ""}"
     val base                      = s"${tag}_base"
     val parent                    = s"${tag}_parent"
     val child                     = s"${tag}_child"
@@ -101,6 +101,7 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     val parentBefore = spark.read.format("delta").option("versionAsOf", p0).load(path).selectExpr(columns: _*)
     def plainOverwrite(query: String): Unit =
       sql(query).coalesce(1).write.format("delta").mode("overwrite").save(path)
+    if (changedFirst) sql(s"INSERT OVERWRITE TABLE $base VALUES ${seed.replace("'É a'", "'É a '")}")
     plainOverwrite(s"SELECT * FROM $base")
     val p1 = mvDataVersion(parent)
     p0 shouldBe 0L
@@ -154,8 +155,13 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     )
     for (kind <- Seq("insert", "delete")) {
       val rows = raw.where(s"_change_type = '$kind'").selectExpr(columns: _*)
-      rows.exceptAll(parentBefore).count() shouldBe 0L
-      parentBefore.exceptAll(rows).count() shouldBe 0L
+      if (changedFirst && kind == "insert") {
+        rows.exceptAll(parentBefore).count() should be > 0L
+        parentBefore.exceptAll(rows).count() should be > 0L
+      } else {
+        rows.exceptAll(parentBefore).count() shouldBe 0L
+        parentBefore.exceptAll(rows).count() shouldBe 0L
+      }
     }
     if (expectNoWrite && index == 0 && spark.version.startsWith("4.1")) {
       val sc             = spark.sparkContext
@@ -217,7 +223,8 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
       Files.write(root.resolve("consumed"), p1.toString.getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
     } else if (expectNoWrite && index == 0) {
       def replace(values: String): Unit = {
-        plainOverwrite(s"SELECT * FROM VALUES $values AS updated(${columns.mkString(", ")})")
+        sql(s"INSERT OVERWRITE TABLE $base VALUES $values")
+        plainOverwrite(s"SELECT * FROM $base")
       }
       def mustWrite(label: String, oldVersion: Long): Unit = {
         val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
@@ -252,6 +259,47 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     }
   }
 
+  private def partialOverwrite(): Unit = {
+    val parent = "tir_partial_parent"
+    val child = "tir_partial_child"
+    sql("CREATE TABLE tir_partial_base(k INT, payload STRING) USING DELTA")
+    sql("INSERT INTO tir_partial_base VALUES (0, 'replace me'), (1, 'keep me')")
+    sql(s"CREATE MATERIALIZED VIEW $parent PARTITIONED BY (k) AS SELECT k, payload FROM tir_partial_base")
+    val body = s"SELECT CAST(k AS INT) k, CAST(payload AS STRING) payload FROM $parent"
+    sql(s"CREATE MATERIALIZED VIEW $child AS $body")
+    val path = mvDataLocation(parent)
+    val delta = DeltaTableVersion.deltaLogFor(spark, path)
+    val p0 = mvDataVersion(parent)
+    val c0 = mvDataVersion(child)
+    val initial = delta.getChanges(p0, failOnDataLoss = true).next()._2.collect {
+      case add: org.apache.spark.sql.delta.actions.AddFile => add.path
+    }.toSet
+    initial.size shouldBe 2
+    sql("SELECT k, payload FROM tir_partial_base WHERE k = 0").write
+      .format("delta").mode("overwrite").option("partitionOverwriteMode", "dynamic").save(path)
+    val p1 = mvDataVersion(parent)
+    p1 shouldBe p0 + 1L
+    val actions = delta.getChanges(p1, failOnDataLoss = true).next()._2
+    val removed = actions.collect { case file: org.apache.spark.sql.delta.actions.RemoveFile => file.path }.toSet
+    val surviving = initial -- removed
+    removed.size shouldBe 1
+    surviving.size shouldBe 1
+    val link = s"default.$parent"
+    val verdict = DeltaCommitClassifier.classify(spark, link, p0)
+    val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
+    refreshMv(child)
+    val outcome = totalSince(seen)
+    outcome should not include "outcome=public_cdf_no_write"
+    if (verdict == BatchVerdict.Replace) mvDataVersion(child) should be > c0
+    assertMvCorrect(child, body)
+    assertMvCorrect(parent, "SELECT k, payload FROM tir_partial_base")
+    sys.env.get("TYPED_IDENTITY_EVIDENCE").foreach { dir =>
+      val commit = Paths.get(new URI(path)).resolve("_delta_log").resolve(f"$p1%020d.json")
+      Files.copy(commit, Paths.get(dir).resolve("partial.delta-log"))
+      Files.write(Paths.get(dir).resolve("partial.receipt"), s"$verdict\ninitial=$initial\nremoved=$removed\nsurviving=$surviving\n$outcome\n".getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+    }
+  }
+
   it("proves exact typed bags or retains the ordinary replacement route") {
     restorePhase match {
       case Some("prepare") =>
@@ -273,7 +321,8 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
         val outcome = totalSince(seen)
         outcome should include("outcome=no_pending_deltas")
         mvDataVersion(child) shouldBe prior("child-version")
-        assertMvCorrect(child, s"SELECT * FROM $parent")
+        val selected = spark.table(child).columns.mkString(", ")
+        assertMvCorrect(child, s"SELECT $selected FROM $parent")
         Files.write(
           root.resolve("restore-receipt"),
           s"prepare_pid=${prior("prepare-pid")}\nrestore_pid=$pid\nrestored_offset=${prior("consumed")}\nchild_version=${prior("child-version")}\n$outcome\n"
@@ -285,6 +334,8 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
         exercise(0, enabled = true, expectNoWrite = false)
       case None =>
         shapes.indices.foreach(exercise(_, enabled = true, expectNoWrite = true))
+        exercise(0, enabled = true, expectNoWrite = false, changedFirst = true)
+        partialOverwrite()
         restartSpark(extraSparkConf - FeatureGate.PublicCdfNoWriteEnabledKey)
         shapes.indices.foreach(exercise(_, enabled = false, expectNoWrite = false))
     }

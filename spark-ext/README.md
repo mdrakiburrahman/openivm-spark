@@ -156,7 +156,11 @@ attributes from one verified, owned upstream MV. The captured interval must have
 complete MERGE history without metadata or protocol changes, or a single
 same-table `WRITE` overwrite with literal `true` predicate and complete inferred
 CDF (data-changing adds and removes, no explicit CDC files or deletion vectors).
-The proof requires an exact signed public row bag, including duplicate and NULL
+A plain, unpartitioned `WRITE` overwrite without a predicate is admitted only
+for versions 0→1 with two small transaction log entries and one small data file
+on each side. The initial Delta commit must establish that the exact file
+removed was the sole live file; the overwrite must leave only its replacement.
+This check reads transaction metadata, not an additional data snapshot. The proof requires an exact signed public row bag, including duplicate and NULL
 multiplicity; commit metrics are not a substitute. The replacement path also
 supports binary, unpadded strings, `DECIMAL(18,2)`, and microsecond timestamps.
 Pins, other replacement intervals, missing identity or history, and unsupported
