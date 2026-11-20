@@ -18,7 +18,7 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write-cascade") with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
-    FeatureGate.ProfileRefreshKey -> "true",
+    FeatureGate.ProfileRefreshKey          -> "true",
     FeatureGate.PublicCdfNoWriteEnabledKey -> "true"
   )
 
@@ -35,30 +35,31 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
   private def outcome(name: String, expected: String, n: Int): Unit = {
     val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
     refreshMv(name)
-    val totals = RefreshProfileCatalog.scanAll(spark).filter(row => row.stepName == "total_refresh" && !seen(row.refreshId))
+    val totals =
+      RefreshProfileCatalog.scanAll(spark).filter(row => row.stepName == "total_refresh" && !seen(row.refreshId))
     totals.map(_.detail.split(";").drop(1).mkString(";")).toSeq shouldBe Seq(s"outcome=$expected;pending_deltas=$n")
   }
 
   it("consumes a signed public zero without writing, then propagates a changed row through the child") {
-    val producer = "pcnw_producer"
-    val middle = "pcnw_middle"
-    val child = "pcnw_child"
+    val producer     = "pcnw_producer"
+    val middle       = "pcnw_middle"
+    val child        = "pcnw_child"
     val bodyProducer = "SELECT DISTINCT k FROM pcnw_base"
-    val bodyMiddle = s"SELECT k FROM $producer"
-    val bodyChild = s"SELECT k, COUNT(*) AS n FROM $middle GROUP BY k"
+    val bodyMiddle   = s"SELECT k FROM $producer"
+    val bodyChild    = s"SELECT k, COUNT(*) AS n FROM $middle GROUP BY k"
     sql("CREATE TABLE pcnw_base(k INT, payload INT) USING DELTA")
     sql("INSERT INTO pcnw_base VALUES (1, 10), (NULL, 20)")
     sql(s"CREATE MATERIALIZED VIEW $producer AS $bodyProducer")
     sql(s"CREATE MATERIALIZED VIEW $middle AS $bodyMiddle")
     sql(s"CREATE MATERIALIZED VIEW $child AS $bodyChild")
     val middleMeta = metadata(middle)
-    val childMeta = metadata(child)
+    val childMeta  = metadata(child)
     middleMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
     childMeta.refreshType should not be RefreshTypeCode.FullRefresh
-    val producerLink = middleMeta.sourceTables.head
-    val middleLink = childMeta.sourceTables.head
-    val middle0 = mvDataVersion(middle)
-    val child0 = mvDataVersion(child)
+    val producerLink                                 = middleMeta.sourceTables.head
+    val middleLink                                   = childMeta.sourceTables.head
+    val middle0                                      = mvDataVersion(middle)
+    val child0                                       = mvDataVersion(child)
     def offsets(meta: MvMetadata): Map[String, Long] = CdfWatermarkCatalog.getAll(spark, key(meta), meta.sourceTables)
     def pending(meta: MvMetadata) = new CdfChangePropagation()
       .collectChanges(spark, key(meta), meta.sourceTables, meta.changeWatermarks)
@@ -75,15 +76,15 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     assertMvCorrect(producer, bodyProducer)
     pending(middleMeta) shouldBe Seq(CdfChangeBatch(producerLink, 0L, 2L))
     DeltaCommitClassifier.classify(spark, producerLink, 0L) shouldBe BatchVerdict.Mutating
-    val opts = Map("readChangeFeed" -> "true", "startingVersion" -> "1", "endingVersion" -> "2")
-    val raw = spark.read.format("delta").options(opts).load(mvDataLocation(producer))
+    val opts   = Map("readChangeFeed" -> "true", "startingVersion" -> "1", "endingVersion" -> "2")
+    val raw    = spark.read.format("delta").options(opts).load(mvDataLocation(producer))
     val hidden = raw.columns.filter(_.startsWith("openivm_")).toSeq
     hidden should not be empty
-    val deleted = raw.where("_change_type = 'update_preimage'")
+    val deleted  = raw.where("_change_type = 'update_preimage'")
     val inserted = raw.where("_change_type = 'update_postimage'")
-    val cols = raw.columns.filterNot(_.startsWith("_commit_")).filterNot(_ == "_change_type").toSeq
+    val cols     = raw.columns.filterNot(_.startsWith("_commit_")).filterNot(_ == "_change_type").toSeq
     deleted.select(cols.head, cols.tail: _*).exceptAll(inserted.select(cols.head, cols.tail: _*)).isEmpty shouldBe false
-    val public = MvProjectionSource.read(spark, producerLink, opts)
+    val public         = MvProjectionSource.read(spark, producerLink, opts)
     val expectedImages = sql("SELECT CAST(NULL AS INT) AS k UNION ALL SELECT CAST(NULL AS INT) AS k")
     assertBag(public.where("_change_type = 'update_preimage'").select("k"), expectedImages)
     assertBag(public.where("_change_type = 'update_postimage'").select("k"), expectedImages)
@@ -102,9 +103,10 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     mvDataVersion(child) shouldBe child0
     assertMvCorrect(child, bodyChild)
 
-    sql("INSERT INTO pcnw_base VALUES (2, 30)")
+    sql("INSERT INTO pcnw_base VALUES (2, 30), (NULL, 23)")
     refreshMv(producer)
     mvDataVersion(producer) shouldBe 3L
+    DeltaCommitClassifier.classify(spark, producerLink, 2L) shouldBe BatchVerdict.Mutating
     outcome(middle, "incremental_executed", 1)
     val middle1 = mvDataVersion(middle)
     middle1 should be > middle0
