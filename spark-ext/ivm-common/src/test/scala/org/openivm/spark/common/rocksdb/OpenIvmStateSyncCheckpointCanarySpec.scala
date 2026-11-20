@@ -56,7 +56,7 @@ object OpenIvmStateSyncFreshRestoreProbe {
       Files.createDirectories(evidence.toPath.getParent)
       Files.write(
         evidence.toPath,
-        s"{\"fresh_jvm\":true,\"deleted_absent\":true,\"retained_present\":true,\"profile_row\":\"$refreshId\"}"
+        s"""{"fresh_jvm":true,"deleted_absent":true,"retained_present":true,"profile_row":"$refreshId"}"""
           .getBytes(
             StandardCharsets.UTF_8
           )
@@ -212,22 +212,22 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
   ): Unit = {
     val receiptJson = receipts.asScala
       .map { receipt =>
-        s"{\"request_id\":\"${receipt.requestId}\",\"requested_generation\":${receipt.requestedMutationGeneration}," +
-          s"\"captured_generation\":${receipt.capturedMutationGeneration.map(_.toString).getOrElse("null")}," +
-          s"\"publication_generation\":\"${receipt.publicationGeneration.getOrElse("")}\"," +
-          s"\"published\":${receipt.published},\"reused\":${receipt.reused}," +
-          s"\"archive_sha256\":\"${receipt.archiveSha256.getOrElse("")}\"," +
-          s"\"archive_bytes\":${receipt.archiveBytes.getOrElse(0L)}," +
-          s"\"coverage_proven\":${receipt.coverageProven},\"acknowledged\":${receipt.acknowledged}," +
-          s"\"outcome\":\"${receipt.outcome}\"}"
+        s"""{"request_id":"${receipt.requestId}","requested_generation":${receipt.requestedMutationGeneration},""" +
+          s""""captured_generation":${receipt.capturedMutationGeneration.map(_.toString).getOrElse("null")},""" +
+          s""""publication_generation":"${receipt.publicationGeneration.getOrElse("")}",""" +
+          s""""published":${receipt.published},"reused":${receipt.reused},""" +
+          s""""archive_sha256":"${receipt.archiveSha256.getOrElse("")}",""" +
+          s""""archive_bytes":${receipt.archiveBytes.getOrElse(0L)},""" +
+          s""""coverage_proven":${receipt.coverageProven},"acknowledged":${receipt.acknowledged},""" +
+          s""""outcome":"${receipt.outcome}"}"""
       }
       .mkString("[", ",", "]")
     val output = new File(repoRoot, s".logs/checkpoint-only-canary/$fixture.json")
     Files.createDirectories(output.toPath.getParent)
     val json =
-      s"{\"fixture\":\"$fixture\",\"request_ids\":[${expectedIds.map(id => s"\"$id\"").mkString(",")}]" +
-        s",\"latest_generation\":\"${latest._1}\",\"manifest_sha256\":\"${latest._2}\"," +
-        s"\"archive_bytes\":${latest._3},\"archive_sha256\":\"${latest._4}\",\"receipts\":$receiptJson,$extra}"
+      s"""{"fixture":"$fixture","request_ids":[${expectedIds.map(id => '"'.toString + id + '"').mkString(",")}]""" +
+        s""","latest_generation":"${latest._1}","manifest_sha256":"${latest._2}",""" +
+        s""""archive_bytes":${latest._3},"archive_sha256":"${latest._4}","receipts":$receiptJson,$extra}"""
     Files.write(output.toPath, json.getBytes(StandardCharsets.UTF_8))
   }
 
@@ -375,10 +375,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "partial-trigger-cleanup-spark-4.1",
         Seq("before-partial-cleanup", "after-partial-cleanup"),
         latest,
-        s"\"deleted_trigger_absent_in_fresh_jvm\":true,\"unrelated_profile_row_preserved\":true," +
-          s"\"mv_versions_unchanged\":true,\"partial_cleanup_failure_injected\":true," +
-          s"\"precommit_cleanup_callback_suppressed\":${!cleanupCallbackRan}," +
-          s"\"fresh_jvm_evidence\":\"${childEvidence.getAbsolutePath}\""
+        s""""deleted_trigger_absent_in_fresh_jvm":true,"unrelated_profile_row_preserved":true,""" +
+          s""""mv_versions_unchanged":true,"partial_cleanup_failure_injected":true,""" +
+          s""""precommit_cleanup_callback_suppressed":${!cleanupCallbackRan},""" +
+          s""""fresh_jvm_evidence":"${childEvidence.getAbsolutePath}""""
       )
     }
 
@@ -496,12 +496,12 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "late-profile-inflight-spark-4.1",
         Seq("late-profile-baseline", "capture-before-late-profile", "late-profile-during-capture"),
         latest,
-        s"\"captured_generation_before_late_write\":$capturedGeneration," +
-          s"\"late_requested_generation\":$lateRequestedGeneration," +
-          s"\"older_commit_did_not_ack_late_request\":$olderCommitDidNotAckLateRequest," +
-          s"\"late_archive_differs_from_older_commit\":true," +
-          s"\"mv_versions_unchanged\":true,\"fresh_jvm_profile_restored\":true," +
-          s"\"fresh_jvm_evidence\":\"${childEvidence.getAbsolutePath}\""
+        s""""captured_generation_before_late_write":$capturedGeneration,""" +
+          s""""late_requested_generation":$lateRequestedGeneration,""" +
+          s""""older_commit_did_not_ack_late_request":$olderCommitDidNotAckLateRequest,""" +
+          s""""late_archive_differs_from_older_commit":true,""" +
+          s""""mv_versions_unchanged":true,"fresh_jvm_profile_restored":true,""" +
+          s""""fresh_jvm_evidence":"${childEvidence.getAbsolutePath}""""
       )
     }
 
