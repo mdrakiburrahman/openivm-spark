@@ -378,7 +378,6 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         val mixedResults = awaitResults(beforeFutures ++ duringFutures ++ afterFutures ++ changedFutures)
         calls ++= mixedResults
         mixedResults.foreach(_.outcome shouldBe "success")
-        OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
         OpenIvmStateSync.setDuringCaptureHookForTesting(null)
 
         val beforeNoChangePublications = evidence.asScala.toVector.drop(eventStart).flatMap(_.publications).size
