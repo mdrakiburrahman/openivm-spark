@@ -25,9 +25,9 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       loseDelete: Boolean = false,
       beforeInstall: () => Unit = () => ()
   ) extends ArchiveStore {
-    val canonicalRoot: String = root.toRealPath().toString
+    val canonicalRoot: String                             = root.toRealPath().toString
     private def slot(g: Generation, suffix: String): Path = root.resolve(g.value + suffix)
-    def archive(g: Generation): Path = slot(g, ".zip")
+    def archive(g: Generation): Path                      = slot(g, ".zip")
     private def version(g: Generation): String =
       Files.getAttribute(archive(g), "unix:ino").toString
     private def fields(f: Finished): Seq[String] =
@@ -42,31 +42,40 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       val channel = FileChannel.open(slot(g, ".lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
       try {
         val lock = channel.lock()
-        try body finally lock.release()
+        try body
+        finally lock.release()
       } finally channel.close()
     }
 
     def seal(g: Generation): Finished = {
-      val path = archive(g)
+      val path    = archive(g)
       val receipt = Finished(canonicalRoot, g, Files.size(path), OpenIvmSnapshotArchive.sha256(path.toFile), version(g))
       write(slot(g, ".finished"), fields(receipt))
       receipt
     }
 
     override def verifyNamespace(): Unit =
-      if (root.toRealPath().toString != canonicalRoot || !read(root.resolve("format")).contains(Seq("guarded-v1")) ||
-          !Files.notExists(root.resolve(".openivm-state-sync")))
+      if (
+        root.toRealPath().toString != canonicalRoot || !read(root.resolve("format")).contains(Seq("guarded-v1")) ||
+        !Files.notExists(root.resolve(".openivm-state-sync"))
+      )
         throw new IOException("unverified local guarded namespace")
     override def readFinished(g: Generation): Option[Finished] = read(slot(g, ".finished")).map(decode)
     override def readDecision(g: Generation): Option[Decision] = read(slot(g, ".decision")).map {
       case values if values.size == 6 && values.head == "publish" => Published(decode(values.tail))
-      case values if values.size == 6 && values.head == "retire" => Retired(decode(values.tail))
-      case _ => throw new IOException("invalid terminal decision")
+      case values if values.size == 6 && values.head == "retire"  => Retired(decode(values.tail))
+      case _                                                      => throw new IOException("invalid terminal decision")
     }
     override def listDecisionGenerations(): Seq[Generation] = {
       val stream = Files.list(root)
-      try stream.iterator().asScala.map(_.getFileName.toString).filter(_.endsWith(".decision"))
-        .map(name => Generation(name.stripSuffix(".decision"))).toVector
+      try
+        stream
+          .iterator()
+          .asScala
+          .map(_.getFileName.toString)
+          .filter(_.endsWith(".decision"))
+          .map(name => Generation(name.stripSuffix(".decision")))
+          .toVector
       finally stream.close()
     }
     override def installIfAbsent(decision: Decision): Unit = {
@@ -74,7 +83,7 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       try {
         val state = decision match {
           case Published(_) => "publish"
-          case Retired(_) => "retire"
+          case Retired(_)   => "retire"
         }
         Files.write(temp, (state +: fields(decision.artifact)).asJava, UTF_8)
         beforeInstall()
@@ -112,14 +121,15 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       root,
       loseInstall = true,
       loseDelete = role == "retire-lost-delete",
-      beforeInstall = () => if (role.startsWith("race-")) {
-        Files.createFile(root.resolve(s"$role.ready"))
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
-        while (Files.notExists(root.resolve("race-release")) && System.nanoTime() < deadline) Thread.sleep(10)
-        require(Files.exists(root.resolve("race-release")), "race was not released")
-      }
+      beforeInstall = () =>
+        if (role.startsWith("race-")) {
+          Files.createFile(root.resolve(s"$role.ready"))
+          val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+          while (Files.notExists(root.resolve("race-release")) && System.nanoTime() < deadline) Thread.sleep(10)
+          require(Files.exists(root.resolve("race-release")), "race was not released")
+        }
     )
-    val protocol = new GuardedSnapshotDecisions(store)
+    val protocol           = new GuardedSnapshotDecisions(store)
     val selectedGeneration = generation(args(2).toInt)
     if (role.startsWith("spark-")) {
       runSpark(root, role, selectedGeneration, store)
@@ -156,7 +166,9 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
   }
 
   private def runSpark(root: Path, role: String, gen: Generation, store: LocalStore): Unit = {
-    val spark = SparkSession.builder().master("local[1]")
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
       .appName(role)
       .config("spark.ui.enabled", "false")
       .config("spark.driver.host", "localhost")
@@ -169,7 +181,7 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
         require(StagingCatalog.referencedStagingPaths(spark) == Set("published-control"))
       } else {
         val published = role == "spark-publish"
-        val value = if (published) "published-control" else "retired-value"
+        val value     = if (published) "published-control" else "retired-value"
         StagingCatalog.record(spark, StagingDelta("default.guarded_source", "INSERT", value, new Timestamp(1000L), Nil))
         if (published) OpenIvmStateSync.publishGuarded(spark, gen, store)
         else {
@@ -202,10 +214,16 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
     for ((role, n) <- Seq("spark-publish" -> 1, "spark-retire" -> 2, "spark-restore" -> 1)) {
       val log = root.resolve(s"$role.log").toFile
-      val process = new ProcessBuilder((Seq(java, "-Xmx1g") ++ modules ++ Seq(
-        "-cp", System.getProperty("java.class.path"),
-        "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe", root.toString, role, n.toString
-      )): _*).redirectErrorStream(true).redirectOutput(log).start()
+      val process = new ProcessBuilder(
+        (Seq(java, "-Xmx1g") ++ modules ++ Seq(
+          "-cp",
+          System.getProperty("java.class.path"),
+          "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe",
+          root.toString,
+          role,
+          n.toString
+        )): _*
+      ).redirectErrorStream(true).redirectOutput(log).start()
       try {
         process.waitFor(90, TimeUnit.SECONDS) shouldBe true
         withClue(s"$role failed; see $log: ") { process.exitValue() shouldBe 0 }
@@ -220,19 +238,28 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
   it("reconciles lost decisions across processes without exposing a retired archive on restore") {
     val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "guarded-decisions-")
     Files.write(root.resolve("format"), Seq("guarded-v1").asJava, UTF_8)
-    val store = new LocalStore(root)
+    val store    = new LocalStore(root)
     val protocol = new GuardedSnapshotDecisions(store)
     def prepare(n: Int): GuardedSnapshotDecisions.Finished = {
       val stage = Files.createDirectory(root.resolve(s"stage-$n"))
-      val file = Files.write(stage.resolve("state"), Seq(s"generation-$n").asJava, UTF_8)
+      val file  = Files.write(stage.resolve("state"), Seq(s"generation-$n").asJava, UTF_8)
       OpenIvmSnapshotArchive.pack(stage.toFile, Seq(file.toFile), store.archive(generation(n)).toFile, _ => ())
       store.seal(generation(n))
     }
     def start(role: String, n: Int): Process = {
       val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
-      new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
-        "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe", root.toString, role, n.toString)
-        .redirectErrorStream(true).redirectOutput(root.resolve(s"$role-$n.log").toFile).start()
+      new ProcessBuilder(
+        java,
+        "-cp",
+        System.getProperty("java.class.path"),
+        "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe",
+        root.toString,
+        role,
+        n.toString
+      )
+        .redirectErrorStream(true)
+        .redirectOutput(root.resolve(s"$role-$n.log").toFile)
+        .start()
     }
 
     def waitForChild(process: Process): Unit = {
@@ -255,17 +282,17 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
     child("restore", 1)
     Files.exists(store.archive(generation(2))) shouldBe false
     val replaced = prepare(3)
-    val old = store.archive(generation(3))
+    val old      = store.archive(generation(3))
     Files.move(old, root.resolve("old-inode"), StandardCopyOption.ATOMIC_MOVE)
     Files.write(old, Seq("replacement").asJava, UTF_8)
     intercept[IOException](protocol.retire(replaced)).getMessage should include("version changed")
     Files.readAllLines(old, UTF_8).asScala shouldBe Seq("replacement")
 
-    val raced = prepare(4)
-    val racers = Seq("race-publish", "race-retire")
+    val raced     = prepare(4)
+    val racers    = Seq("race-publish", "race-retire")
     val processes = racers.map(start(_, 4))
     try {
-      val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+      val deadline           = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
       def bothReady: Boolean = racers.forall(role => Files.exists(root.resolve(s"$role.ready")))
       while (!bothReady && System.nanoTime() < deadline) Thread.sleep(10)
       bothReady shouldBe true

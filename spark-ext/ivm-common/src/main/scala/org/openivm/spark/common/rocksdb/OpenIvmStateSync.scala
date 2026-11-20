@@ -419,30 +419,30 @@ object OpenIvmStateSync {
       archiveBytes: Long,
       checksum: String
   ): Unit = {
-      val remoteArchive = new Path(remoteRoot, "snapshot.zip")
-      val copyHook      = copyLocalFileHookForTesting
-      if (copyHook != null) copyHook(fs, archive, remoteArchive)
-      else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
-      OpenIvmSnapshotArchive.checkInterrupted()
-      if (fs.getFileStatus(remoteArchive).getLen != archiveBytes)
-        throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
-      val pendingCommit = new Path(commitRoot, s".$generation.pending")
-      val committed     = new Path(commitRoot, s"$generation.commit")
-      val output        = fs.create(pendingCommit, false)
-      try
-        output.write(
-          s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n$checksum\n".getBytes(StandardCharsets.UTF_8)
-        )
-      finally output.close()
-      val commitHook = beforeSnapshotCommitHookForTesting
-      if (commitHook != null) commitHook()
-      OpenIvmSnapshotArchive.checkInterrupted()
-      if (!fs.rename(pendingCommit, committed))
-        throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
-      log.info(
-        s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
+    val remoteArchive = new Path(remoteRoot, "snapshot.zip")
+    val copyHook      = copyLocalFileHookForTesting
+    if (copyHook != null) copyHook(fs, archive, remoteArchive)
+    else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
+    OpenIvmSnapshotArchive.checkInterrupted()
+    if (fs.getFileStatus(remoteArchive).getLen != archiveBytes)
+      throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
+    val pendingCommit = new Path(commitRoot, s".$generation.pending")
+    val committed     = new Path(commitRoot, s"$generation.commit")
+    val output        = fs.create(pendingCommit, false)
+    try
+      output.write(
+        s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n$checksum\n".getBytes(StandardCharsets.UTF_8)
       )
-      pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
+    finally output.close()
+    val commitHook = beforeSnapshotCommitHookForTesting
+    if (commitHook != null) commitHook()
+    OpenIvmSnapshotArchive.checkInterrupted()
+    if (!fs.rename(pendingCommit, committed))
+      throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
+    log.info(
+      s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
+    )
+    pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
   }
 
   // Explicit guarded entry points; there is no configured OneLake transport or legacy fallback.
@@ -467,8 +467,8 @@ object OpenIvmStateSync {
   private[rocksdb] def restoreGuarded(spark: SparkSession, store: GuardedSnapshotDecisions.ArchiveStore): Unit =
     OpenIvmStateBarrier.withCapture(spark) {
       new GuardedSnapshotDecisions(store).latestPublished().foreach { receipt =>
-        restorePackedArchive(receipt.bytes -> receipt.sha256, localRoot(spark))(
-          archive => store.copyExactArchive(receipt, archive)
+        restorePackedArchive(receipt.bytes -> receipt.sha256, localRoot(spark))(archive =>
+          store.copyExactArchive(receipt, archive)
         )
       }
     }
@@ -598,8 +598,8 @@ object OpenIvmStateSync {
     val remote = new Path(root, "snapshot.zip")
     if (fs.getFileStatus(remote).getLen != info._1)
       throw new java.io.IOException("openivm state-sync: archive length mismatch")
-    restorePackedArchive(info, local)(
-      archive => fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
+    restorePackedArchive(info, local)(archive =>
+      fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
     )
   }
 

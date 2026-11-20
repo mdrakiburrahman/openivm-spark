@@ -16,11 +16,11 @@ private[rocksdb] object GuardedSnapshotDecisions {
 
   sealed trait Decision { def artifact: Finished }
   final case class Published(artifact: Finished) extends Decision
-  final case class Retired(artifact: Finished) extends Decision
+  final case class Retired(artifact: Finished)   extends Decision
 
   sealed trait Deletion
-  case object Deleted extends Deletion
-  case object AlreadyAbsent extends Deletion
+  case object Deleted        extends Deletion
+  case object AlreadyAbsent  extends Deletion
   case object VersionChanged extends Deletion
 
   trait Store {
@@ -78,15 +78,22 @@ private[rocksdb] final class GuardedSnapshotDecisions(store: GuardedSnapshotDeci
 
   def latestPublished(): Option[Finished] = {
     store.verifyNamespace()
-    store.listDecisionGenerations().map { generation =>
-      val decision = store.readDecision(generation).getOrElse(throw new IOException("checkpoint decision disappeared"))
-      if (decision.artifact.generation != generation) throw new IOException("checkpoint generation mismatch")
-      requireReceipt(decision.artifact)
-      decision
-    }.collect { case Published(receipt) => receipt }.sortBy(_.generation.value).lastOption.map { receipt =>
-      store.requireArchiveVersion(receipt)
-      receipt
-    }
+    store
+      .listDecisionGenerations()
+      .map { generation =>
+        val decision =
+          store.readDecision(generation).getOrElse(throw new IOException("checkpoint decision disappeared"))
+        if (decision.artifact.generation != generation) throw new IOException("checkpoint generation mismatch")
+        requireReceipt(decision.artifact)
+        decision
+      }
+      .collect { case Published(receipt) => receipt }
+      .sortBy(_.generation.value)
+      .lastOption
+      .map { receipt =>
+        store.requireArchiveVersion(receipt)
+        receipt
+      }
   }
 
   private def requireReceipt(receipt: Finished): Unit =
@@ -103,7 +110,7 @@ private[rocksdb] final class GuardedSnapshotDecisions(store: GuardedSnapshotDeci
         } catch { case error: IOException => Some(error) }
       store.readDecision(generation) match {
         case result @ Some(_) => result
-        case None => throw new IOException("checkpoint decision was not confirmed", failure.orNull)
+        case None             => throw new IOException("checkpoint decision was not confirmed", failure.orNull)
       }
     }
     observed match {
