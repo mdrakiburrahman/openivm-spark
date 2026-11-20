@@ -21,14 +21,14 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
   Files.createDirectories(evidence.resolve("events"))
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.openivm.profile.refresh"       -> "true",
-    FeatureGate.QueryLogEnabledKey        -> "true",
-    FeatureGate.ExplainCaptureKey         -> "true",
-    FeatureGate.StateSyncAsyncEnabledKey  -> "false",
-    FeatureGate.FuseScratchEnabledKey     -> "false",
-    "spark.eventLog.enabled"              -> "true",
-    "spark.eventLog.compress"             -> "false",
-    "spark.eventLog.dir"                  -> evidence.resolve("events").toUri.toString
+    "spark.openivm.profile.refresh"      -> "true",
+    FeatureGate.QueryLogEnabledKey       -> "true",
+    FeatureGate.ExplainCaptureKey        -> "true",
+    FeatureGate.StateSyncAsyncEnabledKey -> "false",
+    FeatureGate.FuseScratchEnabledKey    -> "false",
+    "spark.eventLog.enabled"             -> "true",
+    "spark.eventLog.compress"            -> "false",
+    "spark.eventLog.dir"                 -> evidence.resolve("events").toUri.toString
   )
 
   private def write(name: String, data: String): Unit =
@@ -55,15 +55,15 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
     writeJson("initial-mv.jsonl", spark.table("witness_mv").select("id", "v"))
 
     def run(label: String, mutation: Option[String]): Unit = {
-      val previousMv = snapshot(spark.table("witness_mv").select("id", "v"))
-      val previousSource = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
+      val previousMv      = snapshot(spark.table("witness_mv").select("id", "v"))
+      val previousSource  = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
       val previousVersion = DeltaCommitClassifier.latestVersion(spark, meta.location)
       mutation.foreach(sql)
       RefreshProfileCatalog.removeAll(spark)
       sql("REFRESH MATERIALIZED VIEW witness_mv").collect()
       val currentVersion = DeltaCommitClassifier.latestVersion(spark, meta.location)
       currentVersion shouldBe previousVersion + (if (mutation.isDefined) 1L else 0L)
-      val currentMv = snapshot(spark.table("witness_mv").select("id", "v"))
+      val currentMv     = snapshot(spark.table("witness_mv").select("id", "v"))
       val currentSource = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
       sameBag(currentMv, currentSource)
       sameBag(currentMv.exceptAll(previousMv), currentSource.exceptAll(previousSource))
@@ -80,24 +80,29 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
       val attempts = profile.collect().filter(_.getString(4) == "execute_refresh_sql_attempt")
       if (mutation.isDefined) {
         val attempt = attempts.find(_.getString(6).contains("stmt_kind=insert_into")).get
-        val fields = attempt.getString(6).split(";").map(_.split("=", 2)).collect {
-          case Array(k, v) => k -> v
-        }.toMap
+        val fields = attempt
+          .getString(6)
+          .split(";")
+          .map(_.split("=", 2))
+          .collect { case Array(k, v) =>
+            k -> v
+          }
+          .toMap
         fields("status") shouldBe "success"
         fields("origin_class") shouldBe "unknown"
         fields("credit_ns") shouldBe "0"
         fields("rewrite_rule") shouldBe "simple-projection-data-insert"
-        val logs = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == attempt.getString(0))
-        val native = logs.find(_.category == "compiler_program_native").get.sqlText
+        val logs       = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == attempt.getString(0))
+        val native     = logs.find(_.category == "compiler_program_native").get.sqlText
         val normalized = logs.find(_.category == "compiler_program_normalized").get.sqlText
-        val executed = logs.find(r =>
-          r.category == "rewritten_stmt" && r.stmtOrder == fields("query_log_order").toInt
-        ).get.sqlText
+        val executed =
+          logs.find(r => r.category == "rewritten_stmt" && r.stmtOrder == fields("query_log_order").toInt).get.sqlText
         executed should startWith("INSERT INTO `witness_mv`")
         RewriteLineage.sha256Utf8(native) shouldBe fields("compiler_program_digest")
         RewriteLineage.sha256Utf8(normalized) shouldBe fields("normalized_program_digest")
         RewriteLineage.sha256Utf8(executed) shouldBe fields("executed_digest")
-        val source = SparkRefreshRewriter.splitStatements(native).filter(_.trim.nonEmpty)(fields("source_ordinal").toInt)
+        val source =
+          SparkRefreshRewriter.splitStatements(native).filter(_.trim.nonEmpty)(fields("source_ordinal").toInt)
         RewriteLineage.sha256Utf8(source) shouldBe fields("source_digest")
       } else {
         attempts.exists(_.getString(6).contains("reason=no_pending_deltas")) shouldBe true
