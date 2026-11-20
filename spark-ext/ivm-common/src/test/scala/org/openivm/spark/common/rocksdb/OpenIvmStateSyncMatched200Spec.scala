@@ -127,9 +127,10 @@ object OpenIvmStateSyncMatched200FreshRestoreProbe {
         .foreach(m =>
           require(!profiles.exists(_.refreshId == m.requestId), s"later waiter ${m.requestId} appeared in old archive")
         )
-      val includedIds = included.map(_.requestId).sorted.map(id => s""""$id"").mkString("[", ",", "]""")
-      val excludedIds =
-        mutations.filter(_.stage > captureStage).map(_.requestId).sorted.map(id => s""""$id"").mkString("[", ",", "]""")
+      def renderIds(values: Seq[String]): String =
+        values.sorted.map(id => "\"" + id + "\"").mkString("[", ",", "]")
+      val includedIds = renderIds(included.map(_.requestId).toVector)
+      val excludedIds = renderIds(mutations.filter(_.stage > captureStage).map(_.requestId).toVector)
       Files.createDirectories(evidence.toPath.getParent)
       Files.write(
         evidence.toPath,
