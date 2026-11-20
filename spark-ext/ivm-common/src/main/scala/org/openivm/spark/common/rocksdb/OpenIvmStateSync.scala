@@ -676,7 +676,11 @@ object OpenIvmStateSync {
     try {
       val captureHook = beforeCaptureHookForTesting
       if (captureHook != null) captureHook()
+      var captureStarted = 0L
+      var shardsNanos = 0L
+      val barrierStarted = System.nanoTime()
       OpenIvmStateBarrier.withCapture(spark) {
+        captureStarted = System.nanoTime()
         OpenIvmSnapshotArchive.checkInterrupted()
         val localBase = local.toPath
         val files     = backupFiles(local)
@@ -685,11 +689,13 @@ object OpenIvmStateSync {
           .map(_.getParentFile.toPath)
           .distinct
           .sortBy(_.toString)
+        val shardsStarted = System.nanoTime()
         databases.foreach { db =>
           val target = capture.toPath.resolve(localBase.relativize(db))
           Files.createDirectories(target.getParent)
           OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
         }
+        shardsNanos = System.nanoTime() - shardsStarted
         files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
           val target = capture.toPath.resolve(localBase.relativize(file.toPath))
@@ -699,17 +705,25 @@ object OpenIvmStateSync {
         if (FeatureGate.stateSyncCheckpointEnabled(spark))
           capturedMutationGeneration = Some(OpenIvmStateBarrier.currentMutationGeneration(spark))
       }
+      val captureEnded = System.nanoTime()
+      var packHookNanos = 0L
       OpenIvmSnapshotArchive.pack(
         capture,
         backupFiles(capture),
         archive,
         file => {
           val hook = beforeLocalFileCopyHookForTesting
-          if (hook != null) hook(file)
+          if (hook != null) {
+            val started = System.nanoTime()
+            try hook(file)
+            finally packHookNanos += System.nanoTime() - started
+          }
         }
       )
+      val packEnded = System.nanoTime()
       val archiveBytes  = archive.length()
       val checksum      = OpenIvmSnapshotArchive.sha256(archive)
+      val hashEnded = System.nanoTime()
       val remoteArchive = new Path(remoteRoot, "snapshot.zip")
       val copyHook      = copyLocalFileHookForTesting
       if (copyHook != null) copyHook(fs, archive, remoteArchive)
@@ -733,7 +747,15 @@ object OpenIvmStateSync {
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
+      val commitEnded = System.nanoTime()
       pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
+      log.info(
+        s"checkpoint_phase generation=$generation barrier_ns=${captureStarted - barrierStarted} " +
+          s"capture_ns=${captureEnded - captureStarted} shards_ns=$shardsNanos " +
+          s"pack_ns=${packEnded - captureEnded - packHookNanos} pack_fixture_hook_ns=$packHookNanos " +
+          s"hash_ns=${hashEnded - packEnded} publication_with_fixture_ns=${commitEnded - hashEnded} " +
+          s"prune_ns=${System.nanoTime() - commitEnded} archive_bytes=$archiveBytes"
+      )
       Some(SnapshotPublication(generation, capturedMutationGeneration, checksum, archiveBytes))
     } finally {
       try Files.deleteIfExists(archive.toPath)
