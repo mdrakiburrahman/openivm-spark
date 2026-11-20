@@ -230,7 +230,11 @@ object OpenIvmRocksDBRegistry {
     }
   }
 
-  private val entries               = new ConcurrentHashMap[String, Slot]()
+  private val entries = new ConcurrentHashMap[String, Slot]()
+
+  private[openivm] def hasSlotForGuard(dbPath: String): Boolean =
+    entries.containsKey(canonicalLocalPath(dbPath))
+
   private val listenerAppIds        = ConcurrentHashMap.newKeySet[String]()
   private val openEntryCount        = new AtomicInteger(0)
   private val shutdownHookInstalled = new AtomicBoolean(false)

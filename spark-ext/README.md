@@ -2,6 +2,12 @@
 
 ## Guarded refresh
 
+The request-bound v3 syntax is an **unadvertised, disabled prototype**: it fails
+closed before catalog or target access. `RefreshMutex` is JVM-local, while the
+Delta catalog supports multiple drivers, so it cannot yet prove the target lock
+required by v3. Automatic lost-registration recovery remains disabled. The
+ordinary and v2 guarded refresh paths are unchanged.
+
 When the extension and feature gate are enabled, `SET spark.openivm.capabilities`
 advertises `ensure_refresh_v2`. Clients can opt in using
 

@@ -12,6 +12,21 @@ class StateSyncRecoverySpec extends IvmParitySpecBase("state-sync-recovery") wit
     FeatureGate.StateSyncAsyncEnabledKey -> "false"
   )
 
+  it("refuses unverified pre-existing local state for a guarded preflight") {
+    val local = new File(warehouseDir, "_openivm")
+    local.mkdirs()
+    val marker = new File(local, "guard-unverified-marker")
+    java.nio.file.Files.write(marker.toPath, Array[Byte](1))
+    try {
+      OpenIvmStateSync.resetForTesting()
+      OpenIvmStateSync.maybeRestore(spark)
+      intercept[IllegalStateException](OpenIvmStateSync.requireVerifiedRestoreForGuard(spark))
+    } finally {
+      java.nio.file.Files.deleteIfExists(marker.toPath)
+      OpenIvmStateSync.resetForTesting()
+    }
+  }
+
   it("restores a chained view's metadata and continues incremental refresh") {
     sql("CREATE TABLE state_sync_recovery_src(id INT, amount INT) USING DELTA")
     sql("INSERT INTO state_sync_recovery_src VALUES (1, 10)")
@@ -32,6 +47,7 @@ class StateSyncRecoverySpec extends IvmParitySpecBase("state-sync-recovery") wit
     OpenIvmStateSync.resetForTesting()
     Seq("state_sync_recovery_up", "state_sync_recovery_down").foreach { name =>
       val meta = MvCatalog.lookup(spark, TableIdentifier(name)).get
+      OpenIvmStateSync.requireVerifiedRestoreForGuard(spark)
       meta.refreshType should not be RefreshTypeCode.FullRefresh
       meta.lastVersion shouldBe DeltaTableVersion.requireLatest(spark, meta.location)
     }

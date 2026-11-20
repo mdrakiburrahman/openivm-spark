@@ -105,6 +105,29 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
     }
   }
 
+  private[openivm] def mayContainForGuard(spark: SparkSession, name: TableIdentifier): Boolean = {
+    val metadataPath = new org.apache.hadoop.fs.Path(path(spark))
+    val fs           = metadataPath.getFileSystem(spark.sessionState.newHadoopConf())
+    val present =
+      try {
+        fs.getFileStatus(metadataPath)
+        true
+      } catch {
+        case _: java.io.FileNotFoundException => false
+      }
+    if (!present) false
+    else {
+      val catalog  = spark.read.format("delta").load(path(spark))
+      val expected = schema.fields.map(field => field.name -> field.dataType.catalogString).toMap
+      val actual   = catalog.schema.fields.map(field => field.name -> field.dataType.catalogString).toMap
+      if (actual != expected) throw new IllegalStateException("Invalid MV catalog schema")
+      val missing = schema.fields.map(field => col(field.name).isNull).reduce(_ || _)
+      if (catalog.filter(missing).take(1).nonEmpty)
+        throw new IllegalStateException("Incomplete MV catalog row")
+      catalog.filter(col(Name) === lit(serializedName(name))).take(1).nonEmpty
+    }
+  }
+
   override def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
     ensureTables(spark)
     spark.read

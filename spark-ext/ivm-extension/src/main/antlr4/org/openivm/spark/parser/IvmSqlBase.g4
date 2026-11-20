@@ -7,7 +7,7 @@
  *     [USING <provider>] [<table_clauses>] [CLUSTER BY (<cols>)] AS <query>
  *
  *   REFRESH MATERIALIZED VIEW <multipart_identifier>
- *     [EXPECT QUERY HASH '<32-hex>' IF EXISTS]
+ *     [EXPECT QUERY HASH '<32-hex>' IF EXISTS [REQUEST ID '<32-hex>']]
  *
  *   ALTER MATERIALIZED VIEW <multipart_identifier>
  *     ADVANCE SOURCE VERSIONS (<source>=<version> [, ...])
@@ -119,7 +119,7 @@ showRefreshSql
 
 refreshMaterializedView
     : REFRESH MATERIALIZED VIEW multipartIdentifier
-      (EXPECT QUERY HASH expectedQueryHash=STRING IF EXISTS)?
+      (EXPECT QUERY HASH expectedQueryHash=STRING IF EXISTS (REQUEST ID requestId=STRING)?)?
     ;
 
 advanceMaterializedViewSourceVersions
@@ -235,7 +235,7 @@ nonReserved
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
     | QUERY | EXPECT | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
     | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP | LIKE
-    | INSIGHTS | BEGIN | REQUEST | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
+    | INSIGHTS | BEGIN | REQUEST | ID | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
     | MATERIALIZATION | TARGET | ERROR_CLASS | ERROR_CODE | ANNOTATE | HASH | OLD | NEW | POLICY | DECISION | REASON
     ;
 
@@ -277,6 +277,7 @@ STOP          : [Ss][Tt][Oo][Pp];
 INSIGHTS      : [Ii][Nn][Ss][Ii][Gg][Hh][Tt][Ss];
 BEGIN         : [Bb][Ee][Gg][Ii][Nn];
 REQUEST       : [Rr][Ee][Qq][Uu][Ee][Ss][Tt];
+ID            : [Ii][Dd];
 RUN           : [Rr][Uu][Nn];
 NODE          : [Nn][Oo][Dd][Ee];
 AFTER         : [Aa][Ff][Tt][Ee][Rr];

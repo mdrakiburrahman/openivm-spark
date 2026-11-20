@@ -88,6 +88,16 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       properties = Map("owner" -> "alice", "tier" -> "gold")
     )
 
+  it("treats a prepared but incomplete shard as uncertain without creating a shard on a miss") {
+    val meta  = sampleMeta("guard_preflight")
+    val shard = Paths.get(OpenIvmStatePaths.perMvDbPath(spark, s"db.${meta.name.identifier}")).getParent
+    MvCatalog.mayContainForGuard(spark, meta.name) shouldBe false
+    Files.exists(shard) shouldBe false
+    MvCatalog.prepareCreate(spark, meta.name)
+    MvCatalog.mayContainForGuard(spark, meta.name) shouldBe true
+    MvCatalog.lookup(spark, meta.name) shouldBe None
+  }
+
   it("prepares metadata shards without publishing a view or dependency") {
     val meta = sampleMeta("prepared", Seq("prepared_orders"))
     MvCatalog.prepareCreate(spark, meta.name)

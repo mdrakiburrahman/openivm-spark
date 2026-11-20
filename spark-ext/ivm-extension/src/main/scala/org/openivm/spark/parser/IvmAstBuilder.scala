@@ -83,9 +83,18 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
       }
       literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
     }
+    val requestId = Option(ctx.requestId).map { token =>
+      val literal = token.getText
+      if (!literal.matches("'[0-9a-f]{32}'"))
+        parseError("request ID must be exactly 32 lowercase hexadecimal characters")
+      if (!ctx.expectedQueryHash.getText.matches("'[0-9a-f]{32}'"))
+        parseError("expected query hash must be exactly 32 lowercase hexadecimal characters")
+      literal.substring(1, literal.length - 1)
+    }
     RefreshMaterializedViewCommand(
       toTableIdentifier(ctx.multipartIdentifier()),
-      expectedQueryHash = expectedQueryHash
+      expectedQueryHash = expectedQueryHash,
+      requestId = requestId
     )
   }
 

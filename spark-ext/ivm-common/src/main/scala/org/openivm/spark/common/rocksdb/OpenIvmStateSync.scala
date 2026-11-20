@@ -114,8 +114,9 @@ object OpenIvmStateSync {
 
   private val MaxPrunedPerPublish = 25
 
-  private val restoreStates = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
-  private val backupStates  = new ConcurrentHashMap[String, BackupState]()
+  private val restoreStates    = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
+  private val verifiedRestores = new ConcurrentHashMap[String, java.lang.Boolean]()
+  private val backupStates     = new ConcurrentHashMap[String, BackupState]()
   @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
   @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
@@ -188,14 +189,25 @@ object OpenIvmStateSync {
     }
 
     try {
-      OpenIvmStateBarrier.withCapture(spark) {
+      val verified = OpenIvmStateBarrier.withCapture(spark) {
         restoreNow(spark, uri)
       }
+      if (verified) verifiedRestores.put(key, java.lang.Boolean.TRUE)
       waiter.complete(())
     } catch {
       case error: Throwable =>
         waiter.completeExceptionally(error)
         throw error
+    }
+  }
+
+  /** Require a previously completed, verified restore without initiating any I/O. */
+  private[openivm] def requireVerifiedRestoreForGuard(spark: SparkSession): Unit = {
+    stateSyncUri(spark).foreach { uri =>
+      val key   = s"${spark.sparkContext.applicationId}|${effectiveStateSyncKey(spark, uri)}"
+      val state = restoreStates.get(key)
+      if (state == null || !state.isDone || state.isCompletedExceptionally || !verifiedRestores.containsKey(key))
+        throw new IllegalStateException("Guarded refresh cannot prove state restoration completed")
     }
   }
 
@@ -292,22 +304,22 @@ object OpenIvmStateSync {
     } finally lock.unlock()
   }
 
-  private def restoreNow(spark: SparkSession, uri: String): Unit = {
+  private def restoreNow(spark: SparkSession, uri: String): Boolean = {
     val local = localRoot(spark)
-    if (hasLocalStateFiles(local)) return
+    if (hasLocalStateFiles(local)) return false
 
     val hconf      = spark.sessionState.newHadoopConf()
     val remoteRoot = new Path(uri)
     val fs         = remoteRoot.getFileSystem(hconf)
     if (!fs.exists(remoteRoot)) {
       log.info(s"openivm state-sync: no remote state at $uri, starting fresh")
-      return
+      return true
     }
 
     val committed = latestCommit(fs, remoteRoot)
     committed.flatMap(_.archive).foreach { info =>
       restoreArchive(fs, committed.get.root, info, local)
-      return
+      return true
     }
     val snapshotRoot = committed.map(_.root).getOrElse(remoteRoot)
     local.mkdirs()
@@ -332,6 +344,7 @@ object OpenIvmStateSync {
     if (restored == 0 && snapshotRoot == remoteRoot && fs.exists(new Path(remoteRoot, ".openivm-state-sync")))
       throw new java.io.IOException(s"openivm state-sync: no committed snapshot or legacy state at $uri")
     log.info(s"openivm state-sync: restored $restored files from $uri to $local")
+    false
   }
 
   private def backupNowInternal(spark: SparkSession, uri: String): Unit = {
@@ -617,6 +630,7 @@ object OpenIvmStateSync {
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
     restoreStates.clear()
+    verifiedRestores.clear()
     backupStates.clear()
   }
 

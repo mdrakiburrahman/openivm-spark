@@ -78,6 +78,20 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       properties = Map("owner" -> "openivm")
     )
 
+  describe("read-only guard preflight") {
+    it("does not create the Delta catalog and propagates invalid catalog errors") {
+      withNewSession { session =>
+        val catalogRoot = s"$root/guard-catalog"
+        session.conf.set(FeatureGate.CatalogPathKey, catalogRoot)
+        val name = CatalystSqlParser.parseTableIdentifier("db.guard_mv")
+        MvCatalog.mayContainForGuard(session, name) shouldBe false
+        new File(s"$catalogRoot/mv_metadata").exists() shouldBe false
+        new File(s"$catalogRoot/mv_metadata").mkdirs()
+        intercept[Exception](MvCatalog.mayContainForGuard(session, name))
+      }
+    }
+  }
+
   describe("Delta MV catalog backend") {
     it("round-trips, indexes dependencies, advances, updates, and removes metadata") {
       val orders   = metadata("db.mv_orders", "db.orders")
@@ -88,6 +102,8 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       MvCatalog.upsert(spark, customer)
 
       MvCatalog.lookup(spark, orders.name) shouldBe Some(orders)
+      MvCatalog.mayContainForGuard(spark, orders.name) shouldBe true
+      MvCatalog.mayContainForGuard(spark, CatalystSqlParser.parseTableIdentifier("db.guard_missing")) shouldBe false
       MvCatalog.list(spark).map(_.name).toSet shouldBe Set(orders.name, customer.name)
       MvCatalog.viewsForSource(spark, "db.orders").map(_.name) shouldBe Seq(orders.name)
 

@@ -861,6 +861,34 @@ object MvCatalog {
   def upsert(spark: SparkSession, meta: MvMetadata): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
+  /** Conservative, read-only preflight: true also covers incomplete local shards. */
+  private[openivm] def mayContainForGuard(spark: SparkSession, name: TableIdentifier): Boolean = {
+    if (FeatureGate.deltaCatalogEnabled(spark)) DeltaMvCatalogBackend.mayContainForGuard(spark, name)
+    else {
+      OpenIvmStateSync.requireVerifiedRestoreForGuard(spark)
+      val serializedName = name.database.fold(name.identifier)(db => s"$db.${name.identifier}")
+      val dbPath         = OpenIvmStatePaths.perMvDbPath(spark, serializedName)
+      val shard          = Paths.get(dbPath).getParent
+      if (OpenIvmRocksDBRegistry.hasSlotForGuard(dbPath)) true
+      else {
+        val paths = Seq(OpenIvmStatePaths.openIvmRoot(spark), OpenIvmStatePaths.mvsRoot(spark), shard)
+        paths.forall { path =>
+          val attributes =
+            try {
+              Some(Files.readAttributes(path, classOf[BasicFileAttributes], java.nio.file.LinkOption.NOFOLLOW_LINKS))
+            } catch {
+              case _: java.nio.file.NoSuchFileException => None
+            }
+          attributes match {
+            case None                             => false
+            case Some(value) if value.isDirectory => true
+            case Some(_) => throw new IllegalStateException(s"Uncertain MV catalog path: $path")
+          }
+        }
+      }
+    }
+  }
+
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
 
   def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)

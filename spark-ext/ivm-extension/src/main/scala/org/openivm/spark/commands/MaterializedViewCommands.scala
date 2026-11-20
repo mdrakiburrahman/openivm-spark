@@ -4143,23 +4143,57 @@ final case class SourceVersionAdvanceRequest(versionsBySource: Map[String, Long]
 case class RefreshMaterializedViewCommand(
     name: TableIdentifier,
     sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None,
-    expectedQueryHash: Option[String] = None
+    expectedQueryHash: Option[String] = None,
+    requestId: Option[String] = None
 ) extends LeafRunnableCommand {
 
   override val output: Seq[Attribute] =
-    if (expectedQueryHash.isDefined)
-      Seq(
-        AttributeReference("status", StringType, nullable = false)(),
-        AttributeReference("query_hash", StringType, nullable = false)(),
-        AttributeReference("target", StringType, nullable = false)(),
-        AttributeReference("target_table_id", StringType, nullable = true)(),
-        AttributeReference("refresh_id", StringType, nullable = true)(),
-        AttributeReference("outcome", StringType, nullable = true)()
-      )
-    else Seq.empty
+    (if (expectedQueryHash.isDefined)
+       Seq(
+         AttributeReference("status", StringType, nullable = false)(),
+         AttributeReference("query_hash", StringType, nullable = false)(),
+         AttributeReference("target", StringType, nullable = false)(),
+         AttributeReference("target_table_id", StringType, nullable = true)(),
+         AttributeReference("refresh_id", StringType, nullable = true)(),
+         AttributeReference("outcome", StringType, nullable = true)()
+       )
+     else Seq.empty) ++ requestId.toSeq.map(_ => AttributeReference("request_id", StringType, nullable = false)())
 
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
+
+    if (requestId.isDefined)
+      throw new IllegalStateException("Guarded refresh v3 is disabled: cross-driver target serialization is unverified")
+
+    requestId.foreach { request =>
+      if (
+        !request.matches("[0-9a-f]{32}") || !expectedQueryHash.exists(_.matches("[0-9a-f]{32}")) ||
+        sourceVersionAdvance.isDefined
+      )
+        throw new IllegalArgumentException("Invalid guarded refresh request")
+      val prewrite = RefreshMutex.withLock(metaName(name)) {
+        if (MvCatalog.mayContainForGuard(spark, name)) None
+        else {
+          val ident = sqlIdent(name)
+          if (!spark.catalog.tableExists(ident))
+            Some(Seq(Row("absent", expectedQueryHash.get, ident, null, null, null, request)))
+          else {
+            val plan = spark.table(ident).queryExecution.analyzed
+            if (plan.exists(_.isInstanceOf[View]))
+              throw new IllegalStateException(s"Relation $ident is not a physical Delta table")
+            val log = DeltaTableVersion.deltaLogFromPlan(plan).getOrElse {
+              throw new IllegalStateException(s"Relation $ident is not a physical Delta table")
+            }
+            val snapshot = log.update()
+            val id       = Option(snapshot.metadata.id).getOrElse("")
+            if (snapshot.version < 0L || !id.matches("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"))
+              throw new IllegalStateException(s"Relation $ident has no canonical Delta table ID")
+            Some(Seq(Row("present_unregistered_prewrite", expectedQueryHash.get, ident, id, null, null, request)))
+          }
+        }
+      }
+      if (prewrite.isDefined) return prewrite.get
+    }
 
     // Serialize concurrent REFRESHes against the same MV — see comment on
     // RefreshMutex above. Without this, two threads that both read the
@@ -4207,6 +4241,8 @@ case class RefreshMaterializedViewCommand(
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         val missing = expectedQueryHash.isDefined && MvCatalog.lookup(spark, name).isEmpty
         if (missing) {
+          if (requestId.isDefined)
+            throw new IllegalStateException("Guarded refresh registration changed while acquiring locks")
           if (spark.catalog.tableExists(sqlIdent(name)))
             throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
           absent = true
@@ -4230,12 +4266,39 @@ case class RefreshMaterializedViewCommand(
             try {
               DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
                 org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-                  runUnderLock(
+                  val result = runUnderLock(
                     cloned,
                     lockAcqMs,
                     id => targetTableId = Some(id),
                     (id, outcome) => completedRefresh = Some(id -> outcome)
                   )
+                  if (requestId.isDefined) {
+                    val meta = MvCatalog.lookup(cloned, name).getOrElse {
+                      throw new IllegalStateException("Guarded refresh registration disappeared")
+                    }
+                    val ownership = MaterializedViewLifecycle.liveOwnership(cloned, name, meta)
+                    val key       = "dbt.fabricspark.materialized_view.query_hash"
+                    val props     = cloned.sql(s"SHOW TBLPROPERTIES ${sqlIdent(name)} ('$key')").collect()
+                    if (
+                      !ownership.owned || ownership.dataTableId != targetTableId ||
+                      !meta.properties.get(MvMetadata.TargetDeltaTableIdKey).exists(targetTableId.contains) ||
+                      !meta.properties.get(key).exists(expectedQueryHash.contains) ||
+                      props.length != 1 || props.head.length != 2 || props.head.isNullAt(0) ||
+                      props.head.isNullAt(1) || props.head.getString(0) != key ||
+                      !expectedQueryHash.contains(props.head.getString(1))
+                    )
+                      throw new IllegalStateException("Guarded refresh target changed before completion")
+                    val id = targetTableId.getOrElse(throw new IllegalStateException("Missing target identity"))
+                    val (refresh, outcome) = completedRefresh.getOrElse {
+                      throw new IllegalStateException("Missing completed refresh proof")
+                    }
+                    if (
+                      !id.matches("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}") || refresh.isEmpty ||
+                      !Set("incremental_executed", "full_refresh_executed", "no_pending_deltas").contains(outcome)
+                    )
+                      throw new IllegalStateException("Invalid guarded refresh completion proof")
+                  }
+                  result
                 }
               }
             } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
@@ -4266,7 +4329,10 @@ case class RefreshMaterializedViewCommand(
           val tableId = targetTableId.getOrElse(throw new IllegalStateException("Missing validated target identity"))
           val (refreshId, outcome) =
             completedRefresh.getOrElse(throw new IllegalStateException("Missing completed refresh proof"))
-          Seq(Row("refreshed", hash, sqlIdent(name), tableId, refreshId, outcome))
+          requestId match {
+            case None          => Seq(Row("refreshed", hash, sqlIdent(name), tableId, refreshId, outcome))
+            case Some(request) => Seq(Row("refreshed", hash, sqlIdent(name), tableId, refreshId, outcome, request))
+          }
       }
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach

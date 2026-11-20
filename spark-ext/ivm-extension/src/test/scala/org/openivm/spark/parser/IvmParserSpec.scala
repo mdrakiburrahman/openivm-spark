@@ -373,6 +373,51 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       error.getMessage should include("Identifier has too many parts")
     }
 
+    it("parses v3 request binding without changing the v2 result schema") {
+      val hash    = "0123456789abcdef0123456789abcdef"
+      val request = "0123456789ab4def8abc0123456789ab"
+      val v2 = spark.sessionState.sqlParser
+        .parsePlan(s"REFRESH MATERIALIZED VIEW `db`.`a``b` EXPECT QUERY HASH '$hash' IF EXISTS")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      val v3 = spark.sessionState.sqlParser
+        .parsePlan(s"REFRESH MATERIALIZED VIEW `db`.`a``b` EXPECT QUERY HASH '$hash' IF EXISTS REQUEST ID '$request'")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      v2.requestId shouldBe None
+      v2.output.map(_.name) shouldBe Seq("status", "query_hash", "target", "target_table_id", "refresh_id", "outcome")
+      v3.name shouldBe TableIdentifier("a`b", Some("db"))
+      v3.expectedQueryHash shouldBe Some(hash)
+      v3.requestId shouldBe Some(request)
+      v3.output.map(a => (a.name, a.nullable)) shouldBe Seq(
+        ("status", false),
+        ("query_hash", false),
+        ("target", false),
+        ("target_table_id", true),
+        ("refresh_id", true),
+        ("outcome", true),
+        ("request_id", false)
+      )
+    }
+
+    it("rejects malformed or non-lowercase v3 request bindings") {
+      val hash    = "0123456789abcdef0123456789abcdef"
+      val request = "0123456789ab4def8abc0123456789ab"
+      Seq(
+        s"EXPECT QUERY HASH '$hash' IF EXISTS REQUEST",
+        s"EXPECT QUERY HASH '$hash' IF EXISTS REQUEST ID",
+        s"EXPECT QUERY HASH '$hash' IF EXISTS REQUEST ID 'ABCDEF0123456789abcdef0123456789'",
+        s"EXPECT QUERY HASH '$hash' IF EXISTS REQUEST ID 'short'",
+        s"EXPECT QUERY HASH '$hash' IF EXISTS REQUEST ID '$request' EXTRA",
+        s"EXPECT QUERY HASH '0123456789ABCDEF0123456789abcdef' IF EXISTS REQUEST ID '$request'",
+        s"REQUEST ID '$request'"
+      ).foreach { suffix =>
+        withClue(suffix) {
+          an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(
+            s"REFRESH MATERIALIZED VIEW v $suffix"
+          )
+        }
+      }
+    }
+
     it("preserves EXPECT as a non-reserved identifier") {
       val cmd = spark.sessionState.sqlParser
         .parsePlan("REFRESH MATERIALIZED VIEW expect")
