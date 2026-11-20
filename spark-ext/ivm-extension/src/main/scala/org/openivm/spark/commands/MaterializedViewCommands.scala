@@ -7882,6 +7882,19 @@ case class RefreshMaterializedViewCommand(
         false
     }
 
+  private def windowNetChangeGroupingIsLossless(dataType: org.apache.spark.sql.types.DataType): Boolean = {
+    import org.apache.spark.sql.types._
+
+    // Grouping may normalize signed zero or collation-equivalent strings, even inside containers.
+    dataType match {
+      case BooleanType | ByteType | ShortType | IntegerType | LongType | BinaryType | DateType | TimestampType |
+          TimestampNTZType =>
+        true
+      case _: DecimalType => true
+      case other          => other == StringType
+    }
+  }
+
   private def cdfBatchesHaveNetChanges(
       spark: SparkSession,
       batches: Seq[CdfChangeBatch],
@@ -7906,7 +7919,7 @@ case class RefreshMaterializedViewCommand(
         val names  = projection.map(_._1)
         val signed = spark.table(quoteCol(view.name))
         if (
-          rowFields.isEmpty || !rowFields.forall(field => RowOrdering.isOrderable(field.dataType)) ||
+          rowFields.isEmpty || !rowFields.forall(field => windowNetChangeGroupingIsLossless(field.dataType)) ||
           names.exists(name => names.count(_.equalsIgnoreCase(name)) != 1) ||
           signed.schema.fields.map(field => field.name -> field.dataType).toSeq != projection
         ) true

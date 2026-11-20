@@ -160,6 +160,48 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       }
     }
 
+    it("does not suppress a managed-parent signed-zero change visible through a window projection") {
+      spark.conf.set("spark.openivm.catalogPreservesColumnCase", "true")
+      spark.conf.set("spark.openivm.managedTablesRoot", s"$warehouseDir/Tables")
+      try {
+        val base   = "wspr_zero_base"
+        val parent = "default.wspr_zero_parent"
+        val target = "default.wspr_zero_target"
+        val child  = "default.wspr_zero_child"
+        sql(s"CREATE TABLE $base(id INT, region STRING, item_value DOUBLE) USING DELTA")
+        sql(s"INSERT INTO $base VALUES (1, 'east', CAST('0.0' AS DOUBLE)), (2, 'east', 2D)")
+        sql(s"CREATE MATERIALIZED VIEW $parent AS SELECT DISTINCT id, region, item_value FROM $base")
+        val query = s"SELECT id, region, CAST(item_value AS STRING) AS observed_zero, " +
+          s"ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) AS rn FROM $parent"
+        sql(s"CREATE MATERIALIZED VIEW $target AS $query")
+        val childQuery = s"SELECT id, region, observed_zero, rn FROM $target"
+        sql(s"CREATE MATERIALIZED VIEW $child AS $childQuery")
+        MvProjectionSource.isProjection(spark, parent) shouldBe true
+        val targetId = spark.sessionState.sqlParser.parseTableIdentifier(target)
+        MvCatalog.lookup(spark, targetId).get.refreshType shouldBe RefreshTypeCode.WindowPartition
+        val parentPath = mvDataLocation(parent).replace("`", "``")
+        mvDataVersion(parent) shouldBe 0L
+        sql(s"UPDATE delta.`$parentPath` SET item_value = CAST('-0.0' AS DOUBLE) WHERE id = 1")
+        mvDataVersion(parent) shouldBe 1L
+        val signed = sql(
+          s"SELECT _change_type, CAST(item_value AS STRING) AS v " +
+            s"FROM table_changes_by_path('$parentPath', 1, 1)"
+        ).collect()
+          .map(row => row.getString(0) -> row.getString(1))
+          .toSet
+        signed shouldBe Set("update_preimage" -> "0.0", "update_postimage" -> "-0.0")
+        sql(query).filter("id = 1").select("observed_zero").head().getString(0) shouldBe "-0.0"
+        refreshMv(target)
+        assertMvCorrect(target, query)
+        CdfWatermarkCatalog.get(spark, target, parent) shouldBe Some(1L)
+        refreshMv(child)
+        assertMvCorrect(child, query)
+      } finally {
+        spark.conf.unset("spark.openivm.catalogPreservesColumnCase")
+        spark.conf.unset("spark.openivm.managedTablesRoot")
+      }
+    }
+
     it("does not scan CDF for net-zero detection when the window view has no downstream consumer") {
       sql("CREATE TABLE wspr_terminal_sales(id INT, region STRING, amount INT) USING DELTA")
       sql("INSERT INTO wspr_terminal_sales VALUES (1, 'east', 10), (2, 'east', 20), (3, 'west', 30)")
