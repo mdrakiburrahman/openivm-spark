@@ -14,9 +14,9 @@ private[openivm] object OpenIvmStateBarrier {
   private final class RootState {
     val lock: ReentrantReadWriteLock   = new ReentrantReadWriteLock(true)
     val mutationGeneration: AtomicLong = new AtomicLong(0L)
-    @volatile var trackingEnabled     = false
-    private val mutationMonitor       = new Object
-    private var activeMutations       = 0
+    @volatile var trackingEnabled      = false
+    private val mutationMonitor        = new Object
+    private var activeMutations        = 0
 
     def beginMutation(): Unit = mutationMonitor.synchronized {
       activeMutations += 1
@@ -35,7 +35,7 @@ private[openivm] object OpenIvmStateBarrier {
     def recordMutation(): Unit = mutationMonitor.synchronized { mutationGeneration.incrementAndGet() }
   }
 
-  private val roots = new ConcurrentHashMap[NioPath, RootState]()
+  private val roots                  = new ConcurrentHashMap[NioPath, RootState]()
   private val rootOverrideForTesting = new ThreadLocal[NioPath]()
   @volatile private var stateSyncConfiguredHookForTesting: SparkSession => Boolean = null
 
@@ -152,7 +152,7 @@ private[openivm] object OpenIvmStateBarrier {
       }
 
   private def localPath(value: String): NioPath = {
-    val uri = new Path(value).toUri
+    val uri  = new Path(value).toUri
     val path = if (uri.getScheme == null) Paths.get(value) else Paths.get(uri)
     path.toFile.getCanonicalFile.toPath
   }

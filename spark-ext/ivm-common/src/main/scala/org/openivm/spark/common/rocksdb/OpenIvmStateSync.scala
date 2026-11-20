@@ -72,13 +72,13 @@ object OpenIvmStateSync {
     val requested                   = new AtomicBoolean(false)
     val running                     = new AtomicBoolean(false)
     private val requests            = new ConcurrentLinkedQueue[AsyncRequest]()
-    private val synchronousMonitor      = new Object
-    private val synchronousRequests     = scala.collection.mutable.ArrayBuffer.empty[CompletableFuture[Unit]]
-    private val candidateRequests       = scala.collection.mutable.ArrayBuffer.empty[SynchronousCandidateRequest]
-    private var synchronousRunning      = false
-    private var candidateRunning        = false
-    private var submittedRequests       = 0L
-    private var publishedCoverage       = Option.empty[PublishedCoverage]
+    private val synchronousMonitor  = new Object
+    private val synchronousRequests = scala.collection.mutable.ArrayBuffer.empty[CompletableFuture[Unit]]
+    private val candidateRequests   = scala.collection.mutable.ArrayBuffer.empty[SynchronousCandidateRequest]
+    private var synchronousRunning  = false
+    private var candidateRunning    = false
+    private var submittedRequests   = 0L
+    private var publishedCoverage   = Option.empty[PublishedCoverage]
 
     def synchronousRequestCount: Long = synchronousMonitor.synchronized(submittedRequests)
 
@@ -183,7 +183,7 @@ object OpenIvmStateSync {
 
           if (batch.nonEmpty) {
             var result: CandidatePassResult = null
-            var failure: Throwable           = null
+            var failure: Throwable          = null
             try result = pass()
             catch { case error: Throwable => failure = error }
             synchronousMonitor.synchronized {
@@ -223,7 +223,8 @@ object OpenIvmStateSync {
                   req.completion.complete(())
                 }
               } else if (result.publication.isEmpty) {
-                val error = new java.io.IOException("openivm state-sync: synchronous pass produced no committed publication")
+                val error =
+                  new java.io.IOException("openivm state-sync: synchronous pass produced no committed publication")
                 publishedCoverage = None
                 batch.foreach { req =>
                   recordReceipt(
@@ -242,8 +243,8 @@ object OpenIvmStateSync {
                   req.completion.completeExceptionally(error)
                 }
               } else {
-                val publication = result.publication.get
-                val captured = publication.capturedMutationGeneration
+                val publication        = result.publication.get
+                val captured           = publication.capturedMutationGeneration
                 val proofBatchEligible = batch.forall(_.coverageEligible) && captured.isDefined
                 if (proofBatchEligible)
                   publishedCoverage = Some(PublishedCoverage(publication.generation, captured.get))
@@ -319,17 +320,17 @@ object OpenIvmStateSync {
 
   private val MaxPrunedPerPublish = 25
 
-  private val restoreStates = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
-  private val backupStates  = new ConcurrentHashMap[String, BackupState]()
+  private val restoreStates       = new ConcurrentHashMap[String, CompletableFuture[Unit]]()
+  private val backupStates        = new ConcurrentHashMap[String, BackupState]()
   private val stateSyncRootsByUri = new ConcurrentHashMap[String, ConcurrentHashMap[String, java.lang.Boolean]]()
   private val sharedStateSyncUris = new ConcurrentHashMap[String, java.lang.Boolean]()
-  @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit = null
-  @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String     = null
-  @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
-  @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
-  @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
-  @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
-  @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
+  @volatile private var backupPassHookForTesting: (String, SparkSession, String) => Unit       = null
+  @volatile private var stateSyncKeyHookForTesting: (SparkSession, String) => String           = null
+  @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]             = null
+  @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                        = null
+  @volatile private var beforeCaptureHookForTesting: () => Unit                                = null
+  @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit          = null
+  @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                         = null
   @volatile private var stateSyncRequestReceiptHookForTesting: StateSyncRequestReceipt => Unit = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
@@ -455,7 +456,7 @@ object OpenIvmStateSync {
         afterPublish()
         return
       }
-    val key   = effectiveStateSyncKey(spark, uri)
+    val key = effectiveStateSyncKey(spark, uri)
     registerRootForUri(uri, canonicalLocalRoot(spark))
     val state = backupStateFor(key)
     state.capture(OpenIvmExecutionSpan.captureCurrent(), afterPublish)
@@ -511,10 +512,10 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    val key     = effectiveStateSyncKey(spark, uri)
+    val key               = effectiveStateSyncKey(spark, uri)
     val sharedDestination = registerRootForUri(uri, canonicalLocalRoot(spark))
-    val span    = OpenIvmExecutionSpan.captureCurrent()
-    val started = System.nanoTime()
+    val span              = OpenIvmExecutionSpan.captureCurrent()
+    val started           = System.nanoTime()
     try {
       val state = backupStateFor(key)
       if (!FeatureGate.stateSyncCheckpointEnabled(spark)) {

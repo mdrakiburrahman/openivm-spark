@@ -2,7 +2,13 @@ package org.openivm.spark.common.rocksdb
 
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, OpenIvmGarbageCollector, OpenIvmStatePaths, RefreshProfileCatalog, RefreshProfileRow}
+import org.openivm.spark.common.{
+  FeatureGate,
+  OpenIvmGarbageCollector,
+  OpenIvmStatePaths,
+  RefreshProfileCatalog,
+  RefreshProfileRow
+}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -47,9 +53,10 @@ object OpenIvmStateSyncFreshRestoreProbe {
       Files.createDirectories(evidence.toPath.getParent)
       Files.write(
         evidence.toPath,
-        s"{\"fresh_jvm\":true,\"deleted_absent\":true,\"retained_present\":true,\"profile_row\":\"$refreshId\"}".getBytes(
-          StandardCharsets.UTF_8
-        )
+        s"{\"fresh_jvm\":true,\"deleted_absent\":true,\"retained_present\":true,\"profile_row\":\"$refreshId\"}"
+          .getBytes(
+            StandardCharsets.UTF_8
+          )
       )
     } finally {
       OpenIvmRocksDBRegistry.closeAll()
@@ -162,12 +169,14 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       .sortBy(_.getPath.getName)
       .last
     val input = fs.open(latest.getPath)
-    val text = try Source.fromInputStream(input, "UTF-8").mkString
-    finally input.close()
+    val text =
+      try Source.fromInputStream(input, "UTF-8").mkString
+      finally input.close()
     val lines = text.split("\\n", -1)
     lines.length shouldBe 5
     val generation = lines(1)
-    val archive    = new Path(new Path(new Path(new Path(remoteRoot, ".openivm-state-sync"), "snapshots"), generation), "snapshot.zip")
+    val archive =
+      new Path(new Path(new Path(new Path(remoteRoot, ".openivm-state-sync"), "snapshots"), generation), "snapshot.zip")
     (generation, lines(3), lines(2).toLong, sha256(fs, archive))
   }
 
@@ -197,14 +206,16 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       latest: (String, String, Long, String),
       extra: String
   ): Unit = {
-    val receiptJson = receipts.asScala.map { receipt =>
-      s"{\"request_id\":\"${receipt.requestId}\",\"requested_generation\":${receipt.requestedMutationGeneration}," +
-        s"\"captured_generation\":${receipt.capturedMutationGeneration.map(_.toString).getOrElse("null")}," +
-        s"\"publication_generation\":\"${receipt.publicationGeneration.getOrElse("")}\"," +
-        s"\"published\":${receipt.published},\"reused\":${receipt.reused}," +
-        s"\"coverage_proven\":${receipt.coverageProven},\"acknowledged\":${receipt.acknowledged}," +
-        s"\"outcome\":\"${receipt.outcome}\"}"
-    }.mkString("[", ",", "]")
+    val receiptJson = receipts.asScala
+      .map { receipt =>
+        s"{\"request_id\":\"${receipt.requestId}\",\"requested_generation\":${receipt.requestedMutationGeneration}," +
+          s"\"captured_generation\":${receipt.capturedMutationGeneration.map(_.toString).getOrElse("null")}," +
+          s"\"publication_generation\":\"${receipt.publicationGeneration.getOrElse("")}\"," +
+          s"\"published\":${receipt.published},\"reused\":${receipt.reused}," +
+          s"\"coverage_proven\":${receipt.coverageProven},\"acknowledged\":${receipt.acknowledged}," +
+          s"\"outcome\":\"${receipt.outcome}\"}"
+      }
+      .mkString("[", ",", "]")
     val output = new File(repoRoot, s".logs/checkpoint-only-canary/$fixture.json")
     Files.createDirectories(output.toPath.getParent)
     val json =
@@ -226,7 +237,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
     val jvmArgs = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
     val childWarehouse = newDir("fresh-child-warehouse")
-    val logFile = new File(childWarehouse, "fresh-restore.log")
+    val logFile        = new File(childWarehouse, "fresh-restore.log")
     val process = new ProcessBuilder(
       (Seq(javaHome) ++ jvmArgs ++ Seq(
         "-cp",
@@ -246,8 +257,9 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
     process.waitFor(180, TimeUnit.SECONDS) shouldBe true
     if (process.exitValue() != 0) {
       val input = Source.fromFile(logFile)
-      val output = try input.mkString
-      finally input.close()
+      val output =
+        try input.mkString
+        finally input.close()
       fail(s"Fresh restore JVM exited ${process.exitValue()}:\n$output")
     }
     evidenceFile.isFile shouldBe true
@@ -258,14 +270,14 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val fixtureRoot = newDir("partial-sweep")
       val remote      = new File(fixtureRoot, "remote")
       remote.mkdirs()
-      val spark = newSpark("checkpoint-partial-sweep", remote)
+      val spark     = newSpark("checkpoint-partial-sweep", remote)
       val warehouse = new File(org.openivm.spark.common.FeatureGate.stateWarehouse(spark))
       val refreshId = s"profile-only-${UUID.randomUUID()}"
       recordProfile(spark, refreshId)
 
-      val triggerRoot = new File(warehouse, "_openivm/triggers")
-      val firstTrigger = new File(triggerRoot, "db-a/operation-a/marker")
-      val secondTrigger = new File(triggerRoot, "db-b/operation-b/marker")
+      val triggerRoot     = new File(warehouse, "_openivm/triggers")
+      val firstTrigger    = new File(triggerRoot, "db-a/operation-a/marker")
+      val secondTrigger   = new File(triggerRoot, "db-b/operation-b/marker")
       val currentVersions = org.openivm.spark.common.MvCatalog.list(spark).map(_.version)
       currentVersions shouldBe empty
       firstTrigger.getParentFile.mkdirs()
@@ -282,14 +294,19 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       Files.write(cleanupMarker.toPath, Array[Byte](9))
       cleanupMarker.setLastModified(System.currentTimeMillis() + 60000L)
       var cleanupCallbackRan = false
-      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("injected commit failure"))
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() =>
+        throw new java.io.IOException("injected commit failure")
+      )
       setRequestId(spark, "failed-before-cleanup")
       intercept[java.io.IOException] {
-        OpenIvmStateSync.backupForCommand(spark, () => {
-          cleanupCallbackRan = true
-          Files.deleteIfExists(cleanupMarker.toPath)
-          ()
-        })
+        OpenIvmStateSync.backupForCommand(
+          spark,
+          () => {
+            cleanupCallbackRan = true
+            Files.deleteIfExists(cleanupMarker.toPath)
+            ()
+          }
+        )
       }
       cleanupCallbackRan shouldBe false
       cleanupMarker.isFile shouldBe true
@@ -315,7 +332,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val deletedFile = new File(deletedPath.get(), "marker")
       deletedFile.isFile shouldBe false
       val deletedDir = new File(deletedPath.get()).toPath
-      val remaining = Seq(firstTrigger, secondTrigger).find(file => file.getParentFile.toPath != deletedDir)
+      val remaining  = Seq(firstTrigger, secondTrigger).find(file => file.getParentFile.toPath != deletedDir)
       remaining.isDefined shouldBe true
       remaining.get.isFile shouldBe true
 
@@ -334,9 +351,11 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       latest._2 shouldBe latest._4
       latest._3 should be > 0L
       val childEvidence = new File(fixtureRoot, "fresh-child.json")
-      val deletedRelative = new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedPath.get()).toPath)
-      val retainedRelative = new File(warehouse, "_openivm/triggers").toPath.relativize(remaining.get().getParentFile.toPath)
-      val deletedRel = s"triggers/${deletedRelative.toString}/marker"
+      val deletedRelative =
+        new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedPath.get()).toPath)
+      val retainedRelative =
+        new File(warehouse, "_openivm/triggers").toPath.relativize(remaining.get().getParentFile.toPath)
+      val deletedRel  = s"triggers/${deletedRelative.toString}/marker"
       val retainedRel = s"triggers/${retainedRelative.toString}/marker"
       org.openivm.spark.common.MvCatalog.list(spark).map(_.version) shouldBe currentVersions
       stopSpark(spark)
@@ -357,8 +376,8 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val fixtureRoot = newDir("shared-destination")
       val remote      = new File(fixtureRoot, "remote")
       remote.mkdirs()
-      val stateA      = new File(fixtureRoot, "state-a")
-      val stateB      = new File(fixtureRoot, "state-b")
+      val stateA = new File(fixtureRoot, "state-a")
+      val stateB = new File(fixtureRoot, "state-b")
       stateA.mkdirs()
       stateB.mkdirs()
 
@@ -383,7 +402,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       stopSpark(a1)
 
       val sentinelDbPath = new File(stateB, "_openivm/sentinel/rocksdb").getAbsolutePath
-      val sentinelDb = new OpenIvmRocksDB(sentinelDbPath, OpenIvmRocksDBConf.default, Seq("meta"))
+      val sentinelDb     = new OpenIvmRocksDB(sentinelDbPath, OpenIvmRocksDBConf.default, Seq("meta"))
       sentinelDb.load()
       sentinelDb.withBatch { batch =>
         sentinelDb.put(batch, "meta", RocksDBCodec.utf8("state-b"), RocksDBCodec.utf8("local"))

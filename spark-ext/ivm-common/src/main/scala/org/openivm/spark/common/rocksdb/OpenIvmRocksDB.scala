@@ -1097,13 +1097,13 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def cleanup(minVersionsToRetain: Int): Unit = OpenIvmStateBarrier.withDbMutation(normalizedDbPath) {
     withWriteLock {
       if (closed) return
-    require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
-    def body(): Unit = {
-      val threshold = readCurrentVersion() - minVersionsToRetain
-      manifestVersions.filter(_ < threshold).foreach { version =>
-        Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+      require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
+      def body(): Unit = {
+        val threshold = readCurrentVersion() - minVersionsToRetain
+        manifestVersions.filter(_ < threshold).foreach { version =>
+          Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+        }
       }
-    }
       if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
     }
   }
