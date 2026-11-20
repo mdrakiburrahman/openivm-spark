@@ -355,7 +355,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       latest._3 should be > 0L
       val childEvidence = new File(fixtureRoot, "fresh-child.json")
       val deletedRelative =
-        new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedPath.get()).toPath)
+        new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedDirectory).toPath)
       val retainedRelative =
         new File(warehouse, "_openivm/triggers").toPath.relativize(remaining.get.getParentFile.toPath)
       val deletedRel  = s"triggers/${deletedRelative.toString}/marker"
