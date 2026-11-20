@@ -6594,7 +6594,8 @@ case class RefreshMaterializedViewCommand(
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
                 sourceSnapshotRelations = snapshotRelations,
                 lineageCapture =
-                  if (profile.isActive) Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
+                  if (profile.isActive || FeatureGate.generatedActionOwnershipEnabled(spark))
+                    Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
                   else None,
                 lineagePostProcessRules =
                   if (profile.isActive)
@@ -6781,6 +6782,10 @@ case class RefreshMaterializedViewCommand(
                 else lineageDetail(sourceIndex, sql)
               val sqlBytes = sql.length
               val qOrder   = qlogOrder.getAndIncrement()
+              val ownership =
+                if (lineage.nonEmpty && !fullDomainCdfMerge && FeatureGate.generatedActionOwnershipEnabled(spark))
+                  Some(s"refresh_id=$refreshId;action_id=$qOrder:0:statement;attempt=0;credit_ns=0$lineage")
+                else None
               profile.timeStep(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
@@ -6794,8 +6799,9 @@ case class RefreshMaterializedViewCommand(
                         s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
                         s"$origin;credit_ns=0$lineage"
                     ) {
-                      val result = spark.sql(sql)
-                      result -> result.collect()
+                      val result = GeneratedActionOwnership.withBoundary(spark, ownership, "sql")(spark.sql(sql))
+                      val rows = GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
+                      result -> rows
                     }
                     recordPlanMetrics(df, kind)
                     val ms = (System.nanoTime() - t0) / 1000000L

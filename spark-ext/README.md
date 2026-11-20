@@ -1,5 +1,16 @@
 # Spark extension
 
+## Generated action diagnostics
+
+`spark.openivm.refresh.generatedActionOwnership.enabled=true` adds
+`openivm.generated.action` to Spark job properties within supported generated
+SQL dispatches. Join by `refresh_id` and `action_id`; `boundary=sql` is the
+potentially eager SQL call and `boundary=collect` is the result action.
+Compiler/source and execution digests identify the statement, not its stages.
+Nested Delta log/state jobs may inherit this property, and deferred work on
+other threads may lack it. Helpers without a proven source mapping are
+untagged. This diagnostic is off by default and assigns no execution-time credit.
+
 ## Experimental global-window cascades
 
 `spark.openivm.refresh.globalWindowCdfMerge.enabled` is opt-in and defaults to

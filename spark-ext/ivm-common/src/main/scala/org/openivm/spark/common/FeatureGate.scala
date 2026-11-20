@@ -192,6 +192,11 @@ object FeatureGate {
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
 
+  val GeneratedActionOwnershipKey: String = "spark.openivm.refresh.generatedActionOwnership.enabled"
+
+  def generatedActionOwnershipEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, GeneratedActionOwnershipKey, default = false)
+
   /** Cache raw openivm compile/classification results per verified compiler
     * generation, complete request identity, MV schema and structural facts.
     * Default OFF while the compile cache is validated; when enabled, REFRESH still rewrites
