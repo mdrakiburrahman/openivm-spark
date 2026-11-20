@@ -888,6 +888,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       executor = Executors.newFixedThreadPool(3)
       sparkVersion = spark.version
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remote.toURI.toString))
 
       val metadata = MvMetadata(
         name = mvIdentifier,
@@ -1123,6 +1124,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
       OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
       OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
+      OpenIvmStateSync.setStateSyncUriHookForTesting(null)
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
       OpenIvmStateSync.resetForTesting()
       if (executor != null) {
