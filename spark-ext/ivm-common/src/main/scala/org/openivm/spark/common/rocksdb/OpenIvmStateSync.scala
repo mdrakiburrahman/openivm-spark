@@ -48,10 +48,17 @@ object OpenIvmStateSync {
       reused: Boolean,
       coverageProven: Boolean,
       acknowledged: Boolean,
-      outcome: String
+      outcome: String,
+      archiveSha256: Option[String] = None,
+      archiveBytes: Option[Long] = None
   )
 
-  private final case class SnapshotPublication(generation: String, capturedMutationGeneration: Option[Long])
+  private final case class SnapshotPublication(
+      generation: String,
+      capturedMutationGeneration: Option[Long],
+      archiveSha256: String,
+      archiveBytes: Long
+  )
 
   private final case class SynchronousCandidateRequest(
       requestId: String,
@@ -60,7 +67,12 @@ object OpenIvmStateSync {
       completion: CompletableFuture[Unit]
   )
 
-  private final case class PublishedCoverage(generation: String, capturedMutationGeneration: Long)
+  private final case class PublishedCoverage(
+      generation: String,
+      capturedMutationGeneration: Long,
+      archiveSha256: String,
+      archiveBytes: Long
+  )
 
   private final case class CandidatePassResult(
       publication: Option[SnapshotPublication],
@@ -166,7 +178,9 @@ object OpenIvmStateSync {
                       reused = true,
                       coverageProven = true,
                       acknowledged = true,
-                      outcome = "reused_committed_coverage"
+                      outcome = "reused_committed_coverage",
+                      archiveSha256 = Some(coverage.archiveSha256),
+                      archiveBytes = Some(coverage.archiveBytes)
                     )
                   )
                   req.completion.complete(())
@@ -247,7 +261,14 @@ object OpenIvmStateSync {
                 val captured           = publication.capturedMutationGeneration
                 val proofBatchEligible = batch.forall(_.coverageEligible) && captured.isDefined
                 if (proofBatchEligible)
-                  publishedCoverage = Some(PublishedCoverage(publication.generation, captured.get))
+                  publishedCoverage = Some(
+                    PublishedCoverage(
+                      publication.generation,
+                      captured.get,
+                      publication.archiveSha256,
+                      publication.archiveBytes
+                    )
+                  )
                 else publishedCoverage = None
                 val (covered, uncovered) = batch.partition { req =>
                   if (!req.coverageEligible) true
@@ -265,7 +286,9 @@ object OpenIvmStateSync {
                       reused = false,
                       coverageProven = proof,
                       acknowledged = true,
-                      outcome = if (proof) "published_covered_generation" else "published_fresh_fallback"
+                      outcome = if (proof) "published_covered_generation" else "published_fresh_fallback",
+                      archiveSha256 = Some(publication.archiveSha256),
+                      archiveBytes = Some(publication.archiveBytes)
                     )
                   )
                   req.completion.complete(())
@@ -281,7 +304,9 @@ object OpenIvmStateSync {
                       reused = false,
                       coverageProven = false,
                       acknowledged = false,
-                      outcome = "later_generation_requires_new_publication"
+                      outcome = "later_generation_requires_new_publication",
+                      archiveSha256 = Some(publication.archiveSha256),
+                      archiveBytes = Some(publication.archiveBytes)
                     )
                   )
                 }
@@ -380,6 +405,8 @@ object OpenIvmStateSync {
         s"captured_generation=${receipt.capturedMutationGeneration.getOrElse("none")} " +
         s"publication_generation=${receipt.publicationGeneration.getOrElse("none")} " +
         s"published=${receipt.published} reused=${receipt.reused} " +
+        s"archive_sha256=${receipt.archiveSha256.getOrElse("none")} " +
+        s"archive_bytes=${receipt.archiveBytes.getOrElse(0L)} " +
         s"coverage_proven=${receipt.coverageProven} acknowledged=${receipt.acknowledged} " +
         s"outcome=${receipt.outcome}"
     )
@@ -707,7 +734,7 @@ object OpenIvmStateSync {
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
       pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
-      Some(SnapshotPublication(generation, capturedMutationGeneration))
+      Some(SnapshotPublication(generation, capturedMutationGeneration, checksum, archiveBytes))
     } finally {
       try Files.deleteIfExists(archive.toPath)
       finally deleteStagedTree(capture)

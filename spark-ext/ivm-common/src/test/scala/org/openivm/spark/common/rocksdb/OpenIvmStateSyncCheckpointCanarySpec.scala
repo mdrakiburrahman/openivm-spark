@@ -213,6 +213,8 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
           s"\"captured_generation\":${receipt.capturedMutationGeneration.map(_.toString).getOrElse("null")}," +
           s"\"publication_generation\":\"${receipt.publicationGeneration.getOrElse("")}\"," +
           s"\"published\":${receipt.published},\"reused\":${receipt.reused}," +
+          s"\"archive_sha256\":\"${receipt.archiveSha256.getOrElse("")}\"," +
+          s"\"archive_bytes\":${receipt.archiveBytes.getOrElse(0L)}," +
           s"\"coverage_proven\":${receipt.coverageProven},\"acknowledged\":${receipt.acknowledged}," +
           s"\"outcome\":\"${receipt.outcome}\"}"
       }
@@ -353,7 +355,9 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       latest._1 shouldBe afterCleanup.publicationGeneration.get
       latest._2 shouldBe latest._4
       latest._3 should be > 0L
-      val childEvidence = new File(fixtureRoot, "fresh-child.json")
+      afterCleanup.archiveSha256 shouldBe Some(latest._2)
+      afterCleanup.archiveBytes shouldBe Some(latest._3)
+      val childEvidence = new File(repoRoot, ".logs/checkpoint-only-canary/partial-trigger-cleanup-fresh-jvm.json")
       val deletedRelative =
         new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedDirectory).toPath)
       val retainedRelative =
@@ -402,6 +406,8 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       noChange.reused shouldBe true
       noChange.coverageProven shouldBe true
       noChange.publicationGeneration shouldBe first.publicationGeneration
+      noChange.archiveSha256 shouldBe first.archiveSha256
+      noChange.archiveBytes shouldBe first.archiveBytes
       stopSpark(a1)
 
       val sentinelDbPath = new File(stateB, "_openivm/sentinel/rocksdb").getAbsolutePath
@@ -453,7 +459,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       third.reused shouldBe false
       third.acknowledged shouldBe true
       third.publicationGeneration should not be second.publicationGeneration
-      commitDetails(a2, remote.toURI.toString)._1 shouldBe third.publicationGeneration.get
+      val latest = commitDetails(a2, remote.toURI.toString)
+      latest._1 shouldBe third.publicationGeneration.get
+      third.archiveSha256 shouldBe Some(latest._2)
+      third.archiveBytes shouldBe Some(latest._3)
       val publishedIds = receipts.asScala.filter(receipt =>
         receipt.requestId == "root-a-before" || receipt.requestId == "root-a-no-change" ||
           receipt.requestId == "root-b-only" || receipt.requestId == "root-a-after-sharing"
@@ -465,7 +474,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       writeReceiptEvidence(
         "shared-state-roots",
         Seq("root-a-before", "root-a-no-change", "root-b-only", "root-a-after-sharing"),
-        commitDetails(a2, remote.toURI.toString),
+        latest,
         "\"distinct_roots\":2,\"shared_destination_fallback\":true," +
           "\"cross_root_reuse\":false,\"same_root_no_change_reuse\":true"
       )
