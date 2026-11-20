@@ -272,7 +272,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val remote      = new File(fixtureRoot, "remote")
       remote.mkdirs()
       val spark     = newSpark("checkpoint-partial-sweep", remote)
-      val warehouse = new File(org.openivm.spark.common.FeatureGate.stateWarehouse(spark))
+      val warehouse = OpenIvmStatePaths.warehouseRoot(spark).toFile
       val refreshId = s"profile-only-${UUID.randomUUID()}"
       recordProfile(spark, refreshId)
 
