@@ -6800,7 +6800,7 @@ case class RefreshMaterializedViewCommand(
                         s"$origin;credit_ns=0$lineage"
                     ) {
                       val result = GeneratedActionOwnership.withBoundary(spark, ownership, "sql")(spark.sql(sql))
-                      val rows = GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
+                      val rows   = GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
                       result -> rows
                     }
                     recordPlanMetrics(df, kind)

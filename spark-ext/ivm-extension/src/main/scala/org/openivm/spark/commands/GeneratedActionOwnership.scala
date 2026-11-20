@@ -10,7 +10,7 @@ private[commands] object GeneratedActionOwnership {
     owner match {
       case None => run
       case Some(value) =>
-        val context = spark.sparkContext
+        val context  = spark.sparkContext
         val previous = context.getLocalProperty(Property)
         context.setLocalProperty(Property, s"$value;boundary=$boundary")
         try run
