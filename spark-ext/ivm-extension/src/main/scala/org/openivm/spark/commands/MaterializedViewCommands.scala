@@ -6435,7 +6435,11 @@ case class RefreshMaterializedViewCommand(
                 },
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
-                sourceSnapshotRelations = snapshotRelations
+                sourceSnapshotRelations = snapshotRelations,
+                foldCountedDistinct = FeatureGate.countedDistinctStageFoldEnabled(spark) &&
+                  meta.refreshType == RefreshTypeCode.AggregateGroup &&
+                  propagation.requiresMvCdf && !propagation.requiresDmlInterception &&
+                  preparedSourceAdvance.isEmpty
               )
             }
           }

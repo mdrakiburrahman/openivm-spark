@@ -563,7 +563,8 @@ object SparkRefreshRewriter {
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None,
-      sourceSnapshotRelations: Map[String, String] = Map.empty
+      sourceSnapshotRelations: Map[String, String] = Map.empty,
+      foldCountedDistinct: Boolean = false
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -707,12 +708,68 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      RewrittenRefresh(withSemiJoinRewrite.map(postProcess))
+      val ready = withSemiJoinRewrite.map(postProcess)
+      if (foldCountedDistinct && ready.size >= 3)
+        foldCountedDistinctPair(ready.head, ready(1), mvName, viewDeltaPath) match {
+          case Some(folded) => RewrittenRefresh(folded +: ready.drop(2))
+          case None => RewrittenRefresh(ready)
+        }
+      else RewrittenRefresh(ready)
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
       activePinnedPaths.set(priorPaths)
     }
+  }
+
+  private[common] def foldCountedDistinctPair(
+      create: String,
+      insert: String,
+      backing: TableIdentifier,
+      stagePath: String
+  ): Option[String] = {
+    // Match the exact pinned compiler shape after the ordinary Spark translation. Do not
+    // change the staged bag into a public DISTINCT delta: the producer MERGE reads this bag.
+    val ident = "[a-z][a-z0-9_]{0,62}"
+    if (stagePath.isEmpty || stagePath.exists(c => c == '`' || c.isWhitespace) ||
+        !(backing.catalog.toSeq ++ backing.database.toSeq :+ backing.table).forall(_.matches(ident)))
+      return None
+    val stage = s"delta.`$stagePath`"
+    val header = s"CREATE OR REPLACE TABLE $stage USING DELTA AS"
+    if (!create.startsWith(header + " ") && !create.startsWith(header + "\n")) return None
+    val body = create.substring(header.length).trim
+    if (!body.startsWith("WITH t0_scan ") || body.length > 65536 || insert.length > 8192) return None
+
+    val table = backtickMvName(backing)
+    val count = "openivm_distinct_count"
+    val mult = "openivm_multiplicity"
+    val start = s"INSERT INTO $stage ("
+    val companion = insert.trim.replaceAll("\\s+", " ")
+    if (!companion.startsWith(start)) return None
+    val endColumns = companion.indexOf(')', start.length)
+    if (endColumns < 0) return None
+    val keys = companion.substring(start.length, endColumns).split(", ", -1).toSeq.dropRight(2)
+    if (keys.isEmpty || keys.size > 32 || keys.distinct.size != keys.size ||
+        keys.exists(k => !k.matches(ident) || k.startsWith("openivm_")))
+      return None
+
+    val columns = (keys ++ Seq(count, mult)).mkString(", ")
+    val assignments = keys.map(k => s"d.$k <=> m.$k").mkString(" AND ")
+    val dKeys = keys.map(k => s"d.$k").mkString(", ")
+    val membership = s"EXISTS (SELECT 1 FROM $table m WHERE $assignments)"
+    val exact = s"$start$columns) SELECT $dKeys, NULL, -1 FROM $stage d WHERE d.$mult > 0 AND $membership"
+    if (companion != exact) return None
+
+    val keyProjection = keys.map(k => s"${ident} AS $k").mkString(", ")
+    val projection = s"(?s).*\\)\\s+SELECT $keyProjection, $count AS $count, $ident AS $mult FROM t[0-9]+_projection"
+    if (!body.replaceAll("\\s+", " ").matches(projection)) return None
+    Some(s"""$header
+       |WITH ov_distinct_stage AS ($body),
+       |ov_distinct_flag AS (SELECT d.*, $membership AS ov_distinct_present FROM ov_distinct_stage d)
+       |SELECT $dKeys, CASE WHEN e.i = 0 THEN d.$count END AS $count,
+       |       CASE WHEN e.i = 0 THEN d.$mult ELSE -1 END AS $mult
+       |FROM ov_distinct_flag d JOIN (SELECT 0 AS i UNION ALL SELECT 1 AS i) e
+       |ON e.i = 0 OR (d.$mult > 0 AND d.ov_distinct_present)""".stripMargin)
   }
 
   // ── Statement classification ─────────────────────────────────────────────

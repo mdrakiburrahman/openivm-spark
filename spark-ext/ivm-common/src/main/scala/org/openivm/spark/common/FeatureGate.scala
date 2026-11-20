@@ -408,6 +408,9 @@ object FeatureGate {
   val WindowPartitionSingleDeleteMergeEnabledKey: String =
     "spark.openivm.refresh.windowPartitionSingleDeleteMerge.enabled"
 
+  val CountedDistinctStageFoldEnabledKey: String =
+    "spark.openivm.refresh.countedDistinctStageFold.enabled"
+
   /** Liquid-cluster eligible WINDOW_PARTITION MV data tables by their resolved
     * window PARTITION BY columns at CREATE time. Default OFF so the storage
     * layout change is opt-in and reversible.
@@ -750,6 +753,9 @@ object FeatureGate {
 
   def windowPartitionSingleDeleteMergeEnabled(spark: SparkSession): Boolean =
     windowPartitionSingleDeleteMergeEnabled(spark.sparkContext.getConf)
+
+  def countedDistinctStageFoldEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, CountedDistinctStageFoldEnabledKey, default = false)
 
   def windowClusterPruneEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowClusterPruneEnabledKey, default = false)
