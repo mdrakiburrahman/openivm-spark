@@ -8,7 +8,10 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class CountedDistinctCascadeCdfSpec extends IvmParitySpecBase("counted-distinct-cascade") with CdfMode {
   override protected def extraSparkConf: Map[String, String] =
-    Map(FeatureGate.QueryLogEnabledKey -> "true")
+    Map(
+      FeatureGate.QueryLogEnabledKey -> "true",
+      FeatureGate.CountedDistinctStageFoldEnabledKey -> sys.env.contains("COUNTED_DISTINCT_TEST_FOLD").toString
+    )
 
   it("feeds a grouped child from a counted DISTINCT parent's physical CDF") {
     sys.env.get("COUNTED_DISTINCT_REPLAY_PHASE") match {
