@@ -17,7 +17,11 @@ import org.openivm.spark.common.{
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
 class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-witness") with InterceptMode {
-  private val evidence = Paths.get("/workspaces/openivm-spark/.logs/generated-action-witness")
+  private val evidence = sys.env
+    .get("OPENIVM_WITNESS_DIR")
+    .map(Paths.get(_))
+    .getOrElse(Paths.get("target", "generated-action-witness-evidence"))
+    .toAbsolutePath
   Files.createDirectories(evidence.resolve("events"))
 
   override protected def extraSparkConf: Map[String, String] = Map(
