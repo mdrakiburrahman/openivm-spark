@@ -146,6 +146,7 @@ object OpenIvmStateSync {
   @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
   @volatile private var beforeSynchronousDrainHookForTesting: () => Unit                 = null
   @volatile private var duringCaptureHookForTesting: () => Unit                          = null
+  @volatile private var afterFirstDatabaseCheckpointHookForTesting: () => Unit           = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
 
@@ -650,12 +651,14 @@ object OpenIvmStateSync {
         OpenIvmStateBarrier.withCapture(spark) {
           trace.endPhase(barrierStarted, "success")
           barrierAcquired = true
+          val captureHook = duringCaptureHookForTesting
+          if (captureHook != null) captureHook()
           val captured = trace.measure("spark.backup.capture", "durability") {
             OpenIvmSnapshotArchive.checkInterrupted()
-            val captureHook        = duringCaptureHookForTesting
-            var captureHookInvoked = false
-            val localBase          = local.toPath
-            val files              = backupFiles(local)
+            val afterFirstDatabaseCheckpointHook = afterFirstDatabaseCheckpointHookForTesting
+            var checkpointHookInvoked            = false
+            val localBase                        = local.toPath
+            val files                            = backupFiles(local)
             val databases = files
               .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
               .map(_.getParentFile.toPath)
@@ -665,9 +668,9 @@ object OpenIvmStateSync {
               val target = capture.toPath.resolve(localBase.relativize(db))
               Files.createDirectories(target.getParent)
               OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
-              if (!captureHookInvoked && captureHook != null) {
-                captureHookInvoked = true
-                captureHook()
+              if (!checkpointHookInvoked && afterFirstDatabaseCheckpointHook != null) {
+                checkpointHookInvoked = true
+                afterFirstDatabaseCheckpointHook()
               }
             }
             files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
@@ -841,6 +844,9 @@ object OpenIvmStateSync {
   private[rocksdb] def setDuringCaptureHookForTesting(hook: () => Unit): Unit =
     duringCaptureHookForTesting = hook
 
+  private[rocksdb] def setAfterFirstDatabaseCheckpointHookForTesting(hook: () => Unit): Unit =
+    afterFirstDatabaseCheckpointHookForTesting = hook
+
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
 
@@ -963,6 +969,7 @@ object OpenIvmStateSync {
     beforeCaptureHookForTesting = null
     beforeSynchronousDrainHookForTesting = null
     duringCaptureHookForTesting = null
+    afterFirstDatabaseCheckpointHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
     OpenIvmExecutionSpan.resetStateSyncForTesting()
