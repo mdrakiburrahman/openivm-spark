@@ -22,7 +22,6 @@ import java.util.concurrent.{
   TimeUnit
 }
 import java.util.zip.ZipFile
-import scala.collection.JavaConverters._
 
 private[rocksdb] object StateSyncSingleDestinationExperimentSpec {
   final case class Context(label: String, scale: Int, local: File, remote: File)
@@ -58,6 +57,13 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
 
   private def await(latch: CountDownLatch): Unit =
     if (!latch.await(120, TimeUnit.SECONDS)) throw new IllegalStateException("single-destination experiment timed out")
+
+  private def toVector[A](values: java.util.Collection[A]): Vector[A] = {
+    val builder  = Vector.newBuilder[A]
+    val iterator = values.iterator()
+    while (iterator.hasNext) builder += iterator.next()
+    builder.result()
+  }
 
   private def deleteTree(file: File): Unit =
     if (file.exists()) {
@@ -383,12 +389,12 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         mixedResults.foreach(_.outcome shouldBe "success")
         OpenIvmStateSync.setDuringCaptureHookForTesting(null)
 
-        val beforeNoChangePublications = evidence.asScala.toVector.drop(eventStart).flatMap(_.publications).size
+        val beforeNoChangePublications = toVector(evidence).drop(eventStart).flatMap(_.publications).size
         val noChangeFutures            = startCohort(spark, executor, context, "no_change", 16)
         val noChangeResults            = awaitResults(noChangeFutures)
         calls ++= noChangeResults
         noChangeResults.foreach(_.outcome shouldBe "success")
-        val afterNoChangePublications = evidence.asScala.toVector.drop(eventStart).flatMap(_.publications).size
+        val afterNoChangePublications = toVector(evidence).drop(eventStart).flatMap(_.publications).size
         val noChangeNewPublications   = afterNoChangePublications - beforeNoChangePublications
         if (variant == "candidate") noChangeNewPublications shouldBe 0
 
@@ -426,11 +432,11 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         calls += retry
         retry.outcome shouldBe "success"
         OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
-        val retryRequest = matchingRequest(evidence.asScala.toVector.drop(eventStart), retry.requestId)
+        val retryRequest = matchingRequest(toVector(evidence).drop(eventStart), retry.requestId)
         assertDurablyCovered(retryRequest, retry)
         commitFiles(remote).size should be <= 2
 
-        val runEvidence  = evidence.asScala.toVector.drop(eventStart)
+        val runEvidence  = toVector(evidence).drop(eventStart)
         val publications = runEvidence.flatMap(_.publications)
         publications.foreach { publication =>
           publication.counts.getOrElse("captured_databases", None) shouldBe Some(scale.toLong)
@@ -509,7 +515,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
 
         val latestCommit     = commitFiles(remote).last
         val latestGeneration = generation(latestCommit)
-        val markerLines      = Files.readAllLines(latestCommit.toPath, StandardCharsets.UTF_8).asScala
+        val markerLines      = toVector(Files.readAllLines(latestCommit.toPath, StandardCharsets.UTF_8))
         markerLines.head shouldBe "OPENIVM_STATE_SNAPSHOT_V2"
         val latestArchive = archive(remote, latestGeneration)
         latestArchive.isFile shouldBe true
