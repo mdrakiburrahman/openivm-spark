@@ -14,6 +14,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.lang.management.ManagementFactory
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.jdk.CollectionConverters._
 
@@ -22,6 +23,7 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   private var spark: SparkSession = _
   private val warehouse           = new File(s"target/test-warehouse-gc-${UUID.randomUUID().toString.take(8)}")
   private val DayMs               = 24L * 60L * 60L * 1000L
+  private val GcScanTiming        = new org.scalatest.Tag("org.openivm.spark.commands.GcScanTiming")
 
   override def beforeAll(): Unit = {
     spark = SparkSession
@@ -43,11 +45,50 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   }
 
   override def afterAll(): Unit = {
+    OpenIvmStateSync.setBackupPassHookForTesting(null)
+    OpenIvmStateSync.setStateSyncUriHookForTesting(null)
     if (spark != null) spark.stop()
     if (warehouse.exists()) {
       val paths = Files.walk(warehouse.toPath)
       try paths.iterator().asScala.toSeq.reverse.foreach(Files.delete)
       finally paths.close()
+    }
+  }
+
+  private def runRecoveryInSecondJvm(
+      stateUri: String,
+      warehousePath: String,
+      statePath: String,
+      tombstonePath: String,
+      livePaths: Seq[String]
+  ): Unit = {
+    val java = new File(System.getProperty("java.home"), "bin/java").getAbsolutePath
+    val moduleArgs = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala.filter { arg =>
+      arg.startsWith("--add-opens=") || arg.startsWith("--add-exports=")
+    }
+    val command = Seq(java, "-Xmx2g") ++ moduleArgs ++ Seq(
+      "-cp",
+      System.getProperty("java.class.path"),
+      "org.openivm.spark.commands.StagingGarbageCollectionRecoveryChild",
+      stateUri,
+      warehousePath,
+      statePath,
+      tombstonePath
+    ) ++ livePaths
+    val log = new File(warehouse, s"gc-recovery-child-${UUID.randomUUID().toString.take(8)}.log")
+    val process = new ProcessBuilder(command: _*)
+      .directory(new File(System.getProperty("user.dir")))
+      .redirectErrorStream(true)
+      .redirectOutput(log)
+      .start()
+    val completed = process.waitFor(240, TimeUnit.SECONDS)
+    if (!completed) {
+      process.destroyForcibly()
+      fail(s"second JVM did not finish; see ${log.getAbsolutePath}")
+    }
+    val output = if (log.exists()) new String(Files.readAllBytes(log.toPath), StandardCharsets.UTF_8) else ""
+    withClue(s"second JVM exit=${process.exitValue()} output:\n$output") {
+      process.exitValue() shouldBe 0
     }
   }
 
@@ -66,7 +107,7 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   }
 
   describe("staging garbage collection") {
-    it("skips cached empty inventories when a refresh sweep is not due") {
+    it("skips cached empty inventories when a refresh sweep is not due", GcScanTiming) {
       val source = s"default.gc_scan_${UUID.randomUUID().toString.replace('-', '_')}"
       val path   = s"${warehouse.getAbsolutePath}/_ivm/staging/${source.replace('.', '_')}/INSERT/${UUID.randomUUID()}"
       StagingCatalog.record(
@@ -249,7 +290,7 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       expired.exists() shouldBe false
       current.exists() shouldBe true
     }
-    it("preserves tombstones across failed publication and cleans them after fresh-session restore") {
+    it("recovers acknowledged pending garbage in a second JVM and cleans only eligible paths") {
       val source = s"default.gc_retry_${UUID.randomUUID().toString.replace('-', '_')}"
       val stagingPath = new File(
         warehouse,
@@ -269,65 +310,137 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       )
       StagingCatalog.pruneUnconsumed(spark, source)
       StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
-      val remote = new File(warehouse, s"state-sync-gc-retry-${UUID.randomUUID()}")
-      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+
+      val liveSuffix = UUID.randomUUID().toString.replace('-', '_')
+      val liveSource = s"gc_cross_live_$liveSuffix"
+      spark.sql(s"CREATE TABLE $liveSource (id INT) USING delta")
+      spark.sql(s"CREATE MATERIALIZED VIEW ${liveSource}_mv AS SELECT id FROM $liveSource")
+      spark.sql(s"INSERT INTO $liveSource VALUES (1)")
+      val livePaths = stagedPaths(liveSource)
+      livePaths should not be empty
+      all(livePaths.map(localPath(_).exists())) shouldBe true
+
+      val remote         = new File(warehouse, s"state-sync-gc-retry-${UUID.randomUUID()}")
+      val recoveredState = new File(warehouse, s"_recovered_openivm_${UUID.randomUUID().toString.take(8)}")
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remote.toURI.toString))
-      try {
-        val failedPlan = OpenIvmGarbageCollector.prepareForRefresh(spark).get
-        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-          throw new java.io.IOException("injected GC-state publication failure")
-        }
-        try {
-          intercept[java.io.IOException] {
-            OpenIvmStateSync.backupForCommand(
-              spark,
-              () => OpenIvmGarbageCollector.collect(spark, Some(failedPlan))
-            )
-          }.getMessage shouldBe "injected GC-state publication failure"
-          stagingPath.exists() shouldBe true
-          StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
-        } finally OpenIvmStateSync.setBackupPassHookForTesting(null)
-
-        OpenIvmStateSync.backupNow(spark)
-        val stateRoot = new File(warehouse, "_openivm").toPath
-        OpenIvmRocksDBRegistry.closeAll()
-        spark.stop()
-        SparkSession.clearActiveSession()
-        SparkSession.clearDefaultSession()
-        if (Files.exists(stateRoot)) {
-          val paths = Files.walk(stateRoot)
-          try paths.iterator().asScala.toSeq.reverse.foreach(Files.delete)
-          finally paths.close()
-        }
-
-        spark = SparkSession
-          .builder()
-          .master("local[1]")
-          .appName("openivm-spark-StagingGarbageCollectionSpec-fresh-session")
-          .config(
-            "spark.sql.extensions",
-            "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
-          )
-          .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-          .config("spark.openivm.enabled", "true")
-          .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
-          .config("spark.ui.enabled", "false")
-          .config("spark.sql.shuffle.partitions", "1")
-          .getOrCreate()
-        OpenIvmStateSync.maybeRestore(spark)
-        val restoredPlan = OpenIvmGarbageCollector.prepareForRefresh(spark).get
-        restoredPlan.tombstoned should contain(stagingPath.getAbsolutePath)
-        OpenIvmStateSync.backupNow(spark)
-        OpenIvmGarbageCollector.collect(spark, Some(restoredPlan))
-        stagingPath.exists() shouldBe false
-        StagingCatalog.pendingGarbage(spark) should not contain stagingPath.getAbsolutePath
-      } finally {
-        OpenIvmStateSync.setBackupPassHookForTesting(null)
-        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
-        spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
-        spark.conf.unset(FeatureGate.StateSyncUriKey)
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+      val failedPlan = OpenIvmGarbageCollector.prepareForRefresh(spark).get
+      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+        throw new java.io.IOException("injected GC-state publication failure")
       }
+      try {
+        intercept[java.io.IOException] {
+          OpenIvmStateSync.backupForCommand(
+            spark,
+            () => OpenIvmGarbageCollector.collect(spark, Some(failedPlan))
+          )
+        }.getMessage shouldBe "injected GC-state publication failure"
+        stagingPath.exists() shouldBe true
+        StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
+        all(livePaths.map(localPath(_).exists())) shouldBe true
+      } finally OpenIvmStateSync.setBackupPassHookForTesting(null)
+
+      OpenIvmStateSync.backupNow(spark)
+      stagingPath.exists() shouldBe true
+      StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
+      all(livePaths.map(localPath(_).exists())) shouldBe true
+
+      OpenIvmRocksDBRegistry.closeAll()
+      spark.stop()
+      spark = null
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+      runRecoveryInSecondJvm(
+        remote.toURI.toString,
+        warehouse.getAbsolutePath,
+        recoveredState.getAbsolutePath,
+        stagingPath.getAbsolutePath,
+        livePaths
+      )
+      stagingPath.exists() shouldBe false
+      all(livePaths.map(localPath(_).exists())) shouldBe true
+
+      spark = SparkSession
+        .builder()
+        .master("local[1]")
+        .appName("openivm-spark-StagingGarbageCollectionSpec-resumed")
+        .config(
+          "spark.sql.extensions",
+          "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+        )
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.openivm.enabled", "true")
+        .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "1")
+        .getOrCreate()
+      MvCatalog.ensureTables(spark)
+      StagingCatalog.ensureTables(spark)
+      OpenIvmStateSync.setStateSyncUriHookForTesting(null)
     }
 
+  }
+}
+
+private[commands] object StagingGarbageCollectionRecoveryChild {
+  private def localFile(location: String): File =
+    if (location.startsWith("file:")) new File(new java.net.URI(location).getPath) else new File(location)
+
+  def main(args: Array[String]): Unit = {
+    require(
+      args.length >= 5,
+      s"expected state URI, warehouse, fresh state path, tombstone, and live paths; got ${args.length}"
+    )
+    val Array(stateUri, warehousePath, statePath, tombstonePath) = args.take(4)
+    val livePaths                                                = args.drop(4).toSeq
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-spark-StagingGarbageCollectionRecoveryChild")
+      .config(
+        "spark.sql.extensions",
+        "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+      )
+      .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+      .config("spark.openivm.enabled", "true")
+      .config("spark.sql.warehouse.dir", warehousePath)
+      .config(FeatureGate.StatePathKey, statePath)
+      .config(FeatureGate.StateSyncUriKey, stateUri)
+      .config(FeatureGate.StateSyncAsyncEnabledKey, "false")
+      .config("spark.ui.enabled", "false")
+      .config("spark.sql.shuffle.partitions", "1")
+      .getOrCreate()
+    try {
+      OpenIvmStateSync.maybeRestore(spark)
+      MvCatalog.ensureTables(spark)
+      StagingCatalog.ensureTables(spark)
+      val plan = OpenIvmGarbageCollector
+        .prepareForRefresh(spark)
+        .getOrElse(
+          throw new AssertionError("restored pending garbage did not produce a GC plan")
+        )
+      require(plan.tombstoned.contains(tombstonePath), "restored snapshot did not contain the pending tombstone")
+      require(
+        livePaths.forall(plan.referenced.contains),
+        "restored snapshot did not preserve every live staging reference"
+      )
+      require(
+        localFile(tombstonePath).exists(),
+        "eligible path was deleted before the child JVM committed its restored state"
+      )
+      require(
+        livePaths.forall(path => localFile(path).exists()),
+        "a referenced path disappeared before recovery cleanup"
+      )
+
+      OpenIvmStateSync.backupNow(spark)
+      OpenIvmGarbageCollector.collect(spark, Some(plan))
+      require(!localFile(tombstonePath).exists(), "committed eligible tombstone was not cleaned")
+      require(livePaths.forall(path => localFile(path).exists()), "GC deleted a path still referenced by live state")
+      require(!StagingCatalog.pendingGarbage(spark).contains(tombstonePath), "cleaned tombstone remained pending")
+    } finally {
+      OpenIvmRocksDBRegistry.closeAll()
+      spark.stop()
+    }
   }
 }
