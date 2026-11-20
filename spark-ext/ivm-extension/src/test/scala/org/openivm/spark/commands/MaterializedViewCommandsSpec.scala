@@ -1709,6 +1709,39 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // Test 2 — CREATE … IF NOT EXISTS on an existing MV (no-op)
   // ---------------------------------------------------------------------------
   describe("(2) CREATE MATERIALIZED VIEW IF NOT EXISTS — already exists → no-op") {
+    it("rediscovers managed upstream locks when DROP wins ahead of an existing CREATE") {
+      val source = "src_create_locked_drop"
+      val upstream = "mv_create_locked_a_upstream"
+      val target = "mv_create_locked_z_target"
+      spark.sql(s"CREATE TABLE $source (id INT) USING DELTA").collect()
+      spark.sql(s"INSERT INTO $source VALUES (1), (2)").collect()
+      spark.sql(s"CREATE MATERIALIZED VIEW $upstream AS SELECT id FROM $source").collect()
+      spark.sql(s"CREATE MATERIALIZED VIEW $target AS SELECT id FROM $upstream WHERE id = 1").collect()
+      val name = TableIdentifier(target)
+      val create = s"CREATE MATERIALIZED VIEW IF NOT EXISTS $target AS SELECT id FROM $upstream WHERE id = 2"
+
+      withPool(1) { implicit ec =>
+        val worker = new AtomicReference[Thread]()
+        val queuedCreate = RefreshMutex.withLock(target) {
+          val pending = Future {
+            worker.set(Thread.currentThread())
+            spark.sql(create).collect()
+          }
+          val deadline = 30.seconds.fromNow
+          def queued: Boolean = Option(worker.get()).exists(RefreshMutex.hasQueuedThread(target, _))
+          while (!queued && deadline.hasTimeLeft()) Thread.sleep(5)
+          queued shouldBe true
+          spark.sql(s"DROP MATERIALIZED VIEW $target").collect()
+          MvCatalog.lookup(spark, name) shouldBe None
+          pending
+        }
+        awaitResult(queuedCreate)
+      }
+
+      MvCatalog.lookup(spark, name).get.querySql should include("id = 2")
+      assertBagEqual(target, s"SELECT id FROM $upstream WHERE id = 2")
+    }
+
     it("silently does nothing when the MV already exists") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t2(region STRING, amount INT) USING DELTA")
       spark.sql("INSERT INTO sales_t2 VALUES ('north', 50)")

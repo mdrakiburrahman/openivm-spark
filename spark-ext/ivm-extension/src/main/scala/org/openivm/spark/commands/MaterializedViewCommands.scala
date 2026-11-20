@@ -2926,51 +2926,73 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     CreatePublicationMutex.withLock(commandName) {
-      val createUpstreamReadKeys = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) {
-        isolated =>
-          MvCatalog.ensureTables(isolated)
-          if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
-          else {
-            val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
-            val sourceNames = collectSourceSchemas(analyzed)._1
-            computeUpstreamMvByQual(isolated, sourceNames).values
-              .map(meta => metaName(meta.name))
-              .toSeq
-              .distinct
-              .sorted
-          }
+      def discoverUpstreamReadKeys(isolated: SparkSession): Seq[String] = {
+        val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
+        val sourceNames = collectSourceSchemas(analyzed)._1
+        computeUpstreamMvByQual(isolated, sourceNames).values
+          .map(meta => metaName(meta.name))
+          .toSeq
+          .distinct
+          .sorted
       }
-      val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
-        try {
-          val threadName = Thread.currentThread().getName
-          val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
-          profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-          val outcome = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-            OpenIvmMetrics.CreateInflight.incrementAndGet()
-            try {
-              CommandConcurrencyInjection.maybePauseBeforeCreate()
-              DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                runCreate(
-                  isolated,
-                  profile,
-                  sqlLog,
-                  createUpstreamReadKeys.toSet,
-                  classification => createInsightClassification = Some(classification)
-                )
+
+      def runLocked(upstreamReadKeys: Seq[String], existingOnly: Boolean): Option[String] = {
+        val lockWaitT0 = System.nanoTime()
+        RefreshMutex.withLocks(upstreamReadKeys, Seq(commandName)) {
+          var retryWithDependencies = false
+          try {
+            val threadName = Thread.currentThread().getName
+            val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+            profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
+            val outcome = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+              OpenIvmMetrics.CreateInflight.incrementAndGet()
+              try {
+                CommandConcurrencyInjection.maybePauseBeforeCreate()
+                DriverHeavyOperationAdmission.withPermit(spark, "create") {
+                  runCreate(
+                    isolated,
+                    profile,
+                    sqlLog,
+                    upstreamReadKeys.toSet,
+                    existingOnly,
+                    classification => createInsightClassification = Some(classification)
+                  )
+                }
+              } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+            }
+            // An existing view is only looked up; there is no state change to publish.
+            if (finalizeUnderLock)
+              outcome.foreach { completed =>
+                if (completed != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
+                createOutcome = completed
               }
-            } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+            retryWithDependencies = outcome.isEmpty
+            outcome
+          } finally {
+            if (finalizeUnderLock && !retryWithDependencies) finalizeCreate(deferExecutionSpanEmission = true)
           }
-          // An existing view is only looked up; there is no state change to publish.
-          if (finalizeUnderLock) {
-            if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
-            createOutcome = outcome
-          }
-          outcome
-        } finally {
-          if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
         }
       }
+
+      // Do not count a speculative miss as a second driver admission when AIMD is enabled.
+      val probeExisting = ifNotExists && !FeatureGate.driverAdmissionEnabled(spark)
+      val (existingOutcome, upstreamReadKeys) =
+        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+          // In RocksDB mode this also joins/starts restore, before taking any lifecycle lock.
+          MvCatalog.ensureTables(isolated)
+          if (probeExisting) {
+            val existing = runLocked(Seq.empty, existingOnly = true)
+            // On a miss no metadata escapes, and the target lock is released before discovery.
+            // Fresh CREATE still rechecks the registration under the complete ordered lock set.
+            (existing, if (existing.isEmpty) discoverUpstreamReadKeys(isolated) else Seq.empty[String])
+          } else {
+            val keys =
+              if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+              else discoverUpstreamReadKeys(isolated)
+            (None, keys)
+          }
+        }
+      val outcome = existingOutcome.getOrElse(runLocked(upstreamReadKeys, existingOnly = false).get)
       if (!finalizeUnderLock) {
         if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
         createOutcome = outcome
@@ -2999,8 +3021,9 @@ case class CreateMaterializedViewCommand(
       profile: RefreshProfile,
       sqlLog: RefreshSqlLog,
       expectedUpstreamMvLockKeys: Set[String],
+      existingOnly: Boolean,
       recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit
-  ): String = {
+  ): Option[String] = {
     import MvCommandHelper._
 
     val propagation = ChangePropagationFactory.forSession(spark)
@@ -3019,19 +3042,20 @@ case class CreateMaterializedViewCommand(
         if (OpenIvmExecutionSpan.hasActiveExport) {
           recordExistingCreateTelemetry(spark, meta, profile.refreshId)
           OpenIvmExecutionSpan.allowActiveCompletedExportReuse()
-          return "create_already_exists"
+          return Some("create_already_exists")
         }
         if (OpenIvmInsightsBroker.hasActiveCapture(spark)) {
           recordExistingCreateInsights(spark, meta, profile.refreshId)
-          return "create_already_exists"
+          return Some("create_already_exists")
         }
-        return "create_executed"
+        return Some("create_executed")
       case Some(_) =>
         throw new AnalysisException(
           "TABLE_OR_VIEW_ALREADY_EXISTS",
           Map("relationName" -> sqlIdent(name))
         )
-      case None => // proceed
+      case None if existingOnly => return None
+      case None                 => // proceed
     }
 
     // A fresh CREATE (the view did not exist above) deterministically FORCE-clears
@@ -3979,7 +4003,7 @@ case class CreateMaterializedViewCommand(
         classification.reason
       )
     )
-    "create_executed"
+    Some("create_executed")
   }
 
   private def recordExistingCreateTelemetry(
