@@ -103,7 +103,15 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
         matching.head should include("credit_ns=0")
         matching.head should include("query_log_order=")
         matching.head should include("duration_ns=")
+        matching.head should include("compiler_program_digest=")
+        matching.head should include("source_ordinal=")
+        matching.head should include("source_digest=")
+        matching.head should include("rewrite_pipeline=")
+        matching.head should include("executed_digest=")
       }
+      attempts.find(_.contains("segment=fused_action")).get should include(
+        "executed_digest_kind=action_descriptor_utf8"
+      )
     }
 
     it("uses the fused scratch cache as the cascade input when an MV-over-MV chain depends on it") {

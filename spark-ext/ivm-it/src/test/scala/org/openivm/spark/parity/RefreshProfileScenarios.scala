@@ -3,7 +3,14 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, RefreshProfileCatalog}
+import org.openivm.spark.common.{
+  ChangeFeedMode,
+  FeatureGate,
+  RefreshProfileCatalog,
+  RefreshSqlLogAsyncFlusher,
+  RefreshSqlLogCatalog,
+  RewriteLineage
+}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -20,6 +27,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
   override protected def extraSparkConf: Map[String, String] =
     Map(
       "spark.openivm.profile.refresh"      -> "true",
+      FeatureGate.QueryLogEnabledKey       -> "true",
       FeatureGate.StateSyncAsyncEnabledKey -> "false"
     )
 
@@ -235,6 +243,47 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         detail should include("native_close_ns=")
         detail should include("body_ns=")
         detail should not include spark.conf.get("spark.sql.warehouse.dir")
+      }
+    }
+
+    it("links ordinary dispatched statements to their exact captured origin without credit") {
+      sql("CREATE TABLE profile_lineage_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_lineage_src VALUES (1, 10), (1, 20), (2, 30)")
+      sql("CREATE MATERIALIZED VIEW profile_lineage_mv AS SELECT k, SUM(v) AS s FROM profile_lineage_src GROUP BY k")
+      sql("DELETE FROM profile_lineage_src WHERE v = 10")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_lineage_mv").collect()
+      assertMvCorrect("profile_lineage_mv", "SELECT k, SUM(v) AS s FROM profile_lineage_src GROUP BY k")
+      val rows      = showProfile()
+      val refreshId = rows.find(_.getString(4) == "query_span").get.getString(0)
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
+      val logs = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == refreshId)
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+        .filter(_.contains("compiler_program_digest="))
+      attempts should not be empty
+      attempts.foreach { detail =>
+        val fields = detail
+          .split(";")
+          .iterator
+          .map(_.split("=", 2))
+          .collect { case Array(key, value) =>
+            key -> value
+          }
+          .toMap
+        val log = logs
+          .find(r =>
+            r.category == "rewritten_stmt" && r.stmtOrder == fields("query_log_order").toInt &&
+              r.attemptIdx == fields("attempt").toInt
+          )
+          .get
+        fields("executed_digest") shouldBe RewriteLineage.sha256Utf8(log.sqlText)
+        fields("compiler_program_digest") should fullyMatch regex "[0-9a-f]{64}"
+        fields("source_digest") should fullyMatch regex "[0-9a-f]{64}"
+        fields("compiler_program_digest_kind") shouldBe "native_program_utf8"
+        fields("source_ordinal_basis") shouldBe "zero_based_compiler_program_split"
+        fields("source_digest_basis") shouldBe "split_statement_utf8_without_delimiter"
+        fields("origin_class") shouldBe "unknown"
+        fields("credit_ns") shouldBe "0"
       }
     }
 

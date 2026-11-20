@@ -6570,12 +6570,16 @@ case class RefreshMaterializedViewCommand(
                 },
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
-                sourceSnapshotRelations = snapshotRelations
+                sourceSnapshotRelations = snapshotRelations,
+                lineageCapture =
+                  if (profile.isActive) Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
+                  else None
               )
             }
           }
           expressionBridge.markers.requireAllSeen()
 
+          var literalPruneApplied = false
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
               val requests = rewrittenBase.statements.flatMap(SparkRefreshRewriter.regularNtermKeyRequests).distinct
@@ -6585,6 +6589,7 @@ case class RefreshMaterializedViewCommand(
                   s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                     s"outcome='regular_nterm_literal_prune' key_sets='${literals.size}'"
                 )
+                literalPruneApplied = true
                 rewrittenBase.copy(
                   statements = rewrittenBase.statements.map(
                     SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(_, literals)
@@ -6656,11 +6661,48 @@ case class RefreshMaterializedViewCommand(
                 done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
               }
             }
-            def executeSqlAt(sql: String, stmtIdx: Int, fullDomainCdfMerge: Boolean = false): Unit = {
-              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge)
+            def lineageDetail(
+                sourceIndex: Option[Int],
+                executed: String,
+                dispatchRule: String = "strip-execution-marker@1",
+                digestKind: String = "sql_utf8"
+            ): String =
+              sourceIndex
+                .flatMap { index =>
+                  rewritten.lineage.flatMap { lineage =>
+                    lineage.outputs.lift(index).map { source =>
+                      val pipeline = source.additionalRewriteRules.map(rule => s"${rule.name}@${rule.version}") ++
+                        (if (literalPruneApplied) Seq("regular-nterm-literal-prune@1") else Seq.empty) ++
+                        Seq(dispatchRule)
+                      s";compiler_program_digest=${lineage.compilerProgramDigest};" +
+                        s"compiler_program_digest_kind=${lineage.compilerProgramDigestKind};" +
+                        s"normalized_program_digest=${lineage.normalizedProgramDigest};" +
+                        "source_ordinal_basis=zero_based_compiler_program_split;" +
+                        "source_digest_basis=split_statement_utf8_without_delimiter;" +
+                        s"source_ordinal=${source.sourceOrdinal};source_digest=${source.sourceStatementDigest};" +
+                        s"rewrite_rule=${source.rewriteRuleName};rewrite_version=${source.rewriteRuleVersion};" +
+                        s"rewrite_pipeline=${pipeline.mkString(",")};executed_digest_kind=$digestKind;" +
+                        s"executed_digest=${RewriteLineage.sha256Utf8(executed)}"
+                    }
+                  }
+                }
+                .getOrElse("")
+
+            def executeSqlAt(
+                sql: String,
+                stmtIdx: Int,
+                fullDomainCdfMerge: Boolean = false,
+                sourceIndex: Option[Int] = None
+            ): Unit = {
+              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex)
               ()
             }
-            def executeSqlRowsAt(sql: String, stmtIdx: Int, fullDomainCdfMerge: Boolean = false): Array[Row] = {
+            def executeSqlRowsAt(
+                sql: String,
+                stmtIdx: Int,
+                fullDomainCdfMerge: Boolean = false,
+                sourceIndex: Option[Int] = None
+            ): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)
               val kind =
                 if (fullDomainCdfMerge) "global_window_cdf_merge" else RefreshPerf.classify(sql, viewDeltaPath)
@@ -6680,7 +6722,7 @@ case class RefreshMaterializedViewCommand(
                       "execute_refresh_sql_attempt",
                       s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
                         s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
-                        s"$origin;credit_ns=0"
+                        s"$origin;credit_ns=0${lineageDetail(sourceIndex, sql)}"
                     ) {
                       val result = spark.sql(sql)
                       result -> result.collect()
@@ -6816,7 +6858,8 @@ case class RefreshMaterializedViewCommand(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
                               s"work_class=incremental_sql;segment=fused_analysis;action_id=$qOrder:0:fused_analysis;" +
-                              "origin_class=executor_helper;credit_ns=0;credit_reason=analysis"
+                              "origin_class=executor_helper;credit_ns=0;credit_reason=analysis" +
+                              lineageDetail(Some(0), selectBody, "extract-view-delta-ctas-body@1")
                           ) {
                             spark.sql(selectBody)
                           }
@@ -6836,7 +6879,13 @@ case class RefreshMaterializedViewCommand(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
                               s"work_class=incremental_sql;segment=fused_action;action_id=$qOrder:0:fused_action;" +
-                              "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization"
+                              "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization" +
+                              lineageDetail(
+                                Some(0),
+                                s"spark.table(global_temp.$scratchView).count()",
+                                "fused-cache-materialization@1",
+                                "action_descriptor_utf8"
+                              )
                           ) {
                             spark.table(s"global_temp.$scratchView").count()
                           }
@@ -6906,7 +6955,11 @@ case class RefreshMaterializedViewCommand(
 
               if (fusedView.isEmpty) {
                 withPlanTimeBroadcastDisabled {
-                  executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
+                  executeSqlAt(
+                    SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head),
+                    0,
+                    sourceIndex = Some(0)
+                  )
                 }
                 logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
               }
@@ -7017,12 +7070,13 @@ case class RefreshMaterializedViewCommand(
                     // body, which trips Spark's 8 GiB `BroadcastExchangeExec`
                     // cap. See `SparkRefreshRewriter.isMergeStatement` for the
                     // full rationale.
+                    val directSourceIndex = if (atomicSql.isEmpty && fusedView.isEmpty) Some(stmtIdx) else None
                     if (SparkRefreshRewriter.isMergeStatement(sqlForExec)) {
                       withPlanTimeBroadcastDisabled {
-                        executeSqlAt(sqlForExec, stmtIdx)
+                        executeSqlAt(sqlForExec, stmtIdx, sourceIndex = directSourceIndex)
                       }
                     } else {
-                      executeSqlAt(sqlForExec, stmtIdx)
+                      executeSqlAt(sqlForExec, stmtIdx, sourceIndex = directSourceIndex)
                     }
                     if (atomicSql.nonEmpty) atomicApplyInsertIdx = Some(stmtIdx + 1)
                   }
@@ -7434,10 +7488,10 @@ case class RefreshMaterializedViewCommand(
                     SparkRefreshRewriter.extractViewDeltaCtasBody(stmt, viewDeltaPath).isDefined
                   if (SparkRefreshRewriter.isMergeStatement(sql) || isViewDeltaCtas) {
                     withPlanTimeBroadcastDisabled {
-                      executeSqlAt(sql, idx)
+                      executeSqlAt(sql, idx, sourceIndex = Some(idx))
                     }
                   } else {
-                    executeSqlAt(sql, idx)
+                    executeSqlAt(sql, idx, sourceIndex = Some(idx))
                   }
                   if (isViewDeltaCtas && idx == windowCascadeCtasIdx) {
                     val targetWritePending = windowCascadeMergePlan.nonEmpty || deferredWindowTargetSql.nonEmpty

@@ -952,6 +952,112 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_trh';
         |""".stripMargin
 
+    it("captures exact native digests and maps suppressed and one-to-many statements structurally") {
+      val sourceBytes = windowDeleteInput.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      def rewrite(capture: Option[RewriteLineage.Capture] = None) =
+        SparkRefreshRewriter.rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          lineageCapture = capture
+        )
+
+      val disabled = rewrite()
+      disabled.lineage shouldBe None
+      val captured     = rewrite(Some(RewriteLineage.captureNativeProgramBytes(sourceBytes)))
+      val snapshot     = captured.lineage.get
+      val splitSources = SparkRefreshRewriter.splitStatements(windowDeleteInput)
+
+      captured.statements shouldBe disabled.statements
+      snapshot.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(windowDeleteInput)
+      snapshot.sourceStatements.map(_.ordinal) shouldBe Seq(0, 1, 2, 3)
+      snapshot.sourceStatements.map(_.sourceStatementDigest) shouldBe splitSources.map(RewriteLineage.sha256Utf8)
+      snapshot.sourceStatements.map(_.outputIndices) shouldBe Seq(Seq.empty, Seq(0, 1), Seq(2), Seq.empty)
+      snapshot.outputs.map(_.outputIndex) shouldBe Seq(0, 1, 2)
+      snapshot.outputs.map(_.sourceOrdinal) shouldBe Seq(1, 1, 2)
+      snapshot.outputs.map(_.rewriteRuleName) shouldBe
+        Seq("partition-scoped-delete", "partition-scoped-delete", "partition-scoped-insert")
+      snapshot.outputs.forall(_.classification == RewriteLineage.Unknown) shouldBe true
+      snapshot.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+      snapshot.outputs.head.additionalRewriteRules.last shouldBe RewriteLineage.RewriteRule(
+        "caller-post-process",
+        "unidentified",
+        RewriteLineage.Unknown
+      )
+      RewriteLineage.sha256Utf8("abc") shouldBe "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+      val repeated = rewrite(Some(RewriteLineage.captureNativeProgramBytes(sourceBytes))).lineage.get
+      repeated shouldBe snapshot
+    }
+
+    it("distinguishes native compiler input from normalized-only or ambiguous cached output") {
+      val normalized = windowDeleteInput
+      val native     = normalized.replace("openivm_data_mv_trh", "memory.main.openivm_data_mv_trh")
+      def lineage(raw: Option[String]) = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = normalized,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          lineageCapture = Some(RewriteLineage.captureCompilerOutput(normalized, raw))
+        )
+        .lineage
+        .get
+
+      val fresh = lineage(Some(native))
+      fresh.compilerProgramDigestKind shouldBe "native_program_utf8"
+      fresh.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(native)
+      fresh.normalizedProgramDigest shouldBe RewriteLineage.sha256Utf8(normalized)
+      fresh.sourceStatements.map(_.sourceStatementDigest) shouldBe
+        SparkRefreshRewriter.splitStatements(native).map(RewriteLineage.sha256Utf8)
+      val cached    = lineage(None)
+      val ambiguous = lineage(Some(native + "SELECT 1;"))
+      Seq(cached, ambiguous).foreach { result =>
+        result.compilerProgramDigestKind shouldBe "normalized_compiler_output_utf8"
+        result.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(normalized)
+        result.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+      }
+    }
+
+    it("labels generated snapshot scratch statements as executor helpers without timing credit") {
+      val input = "CREATE OR REPLACE TEMP TABLE openivm_current_mv_trh AS SELECT 1 AS id;"
+      val result = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = TableIdentifier("mv_trh", Some("silver")),
+        mvLocation = "dbfs:/delta/mv_trh",
+        viewLogicalName = "mv_trh",
+        sourceTempViews = Map.empty,
+        viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+        lineageCapture = Some(
+          RewriteLineage.captureNativeProgramBytes(input.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        )
+      )
+
+      result.lineage.get.outputs.map(_.classification) shouldBe Seq(RewriteLineage.ExecutorHelper)
+      result.lineage.get.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+    }
+
+    it("keeps opt-in lineage absent and output ordering unchanged by default") {
+      val result = SparkRefreshRewriter.rewrite(
+        compiledSql = windowDeleteInput,
+        mvName = TableIdentifier("mv_trh", Some("silver")),
+        mvLocation = "dbfs:/delta/mv_trh",
+        viewLogicalName = "mv_trh",
+        sourceTempViews = Map.empty,
+        viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid"
+      )
+
+      result.lineage shouldBe None
+      result.statements should have size 3
+      result.statements.head should include("WHEN MATCHED THEN DELETE")
+      result.statements(1) should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("keeps the legacy one-MERGE-per-IN-clause shape when the gate is off") {
       val rewritten = SparkRefreshRewriter
         .rewrite(
