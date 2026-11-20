@@ -1,6 +1,7 @@
 package org.openivm.spark.common.rocksdb
 
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
@@ -36,6 +37,15 @@ object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
 
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
+
+  private final class GuardedBinding(val root: String, val store: GuardedSnapshotDecisions.ArchiveStore) {
+    val backup = new BackupState
+    val restored = new CompletableFuture[Unit]()
+    val restoring = new AtomicBoolean(false)
+    var latest: Option[GuardedSnapshotDecisions.Generation] = None
+  }
+
+  private val guardedBindings = new java.util.WeakHashMap[SparkContext, GuardedBinding]()
 
   private final case class AsyncRequest(span: Option[OpenIvmExecutionSpan], afterPublish: () => Unit)
 
@@ -164,6 +174,60 @@ object OpenIvmStateSync {
     if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
   }
 
+  private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
+    spark.sparkContext.getConf.getOption(FeatureGate.GuardedStateSyncUriKey)
+
+  private[openivm] def guardedSqlEnabled(spark: SparkSession): Boolean = guardedUri(spark).isDefined
+
+  private def checkGuardedSettings(spark: SparkSession): Unit = {
+    if (spark.sparkContext.isStopped || stateSyncUri(spark).nonEmpty ||
+        spark.conf.getOption(FeatureGate.StateSyncUriKey).exists(_.trim.nonEmpty) ||
+        FeatureGate.stateSyncAsyncEnabled(spark) || FeatureGate.gcEnabled(spark))
+      throw new java.io.IOException(
+        "guarded SQL state sync requires an active Spark application, no legacy URI, synchronous state sync, and legacy GC disabled"
+      )
+  }
+
+  private[rocksdb] def attachGuarded(
+      spark: SparkSession,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Unit = {
+    checkGuardedSettings(spark)
+    if (!guardedUri(spark).contains(store.canonicalRoot))
+      throw new java.io.IOException("guarded SQL checkpoint root does not match the startup configuration")
+    val binding = new GuardedBinding(canonicalLocalRoot(spark), store)
+    guardedBindings.synchronized {
+      if (guardedBindings.containsKey(spark.sparkContext))
+        throw new java.io.IOException("guarded SQL checkpoint transport is already attached")
+      guardedBindings.put(spark.sparkContext, binding)
+    }
+  }
+
+  private def guardedBinding(spark: SparkSession): Option[GuardedBinding] = guardedUri(spark).map { uri =>
+    checkGuardedSettings(spark)
+    val binding = guardedBindings.synchronized(Option(guardedBindings.get(spark.sparkContext)))
+      .getOrElse(throw new java.io.IOException("guarded SQL checkpoint transport was not attached at startup"))
+    if (binding.store.canonicalRoot != uri || binding.root != canonicalLocalRoot(spark))
+      throw new java.io.IOException("guarded SQL checkpoint binding changed")
+    binding
+  }
+
+  private def restoreGuardedOnce(spark: SparkSession, binding: GuardedBinding): Unit = {
+    if (binding.restoring.compareAndSet(false, true)) {
+      try {
+        binding.latest = restoreGuarded(spark, binding.store)
+        binding.restored.complete(())
+      } catch {
+        case error: Throwable =>
+          binding.restored.completeExceptionally(error)
+          throw error
+      }
+    } else {
+      try binding.restored.get()
+      catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
+    }
+  }
+
   private def backupStateFor(key: String): BackupState = {
     val fresh    = new BackupState
     val existing = backupStates.putIfAbsent(key, fresh)
@@ -173,6 +237,12 @@ object OpenIvmStateSync {
   /** Download the remote state tree into the local `_openivm` dir on the first
     * call per Spark application. Restore failures fail all callers closed. */
   def maybeRestore(spark: SparkSession): Unit = {
+    guardedBinding(spark) match {
+      case Some(binding) =>
+        restoreGuardedOnce(spark, binding)
+        return
+      case None => ()
+    }
     val uri = stateSyncUri(spark)
       .getOrElse(
         return
@@ -213,6 +283,8 @@ object OpenIvmStateSync {
     }
 
   private def backupAsync(spark: SparkSession, afterPublish: () => Unit): Unit = {
+    if (guardedSqlEnabled(spark))
+      throw new java.io.IOException("guarded SQL checkpoint publication cannot be asynchronous")
     val uri = stateSyncUri(spark)
       .getOrElse {
         afterPublish()
@@ -268,6 +340,25 @@ object OpenIvmStateSync {
 
   /** Synchronously publish a snapshot covering this request's committed state. */
   def backupNow(spark: SparkSession): Unit = {
+    guardedBinding(spark) match {
+      case Some(binding) =>
+        restoreGuardedOnce(spark, binding)
+        val span = OpenIvmExecutionSpan.captureCurrent()
+        val started = System.nanoTime()
+        try binding.backup.backupSynchronous { () =>
+          val previous = new GuardedSnapshotDecisions(binding.store).latestPublished().map(_.generation)
+          if (previous != binding.latest)
+            throw new java.io.IOException("guarded SQL checkpoint was published by another writer; fresh restore required")
+          val previousStamp = previous.map(_.value.take(19).toLong).getOrElse(0L)
+          val stamp = math.max(System.currentTimeMillis(), Math.addExact(previousStamp, 1L))
+          val generation = GuardedSnapshotDecisions.Generation(f"$stamp%019d-${UUID.randomUUID()}")
+          publishGuarded(spark, generation, binding.store)
+          binding.latest = Some(generation)
+        }
+        finally span.foreach(_.recordRocksDbBackup((System.nanoTime() - started) / 1000000L))
+        return
+      case None => ()
+    }
     val uri = stateSyncUri(spark)
       .getOrElse(
         return

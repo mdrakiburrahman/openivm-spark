@@ -49,6 +49,7 @@ object FeatureGate {
     * local-only behavior unchanged.
     */
   val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+  val GuardedStateSyncUriKey: String = "spark.openivm.stateSync.guarded.uri"
 
   /** Return from MV commands before remote backup completes (default true).
     * Local commits remain synchronous; driver loss can restore an older remote generation.

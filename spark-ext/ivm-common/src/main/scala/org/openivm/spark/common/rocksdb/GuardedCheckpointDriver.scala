@@ -48,9 +48,26 @@ final class GuardedCheckpointDriver(
   }
 
   private def requireIsolated(): Unit = {
-    if (spark.sparkContext.isStopped || FeatureGate.stateSyncUri(spark).nonEmpty)
+    if (spark.sparkContext.isStopped || FeatureGate.stateSyncUri(spark).nonEmpty ||
+        OpenIvmStateSync.guardedSqlEnabled(spark))
       throw new IOException(
-        "guarded checkpoint qualification requires an active Spark application with no legacy state-sync URI"
+        "guarded checkpoint qualification requires an active Spark application with no configured SQL state sync"
       )
+  }
+}
+
+object GuardedCheckpointDriver {
+  /** Bind a driver-only transport before first OpenIVM access. Only for a namespace with one
+    * externally exclusive writer across startup, mutation, capture and publication. A per-generation
+    * terminal decision is not a namespace writer fence.
+    */
+  def attachSqlPersistence(spark: SparkSession, storageCredential: Supplier[String]): Unit = {
+    val root = OpenIvmStateSync.guardedUri(spark)
+      .getOrElse(throw new IOException("guarded SQL checkpoint URI is not configured"))
+    if (storageCredential == null) throw new IOException("guarded SQL checkpoint storage credentials are required")
+    OpenIvmStateSync.attachGuarded(
+      spark,
+      new OneLakeGuardedStore(OneLakeGuardedPaths(root, () => storageCredential.get()))
+    )
   }
 }

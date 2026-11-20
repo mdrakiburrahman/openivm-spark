@@ -24,7 +24,7 @@ private[openivm] object OpenIvmStateBarrier {
   }
 
   def withMutation[A](spark: SparkSession)(body: => A): A =
-    if (FeatureGate.stateSyncUri(spark).isDefined) {
+    if (OpenIvmStateSync.guardedSqlEnabled(spark) || FeatureGate.stateSyncUri(spark).isDefined) {
       OpenIvmStateSync.maybeRestore(spark)
       withRead(forRoot(root(spark)))(body)
     } else body
