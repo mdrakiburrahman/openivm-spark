@@ -17,7 +17,7 @@ import java.sql.Timestamp
 import java.util.UUID
 import java.util.concurrent.{Callable, CyclicBarrier, Executors, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 /** Diagnostic only: a counterexample must prevent adopting the point-read prototype. */
@@ -258,7 +258,7 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     val onFailure = intercept[org.apache.spark.sql.AnalysisException] {
       schemaCommand(spark, Seq("scprobe.absent"), enabled = true)
     }
-    onFailure.getErrorClass shouldBe offFailure.getErrorClass
+    onFailure.getMessage.split("\n").head shouldBe offFailure.getMessage.split("\n").head
     record("kind" -> "negative", "case" -> "legacy_and_missing", "passed" -> true)
   }
 
