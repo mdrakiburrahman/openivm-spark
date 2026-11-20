@@ -25,6 +25,7 @@ private[rocksdb] object GcReferencePublicationWitness {
       .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config(FeatureGate.StateSyncUriKey, destination.toUri.toString)
+      .config(FeatureGate.StateSyncRetainGenerationsKey, "10")
       .getOrCreate()
 
   def main(args: Array[String]): Unit = {
@@ -32,12 +33,21 @@ private[rocksdb] object GcReferencePublicationWitness {
     val location = args(3)
     try {
       OpenIvmStateSync.maybeRestore(spark)
-      if (args(0) == "publish") {
+      if (args(0) == "publish" || args(0) == "pending") {
         require(!StagingCatalog.referencedStagingPaths(spark).contains(location))
         StagingCatalog.record(
           spark,
           StagingDelta("default.witness_source", "INSERT", location, new Timestamp(1000L), Nil)
         )
+        if (args(0) == "pending") {
+          val gate = Paths.get(args(1)).getParent
+          OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => {
+            Files.createFile(gate.resolve("pending-ready"))
+            val stop = System.nanoTime() + TimeUnit.SECONDS.toNanos(90)
+            while (!Files.exists(gate.resolve("pending-release")) && System.nanoTime() < stop) Thread.sleep(25)
+            require(Files.exists(gate.resolve("pending-release")), "pending publisher was not released")
+          })
+        }
         OpenIvmStateSync.backupNow(spark)
       } else {
         require(StagingCatalog.referencedStagingPaths(spark).contains(location))
@@ -62,7 +72,9 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
     finally files.close()
   }
 
-  private def freshProcess(role: String, root: Path, destination: Path, location: String): Unit = {
+  private def freshProcess(role: String, root: Path, destination: Path, location: String)(
+      whileRunning: => Unit
+  ): Unit = {
     val java = new File(System.getProperty("java.home"), "bin/java").getAbsolutePath
     val modules = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
@@ -79,6 +91,7 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
       )): _*
     ).redirectErrorStream(true).redirectOutput(log).start()
     try {
+      whileRunning
       process.waitFor(150, TimeUnit.SECONDS) shouldBe true
       withClue(s"$role JVM failed; see $log: ") { process.exitValue() shouldBe 0 }
     } finally {
@@ -104,14 +117,60 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
         plan.referenced shouldBe empty
         plan.tombstoned shouldBe empty
 
-        freshProcess("publish", root, destination, location)
+        freshProcess("publish", root, destination, location)(())
         fingerprint(payload) shouldBe candidateFingerprint
         OpenIvmGarbageCollector.prepare(spark).get.referenced shouldBe empty
-        freshProcess("restore", root, destination, location)
+        freshProcess("restore", root, destination, location)(())
         fingerprint(payload) shouldBe candidateFingerprint
       } finally {
         OpenIvmRocksDBRegistry.closeAll()
         spark.stop()
+      }
+
+      it("cannot use generation age to retire an in-flight publisher's unchanged archive") {
+        val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-generation-")
+        val destination = Files.createDirectory(root.resolve("published"))
+        val spark = GcReferencePublicationWitness.session(root.resolve("local"), destination)
+        val control = destination.resolve(".openivm-state-sync")
+        val commits = control.resolve("commits")
+        val snapshots = control.resolve("snapshots")
+        def names(path: Path): Seq[String] = {
+          val entries = Files.list(path)
+          try entries.iterator().asScala.map(_.getFileName.toString).toVector.sorted
+          finally entries.close()
+        }
+        var generation = ""
+        try {
+          StagingCatalog.record(
+            spark,
+            StagingDelta("default.witness_source", "INSERT", root.resolve("newer").toString, new Timestamp(2000L), Nil)
+          )
+          freshProcess("pending", root, destination, root.resolve("older").toString) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60)
+            while (!Files.exists(root.resolve("pending-ready")) && System.nanoTime() < deadline) Thread.sleep(25)
+            Files.exists(root.resolve("pending-ready")) shouldBe true
+            val pendingMarkers = names(commits).filter(_.endsWith(".pending"))
+            pendingMarkers.size shouldBe 1
+            val pending = pendingMarkers.head
+            generation = pending.stripPrefix(".").stripSuffix(".pending")
+            val original = fingerprint(snapshots.resolve(generation))
+            val stagedAt = generation.takeWhile(_ != '-').toLong
+            while (System.currentTimeMillis() <= stagedAt && System.nanoTime() < deadline) Thread.sleep(1)
+            (System.currentTimeMillis() > stagedAt) shouldBe true
+            OpenIvmStateSync.backupNow(spark)
+            OpenIvmStateSync.backupNow(spark)
+            val oldestRetained = names(commits).filter(_.endsWith(".commit")).takeRight(2).head.stripSuffix(".commit")
+            (generation < oldestRetained) shouldBe true
+            (pending.stripPrefix(".") < oldestRetained) shouldBe true
+            fingerprint(snapshots.resolve(generation)) shouldBe original
+            Files.createFile(root.resolve("pending-release"))
+          }
+          Files.exists(commits.resolve(s"$generation.commit")) shouldBe true
+          Files.isRegularFile(snapshots.resolve(generation).resolve("snapshot.zip")) shouldBe true
+        } finally {
+          OpenIvmRocksDBRegistry.closeAll()
+          spark.stop()
+        }
       }
     }
   }
