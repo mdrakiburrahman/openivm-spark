@@ -685,7 +685,8 @@ object SparkRefreshRewriter {
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None,
       sourceSnapshotRelations: Map[String, String] = Map.empty,
-      lineageCapture: Option[RewriteLineage.Capture] = None
+      lineageCapture: Option[RewriteLineage.Capture] = None,
+      lineagePostProcessRules: Option[Seq[RewriteLineage.RewriteRule]] = None
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -875,7 +876,8 @@ object SparkRefreshRewriter {
               pending.rule.name,
               pending.rule.version,
               pending.rule.classification,
-              RewriteLineage.outputPipelineRules
+              RewriteLineage.outputPipelineRules.dropRight(1) ++
+                lineagePostProcessRules.getOrElse(RewriteLineage.outputPipelineRules.takeRight(1))
             )
           }.toVector
           val outputIndicesBySource = outputs.groupBy(_.sourceOrdinal).map { case (ordinal, sourceOutputs) =>

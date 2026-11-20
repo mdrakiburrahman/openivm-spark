@@ -6143,6 +6143,28 @@ case class RefreshMaterializedViewCommand(
           }
         }
       }
+      if (profile.isActive && sqlLog.isActive) {
+        compiled.nativeSql.foreach { nativeSql =>
+          sqlLog.record(
+            category = "compiler_program_native",
+            stmtOrder = -2,
+            attemptIdx = 0,
+            stmtKind = "compiler_program",
+            sql = nativeSql,
+            durationMs = -1L,
+            emitInsight = false
+          )
+        }
+        sqlLog.record(
+          category = "compiler_program_normalized",
+          stmtOrder = -2,
+          attemptIdx = 0,
+          stmtKind = "compiler_program",
+          sql = compiled.sql,
+          durationMs = -1L,
+          emitInsight = false
+        )
+      }
       if (
         preparedSourceAdvance.nonEmpty &&
         (compiled.refreshType == RefreshTypeCode.FullRefresh ||
@@ -6573,6 +6595,20 @@ case class RefreshMaterializedViewCommand(
                 sourceSnapshotRelations = snapshotRelations,
                 lineageCapture =
                   if (profile.isActive) Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
+                  else None,
+                lineagePostProcessRules =
+                  if (profile.isActive)
+                    Some(
+                      Seq(
+                        RewriteLineage.RewriteRule("lpts-spark-dialect", "1", RewriteLineage.Unknown),
+                        RewriteLineage.RewriteRule("selective-broadcast-hints", "1", RewriteLineage.Unknown),
+                        RewriteLineage.RewriteRule("skew-fanout-broadcast-hints", "1", RewriteLineage.Unknown)
+                      ) ++
+                        (if (FeatureGate.scd2RangeAccelEnabled(spark))
+                           Seq(RewriteLineage.RewriteRule("scd2-range-acceleration", "1", RewriteLineage.Unknown))
+                         else Seq.empty) ++
+                        Seq(RewriteLineage.RewriteRule("expression-marker-restore", "1", RewriteLineage.Unknown))
+                    )
                   else None
               )
             }
@@ -6688,20 +6724,51 @@ case class RefreshMaterializedViewCommand(
                 }
                 .getOrElse("")
 
+            def fusedAggregateLineageDetail(indices: Seq[Int], executed: String): String =
+              rewritten.lineage
+                .flatMap { lineage =>
+                  val outputs = indices.flatMap(index => lineage.outputs.lift(index).toSeq)
+                  if (
+                    outputs.size != indices.size || outputs.isEmpty ||
+                    outputs.exists(_.additionalRewriteRules != outputs.head.additionalRewriteRules)
+                  ) None
+                  else {
+                    val rules = outputs.map(out => s"${out.rewriteRuleName}@${out.rewriteRuleVersion}")
+                    val pipeline = outputs.head.additionalRewriteRules.map(rule => s"${rule.name}@${rule.version}") ++
+                      (if (literalPruneApplied) Seq("regular-nterm-literal-prune@1") else Seq.empty) ++
+                      Seq("inline-view-delta-ctas-into-merge@1")
+                    Some(
+                      s";compiler_program_digest=${lineage.compilerProgramDigest};" +
+                        s"compiler_program_digest_kind=${lineage.compilerProgramDigestKind};" +
+                        s"normalized_program_digest=${lineage.normalizedProgramDigest};" +
+                        "source_ordinal_basis=zero_based_compiler_program_split;" +
+                        "source_digest_basis=split_statement_utf8_without_delimiter;" +
+                        s"source_output_indices=${indices.mkString(",")};" +
+                        s"source_ordinals=${outputs.map(_.sourceOrdinal).mkString(",")};" +
+                        s"source_digests=${outputs.map(_.sourceStatementDigest).mkString(",")};" +
+                        s"source_rewrite_rules=${rules.mkString(",")};rewrite_pipeline=${pipeline.mkString(",")};" +
+                        s"executed_digest_kind=sql_utf8;executed_digest=${RewriteLineage.sha256Utf8(executed)}"
+                    )
+                  }
+                }
+                .getOrElse("")
+
             def executeSqlAt(
                 sql: String,
                 stmtIdx: Int,
                 fullDomainCdfMerge: Boolean = false,
-                sourceIndex: Option[Int] = None
+                sourceIndex: Option[Int] = None,
+                fusedAggregateSources: Seq[Int] = Seq.empty
             ): Unit = {
-              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex)
+              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex, fusedAggregateSources)
               ()
             }
             def executeSqlRowsAt(
                 sql: String,
                 stmtIdx: Int,
                 fullDomainCdfMerge: Boolean = false,
-                sourceIndex: Option[Int] = None
+                sourceIndex: Option[Int] = None,
+                fusedAggregateSources: Seq[Int] = Seq.empty
             ): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)
               val kind =
@@ -6709,6 +6776,9 @@ case class RefreshMaterializedViewCommand(
               val origin =
                 if (fullDomainCdfMerge) "origin_class=executor_helper;credit_reason=full_domain_rewrite"
                 else "origin_class=unknown;credit_reason=unverified_mixed_interval"
+              val lineage =
+                if (fusedAggregateSources.nonEmpty) fusedAggregateLineageDetail(fusedAggregateSources, sql)
+                else lineageDetail(sourceIndex, sql)
               val sqlBytes = sql.length
               val qOrder   = qlogOrder.getAndIncrement()
               profile.timeStep(
@@ -6722,7 +6792,7 @@ case class RefreshMaterializedViewCommand(
                       "execute_refresh_sql_attempt",
                       s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
                         s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
-                        s"$origin;credit_ns=0${lineageDetail(sourceIndex, sql)}"
+                        s"$origin;credit_ns=0$lineage"
                     ) {
                       val result = spark.sql(sql)
                       result -> result.collect()
@@ -6826,7 +6896,7 @@ case class RefreshMaterializedViewCommand(
                   "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
               )
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(directAggregateMerge.get, 1)
+                executeSqlAt(directAggregateMerge.get, 1, fusedAggregateSources = Seq(0, 1))
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────

@@ -282,6 +282,18 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         fields("compiler_program_digest_kind") shouldBe "native_program_utf8"
         fields("source_ordinal_basis") shouldBe "zero_based_compiler_program_split"
         fields("source_digest_basis") shouldBe "split_statement_utf8_without_delimiter"
+        val native     = logs.find(_.category == "compiler_program_native").get.sqlText
+        val normalized = logs.find(_.category == "compiler_program_normalized").get.sqlText
+        fields("compiler_program_digest") shouldBe RewriteLineage.sha256Utf8(native)
+        fields("normalized_program_digest") shouldBe RewriteLineage.sha256Utf8(normalized)
+        fields("source_digest") shouldBe RewriteLineage.sha256Utf8(
+          org.openivm.spark.common.SparkRefreshRewriter
+            .splitStatements(native)
+            .filter(_.trim.nonEmpty)(fields("source_ordinal").toInt)
+        )
+        fields("rewrite_pipeline") should include("lpts-spark-dialect@1")
+        fields("rewrite_pipeline") should include("expression-marker-restore@1")
+        fields("rewrite_pipeline") should not include "caller-post-process@unidentified"
         fields("origin_class") shouldBe "unknown"
         fields("credit_ns") shouldBe "0"
       }

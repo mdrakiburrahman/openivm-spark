@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.RefreshSqlLogCatalog
+import org.openivm.spark.common.{RefreshSqlLogCatalog, RewriteLineage}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Generic coverage for runtime selection of OpenIVM's insert-only aggregate
@@ -11,7 +11,7 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    super.extraSparkConf + ("spark.openivm.queryLog.enabled" -> "true")
+    super.extraSparkConf ++ Map("spark.openivm.queryLog.enabled" -> "true", "spark.openivm.profile.refresh" -> "true")
 
   private def rewrittenSql(view: String): Seq[String] =
     sql("SHOW OPENIVM QUERY LOG")
@@ -50,6 +50,28 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       statements.head.toUpperCase should include("MERGE INTO")
       statements.head.toUpperCase should not include "CREATE OR REPLACE TABLE"
       statements.head should include("__openivm_direct_delta")
+      val attempts = sql("SHOW OPENIVM REFRESH PROFILE")
+        .collect()
+        .toSeq
+        .filter(row => row.getString(1).contains("aio_rollup") && row.getString(4) == "execute_refresh_sql_attempt")
+        .map(_.getString(6))
+        .filter(_.contains("source_output_indices=0,1"))
+      attempts should have size 1
+      val fields = attempts.head
+        .split(";")
+        .iterator
+        .map(_.split("=", 2))
+        .collect { case Array(key, value) =>
+          key -> value
+        }
+        .toMap
+      fields("source_ordinals").split(",") should have length 2
+      fields("source_digests").split(",").foreach(_ should fullyMatch regex "[0-9a-f]{64}")
+      fields("source_rewrite_rules").split(",") should have length 2
+      fields("rewrite_pipeline") should include("inline-view-delta-ctas-into-merge@1")
+      fields("executed_digest") shouldBe RewriteLineage.sha256Utf8(statements.head)
+      fields("origin_class") shouldBe "unknown"
+      fields("credit_ns") shouldBe "0"
     }
 
     itCdf("executes one direct MERGE for MIN/MAX with a derived projection") {

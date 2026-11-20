@@ -19,7 +19,7 @@ import java.sql.Timestamp
   *   - `stmt_order        INT`       — monotonic per-refresh, 0-based; matches the order Spark actually executed statements
   *   - `attempt_idx       INT`       — 0 for the first attempt; 1+ for Delta-OCC retries. Each retry attempt is recorded as its own row so the bench can see all the work Spark did.
   *   - `mode              STRING`    — `create` or `refresh`
-  *   - `category          STRING`    — one of `original_query`, `initial_load_ctas`, `aggregate_having_view`, `register_source_delta`, `rewritten_stmt`, `count_monoid_cleanup`, `post_cleanup_stage`, `drop_cleanup`, `full_refresh_stmt`, `fused_view_delta_select`
+  *   - `category          STRING`    — e.g. `original_query`, `rewritten_stmt`, `full_refresh_stmt`, `compiler_program_native`, `compiler_program_normalized`
   *   - `stmt_kind         STRING`    — reuses [[org.openivm.spark.commands.RefreshPerf.classify]] (e.g. `merge` / `insert_into` / `view_delta_ctas`)
   *   - `duration_ms       BIGINT`    — wall-clock for this single execution (-1 if the statement was not executed by us, e.g. `original_query` capture, or 0 for synthetic events)
   *   - `sql_text          STRING`    — full SQL — **no truncation**
