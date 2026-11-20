@@ -4,7 +4,8 @@ import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Paths, StandardOpenOption}
 
-import org.openivm.spark.common.{BatchVerdict, CdfWatermarkCatalog, DeltaCommitClassifier, FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
+import org.openivm.spark.common.{BatchVerdict, CdfChangeAvailability, DeltaTableVersion, CdfWatermarkCatalog, DeltaCommitClassifier, FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-replacement") with CdfMode {
@@ -16,6 +17,26 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     val events = Files.createDirectories(Paths.get(directory).resolve("spark-events"))
     Seq("spark.eventLog.enabled" -> "true", "spark.eventLog.dir" -> events.toUri.toString)
   }
+
+  private val restorePhase = sys.env.get("TYPED_IDENTITY_RESTORE_PHASE")
+  private val restoreRoot = sys.env.get("TYPED_IDENTITY_RESTORE_ROOT").map(Paths.get(_))
+  private def durableConf: Map[String, String] = {
+    val root = restoreRoot.getOrElse(fail("Missing durable fixture directory"))
+    val phase = restorePhase.getOrElse(fail("Missing durable fixture phase"))
+    val state = root.resolve(s"state-$phase")
+    Files.exists(state) shouldBe false
+    extraSparkConf ++ Map(
+      "spark.sql.catalogImplementation" -> "hive",
+      "spark.hadoop.javax.jdo.option.ConnectionURL" -> s"jdbc:derby:;databaseName=$root/metastore;create=true",
+      "spark.sql.warehouse.dir" -> root.resolve("warehouse").toString,
+      FeatureGate.StatePathKey -> state.toString,
+      FeatureGate.StateSyncUriKey -> root.resolve("archive").toUri.toString,
+      FeatureGate.StateSyncAsyncEnabledKey -> "false"
+    )
+  }
+
+  private def totalSince(known: Set[String]): String =
+    RefreshProfileCatalog.scanAll(spark).filter(row => row.stepName == "total_refresh" && !known(row.refreshId)).map(_.detail).mkString
 
   private val shapes = Seq((13, 9, 4), (13, 9, 4), (12, 9, 5), (12, 9, 5))
   private def exercise(index: Int, enabled: Boolean, expectNoWrite: Boolean): Unit = {
@@ -70,11 +91,38 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     evidence("gate", s"spark=${spark.version}\nclassifier=$log\nlink=$link\nstartExclusive=$p0\nendInclusive=$p1\n${meta.properties}\n$body\n")
     log shouldBe BatchVerdict.Replace
     val raw = spark.read.format("delta").option("readChangeFeed", "true").option("startingVersion", p0 + 1).option("endingVersion", p1).load(path)
-    evidence("cdf.jsonl", raw.toJSON.collect().mkString("\n") + "\n")
+    val evidenceColumns = columns.map(c => if (c == columns.last) s"unix_micros($c) AS ${c}_epoch_micros" else c)
+    evidence("cdf.jsonl", raw.selectExpr((evidenceColumns ++ Seq("_change_type", "_commit_version")): _*).toJSON.collect().mkString("\n") + "\n")
     for (kind <- Seq("insert", "delete")) {
       val rows = raw.where(s"_change_type = '$kind'").selectExpr(columns: _*)
       rows.exceptAll(parentBefore).count() shouldBe 0L
       parentBefore.exceptAll(rows).count() shouldBe 0L
+    }
+    if (expectNoWrite && index == 0 && spark.version.startsWith("4.1")) {
+      val sc = spark.sparkContext
+      val cancelled = new java.util.concurrent.atomic.AtomicBoolean(false)
+      val cancelledGroup = s"$tag-cancelled-proof"
+      val listener = new SparkListener {
+        override def onJobStart(event: SparkListenerJobStart): Unit = {
+          val properties = event.properties
+          if (properties != null && cancelledGroup == properties.getProperty("spark.jobGroup.id") &&
+              "replacement" == properties.getProperty("spark.openivm.publicCdfNoWrite.proof") &&
+              cancelled.compareAndSet(false, true)) {
+            sc.cancelJobGroup(cancelledGroup)
+          }
+        }
+      }
+      sc.addSparkListener(listener)
+      sc.setJobGroup(cancelledGroup, cancelledGroup, interruptOnCancel = true)
+      val failure = try intercept[Exception](refreshMv(child))
+      finally {
+        sc.clearJobGroup()
+        sc.removeSparkListener(listener)
+      }
+      cancelled.get() shouldBe true
+      mvDataVersion(child) shouldBe c0
+      CdfWatermarkCatalog.get(spark, child, link) shouldBe None
+      evidence("cancel", s"targetVersion=$c0\noffset=absent\n${failure.toString}\n")
     }
     val known = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
     spark.sparkContext.setJobGroup(tag, tag)
@@ -91,11 +139,76 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     if (expectNoWrite) c1 shouldBe c0 else c1 should be > c0
     offsets shouldBe Map(link -> p1)
     assertMvCorrect(child, body)
+
+    if (restorePhase.contains("prepare")) {
+      val root = restoreRoot.get
+      Files.write(root.resolve("prepare-pid"), ProcessHandle.current().pid().toString.getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+      Files.write(root.resolve("child-version"), c1.toString.getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+      Files.write(root.resolve("consumed"), p1.toString.getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+    } else if (expectNoWrite && index == 0) {
+      def replace(values: String): Unit = {
+        sql(s"INSERT OVERWRITE TABLE $base VALUES $values")
+        refreshMv(parent)
+      }
+      def mustWrite(label: String, oldVersion: Long): Unit = {
+        val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
+        refreshMv(child)
+        val outcome = totalSince(seen)
+        outcome should include("outcome=full_refresh_executed")
+        val after = mvDataVersion(child)
+        after should be > oldVersion
+        assertMvCorrect(child, body)
+        evidence(label, s"child_before=$oldVersion\nchild_after=$after\n$outcome\n")
+      }
+      // A trailing-space-only change in the binary string key must not cancel.
+      val changed = seed.replace("'É a'", "'É a '")
+      replace(changed)
+      mustWrite("changed", c1)
+
+      // Remove only the obsolete file used for inferred delete images, never a live parent file.
+      val c2 = mvDataVersion(child)
+      val p2 = mvDataVersion(parent)
+      replace(changed)
+      val p3 = mvDataVersion(parent)
+      val commit = DeltaTableVersion.deltaLogFor(spark, path).getChanges(p3, failOnDataLoss = true).next()._2
+      val removed = commit.collect { case remove: org.apache.spark.sql.delta.actions.RemoveFile => remove.path }
+      removed should not be empty
+      removed.foreach(file => Files.delete(Paths.get(new URI(path)).resolve(file)))
+      val missing = CdfChangeAvailability.unavailableReason(spark, link, p2, p3)
+      missing.getOrElse(fail("Missing delete image was not detected")) should include("change data files no longer exist")
+      evidence("missing-cdf", missing.mkString + "\n")
+      mustWrite("unavailable", c2)
+    }
   }
 
-  it("reproduces Replace and reads both physical signs through the bounded feed") {
-    shapes.indices.foreach(exercise(_, enabled = true, expectNoWrite = true))
-    restartSpark(extraSparkConf - FeatureGate.PublicCdfNoWriteEnabledKey)
-    shapes.indices.foreach(exercise(_, enabled = false, expectNoWrite = false))
+  it("proves exact typed bags or retains the ordinary replacement route") {
+    restorePhase match {
+      case Some("prepare") =>
+        restartSpark(durableConf)
+        exercise(0, enabled = true, expectNoWrite = true)
+      case Some("restore") =>
+        val root = restoreRoot.get
+        def prior(name: String): Long = new String(Files.readAllBytes(root.resolve(name)), UTF_8).trim.toLong
+        val pid = ProcessHandle.current().pid()
+        pid should not be prior("prepare-pid")
+        restartSpark(durableConf)
+        val child = "tir_0_on_child"
+        val parent = "default.tir_0_on_parent"
+        OpenIvmStateSync.maybeRestore(spark)
+        CdfWatermarkCatalog.get(spark, child, parent) shouldBe Some(prior("consumed"))
+        mvDataVersion(child) shouldBe prior("child-version")
+        val seen = RefreshProfileCatalog.scanAll(spark).map(_.refreshId).toSet
+        refreshMv(child)
+        val outcome = totalSince(seen)
+        outcome should include("outcome=no_pending_deltas")
+        mvDataVersion(child) shouldBe prior("child-version")
+        assertMvCorrect(child, s"SELECT * FROM $parent")
+        Files.write(root.resolve("restore-receipt"), s"prepare_pid=${prior("prepare-pid")}\nrestore_pid=$pid\nrestored_offset=${prior("consumed")}\nchild_version=${prior("child-version")}\n$outcome\n".getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
+      case Some(other) => fail(s"Unknown durable fixture phase $other")
+      case None =>
+        shapes.indices.foreach(exercise(_, enabled = true, expectNoWrite = true))
+        restartSpark(extraSparkConf - FeatureGate.PublicCdfNoWriteEnabledKey)
+        shapes.indices.foreach(exercise(_, enabled = false, expectNoWrite = false))
+    }
   }
 }

@@ -100,9 +100,11 @@ private[commands] object PublicCdfNoWrite {
 
   private def cancelled(error: Throwable): Boolean =
     Iterator.iterate(error)(_.getCause).takeWhile(_ != null).take(32).exists {
-      case _: InterruptedException | _: java.util.concurrent.CancellationException => true
+      case _: InterruptedException | _: java.io.InterruptedIOException | _: java.util.concurrent.CancellationException => true
       case e: SparkThrowable =>
-        SparkCommandCompat.errorCondition(e).exists(c => c == "SPARK_JOB_CANCELLED" || c == "OPERATION_CANCELED")
+        SparkCommandCompat.errorCondition(e).exists(c => c == "SPARK_JOB_CANCELLED" || c == "OPERATION_CANCELED") ||
+          (e.isInstanceOf[org.apache.spark.SparkException] &&
+            Option(e.getMessage).exists(_.matches("(?s)Job [0-9]+ cancelled.*")))
       case _ => false
     }
 
@@ -179,7 +181,12 @@ private[commands] object PublicCdfNoWrite {
                   val keys = schema.fields.toSeq.zip(columns).map { case (field, column) =>
                     if (field.dataType == StringType) column.cast(BinaryType).as(field.name) else column
                   }
-                  replacementCancels(public, keys.zipWithIndex.map { case (key, i) => key.as(s"_k$i") }, end)
+                  val sc = spark.sparkContext
+                  val property = "spark.openivm.publicCdfNoWrite.proof"
+                  val prior = sc.getLocalProperty(property)
+                  sc.setLocalProperty(property, "replacement")
+                  try replacementCancels(public, keys.zipWithIndex.map { case (key, i) => key.as(s"_k$i") }, end)
+                  finally sc.setLocalProperty(property, prior)
                 } else {
                 val adds                          = public.where(col(ChangeType).isin(Positive: _*)).select(columns: _*)
                 val removes                       = public.where(col(ChangeType).isin(Negative: _*)).select(columns: _*)
