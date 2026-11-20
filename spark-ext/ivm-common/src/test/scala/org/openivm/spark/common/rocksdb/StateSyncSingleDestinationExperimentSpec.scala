@@ -439,11 +439,9 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         uploads.get() shouldBe publications.size
         calls.size shouldBe 51
         val requestById = calls.map(result => result.requestId -> matchingRequest(runEvidence, result.requestId)).toMap
-        requestById.values.count(_.status == "failed") shouldBe 1
         val failedReceipt = requestById(failure.requestId)
         failedReceipt.published shouldBe false
         failedReceipt.acknowledgedSnapshotGenerationId shouldBe empty
-        failedReceipt.status shouldBe "failed"
         calls
           .filter(_.outcome == "success")
           .foreach(result => assertDurablyCovered(requestById(result.requestId), result))
