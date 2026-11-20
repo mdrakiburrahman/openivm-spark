@@ -112,6 +112,19 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     spark
   }
 
+  private def seedStateSync(spark: SparkSession, name: String = "seed.bin"): File = {
+    val file = OpenIvmStatePaths.openIvmRoot(spark).resolve(name).toFile
+    file.getParentFile.mkdirs()
+    Files.write(file.toPath, Array[Byte](1))
+    file
+  }
+
+  private def mutateStateSyncFile(spark: SparkSession, file: File, value: Int): Unit =
+    OpenIvmStateBarrier.withMutationRootForTesting(OpenIvmStatePaths.openIvmRoot(spark)) {
+      Files.write(file.toPath, Array(value.toByte))
+      ()
+    }
+
   private def newStateSyncSession(base: SparkSession, key: String): SparkSession = {
     val session = base.newSession()
     session.conf.set(TestStateSyncKey, key)
@@ -868,33 +881,87 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
   }
 
   describe("OpenIvmStateSync") {
-    it("honours an explicit synchronous command backup and propagates upload failure") {
+    it("requires a committed synchronous snapshot before command cleanup") {
+      val remote    = newDir("state-sync-command-remote")
+      val localRoot = newDir("state-sync-command-local")
       val spark = newSpark(
         "state-sync-command-override",
         Seq(
-          FeatureGate.StateSyncUriKey          -> "file:/state-sync-command-override",
+          FeatureGate.StatePathKey             -> localRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey          -> remote.toURI.toString,
           FeatureGate.StateSyncAsyncEnabledKey -> "false"
         )
       )
       FeatureGate.stateSyncAsyncEnabled(spark) shouldBe false
-      val caller   = Thread.currentThread()
+      OpenIvmRocksDBRegistry.closeAll()
+      deleteRecursively(OpenIvmStateBarrier.root(spark).toFile)
+      OpenIvmStateSync.resetForTesting()
+      OpenIvmStateSync.backupNowWithOutcome(spark) shouldBe OpenIvmStateSync.BackupNoLocalState
       val cleanups = new AtomicInteger(0)
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-        Thread.currentThread() shouldBe caller
-        throw new java.io.IOException("injected synchronous command backup failure")
-      }
-      intercept[java.io.IOException] {
-        OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
-      }.getMessage shouldBe "injected synchronous command backup failure"
+      OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
       cleanups.get() shouldBe 0
 
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => Thread.currentThread() shouldBe caller }
-      OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
+      MvCatalog.ensureTables(spark)
+      MvCatalog.upsert(spark, sourceSharingMeta(1, "state-sync"))
+      OpenIvmStateSync.setBackupPassHookForTesting((_, _, _) => ())
+      intercept[java.io.IOException] {
+        OpenIvmStateSync.backupForCommand(spark, () => { cleanups.incrementAndGet(); () })
+      }.getMessage shouldBe
+        "openivm state-sync: synchronous backup returned without publishing a committed snapshot"
+      cleanups.get() shouldBe 0
+
+      OpenIvmStateSync.setBackupPassHookForTesting(null)
+      OpenIvmStateSync.backupForCommand(
+        spark,
+        () => {
+          val commitRoot = new File(remote, ".openivm-state-sync/commits")
+          Option(commitRoot.listFiles()).toSeq.flatten.count(_.getName.endsWith(".commit")) should be > 0
+          cleanups.incrementAndGet()
+          ()
+        }
+      )
       cleanups.get() shouldBe 1
       spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "true")
       FeatureGate.stateSyncAsyncEnabled(spark) shouldBe true
       spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
       FeatureGate.stateSyncAsyncEnabled(spark) shouldBe false
+    }
+
+    it("separates synchronous requests with different generation-coverage modes") {
+      val remote = newDir("state-sync-mixed-remote")
+      val spark = newSpark(
+        "state-sync-mixed-coverage",
+        Seq(
+          FeatureGate.StateSyncUriKey          -> remote.toURI.toString,
+          FeatureGate.StateSyncAsyncEnabledKey -> "false"
+        )
+      )
+      MvCatalog.ensureTables(spark)
+      val noCoverage = newStateSyncSession(spark, "state-sync-mixed-no-coverage")
+      noCoverage.conf.set(OpenIvmRocksDBConf.MultiProcessKey, "true")
+      val entered  = new CountDownLatch(1)
+      val release  = new CountDownLatch(1)
+      val enqueues = new AtomicInteger(0)
+      val passes   = new AtomicInteger(0)
+      OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting { () =>
+        if (enqueues.incrementAndGet() == 1) {
+          entered.countDown()
+          release.await(RegistryRaceTimeout.toMillis, TimeUnit.MILLISECONDS) shouldBe true
+        }
+      }
+      OpenIvmStateSync.setBackupPassHookForTesting((_, _, _) => { passes.incrementAndGet(); () })
+      try {
+        val coveredRequest = Future(scala.util.Try(OpenIvmStateSync.backupNow(spark)))
+        awaitLatch(entered, "first synchronous request to pause before draining")
+        val untrackedRequest = Future(scala.util.Try(OpenIvmStateSync.backupNow(noCoverage)))
+        waitUntil(RegistryRaceTimeout) {
+          OpenIvmStateSync.synchronousRequestCountForTesting(spark) == 2L
+        }
+        release.countDown()
+        val results = Await.result(Future.sequence(Seq(coveredRequest, untrackedRequest)), RegistryRaceTimeout)
+        results.foreach(_.failed.get.getMessage should include("synchronous backup returned without publishing"))
+        passes.get() shouldBe 2
+      } finally release.countDown()
     }
 
     it("runs local command cleanup inline when asynchronous remote sync has no URI") {
@@ -907,12 +974,15 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       OpenIvmStateSync.backupStateSnapshotForTesting(spark) shouldBe None
     }
 
-    it("runs asynchronous cleanup by default only after its own successful publication") {
+    it("runs asynchronous cleanup only after a covering successful publication") {
       val spark = newSpark(
         "state-sync-async-command",
-        Seq(FeatureGate.StateSyncUriKey -> "file:/state-sync-async-command")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-async-remote").toURI.toString)
       )
       val session = newStateSyncSession(spark, "async-command")
+      val seed    = new File(OpenIvmStatePaths.openIvmRoot(session).toFile, "seed.bin")
+      seed.getParentFile.mkdirs()
+      Files.write(seed.toPath, Array[Byte](1))
       session.conf.getOption(FeatureGate.StateSyncAsyncEnabledKey) shouldBe None
       FeatureGate.stateSyncAsyncEnabled(session) shouldBe true
       val entered           = Array.fill(2)(new CountDownLatch(1))
@@ -921,11 +991,11 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val failedCleanup     = new AtomicInteger(0)
       val successfulCleanup = new AtomicInteger(0)
       OpenIvmStateSync.setStateSyncKeyHookForTesting((current, _) => current.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         val pass = passes.getAndIncrement()
         entered(pass).countDown()
         release(pass).await(10, TimeUnit.SECONDS) shouldBe true
-        if (pass == 0) throw new java.io.IOException("injected asynchronous upload failure")
+        if (pass == 0) throw new java.io.IOException("injected asynchronous commit failure")
       }
       try {
         OpenIvmStateSync.backupForCommand(session, () => { failedCleanup.incrementAndGet(); () })
@@ -938,7 +1008,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         successfulCleanup.get() shouldBe 0
         release(1).countDown()
         waitForStateSyncIdle(session)
-        failedCleanup.get() shouldBe 0
+        failedCleanup.get() shouldBe 1
         successfulCleanup.get() shouldBe 1
         passes.get() shouldBe 2
       } finally {
@@ -947,18 +1017,21 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
-    it("admits a waiting synchronous barrier before an asynchronous follow-up pass") {
+    it("acknowledges a waiting synchronous barrier from a covering async publication") {
       val spark = newSpark(
         "state-sync-fair-admission",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-remote").toURI.toString)
       )
       val session = newStateSyncSession(spark, "fair-admission")
+      val seed    = new File(OpenIvmStatePaths.openIvmRoot(session).toFile, "seed.bin")
+      seed.getParentFile.mkdirs()
+      Files.write(seed.toPath, Array[Byte](1))
       val entered = new CountDownLatch(1)
       val release = new CountDownLatch(1)
       val passes  = new AtomicInteger(0)
       val order   = new java.util.concurrent.ConcurrentLinkedQueue[String]()
       OpenIvmStateSync.setStateSyncKeyHookForTesting((current, _) => current.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         val background = Thread.currentThread().getName == "openivm-state-sync"
         order.add(if (background) "async" else "sync")
         if (passes.incrementAndGet() == 1) {
@@ -975,7 +1048,8 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         release.countDown()
         Await.result(synchronous, RegistryRaceTimeout)
         waitForStateSyncIdle(session)
-        order.iterator().asScala.toSeq shouldBe Seq("async", "sync", "async")
+        order.iterator().asScala.toSeq shouldBe Seq("async")
+        passes.get() shouldBe 1
       } finally {
         release.countDown()
         waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
@@ -1299,99 +1373,111 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     it("does not cover mutations requested after a synchronous pass starts") {
       val spark = newSpark(
         "state-sync-barrier-arrival",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-barrier-arrival-remote").toURI.toString)
       )
       val stateSession = newStateSyncSession(spark, "barrier-arrival")
+      val seed         = seedStateSync(stateSession)
       val entered      = Array.fill(3)(new CountDownLatch(1))
       val release      = Array.fill(3)(new CountDownLatch(1))
-      val generation   = new AtomicInteger(1)
       val passes       = new AtomicInteger(0)
-      val copied       = new java.util.concurrent.ConcurrentLinkedQueue[Int]()
-      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      val captured     = new java.util.concurrent.ConcurrentLinkedQueue[Long]()
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         val index = passes.getAndIncrement()
-        copied.add(generation.get())
+        captured.add(OpenIvmStateBarrier.currentMutationGenerationForTesting(stateSession))
         entered(index).countDown()
         release(index).await(10, TimeUnit.SECONDS) shouldBe true
       }
       try {
+        mutateStateSyncFile(stateSession, seed, 1)
         val first = Future(OpenIvmStateSync.backupNow(stateSession))
         entered(0).await(5, TimeUnit.SECONDS) shouldBe true
-        generation.set(2)
+        mutateStateSyncFile(stateSession, seed, 2)
         val second = Future(OpenIvmStateSync.backupNow(stateSession))
         waitUntil(5.seconds) { OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) == 2L }
         release(0).countDown()
-        entered(1).await(5, TimeUnit.SECONDS) shouldBe true
         Await.result(first, RegistryRaceTimeout)
         second.isCompleted shouldBe false
-        generation.set(3)
+        entered(1).await(5, TimeUnit.SECONDS) shouldBe true
+        mutateStateSyncFile(stateSession, seed, 3)
         val third = Future(OpenIvmStateSync.backupNow(stateSession))
         waitUntil(5.seconds) { OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) == 3L }
         release(1).countDown()
-        entered(2).await(5, TimeUnit.SECONDS) shouldBe true
         Await.result(second, RegistryRaceTimeout)
         third.isCompleted shouldBe false
+        entered(2).await(5, TimeUnit.SECONDS) shouldBe true
         release(2).countDown()
         Await.result(third, RegistryRaceTimeout)
-        copied.iterator().asScala.toSeq shouldBe Seq(1, 2, 3)
+        captured.iterator().asScala.toSeq shouldBe Seq(1L, 2L, 3L)
       } finally release.foreach(_.countDown())
     }
 
     it("fails every covered synchronous waiter and permits a later explicit retry") {
       val spark = newSpark(
         "state-sync-barrier-failure",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-barrier-failure-remote").toURI.toString)
       )
       val stateSession = newStateSyncSession(spark, "barrier-failure")
-      val entered      = new CountDownLatch(1)
-      val release      = new CountDownLatch(1)
-      val passes       = new AtomicInteger(0)
-      val failure      = new java.io.IOException("snapshot upload failed")
-      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-        passes.incrementAndGet() match {
-          case 1 =>
-            entered.countDown()
-            release.await(10, TimeUnit.SECONDS) shouldBe true
-          case 2 => throw failure
-          case _ => ()
-        }
+      seedStateSync(stateSession)
+      val arrivals = new CountDownLatch(3)
+      val release  = new CountDownLatch(1)
+      val passes   = new AtomicInteger(0)
+      val failure  = new java.io.IOException("snapshot commit failed")
+      OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting { () =>
+        arrivals.countDown()
+        release.await(10, TimeUnit.SECONDS) shouldBe true
+      }
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
+        if (passes.incrementAndGet() == 1) throw failure
       }
       try {
-        val first = Future(OpenIvmStateSync.backupNow(stateSession))
-        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        val first  = Future(scala.util.Try(OpenIvmStateSync.backupNow(stateSession)))
         val second = Future(scala.util.Try(OpenIvmStateSync.backupNow(stateSession)))
         val third  = Future(scala.util.Try(OpenIvmStateSync.backupNow(stateSession)))
-        waitUntil(5.seconds) { OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) == 3L }
+        arrivals.await(5, TimeUnit.SECONDS) shouldBe true
+        OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) shouldBe 3L
         release.countDown()
-        Await.result(first, RegistryRaceTimeout)
-        Await.result(second, RegistryRaceTimeout).failed.get shouldBe failure
-        Await.result(third, RegistryRaceTimeout).failed.get shouldBe failure
+        Seq(first, second, third).foreach { pending =>
+          Await.result(pending, RegistryRaceTimeout).failed.get shouldBe failure
+        }
+        OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
         OpenIvmStateSync.backupNow(stateSession)
-        passes.get() shouldBe 3
+        passes.get() shouldBe 2
       } finally release.countDown()
     }
 
     it("allows different synchronous namespaces to publish concurrently") {
       val spark = newSpark(
         "state-sync-synchronous-namespaces",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-synchronous-remote").toURI.toString)
       )
-      val left    = newStateSyncSession(spark, "sync-left")
-      val right   = newStateSyncSession(spark, "sync-right")
-      val entered = new CountDownLatch(2)
-      val release = new CountDownLatch(1)
+      val left  = newStateSyncSession(spark, "sync-left")
+      val right = newStateSyncSession(spark, "sync-right")
+      left.conf.set(FeatureGate.StateSyncUriKey, newDir("state-sync-sync-left-remote").toURI.toString)
+      right.conf.set(FeatureGate.StateSyncUriKey, newDir("state-sync-sync-right-remote").toURI.toString)
+      seedStateSync(left)
+      val entered   = new CountDownLatch(2)
+      val release   = new CountDownLatch(1)
+      val passes    = new AtomicInteger(0)
+      val active    = new AtomicInteger(0)
+      val maxActive = new AtomicInteger(0)
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-        entered.countDown()
-        release.await(10, TimeUnit.SECONDS) shouldBe true
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
+        val current = active.incrementAndGet()
+        maxActive.updateAndGet(existing => math.max(existing, current))
+        passes.incrementAndGet()
+        try {
+          entered.countDown()
+          release.await(10, TimeUnit.SECONDS) shouldBe true
+        } finally active.decrementAndGet()
       }
       try {
         val pending = Seq(left, right).map(session => Future(OpenIvmStateSync.backupNow(session)))
         entered.await(5, TimeUnit.SECONDS) shouldBe true
         pending.forall(!_.isCompleted) shouldBe true
+        maxActive.get() shouldBe 2
         release.countDown()
         Await.result(Future.sequence(pending), RegistryRaceTimeout)
+        passes.get() shouldBe 2
       } finally release.countDown()
     }
 
@@ -1563,7 +1649,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     it("bounds sixty-four synchronous request-barrier backups") {
       val spark = newSpark(
         "state-sync-request-barrier",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-request-barrier-remote").toURI.toString)
       )
       val stateSession                = newStateSyncSession(spark, "request-barrier")
       val executor                    = Executors.newFixedThreadPool(64)
@@ -1572,8 +1658,8 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val release                     = new CountDownLatch(1)
       val submitted                   = new CountDownLatch(63)
       val passes                      = new AtomicInteger(0)
-      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      seedStateSync(stateSession)
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         if (passes.incrementAndGet() == 1) {
           entered.countDown()
           release.await(10, TimeUnit.SECONDS) shouldBe true
@@ -1593,7 +1679,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         rest.forall(!_.isCompleted) shouldBe true
         release.countDown()
         Await.result(Future.sequence(first +: rest), RegistryRaceTimeout)
-        passes.get() shouldBe 2
+        passes.get() shouldBe 1
       } finally {
         release.countDown()
         executor.shutdownNow()
@@ -1785,19 +1871,20 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val spark = newSpark(
         "state-sync-mixed-coalesce",
         Seq(
-          FeatureGate.StateSyncUriKey        -> "abfss://state-sync@onelake/lh/_openivm",
+          FeatureGate.StateSyncUriKey        -> newDir("state-sync-remote").toURI.toString,
           FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
       val stateSession = newStateSyncSession(spark, "mixed-coalesce")
-      val passCount    = new AtomicInteger(0)
-      val evidence     = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
+      seedStateSync(stateSession)
+      val passCount = new AtomicInteger(0)
+      val evidence  = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.synchronized(evidence += value))
       val firstEntered = new CountDownLatch(1)
       val releaseFirst = new CountDownLatch(1)
 
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         if (passCount.incrementAndGet() == 1) {
           firstEntered.countDown()
           releaseFirst.await(10, TimeUnit.SECONDS)
@@ -1821,17 +1908,15 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         releaseFirst.countDown()
         waitForStateSyncIdle(stateSession)
 
-        passCount.get() shouldBe 2
-        val events     = evidence.synchronized(evidence.toVector)
-        val shared     = events.flatMap(_.publications).find(_.requestedRequests == 2).get
-        val associated = events.flatMap(_.requests).filter(_.publicationId == shared.publicationId)
-        associated.map(_.requestId).distinct should have length 2
-        associated.filter(_.parentRequestId.nonEmpty).map(_.requestId).distinct should have length 1
-        associated.filter(_.parentRequestId.isEmpty).map(_.requestId).distinct should have length 1
-        events.flatMap(_.publications).count(_.publicationId == shared.publicationId) shouldBe 1
-        events.exists(event =>
-          event.publications.isEmpty && event.requests.exists(_.parentRequestId.contains("refresh-parent"))
-        ) shouldBe true
+        passCount.get() shouldBe 1
+        val events      = evidence.synchronized(evidence.toVector)
+        val publication = events.flatMap(_.publications).find(_.published).get
+        publication.requestedRequests shouldBe 1
+        val associated = events.flatMap(_.requests).filter(_.publicationId == publication.publicationId)
+        associated.map(_.requestId).distinct should have length 3
+        associated.filter(_.parentRequestId.contains("refresh-parent")).map(_.requestId).distinct should have length 1
+        associated.filter(_.parentRequestId.isEmpty).map(_.requestId).distinct should have length 2
+        events.flatMap(_.publications).count(_.publicationId == publication.publicationId) shouldBe 1
 
         val files = Files.walk(telemetryDir.toPath)
         val receipts =
@@ -1847,16 +1932,14 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
             .path("publications")
             .elements()
             .asScala
-            .exists(_.path("publication_id").asText() == shared.publicationId)
+            .exists(_.path("publication_id").asText() == publication.publicationId)
         }
         publicationReceipts should have size 1
         publicationReceipts.head.path("scope").asText() shouldBe "run"
-        publicationReceipts.head
-          .path("state_sync")
-          .path("requests")
-          .elements()
-          .asScala
-          .exists(_.path("parent_request_id").asText() == "refresh-parent") shouldBe true
+        trees.flatMap(_.path("state_sync").path("requests").elements().asScala).exists { request =>
+          request.path("parent_request_id").asText() == "refresh-parent" &&
+          request.path("publication_id").asText() == publication.publicationId
+        } shouldBe true
       } finally {
         releaseFirst.countDown()
         waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
@@ -1868,19 +1951,21 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val spark = newSpark(
         "state-sync-parent-sink",
         Seq(
-          FeatureGate.StateSyncUriKey   -> "abfss://state-sync@onelake/lh/_openivm",
-          FeatureGate.ProfileRefreshKey -> "true"
+          FeatureGate.StateSyncUriKey        -> newDir("state-sync-remote").toURI.toString,
+          FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString,
+          FeatureGate.ProfileRefreshKey      -> "true"
         )
       )
       val stateSession = newStateSyncSession(spark, "parent-sink")
-      val evidence     = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
+      seedStateSync(stateSession)
+      val evidence = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.synchronized(evidence += value))
       val firstEntered = new CountDownLatch(1)
       val releaseFirst = new CountDownLatch(1)
       val passCount    = new AtomicInteger(0)
 
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         if (passCount.incrementAndGet() == 1) {
           firstEntered.countDown()
           releaseFirst.await(10, TimeUnit.SECONDS)
@@ -1912,10 +1997,16 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         releaseFirst.countDown()
         waitForStateSyncIdle(stateSession)
 
-        val publication =
-          evidence.synchronized(evidence.toVector.flatMap(_.publications)).find(_.requestedRequests == 2).get
-        publication.parentRequestIds should contain("refresh-log-only-parent")
-        publication.parentRequestIds should contain("refresh-sink-parent")
+        val events      = evidence.synchronized(evidence.toVector)
+        val publication = events.flatMap(_.publications).find(_.published).get
+        publication.requestedRequests shouldBe 1
+        val associated = events.flatMap(_.requests).filter(_.publicationId == publication.publicationId)
+        associated.map(_.requestId).distinct should have length 3
+        associated.flatMap(_.parentRequestId).toSet should contain allOf (
+          "refresh-log-only-parent",
+          "refresh-sink-parent"
+        )
+        events.flatMap(_.publications).count(_.publicationId == publication.publicationId) shouldBe 1
 
         val files = Files.walk(telemetryDir.toPath)
         val receipts =
@@ -1933,6 +2024,9 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
             .asScala
             .exists(_.path("publication_id").asText() == publication.publicationId)
         } shouldBe true
+        persisted
+          .flatMap(_.path("state_sync").path("requests").elements().asScala)
+          .exists(_.path("parent_request_id").asText() == "refresh-sink-parent") shouldBe true
       } finally {
         spark.sparkContext.setLocalProperty("openivm.request_id", null)
         releaseFirst.countDown()
@@ -1940,24 +2034,25 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
-    it("bounds coalesced publication request links and reports omitted IDs") {
+    it("keeps late coalesced request links exact and bounded per telemetry record") {
       val telemetryDir = newDir("state-sync-link-limit-telemetry")
       val spark = newSpark(
         "state-sync-link-limit",
         Seq(
-          FeatureGate.StateSyncUriKey        -> "abfss://state-sync@onelake/lh/_openivm",
+          FeatureGate.StateSyncUriKey        -> newDir("state-sync-remote").toURI.toString,
           FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
       val stateSession = newStateSyncSession(spark, "link-limit")
-      val evidence     = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
+      seedStateSync(stateSession)
+      val evidence = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.synchronized(evidence += value))
       val firstEntered = new CountDownLatch(1)
       val releaseFirst = new CountDownLatch(1)
       val passCount    = new AtomicInteger(0)
 
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         if (passCount.incrementAndGet() == 1) {
           firstEntered.countDown()
           releaseFirst.await(10, TimeUnit.SECONDS)
@@ -1975,45 +2070,42 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         releaseFirst.countDown()
         waitForStateSyncIdle(stateSession)
 
-        val publication = evidence
-          .synchronized(evidence.toVector.flatMap(_.publications))
-          .find(_.requestedRequests == 130)
-          .get
-        publication.requestIds should have length OpenIvmExecutionSpan.MaxStateSyncRequests
-        publication.parentRequestIds should have length OpenIvmExecutionSpan.MaxStateSyncRequests
-        publication.droppedRequestIds shouldBe 2L
-        publication.droppedParentRequestIds shouldBe 2L
+        val events      = evidence.synchronized(evidence.toVector)
+        val publication = events.flatMap(_.publications).find(_.published).get
+        publication.requestedRequests shouldBe 1
+        publication.requestIds should have length 1
+        publication.droppedRequestIds shouldBe 0L
+        publication.droppedParentRequestIds shouldBe 0L
+        val associated = events.flatMap(_.requests).filter(_.publicationId == publication.publicationId)
+        associated.map(_.requestId).distinct should have length 131
+        associated.flatMap(_.parentRequestId).toSet shouldBe (1 to 130).map(i => s"refresh-$i").toSet
+        associated.foreach(_.requestId.length should be > 0)
 
         val files = Files.walk(telemetryDir.toPath)
         val receipts =
           try files.iterator().asScala.filter(_.getFileName.toString.endsWith(".jsonl")).toVector
           finally files.close()
-        val mixedReceipt = receipts.iterator
-          .map { file =>
-            val line = new String(Files.readAllBytes(file), StandardCharsets.UTF_8).trim
-            json.readTree(line.stripPrefix("OPENIVM_EXECUTION_SPAN "))
-          }
-          .find(
-            _.path("state_sync")
-              .path("publications")
-              .elements()
-              .asScala
-              .exists(
-                _.path("publication_id").asText() == publication.publicationId
-              )
-          )
-          .get
-        val linkedPublication = mixedReceipt
-          .path("state_sync")
-          .path("publications")
-          .elements()
-          .asScala
-          .find(_.path("publication_id").asText() == publication.publicationId)
-          .get
-        linkedPublication.path("request_ids").size() shouldBe OpenIvmExecutionSpan.MaxStateSyncRequests
-        linkedPublication.path("parent_request_ids").size() shouldBe OpenIvmExecutionSpan.MaxStateSyncRequests
-        linkedPublication.path("dropped_request_ids").asLong() shouldBe 2L
-        linkedPublication.path("dropped_parent_request_ids").asLong() shouldBe 2L
+        val persisted = receipts.map { file =>
+          val line = new String(Files.readAllBytes(file), StandardCharsets.UTF_8).trim
+          json.readTree(line.stripPrefix("OPENIVM_EXECUTION_SPAN "))
+        }
+        val publicationReceipts = persisted.filter { tree =>
+          tree
+            .path("state_sync")
+            .path("publications")
+            .elements()
+            .asScala
+            .exists(_.path("publication_id").asText() == publication.publicationId)
+        }
+        publicationReceipts should have size 1
+        val requestReceipts = persisted
+          .flatMap(_.path("state_sync").path("requests").elements().asScala)
+          .filter(_.path("publication_id").asText() == publication.publicationId)
+        requestReceipts should have length 131
+        requestReceipts.foreach(_.path("request_id").asText().length should be > 0)
+        persisted.foreach(
+          _.path("state_sync").path("requests").size() should be <= OpenIvmExecutionSpan.MaxStateSyncRequests
+        )
       } finally {
         spark.sparkContext.setLocalProperty("openivm.request_id", null)
         releaseFirst.countDown()
@@ -2021,66 +2113,69 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
-    it("coalesces in-flight requests into one follow-up pass and stays bounded while eventually becoming idle") {
+    it("coalesces requests only when committed capture coverage includes their generation") {
+      val telemetryDir = newDir("state-sync-coalesce-telemetry")
       val spark = newSpark(
         "state-sync-coalesce",
         Seq(
-          FeatureGate.StateSyncUriKey   -> "abfss://state-sync@onelake/lh/_openivm",
-          FeatureGate.ProfileRefreshKey -> "true"
+          FeatureGate.StateSyncUriKey        -> newDir("state-sync-coalesce-remote").toURI.toString,
+          FeatureGate.ProfileRefreshKey      -> "true",
+          FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
       val stateSession = newStateSyncSession(spark, "coalesce")
-      val passCount    = new AtomicInteger(0)
-      val evidence     = ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncEvidence]
-      OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.synchronized(evidence += value))
-      val entered = Array.fill(3)(new CountDownLatch(1))
-      val release = Array.fill(3)(new CountDownLatch(1))
+      seedStateSync(stateSession)
+      val passes         = new AtomicInteger(0)
+      val captureEntered = new CountDownLatch(1)
+      val releaseCapture = new CountDownLatch(1)
+      val commitEntered  = new CountDownLatch(1)
+      val releaseCommit  = new CountDownLatch(1)
+      val duringAcks     = new java.util.concurrent.ConcurrentLinkedQueue[OpenIvmStateSync.StateSyncAcknowledgement]()
+      val afterAcks      = new java.util.concurrent.ConcurrentLinkedQueue[OpenIvmStateSync.StateSyncAcknowledgement]()
 
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-        val pass = passCount.incrementAndGet()
-        if (pass <= entered.length) {
-          entered(pass - 1).countDown()
-          release(pass - 1).await(10, TimeUnit.SECONDS)
-        }
+      OpenIvmStateSync.setDuringCaptureHookForTesting { () =>
+        captureEntered.countDown()
+        releaseCapture.await(10, TimeUnit.SECONDS) shouldBe true
+      }
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
+        passes.incrementAndGet()
+        commitEntered.countDown()
+        releaseCommit.await(10, TimeUnit.SECONDS) shouldBe true
       }
 
       try {
         OpenIvmStateSync.backupAsync(stateSession)
-        entered(0).await(5, TimeUnit.SECONDS) shouldBe true
+        captureEntered.await(5, TimeUnit.SECONDS) shouldBe true
 
-        OpenIvmStateSync.backupAsync(stateSession)
-        release(0).countDown()
-
-        entered(1).await(5, TimeUnit.SECONDS) shouldBe true
-        passCount.get() shouldBe 2
-
-        (1 to 64).foreach(_ => OpenIvmStateSync.backupAsync(stateSession))
-        release(1).countDown()
-
-        entered(2).await(5, TimeUnit.SECONDS) shouldBe true
-        passCount.get() shouldBe 3
-
-        release(2).countDown()
-        waitForStateSyncIdle(stateSession)
-        OpenIvmStateSync.allBackupStatesIdleForTesting shouldBe true
-        passCount.get() shouldBe 3
-        val requestEvidence = evidence.synchronized(evidence.toVector.flatMap(_.requests))
-        requestEvidence should have length 66
-        requestEvidence.map(_.requestId).distinct should have length 66
-        requestEvidence.foreach { request =>
-          request.effectiveMode shouldBe "asynchronous"
-          request.requested shouldBe true
-          request.captured shouldBe false
-          request.published shouldBe false
-          request.acknowledgedSnapshotGenerationId shouldBe None
+        val duringCapture = Future {
+          OpenIvmStateSync.backupAsyncWithAcknowledgement(stateSession, ack => duringAcks.add(ack))
         }
-        val passEvidence = evidence.synchronized(evidence.toVector.flatMap(_.publications))
-        passEvidence should have length 3
-        passEvidence.map(_.requestedRequests) shouldBe Vector(1, 1, 64)
-        requestEvidence.map(_.publicationId).distinct.toSet shouldBe passEvidence.map(_.publicationId).toSet
+        duringCapture.isCompleted shouldBe false
+        releaseCapture.countDown()
+        commitEntered.await(5, TimeUnit.SECONDS) shouldBe true
+        Await.result(duringCapture, RegistryRaceTimeout)
+        duringAcks shouldBe empty
+
+        releaseCommit.countDown()
+        waitForStateSyncIdle(stateSession)
+        duringAcks should have size 1
+
+        OpenIvmStateSync.backupAsyncWithAcknowledgement(stateSession, ack => afterAcks.add(ack))
+        afterAcks should have size 1
+        passes.get() shouldBe 1
+
+        val duringAck = duringAcks.peek()
+        val afterAck  = afterAcks.peek()
+        duringAck.exactCoverage shouldBe true
+        afterAck.exactCoverage shouldBe true
+        duringAck.publicationId shouldBe afterAck.publicationId
+        duringAck.snapshotGenerationId shouldBe afterAck.snapshotGenerationId
+        duringAck.capturedMutationGeneration.get should be >= duringAck.requestedMutationGeneration.get
+        afterAck.capturedMutationGeneration.get should be >= afterAck.requestedMutationGeneration.get
       } finally {
-        release.foreach(_.countDown())
+        releaseCapture.countDown()
+        releaseCommit.countDown()
         waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
       }
     }
@@ -2088,105 +2183,91 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
     it("serializes synchronous backup with an in-flight asynchronous pass") {
       val spark = newSpark(
         "state-sync-synchronous-serialization",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-synchronous-serialization-remote").toURI.toString)
       )
       val stateSession = newStateSyncSession(spark, "synchronous-serialization")
-      val entered      = new CountDownLatch(1)
-      val release      = new CountDownLatch(1)
-      val passCount    = new AtomicInteger(0)
-      val active       = new AtomicInteger(0)
-      val maxActive    = new AtomicInteger(0)
+      seedStateSync(stateSession)
+      val entered   = new CountDownLatch(1)
+      val release   = new CountDownLatch(1)
+      val passCount = new AtomicInteger(0)
+      val active    = new AtomicInteger(0)
+      val maxActive = new AtomicInteger(0)
 
-      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         val current = active.incrementAndGet()
         maxActive.updateAndGet(existing => math.max(existing, current))
         val pass = passCount.incrementAndGet()
         try {
           if (pass == 1) {
             entered.countDown()
-            release.await(10, TimeUnit.SECONDS)
+            release.await(10, TimeUnit.SECONDS) shouldBe true
           }
-        } finally {
-          active.decrementAndGet()
-        }
+        } finally active.decrementAndGet()
       }
 
       try {
         OpenIvmStateSync.backupAsync(stateSession)
         entered.await(5, TimeUnit.SECONDS) shouldBe true
 
-        val synchronous = Future {
-          OpenIvmStateSync.backupNow(stateSession)
-        }
-        Thread.sleep(100L)
+        val synchronous = Future(OpenIvmStateSync.backupNow(stateSession))
+        waitUntil(5.seconds) { OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) == 1L }
         synchronous.isCompleted shouldBe false
 
         release.countDown()
         Await.result(synchronous, RegistryRaceTimeout)
         waitForStateSyncIdle(stateSession)
-        passCount.get() should be >= 2
+        passCount.get() shouldBe 1
         maxActive.get() shouldBe 1
       } finally {
         release.countDown()
-        waitUntil(10.seconds) {
-          OpenIvmStateSync.allBackupStatesIdleForTesting
-        }
+        waitUntil(10.seconds) { OpenIvmStateSync.allBackupStatesIdleForTesting }
       }
     }
 
     it("serializes concurrent synchronous backup passes") {
       val spark = newSpark(
         "state-sync-concurrent-synchronous",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-concurrent-synchronous-remote").toURI.toString)
       )
       val stateSession = newStateSyncSession(spark, "concurrent-synchronous")
+      seedStateSync(stateSession)
       val firstEntered = new CountDownLatch(1)
       val releaseFirst = new CountDownLatch(1)
       val passCount    = new AtomicInteger(0)
       val active       = new AtomicInteger(0)
       val maxActive    = new AtomicInteger(0)
 
-      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting { () =>
         val current = active.incrementAndGet()
         maxActive.updateAndGet(existing => math.max(existing, current))
         val pass = passCount.incrementAndGet()
         try {
           if (pass == 1) {
             firstEntered.countDown()
-            releaseFirst.await(10, TimeUnit.SECONDS)
+            releaseFirst.await(10, TimeUnit.SECONDS) shouldBe true
           }
-        } finally {
-          active.decrementAndGet()
-        }
+        } finally active.decrementAndGet()
       }
 
       try {
-        val first = Future {
-          OpenIvmStateSync.backupNow(stateSession)
-        }
+        val first = Future(OpenIvmStateSync.backupNow(stateSession))
         firstEntered.await(5, TimeUnit.SECONDS) shouldBe true
 
-        val second = Future {
-          OpenIvmStateSync.backupNow(stateSession)
-        }
-        Thread.sleep(100L)
+        val second = Future(OpenIvmStateSync.backupNow(stateSession))
+        waitUntil(5.seconds) { OpenIvmStateSync.synchronousRequestCountForTesting(stateSession) == 2L }
         second.isCompleted shouldBe false
 
         releaseFirst.countDown()
         Await.result(Future.sequence(Seq(first, second)), RegistryRaceTimeout)
-        passCount.get() shouldBe 2
+        passCount.get() shouldBe 1
         maxActive.get() shouldBe 1
-      } finally {
-        releaseFirst.countDown()
-      }
+      } finally releaseFirst.countDown()
     }
 
     it("allows different state-sync keys to overlap and eventually returns both to idle") {
       val spark = newSpark(
         "state-sync-overlap",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(FeatureGate.StateSyncUriKey -> newDir("state-sync-remote").toURI.toString)
       )
       val leftSession  = newStateSyncSession(spark, "overlap-left")
       val rightSession = newStateSyncSession(spark, "overlap-right")

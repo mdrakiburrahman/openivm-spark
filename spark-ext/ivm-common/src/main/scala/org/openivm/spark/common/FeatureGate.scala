@@ -608,8 +608,16 @@ object FeatureGate {
   def fuseScratchCascadeCacheEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, FuseScratchCascadeCacheEnabledKey, default = false)
 
-  def profileRefreshEnabled(spark: SparkSession): Boolean =
-    boolConf(spark.sparkContext.getConf, ProfileRefreshKey, default = false)
+  @volatile private var profileRefreshEnabledHookForTesting: SparkSession => Boolean = null
+
+  private[openivm] def setProfileRefreshEnabledHookForTesting(hook: SparkSession => Boolean): Unit =
+    profileRefreshEnabledHookForTesting = hook
+
+  def profileRefreshEnabled(spark: SparkSession): Boolean = {
+    val hook = profileRefreshEnabledHookForTesting
+    if (hook == null) boolConf(spark.sparkContext.getConf, ProfileRefreshKey, default = false)
+    else hook(spark)
+  }
 
   def profileRefreshEnabled(conf: SparkConf): Boolean =
     boolConf(conf, ProfileRefreshKey, default = false)

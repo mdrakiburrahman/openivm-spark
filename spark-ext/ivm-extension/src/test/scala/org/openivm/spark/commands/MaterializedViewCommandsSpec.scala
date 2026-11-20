@@ -21,6 +21,8 @@ import org.openivm.spark.common.{
   InterceptChangePropagation,
   MvCatalog,
   MvMetadata,
+  RefreshProfileCatalog,
+  RefreshProfileRow,
   RefreshTypeCode,
   StagingCatalog,
   StagingChangeBatch,
@@ -30,7 +32,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
 import org.openivm.spark.compiler.CompiledRefresh
-import org.openivm.spark.common.rocksdb.OpenIvmStateSync
+import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
 import org.openivm.spark.telemetry.{
   OpenIvmExecutionSpan,
   OpenIvmTelemetryContract,
@@ -1810,37 +1812,153 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
         val source = "src_t5a_backup"
         val view   = "mv_t5a_backup"
+        val remote = new File(warehouseDir, s"state-sync-$view")
         FeatureGate.profileRefreshEnabled(spark) shouldBe false
         spark.sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA").collect()
         spark.sql(s"INSERT INTO $source VALUES (1, 10)").collect()
         spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
-        var backups = 0
+        val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+        OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
         val payloads = withLogCapture { appender =>
-          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(s"file:/state-sync-$view"))
-          OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
-            OpenIvmExecutionSpan.hasCurrentSpan shouldBe true
-            executionSpanPayloads(appender.messages, view).size shouldBe backups
-            backups += 1
-          }
+          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remote.toURI.toString))
           try {
             spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
             spark.sql(s"INSERT INTO $source VALUES (1, 5)").collect()
             spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect()
-          } finally {
-            OpenIvmStateSync.setBackupPassHookForTesting(null)
-            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
-          }
-          executionSpanPayloads(appender.messages, view)
+            executionSpanPayloads(appender.messages, view)
+          } finally OpenIvmStateSync.setStateSyncUriHookForTesting(null)
         }
-        backups shouldBe 2
         payloads should have size 2
         payloads.foreach { payload =>
           payload.has("rocksdb_backup_ms") shouldBe true
           payload.path("rocksdb_backup_ms").asLong() should be >= 0L
         }
+        val publications = evidence.asScala.toVector.flatMap(_.publications).filter(_.published)
+        publications.map(_.publicationId).distinct should have size 2
+        publications.foreach(_.snapshotGenerationId should not be empty)
+        Option(new File(remote, ".openivm-state-sync/commits").listFiles()).toSeq.flatten
+          .count(_.getName.endsWith(".commit")) shouldBe 2
+        OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
         OpenIvmExecutionSpan.hasCurrentSpan shouldBe false
         assertBagEqual(view, s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
       }
+    }
+
+    it("publishes a profiled no-delta refresh only after covering a concurrent unrelated writer") {
+      FeatureGate.setProfileRefreshEnabledHookForTesting(_ => true)
+      try {
+        withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+          val source = "src_t5a_no_delta_race"
+          val view   = "mv_t5a_no_delta_race"
+          val remote = new File(warehouseDir, s"state-sync-$view")
+          spark.sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA").collect()
+          spark.sql(s"INSERT INTO $source VALUES (1, 10)").collect()
+          spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
+          val profilesBefore   = RefreshProfileCatalog.scanAll(spark).count(_.viewName.contains(view))
+          val captureEntered   = new CountDownLatch(1)
+          val writerFinished   = new CountDownLatch(1)
+          val writerGeneration = new AtomicLong(-1L)
+          val writerId         = s"unrelated-${UUID.randomUUID()}"
+          val writerRow        = new AtomicReference[RefreshProfileRow]()
+          val evidence         = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+          OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
+          OpenIvmStateBarrier.setStateSyncConfiguredHookForTesting(_ => true)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remote.toURI.toString))
+          OpenIvmStateSync.setBeforeCaptureHookForTesting { () =>
+            captureEntered.countDown()
+            writerFinished.await(30, TimeUnit.SECONDS) shouldBe true
+          }
+          val commandDurationNs =
+            try
+              withPool(2) { implicit ec =>
+                val writer = Future {
+                  captureEntered.await(30L, TimeUnit.SECONDS) shouldBe true
+                  try {
+                    val row = RefreshProfileRow(
+                      writerId,
+                      "default.unrelated_writer_model",
+                      java.sql.Timestamp.from(Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS)),
+                      0,
+                      "synthetic_concurrent_writer",
+                      1L,
+                      ""
+                    )
+                    writerRow.set(row)
+                    RefreshProfileCatalog.record(spark, Seq(row))
+                    writerGeneration.set(OpenIvmStateBarrier.currentMutationGenerationForTesting(spark))
+                  } finally writerFinished.countDown()
+                }
+                val startedAt = System.nanoTime()
+                val command   = Future(spark.sql(s"REFRESH MATERIALIZED VIEW $view").collect())
+                captureEntered.await(30L, TimeUnit.SECONDS) shouldBe true
+                Await.result(writer, 30.seconds)
+                Await.result(command, 90.seconds)
+                System.nanoTime() - startedAt
+              }
+            finally {
+              writerFinished.countDown()
+              OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
+              OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+              OpenIvmStateBarrier.setStateSyncConfiguredHookForTesting(null)
+              OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
+            }
+          commandDurationNs should be > 0L
+          writerGeneration.get() should be > 0L
+          RefreshProfileCatalog.scanAll(spark).count(_.viewName.contains(view)) should be > profilesBefore
+          RefreshProfileCatalog.scanAll(spark).exists(_.stepName == "synthetic_concurrent_writer") shouldBe true
+          val commits = Option(new File(remote, ".openivm-state-sync/commits").listFiles()).toSeq.flatten
+            .filter(_.getName.endsWith(".commit"))
+          commits should have size 1
+          val requests     = evidence.asScala.toVector.flatMap(_.requests)
+          val publications = evidence.asScala.toVector.flatMap(_.publications).filter(_.published)
+          val request      = requests.find(_.published).getOrElse(fail("missing published no-delta request evidence"))
+          val publication = publications
+            .find(_.publicationId == request.publicationId)
+            .getOrElse(fail("missing committed publication evidence for no-delta refresh"))
+          request.requested shouldBe true
+          request.captured shouldBe true
+          request.published shouldBe true
+          request.requestedMutationGeneration should not be empty
+          request.requestedMutationGeneration.get should be < writerGeneration.get()
+          request.capturedMutationGeneration.get should be >= writerGeneration.get()
+          request.publishedMutationGeneration shouldBe request.capturedMutationGeneration
+          request.acknowledgedSnapshotGenerationId shouldBe publication.snapshotGenerationId
+          publication.status shouldBe "success"
+          publication.captured shouldBe true
+          publication.published shouldBe true
+          val generation = request.acknowledgedSnapshotGenerationId.getOrElse(
+            fail("missing acknowledged snapshot generation")
+          )
+          publication.snapshotGenerationId shouldBe Some(generation)
+
+          val commitFile = new File(remote, s".openivm-state-sync/commits/$generation.commit")
+          val commitText = new String(
+            java.nio.file.Files.readAllBytes(commitFile.toPath),
+            java.nio.charset.StandardCharsets.UTF_8
+          )
+          val manifest = commitText.split("\n", -1)
+          manifest.toSeq should have length 5
+          manifest(0) shouldBe "OPENIVM_STATE_SNAPSHOT_V2"
+          manifest(1) shouldBe generation
+          val archiveFile  = new File(remote, s".openivm-state-sync/snapshots/$generation/snapshot.zip")
+          val archiveBytes = java.nio.file.Files.readAllBytes(archiveFile.toPath)
+          val archiveHash = java.security.MessageDigest
+            .getInstance("SHA-256")
+            .digest(archiveBytes)
+            .map(byte => f"${byte & 0xff}%02x")
+            .mkString
+          manifest(2).toLong shouldBe archiveBytes.length.toLong
+          manifest(3) shouldBe archiveHash
+          commitText shouldBe s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n${archiveBytes.length}\n$archiveHash\n"
+
+          val expectedWriterRow = Option(writerRow.get()).getOrElse(fail("writer row was not retained"))
+          expectedWriterRow.refreshId shouldBe writerId
+          val restoredWarehouse = new File(warehouseDir, s"restore-$view-${UUID.randomUUID()}").getCanonicalPath
+          OpenIvmStateSyncRestoreProbe.assertRestored(remote.toURI.toString, restoredWarehouse, expectedWriterRow)
+          deleteDir(new File(restoredWarehouse))
+          assertBagEqual(view, s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id")
+        }
+      } finally FeatureGate.setProfileRefreshEnabledHookForTesting(null)
     }
 
     it("emits failed command telemetry and backup timing when durable backup throws") {
@@ -3076,5 +3194,80 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val meta = MvCatalog.lookup(spark, TableIdentifier("mv_t12")).get
       meta.lastVersion should be >= 0L
     }
+  }
+}
+
+private[commands] object OpenIvmStateSyncRestoreProbe {
+  private val SuccessMarker = "OPENIVM_RESTORED_PROFILE_ROW="
+
+  def assertRestored(remoteUri: String, warehouse: String, expected: RefreshProfileRow): Unit = {
+    val javaExecutable = new File(System.getProperty("java.home"), "bin/java").getAbsolutePath
+    val moduleOptions = _root_.java.lang.management.ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
+      .filter(argument => argument.startsWith("--add-opens=") || argument.startsWith("--add-exports="))
+    val command = Seq(javaExecutable) ++ moduleOptions ++ Seq(
+      "-cp",
+      System.getProperty("java.class.path"),
+      "org.openivm.spark.commands.OpenIvmStateSyncRestoreProbe",
+      remoteUri,
+      warehouse,
+      expected.refreshId,
+      expected.viewName,
+      expected.profileTimestamp.toString,
+      expected.stepOrder.toString,
+      expected.stepName,
+      expected.durationMs.toString,
+      expected.detail
+    )
+    val process = new ProcessBuilder(command: _*).redirectErrorStream(true).start()
+    val output  = new java.io.ByteArrayOutputStream()
+    val reader = new Thread(() => {
+      val input  = process.getInputStream
+      val buffer = new Array[Byte](8192)
+      var size   = input.read(buffer)
+      while (size >= 0) {
+        output.write(buffer, 0, size)
+        size = input.read(buffer)
+      }
+    })
+    reader.setDaemon(true)
+    reader.start()
+    if (!process.waitFor(120, TimeUnit.SECONDS)) {
+      process.destroyForcibly()
+      process.waitFor(5, TimeUnit.SECONDS)
+      reader.join(5000L)
+      throw new AssertionError("fresh-process snapshot restore timed out")
+    }
+    reader.join(5000L)
+    val outputText = output.toString(_root_.java.nio.charset.StandardCharsets.UTF_8.name())
+    if (process.exitValue() != 0)
+      throw new AssertionError(s"fresh-process snapshot restore exited ${process.exitValue()}: $outputText")
+    if (!outputText.contains(s"$SuccessMarker${expected.refreshId}"))
+      throw new AssertionError(s"fresh-process restore did not acknowledge the exact row: $outputText")
+  }
+
+  def main(args: Array[String]): Unit = {
+    require(args.length == 9, s"expected 9 arguments, received ${args.length}")
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-state-sync-restore-probe")
+      .config("spark.ui.enabled", "false")
+      .config("spark.sql.warehouse.dir", args(1))
+      .config(FeatureGate.StateSyncUriKey, args(0))
+      .getOrCreate()
+    try {
+      val expected = RefreshProfileRow(
+        args(2),
+        args(3),
+        java.sql.Timestamp.valueOf(args(4)),
+        args(5).toInt,
+        args(6),
+        args(7).toLong,
+        args(8)
+      )
+      val restored = RefreshProfileCatalog.scanAll(spark).filter(_.refreshId == expected.refreshId)
+      require(restored == Seq(expected), s"fresh process did not restore exact profile row: $restored")
+      println(s"$SuccessMarker${expected.refreshId}")
+    } finally spark.stop()
   }
 }

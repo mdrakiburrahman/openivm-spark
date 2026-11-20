@@ -11,7 +11,7 @@ import java.nio.file.Files
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, Executors}
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import scala.util.control.NonFatal
@@ -28,10 +28,10 @@ import scala.util.control.NonFatal
  *   - [[maybeRestore]] runs once per Spark application, before any RocksDB opens,
  *     and downloads the remote tree if the local tree is absent/empty.
  *   - [[backupNow]] synchronously publishes a complete immutable generation.
- *     Concurrent requests share a pass only if they arrived before its request
- *     barrier. Failed or interrupted uploads never overwrite earlier snapshots.
- *   - [[backupAsync]] coalesces background requests through the same serialized
- *     generation publisher. Legacy flat-layout snapshots remain readable.
+ *     Failed or interrupted uploads never overwrite earlier snapshots.
+ *   - [[backupAsync]] coalesces background requests only when a committed
+ *     capture covers their barrier generation; later mutations require another
+ *     pass. Legacy flat-layout snapshots remain readable.
  */
 private[rocksdb] final case class StateSyncPhaseStart(
     operation: String,
@@ -45,61 +45,210 @@ object OpenIvmStateSync {
 
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
+  private[rocksdb] final case class StateSyncAcknowledgement(
+      requestId: String,
+      publicationId: String,
+      snapshotGenerationId: String,
+      requestedMutationGeneration: Option[Long],
+      capturedMutationGeneration: Option[Long],
+      exactCoverage: Boolean
+  )
+
+  private final case class PublishedCoverage(
+      publicationId: String,
+      snapshotGenerationId: String,
+      capturedMutationGeneration: Long
+  )
+
+  private final case class BackupPassResult(
+      published: Boolean,
+      publicationId: String,
+      snapshotGenerationId: Option[String],
+      requestedMutationGeneration: Option[Long],
+      capturedMutationGeneration: Option[Long],
+      coverage: Option[PublishedCoverage],
+      noState: Boolean = false,
+      reused: Boolean = false
+  )
+
+  private sealed trait SynchronousBackupCompletion
+  private case object SynchronouslyPublished extends SynchronousBackupCompletion
+  private case object SynchronouslyNoState   extends SynchronousBackupCompletion
+
+  private[rocksdb] sealed trait BackupNowOutcome
+  private[rocksdb] case object BackupDurablyPublished  extends BackupNowOutcome
+  private[rocksdb] case object BackupNoLocalState      extends BackupNowOutcome
+  private[rocksdb] case object BackupSyncNotConfigured extends BackupNowOutcome
+
   private final case class BackupRequest(
       requestId: String,
       parent: OpenIvmExecutionSpan.StateSyncParentContext,
       span: Option[OpenIvmExecutionSpan],
       requestedAtNanos: Long,
       requestedAtUtc: String,
+      requestedMutationGeneration: Long,
+      generationCoverageEnabled: Boolean,
       mode: String,
       captureTelemetry: Boolean,
       receiptWriter: Option[OpenIvmExecutionSpan.StateSyncReceiptWriter]
   )
 
-  private final case class AsyncRequest(request: BackupRequest, afterPublish: () => Unit)
-  private final case class SynchronousRequest(request: BackupRequest, completion: CompletableFuture[Unit])
+  private final case class AsyncRequest(
+      request: BackupRequest,
+      afterPublish: () => Unit,
+      onPublished: StateSyncAcknowledgement => Unit
+  )
+  private final case class SynchronousRequest(
+      request: BackupRequest,
+      completion: CompletableFuture[SynchronousBackupCompletion]
+  )
 
   private final class BackupState {
-    val passLock                    = new ReentrantLock(true)
-    val requested                   = new AtomicBoolean(false)
-    val running                     = new AtomicBoolean(false)
-    private val requests            = new ConcurrentLinkedQueue[AsyncRequest]()
-    private val synchronousMonitor  = new Object
-    private val synchronousRequests = scala.collection.mutable.ArrayBuffer.empty[SynchronousRequest]
-    private var synchronousRunning  = false
-    private var submittedRequests   = 0L
+    val passLock                            = new ReentrantLock(true)
+    val requested                           = new AtomicBoolean(false)
+    val running                             = new AtomicBoolean(false)
+    private val asyncMonitor                = new Object
+    private var asyncRequests               = Vector.empty[AsyncRequest]
+    @volatile private var publishedCoverage = Option.empty[PublishedCoverage]
+    private val synchronousMonitor          = new Object
+    private val synchronousRequests         = scala.collection.mutable.ArrayBuffer.empty[SynchronousRequest]
+    private var synchronousRunning          = false
+    private var submittedRequests           = 0L
 
     def synchronousRequestCount: Long = synchronousMonitor.synchronized(submittedRequests)
 
-    def backupSynchronous(request: BackupRequest)(pass: Seq[BackupRequest] => Unit): Unit = {
-      val completion = new CompletableFuture[Unit]()
+    def coverageFor(request: BackupRequest): Option[PublishedCoverage] = {
+      val current = publishedCoverage
+      current.filter(coverageCovers(request, _))
+    }
+
+    def coverageFor(requests: Seq[BackupRequest]): Option[PublishedCoverage] = {
+      val current = publishedCoverage
+      current.filter(coverage => requests.nonEmpty && requests.forall(coverageCovers(_, coverage)))
+    }
+
+    def capture(
+        request: BackupRequest,
+        afterPublish: () => Unit,
+        onPublished: StateSyncAcknowledgement => Unit
+    ): Option[PublishedCoverage] = asyncMonitor.synchronized {
+      val current = publishedCoverage.filter(coverageCovers(request, _))
+      if (current.isEmpty) {
+        asyncRequests :+= AsyncRequest(request, afterPublish, onPublished)
+        requested.set(true)
+      }
+      current
+    }
+
+    def drainRequests(): Seq[AsyncRequest] = asyncMonitor.synchronized {
+      val drained = asyncRequests
+      asyncRequests = Vector.empty
+      requested.set(false)
+      drained
+    }
+
+    def requeue(requests: Seq[AsyncRequest]): Unit = asyncMonitor.synchronized {
+      if (requests.nonEmpty) asyncRequests = requests.toVector ++ asyncRequests
+      requested.set(asyncRequests.nonEmpty)
+    }
+
+    def requeueFailed(requests: Seq[AsyncRequest]): Unit = asyncMonitor.synchronized {
+      val newerRequestsPending = asyncRequests.nonEmpty
+      if (requests.nonEmpty) asyncRequests = requests.toVector ++ asyncRequests
+      requested.set(newerRequestsPending)
+    }
+
+    def rememberPublication(coverage: PublishedCoverage): Unit = asyncMonitor.synchronized {
+      publishedCoverage = Some(coverage)
+    }
+
+    def recordPublication(coverage: PublishedCoverage): Seq[AsyncRequest] = asyncMonitor.synchronized {
+      publishedCoverage = Some(coverage)
+      val (covered, remaining) = asyncRequests.partition(request => coverageCovers(request.request, coverage))
+      asyncRequests = remaining
+      requested.set(remaining.nonEmpty)
+      covered
+    }
+
+    def backupSynchronous(
+        request: BackupRequest
+    )(pass: Seq[BackupRequest] => BackupPassResult): SynchronousBackupCompletion = {
+      val completion = new CompletableFuture[SynchronousBackupCompletion]()
       val submitted  = SynchronousRequest(request, completion)
       synchronousMonitor.synchronized {
         submittedRequests += 1L
         synchronousRequests += submitted
       }
+      var completedAs: SynchronousBackupCompletion = SynchronouslyNoState
       try {
+        val beforeDrain = beforeSynchronousDrainHookForTesting
+        if (beforeDrain != null) beforeDrain()
         while (!completion.isDone) {
+          var alreadyCovered = Vector.empty[SynchronousRequest]
+          var coveredBy      = Option.empty[PublishedCoverage]
           val batch = synchronousMonitor.synchronized {
             if (completion.isDone) Vector.empty[SynchronousRequest]
-            else if (!synchronousRunning) {
-              synchronousRunning = true
-              val captured = synchronousRequests.toVector
-              synchronousRequests.clear()
-              captured
-            } else {
-              synchronousMonitor.wait()
-              Vector.empty[SynchronousRequest]
+            else {
+              coveredBy = publishedCoverage
+              coveredBy.foreach { coverage =>
+                alreadyCovered =
+                  synchronousRequests.filter(waiting => coverageCovers(waiting.request, coverage)).toVector
+                if (alreadyCovered.nonEmpty) {
+                  synchronousRequests --= alreadyCovered
+                  alreadyCovered.foreach(_.completion.complete(SynchronouslyPublished))
+                }
+              }
+              if (completion.isDone) Vector.empty[SynchronousRequest]
+              else if (!synchronousRunning) {
+                synchronousRunning = true
+                val coverageMode = synchronousRequests.head.request.generationCoverageEnabled
+                val (captured, remaining) = synchronousRequests.partition(
+                  _.request.generationCoverageEnabled == coverageMode
+                )
+                synchronousRequests.clear()
+                synchronousRequests ++= remaining
+                captured.toVector
+              } else {
+                synchronousMonitor.wait()
+                Vector.empty[SynchronousRequest]
+              }
             }
           }
+          coveredBy.foreach(coverage =>
+            alreadyCovered.foreach(waiting => recordCoveredRequest(waiting.request, coverage))
+          )
           if (batch.nonEmpty) {
-            var failure: Throwable = null
-            try pass(batch.map(_.request))
-            catch { case error: Throwable => failure = error }
+            var failure: Throwable                           = null
+            var completionValue: SynchronousBackupCompletion = SynchronouslyNoState
+            try {
+              val result = pass(batch.map(_.request))
+              if (result.noState) {
+                if (result.published || result.coverage.nonEmpty)
+                  throw new IllegalStateException("openivm state-sync: no-state result cannot be published")
+              } else if (!result.published) {
+                throw new java.io.IOException(
+                  "openivm state-sync: synchronous backup returned without publishing a committed snapshot"
+                )
+              } else if (
+                batch.exists(_.request.generationCoverageEnabled) &&
+                !result.coverage.exists(coverage => batch.forall(waiting => coverageCovers(waiting.request, coverage)))
+              ) {
+                throw new java.io.IOException(
+                  "openivm state-sync: synchronous publication did not prove requested mutation-generation coverage"
+                )
+              }
+              completionValue = if (result.noState) SynchronouslyNoState else SynchronouslyPublished
+              result.coverage.foreach { coverage =>
+                if (result.reused)
+                  batch.foreach(waiting => recordCoveredRequest(waiting.request, coverage))
+                val coveredAsync = recordPublication(coverage)
+                acknowledgeAsyncRequests(coveredAsync, coverage, emitRequestEvidence = true)
+              }
+            } catch { case error: Throwable => failure = error }
             finally
               synchronousMonitor.synchronized {
                 batch.foreach { waiting =>
-                  if (failure == null) waiting.completion.complete(())
+                  if (failure == null) waiting.completion.complete(completionValue)
                   else waiting.completion.completeExceptionally(failure)
                 }
                 synchronousRunning = false
@@ -107,7 +256,7 @@ object OpenIvmStateSync {
               }
           }
         }
-        try completion.get()
+        try completedAs = completion.get()
         catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
       } catch {
         case interrupted: InterruptedException =>
@@ -117,19 +266,7 @@ object OpenIvmStateSync {
           Thread.currentThread().interrupt()
           throw interrupted
       }
-    }
-
-    def capture(request: BackupRequest, afterPublish: () => Unit): Unit =
-      requests.add(AsyncRequest(request, afterPublish))
-
-    def drainRequests(): Seq[AsyncRequest] = {
-      val drained = scala.collection.mutable.ArrayBuffer.empty[AsyncRequest]
-      var request = requests.poll()
-      while (request != null) {
-        drained += request
-        request = requests.poll()
-      }
-      drained.toSeq
+      completedAs
     }
   }
 
@@ -142,6 +279,8 @@ object OpenIvmStateSync {
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
   @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
+  @volatile private var beforeSynchronousDrainHookForTesting: () => Unit                 = null
+  @volatile private var duringCaptureHookForTesting: () => Unit                          = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
 
@@ -150,24 +289,29 @@ object OpenIvmStateSync {
       mode: String,
       publicationId: String
   ) {
-    val enabled: Boolean       = requests.exists(_.captureTelemetry)
+    val enabled: Boolean                  = requests.exists(_.captureTelemetry)
+    private val generationCoverageEnabled = requests.nonEmpty && requests.forall(_.generationCoverageEnabled)
+    private val requestedMutationGeneration =
+      if (generationCoverageEnabled) requests.map(_.requestedMutationGeneration).reduceOption(_ max _) else None
     private val startedAtNanos = if (enabled) System.nanoTime() else 0L
     private val startedAtUtc   = if (enabled) Instant.now().toString else ""
     private val phases         = scala.collection.mutable.ArrayBuffer.empty[OpenIvmExecutionSpan.StateSyncPhaseEvidence]
-    private var admittedAtNanos       = Option.empty[Long]
-    private var wasCaptured           = false
-    private var wasPublished          = false
-    private var snapshotGeneration    = Option.empty[String]
-    private var capturedDatabaseCount = Option.empty[Long]
-    private var capturedFileCount     = Option.empty[Long]
-    private var capturedBytes         = Option.empty[Long]
-    private var archiveBytes          = Option.empty[Long]
-    private var uploadedBytes         = Option.empty[Long]
-    private var prunedPaths           = Option.empty[Long]
+    private var admittedAtNanos            = Option.empty[Long]
+    private var wasCaptured                = false
+    private var wasPublished               = false
+    private var wasNoState                 = false
+    private var snapshotGeneration         = Option.empty[String]
+    private var capturedMutationGeneration = Option.empty[Long]
+    private var capturedDatabaseCount      = Option.empty[Long]
+    private var capturedFileCount          = Option.empty[Long]
+    private var capturedBytes              = Option.empty[Long]
+    private var archiveBytes               = Option.empty[Long]
+    private var uploadedBytes              = Option.empty[Long]
+    private var prunedPaths                = Option.empty[Long]
 
     def markAdmitted(atNanos: Long): Unit = if (enabled) admittedAtNanos = Some(atNanos)
 
-    def setSnapshotGeneration(generation: String): Unit = if (enabled) snapshotGeneration = Some(generation)
+    def setSnapshotGeneration(generation: String): Unit = snapshotGeneration = Some(generation)
 
     def beginPhase(operation: String, workClass: String): StateSyncPhaseStart =
       if (enabled) StateSyncPhaseStart(operation, workClass, System.nanoTime(), Instant.now().toString)
@@ -206,9 +350,10 @@ object OpenIvmStateSync {
       }
     }
 
-    def markCaptured(databaseCount: Int): Unit = if (enabled) {
+    def markCaptured(databaseCount: Int, mutationGeneration: Long): Unit = {
       wasCaptured = true
-      capturedDatabaseCount = Some(databaseCount.toLong)
+      if (generationCoverageEnabled) capturedMutationGeneration = Some(mutationGeneration)
+      if (enabled) capturedDatabaseCount = Some(databaseCount.toLong)
     }
 
     def markCapturedInventory(fileCount: Int, bytes: Option[Long]): Unit = if (enabled) {
@@ -220,9 +365,31 @@ object OpenIvmStateSync {
 
     def markUploaded(bytes: Long): Unit = if (enabled) uploadedBytes = Some(bytes)
 
-    def markPublished(): Unit = if (enabled) wasPublished = true
+    def markPublished(): Unit = wasPublished = true
+
+    def markNoState(): Unit = {
+      require(!wasCaptured && !wasPublished, "a no-state pass cannot capture or publish a snapshot")
+      wasNoState = true
+    }
 
     def markPruned(paths: Long): Unit = if (enabled) prunedPaths = Some(paths)
+
+    def result: BackupPassResult = {
+      val committedGeneration = if (wasPublished) snapshotGeneration else None
+      val coverage = for {
+        generation <- committedGeneration
+        captured   <- capturedMutationGeneration
+      } yield PublishedCoverage(publicationId, generation, captured)
+      BackupPassResult(
+        published = wasPublished,
+        publicationId = publicationId,
+        snapshotGenerationId = committedGeneration,
+        requestedMutationGeneration = requestedMutationGeneration,
+        capturedMutationGeneration = capturedMutationGeneration,
+        coverage = coverage,
+        noState = wasNoState
+      )
+    }
 
     def finish(status: String, endNanos: Long, error: Option[Throwable]): Unit = {
       if (!enabled) return
@@ -230,7 +397,10 @@ object OpenIvmStateSync {
       val committedGeneration = if (wasPublished) snapshotGeneration else None
       val trackedRequests     = requests.filter(_.captureTelemetry)
       val requestEvidence = trackedRequests.map { request =>
-        val queueStatus = if (admittedAtNanos.nonEmpty) "success" else spanStatus(error.orNull)
+        val queueStatus =
+          if (status == "no_state") "no_state"
+          else if (status == "success" && admittedAtNanos.nonEmpty) "success"
+          else spanStatus(error.orNull)
         OpenIvmExecutionSpan.StateSyncRequestEvidence(
           requestId = request.requestId,
           parentRequestId = request.parent.requestId,
@@ -244,9 +414,17 @@ object OpenIvmStateSync {
           published = wasPublished,
           snapshotGenerationId = committedGeneration,
           acknowledgedSnapshotGenerationId =
-            if (request.mode == "synchronous" && status == "success" && wasPublished) committedGeneration else None,
+            if (
+              status == "success" && wasPublished && request.generationCoverageEnabled &&
+              capturedMutationGeneration.exists(_ >= request.requestedMutationGeneration)
+            ) committedGeneration
+            else None,
           requestStartMonotonicNs = request.requestedAtNanos,
-          requestStartUtc = request.requestedAtUtc
+          requestStartUtc = request.requestedAtUtc,
+          requestedMutationGeneration =
+            if (request.generationCoverageEnabled) Some(request.requestedMutationGeneration) else None,
+          capturedMutationGeneration = capturedMutationGeneration,
+          publishedMutationGeneration = if (wasPublished) capturedMutationGeneration else None
         )
       }
       val counts = Map(
@@ -275,6 +453,9 @@ object OpenIvmStateSync {
         captured = wasCaptured,
         published = wasPublished,
         snapshotGenerationId = committedGeneration,
+        requestedMutationGeneration = requestedMutationGeneration,
+        capturedMutationGeneration = capturedMutationGeneration,
+        publishedMutationGeneration = if (wasPublished) capturedMutationGeneration else None,
         requestIds = trackedRequests.map(_.requestId).take(OpenIvmExecutionSpan.MaxStateSyncRequests),
         parentRequestIds =
           trackedRequests.flatMap(_.parent.requestId).distinct.take(OpenIvmExecutionSpan.MaxStateSyncRequests),
@@ -336,7 +517,89 @@ object OpenIvmStateSync {
     else if (error.isInstanceOf[InterruptedException] || error.isInstanceOf[java.io.InterruptedIOException]) "cancelled"
     else "failed"
 
-  private def newBackupRequest(spark: SparkSession, mode: String): BackupRequest = {
+  private def coverageCovers(request: BackupRequest, coverage: PublishedCoverage): Boolean =
+    request.generationCoverageEnabled && coverage.capturedMutationGeneration >= request.requestedMutationGeneration
+
+  private def acknowledgement(request: BackupRequest, coverage: PublishedCoverage): StateSyncAcknowledgement =
+    StateSyncAcknowledgement(
+      requestId = request.requestId,
+      publicationId = coverage.publicationId,
+      snapshotGenerationId = coverage.snapshotGenerationId,
+      requestedMutationGeneration =
+        if (request.generationCoverageEnabled) Some(request.requestedMutationGeneration) else None,
+      capturedMutationGeneration =
+        if (request.generationCoverageEnabled) Some(coverage.capturedMutationGeneration) else None,
+      exactCoverage = coverageCovers(request, coverage)
+    )
+
+  private def recordCoveredRequest(request: BackupRequest, coverage: PublishedCoverage): Unit =
+    if (request.captureTelemetry) {
+      val ack = acknowledgement(request, coverage)
+      val evidence = OpenIvmExecutionSpan.StateSyncRequestEvidence(
+        requestId = request.requestId,
+        parentRequestId = request.parent.requestId,
+        publicationId = coverage.publicationId,
+        effectiveMode = request.mode,
+        scope = if (request.parent.modelUniqueId.nonEmpty) "model" else "run",
+        queueWaitNs = elapsedNanos(request.requestedAtNanos, System.nanoTime()),
+        status = "success",
+        requested = true,
+        captured = true,
+        published = true,
+        snapshotGenerationId = Some(coverage.snapshotGenerationId),
+        acknowledgedSnapshotGenerationId = if (ack.exactCoverage) Some(coverage.snapshotGenerationId) else None,
+        requestStartMonotonicNs = request.requestedAtNanos,
+        requestStartUtc = request.requestedAtUtc,
+        requestedMutationGeneration = ack.requestedMutationGeneration,
+        capturedMutationGeneration = ack.capturedMutationGeneration,
+        publishedMutationGeneration = ack.capturedMutationGeneration
+      )
+      request.span.filter(_.stateSyncEvidenceEnabled) match {
+        case Some(span) =>
+          span.recordStateSyncEvidence(Seq(evidence), Seq.empty)
+          if (!span.stateSyncPublicationSinkConfigured)
+            OpenIvmExecutionSpan.emitRunStateSyncRequests(Seq(evidence), request.receiptWriter)
+        case None => OpenIvmExecutionSpan.emitRunStateSyncRequests(Seq(evidence), request.receiptWriter)
+      }
+    }
+
+  private def acknowledgeAsyncRequests(
+      requests: Seq[AsyncRequest],
+      coverage: PublishedCoverage,
+      emitRequestEvidence: Boolean
+  ): Unit = requests.foreach { pending =>
+    if (emitRequestEvidence) recordCoveredRequest(pending.request, coverage)
+    try pending.onPublished(acknowledgement(pending.request, coverage))
+    catch { case NonFatal(error) => log.warn(s"openivm state-sync: acknowledgement callback failed: $error") }
+    try pending.afterPublish()
+    catch { case NonFatal(error) => log.warn(s"openivm state-sync: post-backup cleanup failed: $error") }
+  }
+
+  private def acknowledgePublishedWithoutGenerationProof(
+      requests: Seq[AsyncRequest],
+      result: BackupPassResult
+  ): Unit = result.snapshotGenerationId.foreach { snapshotGenerationId =>
+    requests.foreach { pending =>
+      val ack = StateSyncAcknowledgement(
+        requestId = pending.request.requestId,
+        publicationId = result.publicationId,
+        snapshotGenerationId = snapshotGenerationId,
+        requestedMutationGeneration = None,
+        capturedMutationGeneration = None,
+        exactCoverage = false
+      )
+      try pending.onPublished(ack)
+      catch { case NonFatal(error) => log.warn(s"openivm state-sync: acknowledgement callback failed: $error") }
+      try pending.afterPublish()
+      catch { case NonFatal(error) => log.warn(s"openivm state-sync: post-backup cleanup failed: $error") }
+    }
+  }
+
+  private def newBackupRequest(
+      spark: SparkSession,
+      mode: String,
+      mutationGeneration: Long
+  ): BackupRequest = {
     val span             = OpenIvmExecutionSpan.captureCurrent()
     val captureTelemetry = OpenIvmExecutionSpan.stateSyncCaptureEnabled(spark, span)
     val emptyParent = OpenIvmExecutionSpan.StateSyncParentContext(
@@ -358,11 +621,13 @@ object OpenIvmStateSync {
             emptyParent
         }
     BackupRequest(
-      requestId = if (captureTelemetry) UUID.randomUUID().toString else "",
+      requestId = UUID.randomUUID().toString,
       parent = parent,
       span = span,
       requestedAtNanos = if (captureTelemetry) System.nanoTime() else 0L,
       requestedAtUtc = if (captureTelemetry) Instant.now().toString else "",
+      requestedMutationGeneration = mutationGeneration,
+      generationCoverageEnabled = !OpenIvmRocksDBConf.fromSpark(spark).multiProcess,
       mode = mode,
       captureTelemetry = captureTelemetry,
       receiptWriter = if (captureTelemetry) OpenIvmExecutionSpan.captureStateSyncReceiptWriter(spark, span) else None
@@ -453,12 +718,25 @@ object OpenIvmStateSync {
   /** Select the command's backup policy, then run cleanup only after publication succeeds. */
   def backupForCommand(spark: SparkSession, afterPublish: () => Unit = () => ()): Unit =
     if (FeatureGate.stateSyncAsyncEnabled(spark)) backupAsync(spark, afterPublish)
-    else {
-      backupNow(spark)
-      afterPublish()
-    }
+    else
+      backupNowWithOutcome(spark) match {
+        case BackupDurablyPublished | BackupSyncNotConfigured => afterPublish()
+        case BackupNoLocalState                               => ()
+      }
 
-  private def backupAsync(spark: SparkSession, afterPublish: () => Unit): Unit = {
+  private[rocksdb] def backupAsyncWithAcknowledgement(
+      spark: SparkSession,
+      onPublished: StateSyncAcknowledgement => Unit
+  ): Unit = backupAsyncInternal(spark, () => (), onPublished)
+
+  private def backupAsync(spark: SparkSession, afterPublish: () => Unit): Unit =
+    backupAsyncInternal(spark, afterPublish, _ => ())
+
+  private def backupAsyncInternal(
+      spark: SparkSession,
+      afterPublish: () => Unit,
+      onPublished: StateSyncAcknowledgement => Unit
+  ): Unit = {
     val uri = stateSyncUri(spark)
       .getOrElse {
         afterPublish()
@@ -466,9 +744,14 @@ object OpenIvmStateSync {
       }
     val key   = effectiveStateSyncKey(spark, uri)
     val state = backupStateFor(key)
-    state.capture(newBackupRequest(spark, "asynchronous"), afterPublish)
-    state.requested.set(true)
-    scheduleBackupIfNeeded(state, spark, uri)
+    val request = OpenIvmStateBarrier.withCurrentMutationGeneration(spark) { generation =>
+      newBackupRequest(spark, "asynchronous", generation)
+    }
+    state.capture(request, afterPublish, onPublished) match {
+      case Some(coverage) =>
+        acknowledgeAsyncRequests(Seq(AsyncRequest(request, afterPublish, onPublished)), coverage, true)
+      case None => scheduleBackupIfNeeded(state, spark, uri)
+    }
   }
 
   private def scheduleBackupIfNeeded(state: BackupState, spark: SparkSession, uri: String): Unit =
@@ -481,29 +764,51 @@ object OpenIvmStateSync {
     try {
       var continue = true
       while (continue) {
-        state.requested.set(false)
-        // Capture before the snapshot: a later request must not clean up files
-        // until a pass that covers its committed state has succeeded.
-        val requests  = state.drainRequests()
-        val started   = System.nanoTime()
-        var succeeded = false
-        try {
-          runBackupPass(key, spark, uri, requests.map(_.request), "asynchronous")
-          succeeded = true
-        } catch { case NonFatal(e) => log.warn(s"openivm state-sync: backup failed: $e") }
-        finally {
-          val durationMs = (System.nanoTime() - started) / 1000000L
-          requests.foreach(_.request.span.foreach(_.recordRocksDbBackup(durationMs)))
-          log.info(
-            s"openivm state-sync: async backup duration_ms=$durationMs succeeded=$succeeded requests=${requests.size}"
-          )
-        }
-        if (succeeded)
-          requests.foreach { request =>
-            try request.afterPublish()
-            catch { case NonFatal(e) => log.warn(s"openivm state-sync: post-backup cleanup failed: $e") }
+        val requests = state.drainRequests()
+        if (requests.isEmpty) continue = false
+        else {
+          val started = System.nanoTime()
+          var result  = Option.empty[BackupPassResult]
+          try {
+            result = Some(runBackupPass(key, spark, uri, requests.map(_.request), "asynchronous"))
+            if (result.exists(pass => !pass.published && !pass.noState)) state.requeueFailed(requests)
+          } catch {
+            case interrupted: InterruptedException =>
+              state.requeueFailed(requests)
+              Thread.currentThread().interrupt()
+              continue = false
+            case NonFatal(error) =>
+              state.requeueFailed(requests)
+              log.warn(s"openivm state-sync: backup failed: $error")
+            case error: Throwable =>
+              state.requeueFailed(requests)
+              throw error
+          } finally {
+            val durationMs = (System.nanoTime() - started) / 1000000L
+            requests.foreach(_.request.span.foreach(_.recordRocksDbBackup(durationMs)))
+            log.info(
+              s"openivm state-sync: async backup duration_ms=$durationMs succeeded=${result
+                  .exists(_.published)} requests=${requests.size}"
+            )
           }
-        continue = state.requested.get()
+          result.filter(_.published).foreach { published =>
+            val covered = published.coverage match {
+              case Some(coverage) => requests.filter(request => coverageCovers(request.request, coverage))
+              case None           => requests.filterNot(_.request.generationCoverageEnabled)
+            }
+            val uncovered = requests.filterNot(covered.contains)
+            if (uncovered.nonEmpty) state.requeue(uncovered)
+            published.coverage.foreach { coverage =>
+              val lateCovered = state.recordPublication(coverage)
+              acknowledgeAsyncRequests(lateCovered, coverage, emitRequestEvidence = true)
+              val passCovered = covered.filter(_.request.generationCoverageEnabled)
+              acknowledgeAsyncRequests(passCovered, coverage, emitRequestEvidence = published.reused)
+            }
+            val withoutGenerationProof = covered.filterNot(_.request.generationCoverageEnabled)
+            acknowledgePublishedWithoutGenerationProof(withoutGenerationProof, published)
+          }
+          continue = continue && state.requested.get()
+        }
       }
     } finally {
       state.running.set(false)
@@ -514,16 +819,30 @@ object OpenIvmStateSync {
 
   /** Synchronously publish a snapshot covering this request's committed state. */
   def backupNow(spark: SparkSession): Unit = {
-    val uri = stateSyncUri(spark)
-      .getOrElse(
-        return
-      )
-    val key     = effectiveStateSyncKey(spark, uri)
-    val request = newBackupRequest(spark, "synchronous")
+    backupNowWithOutcome(spark)
+    ()
+  }
+
+  private[rocksdb] def backupNowWithOutcome(spark: SparkSession): BackupNowOutcome = {
+    val uri   = stateSyncUri(spark).getOrElse(return BackupSyncNotConfigured)
+    val key   = effectiveStateSyncKey(spark, uri)
+    val state = backupStateFor(key)
+    val request = OpenIvmStateBarrier.withCurrentMutationGeneration(spark) { generation =>
+      newBackupRequest(spark, "synchronous", generation)
+    }
+    state.coverageFor(request) match {
+      case Some(coverage) =>
+        recordCoveredRequest(request, coverage)
+        return BackupDurablyPublished
+      case None => ()
+    }
     val started = System.nanoTime()
     try
-      backupStateFor(key).backupSynchronous(request) { requests =>
+      state.backupSynchronous(request) { requests =>
         runBackupPass(key, spark, uri, requests, "synchronous")
+      } match {
+        case SynchronouslyPublished => BackupDurablyPublished
+        case SynchronouslyNoState   => BackupNoLocalState
       }
     finally {
       val durationMs = (System.nanoTime() - started) / 1000000L
@@ -537,15 +856,44 @@ object OpenIvmStateSync {
       uri: String,
       requests: Seq[BackupRequest],
       mode: String
-  ): Unit = {
-    val operationId = if (requests.exists(_.captureTelemetry)) UUID.randomUUID().toString else ""
+  ): BackupPassResult = {
+    val operationId = UUID.randomUUID().toString
     val trace       = new BackupPassTrace(requests, mode, operationId)
-    val lock        = backupStateFor(key).passLock
-    var locked      = false
-    var failure     = Option.empty[Throwable]
+    val state       = backupStateFor(key)
+    state.passLock.lockInterruptibly()
+    try
+      state.coverageFor(requests) match {
+        case Some(coverage) =>
+          val requestedGeneration = requests
+            .filter(_.generationCoverageEnabled)
+            .map(_.requestedMutationGeneration)
+            .reduceOption((left: Long, right: Long) => math.max(left, right))
+          BackupPassResult(
+            published = true,
+            publicationId = coverage.publicationId,
+            snapshotGenerationId = Some(coverage.snapshotGenerationId),
+            requestedMutationGeneration = requestedGeneration,
+            capturedMutationGeneration = Some(coverage.capturedMutationGeneration),
+            coverage = Some(coverage),
+            reused = true
+          )
+        case None =>
+          val result = runBackupPassWithLock(key, spark, uri, requests, trace)
+          result.coverage.filter(_ => result.published).foreach(state.rememberPublication)
+          result
+      }
+    finally state.passLock.unlock()
+  }
+
+  private def runBackupPassWithLock(
+      key: String,
+      spark: SparkSession,
+      uri: String,
+      requests: Seq[BackupRequest],
+      trace: BackupPassTrace
+  ): BackupPassResult = {
+    var failure = Option.empty[Throwable]
     try {
-      lock.lockInterruptibly()
-      locked = true
       trace.markAdmitted(System.nanoTime())
       val hook = backupPassHookForTesting
       if (hook == null) backupNowInternal(spark, uri, trace)
@@ -555,14 +903,20 @@ object OpenIvmStateSync {
         failure = Some(error)
         throw error
     } finally {
-      val ended = if (trace.enabled) System.nanoTime() else 0L
-      if (locked) lock.unlock()
-      try trace.finish(failure.fold("success")(_ => spanStatus(failure.get)), ended, failure)
+      val ended      = if (trace.enabled) System.nanoTime() else 0L
+      val passResult = trace.result
+      try
+        trace.finish(
+          failure.fold(if (passResult.noState) "no_state" else "success")(_ => spanStatus(failure.get)),
+          ended,
+          failure
+        )
       catch {
         case NonFatal(telemetryError) =>
           log.warn(s"openivm state-sync: optional telemetry emission failed: $telemetryError")
       }
     }
+    trace.result
   }
 
   private def restoreNow(spark: SparkSession, uri: String): Unit = {
@@ -580,6 +934,7 @@ object OpenIvmStateSync {
     val committed = latestCommit(fs, remoteRoot)
     committed.flatMap(_.archive).foreach { info =>
       restoreArchive(fs, committed.get.root, info, local)
+      OpenIvmStateBarrier.markRestoredMutationGeneration(spark)
       return
     }
     val snapshotRoot = committed.map(_.root).getOrElse(remoteRoot)
@@ -604,6 +959,9 @@ object OpenIvmStateSync {
     }
     if (restored == 0 && snapshotRoot == remoteRoot && fs.exists(new Path(remoteRoot, ".openivm-state-sync")))
       throw new java.io.IOException(s"openivm state-sync: no committed snapshot or legacy state at $uri")
+    if (restored > 0) {
+      OpenIvmStateBarrier.markRestoredMutationGeneration(spark)
+    }
     log.info(s"openivm state-sync: restored $restored files from $uri to $local")
   }
 
@@ -612,63 +970,56 @@ object OpenIvmStateSync {
   private final case class PruneResult(deletedPaths: Long, failure: Option[Throwable])
 
   private def backupNowInternal(spark: SparkSession, uri: String, trace: BackupPassTrace): Unit = {
-    val local = localRoot(spark)
-    if (!local.exists()) return
-
+    val local         = localRoot(spark)
     val hconf         = spark.sessionState.newHadoopConf()
     val namespaceRoot = new Path(uri)
     val fs            = namespaceRoot.getFileSystem(hconf)
     val controlRoot   = new Path(namespaceRoot, ".openivm-state-sync")
     val commitRoot    = new Path(controlRoot, "commits")
-    if (!fs.mkdirs(commitRoot))
-      throw new java.io.IOException(s"openivm state-sync: cannot create commit directory $commitRoot")
-    val previous = fs
-      .listStatus(commitRoot)
-      .iterator
-      .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
-      .map(_.getPath.getName.takeWhile(_ != '-').toLong)
-      .foldLeft(0L)(math.max)
-    val stamp      = math.max(System.currentTimeMillis(), previous + 1L)
-    val generation = f"$stamp%019d-${UUID.randomUUID()}"
-    val remoteRoot = new Path(new Path(controlRoot, "snapshots"), generation)
-    if (!fs.mkdirs(remoteRoot))
-      throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
-    trace.setSnapshotGeneration(generation)
     OpenIvmStateBarrier.register(spark)
-    val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
-    val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    val capture       = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    var archive: File = null
     try {
       val captureHook = beforeCaptureHookForTesting
       if (captureHook != null) captureHook()
       val barrierStarted  = trace.beginPhase("spark.backup.barrier_wait", "wait")
       var barrierAcquired = false
+      var noState         = false
       try {
         OpenIvmStateBarrier.withCapture(spark) {
           trace.endPhase(barrierStarted, "success")
           barrierAcquired = true
+          val captureHook = duringCaptureHookForTesting
+          if (captureHook != null) captureHook()
           val captured = trace.measure("spark.backup.capture", "durability") {
             OpenIvmSnapshotArchive.checkInterrupted()
             val localBase = local.toPath
             val files     = backupFiles(local)
-            val databases = files
-              .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
-              .map(_.getParentFile.toPath)
-              .distinct
-              .sortBy(_.toString)
-            databases.foreach { db =>
-              val target = capture.toPath.resolve(localBase.relativize(db))
-              Files.createDirectories(target.getParent)
-              OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
+            if (files.isEmpty) {
+              noState = true
+              CapturedState(0)
+            } else {
+              val databases = files
+                .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
+                .map(_.getParentFile.toPath)
+                .distinct
+                .sortBy(_.toString)
+              databases.foreach { db =>
+                val target = capture.toPath.resolve(localBase.relativize(db))
+                Files.createDirectories(target.getParent)
+                OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
+              }
+              files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
+                OpenIvmSnapshotArchive.checkInterrupted()
+                val target = capture.toPath.resolve(localBase.relativize(file.toPath))
+                Files.createDirectories(target.getParent)
+                Files.copy(file.toPath, target)
+              }
+              CapturedState(databases.size)
             }
-            files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
-              OpenIvmSnapshotArchive.checkInterrupted()
-              val target = capture.toPath.resolve(localBase.relativize(file.toPath))
-              Files.createDirectories(target.getParent)
-              Files.copy(file.toPath, target)
-            }
-            CapturedState(databases.size)
           }
-          trace.markCaptured(captured.databaseCount)
+          if (noState) trace.markNoState()
+          else trace.markCaptured(captured.databaseCount, OpenIvmStateBarrier.currentMutationGeneration(spark))
         }
       } catch {
         case error: Throwable =>
@@ -676,6 +1027,25 @@ object OpenIvmStateSync {
           throw error
       }
 
+      if (noState) return
+
+      val previous =
+        if (fs.exists(commitRoot))
+          fs.listStatus(commitRoot)
+            .iterator
+            .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
+            .map(_.getPath.getName.takeWhile(_ != '-').toLong)
+            .foldLeft(0L)(math.max)
+        else 0L
+      val stamp      = math.max(System.currentTimeMillis(), previous + 1L)
+      val generation = f"$stamp%019d-${UUID.randomUUID()}"
+      val remoteRoot = new Path(new Path(controlRoot, "snapshots"), generation)
+      if (!fs.mkdirs(commitRoot) && !fs.exists(commitRoot))
+        throw new java.io.IOException(s"openivm state-sync: cannot create commit directory $commitRoot")
+      if (!fs.mkdirs(remoteRoot))
+        throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
+      trace.setSnapshotGeneration(generation)
+      archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
       val packed = trace.measure("spark.backup.pack_hash", "durability") {
         val files = backupFiles(capture)
         if (trace.enabled) {
@@ -743,7 +1113,7 @@ object OpenIvmStateSync {
         error = pruned.failure
       )
     } finally {
-      try Files.deleteIfExists(archive.toPath)
+      try if (archive != null) Files.deleteIfExists(archive.toPath)
       finally deleteStagedTree(capture)
     }
   }
@@ -822,8 +1192,14 @@ object OpenIvmStateSync {
   private[rocksdb] def setBeforeLocalFileCopyHookForTesting(hook: File => Unit): Unit =
     beforeLocalFileCopyHookForTesting = hook
 
-  private[rocksdb] def setBeforeCaptureHookForTesting(hook: () => Unit): Unit =
+  private[openivm] def setBeforeCaptureHookForTesting(hook: () => Unit): Unit =
     beforeCaptureHookForTesting = hook
+
+  private[rocksdb] def setBeforeSynchronousDrainHookForTesting(hook: () => Unit): Unit =
+    beforeSynchronousDrainHookForTesting = hook
+
+  private[rocksdb] def setDuringCaptureHookForTesting(hook: () => Unit): Unit =
+    duringCaptureHookForTesting = hook
 
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
@@ -945,6 +1321,8 @@ object OpenIvmStateSync {
     stateSyncUriHookForTesting = null
     beforeLocalFileCopyHookForTesting = null
     beforeCaptureHookForTesting = null
+    beforeSynchronousDrainHookForTesting = null
+    duringCaptureHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
     OpenIvmExecutionSpan.resetStateSyncForTesting()
@@ -961,7 +1339,8 @@ object OpenIvmStateSync {
   private def listLocalFiles(dir: File): Seq[File] = {
     val out = scala.collection.mutable.ArrayBuffer.empty[File]
     def walk(f: File): Unit =
-      if (Files.isSymbolicLink(f.toPath))
+      if (!f.exists()) ()
+      else if (Files.isSymbolicLink(f.toPath))
         throw new java.io.IOException("openivm state-sync: symbolic state path")
       else if (f.isDirectory) Option(f.listFiles()).foreach(_.foreach(walk))
       else out += f

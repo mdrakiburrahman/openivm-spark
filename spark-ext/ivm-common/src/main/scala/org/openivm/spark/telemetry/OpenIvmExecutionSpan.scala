@@ -609,7 +609,10 @@ object OpenIvmExecutionSpan extends Logging {
       snapshotGenerationId: Option[String],
       acknowledgedSnapshotGenerationId: Option[String],
       requestStartMonotonicNs: Long = 0L,
-      requestStartUtc: String = ""
+      requestStartUtc: String = "",
+      requestedMutationGeneration: Option[Long] = None,
+      capturedMutationGeneration: Option[Long] = None,
+      publishedMutationGeneration: Option[Long] = None
   )
 
   private[spark] final case class StateSyncPhaseEvidence(
@@ -641,7 +644,10 @@ object OpenIvmExecutionSpan extends Logging {
       requestIds: Seq[String] = Seq.empty,
       parentRequestIds: Seq[String] = Seq.empty,
       droppedRequestIds: Long = 0L,
-      droppedParentRequestIds: Long = 0L
+      droppedParentRequestIds: Long = 0L,
+      requestedMutationGeneration: Option[Long] = None,
+      capturedMutationGeneration: Option[Long] = None,
+      publishedMutationGeneration: Option[Long] = None
   )
 
   private[spark] final case class StateSyncEvidence(
@@ -734,9 +740,18 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("published", java.lang.Boolean.valueOf(request.published))
       item.put("snapshot_generation_id", request.snapshotGenerationId.orNull)
       item.put("acknowledged_snapshot_generation_id", request.acknowledgedSnapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", null)
-      item.put("captured_mutation_generation", null)
-      item.put("published_mutation_generation", null)
+      item.put(
+        "requested_mutation_generation",
+        request.requestedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
+      item.put(
+        "captured_mutation_generation",
+        request.capturedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
+      item.put(
+        "published_mutation_generation",
+        request.publishedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
       requests.add(item)
     }
     stateSync.put("requests", requests)
@@ -773,9 +788,18 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("captured", java.lang.Boolean.valueOf(publication.captured))
       item.put("published", java.lang.Boolean.valueOf(publication.published))
       item.put("snapshot_generation_id", publication.snapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", null)
-      item.put("captured_mutation_generation", null)
-      item.put("published_mutation_generation", null)
+      item.put(
+        "requested_mutation_generation",
+        publication.requestedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
+      item.put(
+        "captured_mutation_generation",
+        publication.capturedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
+      item.put(
+        "published_mutation_generation",
+        publication.publishedMutationGeneration.map(value => java.lang.Long.valueOf(value)).orNull
+      )
       val counts = new LinkedHashMap[String, AnyRef]()
       publication.counts.toSeq.sortBy(_._1).foreach { case (name, value) =>
         counts.put(name, value.map(count => java.lang.Long.valueOf(math.max(0L, count))).orNull)
