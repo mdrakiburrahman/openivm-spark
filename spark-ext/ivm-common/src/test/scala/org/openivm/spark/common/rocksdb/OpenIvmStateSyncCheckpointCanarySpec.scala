@@ -123,6 +123,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
       .config(FeatureGate.StateSyncUriKey, uri.toURI.toString)
       .config(FeatureGate.StateSyncCheckpointEnabledKey, "true")
+      .config(FeatureGate.StateSyncAsyncEnabledKey, "false")
       .config(FeatureGate.GcOrphanGracePeriodKey, "0ms")
     extra.foreach { case (key, value) => builder.config(key, value) }
     val spark = builder.getOrCreate()
