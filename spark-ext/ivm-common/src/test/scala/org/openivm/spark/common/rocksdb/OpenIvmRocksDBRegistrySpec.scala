@@ -102,6 +102,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       .config("spark.driver.host", "localhost")
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
+      .config("spark.openivm.stateSync.checkpoint.enabled", "false")
     extraConf.foreach { case (key, value) => builder.config(key, value) }
     val spark = builder.getOrCreate()
 

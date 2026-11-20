@@ -20,8 +20,11 @@ import java.nio.file.Files
 import java.security.MessageDigest
 import java.sql.Timestamp
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, TimeUnit}
+import java.util.concurrent.{CountDownLatch, CopyOnWriteArrayList, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.io.Source
 
@@ -375,6 +378,129 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         s"\"deleted_trigger_absent_in_fresh_jvm\":true,\"unrelated_profile_row_preserved\":true," +
           s"\"mv_versions_unchanged\":true,\"partial_cleanup_failure_injected\":true," +
           s"\"precommit_cleanup_callback_suppressed\":${!cleanupCallbackRan}," +
+          s"\"fresh_jvm_evidence\":\"${childEvidence.getAbsolutePath}\""
+      )
+    }
+
+    it("defers a profile-only mutation after capture until its exact follow-up archive commits") {
+      implicit val executionContext: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+      val fixtureRoot                                                  = newDir("late-profile")
+      val remote                                                       = new File(fixtureRoot, "remote")
+      val stateRoot                                                    = new File(fixtureRoot, "state")
+      remote.mkdirs()
+      stateRoot.mkdirs()
+      val spark = newSpark(
+        "checkpoint-late-profile",
+        remote,
+        Seq(FeatureGate.StatePathKey -> stateRoot.getAbsolutePath)
+      )
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
+      val ivmRoot  = new File(stateRoot, "_openivm")
+      val retained = new File(ivmRoot, "triggers/late-profile/retained/marker")
+      retained.getParentFile.mkdirs()
+      Files.write(retained.toPath, Array[Byte](7, 8, 9))
+      val versionsBefore = org.openivm.spark.common.MvCatalog.list(spark).map(_.lastVersion)
+      versionsBefore shouldBe empty
+      recordProfile(spark, s"profile-before-${UUID.randomUUID()}")
+
+      def request(requestId: String): Future[Unit] = Future {
+        setRequestId(spark, requestId)
+        try OpenIvmStateSync.backupNow(spark)
+        finally setRequestId(spark, null)
+      }
+
+      Await.result(request("late-profile-baseline"), 60.seconds)
+      val baseline = receipts.asScala.find(_.requestId == "late-profile-baseline").get
+      baseline.acknowledged shouldBe true
+      baseline.archiveSha256 should not be empty
+
+      recordProfile(spark, s"profile-before-capture-${UUID.randomUUID()}")
+      val captureStarted       = new CountDownLatch(1)
+      val releaseFirstPack     = new CountDownLatch(1)
+      val secondCaptureStarted = new CountDownLatch(1)
+      val releaseSecondCapture = new CountDownLatch(1)
+      val holdPack             = new AtomicBoolean(false)
+      val captureNumber        = new AtomicInteger(0)
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting { _ =>
+        if (holdPack.compareAndSet(false, true)) {
+          captureStarted.countDown()
+          releaseFirstPack.await(30, TimeUnit.SECONDS) shouldBe true
+        }
+      }
+      OpenIvmStateSync.setBeforeCaptureHookForTesting { () =>
+        if (captureNumber.incrementAndGet() == 2) {
+          secondCaptureStarted.countDown()
+          releaseSecondCapture.await(30, TimeUnit.SECONDS) shouldBe true
+        }
+      }
+      def awaitRequestCount(expected: Long): Unit = {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (OpenIvmStateSync.synchronousRequestCountForTesting(spark) != expected && System.nanoTime() < deadline)
+          Thread.sleep(25L)
+        OpenIvmStateSync.synchronousRequestCountForTesting(spark) shouldBe expected
+      }
+      val countBeforeCapture  = OpenIvmStateSync.synchronousRequestCountForTesting(spark)
+      val firstCaptureRequest = request("capture-before-late-profile")
+      awaitRequestCount(countBeforeCapture + 1)
+      captureStarted.await(10, TimeUnit.SECONDS) shouldBe true
+      val capturedGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
+
+      val lateProfileId = s"profile-late-${UUID.randomUUID()}"
+      recordProfile(spark, lateProfileId)
+      val lateRequestedGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
+      lateRequestedGeneration should be > capturedGeneration
+      val lateRequest = request("late-profile-during-capture")
+      awaitRequestCount(countBeforeCapture + 2)
+      lateRequest.isCompleted shouldBe false
+
+      releaseFirstPack.countDown()
+      Await.result(firstCaptureRequest, 60.seconds)
+      secondCaptureStarted.await(10, TimeUnit.SECONDS) shouldBe true
+      val olderCommitDidNotAckLateRequest = !lateRequest.isCompleted
+      olderCommitDidNotAckLateRequest shouldBe true
+      val firstPublication = receipts.asScala.find(_.requestId == "capture-before-late-profile").get
+      firstPublication.acknowledged shouldBe true
+      firstPublication.capturedMutationGeneration shouldBe Some(capturedGeneration)
+      firstPublication.capturedMutationGeneration.get should be < lateRequestedGeneration
+      val firstCommit = commitDetails(spark, remote.toURI.toString)
+      firstCommit._1 shouldBe firstPublication.publicationGeneration.get
+      firstPublication.archiveSha256 shouldBe Some(firstCommit._2)
+      firstPublication.archiveBytes shouldBe Some(firstCommit._3)
+
+      releaseSecondCapture.countDown()
+      Await.result(lateRequest, 60.seconds)
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)
+      OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
+
+      val latePublication =
+        receipts.asScala.find(receipt => receipt.requestId == "late-profile-during-capture" && receipt.acknowledged).get
+      latePublication.published shouldBe true
+      latePublication.reused shouldBe false
+      latePublication.coverageProven shouldBe true
+      latePublication.requestedMutationGeneration shouldBe lateRequestedGeneration
+      latePublication.capturedMutationGeneration shouldBe Some(lateRequestedGeneration)
+      latePublication.publicationGeneration should not be firstPublication.publicationGeneration
+      val latest = commitDetails(spark, remote.toURI.toString)
+      latest._1 shouldBe latePublication.publicationGeneration.get
+      latePublication.archiveSha256 shouldBe Some(latest._2)
+      latePublication.archiveBytes shouldBe Some(latest._3)
+      latest._2 should not be firstCommit._2
+      org.openivm.spark.common.MvCatalog.list(spark).map(_.lastVersion) shouldBe versionsBefore
+
+      val childEvidence = new File(repoRoot, ".logs/checkpoint-only-canary/late-profile-fresh-jvm.json")
+      val missingRel    = "triggers/late-profile/missing/marker"
+      val retainedRel   = "triggers/late-profile/retained/marker"
+      stopSpark(spark)
+      runFreshRestoreProbe(remote.toURI.toString, missingRel, retainedRel, lateProfileId, childEvidence)
+      writeReceiptEvidence(
+        "late-profile-inflight-spark-4.1",
+        Seq("late-profile-baseline", "capture-before-late-profile", "late-profile-during-capture"),
+        latest,
+        s"\"captured_generation_before_late_write\":$capturedGeneration," +
+          s"\"late_requested_generation\":$lateRequestedGeneration," +
+          s"\"older_commit_did_not_ack_late_request\":$olderCommitDidNotAckLateRequest," +
+          s"\"late_archive_differs_from_older_commit\":true," +
+          s"\"mv_versions_unchanged\":true,\"fresh_jvm_profile_restored\":true," +
           s"\"fresh_jvm_evidence\":\"${childEvidence.getAbsolutePath}\""
       )
     }
