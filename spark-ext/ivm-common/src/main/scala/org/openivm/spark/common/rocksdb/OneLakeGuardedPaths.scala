@@ -1,25 +1,21 @@
 package org.openivm.spark.common.rocksdb
 
 import java.io.{IOException, InputStream}
-import java.net.URI
+import java.net.{URI, URLEncoder}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
+import java.nio.charset.StandardCharsets.UTF_8
 import java.time.Duration
 import java.util.UUID
 
 /** Driver-only DFS transport for guarded checkpoint slots, not a general path client. */
 private[rocksdb] final class OneLakeGuardedPaths private (
     val canonicalRoot: String,
-    token: () => String
+    token: () => String,
+    exchange: HttpRequest => HttpResponse[InputStream]
 ) {
   import GuardedSnapshotDecisions.Generation
   import OneLakeGuardedPaths._
-  import HttpRequest.BodyPublishers.noBody
-
-  private val http = HttpClient
-    .newBuilder()
-    .connectTimeout(Duration.ofSeconds(15))
-    .followRedirects(HttpClient.Redirect.NEVER)
-    .build()
+  import HttpRequest.BodyPublishers.{noBody, ofByteArray}
 
   private def file(generation: Generation, slot: Slot): URI =
     URI.create(s"$canonicalRoot/${generation.value}.${slot.suffix}")
@@ -30,7 +26,7 @@ private[rocksdb] final class OneLakeGuardedPaths private (
   private[rocksdb] def installRequest(
       generation: Generation,
       nonce: UUID,
-      target: RecordSlot,
+      target: InstallSlot,
       sourceVersion: String
   ): HttpRequest.Builder = {
     val source = file(generation, Pending(nonce))
@@ -49,9 +45,75 @@ private[rocksdb] final class OneLakeGuardedPaths private (
       .header("If-Match", exactVersion(version))
       .DELETE()
 
+  private[rocksdb] def createPendingRequest(generation: Generation, nonce: UUID): HttpRequest.Builder =
+    request(URI.create(s"${file(generation, Pending(nonce))}?resource=file"))
+      .header("If-None-Match", "*")
+      .PUT(noBody())
+
+  private[rocksdb] def appendPendingRequest(
+      generation: Generation,
+      nonce: UUID,
+      position: Long,
+      data: Array[Byte]
+  ): HttpRequest.Builder = {
+    require(position >= 0 && data.nonEmpty && data.length <= ChunkBytes, "invalid guarded upload chunk")
+    request(URI.create(s"${file(generation, Pending(nonce))}?action=append&position=$position"))
+      .header("Content-Type", "application/octet-stream")
+      .method("PATCH", ofByteArray(data))
+  }
+
+  private[rocksdb] def flushPendingRequest(
+      generation: Generation,
+      nonce: UUID,
+      bytes: Long
+  ): HttpRequest.Builder = {
+    require(bytes > 0 && bytes <= OpenIvmSnapshotArchive.MaxBytes, "invalid guarded upload length")
+    request(URI.create(s"${file(generation, Pending(nonce))}?action=flush&position=$bytes&close=true"))
+      .method("PATCH", noBody())
+  }
+
+  private[rocksdb] def listRequest(continuation: Option[String]): HttpRequest.Builder = {
+    val path      = URI.create(canonicalRoot).getRawPath.stripPrefix("/")
+    val parts     = path.split("/", 2)
+    val directory = URLEncoder.encode(parts(1), UTF_8.name())
+    val suffix = continuation
+      .map { next =>
+        require(next.nonEmpty && next.length <= 2048, "invalid guarded listing continuation")
+        s"&continuation=${URLEncoder.encode(next, UTF_8.name())}"
+      }
+      .getOrElse("")
+    request(
+      URI.create(
+        s"https://$Host/${parts(0)}?resource=filesystem&directory=$directory&recursive=false&maxResults=256$suffix"
+      )
+    )
+      .GET()
+  }
+
   // Keep the supplier on the calling driver. The caller must reconcile conditional writes by readback.
-  def install(generation: Generation, nonce: UUID, target: RecordSlot, version: String): HttpResponse[InputStream] =
+  def install(generation: Generation, nonce: UUID, target: InstallSlot, version: String): HttpResponse[InputStream] =
     send(installRequest(generation, nonce, target, version))
+
+  def createPending(generation: Generation, nonce: UUID): HttpResponse[InputStream] =
+    send(createPendingRequest(generation, nonce))
+
+  def appendPending(generation: Generation, nonce: UUID, position: Long, data: Array[Byte]): HttpResponse[InputStream] =
+    send(appendPendingRequest(generation, nonce, position, data))
+
+  def closePending(generation: Generation, nonce: UUID, bytes: Long): HttpResponse[InputStream] =
+    send(flushPendingRequest(generation, nonce, bytes))
+
+  def list(continuation: Option[String]): HttpResponse[InputStream] =
+    send(listRequest(continuation))
+
+  def readMarker(): HttpResponse[InputStream] =
+    send(request(URI.create(s"$canonicalRoot/format")).GET())
+
+  def readRecord(generation: Generation, slot: RecordSlot): HttpResponse[InputStream] =
+    send(request(file(generation, slot)).GET())
+
+  def archiveStatus(generation: Generation): HttpResponse[InputStream] =
+    send(request(file(generation, Archive)).method("HEAD", noBody()))
 
   def readArchive(generation: Generation, version: String): HttpResponse[InputStream] =
     send(readArchiveRequest(generation, version))
@@ -63,7 +125,7 @@ private[rocksdb] final class OneLakeGuardedPaths private (
     val bearer = token()
     if (bearer == null || !bearer.matches("[A-Za-z0-9._~+/-]+=*"))
       throw new IOException("invalid OneLake storage credential")
-    http.send(request.setHeader("Authorization", s"Bearer $bearer").build(), HttpResponse.BodyHandlers.ofInputStream())
+    exchange(request.setHeader("Authorization", s"Bearer $bearer").build())
   }
 }
 
@@ -71,19 +133,35 @@ private[rocksdb] object OneLakeGuardedPaths {
   private val Host       = "onelake.dfs.fabric.microsoft.com"
   private val ApiVersion = "2021-06-08"
   private val LowerUuid  = "[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+  val ChunkBytes         = 4 * 1024 * 1024
   private val Root =
     s"https://${java.util.regex.Pattern.quote(Host)}/$LowerUuid/$LowerUuid/Files/openivm-checkpoints-v1/$LowerUuid"
 
   sealed abstract class Slot(val suffix: String)
-  sealed abstract class RecordSlot(suffix: String) extends Slot(suffix)
-  case object Receipt                              extends RecordSlot("finished")
-  case object Terminal                             extends RecordSlot("decision")
-  private case object Archive                      extends Slot("zip")
-  private final case class Pending(nonce: UUID)    extends Slot(s"pending-$nonce")
+  sealed abstract class InstallSlot(suffix: String) extends Slot(suffix)
+  sealed abstract class RecordSlot(suffix: String)  extends InstallSlot(suffix)
+  case object Receipt                               extends RecordSlot("finished")
+  case object Terminal                              extends RecordSlot("decision")
+  case object Upload                                extends RecordSlot("upload")
+  case object Archive                               extends InstallSlot("zip")
+  private final case class Pending(nonce: UUID)     extends Slot(s"pending-$nonce")
 
   def apply(root: String, token: () => String): OneLakeGuardedPaths = {
     requireCanonicalRoot(root)
-    new OneLakeGuardedPaths(root, token)
+    val http = HttpClient
+      .newBuilder()
+      .connectTimeout(Duration.ofSeconds(15))
+      .followRedirects(HttpClient.Redirect.NEVER)
+      .build()
+    new OneLakeGuardedPaths(root, token, request => http.send(request, HttpResponse.BodyHandlers.ofInputStream()))
+  }
+
+  private[rocksdb] def forTesting(
+      root: String,
+      exchange: HttpRequest => HttpResponse[InputStream]
+  ): OneLakeGuardedPaths = {
+    requireCanonicalRoot(root)
+    new OneLakeGuardedPaths(root, () => "synthetic-storage-token", exchange)
   }
 
   private[rocksdb] def requireCanonicalRoot(root: String): Unit =
