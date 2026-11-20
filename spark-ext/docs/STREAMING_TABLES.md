@@ -30,12 +30,65 @@ streaming source can carry its own case-insensitive `WITH (...)` reader options;
 duplicate keys and simultaneous `startingVersion` / `startingTimestamp` are
 rejected before Spark receives the native options.
 
+For a catalog-free TEXT file source, use `STREAM(text.` followed by a
+backtick-quoted absolute Hadoop path or URI:
+
+```sql
+CREATE STREAMING TABLE monitoring.raw_events
+TBLPROPERTIES (
+  'trigger' = 'availableNow',
+  'outputMode' = 'append',
+  'onQueryChange' = 'fail'
+)
+AS SELECT value AS request_body, input_file_name() AS source_file
+FROM STREAM(text.`abfss://container@account.dfs.core.windows.net/inbox`)
+WITH (
+  'pathGlobFilter' = '*.json',
+  'cleanSource' = 'archive',
+  'sourceArchiveDir' = 'abfss://container@account.dfs.core.windows.net/archive'
+);
+```
+
+This boundary uses Spark's native TEXT streaming reader on both supported Spark
+lines; it needs neither a catalog TEXT table nor a session view. Native TEXT
+schema, `input_file_name()`, reader-option validation and post-commit file
+cleanup are preserved. Other table/view boundaries retain catalog resolution.
+The source path, schema and semantic reader options remain checkpoint
+fingerprint inputs. Reissuing the same declaration resumes its checkpoint;
+incompatible source/options changes fail under `onQueryChange='fail'` without
+resetting the checkpoint.
+
+A single native TEXT reader previously exposed through a DataFrame temporary
+view can adopt the direct-path representation without the old session view.
+OpenIVM requires the same physical source identity, occurrence, provider and
+schema, and identical semantic reader options except equivalent Hadoop
+qualification of `path` and `sourceArchiveDir`. It reconstructs the legacy
+representation only as an in-memory logical plan and requires its **entire**
+semantic definition to match the saved definition, including projection,
+time zone, output/target schemas, sink settings, partitioning and watermarks.
+Only a proven representation change is atomically recorded under the existing
+lifecycle locks; the target generation, query ID and native checkpoint remain
+unchanged. Other view/catalog rewrites or actual query/options drift are not
+adopted. This does not enable the analyzer-drift bypass or rebuild the target.
+
+Native asynchronous archive cleanup is not a durable cleanup queue and is not
+guaranteed to finish before the driver exits.
+
 `displayName` controls the friendly Structured Streaming query label shown in
 the Spark UI and micro-batch job descriptions. OpenIVM sanitizes the label and
 appends a stable target-identity suffix so independently active tables cannot
 collide. When omitted, the target table name is used. Changing only
 `displayName` restarts the native writer on its existing checkpoint without
 rebuilding the target or replaying committed input.
+
+For Spark hosts whose SQL parser rejects `OPTIONS` on this statement, the five
+OpenIVM writer controls (`outputMode`, `trigger`, `triggerInterval`,
+`onQueryChange`, and `displayName`) may instead be supplied in `TBLPROPERTIES`.
+OpenIVM consumes these keys as runtime controls rather than persisting them as
+Delta table properties; unrelated `TBLPROPERTIES` continue to be applied
+normally. A runtime key may appear in only one of `OPTIONS` or `TBLPROPERTIES`;
+declaring it in both is an error. Runtime values receive the same validation
+regardless of clause.
 
 ## Destination layouts
 

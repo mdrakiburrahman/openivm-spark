@@ -97,6 +97,9 @@ object StreamingRuntimeOptions {
     Set("outputmode", "trigger", "triggerinterval", "onquerychange", "displayname")
   private val WriterOwnedKeys = Set("path", "checkpointlocation", "queryname")
 
+  private[openivm] def isExtensionOptionKey(key: String): Boolean =
+    ExtensionOptionKeys.contains(normalizeKey(key))
+
   def parse(rawOptions: Map[String, String]): StreamingRuntimeOptions = {
     val grouped = rawOptions.toSeq.groupBy { case (key, _) => normalizeKey(key) }
     grouped.collectFirst {

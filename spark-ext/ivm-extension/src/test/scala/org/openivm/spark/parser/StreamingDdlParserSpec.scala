@@ -89,6 +89,39 @@ class StreamingDdlParserSpec extends AnyFunSpec with Matchers with BeforeAndAfte
       command.spec.ifNotExists shouldBe true
     }
 
+    it("routes OpenIVM runtime controls from TBLPROPERTIES without consuming other properties") {
+      val command = parseCreate(
+        """CREATE STREAMING TABLE sink
+          |TBLPROPERTIES (
+          |  'trigger' = 'processingTime',
+          |  'triggerInterval' = '5 seconds',
+          |  'outputMode' = 'append',
+          |  'onQueryChange' = 'rebuild',
+          |  'displayName' = 'lineage_restart_scratch',
+          |  'delta.enableChangeDataFeed' = 'true'
+          |)
+          |AS SELECT 1 AS id""".stripMargin
+      )
+
+      command.spec.options shouldBe Map(
+        "trigger"         -> "processingTime",
+        "triggerInterval" -> "5 seconds",
+        "outputMode"      -> "append",
+        "onQueryChange"   -> "rebuild",
+        "displayName"     -> "lineage_restart_scratch"
+      )
+      command.spec.tableProperties shouldBe Map("delta.enableChangeDataFeed" -> "true")
+    }
+
+    it("rejects runtime controls duplicated across TBLPROPERTIES and OPTIONS") {
+      an[ParseException] should be thrownBy {
+        parseCreate(
+          "CREATE STREAMING TABLE sink OPTIONS ('trigger' = 'availableNow') " +
+            "TBLPROPERTIES ('TRIGGER' = 'availableNow') AS SELECT 1"
+        )
+      }
+    }
+
     it("accepts case-insensitive keywords, comments, and a trailing semicolon") {
       val command = parseCreate(
         """/* lead */ cReAtE /* head */ sTrEaMiNg TABLE `sink`
