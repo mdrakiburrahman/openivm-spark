@@ -989,10 +989,10 @@ object OpenIvmStateSync {
         OpenIvmStateBarrier.withCapture(spark) {
           trace.endPhase(barrierStarted, "success")
           barrierAcquired = true
-          val captureHook = duringCaptureHookForTesting
-          if (captureHook != null) captureHook()
           val captured = trace.measure("spark.backup.capture", "durability") {
             OpenIvmSnapshotArchive.checkInterrupted()
+            val captureHook = duringCaptureHookForTesting
+            var captureHookInvoked = false
             val localBase = local.toPath
             val files     = backupFiles(local)
             if (files.isEmpty) {
@@ -1008,6 +1008,10 @@ object OpenIvmStateSync {
                 val target = capture.toPath.resolve(localBase.relativize(db))
                 Files.createDirectories(target.getParent)
                 OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
+                if (!captureHookInvoked && captureHook != null) {
+                  captureHookInvoked = true
+                  captureHook()
+                }
               }
               files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
                 OpenIvmSnapshotArchive.checkInterrupted()
