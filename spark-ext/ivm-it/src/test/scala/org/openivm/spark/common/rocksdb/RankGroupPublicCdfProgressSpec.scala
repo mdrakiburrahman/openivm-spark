@@ -157,6 +157,12 @@ class RankGroupPublicCdfProgressSpec extends IvmParitySpecBase("rank-group-publi
         refreshMv(f.producer)
         val mixed = mvDataVersion(f.producer)
         mixed should be > duplicateRemoval
+        f.assertSignedZero(1L, 1L)
+        val mixedFeed = f.feed(duplicateRemoval + 1L, mixed)
+        val inserted = mixedFeed.where("_change_type IN ('insert', 'update_postimage')").select("part", "id", "score")
+        val deleted = mixedFeed.where("_change_type IN ('delete', 'update_preimage')").select("part", "id", "score")
+        inserted.exceptAll(deleted).isEmpty shouldBe false
+        deleted.exceptAll(inserted).isEmpty shouldBe false
         f.consumers.zip(versions).foreach { case (name, version) =>
           refreshOutcome(name, 1) shouldBe "incremental_executed"
           f.offset(name) shouldBe Some(mixed)

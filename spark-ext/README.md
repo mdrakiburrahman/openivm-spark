@@ -161,7 +161,7 @@ refresh path remains in charge when the proof is unavailable. This relies on
 the existing managed-MV lifecycle locks, not a cross-driver DDL fence.
 
 The independent experimental flag `spark.openivm.refresh.publicCdfRankGroupNoWrite.enabled`
-(default `false`) admits direct single-source grouped `COUNT` and `ROW_NUMBER`
+(default `false`) admits managed DISTINCT inputs to direct single-source grouped `COUNT` and `ROW_NUMBER`
 consumers whose primitive input attributes are all covered by their partition/order
 keys. Other orderings (including unproved ties) use ordinary refresh. The exact
 signed grouping probe is limited to four complete MERGE commits with explicit CDF

@@ -78,7 +78,7 @@ private[commands] object PublicCdfNoWrite {
     case _ => false
   }
 
-  private[commands] val MaxRankGroupVersions = 4L
+  private val MaxRankGroupVersions = 4L
   private val MaxRankGroupCdcBytes           = BigInt(8 * 1024 * 1024)
 
   private def deterministicRankOrCount(plan: LogicalPlan, source: LogicalPlan, refreshType: Int): Boolean = {
@@ -200,7 +200,10 @@ private[commands] object PublicCdfNoWrite {
               MaterializedViewLifecycle.liveOwnership(spark, consumer.name, consumer).owned &&
               DeltaTableVersion.latest(spark, consumer.location) == consumer.lastVersion
 
-          schema.nonEmpty && schema.forall { field =>
+          val producerEligible = !rankGroup ||
+            unalias(spark.sessionState.sqlParser.parsePlan(producer.querySql)).isInstanceOf[Distinct]
+
+          producerEligible && schema.nonEmpty && schema.forall { field =>
             !CdfColumns.contains(field.name.toLowerCase(java.util.Locale.ROOT)) &&
             EligibleTypes.contains(field.dataType)
           } && fingerprint == consumer.sourceSchemaFingerprint && {
