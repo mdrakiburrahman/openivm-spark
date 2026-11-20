@@ -1,0 +1,429 @@
+{
+  "outcome": "point-read prototype rejected; no production optimization adopted",
+  "baseline_commit": "38f571cc1c4c5d1b14df1cdc6499aa26940f10bd",
+  "fixture_commit_spark35": "b67cb1f3c1e5f30720f242b2e11522e743e4d3e8",
+  "fixture_commit_spark41": "b67cb1f3c1e5f30720f242b2e11522e743e4d3e8",
+  "branch": "mdrakiburrahman/campaign-schema-catalog-probe",
+  "scope": {
+    "production_files_modified": [],
+    "native_files_modified": [],
+    "fabric_calls": 0,
+    "end_to_end_refresh_sql_measured": false,
+    "measured_command": "schema-only command: fresh spark.table(source).schema, actual catalog identity reads, and schema fingerprint; not a complete REFRESH MATERIALIZED VIEW command",
+    "why_no_refresh_claim": "The candidate fails the schema-gate equivalence counterexample before dispatcher integration. Timing it as a valid complete REFRESH would be misleading.",
+    "cold_registry_cost": "Registry teardown is outside timed commands; native reopens and per-source validation are inside them.",
+    "security_scope": "Fresh Spark source schema resolution remains first in both variants. This local fixture does not establish external authorization behavior and no authorization path was changed."
+  },
+  "counterexample": {
+    "setup": "200 valid authoritative MV shards including a matching upstream source, then an unrelated shard with CURRENT naming a missing manifest",
+    "baseline": "MvCatalog.list throws RocksDBException; the existing allMvsCached catch converts the entire catalog read to an empty sequence",
+    "point_candidate": "Verified source point lookup succeeds and never observes the unrelated shard failure, even with missing/legacy/error fallback",
+    "consequence": "Same fresh source schema and persisted upstream identity produce different fingerprints: baseline schema_drift, prototype pass.",
+    "decision": "Do not replace schema resolution with this point prototype. Checking only successful candidate names cannot preserve whole-read failure semantics. This is a counterexample to the tested candidate, not a proof that every possible catalog optimization is impossible."
+  },
+  "alias_and_mutation_findings": [
+    "Schema identity matching is exact metadata db.table first, then an unqualified metadata key. It is not a consumer reverse-dependency lookup.",
+    "An unrelated namespace may intentionally fall back to a db-less MV with the same short name; exact namespace matches override that fallback.",
+    "A real registered Delta operational alias shares a physical location and schema with its source but contributes no MV identity when its lexical key is absent.",
+    "Legacy missing definition identities use full enumeration and legacy hashing.",
+    "Create/drop/recreate and definition-property changes are re-read; in-flight source-version advancements still reject dependent schema resolution.",
+    "A simultaneous upsert writer and point readers observed current generations; a completed generation was always visible without a success cache.",
+    "Fresh local state restored from a real file-backed state-sync publication retained the same lookup and full-read identities.",
+    "OpenIvmStateBarrier.withMutation takes a read lock and is gated by state sync. It is not a writer-excluding catalog epoch; sharing snapshots across concurrent commands would require additional independently proven mutation semantics.",
+    "The original allMvsCached value is reused by downstream/cascade decisions. Moving a schema scan can merely move the same enumeration downstream, so no whole-refresh improvement is inferred from this diagnostic."
+  ],
+  "no_win_policy": "No production switch or cache was introduced. Base-table/no-match paths retain a full enumeration and add validation work in the prototype; the prototype remains unadopted on every path.",
+  "validation": [
+    {
+      "command": "npx --no-install nx run spark-ext:test --configuration=spark-3.5 -- 'ivmCommon/testOnly org.openivm.spark.common.SchemaCatalogReadProbeSpec'",
+      "result": "passed 7/7"
+    },
+    {
+      "command": "npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- 'ivmCommon/testOnly org.openivm.spark.common.SchemaCatalogReadProbeSpec'",
+      "result": "passed 7/7 after fixing diagnostic-only cross-version deprecations"
+    },
+    {
+      "command": "npx --no-install nx run spark-ext:lint --configuration=spark-3.5",
+      "result": "passed"
+    },
+    {
+      "command": "npx --no-install nx run spark-ext:lint --configuration=spark-4.1",
+      "result": "passed"
+    },
+    {
+      "command": "npx --no-install nx run spark-ext:verify-all",
+      "result": "not run: bounded diagnostic-only revision; no production code changed"
+    }
+  ],
+  "runs": {
+    "spark35": {
+      "same_data_and_artifact_within_off_on_pairs": true,
+      "order_warm": "ABBA BAAB",
+      "order_cold": "ABBA",
+      "groups": {
+        "warm_full": {
+          "batches": 4,
+          "full_enumerations_per_batch": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "shard_get_or_open_per_batch": [
+            800,
+            800,
+            800,
+            800
+          ],
+          "native_opens_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "median_batch_elapsed_ms": 157.9637665,
+          "median_command_mean_ms": 151.733833375,
+          "median_point_validation_mean_ms": 0.0
+        },
+        "warm_point": {
+          "batches": 4,
+          "full_enumerations_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "shard_get_or_open_per_batch": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "native_opens_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "median_batch_elapsed_ms": 18.776774,
+          "median_command_mean_ms": 14.465884,
+          "median_point_validation_mean_ms": 1.426100625
+        },
+        "cold_full": {
+          "batches": 2,
+          "full_enumerations_per_batch": [
+            4,
+            4
+          ],
+          "shard_get_or_open_per_batch": [
+            800,
+            800
+          ],
+          "native_opens_per_batch": [
+            200,
+            200
+          ],
+          "median_batch_elapsed_ms": 7108.125173,
+          "median_command_mean_ms": 7106.6381095,
+          "median_point_validation_mean_ms": 0.0
+        },
+        "cold_point": {
+          "batches": 2,
+          "full_enumerations_per_batch": [
+            0,
+            0
+          ],
+          "shard_get_or_open_per_batch": [
+            4,
+            4
+          ],
+          "native_opens_per_batch": [
+            4,
+            4
+          ],
+          "median_batch_elapsed_ms": 93.639912,
+          "median_command_mean_ms": 92.698215875,
+          "median_point_validation_mean_ms": 82.208107
+        }
+      },
+      "no_win": {
+        "full": {
+          "median_command_ms": 98.216706,
+          "median_validation_ms": 0.0,
+          "full_enumerations_per_command": [
+            1,
+            1
+          ],
+          "shard_get_or_open_per_command": [
+            200,
+            200
+          ]
+        },
+        "point": {
+          "median_command_ms": 92.5284535,
+          "median_validation_ms": 0.536855,
+          "full_enumerations_per_command": [
+            1,
+            1
+          ],
+          "shard_get_or_open_per_command": [
+            200,
+            200
+          ]
+        }
+      },
+      "negatives": [
+        {
+          "utc_millis": 1795154283764,
+          "kind": "negative",
+          "case": "namespace_and_lexical_alias",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154284126,
+          "kind": "negative",
+          "case": "legacy_and_missing",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154284584,
+          "kind": "negative",
+          "case": "recreate_and_pending_advance",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154284815,
+          "kind": "negative",
+          "case": "concurrent_writer_visibility",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154284983,
+          "kind": "negative",
+          "case": "fresh_restore",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154285087,
+          "kind": "counterexample",
+          "case": "unrelated_failed_shard",
+          "baseline_identity_count": 0,
+          "point_identity_count": 1,
+          "same_schema_fingerprint": false,
+          "production_optimization_adopted": false,
+          "catalog_read_failure": "org.rocksdb.RocksDBException",
+          "baseline_gate": "schema_drift",
+          "point_gate": "pass"
+        }
+      ],
+      "resource_context": {
+        "interval_sample_count": 85,
+        "sampling_interval_seconds": 1,
+        "logical_cpus": 16,
+        "machine_cpu_busy_percent_max": 44.93827160493827,
+        "machine_cpu_busy_percent_mean": 21.083197394208497,
+        "orphan_present": true,
+        "orphan_pid": 574877,
+        "orphan_rss_mib_max": 3135.25,
+        "orphan_max_one_core_cpu_percent": 0.997263421412138,
+        "orphan_mean_one_core_cpu_percent": 0.23717681590974374,
+        "minimum_memory_available_gib": 53.105777740478516,
+        "observed_non_orphan_java_pids": [
+          3502034,
+          3502390
+        ],
+        "assessment": "Only expected sbt and its single fork plus the untouched orphan were observed. Low orphan CPU and ample memory look locally uncontended, but the orphan remains and these are not isolated machine or production performance proofs."
+      }
+    },
+    "spark41": {
+      "same_data_and_artifact_within_off_on_pairs": true,
+      "order_warm": "ABBA BAAB",
+      "order_cold": "ABBA",
+      "groups": {
+        "warm_full": {
+          "batches": 4,
+          "full_enumerations_per_batch": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "shard_get_or_open_per_batch": [
+            800,
+            800,
+            800,
+            800
+          ],
+          "native_opens_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "median_batch_elapsed_ms": 223.4367655,
+          "median_command_mean_ms": 219.560491875,
+          "median_point_validation_mean_ms": 0.0
+        },
+        "warm_point": {
+          "batches": 4,
+          "full_enumerations_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "shard_get_or_open_per_batch": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "native_opens_per_batch": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "median_batch_elapsed_ms": 19.1247765,
+          "median_command_mean_ms": 17.2968225,
+          "median_point_validation_mean_ms": 1.71224075
+        },
+        "cold_full": {
+          "batches": 2,
+          "full_enumerations_per_batch": [
+            4,
+            4
+          ],
+          "shard_get_or_open_per_batch": [
+            800,
+            800
+          ],
+          "native_opens_per_batch": [
+            200,
+            200
+          ],
+          "median_batch_elapsed_ms": 6508.950098,
+          "median_command_mean_ms": 6504.5461205,
+          "median_point_validation_mean_ms": 0.0
+        },
+        "cold_point": {
+          "batches": 2,
+          "full_enumerations_per_batch": [
+            0,
+            0
+          ],
+          "shard_get_or_open_per_batch": [
+            4,
+            4
+          ],
+          "native_opens_per_batch": [
+            4,
+            4
+          ],
+          "median_batch_elapsed_ms": 92.7178955,
+          "median_command_mean_ms": 88.943536,
+          "median_point_validation_mean_ms": 78.727243
+        }
+      },
+      "no_win": {
+        "full": {
+          "median_command_ms": 75.6410995,
+          "median_validation_ms": 0.0,
+          "full_enumerations_per_command": [
+            1,
+            1
+          ],
+          "shard_get_or_open_per_command": [
+            200,
+            200
+          ]
+        },
+        "point": {
+          "median_command_ms": 75.105544,
+          "median_validation_ms": 0.3992035,
+          "full_enumerations_per_command": [
+            1,
+            1
+          ],
+          "shard_get_or_open_per_command": [
+            200,
+            200
+          ]
+        }
+      },
+      "negatives": [
+        {
+          "utc_millis": 1795154382243,
+          "kind": "negative",
+          "case": "namespace_and_lexical_alias",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154382673,
+          "kind": "negative",
+          "case": "legacy_and_missing",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154383015,
+          "kind": "negative",
+          "case": "recreate_and_pending_advance",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154383230,
+          "kind": "negative",
+          "case": "concurrent_writer_visibility",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154383358,
+          "kind": "negative",
+          "case": "fresh_restore",
+          "passed": true
+        },
+        {
+          "utc_millis": 1795154383454,
+          "kind": "counterexample",
+          "case": "unrelated_failed_shard",
+          "baseline_identity_count": 0,
+          "point_identity_count": 1,
+          "same_schema_fingerprint": false,
+          "production_optimization_adopted": false,
+          "catalog_read_failure": "org.rocksdb.RocksDBException",
+          "baseline_gate": "schema_drift",
+          "point_gate": "pass"
+        }
+      ],
+      "resource_context": {
+        "interval_sample_count": 73,
+        "sampling_interval_seconds": 1,
+        "logical_cpus": 16,
+        "machine_cpu_busy_percent_max": 44.65370595382746,
+        "machine_cpu_busy_percent_mean": 20.13597328508302,
+        "orphan_present": true,
+        "orphan_pid": 574877,
+        "orphan_rss_mib_max": 3135.25,
+        "orphan_max_one_core_cpu_percent": 0.9970306333945602,
+        "orphan_mean_one_core_cpu_percent": 0.22131759532295764,
+        "minimum_memory_available_gib": 53.259796142578125,
+        "observed_non_orphan_java_pids": [
+          3542891,
+          3543219
+        ],
+        "assessment": "Only expected sbt and its single fork plus the untouched orphan were observed. Low orphan CPU and ample memory look locally uncontended, but the orphan remains and these are not isolated machine or production performance proofs."
+      }
+    }
+  },
+  "artifact_sha256": {
+    "package-lock.json": "4bca7e1b9c37f606e935dad170f1f095f951a6008ce5134b997d2aff1e0d43da",
+    "spark-ext/dev/pins.env": "c82b57111fe362742c5c6eeb0bc10d748f43b224243495a059359cba6cc9f49e",
+    "spark-ext/dev/targets/spark-3.5.env": "b72b6e64d6a6bb0c7fadbade24a8c580be37af1adeed2c8e3d5f448912625b08",
+    "spark-ext/dev/targets/spark-4.1.env": "0ff48c7ed464b9e1643f0d2f9021bdb960976545fe6de54ffe04977f4518c4d6",
+    "spark-ext/ivm-common/src/test/scala/org/openivm/spark/common/SchemaCatalogReadProbeSpec.scala": "a0cefceb5471842c475980ccbf15f912ca141f7b50553480a3779c0d43d7360a",
+    "spark-ext/ivm-common/target/scala-2.12/test-classes/org/openivm/spark/common/SchemaCatalogReadProbeSpec.class": "ffbd9c2d25958fe6abd52d8c2b045410169634adf07dc5a6fb9bc7a4542d48cb",
+    "spark-ext/ivm-common/target/scala-2.13/test-classes/org/openivm/spark/common/SchemaCatalogReadProbeSpec.class": "932c25ca967f7d280e9c8cf5497e767443502ed8716622216f10376f3b922737",
+    "/opt/openivm/duckdb": "62177a6a98af4414488466b20a9cc83339083dd604d913d4da4afe4a03723e56",
+    "/opt/openivm/openivm.duckdb_extension": "2c9619804bb93cc498397f9050114db714726e68859bddd88252c24738fdcd7b"
+  }
+}
