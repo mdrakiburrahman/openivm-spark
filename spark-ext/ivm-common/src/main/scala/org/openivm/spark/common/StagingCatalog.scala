@@ -94,6 +94,13 @@ object StagingCatalog {
   private val GcCf       = "gc"
   private val LedgerKey  = RocksDBCodec.utf8("source")
 
+  @volatile private var gcScanHookForTesting: String => Unit = null
+
+  private[openivm] def setGcScanHookForTesting(hook: String => Unit): Unit =
+    gcScanHookForTesting = hook
+
+  private def recordGcScan(kind: String): Unit = Option(gcScanHookForTesting).foreach(_(kind))
+
   private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
     OpenIvmStatePaths.baseTableDbPath(spark, baseTable)
 
@@ -347,6 +354,8 @@ object StagingCatalog {
             OpenIvmRocksDBBatchOps.put(baseDb, batch, GcCf, RocksDBCodec.utf8(stagingPath), Array.emptyByteArray)
         }
       }
+      if (records.exists { case (_, stagingPath) => StagingDeltaView.CachedViewDeltaRef.decode(stagingPath).isEmpty })
+        OpenIvmStateBarrier.markGcTombstonesChanged(spark)
       records
         .map { case (_, stagingPath) => stagingPath }
         .flatMap(p => StagingDeltaView.CachedViewDeltaRef.decode(p).map(p -> _))
@@ -359,6 +368,45 @@ object StagingCatalog {
           StagingDeltaView.CachedViewDeltaRef.forgetInputs(globalView)
         }
     }
+
+  final case class GarbageCollectionPaths(tombstoned: Set[String], referenced: Set[String])
+
+  /** Reuse one shard inventory for both scans; skip live staging reads only when there are no
+    * tombstones and the caller does not need references for a sweep.
+    */
+  private[openivm] def garbageCollectionPaths(
+      spark: SparkSession,
+      sweepDue: => Boolean
+  ): Option[GarbageCollectionPaths] = {
+    val sweepIsDue = sweepDue
+    val gcEpoch    = OpenIvmStateBarrier.gcTombstoneEpoch(spark)
+    if (!sweepIsDue && OpenIvmStateBarrier.gcTombstonesKnownEmpty(spark, gcEpoch)) return None
+
+    val baseDbs = OpenIvmStatePaths
+      .existingBaseTableDbPaths(spark)
+      .map(dbPath => OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies))
+    val tombstones = Set.newBuilder[String]
+    baseDbs.foreach { baseDb =>
+      recordGcScan("tombstone")
+      baseDb.prefixScan(GcCf, Array.emptyByteArray).foreach { case (key, _) =>
+        tombstones += RocksDBCodec.fromUtf8(key)
+      }
+    }
+    val tombstoned = tombstones.result()
+    if (tombstoned.isEmpty && !sweepIsDue) {
+      OpenIvmStateBarrier.markGcTombstonesEmptyIfUnchanged(spark, gcEpoch)
+      None
+    } else {
+      val referenced = Set.newBuilder[String]
+      baseDbs.foreach { baseDb =>
+        recordGcScan("referenced")
+        baseDb.prefixScan(StagingCf, Array.emptyByteArray).foreach { case (key, _) =>
+          referenced += decodeStagingKey(key)._2
+        }
+      }
+      Some(GarbageCollectionPaths(tombstoned, referenced.result()))
+    }
+  }
 
   /** Staging locations whose records were pruned and that await deletion. A location may only be
     * deleted once a durable state that no longer references it exists: with state sync enabled,
@@ -398,8 +446,10 @@ object StagingCatalog {
         .prefixScan(GcCf, Array.emptyByteArray)
         .collect { case (key, _) if paths.contains(RocksDBCodec.fromUtf8(key)) => key.clone() }
         .toList
-      if (victims.nonEmpty)
+      if (victims.nonEmpty) {
         baseDb.withBatch(batch => victims.foreach(key => OpenIvmRocksDBBatchOps.delete(baseDb, batch, GcCf, key)))
+        OpenIvmStateBarrier.markGcTombstonesChanged(spark)
+      }
     }
   }
 

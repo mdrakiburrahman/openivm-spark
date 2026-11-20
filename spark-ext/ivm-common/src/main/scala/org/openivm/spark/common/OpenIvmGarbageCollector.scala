@@ -58,23 +58,31 @@ object OpenIvmGarbageCollector {
     *
     * @param spark active session
     */
-  def prepare(spark: SparkSession): Option[Plan] =
+  def prepare(spark: SparkSession): Option[Plan] = prepareCandidates(spark, sweepDue = true)
+
+  def prepareForRefresh(spark: SparkSession): Option[Plan] =
+    prepareCandidates(
+      spark,
+      sweepDue = System.currentTimeMillis() - lastSweepMs.get() >= FeatureGate.gcOrphanSweepIntervalMs(spark)
+    )
+
+  private def prepareCandidates(spark: SparkSession, sweepDue: => Boolean): Option[Plan] =
     if (!FeatureGate.gcEnabled(spark)) None
     else
       try {
-        val metadataReferences = MvCatalog
-          .list(spark)
-          .iterator
-          .flatMap(_.properties.values)
-          .filter(value => value.contains("/_ivm/") || value.contains("/_openivm/"))
-          .toSet
-        val recorded = StagingCatalog.referencedStagingPaths(spark)
-        Some(
+        StagingCatalog.garbageCollectionPaths(spark, sweepDue).map { stagingPaths =>
+          val metadataReferences = MvCatalog
+            .list(spark)
+            .iterator
+            .flatMap(_.properties.values)
+            .filter(value => value.contains("/_ivm/") || value.contains("/_openivm/"))
+            .toSet
+          val recorded = stagingPaths.referenced
           Plan(
-            StagingCatalog.pendingGarbage(spark),
+            stagingPaths.tombstoned,
             recorded ++ metadataReferences ++ StagingDeltaView.CachedViewDeltaRef.inputsOf(recorded)
           )
-        )
+        }
       } catch {
         case NonFatal(error) =>
           log.warn(s"openivm gc: cannot read garbage candidates: $error")

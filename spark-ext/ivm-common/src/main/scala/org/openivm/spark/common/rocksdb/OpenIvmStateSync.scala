@@ -307,6 +307,7 @@ object OpenIvmStateSync {
     val committed = latestCommit(fs, remoteRoot)
     committed.flatMap(_.archive).foreach { info =>
       restoreArchive(fs, committed.get.root, info, local)
+      OpenIvmStateBarrier.markGcTombstonesChanged(spark)
       return
     }
     val snapshotRoot = committed.map(_.root).getOrElse(remoteRoot)
@@ -331,6 +332,7 @@ object OpenIvmStateSync {
     }
     if (restored == 0 && snapshotRoot == remoteRoot && fs.exists(new Path(remoteRoot, ".openivm-state-sync")))
       throw new java.io.IOException(s"openivm state-sync: no committed snapshot or legacy state at $uri")
+    if (restored > 0) OpenIvmStateBarrier.markGcTombstonesChanged(spark)
     log.info(s"openivm state-sync: restored $restored files from $uri to $local")
   }
 

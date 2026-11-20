@@ -4188,7 +4188,7 @@ case class RefreshMaterializedViewCommand(
       }
       // In async mode the same publication ordering holds in the background.
       val garbage = RefreshProfile.timeObservedActiveStep("gc_prepare") {
-        OpenIvmGarbageCollector.prepare(spark)
+        OpenIvmGarbageCollector.prepareForRefresh(spark)
       }
       if (FeatureGate.stateSyncAsyncEnabled(spark)) {
         RefreshProfile.timeActiveStep("state_backup_enqueue") {

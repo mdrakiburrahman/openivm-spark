@@ -2,7 +2,8 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog}
-import org.openivm.spark.common.rocksdb.OpenIvmStateSync
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDBRegistry, OpenIvmStateSync}
+import org.openivm.spark.common.StagingDelta
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funspec.AnyFunSpec
@@ -11,6 +12,7 @@ import org.scalatest.time.{Millis, Seconds, Span}
 
 import java.io.File
 import java.nio.file.Files
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.jdk.CollectionConverters._
@@ -64,6 +66,60 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   }
 
   describe("staging garbage collection") {
+    it("skips cached empty inventories when a refresh sweep is not due") {
+      val source = s"default.gc_scan_${UUID.randomUUID().toString.replace('-', '_')}"
+      val path   = s"${warehouse.getAbsolutePath}/_ivm/staging/${source.replace('.', '_')}/INSERT/${UUID.randomUUID()}"
+      StagingCatalog.record(
+        spark,
+        StagingDelta(
+          source,
+          StagingDelta.OpTypes.Insert,
+          path,
+          new java.sql.Timestamp(System.currentTimeMillis()),
+          Seq.empty
+        )
+      )
+      val dbCount = 1
+
+      val scanCounts = scala.collection.mutable.Map.empty[String, Int].withDefaultValue(0)
+      StagingCatalog.setGcScanHookForTesting(kind => scanCounts.update(kind, scanCounts(kind) + 1))
+      def measured(sweepDue: Boolean): (Option[StagingCatalog.GarbageCollectionPaths], Map[String, Int], Long) = {
+        scanCounts.clear()
+        val started = System.nanoTime()
+        val result  = StagingCatalog.garbageCollectionPaths(spark, sweepDue)
+        (result, scanCounts.toMap, System.nanoTime() - started)
+      }
+      try {
+        val controlStarted = System.nanoTime()
+        StagingCatalog.pendingGarbage(spark) shouldBe empty
+        StagingCatalog.referencedStagingPaths(spark) should contain(path)
+        val controlNs  = System.nanoTime() - controlStarted
+        val coldNotDue = measured(sweepDue = false)
+        coldNotDue._1 shouldBe None
+        coldNotDue._2 shouldBe Map("tombstone" -> dbCount)
+        val warmNotDue = measured(sweepDue = false)
+        warmNotDue._1 shouldBe None
+        warmNotDue._2 shouldBe empty
+        val due = measured(sweepDue = true)
+        due._1.get.tombstoned shouldBe empty
+        due._1.get.referenced should contain(path)
+        due._2 shouldBe Map("tombstone" -> dbCount, "referenced" -> dbCount)
+
+        def scansJson(scans: Map[String, Int]): String =
+          s"""{"tombstone":${scans.getOrElse("tombstone", 0)},"referenced":${scans.getOrElse("referenced", 0)}}"""
+        val report =
+          s"""{"base_commit":"38f571cc1c4c5d1b14df1cdc6499aa26940f10bd","base_db_count":$dbCount,"control_separate_scans_ns":$controlNs,"control_tombstone_scans":$dbCount,"control_reference_scans":$dbCount,"candidate_cold_not_due_scans":${scansJson(
+              coldNotDue._2
+            )},"candidate_cold_not_due_ns":${coldNotDue._3},"candidate_warm_not_due_scans":${scansJson(
+              warmNotDue._2
+            )},"candidate_warm_not_due_ns":${warmNotDue._3},"candidate_due_scans":${scansJson(
+              due._2
+            )},"candidate_due_ns":${due._3}}"""
+        val reportFile = new File("target/gc-no-sweep-observations.json")
+        Files.write(reportFile.toPath, report.getBytes(StandardCharsets.UTF_8))
+      } finally StagingCatalog.setGcScanHookForTesting(null)
+    }
+
     it("deletes a staging location once every dependent consumed it") {
       spark.sql("CREATE TABLE gc_src (id INT, name STRING) USING delta")
       spark.sql("INSERT INTO gc_src VALUES (1, 'a')")
@@ -193,5 +249,85 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
       expired.exists() shouldBe false
       current.exists() shouldBe true
     }
+    it("preserves tombstones across failed publication and cleans them after fresh-session restore") {
+      val source = s"default.gc_retry_${UUID.randomUUID().toString.replace('-', '_')}"
+      val stagingPath = new File(
+        warehouse,
+        s"_ivm/staging/${source.replace('.', '_')}/INSERT/${UUID.randomUUID()}"
+      )
+      Files.createDirectories(stagingPath.toPath)
+      Files.write(stagingPath.toPath.resolve("marker"), Array[Byte](1, 2, 3))
+      StagingCatalog.record(
+        spark,
+        StagingDelta(
+          source,
+          StagingDelta.OpTypes.Insert,
+          stagingPath.getAbsolutePath,
+          new java.sql.Timestamp(System.currentTimeMillis()),
+          Seq.empty
+        )
+      )
+      StagingCatalog.pruneUnconsumed(spark, source)
+      StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
+      val remote = new File(warehouse, s"state-sync-gc-retry-${UUID.randomUUID()}")
+      spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+      OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remote.toURI.toString))
+      try {
+        val failedPlan = OpenIvmGarbageCollector.prepareForRefresh(spark).get
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          throw new java.io.IOException("injected GC-state publication failure")
+        }
+        try {
+          intercept[java.io.IOException] {
+            OpenIvmStateSync.backupForCommand(
+              spark,
+              () => OpenIvmGarbageCollector.collect(spark, Some(failedPlan))
+            )
+          }.getMessage shouldBe "injected GC-state publication failure"
+          stagingPath.exists() shouldBe true
+          StagingCatalog.pendingGarbage(spark) should contain(stagingPath.getAbsolutePath)
+        } finally OpenIvmStateSync.setBackupPassHookForTesting(null)
+
+        OpenIvmStateSync.backupNow(spark)
+        val stateRoot = new File(warehouse, "_openivm").toPath
+        OpenIvmRocksDBRegistry.closeAll()
+        spark.stop()
+        SparkSession.clearActiveSession()
+        SparkSession.clearDefaultSession()
+        if (Files.exists(stateRoot)) {
+          val paths = Files.walk(stateRoot)
+          try paths.iterator().asScala.toSeq.reverse.foreach(Files.delete)
+          finally paths.close()
+        }
+
+        spark = SparkSession
+          .builder()
+          .master("local[1]")
+          .appName("openivm-spark-StagingGarbageCollectionSpec-fresh-session")
+          .config(
+            "spark.sql.extensions",
+            "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+          )
+          .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+          .config("spark.openivm.enabled", "true")
+          .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)
+          .config("spark.ui.enabled", "false")
+          .config("spark.sql.shuffle.partitions", "1")
+          .getOrCreate()
+        OpenIvmStateSync.maybeRestore(spark)
+        val restoredPlan = OpenIvmGarbageCollector.prepareForRefresh(spark).get
+        restoredPlan.tombstoned should contain(stagingPath.getAbsolutePath)
+        OpenIvmStateSync.backupNow(spark)
+        OpenIvmGarbageCollector.collect(spark, Some(restoredPlan))
+        stagingPath.exists() shouldBe false
+        StagingCatalog.pendingGarbage(spark) should not contain stagingPath.getAbsolutePath
+      } finally {
+        OpenIvmStateSync.setBackupPassHookForTesting(null)
+        OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        spark.conf.unset(FeatureGate.StateSyncAsyncEnabledKey)
+        spark.conf.unset(FeatureGate.StateSyncUriKey)
+      }
+    }
+
   }
 }
