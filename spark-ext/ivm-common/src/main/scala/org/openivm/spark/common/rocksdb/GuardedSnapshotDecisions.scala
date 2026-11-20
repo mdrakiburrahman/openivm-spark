@@ -1,6 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
-import java.io.IOException
+import java.io.{File, IOException}
 
 /** Storage contract for a fresh, exclusively versioned checkpoint namespace. No Hadoop fallback. */
 private[rocksdb] object GuardedSnapshotDecisions {
@@ -38,6 +38,13 @@ private[rocksdb] object GuardedSnapshotDecisions {
     def requireArchiveVersion(artifact: Finished): Unit
     // Missing must be distinguished from a replacement. Identity check and delete are one operation.
     def deleteExactArchive(artifact: Finished): Deletion
+  }
+
+  trait ArchiveStore extends Store {
+    // A create-only archive upload followed by an immutable, complete receipt for that version.
+    def sealUpload(generation: Generation, file: File, bytes: Long, sha256: String): Finished
+    // The downloaded body must be from the requested object version, not a second unpinned GET.
+    def copyExactArchive(artifact: Finished, destination: File): Unit
   }
 }
 

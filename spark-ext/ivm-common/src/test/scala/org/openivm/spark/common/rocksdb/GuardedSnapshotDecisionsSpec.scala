@@ -1,12 +1,16 @@
 package org.openivm.spark.common.rocksdb
 
-import java.io.IOException
+import java.io.{File, IOException}
+import java.lang.management.ManagementFactory
 import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths, StandardCopyOption, StandardOpenOption}
 import java.util.concurrent.TimeUnit
+import org.apache.spark.sql.SparkSession
+import org.openivm.spark.common.{StagingCatalog, StagingDelta}
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
+import java.sql.Timestamp
 import scala.jdk.CollectionConverters._
 
 private[rocksdb] object GuardedSnapshotDecisionProbe {
@@ -20,7 +24,7 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       loseInstall: Boolean = false,
       loseDelete: Boolean = false,
       beforeInstall: () => Unit = () => ()
-  ) extends Store {
+  ) extends ArchiveStore {
     val canonicalRoot: String = root.toRealPath().toString
     private def slot(g: Generation, suffix: String): Path = root.resolve(g.value + suffix)
     def archive(g: Generation): Path = slot(g, ".zip")
@@ -80,6 +84,16 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
     }
     override def requireArchiveVersion(artifact: Finished): Unit =
       if (version(artifact.generation) != artifact.version) throw new IOException("archive version changed")
+    override def sealUpload(g: Generation, file: File, bytes: Long, sha256: String): Finished = {
+      Files.copy(file.toPath, archive(g))
+      require(Files.size(archive(g)) == bytes && OpenIvmSnapshotArchive.sha256(archive(g).toFile) == sha256)
+      seal(g)
+    }
+    override def copyExactArchive(artifact: Finished, destination: File): Unit = locked(artifact.generation) {
+      requireArchiveVersion(artifact)
+      Files.copy(archive(artifact.generation), destination.toPath)
+      ()
+    }
     override def deleteExactArchive(artifact: Finished): Deletion = locked(artifact.generation) {
       if (Files.notExists(archive(artifact.generation))) AlreadyAbsent
       else if (version(artifact.generation) != artifact.version) VersionChanged
@@ -106,7 +120,12 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       }
     )
     val protocol = new GuardedSnapshotDecisions(store)
-    val receipt = store.readFinished(generation(args(2).toInt)).get
+    val selectedGeneration = generation(args(2).toInt)
+    if (role.startsWith("spark-")) {
+      runSpark(root, role, selectedGeneration, store)
+      return
+    }
+    val receipt = store.readFinished(selectedGeneration).get
     role match {
       case "publish" => protocol.publish(receipt)
       case "race-publish" =>
@@ -135,10 +154,68 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
       case other => sys.error(s"unexpected probe operation: $other")
     }
   }
+
+  private def runSpark(root: Path, role: String, gen: Generation, store: LocalStore): Unit = {
+    val spark = SparkSession.builder().master("local[1]")
+      .appName(role)
+      .config("spark.ui.enabled", "false")
+      .config("spark.driver.host", "localhost")
+      .config("spark.driver.bindAddress", "127.0.0.1")
+      .config("spark.sql.warehouse.dir", root.resolve(s"warehouse-$role").toString)
+      .getOrCreate()
+    try {
+      if (role == "spark-restore") {
+        OpenIvmStateSync.restoreGuarded(spark, store)
+        require(StagingCatalog.referencedStagingPaths(spark) == Set("published-control"))
+      } else {
+        val published = role == "spark-publish"
+        val value = if (published) "published-control" else "retired-value"
+        StagingCatalog.record(spark, StagingDelta("default.guarded_source", "INSERT", value, new Timestamp(1000L), Nil))
+        if (published) OpenIvmStateSync.publishGuarded(spark, gen, store)
+        else {
+          OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => {
+            val receipt = store.readFinished(gen).get
+            require(new GuardedSnapshotDecisions(store).retire(receipt))
+          })
+          try {
+            OpenIvmStateSync.publishGuarded(spark, gen, store)
+            sys.error("retired Spark capture was acknowledged")
+          } catch { case e: IOException if e.getMessage.contains("was retired") => () }
+          finally OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+        }
+      }
+    } finally {
+      OpenIvmRocksDBRegistry.closeAll()
+      spark.stop()
+    }
+  }
 }
 
 class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
   import GuardedSnapshotDecisionProbe._
+
+  it("uses the real RocksDB checkpoint and restore paths with a retired upload and a published control") {
+    val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "guarded-spark-")
+    Files.write(root.resolve("format"), Seq("guarded-v1").asJava, UTF_8)
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val modules = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
+      .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
+    for ((role, n) <- Seq("spark-publish" -> 1, "spark-retire" -> 2, "spark-restore" -> 1)) {
+      val log = root.resolve(s"$role.log").toFile
+      val process = new ProcessBuilder((Seq(java, "-Xmx1g") ++ modules ++ Seq(
+        "-cp", System.getProperty("java.class.path"),
+        "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe", root.toString, role, n.toString
+      )): _*).redirectErrorStream(true).redirectOutput(log).start()
+      try {
+        process.waitFor(90, TimeUnit.SECONDS) shouldBe true
+        withClue(s"$role failed; see $log: ") { process.exitValue() shouldBe 0 }
+      } finally if (process.isAlive) process.destroyForcibly()
+    }
+    val store = new LocalStore(root)
+    Files.exists(store.archive(generation(1))) shouldBe true
+    Files.exists(store.archive(generation(2))) shouldBe false
+    store.readDecision(generation(2)).exists(_.isInstanceOf[GuardedSnapshotDecisions.Retired]) shouldBe true
+  }
 
   it("reconciles lost decisions across processes without exposing a retired archive on restore") {
     val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "guarded-decisions-")

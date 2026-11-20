@@ -356,6 +356,14 @@ object OpenIvmStateSync {
     val remoteRoot = new Path(new Path(controlRoot, "snapshots"), generation)
     if (!fs.mkdirs(remoteRoot))
       throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
+    withPackedSnapshot(spark, local, generation) { (archive, archiveBytes, checksum) =>
+      publishLegacy(spark, uri, fs, controlRoot, commitRoot, remoteRoot, generation, archive, archiveBytes, checksum)
+    }
+  }
+
+  private def withPackedSnapshot(spark: SparkSession, local: File, generation: String)(
+      consume: (File, Long, String) => Unit
+  ): Unit = {
     OpenIvmStateBarrier.register(spark)
     val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
@@ -392,8 +400,25 @@ object OpenIvmStateSync {
           if (hook != null) hook(file)
         }
       )
-      val archiveBytes  = archive.length()
-      val checksum      = OpenIvmSnapshotArchive.sha256(archive)
+      consume(archive, archive.length(), OpenIvmSnapshotArchive.sha256(archive))
+    } finally {
+      try Files.deleteIfExists(archive.toPath)
+      finally deleteStagedTree(capture)
+    }
+  }
+
+  private def publishLegacy(
+      spark: SparkSession,
+      uri: String,
+      fs: FileSystem,
+      controlRoot: Path,
+      commitRoot: Path,
+      remoteRoot: Path,
+      generation: String,
+      archive: File,
+      archiveBytes: Long,
+      checksum: String
+  ): Unit = {
       val remoteArchive = new Path(remoteRoot, "snapshot.zip")
       val copyHook      = copyLocalFileHookForTesting
       if (copyHook != null) copyHook(fs, archive, remoteArchive)
@@ -418,11 +443,35 @@ object OpenIvmStateSync {
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
       pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
-    } finally {
-      try Files.deleteIfExists(archive.toPath)
-      finally deleteStagedTree(capture)
+  }
+
+  // Explicit guarded entry points; there is no configured OneLake transport or legacy fallback.
+  private[rocksdb] def publishGuarded(
+      spark: SparkSession,
+      generation: GuardedSnapshotDecisions.Generation,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Unit = {
+    store.verifyNamespace()
+    val local = localRoot(spark)
+    withPackedSnapshot(spark, local, generation.value) { (archive, length, digest) =>
+      val receipt = store.sealUpload(generation, archive, length, digest)
+      if (receipt.generation != generation || receipt.bytes != length || receipt.sha256 != digest)
+        throw new java.io.IOException("openivm state-sync: guarded upload receipt does not match local archive")
+      val commitHook = beforeSnapshotCommitHookForTesting
+      if (commitHook != null) commitHook()
+      OpenIvmSnapshotArchive.checkInterrupted()
+      new GuardedSnapshotDecisions(store).publish(receipt)
     }
   }
+
+  private[rocksdb] def restoreGuarded(spark: SparkSession, store: GuardedSnapshotDecisions.ArchiveStore): Unit =
+    OpenIvmStateBarrier.withCapture(spark) {
+      new GuardedSnapshotDecisions(store).latestPublished().foreach { receipt =>
+        restorePackedArchive(receipt.bytes -> receipt.sha256, localRoot(spark))(
+          archive => store.copyExactArchive(receipt, archive)
+        )
+      }
+    }
 
   /** Delete committed generations older than the newest `retain`, then snapshots and pending
     * commit markers older than every retained generation, which interrupted publishes left behind.
@@ -549,12 +598,18 @@ object OpenIvmStateSync {
     val remote = new Path(root, "snapshot.zip")
     if (fs.getFileStatus(remote).getLen != info._1)
       throw new java.io.IOException("openivm state-sync: archive length mismatch")
+    restorePackedArchive(info, local)(
+      archive => fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
+    )
+  }
+
+  private def restorePackedArchive(info: (Long, String), local: File)(download: File => Unit): Unit = {
     val suffix  = UUID.randomUUID().toString
     val archive = new File(local.getParentFile, s".openivm-state-restore-$suffix.zip")
     val staged  = new File(local.getParentFile, s".openivm-state-restore-$suffix")
     Files.createDirectories(local.getParentFile.toPath)
     try {
-      fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
+      download(archive)
       if (archive.length() != info._1 || OpenIvmSnapshotArchive.sha256(archive) != info._2)
         throw new java.io.IOException("openivm state-sync: archive checksum mismatch")
       Files.createDirectories(staged.toPath)
