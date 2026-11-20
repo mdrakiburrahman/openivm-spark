@@ -883,6 +883,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         .config(FeatureGate.StatePathKey, statePath.getAbsolutePath)
         .config(FeatureGate.StateSyncUriKey, remote.toURI.toString)
         .config(FeatureGate.StateSyncRetainGenerationsKey, "2")
+        .config(FeatureGate.ProfileRefreshKey, "true")
         .config("spark.openivm.rocksdb.multiProcess", "false")
         .getOrCreate()
       executor = Executors.newFixedThreadPool(3)
