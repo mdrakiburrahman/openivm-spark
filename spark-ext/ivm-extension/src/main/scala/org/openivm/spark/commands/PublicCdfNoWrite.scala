@@ -101,7 +101,7 @@ private[commands] object PublicCdfNoWrite {
                 }
               }
               log.dataPath.toUri.normalize().toString.stripSuffix("/") == dependency.deltaLogDataPath &&
-          currentEnd && mergeOnly && {
+              currentEnd && mergeOnly && {
                 val raw = spark.read
                   .format("delta")
                   .option("readChangeFeed", "true")
