@@ -40,6 +40,25 @@ class OneLakeGuardedPathsSpec extends AnyFunSpec with Matchers {
       intercept[IOException](paths.deleteArchiveRequest(generation, version))
   }
 
+  it("binds both pages of a listing and record requests to the exact MSIT endpoint") {
+    val host  = "msit-onelake.dfs.fabric.microsoft.com"
+    val msit  = root.replace("onelake.dfs.fabric.microsoft.com", host)
+    val paths = OneLakeGuardedPaths(msit, () => fail("credentials are not required to construct a request"))
+    val requests = Seq(
+      paths.listRequest(None),
+      paths.listRequest(Some("next+page")),
+      paths.installRequest(generation, nonce, OneLakeGuardedPaths.Terminal, etag),
+      paths.readArchiveRequest(generation, etag),
+      paths.deleteArchiveRequest(generation, etag)
+    )
+    requests.foreach(_.build().uri().getRawAuthority shouldBe host)
+    paths.listRequest(Some("next+page")).build().uri().getRawQuery should include("continuation=next%2Bpage")
+    for (authority <- Seq(s"$host.example.com", s"$host:443", s"$host@onelake.dfs.fabric.microsoft.com"))
+      intercept[IOException](
+        OneLakeGuardedPaths(msit.replace(host, authority), () => fail("unexpected credential read"))
+      )
+  }
+
   it("rejects aliases and URLs outside the dedicated GUID-rooted namespace") {
     for (
       alias <- Seq(

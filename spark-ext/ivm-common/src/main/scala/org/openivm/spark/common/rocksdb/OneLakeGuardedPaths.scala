@@ -84,7 +84,7 @@ private[rocksdb] final class OneLakeGuardedPaths private (
       .getOrElse("")
     request(
       URI.create(
-        s"https://$Host/${parts(0)}?resource=filesystem&directory=$directory&recursive=false&maxResults=256$suffix"
+        s"https://${URI.create(canonicalRoot).getHost}/${parts(0)}?resource=filesystem&directory=$directory&recursive=false&maxResults=256$suffix"
       )
     )
       .GET()
@@ -130,12 +130,13 @@ private[rocksdb] final class OneLakeGuardedPaths private (
 }
 
 private[rocksdb] object OneLakeGuardedPaths {
-  private val Host       = "onelake.dfs.fabric.microsoft.com"
+  private val Hosts      = Seq("onelake.dfs.fabric.microsoft.com", "msit-onelake.dfs.fabric.microsoft.com")
   private val ApiVersion = "2021-06-08"
   private val LowerUuid  = "[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"
   val ChunkBytes         = 4 * 1024 * 1024
   private val Root =
-    s"https://${java.util.regex.Pattern.quote(Host)}/$LowerUuid/$LowerUuid/Files/openivm-checkpoints-v1/$LowerUuid"
+    s"https://(?:${Hosts.map(java.util.regex.Pattern.quote).mkString("|")})" +
+      s"/$LowerUuid/$LowerUuid/Files/openivm-checkpoints-v1/$LowerUuid"
 
   sealed abstract class Slot(val suffix: String)
   sealed abstract class InstallSlot(suffix: String) extends Slot(suffix)
