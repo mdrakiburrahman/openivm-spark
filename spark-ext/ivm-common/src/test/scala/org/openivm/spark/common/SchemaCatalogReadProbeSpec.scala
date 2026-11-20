@@ -23,8 +23,8 @@ import scala.util.control.NonFatal
 /** Diagnostic only: a counterexample must prevent adopting the point-read prototype. */
 class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
   private var spark: SparkSession = _
-  private val root = new File(s"target/test-warehouse-schema-catalog-${UUID.randomUUID().toString.take(8)}")
-  private val enumerations = new AtomicLong()
+  private val root            = new File(s"target/test-warehouse-schema-catalog-${UUID.randomUUID().toString.take(8)}")
+  private val enumerations    = new AtomicLong()
   private val validationNanos = new AtomicLong()
   private val evidence = new File(
     sys.env.getOrElse("OPENIVM_SCHEMA_PROBE_EVIDENCE", "../.logs/schema-catalog-probe/evidence.jsonl")
@@ -48,7 +48,8 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
 
   private def record(values: (String, Any)*): Unit = synchronized {
     val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
-    val node = mapper.createObjectNode()
+    val node   = mapper.createObjectNode()
+    node.put("utc_millis", System.currentTimeMillis())
     values.foreach {
       case (key, value: Long)    => node.put(key, value)
       case (key, value: Int)     => node.put(key, value)
@@ -115,7 +116,10 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     root.mkdirs()
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
-    spark = SparkSession.builder().master("local[1]").appName("SchemaCatalogReadProbeSpec")
+    spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("SchemaCatalogReadProbeSpec")
       .config("spark.ui.enabled", "false")
       .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
@@ -155,39 +159,65 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     val pool = Executors.newFixedThreadPool(4)
     try {
       // Warm both variants, then counterbalance ABBA / BAAB on the same state and artifact.
-      Seq(false, true).foreach(on => schemaCommand(spark, Seq("scprobe.up_0"), on))
-      Seq(false, true, true, false, true, false, false, true).zipWithIndex.foreach { case (on, round) =>
-        val gate = new CyclicBarrier(4)
-        val fullBefore = enumerations.get()
+      val expected = (0 until 4).map(index => schemaCommand(spark, Seq(s"scprobe.up_$index"), enabled = false))
+      Seq(false, true, true, false, true, false, false, true, false, true, true, false).zipWithIndex.foreach {
+        case (on, round) =>
+          val cold = round >= 8
+          if (cold) OpenIvmRocksDBRegistry.closeAllForSparkContext(spark.sparkContext.applicationId)
+          val gate             = new CyclicBarrier(4)
+          val fullBefore       = enumerations.get()
+          val validationBefore = validationNanos.get()
+          val hitsBefore       = counter("rocksdb.registry.get_or_open.hit")
+          val missesBefore     = counter("rocksdb.registry.get_or_open.miss")
+          val multiBefore      = counter("rocksdb.scope.mv.operation.multi_get.count")
+          val opensBefore      = counter("rocksdb.scope.mv.operation.load.native.open.count")
+          val started          = System.nanoTime()
+          val futures = (0 until 4).map { index =>
+            pool.submit(new Callable[(String, Long)] {
+              override def call(): (String, Long) = {
+                val session = spark.newSession()
+                gate.await(30, TimeUnit.SECONDS)
+                val commandStarted = System.nanoTime()
+                val result         = schemaCommand(session, Seq(s"scprobe.up_$index"), on)
+                result -> (System.nanoTime() - commandStarted)
+              }
+            })
+          }
+          val results = futures.map(_.get(90, TimeUnit.SECONDS))
+          val elapsed = System.nanoTime() - started
+          results.map(_._1) shouldBe expected
+          record(
+            "kind"              -> "schema_command_batch",
+            "round"             -> round,
+            "point_prototype"   -> on,
+            "cold_registry"     -> cold,
+            "shards"            -> 200,
+            "commands"          -> 4,
+            "full_enumerations" -> (enumerations.get() - fullBefore),
+            "shard_get_or_open" -> (counter("rocksdb.registry.get_or_open.hit") - hitsBefore +
+              counter("rocksdb.registry.get_or_open.miss") - missesBefore),
+            "metadata_multi_get"      -> (counter("rocksdb.scope.mv.operation.multi_get.count") - multiBefore),
+            "native_opens"            -> (counter("rocksdb.scope.mv.operation.load.native.open.count") - opensBefore),
+            "batch_elapsed_ns"        -> elapsed,
+            "command_sum_ns"          -> results.map(_._2).sum,
+            "point_validation_sum_ns" -> (validationNanos.get() - validationBefore)
+          )
+      }
+      spark.sql("CREATE TABLE scprobe.no_mv_source (id INT) USING DELTA").collect()
+      Seq(false, true, true, false).zipWithIndex.foreach { case (on, round) =>
+        val fullBefore       = enumerations.get()
         val validationBefore = validationNanos.get()
-        val hitsBefore = counter("rocksdb.registry.get_or_open.hit")
-        val missesBefore = counter("rocksdb.registry.get_or_open.miss")
-        val multiBefore = counter("rocksdb.scope.mv.operation.multi_get.count")
-        val opensBefore = counter("rocksdb.scope.mv.operation.session.native.open.count")
-        val started = System.nanoTime()
-        val futures = (0 until 4).map { index =>
-          pool.submit(new Callable[(String, Long)] {
-            override def call(): (String, Long) = {
-              val session = spark.newSession()
-              gate.await(30, TimeUnit.SECONDS)
-              val commandStarted = System.nanoTime()
-              val result = schemaCommand(session, Seq(s"scprobe.up_$index"), on)
-              result -> (System.nanoTime() - commandStarted)
-            }
-          })
-        }
-        val results = futures.map(_.get(90, TimeUnit.SECONDS))
-        val elapsed = System.nanoTime() - started
-        results.map(_._1).distinct.size shouldBe 4
+        val hitsBefore       = counter("rocksdb.registry.get_or_open.hit")
+        val started          = System.nanoTime()
+        schemaCommand(spark, Seq("scprobe.no_mv_source"), on)
         record(
-          "kind" -> "schema_command_batch", "round" -> round, "point_prototype" -> on,
-          "shards" -> 200, "commands" -> 4, "full_enumerations" -> (enumerations.get() - fullBefore),
-          "shard_get_or_open" -> (counter("rocksdb.registry.get_or_open.hit") - hitsBefore +
-            counter("rocksdb.registry.get_or_open.miss") - missesBefore),
-          "metadata_multi_get" -> (counter("rocksdb.scope.mv.operation.multi_get.count") - multiBefore),
-          "native_opens" -> (counter("rocksdb.scope.mv.operation.session.native.open.count") - opensBefore),
-          "batch_elapsed_ns" -> elapsed, "command_sum_ns" -> results.map(_._2).sum,
-          "point_validation_sum_ns" -> (validationNanos.get() - validationBefore)
+          "kind"                -> "no_win_schema_command",
+          "round"               -> round,
+          "point_prototype"     -> on,
+          "full_enumerations"   -> (enumerations.get() - fullBefore),
+          "shard_get_or_open"   -> (counter("rocksdb.registry.get_or_open.hit") - hitsBefore),
+          "command_elapsed_ns"  -> (System.nanoTime() - started),
+          "point_validation_ns" -> (validationNanos.get() - validationBefore)
         )
       }
     } finally pool.shutdownNow()
@@ -195,7 +225,7 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
 
   it("preserves exact namespace precedence and the existing unqualified fallback, not physical aliases") {
     val short = metadata("scprobe_collision", "short")
-    val left = metadata("scprobe_left.scprobe_collision", "left")
+    val left  = metadata("scprobe_left.scprobe_collision", "left")
     val right = metadata("scprobe_right.scprobe_collision", "right")
     Seq(short, left, right).foreach(MvCatalog.upsert(spark, _))
     val sources = Seq("scprobe_left.scprobe_collision", "scprobe_right.scprobe_collision", "third.scprobe_collision")
@@ -205,6 +235,11 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     MvCatalog.upsert(spark, physicalAlias)
     baseline(spark, Seq("encoded.operational_alias")) shouldBe empty
     points(spark, Seq("encoded.operational_alias")) shouldBe empty
+    val deltaLocation = spark.sql("DESCRIBE DETAIL scprobe.up_0").select("location").head().getString(0)
+    spark.sql(s"CREATE TABLE scprobe.operational_alias USING DELTA LOCATION '$deltaLocation'").collect()
+    spark.table("scprobe.operational_alias").schema shouldBe spark.table("scprobe.up_0").schema
+    baseline(spark, Seq("scprobe.operational_alias")) shouldBe empty
+    points(spark, Seq("scprobe.operational_alias")) shouldBe empty
     record("kind" -> "negative", "case" -> "namespace_and_lexical_alias", "passed" -> true)
   }
 
@@ -217,6 +252,13 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     val paths = OpenIvmStatePaths.existingMvDbPaths(spark).toSet
     points(spark, Seq("scprobe.absent")) shouldBe empty
     OpenIvmStatePaths.existingMvDbPaths(spark).toSet shouldBe paths
+    val offFailure = intercept[org.apache.spark.sql.AnalysisException] {
+      schemaCommand(spark, Seq("scprobe.absent"), enabled = false)
+    }
+    val onFailure = intercept[org.apache.spark.sql.AnalysisException] {
+      schemaCommand(spark, Seq("scprobe.absent"), enabled = true)
+    }
+    onFailure.getErrorClass shouldBe offFailure.getErrorClass
     record("kind" -> "negative", "case" -> "legacy_and_missing", "passed" -> true)
   }
 
@@ -229,7 +271,9 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     MvCatalog.upsert(spark, initial.copy(properties = Map(MvMetadata.DefinitionIdentityKey -> "after")))
     points(spark, Seq("scprobe.recreated")) shouldBe Map("scprobe.recreated" -> "after")
     MvCatalog.updateProperties(
-      spark, initial.name, Map(MvMetadata.DefinitionIdentityKey -> "after", MvMetadata.SourceVersionAdvancePreMvVersionKey -> "0")
+      spark,
+      initial.name,
+      Map(MvMetadata.DefinitionIdentityKey -> "after", MvMetadata.SourceVersionAdvancePreMvVersionKey -> "0")
     )
     intercept[IllegalStateException](baseline(spark, Seq("scprobe.recreated")))
     intercept[IllegalStateException](points(spark, Seq("scprobe.recreated")))
@@ -244,19 +288,40 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
     try {
       (0 until 8).foreach { index =>
         val identity = s"generation-$index"
-        pool.submit(new Callable[Unit] {
-          override def call(): Unit =
-            MvCatalog.upsert(spark, initial.copy(properties = Map(MvMetadata.DefinitionIdentityKey -> identity)))
-        }).get(30, TimeUnit.SECONDS)
+        pool
+          .submit(new Callable[Unit] {
+            override def call(): Unit =
+              MvCatalog.upsert(spark, initial.copy(properties = Map(MvMetadata.DefinitionIdentityKey -> identity)))
+          })
+          .get(30, TimeUnit.SECONDS)
         points(spark, Seq("scprobe.concurrent")) shouldBe Map("scprobe.concurrent" -> identity)
       }
+      val gate = new CyclicBarrier(2)
+      val writer = pool.submit(new Callable[Unit] {
+        override def call(): Unit = {
+          gate.await(30, TimeUnit.SECONDS)
+          (0 until 16).foreach { index =>
+            MvCatalog.upsert(
+              spark,
+              initial.copy(properties = Map(MvMetadata.DefinitionIdentityKey -> s"overlap-$index"))
+            )
+          }
+        }
+      })
+      gate.await(30, TimeUnit.SECONDS)
+      (0 until 16).foreach { _ =>
+        val seen = points(spark, Seq("scprobe.concurrent"))("scprobe.concurrent")
+        (seen == "generation-7" || seen.startsWith("overlap-")) shouldBe true
+      }
+      writer.get(30, TimeUnit.SECONDS)
+      points(spark, Seq("scprobe.concurrent")) shouldBe Map("scprobe.concurrent" -> "overlap-15")
     } finally pool.shutdownNow()
     record("kind" -> "negative", "case" -> "concurrent_writer_visibility", "passed" -> true)
   }
 
   it("restores a fresh local tree from a real file-backed state-sync publication") {
     val source = spark.newSession()
-    val local = new File(root, "restore-source")
+    val local  = new File(root, "restore-source")
     val remote = new File(root, "restore-publications")
     source.conf.set(FeatureGate.StatePathKey, local.getAbsolutePath)
     source.conf.set(FeatureGate.StateSyncUriKey, remote.toURI.toString)
@@ -274,25 +339,32 @@ class SchemaCatalogReadProbeSpec extends AnyFunSpec with BeforeAndAfterAll with 
   }
 
   it("rejects point-read adoption when an unrelated failed shard changes the schema gate result") {
-    val sources = Seq("scprobe.up_0")
+    val sources  = Seq("scprobe.up_0")
     val expected = baseline(spark, sources)
     expected shouldBe Map("scprobe.up_0" -> "identity-0")
     val broken = new File(OpenIvmStatePaths.perMvDbPath(spark, "scprobe.unreadable")).toPath
     Files.createDirectories(broken)
     Files.write(broken.resolve("CURRENT"), RocksDBCodec.utf8("MANIFEST-DOES-NOT-EXIST\n"))
     try {
-      val off = baseline(spark, sources)
-      val on = points(spark, sources)
+      val readFailure = intercept[Exception](MvCatalog.list(spark))
+      val off         = baseline(spark, sources)
+      val on          = points(spark, sources)
       off shouldBe empty
       on shouldBe expected
-      val schemas = Map("scprobe.up_0" -> StructType(Seq(StructField("id", IntegerType))))
+      val schemas        = Map("scprobe.up_0" -> StructType(Seq(StructField("id", IntegerType))))
       val offFingerprint = MvCatalog.schemaFingerprint(schemas, off)
-      val onFingerprint = MvCatalog.schemaFingerprint(schemas, on)
+      val onFingerprint  = MvCatalog.schemaFingerprint(schemas, on)
       offFingerprint should not be onFingerprint
       record(
-        "kind" -> "counterexample", "case" -> "unrelated_failed_shard",
-        "baseline_identity_count" -> off.size, "point_identity_count" -> on.size,
-        "same_schema_fingerprint" -> false, "production_optimization_adopted" -> false
+        "kind"                            -> "counterexample",
+        "case"                            -> "unrelated_failed_shard",
+        "baseline_identity_count"         -> off.size,
+        "point_identity_count"            -> on.size,
+        "same_schema_fingerprint"         -> false,
+        "production_optimization_adopted" -> false,
+        "catalog_read_failure"            -> readFailure.getClass.getName,
+        "baseline_gate"                   -> "schema_drift",
+        "point_gate"                      -> "pass"
       )
     } finally {
       OpenIvmRocksDBRegistry.closeAndDelete(broken.toString)(_ => delete(broken))
