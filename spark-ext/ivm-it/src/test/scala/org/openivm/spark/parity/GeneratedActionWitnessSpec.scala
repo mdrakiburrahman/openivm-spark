@@ -25,7 +25,7 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
   private def write(name: String, data: String): Unit =
     Files.write(evidence.resolve(name), data.getBytes(StandardCharsets.UTF_8))
 
-  private def export(name: String, df: DataFrame): Unit =
+  private def writeJson(name: String, df: DataFrame): Unit =
     write(name, df.toJSON.collect().mkString("", "\n", "\n"))
 
   private def sameBag(a: DataFrame, b: DataFrame): Unit = {
@@ -40,7 +40,7 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
     sql("CREATE MATERIALIZED VIEW witness_mv AS SELECT id, v FROM witness_src WHERE v >= 10")
     val meta = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("witness_mv")).get
     write("target.txt", s"$meta\n")
-    export("initial-mv.jsonl", spark.table("witness_mv").select("id", "v"))
+    writeJson("initial-mv.jsonl", spark.table("witness_mv").select("id", "v"))
 
     def run(label: String, mutation: Option[String]): Unit = {
       val previousMv = spark.table("witness_mv").select("id", "v").cache()
@@ -57,14 +57,14 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
       sameBag(currentMv, currentSource)
       sameBag(currentMv.exceptAll(previousMv), currentSource.exceptAll(previousSource))
       sameBag(previousMv.exceptAll(currentMv), previousSource.exceptAll(currentSource))
-      export(s"$label-mv.jsonl", currentMv)
-      export(s"$label-source.jsonl", currentSource)
-      export(s"$label-added.jsonl", currentMv.exceptAll(previousMv))
-      export(s"$label-removed.jsonl", previousMv.exceptAll(currentMv))
-      export(s"$label-profile.jsonl", sql("SHOW OPENIVM REFRESH PROFILE"))
+      writeJson(s"$label-mv.jsonl", currentMv)
+      writeJson(s"$label-source.jsonl", currentSource)
+      writeJson(s"$label-added.jsonl", currentMv.exceptAll(previousMv))
+      writeJson(s"$label-removed.jsonl", previousMv.exceptAll(currentMv))
+      writeJson(s"$label-profile.jsonl", sql("SHOW OPENIVM REFRESH PROFILE"))
       RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
-      export(s"$label-query-log.jsonl", sql("SHOW OPENIVM QUERY LOG"))
-      export(s"$label-history.jsonl", sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`"))
+      writeJson(s"$label-query-log.jsonl", sql("SHOW OPENIVM QUERY LOG"))
+      writeJson(s"$label-history.jsonl", sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`"))
       previousMv.unpersist()
       previousSource.unpersist()
       currentMv.unpersist()
