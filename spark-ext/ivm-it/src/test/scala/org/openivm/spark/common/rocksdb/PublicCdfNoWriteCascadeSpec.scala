@@ -117,8 +117,10 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     offsets(childMeta) shouldBe Map(middleLink -> middle1)
     assertMvCorrect(middle, bodyProducer)
     assertMvCorrect(child, bodyChild)
-    sql("CREATE TABLE pcnw_regular_full USING DELTA AS " +
-      s"SELECT CAST(k AS INT) AS k FROM ($bodyProducer) AS source_rows")
+    sql(
+      "CREATE TABLE pcnw_regular_full USING DELTA AS " +
+        s"SELECT CAST(k AS INT) AS k FROM ($bodyProducer) AS source_rows"
+    )
     assertMvCorrect(child, "SELECT k FROM pcnw_regular_full")
   }
 }
