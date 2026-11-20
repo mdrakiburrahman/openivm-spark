@@ -6785,8 +6785,8 @@ case class RefreshMaterializedViewCommand(
               val lineage =
                 if (fusedAggregateSources.nonEmpty) fusedAggregateLineageDetail(fusedAggregateSources, sql)
                 else lineageDetail(sourceIndex, sql)
-              val sqlBytes = sql.length
-              val qOrder   = qlogOrder.getAndIncrement()
+              val sqlBytes  = sql.length
+              val qOrder    = qlogOrder.getAndIncrement()
               val ownership = if (fullDomainCdfMerge) None else actionOwnership(qOrder, "statement", lineage)
               profile.timeStep(
                 "execute_refresh_sql_stmt",
