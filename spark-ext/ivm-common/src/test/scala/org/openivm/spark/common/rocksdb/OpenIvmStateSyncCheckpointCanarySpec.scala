@@ -330,10 +330,12 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         System.currentTimeMillis() + 1L
       )
       deletedPath.get() should not be null
-      val deletedFile = new File(deletedPath.get(), "marker")
+      val deletedDirectory = new Path(deletedPath.get()).toUri.getPath
+      val deletedFile      = new File(deletedDirectory, "marker")
       deletedFile.isFile shouldBe false
-      val deletedDir = new File(deletedPath.get()).toPath
-      val remaining  = Seq(firstTrigger, secondTrigger).find(file => file.getParentFile.toPath != deletedDir)
+      val remaining = Seq(firstTrigger, secondTrigger).find(file =>
+        file.getParentFile.getAbsolutePath != new File(deletedDirectory).getAbsolutePath
+      )
       remaining.isDefined shouldBe true
       remaining.get.isFile shouldBe true
 
