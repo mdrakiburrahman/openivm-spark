@@ -47,7 +47,7 @@ object OpenIvmGarbageCollector {
       telemetry: Option[(Path, Long)]
   )
 
-  private val lastSweepMs = new AtomicLong(0L)
+  private val lastSweepMs                                         = new AtomicLong(0L)
   private[openivm] def setSweepClockForTesting(value: Long): Unit = lastSweepMs.set(value)
 
   private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable =>
