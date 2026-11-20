@@ -46,7 +46,7 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     val child        = "pcnw_child"
     val bodyProducer = "SELECT DISTINCT k FROM pcnw_base"
     val bodyMiddle   = s"SELECT k FROM $producer"
-    val bodyChild    = s"SELECT k, COUNT(*) AS n FROM $middle GROUP BY k"
+    val bodyChild    = s"SELECT CAST(k AS INT) AS k FROM $middle"
     sql("CREATE TABLE pcnw_base(k INT, payload INT) USING DELTA")
     sql("INSERT INTO pcnw_base VALUES (1, 10), (NULL, 20)")
     sql(s"CREATE MATERIALIZED VIEW $producer AS $bodyProducer")
@@ -55,7 +55,7 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     val middleMeta = metadata(middle)
     val childMeta  = metadata(child)
     middleMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
-    childMeta.refreshType should not be RefreshTypeCode.FullRefresh
+    childMeta.refreshType shouldBe RefreshTypeCode.SimpleProjection
     val producerLink                                 = middleMeta.sourceTables.head
     val middleLink                                   = childMeta.sourceTables.head
     val middle0                                      = mvDataVersion(middle)
@@ -115,8 +115,10 @@ class PublicCdfNoWriteCascadeSpec extends IvmParitySpecBase("public-cdf-no-write
     outcome(child, "incremental_executed", 1)
     mvDataVersion(child) should be > child0
     offsets(childMeta) shouldBe Map(middleLink -> middle1)
-    val expected = "SELECT k, COUNT(*) AS n FROM (SELECT DISTINCT k FROM pcnw_base) GROUP BY k"
     assertMvCorrect(middle, bodyProducer)
-    assertMvCorrect(child, expected)
+    assertMvCorrect(child, bodyChild)
+    sql("CREATE TABLE pcnw_regular_full USING DELTA AS " +
+      s"SELECT CAST(k AS INT) AS k FROM ($bodyProducer) AS source_rows")
+    assertMvCorrect(child, "SELECT k FROM pcnw_regular_full")
   }
 }
