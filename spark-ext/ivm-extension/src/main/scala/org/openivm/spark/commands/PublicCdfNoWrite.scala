@@ -14,6 +14,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count}
 import org.apache.spark.sql.catalyst.plans.logical.{
   Aggregate,
+  Distinct,
   Filter,
   LogicalPlan,
   Project,
@@ -79,7 +80,7 @@ private[commands] object PublicCdfNoWrite {
   }
 
   private val MaxRankGroupVersions = 4L
-  private val MaxRankGroupCdcBytes           = BigInt(8 * 1024 * 1024)
+  private val MaxRankGroupCdcBytes = BigInt(8 * 1024 * 1024)
 
   private def deterministicRankOrCount(plan: LogicalPlan, source: LogicalPlan, refreshType: Int): Boolean = {
     def sameSource(child: LogicalPlan): Boolean = unalias(child).sameResult(unalias(source))
