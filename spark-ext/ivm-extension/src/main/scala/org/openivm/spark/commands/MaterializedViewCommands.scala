@@ -6764,6 +6764,11 @@ case class RefreshMaterializedViewCommand(
               executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex, fusedAggregateSources)
               ()
             }
+            def actionOwnership(order: Int, segment: String, lineage: String): Option[String] =
+              if (lineage.nonEmpty && FeatureGate.generatedActionOwnershipEnabled(spark))
+                Some(s"refresh_id=$refreshId;action_id=$order:0:$segment;attempt=0;credit_ns=0$lineage")
+              else None
+
             def executeSqlRowsAt(
                 sql: String,
                 stmtIdx: Int,
@@ -6782,10 +6787,7 @@ case class RefreshMaterializedViewCommand(
                 else lineageDetail(sourceIndex, sql)
               val sqlBytes = sql.length
               val qOrder   = qlogOrder.getAndIncrement()
-              val ownership =
-                if (lineage.nonEmpty && !fullDomainCdfMerge && FeatureGate.generatedActionOwnershipEnabled(spark))
-                  Some(s"refresh_id=$refreshId;action_id=$qOrder:0:statement;attempt=0;credit_ns=0$lineage")
-                else None
+              val ownership = if (fullDomainCdfMerge) None else actionOwnership(qOrder, "statement", lineage)
               profile.timeStep(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
@@ -6951,19 +6953,22 @@ case class RefreshMaterializedViewCommand(
                           // Force materialisation so the cache holds the rows before
                           // any negative-row probe / INSERT read. count() is the
                           // cheapest force-eval action that respects the cache.
+                          val actionLineage = lineageDetail(
+                            Some(0),
+                            s"spark.table(global_temp.$scratchView).count()",
+                            "fused-cache-materialization@1",
+                            "action_descriptor_utf8"
+                          )
+                          val owner = actionOwnership(qOrder, "fused_action", actionLineage)
                           profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
                               s"work_class=incremental_sql;segment=fused_action;action_id=$qOrder:0:fused_action;" +
                               "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization" +
-                              lineageDetail(
-                                Some(0),
-                                s"spark.table(global_temp.$scratchView).count()",
-                                "fused-cache-materialization@1",
-                                "action_descriptor_utf8"
-                              )
+                              actionLineage
                           ) {
-                            spark.table(s"global_temp.$scratchView").count()
+                            val scratch = spark.table(s"global_temp.$scratchView")
+                            GeneratedActionOwnership.withBoundary(spark, owner, "count")(scratch.count())
                           }
                         }
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
