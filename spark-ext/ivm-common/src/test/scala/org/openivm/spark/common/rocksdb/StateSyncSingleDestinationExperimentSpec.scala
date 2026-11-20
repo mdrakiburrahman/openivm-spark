@@ -186,6 +186,18 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
     drainGates.remove(kind)
   }
 
+  private def installDrainGateHook(): Unit =
+    OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(() => {
+      val kind = currentKind.get()
+      if (kind != null) {
+        val gate = drainGates.get(kind)
+        if (gate != null) {
+          gate.entered.countDown()
+          await(gate.release)
+        }
+      }
+    })
+
   private def matchingRequest(
       events: Seq[OpenIvmExecutionSpan.StateSyncEvidence],
       requestId: String
@@ -263,16 +275,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       executor = Executors.newFixedThreadPool(48)
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
       OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Option(currentContext.get()).map(_.remote.toURI.toString))
-      OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(() => {
-        val kind = currentKind.get()
-        if (kind != null) {
-          val gate = drainGates.get(kind)
-          if (gate != null) {
-            gate.entered.countDown()
-            await(gate.release)
-          }
-        }
-      })
+      installDrainGateHook()
 
       val scales = if (order == "ascending") Seq(1, 200, 428) else Seq(428, 200, 1)
       val remote = new File(output, s"destinations/$label/single")
@@ -527,6 +530,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         OpenIvmStateSync.resetForTesting()
         OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Option(currentContext.get()).map(_.remote.toURI.toString))
         OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
+        installDrainGateHook()
         withContext(context, "restore") { OpenIvmStateSync.maybeRestore(spark) }
         (0 until scale).foreach { index =>
           readValue(spark, context, index, "seed") shouldBe Some(f"seed-$index%04d")
