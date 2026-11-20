@@ -13,21 +13,21 @@ class CountedDistinctCascadeCdfSpec extends IvmParitySpecBase("counted-distinct-
   it("feeds a grouped child from a counted DISTINCT parent's physical CDF") {
     sys.env.get("COUNTED_DISTINCT_REPLAY_PHASE") match {
       case Some(phase @ ("prepare" | "restore")) =>
-        val root = Paths.get(sys.env("COUNTED_DISTINCT_REPLAY_ROOT"))
+        val root  = Paths.get(sys.env("COUNTED_DISTINCT_REPLAY_ROOT"))
         val state = root.resolve(s"state-$phase")
         Files.exists(state) shouldBe false
         restartSpark(
           extraSparkConf ++ Map(
-            "spark.sql.catalogImplementation" -> "hive",
+            "spark.sql.catalogImplementation"             -> "hive",
             "spark.hadoop.javax.jdo.option.ConnectionURL" -> s"jdbc:derby:;databaseName=$root/metastore;create=true",
-            "spark.sql.warehouse.dir" -> root.resolve("warehouse").toString,
-            FeatureGate.StatePathKey -> state.toString,
-            FeatureGate.StateSyncUriKey -> root.resolve("archive").toUri.toString,
-            FeatureGate.StateSyncAsyncEnabledKey -> "false"
+            "spark.sql.warehouse.dir"                     -> root.resolve("warehouse").toString,
+            FeatureGate.StatePathKey                      -> state.toString,
+            FeatureGate.StateSyncUriKey                   -> root.resolve("archive").toUri.toString,
+            FeatureGate.StateSyncAsyncEnabledKey          -> "false"
           )
         )
         val receipt = root.resolve("prepare-receipt")
-        val pid = ProcessHandle.current().pid()
+        val pid     = ProcessHandle.current().pid()
         if (phase == "prepare") {
           val (parentVersion, childVersion) = exercise()
           Files.write(receipt, s"$pid\n$parentVersion\n$childVersion\n".getBytes(UTF_8), StandardOpenOption.CREATE_NEW)
@@ -45,15 +45,15 @@ class CountedDistinctCascadeCdfSpec extends IvmParitySpecBase("counted-distinct-
           assertMvCorrect(child, expected)
         }
       case Some(other) => fail(s"Unknown counted DISTINCT replay phase $other")
-      case None => exercise()
+      case None        => exercise()
     }
   }
 
-  private val base = "cdcw_base"
-  private val parent = "default.cdcw_parent"
-  private val child = "default.cdcw_child"
+  private val base        = "cdcw_base"
+  private val parent      = "default.cdcw_parent"
+  private val child       = "default.cdcw_child"
   private val parentQuery = s"SELECT DISTINCT site, pool FROM $base"
-  private val expected = s"SELECT site, COUNT(*) AS n FROM ($parentQuery) p GROUP BY site"
+  private val expected    = s"SELECT site, COUNT(*) AS n FROM ($parentQuery) p GROUP BY site"
 
   private def exercise(): (Long, Long) = {
     spark.conf.set("spark.openivm.catalogPreservesColumnCase", "true")
@@ -61,7 +61,7 @@ class CountedDistinctCascadeCdfSpec extends IvmParitySpecBase("counted-distinct-
     try {
       sql(s"CREATE TABLE $base(id INT, site STRING, pool INT) USING DELTA")
       sql(s"INSERT INTO $base VALUES (1,'anchor',5), (2,'east',2)")
-      val childQuery  = s"SELECT site, COUNT(*) AS n FROM $parent GROUP BY site"
+      val childQuery = s"SELECT site, COUNT(*) AS n FROM $parent GROUP BY site"
       sql(s"CREATE MATERIALIZED VIEW $parent AS $parentQuery")
       sql(s"CREATE MATERIALIZED VIEW $child AS $childQuery")
       MvProjectionSource.isProjection(spark, parent) shouldBe true
