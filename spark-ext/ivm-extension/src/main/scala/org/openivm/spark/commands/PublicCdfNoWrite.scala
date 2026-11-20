@@ -1,7 +1,7 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
 import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, Metadata, Protocol, RemoveFile}
@@ -14,6 +14,13 @@ import scala.util.control.NonFatal
 
 private[commands] object PublicCdfNoWrite {
   import MvCommandHelper._
+
+  private val logger = org.slf4j.LoggerFactory.getLogger(getClass)
+
+  private def check(gate: String)(value: Boolean): Boolean = {
+    if (!value) logger.debug(s"Public CDF cancellation declined: $gate")
+    value
+  }
 
   private val ChangeType    = "_change_type"
   private val Positive      = Seq("insert", "update_postimage")
@@ -66,9 +73,11 @@ private[commands] object PublicCdfNoWrite {
     val info = actions.collect { case commit: CommitInfo => commit }
     val adds = actions.collect { case add: AddFile => add.path }
     val removes = actions.collect { case remove: RemoveFile => remove.path }
+    def parameter(info: CommitInfo, key: String, expected: String): Boolean =
+      info.operationParameters.get(key).exists(value => value == expected || value == "\"" + expected + "\"")
     info.size == 1 && info.head.operation == "WRITE" && info.head.readVersion.contains(baseline) &&
-    info.head.operationParameters.get("mode").contains("Overwrite") &&
-    info.head.operationParameters.get("predicate").contains("true") &&
+    parameter(info.head, "mode", "Overwrite") &&
+    parameter(info.head, "predicate", "true") &&
     adds.nonEmpty && removes.nonEmpty && (adds ++ removes).distinct.size == adds.size + removes.size &&
     actions.forall {
       case _: CommitInfo => true
@@ -78,8 +87,9 @@ private[commands] object PublicCdfNoWrite {
     }
   }
 
-  private def replacementCancels(public: DataFrame, keys: Seq[org.apache.spark.sql.Column]): Boolean = {
-    val sign = when(col(ChangeType) === "insert", lit(1L)).when(col(ChangeType) === "delete", lit(-1L))
+  private def replacementCancels(public: DataFrame, keys: Seq[Column], end: Long): Boolean = {
+    val sign = when(col("_commit_version") === lit(end),
+      when(col(ChangeType) === "insert", lit(1L)).when(col(ChangeType) === "delete", lit(-1L)))
     val groups = public.groupBy(keys: _*).agg(
       sum(sign.cast(DecimalType(38, 0))).as("_net"),
       count(when(sign.isNull, lit(1))).as("_bad")
@@ -124,9 +134,10 @@ private[commands] object PublicCdfNoWrite {
               MaterializedViewLifecycle.liveOwnership(spark, consumer.name, consumer).owned &&
               DeltaTableVersion.latest(spark, consumer.location) == consumer.lastVersion
 
-          schema.nonEmpty && schema.forall(eligible(_, replacement)) && fingerprint == consumer.sourceSchemaFingerprint &&
-          directConsumer(spark.sql(consumer.querySql).queryExecution.analyzed, plan) &&
-          identitiesAndVersionsMatch && backingRelation(plan).flatMap(DeltaTableVersion.deltaLogFromPlan).exists {
+          check("public schema types")(schema.nonEmpty && schema.forall(eligible(_, replacement))) &&
+          check("persisted schema fingerprint")(fingerprint == consumer.sourceSchemaFingerprint) &&
+          check("direct consumer")(directConsumer(spark.sql(consumer.querySql).queryExecution.analyzed, plan)) &&
+          check("ownership and versions")(identitiesAndVersionsMatch) && backingRelation(plan).flatMap(DeltaTableVersion.deltaLogFromPlan).exists {
             log =>
               val start = batch.startVersionExclusive + 1L
               val end   = batch.endVersionInclusive
@@ -153,22 +164,22 @@ private[commands] object PublicCdfNoWrite {
                 })
               }
               log.dataPath.toUri.normalize().toString.stripSuffix("/") == dependency.deltaLogDataPath &&
-              currentEnd && completeHistory && {
+              check("current end")(currentEnd) && check("complete supported history")(completeHistory) && {
                 val raw = spark.read
                   .format("delta")
                   .option("readChangeFeed", "true")
                   .option("startingVersion", start)
                   .option("endingVersion", end)
                   .load(producer.location)
-                val public                        = MvProjectionSource.project(raw, schema, Seq(ChangeType))
+                val cdfFields = if (replacement) Seq(ChangeType, "_commit_version") else Seq(ChangeType)
+                val public = MvProjectionSource.project(raw, schema, cdfFields)
                 def quoted(value: String): String = s"`${value.replace("`", "``")}`"
                 val columns                       = schema.fieldNames.toSeq.map(name => col(quoted(name)))
                 val zero = if (replacement) {
                   val keys = schema.fields.toSeq.zip(columns).map { case (field, column) =>
                     if (field.dataType == StringType) column.cast(BinaryType).as(field.name) else column
                   }
-                  val bounded = raw.where(col("_commit_version").isNull || col("_commit_version") =!= lit(end)).isEmpty
-                  bounded && replacementCancels(public, keys.zipWithIndex.map { case (key, i) => key.as(s"_k$i") })
+                  replacementCancels(public, keys.zipWithIndex.map { case (key, i) => key.as(s"_k$i") }, end)
                 } else {
                 val adds                          = public.where(col(ChangeType).isin(Positive: _*)).select(columns: _*)
                 val removes                       = public.where(col(ChangeType).isin(Negative: _*)).select(columns: _*)
@@ -180,5 +191,9 @@ private[commands] object PublicCdfNoWrite {
           }
         }
       }
-    } catch { case NonFatal(error) if !cancelled(error) => false }
+    } catch {
+      case NonFatal(error) if !cancelled(error) =>
+        logger.debug("Public CDF cancellation unavailable", error)
+        false
+    }
 }
