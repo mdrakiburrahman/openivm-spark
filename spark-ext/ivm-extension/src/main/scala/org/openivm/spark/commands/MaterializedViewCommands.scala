@@ -1798,11 +1798,10 @@ private[commands] object MvCommandHelper {
       spark: SparkSession,
       sources: Seq[String],
       knownVersions: Map[String, Long]
-  ): Seq[OpenIvmTelemetryContract.SourceVersion] = {
-    val knownByCanonical = knownVersions.map { case (source, version) =>
-      OpenIvmTelemetryContract.canonicalRelationKey(source) -> version
-    }
-    val mvVersionsByCanonical =
+  ): Seq[OpenIvmTelemetryContract.SourceVersion] =
+    telemetrySourceVersionsWith(
+      sources,
+      knownVersions,
       try
         MvCatalog
           .list(spark)
@@ -1812,12 +1811,30 @@ private[commands] object MvCommandHelper {
             }
           }
           .toMap
-      catch { case _: Throwable => Map.empty[String, Long] }
+      catch { case _: Throwable => Map.empty[String, Long] },
+      source => DeltaTableVersion.latestOption(spark, source)
+    )
+
+  private[commands] def telemetrySourceVersionsWith(
+      sources: Seq[String],
+      knownVersions: Map[String, Long],
+      catalogVersions: => Map[String, Long],
+      latestVersion: String => Option[Long]
+  ): Seq[OpenIvmTelemetryContract.SourceVersion] = {
+    val knownByCanonical = knownVersions.map { case (source, version) =>
+      OpenIvmTelemetryContract.canonicalRelationKey(source) -> version
+    }
+    val allKnown =
+      try sources.forall(source =>
+        knownByCanonical.get(OpenIvmTelemetryContract.canonicalRelationKey(source)).exists(_ >= 0L)
+      )
+      catch { case _: org.openivm.spark.telemetry.OpenIvmTelemetryExportException => false }
+    val mvVersionsByCanonical = if (allKnown) Map.empty[String, Long] else catalogVersions
     sources.map { source =>
       val key = OpenIvmTelemetryContract.canonicalRelationKey(source)
       val version = knownByCanonical
         .get(key)
-        .orElse(DeltaTableVersion.latestOption(spark, source))
+        .orElse(latestVersion(source))
         .orElse(mvVersionsByCanonical.get(key))
         .filter(_ >= 0L)
         .getOrElse(

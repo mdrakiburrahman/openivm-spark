@@ -71,6 +71,73 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
   private var spark: SparkSession = _
 
+  describe("telemetry source-version resolution") {
+    it("does not enumerate the catalog when every source has a valid known version") {
+      var enumerations = 0
+      var deltaLookups = 0
+      val result = MvCommandHelper.telemetrySourceVersionsWith(
+        Seq("DB.First", "db.second", "DB.First"),
+        Map("db.first" -> 0L, "DB.SECOND" -> 12L),
+        { enumerations += 1; Map.empty[String, Long] },
+        _ => { deltaLookups += 1; None }
+      )
+      result shouldBe Seq(
+        OpenIvmTelemetryContract.SourceVersion("DB.First", 0L, 0L),
+        OpenIvmTelemetryContract.SourceVersion("db.second", 12L, 12L),
+        OpenIvmTelemetryContract.SourceVersion("DB.First", 0L, 0L)
+      )
+      enumerations shouldBe 0
+      deltaLookups shouldBe 0
+    }
+
+    it("enumerates once for mixed sources and preserves Delta-before-catalog fallback") {
+      var enumerations = 0
+      var lookedUp = Vector.empty[String]
+      val result = MvCommandHelper.telemetrySourceVersionsWith(
+        Seq("db.known", "DB.Delta", "mv_short"),
+        Map("DB.KNOWN" -> 3L),
+        { enumerations += 1; Map("db.delta" -> 88L, "mv_short" -> 5L) },
+        source => {
+          lookedUp :+= source
+          if (source == "DB.Delta") Some(9L) else None
+        }
+      )
+      result shouldBe Seq(
+        OpenIvmTelemetryContract.SourceVersion("db.known", 3L, 3L),
+        OpenIvmTelemetryContract.SourceVersion("DB.Delta", 9L, 9L),
+        OpenIvmTelemetryContract.SourceVersion("mv_short", 5L, 5L)
+      )
+      enumerations shouldBe 1
+      lookedUp shouldBe Vector("DB.Delta", "mv_short")
+    }
+
+    it("preserves missing, invalid-version and invalid-identity errors after catalog enumeration") {
+      var enumerations = 0
+      def catalog: Map[String, Long] = { enumerations += 1; Map("negative" -> 8L) }
+      val missing = intercept[IllegalStateException] {
+        MvCommandHelper.telemetrySourceVersionsWith(Seq("missing"), Map.empty, catalog, _ => None)
+      }
+      missing.getMessage should include("source relation 'missing'")
+      enumerations shouldBe 1
+
+      val negative = intercept[IllegalStateException] {
+        MvCommandHelper.telemetrySourceVersionsWith(
+          Seq("negative"),
+          Map("negative" -> -1L),
+          catalog,
+          _ => Some(7L)
+        )
+      }
+      negative.getMessage should include("source relation 'negative'")
+      enumerations shouldBe 2
+
+      intercept[org.openivm.spark.telemetry.OpenIvmTelemetryExportException] {
+        MvCommandHelper.telemetrySourceVersionsWith(Seq(""), Map.empty, catalog, _ => None)
+      }
+      enumerations shouldBe 3
+    }
+  }
+
   describe("compiler runtime ownership") {
     it("reuses the verified compiler across isolated command sessions with the same loader settings") {
       val compiler = OpenIvmCompilers.forSession(spark)
