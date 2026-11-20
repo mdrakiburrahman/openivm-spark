@@ -65,7 +65,9 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
 
   describe("staging garbage collection") {
     it("defers an idle plan across the sweep deadline and lets a later refresh sweep with references") {
-      OpenIvmGarbageCollector.resetSweepClockForTesting()
+      OpenIvmGarbageCollector.setSweepClockForTesting(System.currentTimeMillis())
+      OpenIvmGarbageCollector.prepareForRefresh(spark) shouldBe None
+      OpenIvmGarbageCollector.setSweepClockForTesting(0L)
       val source = "default.gc_preflight"
       val root   = new File(warehouse, "_ivm/staging/default_gc_preflight/INSERT")
       val live   = new File(root, "live")

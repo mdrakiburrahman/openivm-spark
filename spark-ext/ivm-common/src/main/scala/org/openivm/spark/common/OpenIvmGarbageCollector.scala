@@ -48,7 +48,7 @@ object OpenIvmGarbageCollector {
   )
 
   private val lastSweepMs = new AtomicLong(0L)
-  private[openivm] def resetSweepClockForTesting(): Unit = lastSweepMs.set(0L)
+  private[openivm] def setSweepClockForTesting(value: Long): Unit = lastSweepMs.set(value)
 
   private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable =>
     val thread = new Thread(runnable, "openivm-gc")
