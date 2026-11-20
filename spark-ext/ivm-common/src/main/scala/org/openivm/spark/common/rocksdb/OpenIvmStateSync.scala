@@ -652,10 +652,10 @@ object OpenIvmStateSync {
           barrierAcquired = true
           val captured = trace.measure("spark.backup.capture", "durability") {
             OpenIvmSnapshotArchive.checkInterrupted()
-            val captureHook = duringCaptureHookForTesting
+            val captureHook        = duringCaptureHookForTesting
             var captureHookInvoked = false
-            val localBase = local.toPath
-            val files     = backupFiles(local)
+            val localBase          = local.toPath
+            val files              = backupFiles(local)
             val databases = files
               .filter(file => file.getName == "CURRENT" && file.getParentFile.getName == "rocksdb")
               .map(_.getParentFile.toPath)

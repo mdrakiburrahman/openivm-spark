@@ -8,7 +8,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantReadWriteLock
 
 private[openivm] object OpenIvmStateBarrier {
-  private val barriers              = new ConcurrentHashMap[Path, ReentrantReadWriteLock]()
+  private val barriers               = new ConcurrentHashMap[Path, ReentrantReadWriteLock]()
   private val rootOverrideForTesting = new ThreadLocal[Path]()
 
   private[openivm] def root(spark: SparkSession): Path =
