@@ -3,14 +3,26 @@ package org.openivm.spark.common.rocksdb
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.FeatureGate
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.{
+  ChangeWatermark,
+  FeatureGate,
+  MvCatalog,
+  MvMetadata,
+  RefreshProfileCatalog,
+  RefreshProfileRow
+}
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.io.{File, IOException}
+import java.lang.management.ManagementFactory
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.security.MessageDigest
+import java.sql.Timestamp
+import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import java.util.concurrent.{
   Callable,
@@ -39,6 +51,59 @@ private[rocksdb] object StateSyncSingleDestinationExperimentSpec {
   final class Gate(count: Int) {
     val entered = new CountDownLatch(count)
     val release = new CountDownLatch(1)
+  }
+}
+
+private[rocksdb] object StateSyncFreshProfileRestoreProbe {
+  def main(args: Array[String]): Unit = {
+    require(args.length == 10, s"expected 10 arguments, found ${args.length}")
+    val statePath       = args(0)
+    val remoteUri       = args(1)
+    val refreshId       = args(2)
+    val operationId     = args(3)
+    val expectedTs      = args(4)
+    val database        = args(5)
+    val mvName          = args(6)
+    val expectedVersion = args(7).toLong
+    val source          = args(8)
+    val expectedOffset  = args(9).toLong
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-fresh-profile-restore-probe")
+      .config("spark.ui.enabled", "false")
+      .config("spark.driver.host", "localhost")
+      .config("spark.driver.bindAddress", "127.0.0.1")
+      .config("spark.sql.warehouse.dir", statePath)
+      .config(FeatureGate.StatePathKey, statePath)
+      .config(FeatureGate.StateSyncUriKey, remoteUri)
+      .config("spark.openivm.rocksdb.multiProcess", "false")
+      .getOrCreate()
+    try {
+      OpenIvmStateSync.maybeRestore(spark)
+      val matchingRows = RefreshProfileCatalog.scanAll(spark).filter(_.refreshId == refreshId)
+      require(matchingRows.size == 1, s"expected one restored profile row for $refreshId, found ${matchingRows.size}")
+      val row = matchingRows.head
+      require(row.viewName == s"$database.$mvName", s"unexpected restored view name: ${row.viewName}")
+      require(row.profileTimestamp.toString == expectedTs, s"unexpected restored timestamp: ${row.profileTimestamp}")
+      require(row.stepOrder == 0 && row.stepName == "profile_only_probe" && row.durationMs == 17L)
+      require(row.detail == s"operation_id=$operationId", s"unexpected restored operation detail: ${row.detail}")
+
+      val mv = MvCatalog
+        .list(spark)
+        .find(_.name == TableIdentifier(mvName, Some(database)))
+        .getOrElse(throw new AssertionError(s"missing restored MV metadata $database.$mvName"))
+      require(mv.lastVersion == expectedVersion, s"unexpected restored MV version ${mv.lastVersion}")
+      require(
+        mv.changeWatermarks.get(source).contains(ChangeWatermark.DeltaVersion(expectedOffset)),
+        s"unexpected restored source offset ${mv.changeWatermarks}"
+      )
+    } finally {
+      OpenIvmRocksDBRegistry.closeAll()
+      spark.stop()
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+    }
   }
 }
 
@@ -668,4 +733,407 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       if (completed) deleteTree(new File(output, s"inputs/$label"))
     }
   }
+
+  private def profileGateMvSnapshot(spark: SparkSession): Vector[(String, Long, Map[String, String])] =
+    MvCatalog
+      .list(spark)
+      .map { meta =>
+        val offsets = meta.changeWatermarks.map { case (source, watermark) => source -> watermark.encode }
+        (meta.name.toString, meta.lastVersion, offsets)
+      }
+      .toVector
+
+  private def withRequestId[A](spark: SparkSession, requestId: String)(body: => A): A = {
+    val old = spark.sparkContext.getLocalProperty("openivm.request_id")
+    spark.sparkContext.setLocalProperty("openivm.request_id", requestId)
+    try body
+    finally spark.sparkContext.setLocalProperty("openivm.request_id", old)
+  }
+
+  private def runFreshProfileRestore(
+      caseRoot: File,
+      remote: File,
+      statePath: File,
+      refreshId: String,
+      operationId: String,
+      profileTs: Timestamp,
+      database: String,
+      mvName: String,
+      expectedVersion: Long,
+      source: String,
+      expectedOffset: Long
+  ): Unit = {
+    val javaHome = new File(new File(System.getProperty("java.home"), "bin"), "java").getAbsolutePath
+    val args     = ManagementFactory.getRuntimeMXBean.getInputArguments
+    val jvmArgs  = Vector.newBuilder[String]
+    val iterator = args.iterator()
+    while (iterator.hasNext) {
+      val arg = iterator.next()
+      if (
+        arg.startsWith("--add-opens=") || arg.startsWith("--add-exports=") || arg.startsWith("-Xmx") ||
+        arg == "-XX:+UseG1GC" || arg == "-Dfile.encoding=UTF-8"
+      ) jvmArgs += arg
+    }
+    val childLog = new File(caseRoot, "fresh-restore-child.log")
+    val process = new ProcessBuilder(
+      (Vector(javaHome) ++ jvmArgs.result() ++ Vector(
+        "-cp",
+        System.getProperty("java.class.path"),
+        "org.openivm.spark.common.rocksdb.StateSyncFreshProfileRestoreProbe",
+        statePath.getAbsolutePath,
+        remote.toURI.toString,
+        refreshId,
+        operationId,
+        profileTs.toString,
+        database,
+        mvName,
+        expectedVersion.toString,
+        source,
+        expectedOffset.toString
+      )): _*
+    )
+      .directory(caseRoot)
+      .redirectErrorStream(true)
+      .redirectOutput(ProcessBuilder.Redirect.appendTo(childLog))
+      .start()
+    val finished = process.waitFor(180, TimeUnit.SECONDS)
+    if (!finished) process.destroyForcibly()
+    withClue(Option(Files.readString(childLog.toPath)).getOrElse("")) {
+      finished shouldBe true
+      process.exitValue() shouldBe 0
+    }
+  }
+
+  test("profile-only write after capture requires its own committed generation and fresh-JVM restore") {
+    val label     = s"profile-only-${UUID.randomUUID().toString.take(8)}"
+    val caseRoot  = new File(output, s"profile-only-gate/$label")
+    val statePath = new File(caseRoot, "warehouse")
+    val localRoot = new File(statePath, "_openivm")
+    val remote    = new File(caseRoot, "remote")
+    Files.createDirectories(localRoot.toPath)
+    Files.createDirectories(remote.toPath)
+
+    val database      = "profile_gate_db"
+    val mvName        = "profile_gate_mv"
+    val source        = s"$database.source"
+    val mvVersion     = 11L
+    val mvOffset      = 23L
+    val watermark     = ChangeWatermark.DeltaVersion(mvOffset)
+    val mvIdentifier  = TableIdentifier(mvName, Some(database))
+    val baseTimestamp = new Timestamp(1700000000000L)
+    val operationId   = UUID.randomUUID().toString
+    val refreshId     = s"profile-only-$operationId"
+    val profileTs     = new Timestamp(1700000001000L)
+    val targetRow = RefreshProfileRow(
+      refreshId = refreshId,
+      viewName = s"$database.$mvName",
+      profileTimestamp = profileTs,
+      stepOrder = 0,
+      stepName = "profile_only_probe",
+      durationMs = 17L,
+      detail = s"operation_id=$operationId"
+    )
+    val seedRow = RefreshProfileRow(
+      refreshId = s"profile-seed-$label",
+      viewName = s"$database.$mvName",
+      profileTimestamp = baseTimestamp,
+      stepOrder = 0,
+      stepName = "profile_seed",
+      durationMs = 1L,
+      detail = "setup=baseline"
+    )
+    val triggerRow = RefreshProfileRow(
+      refreshId = s"capture-trigger-$label",
+      viewName = s"$database.$mvName",
+      profileTimestamp = new Timestamp(baseTimestamp.getTime + 1L),
+      stepOrder = 0,
+      stepName = "profile_capture_trigger",
+      durationMs = 1L,
+      detail = "setup=real-profile-catalog-write"
+    )
+
+    var spark: SparkSession       = null
+    var sparkVersion              = "unknown"
+    var executor: ExecutorService = null
+    val evidence                  = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+    val captureEntered            = new CountDownLatch(1)
+    val releaseCapture            = new CountDownLatch(1)
+    val uploadEntered             = new CountDownLatch(1)
+    val releaseUpload             = new CountDownLatch(1)
+    val lateRequestQueued         = new CountDownLatch(1)
+    val nextCommitEntered         = new CountDownLatch(1)
+    val releaseNextCommit         = new CountDownLatch(1)
+    val firstCapture              = new AtomicBoolean(false)
+    val firstUpload               = new AtomicBoolean(false)
+    val captureHookGeneration     = new AtomicLong(-1L)
+    val drainCalls                = new AtomicInteger(0)
+    val commitCalls               = new AtomicInteger(0)
+    var firstFuture: Future[Unit] = null
+    var lateFuture: Future[Unit]  = null
+
+    try {
+      spark = SparkSession
+        .builder()
+        .master("local[2]")
+        .appName("openivm-profile-only-checkpoint-gate")
+        .config("spark.ui.enabled", "false")
+        .config("spark.driver.host", "localhost")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.sql.warehouse.dir", statePath.getAbsolutePath)
+        .config(FeatureGate.StatePathKey, statePath.getAbsolutePath)
+        .config(FeatureGate.StateSyncUriKey, remote.toURI.toString)
+        .config(FeatureGate.StateSyncRetainGenerationsKey, "2")
+        .config("spark.openivm.rocksdb.multiProcess", "false")
+        .getOrCreate()
+      executor = Executors.newFixedThreadPool(3)
+      sparkVersion = spark.version
+      OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => evidence.add(value))
+
+      val metadata = MvMetadata(
+        name = mvIdentifier,
+        querySql = s"SELECT id FROM $source",
+        refreshType = 0,
+        refreshTypeName = "SIMPLE_PROJECTION",
+        lastVersion = mvVersion,
+        sourceTables = Seq(source),
+        sourceSchemaFingerprint = "profile-only-check-schema",
+        location = new File(statePath, mvName).toURI.toString,
+        createdAt = baseTimestamp,
+        properties = MvMetadata.changeWatermarkProperties(Map(source -> watermark))
+      )
+      MvCatalog.upsert(spark, metadata)
+      RefreshProfileCatalog.ensureTables(spark)
+      RefreshProfileCatalog.record(spark, Seq(seedRow))
+      OpenIvmRocksDBRegistry.closeAll()
+
+      val initialRequestId = s"$label-initial"
+      withRequestId(spark, initialRequestId) { OpenIvmStateSync.backupNow(spark) }
+      val initialReceipt = matchingRequest(toVector(evidence), initialRequestId)
+      initialReceipt.status shouldBe "success"
+      initialReceipt.published shouldBe true
+      initialReceipt.acknowledgedSnapshotGenerationId shouldBe initialReceipt.snapshotGenerationId
+      val initialGeneration = initialReceipt.acknowledgedSnapshotGenerationId.getOrElse(fail("missing initial ack"))
+      commitFiles(remote).map(generation) should contain(initialGeneration)
+      archive(remote, initialGeneration).isFile shouldBe true
+      val initialCommitIds = commitFiles(remote).map(generation)
+
+      val mvOffsetsBeforeTarget = profileGateMvSnapshot(spark)
+      mvOffsetsBeforeTarget should have size 1
+      mvOffsetsBeforeTarget.head._2 shouldBe mvVersion
+      mvOffsetsBeforeTarget.head._3 shouldBe Map(source -> watermark.encode)
+      RefreshProfileCatalog.record(spark, Seq(triggerRow))
+      OpenIvmRocksDBRegistry.closeAll()
+
+      OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(() =>
+        if (firstCapture.compareAndSet(false, true)) {
+          captureHookGeneration.set(OpenIvmStateBarrier.currentMutationGeneration(spark))
+          captureEntered.countDown()
+          await(releaseCapture)
+        }
+      )
+      OpenIvmStateSync.setCopyLocalFileHookForTesting((fs: FileSystem, file: File, path: Path) => {
+        if (firstUpload.compareAndSet(false, true)) {
+          uploadEntered.countDown()
+          await(releaseUpload)
+        }
+        fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath), path)
+      })
+      OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(() =>
+        if (drainCalls.incrementAndGet() == 2) lateRequestQueued.countDown()
+      )
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => {
+        commitCalls.incrementAndGet() match {
+          case 1 =>
+            commitFiles(remote).map(generation) shouldBe initialCommitIds
+            initialCommitIds.foreach(id => archive(remote, id).isFile shouldBe true)
+          case 2 =>
+            val current = commitFiles(remote).map(generation)
+            (current.toSet -- initialCommitIds.toSet) should have size 1
+            current should contain(initialGeneration)
+            current.foreach(id => archive(remote, id).isFile shouldBe true)
+            nextCommitEntered.countDown()
+            await(releaseNextCommit)
+          case other => fail(s"unexpected additional commit attempt $other")
+        }
+      })
+
+      val firstRequestId = s"$label-capture"
+      firstFuture = executor.submit(new Callable[Unit] {
+        override def call(): Unit = withRequestId(spark, firstRequestId) { OpenIvmStateSync.backupNow(spark) }
+      })
+      await(captureEntered)
+      val capturedGenerationAtGate = captureHookGeneration.get()
+      capturedGenerationAtGate should be >= 0L
+
+      val writerStarted = new CountDownLatch(1)
+      val profileWriteFuture = executor.submit(new Callable[Long] {
+        override def call(): Long = {
+          writerStarted.countDown()
+          RefreshProfileCatalog.record(spark, Seq(targetRow))
+          OpenIvmStateBarrier.currentMutationGeneration(spark)
+        }
+      })
+      await(writerStarted)
+      val queueDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+      while (!OpenIvmStateBarrier.captureQueuedForTesting(spark) && System.nanoTime() < queueDeadline)
+        Thread.sleep(5)
+      OpenIvmStateBarrier.captureQueuedForTesting(spark) shouldBe true
+      profileWriteFuture.isDone shouldBe false
+      firstFuture.isDone shouldBe false
+
+      releaseCapture.countDown()
+      await(uploadEntered)
+      val targetMutationGeneration = profileWriteFuture.get(120, TimeUnit.SECONDS)
+      targetMutationGeneration should be > capturedGenerationAtGate
+      profileGateMvSnapshot(spark) shouldBe mvOffsetsBeforeTarget
+      commitFiles(remote).map(generation) shouldBe initialCommitIds
+      initialCommitIds.foreach(id => archive(remote, id).isFile shouldBe true)
+
+      val lateRequestId = s"$label-late-profile-row"
+      lateFuture = executor.submit(new Callable[Unit] {
+        override def call(): Unit = withRequestId(spark, lateRequestId) { OpenIvmStateSync.backupNow(spark) }
+      })
+      await(lateRequestQueued)
+      lateFuture.isDone shouldBe false
+      firstFuture.isDone shouldBe false
+      commitFiles(remote).map(generation) shouldBe initialCommitIds
+      initialCommitIds.foreach(id => archive(remote, id).isFile shouldBe true)
+
+      releaseUpload.countDown()
+      await(nextCommitEntered)
+      firstFuture.get(120, TimeUnit.SECONDS)
+      lateFuture.isDone shouldBe false
+      val committedBeforeNext = commitFiles(remote).map(generation)
+      committedBeforeNext should contain(initialGeneration)
+      committedBeforeNext.foreach(id => archive(remote, id).isFile shouldBe true)
+      releaseNextCommit.countDown()
+      lateFuture.get(120, TimeUnit.SECONDS)
+
+      val completedEvents = toVector(evidence)
+      val firstReceipt    = matchingRequest(completedEvents, firstRequestId)
+      val lateReceipt     = matchingRequest(completedEvents, lateRequestId)
+      val firstCaptured   = reflectedGeneration(firstReceipt, "capturedMutationGeneration").get
+      val lateRequested   = reflectedGeneration(lateReceipt, "requestedMutationGeneration").get
+      val lateCaptured    = reflectedGeneration(lateReceipt, "capturedMutationGeneration").get
+      val firstGeneration = firstReceipt.acknowledgedSnapshotGenerationId.getOrElse(fail("missing capture ack"))
+      val lateGeneration  = lateReceipt.acknowledgedSnapshotGenerationId.getOrElse(fail("missing late ack"))
+      firstReceipt.status shouldBe "success"
+      firstReceipt.published shouldBe true
+      firstReceipt.snapshotGenerationId shouldBe Some(firstGeneration)
+      lateReceipt.status shouldBe "success"
+      lateReceipt.published shouldBe true
+      lateReceipt.snapshotGenerationId shouldBe Some(lateGeneration)
+      firstCaptured shouldBe capturedGenerationAtGate
+      firstCaptured should be < lateRequested
+      lateRequested should be >= targetMutationGeneration
+      lateCaptured should be >= lateRequested
+      firstGeneration should not be initialGeneration
+      lateGeneration should not be firstGeneration
+      commitCalls.get shouldBe 2
+      lateGeneration should not be initialGeneration
+      profileGateMvSnapshot(spark) shouldBe mvOffsetsBeforeTarget
+
+      val finalCommit = commitFiles(remote)
+        .find(file => generation(file) == lateGeneration)
+        .getOrElse(fail("missing late commit marker"))
+      val markerBytes = Files.readAllBytes(finalCommit.toPath)
+      val markerLines = {
+        val lines = Files.readAllLines(finalCommit.toPath, StandardCharsets.UTF_8)
+        val out   = Vector.newBuilder[String]
+        val iter  = lines.iterator()
+        while (iter.hasNext) out += iter.next()
+        out.result()
+      }
+      markerLines should have size 4
+      markerLines.head shouldBe "OPENIVM_STATE_SNAPSHOT_V2"
+      markerLines(1) shouldBe lateGeneration
+      val finalArchive = archive(remote, lateGeneration)
+      finalArchive.isFile shouldBe true
+      markerLines(2).toLong shouldBe finalArchive.length()
+      val archiveSha = OpenIvmSnapshotArchive.sha256(finalArchive)
+      markerLines(3) shouldBe archiveSha
+      val archiveZip = new ZipFile(finalArchive)
+      val hasProfileDb =
+        try {
+          val entries = archiveZip.entries()
+          var found   = false
+          while (entries.hasMoreElements) {
+            if (entries.nextElement().getName == "refresh_profile/rocksdb/CURRENT") found = true
+          }
+          found
+        } finally archiveZip.close()
+      hasProfileDb shouldBe true
+
+      OpenIvmRocksDBRegistry.closeAll()
+      spark.stop()
+      spark = null
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+      OpenIvmStateSync.resetForTesting()
+      val freshStatePath = new File(caseRoot, "fresh-warehouse")
+      new File(freshStatePath, "_openivm").exists() shouldBe false
+      runFreshProfileRestore(
+        caseRoot,
+        remote,
+        freshStatePath,
+        refreshId,
+        operationId,
+        profileTs,
+        database,
+        mvName,
+        mvVersion,
+        source,
+        mvOffset
+      )
+
+      val result = new ObjectMapper().createObjectNode()
+      result.put("schema_version", 1)
+      result.put("source_head", sys.env.getOrElse("OPENIVM_SOURCE_HEAD", "unknown"))
+      result.put("spark_sql_version", sparkVersion)
+      result.put("fixture", "one state root; one actual refresh_profile RocksDB catalog and one MV metadata row")
+      result.put("remote_latency_measured", false)
+      result.put("operation_id", operationId)
+      result.put("refresh_id", refreshId)
+      result.put("profile_row_restored_fresh_jvm", true)
+      result.put("mv_versions_and_consumer_offsets_unchanged", true)
+      result.put("initial_generation", initialGeneration)
+      result.put("first_capture_generation", firstGeneration)
+      result.put("first_captured_mutation_generation", firstCaptured)
+      result.put("late_requested_mutation_generation", lateRequested)
+      result.put("late_captured_mutation_generation", lateCaptured)
+      result.put("late_acknowledged_generation", lateGeneration)
+      result.put("target_mutation_generation", targetMutationGeneration)
+      result.put("capture_gate_generation", capturedGenerationAtGate)
+      result.put("late_request_acknowledged_by_older_commit", lateGeneration == firstGeneration)
+      result.put(
+        "commit_marker_sha256",
+        MessageDigest.getInstance("SHA-256").digest(markerBytes).map(b => f"${b & 0xff}%02x").mkString
+      )
+      result.put("archive_bytes", finalArchive.length())
+      result.put("archive_sha256", archiveSha)
+      result.put("commit_marker", markerLines.mkString("\n"))
+      result.put("old_commits_retained_until_later_commit", true)
+      val resultPath = new File(caseRoot, "profile-only-gate.json")
+      Files.write(resultPath.toPath, new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsBytes(result))
+    } finally {
+      releaseCapture.countDown()
+      releaseUpload.countDown()
+      releaseNextCommit.countDown()
+      OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(null)
+      OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
+      OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+      OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
+      OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
+      OpenIvmStateSync.resetForTesting()
+      if (executor != null) {
+        executor.shutdownNow()
+        executor.awaitTermination(30, TimeUnit.SECONDS)
+      }
+      OpenIvmRocksDBRegistry.closeAll()
+      if (spark != null) spark.stop()
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+    }
+  }
+
 }
