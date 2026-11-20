@@ -18,6 +18,7 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.io.File
+import java.lang.management.ManagementFactory
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.security.MessageDigest
@@ -935,20 +936,23 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
           val childState     = newDir(s"$arm-child-$generation-state")
           val childWarehouse = newDir(s"$arm-child-$generation-warehouse")
           val java           = new File(System.getProperty("java.home"), "bin/java").getAbsolutePath
+          val jvmArgs = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
+            .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
           val process = new ProcessBuilder(
-            java,
-            "-cp",
-            System.getProperty("java.class.path"),
-            "org.openivm.spark.common.rocksdb.OpenIvmStateSyncMatched200FreshRestoreProbe",
-            childState.getAbsolutePath,
-            childWarehouse.getAbsolutePath,
-            stagedUri,
-            generation,
-            commit.archiveSha256,
-            baselineProfileId,
-            planFile.getAbsolutePath,
-            event.captureOrdinal.toString,
-            evidence.getAbsolutePath
+            (Seq(java) ++ jvmArgs ++ Seq(
+              "-cp",
+              System.getProperty("java.class.path"),
+              "org.openivm.spark.common.rocksdb.OpenIvmStateSyncMatched200FreshRestoreProbe",
+              childState.getAbsolutePath,
+              childWarehouse.getAbsolutePath,
+              stagedUri,
+              generation,
+              commit.archiveSha256,
+              baselineProfileId,
+              planFile.getAbsolutePath,
+              event.captureOrdinal.toString,
+              evidence.getAbsolutePath
+            )): _*
           ).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.appendTo(log)).start()
           process.waitFor(180, TimeUnit.SECONDS) shouldBe true
           if (process.exitValue() != 0) {
