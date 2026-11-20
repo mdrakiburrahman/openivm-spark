@@ -742,7 +742,7 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
       thirdCopyEntered.await(120, TimeUnit.SECONDS) shouldBe true
       releaseThirdCopy.countDown()
 
-      val timings  = Await.result(Future.sequence(requestFutures), 420.seconds)
+      val timings  = Await.result(Future.sequence(requestFutures), 420.seconds).toVector
       val burstEnd = System.nanoTime()
       timings.size shouldBe CohortCount
       timings.forall(_.succeeded) shouldBe true
@@ -845,6 +845,49 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
         ).requestedMutationGeneration
       }
 
+      val noChangeId          = s"$arm-no-change-${UUID.randomUUID()}"
+      val commitsBeforeReplay = cohortCommits.size
+      withRequestId(spark, noChangeId) { OpenIvmStateSync.backupNow(spark) }
+      val replayReceipt      = receipts.asScala.find(r => r.requestId == noChangeId && r.acknowledged)
+      val commitsAfterReplay = commits(spark, remoteUri)
+      if (checkpointEnabled) {
+        replayReceipt should not be empty
+        replayReceipt.get.reused shouldBe true
+        replayReceipt.get.coverageProven shouldBe true
+        commitsAfterReplay.size shouldBe commitsBeforeReplay
+      } else commitsAfterReplay.size shouldBe commitsBeforeReplay + 1
+
+      val practicalGate   = new CountDownLatch(1)
+      val practicalReady  = new CountDownLatch(CohortCount)
+      val practicalBefore = commitsAfterReplay.size
+      val practicalRequests = (0 until CohortCount).map(index =>
+        launch(
+          spark,
+          remoteUri,
+          s"$arm-practical-$index",
+          "practical_no_change",
+          None,
+          Some(practicalGate),
+          Some(practicalReady)
+        )
+      )
+      practicalReady.await(30, TimeUnit.SECONDS) shouldBe true
+      val practicalStart = System.nanoTime()
+      practicalGate.countDown()
+      val practicalTimings = Await.result(Future.sequence(practicalRequests), 300.seconds)
+      val practicalEnd     = System.nanoTime()
+      practicalTimings.size shouldBe CohortCount
+      practicalTimings.forall(_.succeeded) shouldBe true
+      val finalCommits         = commits(spark, remoteUri)
+      val practicalCommitDelta = finalCommits.size - practicalBefore
+      if (checkpointEnabled) {
+        val practicalReceipts =
+          receipts.asScala.filter(_.requestId.startsWith(s"$arm-practical-")).filter(_.acknowledged)
+        practicalReceipts.map(_.requestId).distinct.size shouldBe CohortCount
+        practicalReceipts.foreach(r => { r.reused shouldBe true; r.coverageProven shouldBe true })
+        practicalCommitDelta shouldBe 0
+      } else practicalCommitDelta should be > 0
+
       val planFile = new File(fixture, "cohort-mutations.tsv")
       val planLines = mutations.map(m =>
         Seq(
@@ -920,49 +963,6 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
         try firstProofSource.mkString
         finally firstProofSource.close()
       firstProofText.contains(s"\"${lateMutation.requestId}\"") shouldBe true
-
-      val noChangeId          = s"$arm-no-change-${UUID.randomUUID()}"
-      val commitsBeforeReplay = cohortCommits.size
-      withRequestId(spark, noChangeId) { OpenIvmStateSync.backupNow(spark) }
-      val replayReceipt      = receipts.asScala.find(r => r.requestId == noChangeId && r.acknowledged)
-      val commitsAfterReplay = commits(spark, remoteUri)
-      if (checkpointEnabled) {
-        replayReceipt should not be empty
-        replayReceipt.get.reused shouldBe true
-        replayReceipt.get.coverageProven shouldBe true
-        commitsAfterReplay.size shouldBe commitsBeforeReplay
-      } else commitsAfterReplay.size shouldBe commitsBeforeReplay + 1
-
-      val practicalGate   = new CountDownLatch(1)
-      val practicalReady  = new CountDownLatch(CohortCount)
-      val practicalBefore = commitsAfterReplay.size
-      val practicalRequests = (0 until CohortCount).map(index =>
-        launch(
-          spark,
-          remoteUri,
-          s"$arm-practical-$index",
-          "practical_no_change",
-          None,
-          Some(practicalGate),
-          Some(practicalReady)
-        )
-      )
-      practicalReady.await(30, TimeUnit.SECONDS) shouldBe true
-      val practicalStart = System.nanoTime()
-      practicalGate.countDown()
-      val practicalTimings = Await.result(Future.sequence(practicalRequests), 300.seconds)
-      val practicalEnd     = System.nanoTime()
-      practicalTimings.size shouldBe CohortCount
-      practicalTimings.forall(_.succeeded) shouldBe true
-      val finalCommits         = commits(spark, remoteUri)
-      val practicalCommitDelta = finalCommits.size - practicalBefore
-      if (checkpointEnabled) {
-        val practicalReceipts =
-          receipts.asScala.filter(_.requestId.startsWith(s"$arm-practical-")).filter(_.acknowledged)
-        practicalReceipts.map(_.requestId).distinct.size shouldBe CohortCount
-        practicalReceipts.foreach(r => { r.reused shouldBe true; r.coverageProven shouldBe true })
-        practicalCommitDelta shouldBe 0
-      } else practicalCommitDelta should be > 0
 
       val lateRequestedGeneration = lateReceipt.map(_.requestedMutationGeneration).getOrElse(0L)
       val thirdEvent              = publicationEvents.find(_.captureOrdinal == 3).get
