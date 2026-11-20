@@ -8,10 +8,22 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantReadWriteLock
 
 private[openivm] object OpenIvmStateBarrier {
-  private val barriers = new ConcurrentHashMap[Path, ReentrantReadWriteLock]()
+  private val barriers              = new ConcurrentHashMap[Path, ReentrantReadWriteLock]()
+  private val rootOverrideForTesting = new ThreadLocal[Path]()
 
   private[openivm] def root(spark: SparkSession): Path =
-    OpenIvmStatePaths.openIvmRoot(spark).toFile.getCanonicalFile.toPath
+    Option(rootOverrideForTesting.get())
+      .getOrElse(OpenIvmStatePaths.openIvmRoot(spark))
+      .toFile
+      .getCanonicalFile
+      .toPath
+
+  private[rocksdb] def withRootForTesting[A](path: Path)(body: => A): A = {
+    val previous = rootOverrideForTesting.get()
+    rootOverrideForTesting.set(path)
+    try body
+    finally if (previous == null) rootOverrideForTesting.remove() else rootOverrideForTesting.set(previous)
+  }
 
   private def forRoot(path: Path): ReentrantReadWriteLock =
     barriers.computeIfAbsent(path, _ => new ReentrantReadWriteLock(true))
