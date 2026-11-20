@@ -1,13 +1,14 @@
 package org.openivm.spark.commands
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.SparkThrowable
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
-import org.apache.spark.sql.delta.actions.{CommitInfo, Metadata, Protocol}
+import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, Metadata, Protocol, RemoveFile}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
-import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, IntegerType, LongType, ShortType}
-import org.openivm.spark.common.{CdfChangeBatch, DeltaTableVersion, MvCatalog, MvMetadata, MvProjectionSource}
+import org.apache.spark.sql.functions.{col, count, lit, sum, when}
+import org.apache.spark.sql.types.{BinaryType, BooleanType, ByteType, DataType, DecimalType, IntegerType, LongType, ShortType, StringType, StructField, TimestampType}
+import org.openivm.spark.common.{BatchVerdict, CdfChangeBatch, DeltaTableVersion, MvCatalog, MvMetadata, MvProjectionSource}
 
 import scala.util.control.NonFatal
 
@@ -53,11 +54,58 @@ private[commands] object PublicCdfNoWrite {
     case _ => false
   }
 
+  private def eligible(field: StructField, replacement: Boolean): Boolean =
+    !CdfColumns.contains(field.name.toLowerCase(java.util.Locale.ROOT)) &&
+      !field.metadata.contains("__CHAR_VARCHAR_TYPE_STRING") &&
+      (EligibleTypes.contains(field.dataType) || (replacement &&
+        Set[DataType](StringType, DecimalType(18, 2), TimestampType).contains(field.dataType)))
+
+  // Deliberately admit only the single inferred-CDF commit emitted by the full refresh writer.
+  // With no explicit CDC files or deletion vectors, Delta reads every data-changing add/remove.
+  private def isPhysicalOverwrite(actions: Seq[Action], baseline: Long): Boolean = {
+    val info = actions.collect { case commit: CommitInfo => commit }
+    val adds = actions.collect { case add: AddFile => add.path }
+    val removes = actions.collect { case remove: RemoveFile => remove.path }
+    info.size == 1 && info.head.operation == "WRITE" && info.head.readVersion.contains(baseline) &&
+    info.head.operationParameters.get("mode").contains("Overwrite") &&
+    info.head.operationParameters.get("predicate").contains("true") &&
+    adds.nonEmpty && removes.nonEmpty && (adds ++ removes).distinct.size == adds.size + removes.size &&
+    actions.forall {
+      case _: CommitInfo => true
+      case add: AddFile => add.dataChange && add.deletionVector == null
+      case remove: RemoveFile => remove.dataChange && remove.deletionVector == null
+      case _ => false
+    }
+  }
+
+  private def replacementCancels(public: DataFrame, keys: Seq[org.apache.spark.sql.Column]): Boolean = {
+    val sign = when(col(ChangeType) === "insert", lit(1L)).when(col(ChangeType) === "delete", lit(-1L))
+    val groups = public.groupBy(keys: _*).agg(
+      sum(sign.cast(DecimalType(38, 0))).as("_net"),
+      count(when(sign.isNull, lit(1))).as("_bad")
+    )
+    val result = groups.agg(count(lit(1)), count(when(col("_bad") =!= 0L || col("_net").isNull || col("_net") =!= 0L, lit(1)))).head()
+    result.getLong(0) > 0L && result.getLong(1) == 0L
+  }
+
+  private def cancelled(error: Throwable): Boolean =
+    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).take(32).exists {
+      case _: InterruptedException | _: java.util.concurrent.CancellationException => true
+      case e: SparkThrowable =>
+        SparkCommandCompat.errorCondition(e).exists(c => c == "SPARK_JOB_CANCELLED" || c == "OPERATION_CANCELED")
+      case _ => false
+    }
+
   /** This optimization is a proof, never a fallback/error classifier. Reuse the managed-MV
     * refresh locks already held by the caller and bind the actual Delta read to the recorded path.
     */
-  def provesCancellation(spark: SparkSession, consumer: MvMetadata, batch: CdfChangeBatch): Boolean =
+  def provesCancellation(spark: SparkSession, consumer: MvMetadata, batch: CdfChangeBatch, verdict: BatchVerdict): Boolean =
     try {
+      val replacement = verdict == BatchVerdict.Replace
+      if (verdict != BatchVerdict.Mutating && !replacement) return false
+      if (replacement && (batch.endVersionInclusive != batch.startVersionExclusive + 1L ||
+          spark.conf.get("spark.sql.files.ignoreMissingFiles", "false").toBoolean ||
+          spark.conf.get("spark.sql.files.ignoreCorruptFiles", "false").toBoolean)) return false
       val source = batch.baseTable
       val dep    = readMvDependencyMap(consumer.properties).toOption.collect { case Seq(only) => only }
       dep.exists { dependency =>
@@ -76,10 +124,7 @@ private[commands] object PublicCdfNoWrite {
               MaterializedViewLifecycle.liveOwnership(spark, consumer.name, consumer).owned &&
               DeltaTableVersion.latest(spark, consumer.location) == consumer.lastVersion
 
-          schema.nonEmpty && schema.forall { field =>
-            !CdfColumns.contains(field.name.toLowerCase(java.util.Locale.ROOT)) &&
-            EligibleTypes.contains(field.dataType)
-          } && fingerprint == consumer.sourceSchemaFingerprint &&
+          schema.nonEmpty && schema.forall(eligible(_, replacement)) && fingerprint == consumer.sourceSchemaFingerprint &&
           directConsumer(spark.sql(consumer.querySql).queryExecution.analyzed, plan) &&
           identitiesAndVersionsMatch && backingRelation(plan).flatMap(DeltaTableVersion.deltaLogFromPlan).exists {
             log =>
@@ -89,19 +134,26 @@ private[commands] object PublicCdfNoWrite {
                 val snapshot = log.update()
                 snapshot.version == end && snapshot.metadata.id == dependency.deltaTableMetadataId
               }
-              // Only complete MERGE history using an unchanged schema/protocol is admitted.
-              // Do not infer safety from operation metrics, or read past the captured end.
-              def mergeOnly: Boolean = {
+              def completeHistory: Boolean = {
                 val commits = log.getChanges(start, failOnDataLoss = true).takeWhile(_._1 <= end).toVector
-                commits.map(_._1) == (start to end) && commits.forall { case (_, actions) =>
+                commits.map(_._1) == (start to end) && (if (replacement) {
+                  val baseline = log.getSnapshotAt(batch.startVersionExclusive)
+                  val latest = log.update()
+                  baseline.metadata == latest.metadata && baseline.metadata.id == dependency.deltaTableMetadataId &&
+                  baseline.protocol == latest.protocol &&
+                  // Guard against raw CHAR/VARCHAR metadata masked by Spark's public projection.
+                  baseline.metadata.schema.forall(f => !f.metadata.contains("__CHAR_VARCHAR_TYPE_STRING")) &&
+                  schema.forall(f => baseline.metadata.schema.fields.exists(b => b.name == f.name && b.dataType == f.dataType)) &&
+                  isPhysicalOverwrite(commits.head._2, batch.startVersionExclusive)
+                } else commits.forall { case (_, actions) =>
                   !actions.exists {
                     case _: Metadata | _: Protocol => true
                     case _                         => false
                   } && actions.collectFirst { case info: CommitInfo => info.operation }.contains("MERGE")
-                }
+                })
               }
               log.dataPath.toUri.normalize().toString.stripSuffix("/") == dependency.deltaLogDataPath &&
-              currentEnd && mergeOnly && {
+              currentEnd && completeHistory && {
                 val raw = spark.read
                   .format("delta")
                   .option("readChangeFeed", "true")
@@ -111,14 +163,22 @@ private[commands] object PublicCdfNoWrite {
                 val public                        = MvProjectionSource.project(raw, schema, Seq(ChangeType))
                 def quoted(value: String): String = s"`${value.replace("`", "``")}`"
                 val columns                       = schema.fieldNames.toSeq.map(name => col(quoted(name)))
+                val zero = if (replacement) {
+                  val keys = schema.fields.toSeq.zip(columns).map { case (field, column) =>
+                    if (field.dataType == StringType) column.cast(BinaryType).as(field.name) else column
+                  }
+                  val bounded = raw.where(col("_commit_version").isNull || col("_commit_version") =!= lit(end)).isEmpty
+                  bounded && replacementCancels(public, keys.zipWithIndex.map { case (key, i) => key.as(s"_k$i") })
+                } else {
                 val adds                          = public.where(col(ChangeType).isin(Positive: _*)).select(columns: _*)
                 val removes                       = public.where(col(ChangeType).isin(Negative: _*)).select(columns: _*)
                 raw.where(col(ChangeType).isNull || !col(ChangeType).isin((Positive ++ Negative): _*)).isEmpty &&
-                adds.exceptAll(removes).isEmpty && removes.exceptAll(adds).isEmpty &&
-                currentEnd && identitiesAndVersionsMatch
+                adds.exceptAll(removes).isEmpty && removes.exceptAll(adds).isEmpty
+                }
+                zero && currentEnd && identitiesAndVersionsMatch
               }
           }
         }
       }
-    } catch { case NonFatal(_) => false }
+    } catch { case NonFatal(error) if !cancelled(error) => false }
 }

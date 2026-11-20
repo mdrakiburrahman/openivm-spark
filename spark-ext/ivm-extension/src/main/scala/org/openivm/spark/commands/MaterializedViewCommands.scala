@@ -5337,8 +5337,11 @@ case class RefreshMaterializedViewCommand(
           !SparkTimeTravelSql.hasSnapshotPin(meta.querySql) && cdfRebaselineReasons.isEmpty &&
           cdfChangeBatches.size == 1 && cdfChangeBatches.head.hasBaseline &&
           meta.sourceTables.head == cdfChangeBatches.head.baseTable &&
-          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).contains(BatchVerdict.Mutating) &&
-          PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head)
+          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).exists { verdict =>
+            profile.timeStep("public_cdf_no_write_proof", s"verdict=$verdict") {
+              PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head, verdict)
+            }
+          }
         ) Some("public_cdf_no_write")
         else None
 

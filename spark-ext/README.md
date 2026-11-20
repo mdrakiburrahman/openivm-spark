@@ -153,9 +153,13 @@ or offset rewrite is introduced.
 configuration) can advance a CDF offset without writing the consumer Delta table.
 It is limited to persisted `SIMPLE_PROJECTION` consumers that directly project
 attributes from one verified, owned upstream MV. The captured interval must have
-complete MERGE history without metadata or protocol changes. The proof compares
-both directions of the exact signed public row bag, including duplicate and NULL
-multiplicity; commit metrics are not a substitute. Pins, replacement intervals,
-missing identity or history, and unsupported plans are not eligible. The usual
+complete MERGE history without metadata or protocol changes, or a single
+same-table `WRITE` overwrite with literal `true` predicate and complete inferred
+CDF (data-changing adds and removes, no explicit CDC files or deletion vectors).
+The proof requires an exact signed public row bag, including duplicate and NULL
+multiplicity; commit metrics are not a substitute. The replacement path also
+supports binary, unpadded strings, `DECIMAL(18,2)`, and microsecond timestamps.
+Pins, other replacement intervals, missing identity or history, and unsupported
+plans are not eligible. The usual
 refresh path remains in charge when the proof is unavailable. This relies on
 the existing managed-MV lifecycle locks, not a cross-driver DDL fence.

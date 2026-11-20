@@ -10,8 +10,12 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-replacement") with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.ProfileRefreshKey -> "true",
+    FeatureGate.PublicCdfNoWriteEnabledKey -> "true",
     "spark.sql.session.timeZone" -> "UTC"
-  )
+  ) ++ sys.env.get("TYPED_IDENTITY_EVIDENCE").toSeq.flatMap { directory =>
+    val events = Files.createDirectories(Paths.get(directory).resolve("spark-events"))
+    Seq("spark.eventLog.enabled" -> "true", "spark.eventLog.dir" -> events.toUri.toString)
+  }
 
   private val shapes = Seq((13, 9, 4), (13, 9, 4), (12, 9, 5), (12, 9, 5))
   private def exercise(index: Int, enabled: Boolean, expectNoWrite: Boolean): Unit = {
@@ -35,7 +39,7 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
         }
       }.mkString("(", ", ", ")")
     }.mkString(", ")
-    spark.conf.set(FeatureGate.PublicCdfNoWriteEnabledKey, enabled.toString)
+    spark.sparkContext.getConf.getBoolean(FeatureGate.PublicCdfNoWriteEnabledKey, false) shouldBe enabled
     sql(s"CREATE TABLE $base ($definition) USING DELTA")
     sql(s"INSERT INTO $base VALUES $seed")
     sql(s"CREATE MATERIALIZED VIEW $parent AS SELECT ${columns.mkString(", ")} FROM $base")
@@ -79,10 +83,10 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     val ms = (System.nanoTime() - start) / 1000000L
     val profiles = RefreshProfileCatalog.scanAll(spark).filterNot(row => known(row.refreshId)).toSeq
     val c1 = mvDataVersion(child)
-    val offsets = CdfWatermarkCatalog.getAll(spark, s"default.$child", meta.sourceTables)
+    val offsets = CdfWatermarkCatalog.getAll(spark, child, meta.sourceTables)
     evidence("refresh", s"elapsed_ms=$ms\nchild_before=$c0\nchild_after=$c1\noffsets=$offsets\n${profiles.mkString("\n")}\n")
     profiles.filter(_.stepName == "total_refresh").map(_.detail).mkString should include (
-      if (expectNoWrite) "outcome=public_cdf_no_write" else "outcome=full_refresh"
+      if (expectNoWrite) "outcome=public_cdf_no_write" else "outcome=full_refresh_executed"
     )
     if (expectNoWrite) c1 shouldBe c0 else c1 should be > c0
     offsets shouldBe Map(link -> p1)
@@ -90,6 +94,8 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
   }
 
   it("reproduces Replace and reads both physical signs through the bounded feed") {
-    exercise(0, enabled = true, expectNoWrite = false)
+    shapes.indices.foreach(exercise(_, enabled = true, expectNoWrite = true))
+    restartSpark(extraSparkConf - FeatureGate.PublicCdfNoWriteEnabledKey)
+    shapes.indices.foreach(exercise(_, enabled = false, expectNoWrite = false))
   }
 }

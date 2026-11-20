@@ -1,8 +1,8 @@
 package org.openivm.spark.commands
 
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.SparkThrowable
 
 private[commands] object SparkCommandCompat {
-  def errorCondition(error: AnalysisException): Option[String] =
+  def errorCondition(error: SparkThrowable): Option[String] =
     Option(error.getCondition)
 }
