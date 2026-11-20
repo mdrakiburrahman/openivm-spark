@@ -1825,9 +1825,10 @@ private[commands] object MvCommandHelper {
       OpenIvmTelemetryContract.canonicalRelationKey(source) -> version
     }
     val allKnown =
-      try sources.forall(source =>
-        knownByCanonical.get(OpenIvmTelemetryContract.canonicalRelationKey(source)).exists(_ >= 0L)
-      )
+      try
+        sources.forall(source =>
+          knownByCanonical.get(OpenIvmTelemetryContract.canonicalRelationKey(source)).exists(_ >= 0L)
+        )
       catch { case _: org.openivm.spark.telemetry.OpenIvmTelemetryExportException => false }
     val mvVersionsByCanonical = if (allKnown) Map.empty[String, Long] else catalogVersions
     sources.map { source =>

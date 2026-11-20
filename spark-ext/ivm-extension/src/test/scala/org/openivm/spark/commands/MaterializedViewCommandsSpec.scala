@@ -92,7 +92,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
 
     it("enumerates once for mixed sources and preserves Delta-before-catalog fallback") {
       var enumerations = 0
-      var lookedUp = Vector.empty[String]
+      var lookedUp     = Vector.empty[String]
       val result = MvCommandHelper.telemetrySourceVersionsWith(
         Seq("db.known", "DB.Delta", "mv_short"),
         Map("DB.KNOWN" -> 3L),
@@ -112,7 +112,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
     }
 
     it("preserves missing, invalid-version and invalid-identity errors after catalog enumeration") {
-      var enumerations = 0
+      var enumerations               = 0
       def catalog: Map[String, Long] = { enumerations += 1; Map("negative" -> 8L) }
       val missing = intercept[IllegalStateException] {
         MvCommandHelper.telemetrySourceVersionsWith(Seq("missing"), Map.empty, catalog, _ => None)
