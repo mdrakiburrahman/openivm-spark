@@ -82,12 +82,15 @@ private[rocksdb] object OneLakeGuardedPaths {
   private final case class Pending(nonce: UUID)    extends Slot(s"pending-$nonce")
 
   def apply(root: String, token: () => String): OneLakeGuardedPaths = {
-    if (!root.matches(Root))
-      throw new IOException("guarded checkpoint root must use canonical OneLake GUID paths")
+    requireCanonicalRoot(root)
     new OneLakeGuardedPaths(root, token)
   }
 
-  private def exactVersion(value: String): String = {
+  private[rocksdb] def requireCanonicalRoot(root: String): Unit =
+    if (!root.matches(Root))
+      throw new IOException("guarded checkpoint root must use canonical OneLake GUID paths")
+
+  private[rocksdb] def exactVersion(value: String): String = {
     if (!value.matches("\"[A-Za-z0-9._:-]{1,128}\""))
       throw new IOException("guarded checkpoint requires one strong quoted object ETag")
     value

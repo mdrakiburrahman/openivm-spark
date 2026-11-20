@@ -53,4 +53,22 @@ class OneLakeGuardedPathsSpec extends AnyFunSpec with Matchers {
       )
     ) intercept[IOException](OneLakeGuardedPaths(alias, () => fail("credentials must not be accessed")))
   }
+
+  it("binds complete terminal records to the exact root, slot, and strong archive ETag") {
+    import GuardedSnapshotDecisions._
+    import OneLakeGuardedRecords._
+    val finished  = Finished(root, generation, 17, "e" * 64, etag)
+    val published = decisionBytes(Published(finished))
+    val retired   = decisionBytes(Retired(finished))
+    decision(published, root, generation) shouldBe Published(finished)
+    decision(retired, root, generation) shouldBe Retired(finished)
+    receipt(receiptBytes(finished), root, generation) shouldBe finished
+    intercept[IOException](decision(published, root.replace(namespace, workspace), generation))
+    intercept[IOException](decision(published, root, Generation(generation.value.updated(0, '1'))))
+    intercept[IOException](decision(published.dropRight(1), root, generation))
+    intercept[IOException](decision(retired ++ published, root, generation))
+    intercept[IOException](decision(receiptBytes(finished), root, generation))
+    intercept[IOException](receipt(retired, root, generation))
+    intercept[IOException](receiptBytes(finished.copy(version = "W/\"stale\"")))
+  }
 }
