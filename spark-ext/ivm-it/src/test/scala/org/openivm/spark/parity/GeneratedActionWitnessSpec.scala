@@ -33,6 +33,9 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
     b.exceptAll(a).count() shouldBe 0L
   }
 
+  private def snapshot(df: DataFrame): DataFrame =
+    spark.createDataFrame(spark.sparkContext.parallelize(df.collect().toSeq), df.schema)
+
   it("captures ordinary target insert evidence across distinct changes and replay") {
     RefreshProfileCatalog.ensureTables(spark)
     sql("CREATE TABLE witness_src (id INT, v INT) USING DELTA")
@@ -43,17 +46,13 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
     writeJson("initial-mv.jsonl", spark.table("witness_mv").select("id", "v"))
 
     def run(label: String, mutation: Option[String]): Unit = {
-      val previousMv = spark.table("witness_mv").select("id", "v").cache()
-      val previousSource = sql("SELECT id, v FROM witness_src WHERE v >= 10").cache()
-      previousMv.count()
-      previousSource.count()
+      val previousMv = snapshot(spark.table("witness_mv").select("id", "v"))
+      val previousSource = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
       mutation.foreach(sql)
       RefreshProfileCatalog.removeAll(spark)
       sql("REFRESH MATERIALIZED VIEW witness_mv").collect()
-      val currentMv = spark.table("witness_mv").select("id", "v").cache()
-      val currentSource = sql("SELECT id, v FROM witness_src WHERE v >= 10").cache()
-      currentMv.count()
-      currentSource.count()
+      val currentMv = snapshot(spark.table("witness_mv").select("id", "v"))
+      val currentSource = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
       sameBag(currentMv, currentSource)
       sameBag(currentMv.exceptAll(previousMv), currentSource.exceptAll(previousSource))
       sameBag(previousMv.exceptAll(currentMv), previousSource.exceptAll(currentSource))
@@ -65,10 +64,6 @@ class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-wit
       RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
       writeJson(s"$label-query-log.jsonl", sql("SHOW OPENIVM QUERY LOG"))
       writeJson(s"$label-history.jsonl", sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`"))
-      previousMv.unpersist()
-      previousSource.unpersist()
-      currentMv.unpersist()
-      currentSource.unpersist()
     }
 
     run("insert-one", Some("INSERT INTO witness_src VALUES (3, 30), (4, 2)"))
