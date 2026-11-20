@@ -47,6 +47,13 @@ reuse proof. The URI must still have a single writer
 across JVMs: another process using the same destination cannot be detected by the
 in-process root check. This opt-in changes neither the V2 archive nor restore format.
 
+`spark.openivm.stateSync.parallelCapture.enabled=true` is a separate, default-off
+option for single-process RocksDB. It checkpoints independent shards on at most
+four workers while the publisher holds the same root capture barrier. Shard
+handles retain their existing locks, and the publisher joins all workers before
+packing or releasing the barrier, including after errors. Multi-process mode
+continues to capture serially. Publication, acknowledgement and restore are unchanged.
+
 ## Cross-thread query-hash annotations
 
 When an event callback began capture on a different Java thread, append
