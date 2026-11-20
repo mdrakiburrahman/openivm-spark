@@ -334,7 +334,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         val releaseCapture = new CountDownLatch(1)
         val firstCapture   = new AtomicBoolean(false)
         val captureHoldNs  = new AtomicLong(0L)
-        OpenIvmStateSync.setDuringCaptureHookForTesting(() =>
+        OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(() =>
           if (firstCapture.compareAndSet(false, true)) {
             val started = System.nanoTime()
             captureEntered.countDown()
@@ -351,7 +351,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
         releasePreCapture.countDown()
         await(captureEntered)
-        OpenIvmStateSync.setDuringCaptureHookForTesting(null)
+        OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(null)
         val mutationStarted = new CountDownLatch(1)
         val blockedMutation = executor.submit(new Callable[Long] {
           override def call(): Long = withContext(context, "blocked-during-capture") {
@@ -387,7 +387,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         val mixedResults = awaitResults(beforeFutures ++ duringFutures ++ afterFutures ++ changedFutures)
         calls ++= mixedResults
         mixedResults.foreach(_.outcome shouldBe "success")
-        OpenIvmStateSync.setDuringCaptureHookForTesting(null)
+        OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(null)
 
         val beforeNoChangePublications = toVector(evidence).drop(eventStart).flatMap(_.publications).size
         val noChangeFutures            = startCohort(spark, executor, context, "no_change", 16)
@@ -649,7 +649,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       completed = true
     } finally {
       OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
-      OpenIvmStateSync.setDuringCaptureHookForTesting(null)
+      OpenIvmStateSync.setAfterFirstDatabaseCheckpointHookForTesting(null)
       OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
       OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
       OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
