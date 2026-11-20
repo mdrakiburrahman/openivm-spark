@@ -464,12 +464,20 @@ object OpenIvmStateSync {
     }
   }
 
-  private[rocksdb] def restoreGuarded(spark: SparkSession, store: GuardedSnapshotDecisions.ArchiveStore): Unit =
+  private[rocksdb] def restoreGuarded(
+      spark: SparkSession,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Option[GuardedSnapshotDecisions.Generation] =
     OpenIvmStateBarrier.withCapture(spark) {
-      new GuardedSnapshotDecisions(store).latestPublished().foreach { receipt =>
-        restorePackedArchive(receipt.bytes -> receipt.sha256, localRoot(spark))(archive =>
+      val selected = new GuardedSnapshotDecisions(store).latestPublished()
+      val local    = localRoot(spark)
+      if (hasLocalStateFiles(local))
+        throw new java.io.IOException("openivm state-sync: guarded restore requires an empty local state root")
+      selected.map { receipt =>
+        restorePackedArchive(receipt.bytes -> receipt.sha256, local)(archive =>
           store.copyExactArchive(receipt, archive)
         )
+        receipt.generation
       }
     }
 
