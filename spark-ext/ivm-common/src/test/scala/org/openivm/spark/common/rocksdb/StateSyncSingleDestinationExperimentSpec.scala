@@ -12,7 +12,15 @@ import java.io.{File, IOException}
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
-import java.util.concurrent.{Callable, CopyOnWriteArrayList, CountDownLatch, ExecutorService, Executors, Future, TimeUnit}
+import java.util.concurrent.{
+  Callable,
+  CopyOnWriteArrayList,
+  CountDownLatch,
+  ExecutorService,
+  Executors,
+  Future,
+  TimeUnit
+}
 import java.util.zip.ZipFile
 import scala.collection.JavaConverters._
 
@@ -131,7 +139,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
             await(release)
             val invokedAt = System.nanoTime()
             entered.countDown()
-            val before = commitFiles(context.remote).map(generation)
+            val before  = commitFiles(context.remote).map(generation)
             val started = System.nanoTime()
             try {
               OpenIvmStateSync.backupNow(spark)
@@ -209,7 +217,11 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
     }
   }
 
-  private def addOption(node: com.fasterxml.jackson.databind.node.ObjectNode, key: String, value: Option[String]): Unit =
+  private def addOption(
+      node: com.fasterxml.jackson.databind.node.ObjectNode,
+      key: String,
+      value: Option[String]
+  ): Unit =
     value match {
       case Some(found) => node.put(key, found)
       case None        => node.putNull(key)
@@ -224,12 +236,12 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
     order should (be("ascending") or be("descending"))
     label.matches("[A-Za-z0-9._-]{1,80}") shouldBe true
 
-    val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
-    val mapper   = new ObjectMapper()
+    val evidence                  = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+    val mapper                    = new ObjectMapper()
     var spark: SparkSession       = null
     var executor: ExecutorService = null
     var completed                 = false
-    val allRuns                   = scala.collection.mutable.ArrayBuffer.empty[com.fasterxml.jackson.databind.node.ObjectNode]
+    val allRuns = scala.collection.mutable.ArrayBuffer.empty[com.fasterxml.jackson.databind.node.ObjectNode]
 
     try {
       Files.createDirectories(output.toPath)
@@ -271,10 +283,25 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         if (scaleIndex > 0) deleteTree(remote)
         Files.createDirectories(local.toPath)
         Files.createDirectories(remote.toPath)
-        val context     = Context(label, scale, local, remote)
-        val eventStart  = evidence.size()
-        val uploads     = new AtomicInteger(0)
-        val calls       = scala.collection.mutable.ArrayBuffer.empty[Result]
+        val context           = Context(label, scale, local, remote)
+        val eventStart        = evidence.size()
+        val uploads           = new AtomicInteger(0)
+        val uploadEntered     = new CountDownLatch(1)
+        val releaseUpload     = new CountDownLatch(1)
+        val firstUpload       = new AtomicBoolean(false)
+        val uploadGateEnabled = new AtomicBoolean(false)
+        val uploadHoldNs      = new AtomicLong(0L)
+        val calls             = scala.collection.mutable.ArrayBuffer.empty[Result]
+        OpenIvmStateSync.setCopyLocalFileHookForTesting((fs: FileSystem, file: File, path: Path) => {
+          uploads.incrementAndGet()
+          if (uploadGateEnabled.get() && firstUpload.compareAndSet(false, true)) {
+            val started = System.nanoTime()
+            uploadEntered.countDown()
+            await(releaseUpload)
+            uploadHoldNs.set(System.nanoTime() - started)
+          }
+          fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath), path)
+        })
         (0 until scale).foreach(index => writeDatabase(spark, context, index, "seed", f"seed-$index%04d"))
         OpenIvmRocksDBRegistry.closeAll()
 
@@ -282,11 +309,12 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         calls ++= initial
         initial.head.outcome shouldBe "success"
         commitFiles(remote) should have size 1
+        uploadGateEnabled.set(true)
 
-        val beforeGate       = new Gate(8)
+        val beforeGate        = new Gate(8)
         val preCaptureEntered = new CountDownLatch(1)
         val releasePreCapture = new CountDownLatch(1)
-        val firstPreCapture  = new AtomicBoolean(false)
+        val firstPreCapture   = new AtomicBoolean(false)
         OpenIvmStateSync.setBeforeCaptureHookForTesting(() =>
           if (firstPreCapture.compareAndSet(false, true)) {
             preCaptureEntered.countDown()
@@ -305,21 +333,6 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
             captureHoldNs.set(System.nanoTime() - started)
           }
         )
-        val uploadEntered = new CountDownLatch(1)
-        val releaseUpload = new CountDownLatch(1)
-        val firstUpload   = new AtomicBoolean(false)
-        val uploadHoldNs  = new AtomicLong(0L)
-        OpenIvmStateSync.setCopyLocalFileHookForTesting((fs: FileSystem, file: File, path: Path) => {
-          uploads.incrementAndGet()
-          if (firstUpload.compareAndSet(false, true)) {
-            val started = System.nanoTime()
-            uploadEntered.countDown()
-            await(releaseUpload)
-            uploadHoldNs.set(System.nanoTime() - started)
-          }
-          fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath), path)
-        })
-
         writeDatabase(spark, context, 0, "before-capture", "must-be-covered-by-first-mixed-publication")
         OpenIvmRocksDBRegistry.closeAll()
         drainGates.put("before", beforeGate)
@@ -331,10 +344,8 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         await(captureEntered)
         OpenIvmStateSync.setDuringCaptureHookForTesting(null)
         val mutationStarted = new CountDownLatch(1)
-        val mutationStartedAt = new AtomicLong(0L)
         val blockedMutation = executor.submit(new Callable[Long] {
           override def call(): Long = withContext(context, "blocked-during-capture") {
-            mutationStartedAt.set(System.nanoTime())
             mutationStarted.countDown()
             val started = System.nanoTime()
             writeDatabase(spark, context, 0, "mutation-during-capture", "must-run-after-capture-barrier")
@@ -345,22 +356,21 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         Thread.sleep(100)
         blockedMutation.isDone shouldBe false
 
-        val duringGate    = new Gate(8)
+        val duringGate = new Gate(8)
         drainGates.put("during", duringGate)
         val duringFutures = startCohort(spark, executor, context, "during", 8)
         releaseCapture.countDown()
         awaitDrainGate("during", duringGate)
         val blockedMutationElapsedNs = blockedMutation.get(120, TimeUnit.SECONDS)
         await(uploadEntered)
-        OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
 
-        val afterGate    = new Gate(8)
+        val afterGate = new Gate(8)
         drainGates.put("after", afterGate)
         val afterFutures = startCohort(spark, executor, context, "after", 8)
         awaitDrainGate("after", afterGate)
         writeDatabase(spark, context, 0, "after-capture", "must-force-a-later-publication")
         OpenIvmRocksDBRegistry.closeAll()
-        val changedGate    = new Gate(8)
+        val changedGate = new Gate(8)
         drainGates.put("changed", changedGate)
         val changedFutures = startCohort(spark, executor, context, "changed", 8)
         awaitDrainGate("changed", changedGate)
@@ -370,11 +380,10 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         mixedResults.foreach(_.outcome shouldBe "success")
         OpenIvmStateSync.setBeforeSynchronousDrainHookForTesting(null)
         OpenIvmStateSync.setDuringCaptureHookForTesting(null)
-        OpenIvmStateSync.setCopyLocalFileHookForTesting(null)
 
         val beforeNoChangePublications = evidence.asScala.toVector.drop(eventStart).flatMap(_.publications).size
-        val noChangeFutures = startCohort(spark, executor, context, "no_change", 16)
-        val noChangeResults = awaitResults(noChangeFutures)
+        val noChangeFutures            = startCohort(spark, executor, context, "no_change", 16)
+        val noChangeResults            = awaitResults(noChangeFutures)
         calls ++= noChangeResults
         noChangeResults.foreach(_.outcome shouldBe "success")
         val afterNoChangePublications = evidence.asScala.toVector.drop(eventStart).flatMap(_.publications).size
@@ -419,13 +428,14 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         assertDurablyCovered(retryRequest, retry)
         commitFiles(remote).size should be <= 2
 
-        val runEvidence = evidence.asScala.toVector.drop(eventStart)
+        val runEvidence  = evidence.asScala.toVector.drop(eventStart)
         val publications = runEvidence.flatMap(_.publications)
         publications.foreach { publication =>
           publication.counts.getOrElse("captured_databases", None) shouldBe Some(scale.toLong)
         }
         publications.count(_.published) shouldBe publications.size - 1
-        val capturedDatabaseAttempts = publications.map(_.counts.getOrElse("captured_databases", None).getOrElse(0L)).sum
+        val capturedDatabaseAttempts =
+          publications.map(_.counts.getOrElse("captured_databases", None).getOrElse(0L)).sum
         uploads.get() shouldBe publications.size
         calls.size shouldBe 51
         val requestById = calls.map(result => result.requestId -> matchingRequest(runEvidence, result.requestId)).toMap
@@ -434,22 +444,24 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         failedReceipt.published shouldBe false
         failedReceipt.acknowledgedSnapshotGenerationId shouldBe empty
         failedReceipt.status shouldBe "failed"
-        calls.filter(_.outcome == "success").foreach(result => assertDurablyCovered(requestById(result.requestId), result))
+        calls
+          .filter(_.outcome == "success")
+          .foreach(result => assertDurablyCovered(requestById(result.requestId), result))
 
         val stableCalls = calls.filter(_.kind == "before").toVector
-        val stable = stableCalls.map(call => requestById(call.requestId))
+        val stable      = stableCalls.map(call => requestById(call.requestId))
         stable should have size 8
         val duringCalls = calls.filter(_.kind == "during").toVector
-        val during = duringCalls.map(call => requestById(call.requestId))
+        val during      = duringCalls.map(call => requestById(call.requestId))
         during should have size 8
-        val afterCalls = calls.filter(_.kind == "after").toVector
+        val afterCalls   = calls.filter(_.kind == "after").toVector
         val afterCapture = afterCalls.map(call => requestById(call.requestId))
         afterCapture should have size 8
         val changedCalls = calls.filter(_.kind == "changed").toVector
-        val changed = changedCalls.map(call => requestById(call.requestId))
+        val changed      = changedCalls.map(call => requestById(call.requestId))
         changed should have size 8
         val noChangeCalls = calls.filter(_.kind == "no_change").toVector
-        val noChange = noChangeCalls.map(call => requestById(call.requestId))
+        val noChange      = noChangeCalls.map(call => requestById(call.requestId))
         noChange should have size 16
         val generationProof = stable.headOption.flatMap(reflectedGeneration(_, "requestedMutationGeneration")).isDefined
         if (variant == "candidate") {
@@ -478,10 +490,10 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         }
 
         val firstStablePublication = publications.find(_.publicationId == stable.head.publicationId).get
-        val capturePhase = firstStablePublication.phases.find(_.operation == "spark.backup.capture").get
-        val uploadPhase = firstStablePublication.phases.find(_.operation == "spark.backup.upload").get
-        val captureEnd = capturePhase.startMonotonicNs + capturePhase.durationNs
-        val uploadEnd  = uploadPhase.startMonotonicNs + uploadPhase.durationNs
+        val capturePhase           = firstStablePublication.phases.find(_.operation == "spark.backup.capture").get
+        val uploadPhase            = firstStablePublication.phases.find(_.operation == "spark.backup.upload").get
+        val captureEnd             = capturePhase.startMonotonicNs + capturePhase.durationNs
+        val uploadEnd              = uploadPhase.startMonotonicNs + uploadPhase.durationNs
         duringCalls.foreach { call =>
           call.invokedAtNs should be >= capturePhase.startMonotonicNs
           call.invokedAtNs should be < captureEnd
@@ -495,21 +507,22 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
           call.invokedAtNs should be < uploadEnd
         }
 
-        val latestCommit = commitFiles(remote).last
+        val latestCommit     = commitFiles(remote).last
         val latestGeneration = generation(latestCommit)
-        val markerLines = Files.readAllLines(latestCommit.toPath, StandardCharsets.UTF_8).asScala
+        val markerLines      = Files.readAllLines(latestCommit.toPath, StandardCharsets.UTF_8).asScala
         markerLines.head shouldBe "OPENIVM_STATE_SNAPSHOT_V2"
         val latestArchive = archive(remote, latestGeneration)
         latestArchive.isFile shouldBe true
         val zip = new ZipFile(latestArchive)
-        val archiveDbCount = try {
-          val entries = zip.entries()
-          var count = 0
-          while (entries.hasMoreElements) {
-            if (entries.nextElement().getName.endsWith("/rocksdb/CURRENT")) count += 1
-          }
-          count
-        } finally zip.close()
+        val archiveDbCount =
+          try {
+            val entries = zip.entries()
+            var count   = 0
+            while (entries.hasMoreElements) {
+              if (entries.nextElement().getName.endsWith("/rocksdb/CURRENT")) count += 1
+            }
+            count
+          } finally zip.close()
         archiveDbCount shouldBe scale
 
         OpenIvmRocksDBRegistry.closeAll()
@@ -553,7 +566,7 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
         val requestRows = run.putArray("request_results")
         calls.foreach { result =>
           val receipt = matchingRequest(runEvidence, result.requestId)
-          val row = requestRows.addObject()
+          val row     = requestRows.addObject()
           row.put("request_id", result.requestId)
           row.put("class", result.kind)
           row.put("invoked_monotonic_ns", result.invokedAtNs)
@@ -562,7 +575,10 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
           result.errorClass.foreach(row.put("error_class", _))
           row.put("commits_before", result.commitsBefore.size)
           row.put("commits_after", result.commitsAfter.size)
-          row.put("acknowledged_archive_present_at_return", result.archivesAfter.contains(receipt.acknowledgedSnapshotGenerationId.getOrElse("")))
+          row.put(
+            "acknowledged_archive_present_at_return",
+            result.archivesAfter.contains(receipt.acknowledgedSnapshotGenerationId.getOrElse(""))
+          )
           row.put("publication_id", receipt.publicationId)
           row.put("status", receipt.status)
           row.put("published", receipt.published)
@@ -613,7 +629,10 @@ class StateSyncSingleDestinationExperimentSpec extends AnyFunSuite with Matchers
       root.put("source_head", source)
       root.put("variant", variant)
       root.put("counterbalance_order", order)
-      root.put("fixture", "one local state root and one file destination containing 1/200/428 populated RocksDB directories")
+      root.put(
+        "fixture",
+        "one local state root and one file destination containing 1/200/428 populated RocksDB directories"
+      )
       root.put("remote_latency_measured", false)
       root.put("spark_sql_version", spark.version)
       val runs = root.putArray("runs")

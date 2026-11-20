@@ -991,10 +991,10 @@ object OpenIvmStateSync {
           barrierAcquired = true
           val captured = trace.measure("spark.backup.capture", "durability") {
             OpenIvmSnapshotArchive.checkInterrupted()
-            val captureHook = duringCaptureHookForTesting
+            val captureHook        = duringCaptureHookForTesting
             var captureHookInvoked = false
-            val localBase = local.toPath
-            val files     = backupFiles(local)
+            val localBase          = local.toPath
+            val files              = backupFiles(local)
             if (files.isEmpty) {
               noState = true
               CapturedState(0)
