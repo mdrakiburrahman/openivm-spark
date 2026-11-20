@@ -1,0 +1,7 @@
+phase	pid	process	state	cpu_ticks_delta	read_bytes_delta	write_bytes_delta	VmRSS
+pre_10s	574332	node verify-all	S	3	0	0	128360 kB
+pre_10s	574877	java sbt verify-all	S	2	0	0	3204944 kB
+post_5s	574332	node verify-all	S	3	0	0	128360 kB
+post_5s	574877	java sbt verify-all	S	4	0	4096	3204944 kB
+pre_system	-	16 CPUs; load 0.30/0.82/1.42; available RAM ~60.29 GB; global disk delta 10522624 read / 27746304 write bytes in 10s	-	-	-	-	-
+post_system	-	load 2.00/2.12/1.85 to 1.84/2.08/1.84; orphan remained active	-	-	-	-	-

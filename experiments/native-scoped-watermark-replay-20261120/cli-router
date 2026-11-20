@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE=/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/private-265d9c1e/extracted/static-control
+PATCHED=/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/private-265d9c1e/extracted/candidate
+ROOT=/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/actual-refresh-watermark-replay-20261120-0628
+OUT_DIR="$ROOT/cli-outputs"
+LOG="$ROOT/cli-invocations.tsv"
+CANDIDATE_EXT="$PATCHED/openivm.duckdb_extension"
+mkdir -p "$OUT_DIR"
+start_ns=$(date +%s%N)
+nonce=$(date +%s%N)-$$
+input_path="$OUT_DIR/input-${nonce}.sql"
+cat > "$input_path"
+view=$(sed -n "s/.*openivm_compile_with_facts('\([^']*\)'.*/\1/p" "$input_path" | head -n 1)
+case "$view" in
+  nsc_b*) variant=base; cli="$BASE/duckdb"; ext="$BASE/openivm.duckdb_extension"; cli_sha=ea5b574e5720b6ca8d6cd3eb4e0f37adaff889c01413e70fc8343f5f7a659ffc; ext_sha=086c7f5721d5d3ce36b6fdf5845108c4d70bd45827e387e272d9e9befe48e6f1 ;;
+  *) variant=patched; cli="$PATCHED/duckdb"; ext="$PATCHED/openivm.duckdb_extension"; cli_sha=4d700379be9b2924866200d9c98bd6dc2aff7880aa7694c2036830c82ac9a973; ext_sha=c465711e5c3d17371ac24e1e87d45994a88d1bfb8b24f7559448a457fe3c518b ;;
+esac
+safe_view=${view//[^A-Za-z0-9._-]/_}
+routed_path="$OUT_DIR/${safe_view}-${nonce}.routed.sql"
+if [[ "$variant" == base ]]; then
+  sed "s|$CANDIDATE_EXT|$ext|g" "$input_path" > "$routed_path"
+else
+  cp "$input_path" "$routed_path"
+fi
+markers_present=false
+if grep -Fq '__openivm_spark_expression(' "$input_path"; then markers_present=true; fi
+input_sha=$(sha256sum "$input_path" | awk '{print $1}')
+routed_sha=$(sha256sum "$routed_path" | awk '{print $1}')
+route_ns=$(( $(date +%s%N) - start_ns ))
+stdout_path="$OUT_DIR/${safe_view}-${nonce}.stdout.jsonl"
+stderr_path="$OUT_DIR/${safe_view}-${nonce}.stderr.log"
+set +e
+"$cli" "$@" <"$routed_path" >"$stdout_path" 2>"$stderr_path"
+status=$?
+set -e
+stdout_sha=$(sha256sum "$stdout_path" | awk '{print $1}')
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$view" "$variant" "$cli" "$cli_sha" "$ext" "$ext_sha" "$route_ns" "$markers_present" \
+  "$input_path" "$input_sha" "$routed_path" "$routed_sha" "$stdout_path" "$stdout_sha" "$status" "$stderr_path" >> "$LOG"
+cat "$stdout_path"
+cat "$stderr_path" >&2
+exit "$status"

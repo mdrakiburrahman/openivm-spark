@@ -1,0 +1,45 @@
+
+> nx run spark-ext:test:spark-4.1 ivmIt/testOnly org.openivm.spark.commands.NativeScopeRefreshDispatchSpec
+
+> ./dev/run.sh --target spark-4.1 test "ivmIt/testOnly org.openivm.spark.commands.NativeScopeRefreshDispatchSpec"
+
+[spark-ext/run] Test logs -> .logs/test-20261120-062740/ (per-fork DEBUG logs; console keeps WARN+ only)
+[0m[[0m[0minfo[0m] [0m[0mwelcome to sbt 1.9.7 (Eclipse Adoptium Java 21.0.12.1)[0m
+[0m[[0m[0minfo[0m] [0m[0mloading settings for project spark-ext-build-build-build from metals.sbt ...[0m
+[0m[[0m[0minfo[0m] [0m[0mloading project definition from /workspaces/openivm-spark-scoped-pub-exp-6bb1353/spark-ext/project/project/project[0m
+[0m[[0m[0minfo[0m] [0m[0mloading settings for project spark-ext-build-build from metals.sbt ...[0m
+[0m[[0m[0minfo[0m] [0m[0mloading project definition from /workspaces/openivm-spark-scoped-pub-exp-6bb1353/spark-ext/project/project[0m
+[0m[[0m[32msuccess[0m] [0m[0mGenerated .bloop/spark-ext-build-build.json[0m
+[0m[[0m[32msuccess[0m] [0m[0mTotal time: 3 s, completed Nov 20, 2026, 6:27:48 AM[0m
+[0m[[0m[0minfo[0m] [0m[0mloading settings for project spark-ext-build from metals.sbt,plugins.sbt ...[0m
+[0m[[0m[0minfo[0m] [0m[0mloading project definition from /workspaces/openivm-spark-scoped-pub-exp-6bb1353/spark-ext/project[0m
+[0m[[0m[32msuccess[0m] [0m[0mGenerated .bloop/spark-ext-build.json[0m
+[0m[[0m[32msuccess[0m] [0m[0mTotal time: 1 s, completed Nov 20, 2026, 6:27:50 AM[0m
+[0m[[0m[0minfo[0m] [0m[0mloading settings for project root from build.sbt ...[0m
+[0m[[0m[0minfo[0m] [0m[0mset current project to openivm-spark (in build file:/workspaces/openivm-spark-scoped-pub-exp-6bb1353/spark-ext/)[0m
+[0m[[0m[0minfo[0m] [0m[0mcompiling 1 Scala source to /workspaces/openivm-spark-scoped-pub-exp-6bb1353/spark-ext/ivm-it/target/scala-2.13/test-classes ...[0m
+[0m[[0m[0minfo[0m] [0m[0mdone compiling[0m
+[0m[[0m[0minfo[0m] [0m[0m[32mNativeScopeRefreshDispatchSpec:[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[32m- records actual producer CDF and downstream classification without forcing incremental execution (2 minutes, 48 seconds)[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[36mRun completed in 2 minutes, 56 seconds.[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[36mTotal number of tests run: 1[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[36mSuites: completed 1, aborted 0[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[36mTests: succeeded 1, failed 0, canceled 0, ignored 0, pending 0[0m[0m
+[0m[[0m[0minfo[0m] [0m[0m[32mAll tests passed.[0m[0m
+[0m[[0m[32msuccess[0m] [0m[0mTotal time: 189 s (03:09), completed Nov 20, 2026, 6:31:00 AM[0m
+[0J
+
+
+ NX   Successfully ran target test for project spark-ext
+
+
+  Run duration:      3m 21s
+  Cache:             0/1 hit (0%)
+  Critical path:     3m 21s (1 task)
+  Recoverable time:  <1ms
+
+  Recommendations:
+    - Drastically reduce your run duration by sharing a cache across your team and CI → https://nx.dev/ci/features/remote-cache?utm_source=nx-cli&utm_medium=cli&utm_campaign=performance-report&utm_content=remote-cache.
+    - Speed up or split the longest tasks on the critical path:
+        spark-ext:test:spark-4.1    3m 21s
+TEST_EXIT=0

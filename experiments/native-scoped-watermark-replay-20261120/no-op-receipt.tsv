@@ -1,0 +1,3 @@
+phase	mv	variant	kind	target_version_before	target_version_after	upstream_version_before	upstream_version_after	watermark_before	watermark_after	refresh_ms	cli_calls	output_bag_equal_to_regular_full	profile_outcome
+seed-rekey	nsc_p1_dn	patched	downstream_replay	2	2	2	2	2	2	40	0	true	refresh_type=SIMPLE_PROJECTION;outcome=no_pending_deltas;pending_deltas=0
+same-session-noop	nsc_p1	patched	producer	2	2	4	4	NONE	NONE	27	0	true	no-native-compile

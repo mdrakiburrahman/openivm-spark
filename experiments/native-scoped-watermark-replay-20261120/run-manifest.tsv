@@ -1,0 +1,27 @@
+key	value
+source_head	6bb1353a62ef43b4490aae68067c4fbe17bfab58
+product_source_sha256	74ff4bcb55efa51c60a3725fcf0e0b3a9269bf18aa7ca77656d0524173739119
+native_source_commit_user_supplied	6b061513bb5afdaa2f679b447ebcba254d14bf1e
+spark_configuration	spark-4.1
+scala	2.13.17
+delta	4.2.0
+test_command	OPENIVM_CLI_PATH=/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/actual-refresh-watermark-replay-20261120-0628/cli-router OPENIVM_EXTENSION_PATH=/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/private-265d9c1e/extracted/candidate/openivm.duckdb_extension npx --no-install nx run spark-ext:test --configuration=spark-4.1 -- 'ivmIt/testOnly org.openivm.spark.commands.NativeScopeRefreshDispatchSpec'
+nx_target_result	passed; 1 test; 0 failed
+nx_test_log_source_sha256	39e925b8d6dd1c87792c4c3a27fed62ef37afbcca3c5b31acd79981bd99ccc59
+remote_job_wrapper_result	reported exit 1 despite TEST_EXIT_FINAL=0; Nx target log shows success; wrapper discrepancy unexplained
+native_static_cli_sha256	ea5b574e5720b6ca8d6cd3eb4e0f37adaff889c01413e70fc8343f5f7a659ffc
+native_static_extension_sha256	086c7f5721d5d3ce36b6fdf5845108c4d70bd45827e387e272d9e9befe48e6f1
+native_candidate_cli_sha256	4d700379be9b2924866200d9c98bd6dc2aff7880aa7694c2036830c82ac9a973
+native_candidate_extension_sha256	c465711e5c3d17371ac24e1e87d45994a88d1bfb8b24f7559448a457fe3c518b
+run_harness_sha256	f9df909907c514085da89049c4869cd1f971ed31e5d1c78b187164ca8abf8a46
+router_sha256	7a36167a3f5da159756bd05fc53f51cdc86506a009903379440b5025be30e2ad
+patched_producer_commit	version=2;operation=WRITE;predicate=partition-scoped overwrite on 101 affected islands including NULL;unscoped_overwrite=false
+producer_input_shape	obs=UNCHANGED;tags=GENERAL (dimension/seed-only mutation)
+producer_cdf	version 1 to 2; 202 rows; 101 deletes + 101 inserts; signed bag matched; regular-full output bag matched
+consumer_interval	watermark 1; exact Delta interval (1,2]; CDF versions=[2]; 202 source rows
+consumer_commit	version=2;operation=MERGE;scoped predicate includes token and island including NULL
+consumer_cdf	202 rows; 101 deletes + 101 inserts; signed bag equals projected producer CDF; output bag equals regular full
+downstream_replay	target version 2 unchanged; producer source version 2 unchanged; watermark 2 unchanged; 0 native CLI calls; no_pending_deltas; output equals regular full
+fixture	100000-row facts plus explicit NULL and duplicate rows; changed dimension seed affects 101 islands including NULL
+raw_run_scratch_path	/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/actual-refresh-watermark-replay-20261120-0628
+profiles_receipt_source_sha256	e40603f599f4edb6be9e611a095c245389b797c0148268dab7dde59404b076bc
