@@ -1,0 +1,56 @@
+package org.openivm.spark.common.rocksdb
+
+import java.io.IOException
+import java.util.UUID
+import org.scalatest.funspec.AnyFunSpec
+import org.scalatest.matchers.should.Matchers
+
+class OneLakeGuardedPathsSpec extends AnyFunSpec with Matchers {
+  private val workspace = "11111111-1111-1111-1111-111111111111"
+  private val lakehouse = "22222222-2222-2222-2222-222222222222"
+  private val namespace = "33333333-3333-3333-3333-333333333333"
+  private val path      = s"/$workspace/$lakehouse/Files/openivm-checkpoints-v1/$namespace"
+  private val root      = s"https://onelake.dfs.fabric.microsoft.com$path"
+  private val generation =
+    GuardedSnapshotDecisions.Generation("0000000000000000001-01234567-89ab-cdef-0123-456789abcdef")
+  private val nonce = UUID.fromString("44444444-4444-4444-4444-444444444444")
+  private val etag  = "\"0x1234\""
+
+  it("uses the same single-file conditional POSIX rename for either terminal outcome") {
+    val paths    = OneLakeGuardedPaths(root, () => fail("credentials are not required to construct a request"))
+    val terminal = paths.installRequest(generation, nonce, OneLakeGuardedPaths.Terminal, etag).build()
+    terminal.method() shouldBe "PUT"
+    terminal.uri().toString shouldBe s"$root/${generation.value}.decision?mode=posix"
+    terminal.headers().firstValue("x-ms-rename-source").get() shouldBe s"$path/${generation.value}.pending-$nonce"
+    terminal.headers().firstValue("x-ms-source-if-match").get() shouldBe etag
+    terminal.headers().firstValue("If-None-Match").get() shouldBe "*"
+    terminal.headers().firstValue("x-ms-version").get() shouldBe "2021-06-08"
+  }
+
+  it("pins archive reads and nonrecursive deletion to the exact sealed object") {
+    val paths  = OneLakeGuardedPaths(root, () => fail("credentials are not required to construct a request"))
+    val read   = paths.readArchiveRequest(generation, etag).build()
+    val delete = paths.deleteArchiveRequest(generation, etag).build()
+    read.method() shouldBe "GET"
+    read.uri().toString shouldBe s"$root/${generation.value}.zip"
+    delete.method() shouldBe "DELETE"
+    delete.uri().toString shouldBe s"${read.uri()}?recursive=false"
+    for (req     <- Seq(read, delete)) req.headers().firstValue("If-Match").get() shouldBe etag
+    for (version <- Seq("*", "0x1234", "W/\"0x1234\"", "\"a\", \"b\""))
+      intercept[IOException](paths.deleteArchiveRequest(generation, version))
+  }
+
+  it("rejects aliases and URLs outside the dedicated GUID-rooted namespace") {
+    for (
+      alias <- Seq(
+        root + "/",
+        root + "/../other",
+        root + "?other",
+        root.replace("https:", "http:"),
+        root.replace("onelake.dfs.fabric.microsoft.com", "onelake.dfs.fabric.microsoft.com.example.com"),
+        root.replace(workspace, "workspace"),
+        root.replace("Files", "%46iles")
+      )
+    ) intercept[IOException](OneLakeGuardedPaths(alias, () => fail("credentials must not be accessed")))
+  }
+}
