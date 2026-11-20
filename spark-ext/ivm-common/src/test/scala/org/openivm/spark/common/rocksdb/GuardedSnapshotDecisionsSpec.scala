@@ -186,8 +186,12 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
         if (published) OpenIvmStateSync.publishGuarded(spark, gen, store)
         else {
           OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => {
-            val receipt = store.readFinished(gen).get
-            require(new GuardedSnapshotDecisions(store).retire(receipt))
+            require(store.readFinished(gen).nonEmpty)
+            Files.createFile(root.resolve("spark-upload-sealed"))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45)
+            while (Files.notExists(root.resolve("spark-retire-complete")) && System.nanoTime() < deadline)
+              Thread.sleep(10)
+            require(Files.exists(root.resolve("spark-retire-complete")), "peer retirement did not complete")
           })
           try {
             OpenIvmStateSync.publishGuarded(spark, gen, store)
@@ -212,9 +216,9 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
     val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
     val modules = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
-    for ((role, n) <- Seq("spark-publish" -> 1, "spark-retire" -> 2, "spark-restore" -> 1)) {
+    def start(role: String, n: Int): Process = {
       val log = root.resolve(s"$role.log").toFile
-      val process = new ProcessBuilder(
+      new ProcessBuilder(
         (Seq(java, "-Xmx1g") ++ modules ++ Seq(
           "-cp",
           System.getProperty("java.class.path"),
@@ -224,11 +228,26 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
           n.toString
         )): _*
       ).redirectErrorStream(true).redirectOutput(log).start()
+    }
+    def complete(process: Process, role: String): Unit =
       try {
         process.waitFor(90, TimeUnit.SECONDS) shouldBe true
-        withClue(s"$role failed; see $log: ") { process.exitValue() shouldBe 0 }
+        withClue(s"$role failed; see ${root.resolve(s"$role.log")}: ") { process.exitValue() shouldBe 0 }
       } finally if (process.isAlive) process.destroyForcibly()
-    }
+    complete(start("spark-publish", 1), "spark-publish")
+    val pending = start("spark-retire", 2)
+    try {
+      val ready    = root.resolve("spark-upload-sealed")
+      val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45)
+      while (Files.notExists(ready) && pending.isAlive && System.nanoTime() < deadline) Thread.sleep(10)
+      withClue(s"Spark did not seal the archive; see ${root.resolve("spark-retire.log")}: ") {
+        Files.exists(ready) shouldBe true
+      }
+      complete(start("retire", 2), "retire")
+      Files.createFile(root.resolve("spark-retire-complete"))
+      complete(pending, "spark-retire")
+    } finally if (pending.isAlive) pending.destroyForcibly()
+    complete(start("spark-restore", 1), "spark-restore")
     val store = new LocalStore(root)
     Files.exists(store.archive(generation(1))) shouldBe true
     Files.exists(store.archive(generation(2))) shouldBe false
