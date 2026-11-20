@@ -7,7 +7,7 @@ import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.slf4j.LoggerFactory
 
 import java.io.File
-import java.nio.file.Files
+import java.nio.file.{Files, Path => LocalPath}
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
@@ -376,7 +376,8 @@ object OpenIvmStateSync {
           Files.createDirectories(target.getParent)
           OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
         }
-        files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
+        val databaseRoots = databases.toSet
+        files.filterNot(file => isCheckpointedPath(file.toPath, databaseRoots)).foreach { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
           val target = capture.toPath.resolve(localBase.relativize(file.toPath))
           Files.createDirectories(target.getParent)
@@ -465,6 +466,17 @@ object OpenIvmStateSync {
     } catch {
       case NonFatal(error) => log.warn(s"openivm state-sync: cannot prune old snapshot generations: $error")
     }
+
+  private[rocksdb] def isCheckpointedPath(file: LocalPath, roots: Set[LocalPath]): Boolean = {
+    if (roots.isEmpty) return false
+
+    var path = file
+    while (path != null) {
+      if (roots.contains(path)) return true
+      path = path.getParent
+    }
+    false
+  }
 
   private def backupFiles(local: File): Seq[File] =
     listLocalFiles(local)

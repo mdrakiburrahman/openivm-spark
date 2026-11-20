@@ -979,6 +979,21 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
+    it("selects the same complete paths for copying as component-prefix matching") {
+      val state = newDir("state-sync-paths").getAbsoluteFile.toPath
+      val other = Vector("metadata.json", "mvs/root-0/rocksdb-old/nested/keep", "mvs/root-0000/rocksdb/keep")
+        .map(state.resolve(_))
+      for (count <- Seq(0, 1, 200, 428)) {
+        val databases = Vector.tabulate(count)(i => state.resolve(s"mvs/root-$i/rocksdb"))
+        val files = (other ++ databases.flatMap { db =>
+          Vector(db, db.resolve("CURRENT"), db.resolve("tables/nested/data.sst"), db.resolve("../sidecar"))
+        }).sortBy(_.toString)
+        val roots = databases.toSet
+        files.filterNot(OpenIvmStateSync.isCheckpointedPath(_, roots)) shouldBe
+          files.filterNot(file => databases.exists(file.startsWith))
+      }
+    }
+
     it("uploads one packed data object for many RocksDB roots and waits for remote completion") {
       val stateRoot  = newDir("state-sync-packed-local")
       val remoteRoot = newDir("state-sync-packed-remote")
@@ -993,6 +1008,13 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         val directory = new File(stateRoot, s"_openivm/mvs/root-$index/rocksdb")
         val db        = OpenIvmRocksDBRegistry.getOrOpen(spark, directory.getAbsolutePath, Seq("meta"))
         db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8(index.toString)))
+      }
+      val retained = Seq("mvs/root-1/rocksdb-old/nested/keep", "meta/nested/state")
+      val omitted  = Seq("mvs/root-1/rocksdb/nested/not-a-db-file", "meta/nested/LOCK", "meta/nested/file.crc")
+      (retained ++ omitted).foreach { path =>
+        val file = new File(stateRoot, s"_openivm/$path").toPath
+        java.nio.file.Files.createDirectories(file.getParent)
+        java.nio.file.Files.write(file, RocksDBCodec.utf8(path))
       }
       val entered = new CountDownLatch(1)
       val release = new CountDownLatch(1)
@@ -1016,8 +1038,13 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         val snapshot = OpenIvmStateSync.latestCommittedSnapshot(fs, root).get
         fs.listStatus(snapshot).map(_.getPath.getName).toSeq shouldBe Seq("snapshot.zip")
         val zip = new java.util.zip.ZipFile(new File(new org.apache.hadoop.fs.Path(snapshot, "snapshot.zip").toUri))
-        try zip.entries().asScala.count(_.getName.endsWith("/CURRENT")) shouldBe 100
-        finally zip.close()
+        try {
+          val paths = zip.entries().asScala.map(_.getName).toSet
+          paths.filter(_.endsWith("/CURRENT")) shouldBe
+            (1 to 100).map(i => s"mvs/root-$i/rocksdb/CURRENT").toSet
+          retained.foreach(path => paths should contain(path))
+          omitted.foreach(path => paths should not contain path)
+        } finally zip.close()
       } finally release.countDown()
     }
 
