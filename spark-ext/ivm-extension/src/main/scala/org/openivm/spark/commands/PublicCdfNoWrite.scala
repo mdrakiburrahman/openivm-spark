@@ -83,7 +83,13 @@ private[commands] object PublicCdfNoWrite {
   private val MaxRankGroupCdcBytes = BigInt(8 * 1024 * 1024)
 
   private def deterministicRankOrCount(plan: LogicalPlan, source: LogicalPlan, refreshType: Int): Boolean = {
-    def sameSource(child: LogicalPlan): Boolean = unalias(child).sameResult(unalias(source))
+    def sameSource(child: LogicalPlan): Boolean = unalias(child) match {
+      // Spark 3.5 inserts an identity Project below Window during analysis.
+      case project: Project if project.projectList.forall(_.isInstanceOf[AttributeReference]) &&
+            project.projectList.map(_.exprId) == project.child.output.map(_.exprId) =>
+        sameSource(project.child)
+      case other => other.sameResult(unalias(source))
+    }
     def rankOutput(expr: Expression): Boolean = expr match {
       case alias: Alias =>
         alias.child match {
