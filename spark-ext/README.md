@@ -159,3 +159,12 @@ multiplicity; commit metrics are not a substitute. Pins, replacement intervals,
 missing identity or history, and unsupported plans are not eligible. The usual
 refresh path remains in charge when the proof is unavailable. This relies on
 the existing managed-MV lifecycle locks, not a cross-driver DDL fence.
+
+The independent experimental flag `spark.openivm.refresh.publicCdfRankGroupNoWrite.enabled`
+(default `false`) admits direct single-source grouped `COUNT` and `ROW_NUMBER`
+consumers whose primitive input attributes are all covered by their partition/order
+keys. Other orderings (including unproved ties) use ordinary refresh. The exact
+signed grouping probe is limited to four complete MERGE commits with explicit CDF
+files totaling at most 8 MiB. This is an I/O eligibility cap, not a row-count or
+memory guarantee. A nonzero bag, unsupported plan, or unavailable proof never
+changes the ordinary refresh classifier or fallback.

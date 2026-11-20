@@ -462,6 +462,8 @@ object FeatureGate {
   /** Opt in to the bounded, exact public CDF bag proof for owned MV inputs. */
   val PublicCdfNoWriteEnabledKey: String = "spark.openivm.refresh.publicCdfNoWrite.enabled"
 
+  val PublicCdfRankGroupNoWriteEnabledKey: String = "spark.openivm.refresh.publicCdfRankGroupNoWrite.enabled"
+
   /** Let CREATE MATERIALIZED VIEW accept an incrementally maintained query that contains a random or
     * time-dependent expression (`rand()`, `uuid()`, `current_date()`, …). Default OFF: incremental
     * maintenance evaluates such an expression only for changed rows, so the view diverges from a
@@ -798,6 +800,10 @@ object FeatureGate {
 
   def publicCdfNoWriteEnabled(spark: SparkSession): Boolean =
     boolConf(spark.sparkContext.getConf, PublicCdfNoWriteEnabledKey, default = false)
+
+  def publicCdfRankGroupNoWriteEnabled(spark: SparkSession): Boolean =
+    spark.conf.getOption(PublicCdfRankGroupNoWriteEnabledKey)
+      .fold(boolConf(spark.sparkContext.getConf, PublicCdfRankGroupNoWriteEnabledKey, default = false))(_.toBoolean)
 
   def allowNonDeterministic(spark: SparkSession): Boolean =
     spark.conf

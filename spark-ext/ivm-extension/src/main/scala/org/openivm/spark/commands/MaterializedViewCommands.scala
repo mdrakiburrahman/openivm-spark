@@ -5325,20 +5325,30 @@ case class RefreshMaterializedViewCommand(
           meta.refreshType != RefreshTypeCode.FullRefresh &&
           cdfChangeBatches.size == changeBatches.size &&
           cdfChangeBatches.nonEmpty
+      val tryRankGroupProof =
+        (meta.refreshType == RefreshTypeCode.WindowPartition || meta.refreshType == RefreshTypeCode.AggregateGroup) &&
+          FeatureGate.publicCdfRankGroupNoWriteEnabled(spark)
       val noWriteOutcome =
         if (
           canConsumeCdfWithoutWrite && FeatureGate.noopFastExitEnabled(spark) &&
           cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
         ) Some("noop_fast_exit")
         else if (
-          canConsumeCdfWithoutWrite && FeatureGate.publicCdfNoWriteEnabled(spark) &&
-          meta.refreshType == RefreshTypeCode.SimpleProjection && meta.sourceTables.size == 1 &&
+          canConsumeCdfWithoutWrite && (tryRankGroupProof ||
+            (meta.refreshType == RefreshTypeCode.SimpleProjection && FeatureGate.publicCdfNoWriteEnabled(spark))) &&
+          meta.sourceTables.size == 1 &&
           preparedSourceAdvance.isEmpty && sourceVersionAdvance.isEmpty && refreshPinnedIdentities.isEmpty &&
           !SparkTimeTravelSql.hasSnapshotPin(meta.querySql) && cdfRebaselineReasons.isEmpty &&
           cdfChangeBatches.size == 1 && cdfChangeBatches.head.hasBaseline &&
           meta.sourceTables.head == cdfChangeBatches.head.baseTable &&
           cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).contains(BatchVerdict.Mutating) &&
-          PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head)
+          {
+            if (tryRankGroupProof)
+              profile.timeStep("metadata_pre_sql", "phase=public_cdf_rank_group_proof") {
+                PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head, rankGroup = true)
+              }
+            else PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head, rankGroup = false)
+          }
         ) Some("public_cdf_no_write")
         else None
 
