@@ -1710,14 +1710,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   // ---------------------------------------------------------------------------
   describe("(2) CREATE MATERIALIZED VIEW IF NOT EXISTS — already exists → no-op") {
     it("rediscovers managed upstream locks when DROP wins ahead of an existing CREATE") {
-      val source = "src_create_locked_drop"
+      val source   = "src_create_locked_drop"
       val upstream = "mv_create_locked_a_upstream"
-      val target = "mv_create_locked_z_target"
+      val target   = "mv_create_locked_z_target"
       spark.sql(s"CREATE TABLE $source (id INT) USING DELTA").collect()
       spark.sql(s"INSERT INTO $source VALUES (1), (2)").collect()
       spark.sql(s"CREATE MATERIALIZED VIEW $upstream AS SELECT id FROM $source").collect()
       spark.sql(s"CREATE MATERIALIZED VIEW $target AS SELECT id FROM $upstream WHERE id = 1").collect()
-      val name = TableIdentifier(target)
+      val name   = TableIdentifier(target)
       val create = s"CREATE MATERIALIZED VIEW IF NOT EXISTS $target AS SELECT id FROM $upstream WHERE id = 2"
 
       withPool(1) { implicit ec =>
@@ -1727,7 +1727,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             worker.set(Thread.currentThread())
             spark.sql(create).collect()
           }
-          val deadline = 30.seconds.fromNow
+          val deadline        = 30.seconds.fromNow
           def queued: Boolean = Option(worker.get()).exists(RefreshMutex.hasQueuedThread(target, _))
           while (!queued && deadline.hasTimeLeft()) Thread.sleep(5)
           queued shouldBe true

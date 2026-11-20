@@ -2976,22 +2976,26 @@ case class CreateMaterializedViewCommand(
 
       // Do not count a speculative miss as a second driver admission when AIMD is enabled.
       val probeExisting = ifNotExists && !FeatureGate.driverAdmissionEnabled(spark)
-      val (existingOutcome, upstreamReadKeys) =
+      val (existingOutcome, upstreamReadKeys) = if (probeExisting) {
+        val access   = org.apache.spark.sql.openivm.SparkSessionAccess
+        val isolated = access.cloneSession(spark)
+        // In RocksDB mode this also joins/starts restore, before taking any lifecycle lock.
+        access.withActiveSession(isolated) { MvCatalog.ensureTables(isolated) }
+        val existing = runLocked(Seq.empty, existingOnly = true)
+        // On a miss no metadata escapes, and the target lock is released before discovery.
+        // Fresh CREATE still rechecks the registration under the complete ordered lock set.
+        val keys = if (existing.isEmpty) access.withActiveSession(isolated) { discoverUpstreamReadKeys(isolated) }
+        else Seq.empty[String]
+        (existing, keys)
+      } else {
         org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-          // In RocksDB mode this also joins/starts restore, before taking any lifecycle lock.
           MvCatalog.ensureTables(isolated)
-          if (probeExisting) {
-            val existing = runLocked(Seq.empty, existingOnly = true)
-            // On a miss no metadata escapes, and the target lock is released before discovery.
-            // Fresh CREATE still rechecks the registration under the complete ordered lock set.
-            (existing, if (existing.isEmpty) discoverUpstreamReadKeys(isolated) else Seq.empty[String])
-          } else {
-            val keys =
-              if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
-              else discoverUpstreamReadKeys(isolated)
-            (None, keys)
-          }
+          val keys =
+            if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+            else discoverUpstreamReadKeys(isolated)
+          (None, keys)
         }
+      }
       val outcome = existingOutcome.getOrElse(runLocked(upstreamReadKeys, existingOnly = false).get)
       if (!finalizeUnderLock) {
         if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
