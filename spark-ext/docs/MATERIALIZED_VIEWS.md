@@ -61,6 +61,19 @@ without publishing partial cache state. Identity and integrity failures still
 fail the refresh.
 The cache is published only after the target write succeeds.
 
+## CDF window net-change detection
+
+For a downstream-fed window MV that has selected bounded single-pass
+replacement, the existing net-change probe uses the signed change views
+registered for that refresh. It groups by the source's declared row columns,
+not the CDF timestamp or sign. This lets a managed source MV's private state
+change without rewriting or cascading an unchanged public result; normal
+refresh finalization still records the consumed source version.
+
+The probe requires one exact registered CDF range per changed source and a
+matching, unambiguous schema. If it cannot prove the public row bag is
+unchanged, the normal refresh continues. Terminal windows do not run the probe.
+
 ## Refresh timing
 
 With `spark.openivm.profile.refresh=true` and synchronous remote backup enabled,
