@@ -1,6 +1,14 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, RefreshSqlLogCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{
+  CdfWatermarkCatalog,
+  FeatureGate,
+  MvProjectionSource,
+  MvCatalog,
+  RefreshProfileCatalog,
+  RefreshSqlLogCatalog,
+  RefreshTypeCode
+}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pass-replace") with CdfMode {
@@ -87,6 +95,69 @@ class WindowSinglePassReplaceCdfSpec extends IvmParitySpecBase("window-single-pa
       refreshMv("wspr_noop_downstream")
       assertMvCorrect("wspr_noop_downstream", downstreamSql)
       mvDataVersion("wspr_noop_downstream") shouldBe downstreamVersion
+    }
+
+    for (changed <- Seq(false, true)) {
+      val kind = if (changed) "changed" else "net_zero"
+      it(s"handles managed DISTINCT parent CDF [1,1] with $kind public rows") {
+        spark.conf.set("spark.openivm.catalogPreservesColumnCase", "true")
+        spark.conf.set("spark.openivm.managedTablesRoot", s"$warehouseDir/Tables")
+        try {
+          val base        = s"wspr_${kind}_base"
+          val parent      = s"default.wspr_${kind}_parent"
+          val target      = s"default.wspr_${kind}_target"
+          val child       = s"default.wspr_${kind}_child"
+          val targetShort = target.split("\\.").last
+          sql(s"CREATE TABLE $base(id INT, region STRING, item_value INT) USING DELTA")
+          sql(s"INSERT INTO $base VALUES (1, 'east', 10), (2, 'east', 10), (3, 'east', NULL), (4, 'west', 20)")
+          sql(s"CREATE MATERIALIZED VIEW $parent AS SELECT DISTINCT region, item_value FROM $base")
+          val query = s"SELECT region, item_value, ROW_NUMBER() OVER " +
+            s"(PARTITION BY region ORDER BY item_value NULLS FIRST) AS rn FROM $parent"
+          sql(s"CREATE MATERIALIZED VIEW $target AS $query")
+          val childQuery = s"SELECT region, item_value, rn FROM $target"
+          sql(s"CREATE MATERIALIZED VIEW $child AS $childQuery")
+
+          MvProjectionSource.isProjection(spark, parent) shouldBe true
+          spark.table(parent).columns.toSeq shouldBe Seq("region", "item_value")
+          spark.read.format("delta").load(mvDataLocation(parent)).columns.toSeq should contain("openivm_distinct_count")
+          val targetId   = spark.sessionState.sqlParser.parseTableIdentifier(target)
+          val targetMeta = MvCatalog.lookup(spark, targetId).get
+          targetMeta.refreshType shouldBe RefreshTypeCode.WindowPartition
+          targetMeta.sourceTables shouldBe Seq(parent)
+          mvDataVersion(parent) shouldBe 0L
+          val targetBefore = mvDataVersion(target)
+          val childBefore  = mvDataVersion(child)
+          CdfWatermarkCatalog.get(spark, target, parent) shouldBe None
+
+          if (changed) sql(s"UPDATE $base SET item_value = 7 WHERE id = 1")
+          else sql(s"DELETE FROM $base WHERE id = 1")
+          refreshMv(parent)
+          mvDataVersion(parent) shouldBe 1L
+          assertMvCorrect(parent, s"SELECT DISTINCT region, item_value FROM $base")
+          RefreshProfileCatalog.removeAll(spark)
+          refreshMv(target)
+          ranNetChangeProbe(targetShort) shouldBe true
+          CdfWatermarkCatalog.get(spark, target, parent) shouldBe Some(1L)
+          refreshMv(child)
+          val targetRows = spark.table(target)
+          val expected   = sql(query)
+          targetRows.exceptAll(expected).count() shouldBe 0L
+          expected.exceptAll(targetRows).count() shouldBe 0L
+          val childRows = spark.table(child)
+          childRows.exceptAll(expected).count() shouldBe 0L
+          expected.exceptAll(childRows).count() shouldBe 0L
+          if (changed) {
+            mvDataVersion(target) should be > targetBefore
+            mvDataVersion(child) should be > childBefore
+          } else {
+            mvDataVersion(target) shouldBe targetBefore
+            mvDataVersion(child) shouldBe childBefore
+          }
+        } finally {
+          spark.conf.unset("spark.openivm.catalogPreservesColumnCase")
+          spark.conf.unset("spark.openivm.managedTablesRoot")
+        }
+      }
     }
 
     it("does not scan CDF for net-zero detection when the window view has no downstream consumer") {

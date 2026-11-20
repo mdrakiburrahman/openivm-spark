@@ -35,7 +35,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.functions.{col, lit, sum, when}
+import org.apache.spark.sql.functions.{col, lit, sum}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
@@ -6060,8 +6060,10 @@ case class RefreshMaterializedViewCommand(
       val viewDeltaPath = s"$warehouse/_ivm/view_deltas/$safeMvName/${java.util.UUID.randomUUID()}"
       preparedSourceAdvance.foreach(_.trackPath(viewDeltaPath))
 
-      val byTable                                        = changeBatches.groupBy(_.baseTable)
-      val tempViewShortNames                             = scala.collection.mutable.ArrayBuffer[String]()
+      val byTable            = changeBatches.groupBy(_.baseTable)
+      val tempViewShortNames = scala.collection.mutable.ArrayBuffer[String]()
+      val registeredCdfDeltaViews =
+        scala.collection.mutable.Map.empty[CdfChangeBatch, CdfChangePropagation.RegisteredDeltaView]
       val sourceSnapshotTempViews                        = scala.collection.mutable.ArrayBuffer[String]()
       var fusedScratchView: Option[String]               = None
       var fusedScratchRecordedForCascade: Boolean        = false
@@ -6093,9 +6095,18 @@ case class RefreshMaterializedViewCommand(
                 var registrationSucceeded = false
                 val viewSql =
                   try {
-                    val registered = sourceVersionBatch
-                      .map(SourceVersionDelta.registerSourceDeltaView(spark, _, schema))
-                      .getOrElse(propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches))
+                    val registered = sourceVersionBatch match {
+                      case Some(batch) => SourceVersionDelta.registerSourceDeltaView(spark, batch, schema)
+                      case None =>
+                        propagation match {
+                          case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
+                            val (sql, coverage) =
+                              cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
+                            coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
+                            sql
+                          case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                        }
+                    }
                     registrationSucceeded = true
                     registered
                   } finally {
@@ -7054,7 +7065,12 @@ case class RefreshMaterializedViewCommand(
                   val hasNetChanges =
                     profile.timeStep("metadata_pre_sql", "phase=cdf_window_net_change_probe") {
                       RefreshPerf.timePhase(refreshId, viewLabel, "cdf_window_net_change_probe") {
-                        cdfBatchesHaveNetChanges(spark, cdfChangeBatches)
+                        cdfBatchesHaveNetChanges(
+                          spark,
+                          cdfChangeBatches,
+                          registeredCdfDeltaViews.toMap,
+                          tempViewShortNames.toVector
+                        )
                       }
                     }
                   if (!hasNetChanges) {
@@ -7866,37 +7882,49 @@ case class RefreshMaterializedViewCommand(
         false
     }
 
-  private def cdfBatchesHaveNetChanges(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
+  private def cdfBatchesHaveNetChanges(
+      spark: SparkSession,
+      batches: Seq[CdfChangeBatch],
+      registered: Map[CdfChangeBatch, CdfChangePropagation.RegisteredDeltaView],
+      registeredShortNames: Seq[String]
+  ): Boolean =
     try {
-      batches
-        .groupBy(_.baseTable)
-        .exists { case (source, sourceBatches) =>
-          val sourceSchema = spark.table(source).schema
-          if (sourceSchema.isEmpty || !sourceSchema.forall(field => RowOrdering.isOrderable(field.dataType))) true
-          else {
-            val startVersion  = sourceBatches.map(_.startVersionExclusive).min + 1L
-            val endVersion    = sourceBatches.map(_.endVersionInclusive).max
-            val sourceColumns = sourceSchema.fieldNames.toSeq.map(col)
-            val signed = spark.read
-              .format("delta")
-              .option("readChangeFeed", "true")
-              .option("startingVersion", startVersion)
-              .option("endingVersion", endVersion)
-              .table(source)
-              .filter(col("_change_type").isin("insert", "delete", "update_preimage", "update_postimage"))
-              .select(
-                sourceColumns :+ when(col("_change_type").isin("insert", "update_postimage"), lit(1L))
-                  .otherwise(lit(-1L))
-                  .as("openivm_cdf_multiplicity"): _*
-              )
-            signed
-              .groupBy(sourceColumns: _*)
-              .agg(sum(col("openivm_cdf_multiplicity")).as("openivm_cdf_net_multiplicity"))
-              .filter(col("openivm_cdf_net_multiplicity") =!= lit(0L))
-              .head(1)
-              .nonEmpty
-          }
+      import CdfChangePropagation.{SignColumn, TimestampColumn}
+      import org.apache.spark.sql.types.{IntegerType, TimestampType}
+
+      // Short aliases are shared with generated SQL. Reject shadowing, even by an empty source view.
+      val uniqueCoverage = batches.map(_.baseTable).distinct.size == batches.size && batches.forall { batch =>
+        registered.get(batch).exists { view =>
+          registeredShortNames.count(short => view.name.equalsIgnoreCase(s"openivm_delta_$short")) == 1
         }
+      }
+      !uniqueCoverage || batches.exists { batch =>
+        val view      = registered(batch)
+        val rowFields = view.rowSchema.fields.toSeq
+        val projection = rowFields.map(field => field.name -> field.dataType) ++
+          Seq(TimestampColumn -> TimestampType, SignColumn -> IntegerType)
+        val names  = projection.map(_._1)
+        val signed = spark.table(quoteCol(view.name))
+        if (
+          rowFields.isEmpty || !rowFields.forall(field => RowOrdering.isOrderable(field.dataType)) ||
+          names.exists(name => names.count(_.equalsIgnoreCase(name)) != 1) ||
+          signed.schema.fields.map(field => field.name -> field.dataType).toSeq != projection
+        ) true
+        else {
+          val key = rowFields.map(field => col(quoteCol(field.name)))
+          val net = Iterator
+            .from(0)
+            .map(i => s"openivm_cdf_net_multiplicity_$i")
+            .find(alias => !names.exists(_.equalsIgnoreCase(alias)))
+            .get
+          signed
+            .groupBy(key: _*)
+            .agg(sum(col(quoteCol(SignColumn)).cast("long")).as(net))
+            .filter(col(quoteCol(net)) =!= lit(0L))
+            .head(1)
+            .nonEmpty
+        }
+      }
     } catch {
       case NonFatal(error) =>
         logWarning("[openivm-mv] CDF net-zero probe failed; using the conservative refresh path", error)
