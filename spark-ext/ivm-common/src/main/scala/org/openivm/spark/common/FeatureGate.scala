@@ -48,7 +48,7 @@ object FeatureGate {
     * so IVM state survives Fabric session recycling. Unset (default) → no sync,
     * local-only behavior unchanged.
     */
-  val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+  val StateSyncUriKey: String        = "spark.openivm.stateSync.uri"
   val GuardedStateSyncUriKey: String = "spark.openivm.stateSync.guarded.uri"
 
   /** Return from MV commands before remote backup completes (default true).

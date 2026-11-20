@@ -39,9 +39,9 @@ object OpenIvmStateSync {
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
   private final class GuardedBinding(val root: String, val store: GuardedSnapshotDecisions.ArchiveStore) {
-    val backup = new BackupState
-    val restored = new CompletableFuture[Unit]()
-    val restoring = new AtomicBoolean(false)
+    val backup                                              = new BackupState
+    val restored                                            = new CompletableFuture[Unit]()
+    val restoring                                           = new AtomicBoolean(false)
     var latest: Option[GuardedSnapshotDecisions.Generation] = None
   }
 
@@ -180,9 +180,11 @@ object OpenIvmStateSync {
   private[openivm] def guardedSqlEnabled(spark: SparkSession): Boolean = guardedUri(spark).isDefined
 
   private def checkGuardedSettings(spark: SparkSession): Unit = {
-    if (spark.sparkContext.isStopped || stateSyncUri(spark).nonEmpty ||
-        spark.conf.getOption(FeatureGate.StateSyncUriKey).exists(_.trim.nonEmpty) ||
-        FeatureGate.stateSyncAsyncEnabled(spark) || FeatureGate.gcEnabled(spark))
+    if (
+      spark.sparkContext.isStopped || stateSyncUri(spark).nonEmpty ||
+      spark.conf.getOption(FeatureGate.StateSyncUriKey).exists(_.trim.nonEmpty) ||
+      FeatureGate.stateSyncAsyncEnabled(spark) || FeatureGate.gcEnabled(spark)
+    )
       throw new java.io.IOException(
         "guarded SQL state sync requires an active Spark application, no legacy URI, synchronous state sync, and legacy GC disabled"
       )
@@ -205,7 +207,8 @@ object OpenIvmStateSync {
 
   private def guardedBinding(spark: SparkSession): Option[GuardedBinding] = guardedUri(spark).map { uri =>
     checkGuardedSettings(spark)
-    val binding = guardedBindings.synchronized(Option(guardedBindings.get(spark.sparkContext)))
+    val binding = guardedBindings
+      .synchronized(Option(guardedBindings.get(spark.sparkContext)))
       .getOrElse(throw new java.io.IOException("guarded SQL checkpoint transport was not attached at startup"))
     if (binding.store.canonicalRoot != uri || binding.root != canonicalLocalRoot(spark))
       throw new java.io.IOException("guarded SQL checkpoint binding changed")
@@ -343,18 +346,21 @@ object OpenIvmStateSync {
     guardedBinding(spark) match {
       case Some(binding) =>
         restoreGuardedOnce(spark, binding)
-        val span = OpenIvmExecutionSpan.captureCurrent()
+        val span    = OpenIvmExecutionSpan.captureCurrent()
         val started = System.nanoTime()
-        try binding.backup.backupSynchronous { () =>
-          val previous = new GuardedSnapshotDecisions(binding.store).latestPublished().map(_.generation)
-          if (previous != binding.latest)
-            throw new java.io.IOException("guarded SQL checkpoint was published by another writer; fresh restore required")
-          val previousStamp = previous.map(_.value.take(19).toLong).getOrElse(0L)
-          val stamp = math.max(System.currentTimeMillis(), Math.addExact(previousStamp, 1L))
-          val generation = GuardedSnapshotDecisions.Generation(f"$stamp%019d-${UUID.randomUUID()}")
-          publishGuarded(spark, generation, binding.store)
-          binding.latest = Some(generation)
-        }
+        try
+          binding.backup.backupSynchronous { () =>
+            val previous = new GuardedSnapshotDecisions(binding.store).latestPublished().map(_.generation)
+            if (previous != binding.latest)
+              throw new java.io.IOException(
+                "guarded SQL checkpoint was published by another writer; fresh restore required"
+              )
+            val previousStamp = previous.map(_.value.take(19).toLong).getOrElse(0L)
+            val stamp         = math.max(System.currentTimeMillis(), Math.addExact(previousStamp, 1L))
+            val generation    = GuardedSnapshotDecisions.Generation(f"$stamp%019d-${UUID.randomUUID()}")
+            publishGuarded(spark, generation, binding.store)
+            binding.latest = Some(generation)
+          }
         finally span.foreach(_.recordRocksDbBackup((System.nanoTime() - started) / 1000000L))
         return
       case None => ()

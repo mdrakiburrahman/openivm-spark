@@ -33,6 +33,25 @@ generations are pruned according to the configured retention. Archives are bound
 100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
 rejected.
 
+### Guarded SQL checkpoints (opt-in)
+
+For an externally exclusive single writer, configure
+`spark.openivm.stateSync.guarded.uri` at Spark startup and call
+`GuardedCheckpointDriver.attachSqlPersistence(spark, storageCredential)` on
+the driver before accessing OpenIVM. Use a pre-provisioned guarded V1
+namespace and an initially empty local state root. Do not configure
+`spark.openivm.stateSync.uri`; explicitly set
+`spark.openivm.stateSync.async.enabled=false` and `spark.openivm.gc.enabled=false`.
+The route refuses legacy fallback or the legacy collector's unguarded deletes.
+
+First OpenIVM access restores only the latest verified published archive.
+Ordinary CREATE and REFRESH return their existing SQL responses after a
+covering publication has been confirmed. Failed publications do not return
+success. This does not change archive retention or enable pruning. The
+per-generation terminal decision is not a namespace writer fence: independent
+drivers must not write the same namespace concurrently. The qualification-only
+`publish`, `restore`, and `retire` methods remain separate.
+
 ## Cross-thread query-hash annotations
 
 When an event callback began capture on a different Java thread, append
