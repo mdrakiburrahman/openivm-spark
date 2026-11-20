@@ -278,7 +278,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val triggerRoot     = new File(warehouse, "_openivm/triggers")
       val firstTrigger    = new File(triggerRoot, "db-a/operation-a/marker")
       val secondTrigger   = new File(triggerRoot, "db-b/operation-b/marker")
-      val currentVersions = org.openivm.spark.common.MvCatalog.list(spark).map(_.version)
+      val currentVersions = org.openivm.spark.common.MvCatalog.list(spark).map(_.lastVersion)
       currentVersions shouldBe empty
       firstTrigger.getParentFile.mkdirs()
       secondTrigger.getParentFile.mkdirs()
@@ -354,10 +354,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val deletedRelative =
         new File(warehouse, "_openivm/triggers").toPath.relativize(new File(deletedPath.get()).toPath)
       val retainedRelative =
-        new File(warehouse, "_openivm/triggers").toPath.relativize(remaining.get().getParentFile.toPath)
+        new File(warehouse, "_openivm/triggers").toPath.relativize(remaining.get.getParentFile.toPath)
       val deletedRel  = s"triggers/${deletedRelative.toString}/marker"
       val retainedRel = s"triggers/${retainedRelative.toString}/marker"
-      org.openivm.spark.common.MvCatalog.list(spark).map(_.version) shouldBe currentVersions
+      org.openivm.spark.common.MvCatalog.list(spark).map(_.lastVersion) shouldBe currentVersions
       stopSpark(spark)
       runFreshRestoreProbe(remote.toURI.toString, deletedRel, retainedRel, refreshId, childEvidence)
 
