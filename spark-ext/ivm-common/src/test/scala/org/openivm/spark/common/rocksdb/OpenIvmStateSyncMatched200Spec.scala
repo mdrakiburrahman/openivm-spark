@@ -126,13 +126,13 @@ object OpenIvmStateSyncMatched200FreshRestoreProbe {
         .foreach(m =>
           require(!profiles.exists(_.refreshId == m.requestId), s"later waiter ${m.requestId} appeared in old archive")
         )
-      val includedIds = included.map(_.requestId).sorted.map(id => s"\"$id\"").mkString("[", ",", "]")
+      val includedIds = included.map(_.requestId).sorted.map(id => s""""$id"").mkString("[", ",", "]""")
       val excludedIds =
-        mutations.filter(_.stage > captureStage).map(_.requestId).sorted.map(id => s"\"$id\"").mkString("[", ",", "]")
+        mutations.filter(_.stage > captureStage).map(_.requestId).sorted.map(id => s""""$id"").mkString("[", ",", "]""")
       Files.createDirectories(evidence.toPath.getParent)
       Files.write(
         evidence.toPath,
-        s"{\"fresh_jvm\":true,\"selected_generation\":\"$generation\",\"archive_sha256\":\"$archiveHash\",\"capture_ordinal\":$captureStage,\"restored_mvs\":${all.size},\"all_200_versions_and_offsets_verified\":true,\"baseline_profile_id\":\"$baselineProfileId\",\"included_waiter_ids\":$includedIds,\"excluded_later_waiter_ids\":$excludedIds}"
+        s"""{"fresh_jvm":true,"selected_generation":"$generation","archive_sha256":"$archiveHash","capture_ordinal":$captureStage,"restored_mvs":${all.size},"all_200_versions_and_offsets_verified":true,"baseline_profile_id":"$baselineProfileId","included_waiter_ids":$includedIds,"excluded_later_waiter_ids":$excludedIds}"""
           .getBytes(StandardCharsets.UTF_8)
       )
     } finally {
@@ -537,65 +537,79 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
     def optionalBoolean(value: Option[Boolean]): String = value.map(_.toString).getOrElse("null")
     val result = timings
       .map { t =>
-        s"{\"request_id\":\"${t.requestId}\",\"phase\":\"${t.phase}\",\"shard_index\":${t.shardIndex.map(_.toString).getOrElse("null")},\"expected_version\":${optionalLong(
+        s"""{"request_id":"${t.requestId}","phase":"${t.phase}","shard_index":${t.shardIndex
+            .map(_.toString)
+            .getOrElse("null")},"expected_version":${optionalLong(
             t.expectedVersion
-          )},\"expected_offset\":${optionalLong(t.expectedOffset)},\"completed_generation\":\"${t.completedGeneration
-            .getOrElse("")}\",\"start_monotonic_ns\":${t.startMonotonicNanos},\"end_monotonic_ns\":${t.endMonotonicNanos},\"latency_ms\":${t.latencyMs},\"succeeded\":${t.succeeded}}"
+          )},"expected_offset":${optionalLong(t.expectedOffset)},"completed_generation":"${t.completedGeneration
+            .getOrElse(
+              ""
+            )}","start_monotonic_ns":${t.startMonotonicNanos},"end_monotonic_ns":${t.endMonotonicNanos},"latency_ms":${t.latencyMs},"succeeded":${t.succeeded}}"""
       }
       .mkString("[", ",", "]")
     val practical = practicalTimings
       .map { t =>
-        s"{\"request_id\":\"${t.requestId}\",\"phase\":\"${t.phase}\",\"start_monotonic_ns\":${t.startMonotonicNanos},\"end_monotonic_ns\":${t.endMonotonicNanos},\"latency_ms\":${t.latencyMs},\"succeeded\":${t.succeeded}}"
+        s"""{"request_id":"${t.requestId}","phase":"${t.phase}","start_monotonic_ns":${t.startMonotonicNanos},"end_monotonic_ns":${t.endMonotonicNanos},"latency_ms":${t.latencyMs},"succeeded":${t.succeeded}}"""
       }
       .mkString("[", ",", "]")
     val uploads = publicationEvents
       .map { e =>
-        s"{\"request_id\":\"${e.requestId}\",\"capture_ordinal\":${e.captureOrdinal},\"captured_mutation_generation\":${optionalLong(
+        s"""{"request_id":"${e.requestId}","capture_ordinal":${e.captureOrdinal},"captured_mutation_generation":${optionalLong(
             e.capturedMutationGeneration
-          )},\"generation\":\"${e.generation}\",\"archive_bytes\":${e.archiveBytes},\"archive_sha256\":\"${e.archiveSha256}\"}"
+          )},"generation":"${e.generation}","archive_bytes":${e.archiveBytes},"archive_sha256":"${e.archiveSha256}"}"""
       }
       .mkString("[", ",", "]")
     val commitJson = committed
       .map { c =>
-        s"{\"generation\":\"${c.generation}\",\"manifest_sha256\":\"${c.manifestSha256}\",\"archive_bytes\":${c.archiveBytes},\"archive_sha256\":\"${c.archiveSha256}\"}"
+        s"""{"generation":"${c.generation}","manifest_sha256":"${c.manifestSha256}","archive_bytes":${c.archiveBytes},"archive_sha256":"${c.archiveSha256}"}"""
       }
       .mkString("[", ",", "]")
     val receiptJson = receiptsForArm
       .map { r =>
-        s"{\"request_id\":\"${r.requestId}\",\"requested_generation\":${r.requestedMutationGeneration},\"captured_generation\":${optionalLong(r.capturedMutationGeneration)},\"publication_generation\":\"${r.publicationGeneration
-            .getOrElse("")}\",\"published\":${r.published},\"reused\":${r.reused},\"coverage_proven\":${r.coverageProven},\"acknowledged\":${r.acknowledged},\"outcome\":\"${r.outcome}\",\"archive_bytes\":${r.archiveBytes
-            .getOrElse(0L)},\"archive_sha256\":\"${r.archiveSha256.getOrElse("")}\"}"
+        s"""{"request_id":"${r.requestId}","requested_generation":${r.requestedMutationGeneration},"captured_generation":${optionalLong(
+            r.capturedMutationGeneration
+          )},"publication_generation":"${r.publicationGeneration
+            .getOrElse(
+              ""
+            )}","published":${r.published},"reused":${r.reused},"coverage_proven":${r.coverageProven},"acknowledged":${r.acknowledged},"outcome":"${r.outcome}","archive_bytes":${r.archiveBytes
+            .getOrElse(0L)},"archive_sha256":"${r.archiveSha256.getOrElse("")}"}"""
       }
       .mkString("[", ",", "]")
     val replay = replayReceipt
       .map(r =>
-        s"{\"publication_generation\":\"${r.publicationGeneration
-            .getOrElse("")}\",\"reused\":${r.reused},\"coverage_proven\":${r.coverageProven},\"acknowledged\":${r.acknowledged}}"
+        s"""{"publication_generation":"${r.publicationGeneration
+            .getOrElse(
+              ""
+            )}","reused":${r.reused},"coverage_proven":${r.coverageProven},"acknowledged":${r.acknowledged}}"""
       )
       .getOrElse("null")
     val bindingJson = bindings
       .map { b =>
         val kind = if (checkpointEnabled) "state_sync_receipt" else "test_only_completion_to_single_commit"
-        s"{\"request_id\":\"${b.mutation.requestId}\",\"phase\":\"${b.mutation.phase}\",\"shard_index\":${b.mutation.shardIndex},\"expected_version\":${b.mutation.expectedVersion},\"expected_offset\":${b.mutation.expectedOffset},\"mutation_capture_stage\":${b.mutation.captureStage},\"capture_ordinal\":${b.captureOrdinal},\"generation\":\"${b.generation}\",\"manifest_sha256\":\"${b.manifestSha256}\",\"archive_bytes\":${b.archiveBytes},\"archive_sha256\":\"${b.archiveSha256}\",\"requested_generation\":${optionalLong(b.requestedMutationGeneration)},\"captured_generation\":${optionalLong(
+        s"""{"request_id":"${b.mutation.requestId}","phase":"${b.mutation.phase}","shard_index":${b.mutation.shardIndex},"expected_version":${b.mutation.expectedVersion},"expected_offset":${b.mutation.expectedOffset},"mutation_capture_stage":${b.mutation.captureStage},"capture_ordinal":${b.captureOrdinal},"generation":"${b.generation}","manifest_sha256":"${b.manifestSha256}","archive_bytes":${b.archiveBytes},"archive_sha256":"${b.archiveSha256}","requested_generation":${optionalLong(
+            b.requestedMutationGeneration
+          )},"captured_generation":${optionalLong(
             b.capturedMutationGeneration
-          )},\"coverage_proven\":${b.coverageProven.map(_.toString).getOrElse("null")},\"linkage_kind\":\"$kind\"}"
+          )},"coverage_proven":${b.coverageProven.map(_.toString).getOrElse("null")},"linkage_kind":"$kind"}"""
       }
       .mkString("[", ",", "]")
     val restoreJson = restoreEvidence
       .map { e =>
         val path = e.evidencePath.replace("\\", "\\\\")
-        s"{\"generation\":\"${e.generation}\",\"capture_ordinal\":${e.captureOrdinal},\"archive_sha256\":\"${e.archiveSha256}\",\"evidence_path\":\"$path\",\"evidence_sha256\":\"${e.evidenceSha256}\"}"
+        s"""{"generation":"${e.generation}","capture_ordinal":${e.captureOrdinal},"archive_sha256":"${e.archiveSha256}","evidence_path":"$path","evidence_sha256":"${e.evidenceSha256}"}"""
       }
       .mkString("[", ",", "]")
     val json =
-      s"{\"arm\":\"$arm\",\"checkpoint_enabled\":$checkpointEnabled,\"coverage_eligible\":$checkpointEnabled," +
-        s"\"fixture_scale\":{\"populated_native_view_shards\":$ViewCount,\"cdf_offsets\":$ViewCount,\"mv_catalog_rows\":$ViewCount}," +
-        s"\"cohort_size\":$CohortCount,\"cohort_wall_start_monotonic_ns\":$burstStartNanos,\"cohort_wall_end_monotonic_ns\":$burstEndNanos,\"cohort_wall_ms\":${(burstEndNanos - burstStartNanos) / 1000000L},\"barrier_wait_ms\":$barrierWaitMs,\"cohort_wall_excluding_controlled_barriers_ms\":${((burstEndNanos - burstStartNanos) / 1000000L - barrierWaitMs)
-            .max(0L)}," +
-        s"\"commit_count\":${committed.size},\"total_archive_bytes\":${committed.map(_.archiveBytes).sum},\"first_captured_generation\":$firstCapturedGeneration,\"late_requested_generation\":$lateRequestedGeneration,\"second_captured_generation\":$secondCapturedGeneration,\"older_commit_excluded_late\":${optionalBoolean(
+      s"""{"arm":"$arm","checkpoint_enabled":$checkpointEnabled,"coverage_eligible":$checkpointEnabled,""" +
+        s""""fixture_scale":{"populated_native_view_shards":$ViewCount,"cdf_offsets":$ViewCount,"mv_catalog_rows":$ViewCount},""" +
+        s""""cohort_size":$CohortCount,"cohort_wall_start_monotonic_ns":$burstStartNanos,"cohort_wall_end_monotonic_ns":$burstEndNanos,"cohort_wall_ms":${(burstEndNanos - burstStartNanos) / 1000000L},"barrier_wait_ms":$barrierWaitMs,"cohort_wall_excluding_controlled_barriers_ms":${((burstEndNanos - burstStartNanos) / 1000000L - barrierWaitMs)
+            .max(0L)},""" +
+        s""""commit_count":${committed.size},"total_archive_bytes":${committed
+            .map(_.archiveBytes)
+            .sum},"first_captured_generation":$firstCapturedGeneration,"late_requested_generation":$lateRequestedGeneration,"second_captured_generation":$secondCapturedGeneration,"older_commit_excluded_late":${optionalBoolean(
             olderCommitExcludedLate
-          )},\"second_commit_excluded_after\":$secondCommitExcludedAfter,\"failure_left_commit_count_unchanged\":$failureCommitsUnchanged,\"baseline_profile_id\":\"$baselineProfileId\",\"late_profile_id\":\"$lateProfileId\",\"unchanged_replay\":$replay,\"practical_burst_wall_ms\":$practicalBurstWallMs,\"practical_burst_commit_delta\":$practicalCommitDelta," +
-        s"\"practical_burst_request_timings\":$practical,\"request_timings\":$result,\"upload_events\":$uploads,\"committed_archives\":$commitJson,\"receipts\":$receiptJson,\"waiter_archive_bindings\":$bindingJson,\"generation_restore_evidence\":$restoreJson}"
+          )},"second_commit_excluded_after":$secondCommitExcludedAfter,"failure_left_commit_count_unchanged":$failureCommitsUnchanged,"baseline_profile_id":"$baselineProfileId","late_profile_id":"$lateProfileId","unchanged_replay":$replay,"practical_burst_wall_ms":$practicalBurstWallMs,"practical_burst_commit_delta":$practicalCommitDelta,""" +
+        s""""practical_burst_request_timings":$practical,"request_timings":$result,"upload_events":$uploads,"committed_archives":$commitJson,"receipts":$receiptJson,"waiter_archive_bindings":$bindingJson,"generation_restore_evidence":$restoreJson}"""
     val output = new File(repoRoot, s".logs/checkpoint-matched-200-per-waiter/arm-$arm.json")
     Files.createDirectories(output.toPath.getParent)
     Files.write(output.toPath, json.getBytes(StandardCharsets.UTF_8))
@@ -949,7 +963,7 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
           val proofText =
             try childProof.mkString
             finally childProof.close()
-          proofText.contains(s"\"selected_generation\":\"$generation\"") shouldBe true
+          proofText.contains(s""""selected_generation":"$generation"""") shouldBe true
           proofText.contains("\"all_200_versions_and_offsets_verified\":true") shouldBe true
           GenerationRestoreEvidence(
             generation,
@@ -966,7 +980,7 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
       val firstProofText =
         try firstProofSource.mkString
         finally firstProofSource.close()
-      firstProofText.contains(s"\"${lateMutation.requestId}\"") shouldBe true
+      firstProofText.contains(s""""${lateMutation.requestId}"""") shouldBe true
 
       val lateRequestedGeneration = lateReceipt.map(_.requestedMutationGeneration).getOrElse(0L)
       val thirdEvent              = publicationEvents.find(_.captureOrdinal == 3).get
