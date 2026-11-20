@@ -2,15 +2,37 @@ package org.openivm.spark.commands
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{
-  Alias, AttributeReference, Cast, Expression, LessThanOrEqual, Literal, RowNumber, WindowExpression
+  Alias,
+  AttributeReference,
+  Cast,
+  Expression,
+  LessThanOrEqual,
+  Literal,
+  RowNumber,
+  WindowExpression
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, LogicalPlan, Project, SubqueryAlias, View, Window}
+import org.apache.spark.sql.catalyst.plans.logical.{
+  Aggregate,
+  Filter,
+  LogicalPlan,
+  Project,
+  SubqueryAlias,
+  View,
+  Window
+}
 import org.apache.spark.sql.delta.actions.{AddCDCFile, CommitInfo, Metadata, Protocol}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DecimalType, IntegerType, LongType, ShortType}
-import org.openivm.spark.common.{CdfChangeBatch, DeltaTableVersion, MvCatalog, MvMetadata, MvProjectionSource, RefreshTypeCode}
+import org.openivm.spark.common.{
+  CdfChangeBatch,
+  DeltaTableVersion,
+  MvCatalog,
+  MvMetadata,
+  MvProjectionSource,
+  RefreshTypeCode
+}
 
 import scala.util.control.NonFatal
 
@@ -57,15 +79,16 @@ private[commands] object PublicCdfNoWrite {
   }
 
   private[commands] val MaxRankGroupVersions = 4L
-  private val MaxRankGroupCdcBytes = BigInt(8 * 1024 * 1024)
+  private val MaxRankGroupCdcBytes           = BigInt(8 * 1024 * 1024)
 
   private def deterministicRankOrCount(plan: LogicalPlan, source: LogicalPlan, refreshType: Int): Boolean = {
     def sameSource(child: LogicalPlan): Boolean = unalias(child).sameResult(unalias(source))
     def rankOutput(expr: Expression): Boolean = expr match {
-      case alias: Alias => alias.child match {
-        case window: WindowExpression => window.windowFunction.isInstanceOf[RowNumber]
-        case _ => false
-      }
+      case alias: Alias =>
+        alias.child match {
+          case window: WindowExpression => window.windowFunction.isInstanceOf[RowNumber]
+          case _                        => false
+        }
       case _ => false
     }
     def rankShape(node: LogicalPlan): Boolean = unalias(node) match {
@@ -75,7 +98,9 @@ private[commands] object PublicCdfNoWrite {
         // If a rank tie remains, every public input field is identical and the assigned
         // sequence of row numbers is observationally the same multiset.
         keys.forall(_.isInstanceOf[AttributeReference]) && window.orderSpec.nonEmpty &&
-        keys.collect { case attr: AttributeReference => attr.exprId }.toSet == window.child.output.map(_.exprId).toSet &&
+        keys.collect { case attr: AttributeReference => attr.exprId }.toSet == window.child.output
+          .map(_.exprId)
+          .toSet &&
         window.windowExpressions.size == 1 && window.windowExpressions.forall(rankOutput) && sameSource(window.child)
       case _ => false
     }
@@ -86,54 +111,62 @@ private[commands] object PublicCdfNoWrite {
     }
     def boundedRank(node: LogicalPlan): Boolean = unalias(node) match {
       case project: Project => project.projectList.forall(identityAttribute(_).nonEmpty) && boundedRank(project.child)
-      case filter: Filter => filter.condition match {
-        case LessThanOrEqual(attr: AttributeReference, bound: Literal) =>
-          bound.dataType == IntegerType && Option(bound.value).exists(v => v.asInstanceOf[Int] > 0) &&
-          rankId(filter.child).contains(attr.exprId) && rankShape(filter.child)
-        case _ => false
-      }
+      case filter: Filter =>
+        filter.condition match {
+          case LessThanOrEqual(attr: AttributeReference, bound: Literal) =>
+            bound.dataType == IntegerType && Option(bound.value).exists(v => v.asInstanceOf[Int] > 0) &&
+            rankId(filter.child).contains(attr.exprId) && rankShape(filter.child)
+          case _ => false
+        }
       case _ => false
     }
     def countOutput(expr: Expression): Boolean = expr match {
       case alias: Alias => countOutput(alias.child)
-      case aggregate: AggregateExpression => aggregate.aggregateFunction match {
-        case count: Count =>
-          !aggregate.isDistinct && aggregate.filter.isEmpty && count.children.size == 1 && count.children.forall {
-            case _: AttributeReference | _: Literal => true
-            case _ => false
-          }
-        case _ => false
-      }
+      case aggregate: AggregateExpression =>
+        aggregate.aggregateFunction match {
+          case count: Count =>
+            !aggregate.isDistinct && aggregate.filter.isEmpty && count.children.size == 1 && count.children.forall {
+              case _: AttributeReference | _: Literal => true
+              case _                                  => false
+            }
+          case _ => false
+        }
       case _ => false
     }
     refreshType match {
       case RefreshTypeCode.WindowPartition => rankShape(plan) || boundedRank(plan)
-      case RefreshTypeCode.AggregateGroup => unalias(plan) match {
-        case group: Aggregate =>
-          val keys = group.groupingExpressions.collect { case a: AttributeReference => a.exprId }.toSet
-          keys.nonEmpty && group.groupingExpressions.forall(_.isInstanceOf[AttributeReference]) &&
-          group.aggregateExpressions.exists(countOutput) && group.aggregateExpressions.forall { output =>
-            countOutput(output) || identityAttribute(output).exists(a => keys(a.exprId))
-          } && sameSource(group.child)
-        case _ => false
-      }
+      case RefreshTypeCode.AggregateGroup =>
+        unalias(plan) match {
+          case group: Aggregate =>
+            val keys = group.groupingExpressions.collect { case a: AttributeReference => a.exprId }.toSet
+            keys.nonEmpty && group.groupingExpressions.forall(_.isInstanceOf[AttributeReference]) &&
+            group.aggregateExpressions.exists(countOutput) && group.aggregateExpressions.forall { output =>
+              countOutput(output) || identityAttribute(output).exists(a => keys(a.exprId))
+            } && sameSource(group.child)
+          case _ => false
+        }
       case _ => false
     }
   }
 
   private def signedBagIsEmpty(public: DataFrame, attributes: Seq[String]): Boolean = {
     def quoted(value: String): String = s"`${value.replace("`", "``")}`"
-    val keyNames = attributes.indices.map(i => s"_ivm_proof_key_$i")
-    val keys = attributes.zip(keyNames).map { case (name, key) => col(quoted(name)).as(key) }
-    val change = col(ChangeType)
-    val signed = public.select((keys ++ Seq(
-      when(change.isin(Positive: _*), lit(1)).when(change.isin(Negative: _*), lit(-1)).cast(DecimalType(38, 0))
-        .as("_ivm_proof_signed"),
-      when(change.isNull || !change.isin((Positive ++ Negative): _*), lit(1)).otherwise(lit(0)).as("_ivm_proof_bad")
-    )): _*)
+    val keyNames                      = attributes.indices.map(i => s"_ivm_proof_key_$i")
+    val keys                          = attributes.zip(keyNames).map { case (name, key) => col(quoted(name)).as(key) }
+    val change                        = col(ChangeType)
+    val signed = public.select(
+      (keys ++ Seq(
+        when(change.isin(Positive: _*), lit(1))
+          .when(change.isin(Negative: _*), lit(-1))
+          .cast(DecimalType(38, 0))
+          .as("_ivm_proof_signed"),
+        when(change.isNull || !change.isin((Positive ++ Negative): _*), lit(1)).otherwise(lit(0)).as("_ivm_proof_bad")
+      )): _*
+    )
     // Grouping uses Spark's actual NULL and primitive-value equality; an invalid sign or
     // any failed/overflowed exact sum must decline, not disappear through three-valued logic.
-    signed.groupBy(keyNames.map(col): _*)
+    signed
+      .groupBy(keyNames.map(col): _*)
       .agg(sum(col("_ivm_proof_signed")).as("_ivm_proof_net"), sum(col("_ivm_proof_bad")).as("_ivm_proof_invalid"))
       .where("_ivm_proof_net IS NULL OR _ivm_proof_net <> 0 OR _ivm_proof_invalid IS NULL OR _ivm_proof_invalid <> 0")
       .isEmpty
@@ -142,7 +175,12 @@ private[commands] object PublicCdfNoWrite {
   /** This optimization is a proof, never a fallback/error classifier. Reuse the managed-MV
     * refresh locks already held by the caller and bind the actual Delta read to the recorded path.
     */
-  def provesCancellation(spark: SparkSession, consumer: MvMetadata, batch: CdfChangeBatch, rankGroup: Boolean): Boolean =
+  def provesCancellation(
+      spark: SparkSession,
+      consumer: MvMetadata,
+      batch: CdfChangeBatch,
+      rankGroup: Boolean
+  ): Boolean =
     try {
       val source = batch.baseTable
       val dep    = readMvDependencyMap(consumer.properties).toOption.collect { case Seq(only) => only }
@@ -165,8 +203,7 @@ private[commands] object PublicCdfNoWrite {
           schema.nonEmpty && schema.forall { field =>
             !CdfColumns.contains(field.name.toLowerCase(java.util.Locale.ROOT)) &&
             EligibleTypes.contains(field.dataType)
-          } && fingerprint == consumer.sourceSchemaFingerprint &&
-          {
+          } && fingerprint == consumer.sourceSchemaFingerprint && {
             val definition = spark.sql(consumer.querySql).queryExecution.analyzed
             if (rankGroup) deterministicRankOrCount(definition, plan, consumer.refreshType)
             else directConsumer(definition, plan)
@@ -184,7 +221,9 @@ private[commands] object PublicCdfNoWrite {
               def mergeOnly: Boolean = {
                 val commits = log.getChanges(start, failOnDataLoss = true).takeWhile(_._1 <= end).toVector
                 val budgetOk = !rankGroup || {
-                  val sizes = commits.map { case (_, actions) => actions.collect { case file: AddCDCFile => file.size } }
+                  val sizes = commits.map { case (_, actions) =>
+                    actions.collect { case file: AddCDCFile => file.size }
+                  }
                   sizes.forall(files => files.nonEmpty && files.forall(_ > 0L)) &&
                   sizes.flatten.foldLeft(BigInt(0))(_ + _) <= MaxRankGroupCdcBytes
                 }
@@ -204,14 +243,16 @@ private[commands] object PublicCdfNoWrite {
                   .option("endingVersion", end)
                   .load(producer.location)
                 val public = MvProjectionSource.project(raw, schema, Seq(ChangeType))
-                val canceled = if (rankGroup) signedBagIsEmpty(public, schema.fieldNames.toSeq) else {
-                  def quoted(value: String): String = s"`${value.replace("`", "``")}`"
-                  val columns = schema.fieldNames.toSeq.map(name => col(quoted(name)))
-                  val adds = public.where(col(ChangeType).isin(Positive: _*)).select(columns: _*)
-                  val removes = public.where(col(ChangeType).isin(Negative: _*)).select(columns: _*)
-                  raw.where(col(ChangeType).isNull || !col(ChangeType).isin((Positive ++ Negative): _*)).isEmpty &&
-                  adds.exceptAll(removes).isEmpty && removes.exceptAll(adds).isEmpty
-                }
+                val canceled =
+                  if (rankGroup) signedBagIsEmpty(public, schema.fieldNames.toSeq)
+                  else {
+                    def quoted(value: String): String = s"`${value.replace("`", "``")}`"
+                    val columns                       = schema.fieldNames.toSeq.map(name => col(quoted(name)))
+                    val adds    = public.where(col(ChangeType).isin(Positive: _*)).select(columns: _*)
+                    val removes = public.where(col(ChangeType).isin(Negative: _*)).select(columns: _*)
+                    raw.where(col(ChangeType).isNull || !col(ChangeType).isin((Positive ++ Negative): _*)).isEmpty &&
+                    adds.exceptAll(removes).isEmpty && removes.exceptAll(adds).isEmpty
+                  }
                 canceled && currentEnd && identitiesAndVersionsMatch
               }
           }

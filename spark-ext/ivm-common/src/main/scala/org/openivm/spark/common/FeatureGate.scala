@@ -802,7 +802,8 @@ object FeatureGate {
     boolConf(spark.sparkContext.getConf, PublicCdfNoWriteEnabledKey, default = false)
 
   def publicCdfRankGroupNoWriteEnabled(spark: SparkSession): Boolean =
-    spark.conf.getOption(PublicCdfRankGroupNoWriteEnabledKey)
+    spark.conf
+      .getOption(PublicCdfRankGroupNoWriteEnabledKey)
       .fold(boolConf(spark.sparkContext.getConf, PublicCdfRankGroupNoWriteEnabledKey, default = false))(_.toBoolean)
 
   def allowNonDeterministic(spark: SparkSession): Boolean =

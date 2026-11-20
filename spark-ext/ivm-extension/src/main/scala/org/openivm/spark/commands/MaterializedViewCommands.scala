@@ -5341,8 +5341,7 @@ case class RefreshMaterializedViewCommand(
           !SparkTimeTravelSql.hasSnapshotPin(meta.querySql) && cdfRebaselineReasons.isEmpty &&
           cdfChangeBatches.size == 1 && cdfChangeBatches.head.hasBaseline &&
           meta.sourceTables.head == cdfChangeBatches.head.baseTable &&
-          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).contains(BatchVerdict.Mutating) &&
-          {
+          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).contains(BatchVerdict.Mutating) && {
             if (tryRankGroupProof)
               profile.timeStep("metadata_pre_sql", "phase=public_cdf_rank_group_proof") {
                 PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head, rankGroup = true)
