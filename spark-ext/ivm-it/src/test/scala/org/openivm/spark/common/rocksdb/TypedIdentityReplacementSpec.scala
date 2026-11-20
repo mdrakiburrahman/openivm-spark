@@ -264,7 +264,9 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     val child  = "tir_partial_child"
     sql("CREATE TABLE tir_partial_base(k INT, payload STRING) USING DELTA")
     sql("INSERT INTO tir_partial_base VALUES (0, 'replace me'), (1, 'keep me')")
-    sql(s"CREATE MATERIALIZED VIEW $parent PARTITIONED BY (k) AS SELECT k, payload FROM tir_partial_base")
+    spark.conf.set("spark.sql.files.maxRecordsPerFile", "1")
+    try sql(s"CREATE MATERIALIZED VIEW $parent AS SELECT k, payload FROM tir_partial_base")
+    finally spark.conf.unset("spark.sql.files.maxRecordsPerFile")
     val body = s"SELECT CAST(k AS INT) k, CAST(payload AS STRING) payload FROM $parent"
     sql(s"CREATE MATERIALIZED VIEW $child AS $body")
     val path  = mvDataLocation(parent)
@@ -283,7 +285,7 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     sql("SELECT k, payload FROM tir_partial_base WHERE k = 0").write
       .format("delta")
       .mode("overwrite")
-      .option("partitionOverwriteMode", "dynamic")
+      .option("replaceWhere", "k = 0")
       .save(path)
     val p1 = mvDataVersion(parent)
     p1 shouldBe p0 + 1L
@@ -298,7 +300,11 @@ class TypedIdentityReplacementSpec extends IvmParitySpecBase("typed-identity-rep
     refreshMv(child)
     val outcome = totalSince(seen)
     outcome should not include "outcome=public_cdf_no_write"
-    if (verdict == BatchVerdict.Replace) mvDataVersion(child) should be > c0
+    verdict shouldBe BatchVerdict.Mutating
+    val c1 = mvDataVersion(child)
+    c1 should be >= c0
+    val active = delta.update().allFiles.collect().map(_.path).toSet
+    surviving.subsetOf(active) shouldBe true
     assertMvCorrect(child, body)
     assertMvCorrect(parent, "SELECT k, payload FROM tir_partial_base")
     sys.env.get("TYPED_IDENTITY_EVIDENCE").foreach { dir =>
