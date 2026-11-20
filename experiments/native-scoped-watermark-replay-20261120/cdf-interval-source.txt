@@ -1,0 +1,41 @@
+path	spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfChangePropagation.scala
+sha256	8a115135c6ffe592b81fd38088e137ba91606fd1591b1ea49a50d9f044d18578
+source-lines
+57	  override def collectChanges(
+58	      spark: SparkSession,
+59	      viewName: String,
+60	      sources: Seq[String],
+61	      persisted: Map[String, ChangeWatermark]
+62	  ): Seq[ChangeBatch] = {
+63	    val effective = effectivePersistedVersions(spark, viewName, sources, persisted)
+64	    sources.distinct.flatMap { src =>
+65	      val currentOpt = CdfChangePropagation.tableLatestVersion(spark, src)
+66	      currentOpt.flatMap { cur =>
+67	        val from = effective.getOrElse(src, CdfChangeBatch.NoBaseline)
+68	        if (cur > from) Some(CdfChangeBatch(src, startVersionExclusive = from, endVersionInclusive = cur))
+69	        else None
+114	  override def registerSourceDeltaView(
+115	      spark: SparkSession,
+116	      sourceTable: String,
+117	      sourceSchema: StructType,
+118	      batches: Seq[ChangeBatch]
+119	  ): String = {
+120	    val short    = sourceTable.split("\\.").last
+121	    val viewName = s"openivm_delta_$short"
+122	
+123	    val cdfBatch = batches.collectFirst { case b: CdfChangeBatch => b }
+124	
+125	    cdfBatch match {
+126	      case Some(b) =>
+127	        val from = b.startVersionExclusive + 1L
+128	        val to   = b.endVersionInclusive
+129	        val raw = MvProjectionSource.read(
+130	          spark,
+131	          sourceTable,
+132	          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
+133	        )
+134	
+135	        val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
+136	        val transformedAlias = s"_openivm_cdf_raw_$short"
+137	        raw.createOrReplaceTempView(transformedAlias)
+138	        val sql = s"""CREATE OR REPLACE TEMP VIEW `$viewName` AS

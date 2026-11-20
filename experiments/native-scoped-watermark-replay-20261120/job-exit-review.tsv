@@ -1,0 +1,16 @@
+key	value
+job_id	5fc35b405782
+requested_remote_timeout_s	900
+remote_job_state	failed
+remote_job_exit_code	1
+remote_job_duration_ms	210331
+remote_job_stderr	empty
+observed_stdout_marker_test_exit	TEST_EXIT=0
+observed_stdout_marker_final	TEST_EXIT_FINAL=0
+nx_target_result	Nx reports target test successful; ScalaTest 1 passed, 0 failed; sbt 189 s; Nx 201 s
+cleanup_sequence	temporary source removal and trap removal completed; post-run sampling completed before final marker
+submitted_script_terminal_command	exit "$test_status" with test_status observed as 0
+assertion_or_cleanup_failure_evidenced	no
+cause	unresolved; no explicit timeout/error field in retained job metadata
+possible_explanation	Outer worker deadline or exit-status propagation discrepancy is plausible: job duration 210.331 s versus 900 s requested and about 201 s Nx duration, but this is not proven
+rerun	none; read-only investigation

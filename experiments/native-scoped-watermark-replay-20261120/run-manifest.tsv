@@ -25,3 +25,13 @@ downstream_replay	target version 2 unchanged; producer source version 2 unchange
 fixture	100000-row facts plus explicit NULL and duplicate rows; changed dimension seed affects 101 islands including NULL
 raw_run_scratch_path	/workspaces/openivm-spark-scoped-pub-exp-6bb1353/.logs/native-r2-scope-pair/actual-refresh-watermark-replay-20261120-0628
 profiles_receipt_source_sha256	e40603f599f4edb6be9e611a095c245389b797c0148268dab7dde59404b076bc
+
+remote_job_id	5fc35b405782
+remote_job_requested_timeout_s	900
+remote_job_reported_state_exit_duration	failed / 1 / 210331 ms; stderr empty
+remote_job_stdout_exit_markers	TEST_EXIT=0; TEST_EXIT_FINAL=0
+remote_job_exit_diagnosis	No ScalaTest assertion or cleanup failure evidenced; outer status discrepancy unresolved. 210.331 s suggests but does not prove a runner deadline/status propagation issue. No rerun.
+raw_fork_log_sha256	e85e9e1f116166b290f87f6a23ddfb640ef36a47c659c28154d326698aa73b59
+cdf_interval_source_sha256	8a115135c6ffe592b81fd38088e137ba91606fd1591b1ea49a50d9f044d18578
+cdf_interval_execution_evidence	CdfChangePropagation builds (watermark,current] as readChangeFeed startingVersion=watermark+1 endingVersion=current; actual downstream stmt[0] reads openivm_delta_nsc_p1 and logs 202 rows before MERGE. Test receipt independently records watermark 1->2, CDF version 2, 202 rows. Internal DataFrame option values were not separately emitted in the runtime log.
+downstream_execution_trace_sha256	6a847e8d8f759467ead3976978b0b4d5e0a355abe37d9f4b6ea3e16c194b8a47
