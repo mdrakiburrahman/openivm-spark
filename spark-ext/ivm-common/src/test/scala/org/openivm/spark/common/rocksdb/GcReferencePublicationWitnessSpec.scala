@@ -126,11 +126,13 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
         OpenIvmRocksDBRegistry.closeAll()
         spark.stop()
       }
+      }
 
       it("cannot use generation age to retire an in-flight publisher's unchanged archive") {
         val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-generation-")
         val destination = Files.createDirectory(root.resolve("published"))
-        val spark = GcReferencePublicationWitness.session(root.resolve("local"), destination)
+        val comparison = Files.createDirectory(root.resolve("comparison"))
+        val spark = GcReferencePublicationWitness.session(root.resolve("local"), comparison)
         val control = destination.resolve(".openivm-state-sync")
         val commits = control.resolve("commits")
         val snapshots = control.resolve("snapshots")
@@ -159,7 +161,9 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
             (System.currentTimeMillis() > stagedAt) shouldBe true
             OpenIvmStateSync.backupNow(spark)
             OpenIvmStateSync.backupNow(spark)
-            val oldestRetained = names(commits).filter(_.endsWith(".commit")).takeRight(2).head.stripSuffix(".commit")
+            val comparisonCommits = comparison.resolve(".openivm-state-sync").resolve("commits")
+            val oldestRetained =
+              names(comparisonCommits).filter(_.endsWith(".commit")).takeRight(2).head.stripSuffix(".commit")
             (generation < oldestRetained) shouldBe true
             (pending.stripPrefix(".") < oldestRetained) shouldBe true
             fingerprint(snapshots.resolve(generation)) shouldBe original
@@ -172,6 +176,5 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
           spark.stop()
         }
       }
-    }
   }
 }
