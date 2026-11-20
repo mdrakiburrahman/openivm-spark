@@ -15,7 +15,12 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
   def generation(n: Int): Generation = Generation(f"$n%019d-01234567-89ab-cdef-0123-456789abcdef")
 
   // Cooperative local test store, not a filesystem capability advertised to Spark.
-  final class LocalStore(root: Path, loseInstall: Boolean = false, loseDelete: Boolean = false) extends Store {
+  final class LocalStore(
+      root: Path,
+      loseInstall: Boolean = false,
+      loseDelete: Boolean = false,
+      beforeInstall: () => Unit = () => ()
+  ) extends Store {
     val canonicalRoot: String = root.toRealPath().toString
     private def slot(g: Generation, suffix: String): Path = root.resolve(g.value + suffix)
     def archive(g: Generation): Path = slot(g, ".zip")
@@ -68,6 +73,7 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
           case Retired(_) => "retire"
         }
         Files.write(temp, (state +: fields(decision.artifact)).asJava, UTF_8)
+        beforeInstall()
         Files.createLink(slot(decision.artifact.generation, ".decision"), temp)
         if (loseInstall) throw new IOException("injected lost terminal install response")
       } finally Files.delete(temp)
@@ -87,11 +93,26 @@ private[rocksdb] object GuardedSnapshotDecisionProbe {
 
   def main(args: Array[String]): Unit = {
     val root = Paths.get(args(0))
-    val store = new LocalStore(root, loseInstall = true, loseDelete = args(1) == "retire-lost-delete")
+    val role = args(1)
+    val store = new LocalStore(
+      root,
+      loseInstall = true,
+      loseDelete = role == "retire-lost-delete",
+      beforeInstall = () => if (role.startsWith("race-")) {
+        Files.createFile(root.resolve(s"$role.ready"))
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+        while (Files.notExists(root.resolve("race-release")) && System.nanoTime() < deadline) Thread.sleep(10)
+        require(Files.exists(root.resolve("race-release")), "race was not released")
+      }
+    )
     val protocol = new GuardedSnapshotDecisions(store)
     val receipt = store.readFinished(generation(args(2).toInt)).get
-    args(1) match {
+    role match {
       case "publish" => protocol.publish(receipt)
+      case "race-publish" =>
+        try protocol.publish(receipt)
+        catch { case e: IOException if e.getMessage.contains("was retired") => () }
+      case "race-retire" => protocol.retire(receipt)
       case "publish-declined" =>
         try {
           protocol.publish(receipt)
@@ -130,16 +151,21 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
       OpenIvmSnapshotArchive.pack(stage.toFile, Seq(file.toFile), store.archive(generation(n)).toFile, _ => ())
       store.seal(generation(n))
     }
-    def child(role: String, n: Int): Unit = {
+    def start(role: String, n: Int): Process = {
       val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
-      val process = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
+      new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
         "org.openivm.spark.common.rocksdb.GuardedSnapshotDecisionProbe", root.toString, role, n.toString)
         .redirectErrorStream(true).redirectOutput(root.resolve(s"$role-$n.log").toFile).start()
+    }
+
+    def waitForChild(process: Process): Unit = {
       try {
         process.waitFor(45, TimeUnit.SECONDS) shouldBe true
         process.exitValue() shouldBe 0
       } finally if (process.isAlive) process.destroyForcibly()
     }
+
+    def child(role: String, n: Int): Unit = waitForChild(start(role, n))
 
     val published = prepare(1)
     prepare(2)
@@ -157,6 +183,28 @@ class GuardedSnapshotDecisionsSpec extends AnyFunSpec with Matchers {
     Files.write(old, Seq("replacement").asJava, UTF_8)
     intercept[IOException](protocol.retire(replaced)).getMessage should include("version changed")
     Files.readAllLines(old, UTF_8).asScala shouldBe Seq("replacement")
+
+    val raced = prepare(4)
+    val racers = Seq("race-publish", "race-retire")
+    val processes = racers.map(start(_, 4))
+    try {
+      val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+      def bothReady: Boolean = racers.forall(role => Files.exists(root.resolve(s"$role.ready")))
+      while (!bothReady && System.nanoTime() < deadline) Thread.sleep(10)
+      bothReady shouldBe true
+      Files.createFile(root.resolve("race-release"))
+      processes.foreach(waitForChild)
+      store.readDecision(raced.generation) match {
+        case Some(GuardedSnapshotDecisions.Published(`raced`)) =>
+          protocol.latestPublished() shouldBe Some(raced)
+          protocol.retire(raced) shouldBe false
+        case Some(GuardedSnapshotDecisions.Retired(`raced`)) =>
+          protocol.latestPublished() shouldBe Some(published)
+          Files.exists(store.archive(raced.generation)) shouldBe false
+        case other => fail(s"invalid terminal state: $other")
+      }
+    } finally processes.filter(_.isAlive).foreach(_.destroyForcibly())
+
     Files.createDirectory(root.resolve(".openivm-state-sync"))
     intercept[IOException](protocol.latestPublished()).getMessage should include("unverified")
   }
