@@ -4,9 +4,16 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, OpenIvmStatePaths}
 
-import java.nio.file.{Path => NioPath, Paths}
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
+import java.nio.file.{Files, Path => NioPath, Paths}
+import java.util.concurrent.{
+  Callable,
+  ConcurrentHashMap,
+  ExecutionException,
+  ExecutorCompletionService,
+  Executors,
+  TimeUnit
+}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.util.control.NonFatal
 
@@ -37,6 +44,7 @@ private[openivm] object OpenIvmStateBarrier {
 
   private val roots                  = new ConcurrentHashMap[NioPath, RootState]()
   private val rootOverrideForTesting = new ThreadLocal[NioPath]()
+  private val checkpointWorkerPath   = new ThreadLocal[String]()
   @volatile private var stateSyncConfiguredHookForTesting: SparkSession => Boolean = null
 
   private def stateSyncConfigured(spark: SparkSession): Boolean = {
@@ -121,13 +129,79 @@ private[openivm] object OpenIvmStateBarrier {
   }
 
   private[openivm] def withDbOperation[A](dbPath: String)(body: => A): A = {
-    val state = forDbPath(dbPath)
-    if (state == null) body else withRead(state)(body)
+    val checkpointPath = checkpointWorkerPath.get()
+    if (checkpointPath != null) {
+      if (dbPath != checkpointPath) throw new IllegalStateException("Checkpoint worker accessed another database")
+      body
+    } else {
+      val state = forDbPath(dbPath)
+      if (state == null) body else withRead(state)(body)
+    }
   }
 
   private[openivm] def withDbMutation[A](dbPath: String)(body: => A): A = {
+    if (checkpointWorkerPath.get() != null)
+      throw new IllegalStateException("Checkpoint worker attempted to mutate database state")
     val state = forDbPath(dbPath)
     if (state == null) body else withRead(state)(withMutationTracking(state)(body))
+  }
+
+  private[rocksdb] val ParallelCaptureKey = "spark.openivm.stateSync.parallelCapture.enabled"
+
+  private[rocksdb] def captureDatabases(
+      spark: SparkSession,
+      jobs: Vector[(String, NioPath)]
+  ): Unit = {
+    def capture(job: (String, NioPath)): Unit = {
+      OpenIvmSnapshotArchive.checkInterrupted()
+      Files.createDirectories(job._2.getParent)
+      OpenIvmRocksDBRegistry.checkpoint(spark, job._1, job._2)
+    }
+
+    val state = forRoot(root(spark))
+    require(state.lock.isWriteLockedByCurrentThread, "Database capture requires the root write barrier")
+    val parallel = spark.conf.get(ParallelCaptureKey, "false").toBoolean &&
+      !OpenIvmRocksDBConf.fromSpark(spark).multiProcess && jobs.size > 1 &&
+      jobs.map(_._1).distinct.size == jobs.size && jobs.forall(job => forDbPath(job._1) eq state)
+    if (!parallel) jobs.foreach(capture)
+    else {
+      val count       = math.min(jobs.size, math.min(4, Runtime.getRuntime.availableProcessors()))
+      val pool        = Executors.newFixedThreadPool(count)
+      val completion  = new ExecutorCompletionService[Unit](pool)
+      val next        = new AtomicInteger(0)
+      val stop        = new AtomicBoolean(false)
+      var interrupted = false
+      try {
+        (0 until count).foreach { _ =>
+          completion.submit(new Callable[Unit] {
+            override def call(): Unit = {
+              var index = next.getAndIncrement()
+              while (index < jobs.size && !stop.get()) {
+                val job = jobs(index)
+                checkpointWorkerPath.set(job._1)
+                try capture(job)
+                finally checkpointWorkerPath.remove()
+                index = next.getAndIncrement()
+              }
+            }
+          })
+        }
+        (0 until count).foreach(_ => completion.take().get())
+      } catch {
+        case error: ExecutionException => throw error.getCause
+        case error: InterruptedException =>
+          interrupted = true
+          throw error
+      } finally {
+        stop.set(true)
+        pool.shutdown()
+        // No worker may still hold a native handle or touch the staging tree at barrier release.
+        while (!pool.isTerminated)
+          try pool.awaitTermination(Long.MaxValue, TimeUnit.NANOSECONDS)
+          catch { case _: InterruptedException => interrupted = true }
+        if (interrupted) Thread.currentThread().interrupt()
+      }
+    }
   }
 
   private[rocksdb] def mutationCoverageEnabled(spark: SparkSession): Boolean =

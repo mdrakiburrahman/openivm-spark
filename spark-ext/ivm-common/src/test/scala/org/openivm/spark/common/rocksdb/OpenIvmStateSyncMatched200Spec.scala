@@ -278,6 +278,10 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
       .config(FeatureGate.StatePathKey, stateRoot.getAbsolutePath)
       .config(FeatureGate.StateSyncUriKey, remoteRoot.toURI.toString)
       .config(FeatureGate.StateSyncCheckpointEnabledKey, checkpointEnabled.toString)
+      .config(
+        OpenIvmStateBarrier.ParallelCaptureKey,
+        sys.env.getOrElse("OPENIVM_CHECKPOINT_MATCH_PARALLEL_CAPTURE", "false")
+      )
       .config(FeatureGate.StateSyncAsyncEnabledKey, "false")
       .getOrCreate()
     sparks += spark

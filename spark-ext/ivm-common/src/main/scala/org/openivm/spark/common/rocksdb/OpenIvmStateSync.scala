@@ -677,7 +677,7 @@ object OpenIvmStateSync {
       val captureHook = beforeCaptureHookForTesting
       if (captureHook != null) captureHook()
       var captureStarted = 0L
-      var shardsNanos = 0L
+      var shardsNanos    = 0L
       val barrierStarted = System.nanoTime()
       OpenIvmStateBarrier.withCapture(spark) {
         captureStarted = System.nanoTime()
@@ -690,11 +690,12 @@ object OpenIvmStateSync {
           .distinct
           .sortBy(_.toString)
         val shardsStarted = System.nanoTime()
-        databases.foreach { db =>
-          val target = capture.toPath.resolve(localBase.relativize(db))
-          Files.createDirectories(target.getParent)
-          OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
-        }
+        OpenIvmStateBarrier.captureDatabases(
+          spark,
+          databases.iterator.map { db =>
+            db.toFile.getCanonicalPath -> capture.toPath.resolve(localBase.relativize(db))
+          }.toVector
+        )
         shardsNanos = System.nanoTime() - shardsStarted
         files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
@@ -705,7 +706,7 @@ object OpenIvmStateSync {
         if (FeatureGate.stateSyncCheckpointEnabled(spark))
           capturedMutationGeneration = Some(OpenIvmStateBarrier.currentMutationGeneration(spark))
       }
-      val captureEnded = System.nanoTime()
+      val captureEnded  = System.nanoTime()
       var packHookNanos = 0L
       OpenIvmSnapshotArchive.pack(
         capture,
@@ -720,10 +721,10 @@ object OpenIvmStateSync {
           }
         }
       )
-      val packEnded = System.nanoTime()
+      val packEnded     = System.nanoTime()
       val archiveBytes  = archive.length()
       val checksum      = OpenIvmSnapshotArchive.sha256(archive)
-      val hashEnded = System.nanoTime()
+      val hashEnded     = System.nanoTime()
       val remoteArchive = new Path(remoteRoot, "snapshot.zip")
       val copyHook      = copyLocalFileHookForTesting
       if (copyHook != null) copyHook(fs, archive, remoteArchive)
