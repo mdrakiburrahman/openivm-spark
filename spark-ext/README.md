@@ -146,3 +146,16 @@ in the normal definition fingerprint. Recreating a base table or changing view
 semantics/leaf ordering requires the normal rejection or `onQueryChange=rebuild`
 policy. Restarts reuse the managed target checkpoint; no view-specific checkpoint
 or offset rewrite is introduced.
+
+### Opt-in public CDF progress without a materialized-view write
+
+`spark.openivm.refresh.publicCdfNoWrite.enabled` (default `false`, Spark startup
+configuration) can advance a CDF offset without writing the consumer Delta table.
+It is limited to persisted `SIMPLE_PROJECTION` consumers that directly project
+attributes from one verified, owned upstream MV. The captured interval must have
+complete MERGE history without metadata or protocol changes. The proof compares
+both directions of the exact signed public row bag, including duplicate and NULL
+multiplicity; commit metrics are not a substitute. Pins, replacement intervals,
+missing identity or history, and unsupported plans are not eligible. The usual
+refresh path remains in charge when the proof is unavailable. This relies on
+the existing managed-MV lifecycle locks, not a cross-driver DDL fence.

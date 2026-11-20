@@ -5320,24 +5320,38 @@ case class RefreshMaterializedViewCommand(
             source -> verdict
           }
 
-      if (
-        FeatureGate.noopFastExitEnabled(spark) &&
+      val canConsumeCdfWithoutWrite =
         stateLag.isEmpty &&
-        meta.refreshType != RefreshTypeCode.FullRefresh &&
-        cdfChangeBatches.size == changeBatches.size &&
-        cdfChangeBatches.nonEmpty &&
-        cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
-      ) {
-        // All-noop CDF batch: gate on pinned identity, then consume (frozen +
-        // noop) as a clean commit. A rebind throws before any consume.
+          meta.refreshType != RefreshTypeCode.FullRefresh &&
+          cdfChangeBatches.size == changeBatches.size &&
+          cdfChangeBatches.nonEmpty
+      val noWriteOutcome =
+        if (
+          canConsumeCdfWithoutWrite && FeatureGate.noopFastExitEnabled(spark) &&
+          cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
+        ) Some("noop_fast_exit")
+        else if (
+          canConsumeCdfWithoutWrite && FeatureGate.publicCdfNoWriteEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.SimpleProjection && meta.sourceTables.size == 1 &&
+          preparedSourceAdvance.isEmpty && sourceVersionAdvance.isEmpty && refreshPinnedIdentities.isEmpty &&
+          !SparkTimeTravelSql.hasSnapshotPin(meta.querySql) && cdfRebaselineReasons.isEmpty &&
+          cdfChangeBatches.size == 1 && cdfChangeBatches.head.hasBaseline &&
+          meta.sourceTables.head == cdfChangeBatches.head.baseTable &&
+          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).contains(BatchVerdict.Mutating) &&
+          PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head)
+        ) Some("public_cdf_no_write")
+        else None
+
+      if (noWriteOutcome.nonEmpty) {
+        val outcome = noWriteOutcome.get
         enforcePinnedSourceIdentityGate(meta)
         consumeFrozenSourceDeltas()
         propagation.markConsumed(spark, viewNameStr, changeBatches)
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
-            "outcome='noop_fast_exit'"
+            s"outcome='$outcome'"
         )
-        emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
+        emitEnd(outcome, meta.refreshTypeName, changeBatches.size)
         return Seq.empty
       }
 

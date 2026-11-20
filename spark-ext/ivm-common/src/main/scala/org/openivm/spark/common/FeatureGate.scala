@@ -459,6 +459,9 @@ object FeatureGate {
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
 
+  /** Opt in to the bounded, exact public CDF bag proof for owned MV inputs. */
+  val PublicCdfNoWriteEnabledKey: String = "spark.openivm.refresh.publicCdfNoWrite.enabled"
+
   /** Let CREATE MATERIALIZED VIEW accept an incrementally maintained query that contains a random or
     * time-dependent expression (`rand()`, `uuid()`, `current_date()`, …). Default OFF: incremental
     * maintenance evaluates such an expression only for changed rows, so the view diverges from a
@@ -792,6 +795,9 @@ object FeatureGate {
 
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def publicCdfNoWriteEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, PublicCdfNoWriteEnabledKey, default = false)
 
   def allowNonDeterministic(spark: SparkSession): Boolean =
     spark.conf
