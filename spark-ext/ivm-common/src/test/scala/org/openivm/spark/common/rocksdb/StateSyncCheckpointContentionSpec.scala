@@ -20,7 +20,6 @@ import java.util.concurrent.{
   Future,
   TimeUnit
 }
-import scala.collection.JavaConverters._
 
 private[rocksdb] object StateSyncCheckpointContentionSpec {
   final case class RootContext(round: String, scale: Int, index: Int, local: File, remote: File)
@@ -46,6 +45,13 @@ class StateSyncCheckpointContentionSpec extends AnyFunSuite with Matchers {
 
   private def await(latch: CountDownLatch): Unit =
     if (!latch.await(60, TimeUnit.SECONDS)) throw new IllegalStateException("checkpoint trial timed out")
+
+  private def toVector[A](values: java.util.Collection[A]): Vector[A] = {
+    val builder  = Vector.newBuilder[A]
+    val iterator = values.iterator()
+    while (iterator.hasNext) builder += iterator.next()
+    builder.result()
+  }
 
   private def deleteTree(file: File): Unit =
     if (file.exists()) {
@@ -360,8 +366,8 @@ class StateSyncCheckpointContentionSpec extends AnyFunSuite with Matchers {
           retry.outcome shouldBe OpenIvmStateSync.BackupDurablyPublished.toString
           commitFiles(target.remote).size shouldBe mutationBeforeFailure + 1
 
-          val runEvidence = evidence.asScala.toVector.drop(evidenceStart)
-          val runCalls    = calls.asScala.toVector.drop(callStart)
+          val runEvidence = toVector(evidence).drop(evidenceStart)
+          val runCalls    = toVector(calls).drop(callStart)
           runCalls.size shouldBe 2 * scale + 53
           runCalls.filter(_.outcome == "failed") should have size 1
           val runPublications = runEvidence.flatMap(_.publications)
@@ -425,7 +431,7 @@ class StateSyncCheckpointContentionSpec extends AnyFunSuite with Matchers {
         }
       }
 
-      val finalEvents = evidence.asScala.toVector
+      val finalEvents = toVector(evidence)
       val mapper      = new ObjectMapper()
       val root        = mapper.createObjectNode()
       root.put("schema_version", 1)
