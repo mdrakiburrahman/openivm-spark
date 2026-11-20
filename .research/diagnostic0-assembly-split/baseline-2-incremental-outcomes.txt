@@ -1,0 +1,4 @@
+total_ms=4532 refresh_type='SIMPLE_PROJECTION' outcome='incremental_executed' pending_deltas=1
+total_ms=8994 refresh_type='SIMPLE_PROJECTION' outcome='incremental_executed' pending_deltas=4
+total_ms=3105 refresh_type='SIMPLE_PROJECTION' outcome='incremental_executed' pending_deltas=1
+total_ms=7761 refresh_type='SIMPLE_PROJECTION' outcome='incremental_executed' pending_deltas=4

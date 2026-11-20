@@ -1,0 +1,4 @@
+fixture=`asmsp_nested` source_count=4 changed=1 watermark_calls=4 watermark_ns=10960298 projection_calls=4 projection_ns=17641157 views=0 snapshot_read_ns=0 view_register_ns=0 sql_chars=22301 rewrite_and_args_ns=49225040 total_ns=78956105
+fixture=`asmsp_nested` source_count=4 changed=4 watermark_calls=4 watermark_ns=12265608 projection_calls=4 projection_ns=16899048 views=0 snapshot_read_ns=0 view_register_ns=0 sql_chars=31033 rewrite_and_args_ns=49919439 total_ns=79156696
+fixture=`asmsp_nested` source_count=4 changed=1 watermark_calls=4 watermark_ns=9141985 projection_calls=4 projection_ns=18411871 views=0 snapshot_read_ns=0 view_register_ns=0 sql_chars=22301 rewrite_and_args_ns=24033823 total_ns=51661780
+fixture=`asmsp_nested` source_count=4 changed=4 watermark_calls=4 watermark_ns=11010896 projection_calls=4 projection_ns=16061440 views=0 snapshot_read_ns=0 view_register_ns=0 sql_chars=31051 rewrite_and_args_ns=29707858 total_ns=56834594

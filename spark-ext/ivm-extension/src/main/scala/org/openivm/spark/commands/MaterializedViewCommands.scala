@@ -6374,43 +6374,74 @@ case class RefreshMaterializedViewCommand(
             s"compiled_sql_bytes=${compiled.sql.length}"
           ) {
             RefreshPerf.timePhase(refreshId, viewLabel, "rewrite") {
-              val snapshotVersions = sourceSnapshotWatermarks.collect {
+              val probe = sys.env.get("OPENIVM_ASSEMBLY_PROBE").contains("1")
+              val start = System.nanoTime()
+              val watermarks = sourceSnapshotWatermarks
+              val afterWatermarks = System.nanoTime()
+              var projectionNs = 0L
+              var projectionCalls = 0
+              var readNs = 0L
+              var viewNs = 0L
+              var views = 0
+              val snapshotVersions = watermarks.collect {
                 case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
               } ++ sourceSnapshotAdvanceOldVersions
               val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
                 if (
                   !executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source)) &&
-                  MvProjectionSource.isProjection(spark, source)
+                  {
+                    val t0 = System.nanoTime()
+                    val result = MvProjectionSource.isProjection(spark, source)
+                    projectionNs += System.nanoTime() - t0
+                    projectionCalls += 1
+                    result
+                  }
                 ) {
                   val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                  MvProjectionSource
-                    .read(spark, source, Map("versionAsOf" -> version.toString))
-                    .createOrReplaceTempView(tempName)
+                  val t0 = System.nanoTime()
+                  val snapshot = MvProjectionSource.read(spark, source, Map("versionAsOf" -> version.toString))
+                  val t1 = System.nanoTime()
+                  snapshot.createOrReplaceTempView(tempName)
+                  readNs += t1 - t0
+                  viewNs += System.nanoTime() - t1
+                  views += 1
                   sourceSnapshotTempViews += tempName
                   Some(source -> s"`${tempName.replace("`", "``")}`")
                 } else None
               }
-              SparkRefreshRewriter.rewrite(
+              val beforeRewrite = System.nanoTime()
+              val tempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap
+              val sourceSchemasByShort = freshSchemas.map { case (qual, schema) =>
+                qual.split("\\.").last -> schema.fieldNames.toSeq
+              }
+              val pinsByShort = executionSnapshotPinsByQualified.map { case (qual, clause) =>
+                qual.split("\\.").last -> clause
+              }
+              val pathsByShort = MvCommandHelper.pinnedPathByShort(refreshBinding)
+              val versions = watermarks.collect {
+                case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
+              }
+              val windowSingleMerge = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark)
+              val rewriteStart = System.nanoTime()
+              val rewritten = SparkRefreshRewriter.rewrite(
                 compiledSql = compiled.sql,
                 mvName = mergeTargetId,
                 mvLocation = meta.location,
                 viewLogicalName = name.table,
-                sourceTempViews = tempViewShortNames.map(n => n -> s"openivm_delta_$n").toMap,
+                sourceTempViews = tempViews,
                 viewDeltaPath = viewDeltaPath,
                 postProcess = refreshPostProcess,
                 // Pass the user-facing column list for each source so the rewriter can
                 // expand DuckDB-style `SELECT * EXCEPT (openivm_multiplicity, openivm_timestamp)`
                 // into an explicit column list (Spark 3.5 does not support that syntax).
-                sourceSchemas = freshSchemas.map { case (qual, schema) =>
-                  qual.split("\\.").last -> schema.fieldNames.toSeq
-                },
+                sourceSchemas = sourceSchemasByShort,
                 deltaShape = sourceDeltaShape,
                 semiJoinPruneEnabled = FeatureGate.semiJoinPruneEnabled(spark),
                 fkTermPruneEnabled = fkTermPruneEnabled,
                 fkRelations = rewriteConstraintFacts.fkRelations,
                 uniqueKeys = rewriteConstraintFacts.uniqueKeys,
                 uniqueJoinSimplifyEnabled = uniqueJoinSimplifyEnabled,
-                windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark),
+                windowPartitionSingleDeleteMergeEnabled = windowSingleMerge,
                 // Pass the short → qualified source name map so the rewriter can
                 // expand `memory.main.<short>` to the fully-qualified Spark name
                 // when the user's view body referenced a Hive-qualified table.
@@ -6421,22 +6452,31 @@ case class RefreshMaterializedViewCommand(
                 // refresh uses the persisted user pin; source advancement uses
                 // the supplied target pin and passes the old version separately
                 // for old-state CTE reconstruction.
-                sourceSnapshotPins = executionSnapshotPinsByQualified.map { case (qual, clause) =>
-                  qual.split("\\.").last -> clause
-                },
+                sourceSnapshotPins = pinsByShort,
                 // Verified Delta path per pinned source so every emitted pinned
                 // read (new-state AND the ADVANCE old-state union) binds to
                 // `delta.`<verifiedPath>` <clause>` instead of a rebindable alias.
                 // Path is stable across ADVANCE; the clause/old-version above and
                 // sourceSnapshotAdvanceOldVersions below carry the version.
-                sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-                sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
-                  case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
-                },
+                sourceSnapshotPinnedPaths = pathsByShort,
+                sourceSnapshotVersions = versions,
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
                 sourceSnapshotRelations = snapshotRelations
               )
+              val end = System.nanoTime()
+              if (probe) {
+                val lookupCalls = if (cdfChangeBatches.nonEmpty) changeFeedSources.distinct.size else 0
+                val changedKeys = cdfChangeBatches.map(_.baseTable).distinct.size
+                logInfo(
+                  s"[assembly-probe] fixture=$viewLabel source_count=${meta.sourceTables.size} changed=$changedKeys " +
+                    s"watermark_calls=$lookupCalls watermark_ns=${afterWatermarks - start} " +
+                    s"projection_calls=$projectionCalls projection_ns=$projectionNs views=$views " +
+                    s"snapshot_read_ns=$readNs view_register_ns=$viewNs sql_chars=${compiled.sql.length} " +
+                    s"rewrite_args_ns=${rewriteStart - beforeRewrite} rewrite_ns=${end - rewriteStart} total_ns=${end - start}"
+                )
+              }
+              rewritten
             }
           }
           expressionBridge.markers.requireAllSeen()

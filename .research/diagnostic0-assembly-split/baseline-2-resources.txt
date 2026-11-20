@@ -1,0 +1,17 @@
+38f571cc1c4c5d1b14df1cdc6499aa26940f10bd
+ .../spark/commands/MaterializedViewCommands.scala  | 76 +++++++++++++++++-----
+ 1 file changed, 58 insertions(+), 18 deletions(-)
+62177a6a98af4414488466b20a9cc83339083dd604d913d4da4afe4a03723e56  /opt/openivm/duckdb
+2c9619804bb93cc498397f9050114db714726e68859bddd88252c24738fdcd7b  /opt/openivm/openivm.duckdb_extension
+Fri Nov 20 06:49:40 AM UTC 2026
+2.25 1.57 1.18 1/1229 3665759
+    PID STAT     TIME
+ 574332 Sl   00:02:15
+ 574877 Sl   00:15:19
+Fri Nov 20 06:54:28 AM UTC 2026
+2.65 2.13 1.52 1/1225 3675401
+    PID STAT     TIME
+ 574332 Sl   00:02:16
+ 574877 Sl   00:15:20
+[info] Tests: succeeded 6, failed 0, canceled 0, ignored 0, pending 0
+[info] All tests passed.
