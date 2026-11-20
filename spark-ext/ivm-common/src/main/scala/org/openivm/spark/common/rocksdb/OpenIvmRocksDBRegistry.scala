@@ -254,12 +254,14 @@ object OpenIvmRocksDBRegistry {
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
     OpenIvmStateSync.maybeRestore(spark)
-    val guard = if (new java.io.File(dbPath, "CURRENT").isFile) {
-      OpenIvmStateBarrier.withDbOperation(dbPath) _
-    } else {
-      OpenIvmStateBarrier.withDbMutation(dbPath) _
-    }
-    guard { getOrOpenAfterRestore(spark, dbPath, columnFamilies) }
+    if (new java.io.File(dbPath, "CURRENT").isFile)
+      OpenIvmStateBarrier.withDbOperation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
+    else
+      OpenIvmStateBarrier.withDbMutation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
   }
 
   private def getOrOpenAfterRestore(
