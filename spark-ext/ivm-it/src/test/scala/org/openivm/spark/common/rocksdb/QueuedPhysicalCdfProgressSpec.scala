@@ -7,10 +7,12 @@ import org.openivm.spark.common.{
   CdfChangeBatch,
   CdfChangePropagation,
   CdfWatermarkCatalog,
+  ChangeWatermark,
   FeatureGate,
   MvCatalog,
   MvMetadata,
   RefreshProfileCatalog,
+  RefreshSqlLogAsyncFlusher,
   RefreshSqlLogCatalog,
   RefreshTypeCode
 }
@@ -18,9 +20,9 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
 class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-cdf-progress") with CdfMode {
   override protected def extraSparkConf: Map[String, String] = Map(
-    FeatureGate.ProfileRefreshKey -> "true",
-    FeatureGate.QueryLogEnabledKey -> "true",
-    FeatureGate.StateSyncUriKey -> new File(warehouseDir, "state-sync-remote").toURI.toString,
+    FeatureGate.ProfileRefreshKey        -> "true",
+    FeatureGate.QueryLogEnabledKey       -> "true",
+    FeatureGate.StateSyncUriKey          -> new File(warehouseDir, "state-sync-remote").toURI.toString,
     FeatureGate.StateSyncAsyncEnabledKey -> "false"
   )
 
@@ -35,8 +37,12 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
   }
 
   private def cdf(path: String, end: Long): DataFrame =
-    spark.read.format("delta").option("readChangeFeed", "true")
-      .option("startingVersion", 1L).option("endingVersion", end).load(path)
+    spark.read
+      .format("delta")
+      .option("readChangeFeed", "true")
+      .option("startingVersion", 1L)
+      .option("endingVersion", end)
+      .load(path)
 
   private def viewKey(meta: MvMetadata): String =
     meta.name.database.fold(meta.name.table)(db => s"$db.${meta.name.table}")
@@ -44,12 +50,16 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
   private def profile(name: String): (String, Seq[String]) = {
     val totals = RefreshProfileCatalog.scanAll(spark).filter(_.stepName == "total_refresh").map(_.refreshId).toSet
     refreshMv(name)
-    val newTotals = RefreshProfileCatalog.scanAll(spark)
+    RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
+    val newTotals = RefreshProfileCatalog
+      .scanAll(spark)
       .filter(row => row.stepName == "total_refresh" && !totals.contains(row.refreshId))
     newTotals.size shouldBe 1
     val total = newTotals.head
-    val registrations = RefreshSqlLogCatalog.scanAll(spark)
-      .filter(row => row.refreshId == total.refreshId && row.category == "register_source_delta").map(_.sqlText)
+    val registrations = RefreshSqlLogCatalog
+      .scanAll(spark)
+      .filter(row => row.refreshId == total.refreshId && row.category == "register_source_delta")
+      .map(_.sqlText)
     (total.detail, registrations)
   }
 
@@ -59,7 +69,7 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
       val prefix = s"qpc_$backend"
       val targets = Seq("left" -> 3, "right" -> 3, "instance" -> 8).map { case (suffix, n) =>
         val base = s"${prefix}_${suffix}_base"
-        val up = s"${prefix}_${suffix}_agg"
+        val up   = s"${prefix}_${suffix}_agg"
         sql(s"CREATE TABLE $base(k INT, v INT) USING DELTA")
         sql(s"INSERT INTO $base SELECT CAST(id AS INT), CAST(id + 10 AS INT) FROM range($n)")
         sql(s"INSERT INTO $base VALUES (0, 10), (0, NULL)")
@@ -68,10 +78,12 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
         (up, n)
       }
       val Seq(left, right, instance) = targets.map(_._1)
-      val databaseConsumer = s"${prefix}_database_txn"
-      val instanceConsumer = s"${prefix}_instance_txn"
-      sql(s"CREATE MATERIALIZED VIEW $databaseConsumer AS SELECT l.k, SUM(l.total + r.total) AS total " +
-        s"FROM $left l JOIN $right r ON l.k = r.k GROUP BY l.k")
+      val databaseConsumer           = s"${prefix}_database_txn"
+      val instanceConsumer           = s"${prefix}_instance_txn"
+      sql(
+        s"CREATE MATERIALIZED VIEW $databaseConsumer AS SELECT l.k, SUM(l.total + r.total) AS total " +
+          s"FROM $left l JOIN $right r ON l.k = r.k GROUP BY l.k"
+      )
       sql(s"CREATE MATERIALIZED VIEW $instanceConsumer AS SELECT k, SUM(total) AS total FROM $instance GROUP BY k")
       val consumers = Seq(databaseConsumer -> Seq(left, right), instanceConsumer -> Seq(instance)).map {
         case (name, sources) =>
@@ -79,16 +91,17 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
           meta.refreshType should not be RefreshTypeCode.FullRefresh
           val links = meta.sourceTables
           links.map(_.split("\\.").last).toSet shouldBe sources.toSet
-          links.foreach(source => CdfWatermarkCatalog.get(spark, viewKey(meta), source) shouldBe Some(0L))
+          meta.changeWatermarks shouldBe links.map(_ -> ChangeWatermark.DeltaVersion(0L)).toMap
+          links.foreach(source => CdfWatermarkCatalog.get(spark, viewKey(meta), source) shouldBe None)
           (name, meta, links, mvDataVersion(name))
       }
 
       targets.foreach { case (up, n) =>
         withClue(s"$up: ") {
-          val path = mvDataLocation(up)
+          val path     = mvDataLocation(up)
           val physical = s"delta.`$path`"
-          val v0 = spark.read.format("delta").option("versionAsOf", 0L).load(path)
-          val cols = v0.columns.toSeq
+          val v0       = spark.read.format("delta").option("versionAsOf", 0L).load(path)
+          val cols     = v0.columns.toSeq
           cols.exists(_.startsWith("openivm_")) shouldBe true
           v0.count() shouldBe n.toLong
 
@@ -101,20 +114,28 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
 
           // Execute the bounded read only after v2 exists: v2 cannot cancel v1 from outside the range.
           val bounded = cdf(path, 1L)
-          bounded.select("_commit_version", "_change_type").distinct().collect().map(row =>
-            (row.getLong(0), row.getString(1))).toSeq shouldBe Seq(1L -> "delete")
+          bounded
+            .select("_commit_version", "_change_type")
+            .distinct()
+            .collect()
+            .map(row => (row.getLong(0), row.getString(1)))
+            .toSeq shouldBe Seq(1L -> "delete")
           assertBag(bounded.select(cols.head, cols.tail: _*), v0)
           val queued = cdf(path, 2L)
-          queued.select("_commit_version", "_change_type").distinct().collect().map(row =>
-            (row.getLong(0), row.getString(1))).toSet shouldBe Set(1L -> "delete", 2L -> "insert")
-          val deleted = queued.where("_change_type = 'delete'").select(cols.head, cols.tail: _*)
+          queued
+            .select("_commit_version", "_change_type")
+            .distinct()
+            .collect()
+            .map(row => (row.getLong(0), row.getString(1)))
+            .toSet shouldBe Set(1L -> "delete", 2L -> "insert")
+          val deleted  = queued.where("_change_type = 'delete'").select(cols.head, cols.tail: _*)
           val inserted = queued.where("_change_type = 'insert'").select(cols.head, cols.tail: _*)
           assertBag(inserted, deleted)
 
-          val source = consumers.flatMap(_._3).find(_.split("\\.").last == up).get
-          val schema = spark.table(source).schema
+          val source    = consumers.flatMap(_._3).find(_.split("\\.").last == up).get
+          val schema    = spark.table(source).schema
           val deltaView = s"openivm_delta_$up"
-          val rawView = s"_openivm_cdf_raw_$up"
+          val rawView   = s"_openivm_cdf_raw_$up"
           try {
             propagation.registerSourceDeltaView(spark, source, schema, Seq(CdfChangeBatch(source, 0L, 1L)))
             val registered = spark.table(deltaView)
@@ -130,18 +151,22 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
 
       consumers.foreach { case (name, meta, links, originalVersion) =>
         withClue(s"$name queued refresh: ") {
-          propagation.collectChanges(spark, viewKey(meta), links, Map.empty).toSet shouldBe
+          propagation.collectChanges(spark, viewKey(meta), links, meta.changeWatermarks).toSet shouldBe
             links.map(CdfChangeBatch(_, 0L, 2L)).toSet
           val (end, registrations) = profile(name)
-          end should include ("outcome=incremental_executed")
-          end should endWith (s"pending_deltas=${links.size}")
+          end should include("outcome=incremental_executed")
+          end should endWith(s"pending_deltas=${links.size}")
           registrations.size shouldBe links.size
           links.foreach { source =>
-            registrations.count(sqlText => sqlText.contains("startingVersion=1 endingVersion=2") &&
-              sqlText.contains(s"table_changes('$source', 1, 2)")) shouldBe 1
+            registrations.count(sqlText =>
+              sqlText.contains("startingVersion=1 endingVersion=2") &&
+                sqlText.contains(s"table_changes('$source', 1, 2)")
+            ) shouldBe 1
           }
-          assertBag(spark.read.format("delta").load(meta.location),
-            spark.read.format("delta").option("versionAsOf", originalVersion).load(meta.location))
+          assertBag(
+            spark.read.format("delta").load(meta.location),
+            spark.read.format("delta").option("versionAsOf", originalVersion).load(meta.location)
+          )
           assertMvCorrect(name, meta.querySql)
         }
       }
@@ -158,11 +183,11 @@ class QueuedPhysicalCdfProgressSpec extends IvmParitySpecBase("queued-physical-c
       consumers.foreach { case (name, meta, links, _) =>
         withClue(s"$name replay: ") {
           links.foreach(source => CdfWatermarkCatalog.get(spark, viewKey(meta), source) shouldBe Some(2L))
-          propagation.collectChanges(spark, viewKey(meta), links, Map.empty) shouldBe empty
-          val beforeReplay = mvDataVersion(name)
+          propagation.collectChanges(spark, viewKey(meta), links, meta.changeWatermarks) shouldBe empty
+          val beforeReplay         = mvDataVersion(name)
           val (end, registrations) = profile(name)
-          end should include ("outcome=no_pending_deltas")
-          end should endWith ("pending_deltas=0")
+          end should include("outcome=no_pending_deltas")
+          end should endWith("pending_deltas=0")
           registrations shouldBe empty
           mvDataVersion(name) shouldBe beforeReplay
           links.foreach(source => CdfWatermarkCatalog.get(spark, viewKey(meta), source) shouldBe Some(2L))
