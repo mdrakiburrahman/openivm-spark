@@ -384,9 +384,15 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         val second = eligibility(target)
         second.getString(0) shouldBe "eligible"
         second.getString(3) should not be first.getString(3)
+        val replacement = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p17", Some("default"))).get
+        val versionBefore = io.delta.tables.DeltaTable.forPath(spark, replacement.location).history(1).head().getLong(0)
+        sql("INSERT INTO ensure_src_p17 VALUES (2)")
+        assertMvCorrect("ensure_mv_p17", "SELECT id FROM ensure_src_p17 WHERE id = 1")
         val refreshed = guarded(target).head
         refreshed.getString(0) shouldBe "refreshed"
         refreshed.getString(3) shouldBe second.getString(3)
+        io.delta.tables.DeltaTable.forPath(spark, replacement.location).history(1).head().getLong(0) should be > versionBefore
+        assertMvCorrect("ensure_mv_p17", "SELECT id FROM ensure_src_p17")
         eligibility(target).getString(0) shouldBe "eligible"
         sql("DROP MATERIALIZED VIEW default.ensure_mv_p17")
         guarded(target).head.getString(0) shouldBe "absent"
