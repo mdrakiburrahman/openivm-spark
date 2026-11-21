@@ -7245,8 +7245,21 @@ case class RefreshMaterializedViewCommand(
                         s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                           "outcome='window_single_pass_replace'"
                       )
-                      withPlanTimeBroadcastDisabled {
-                        executeSqlAt(plan.directSql, idx)
+                      val unchanged =
+                        !propagation.requiresDmlInterception &&
+                          spark.conf.get("spark.openivm.experimental.windowOutputEqualityProbe", "false") == "true" &&
+                          profile.timeStep("metadata_pre_sql", "phase=window_output_equality_probe") {
+                            withPlanTimeBroadcastDisabled {
+                              plan.predicate.exists(windowReplacementOutputUnchanged(spark, mergeTargetId, _))
+                            }
+                          }
+                      if (unchanged) {
+                        cascadeProducedChanges = false
+                        logSkippedStmt(idx, "window_output_equal_skipped")
+                      } else {
+                        withPlanTimeBroadcastDisabled {
+                          executeSqlAt(plan.directSql, idx)
+                        }
                       }
                   }
                 } else if (skipRedundantCdfWindowCascade) {
@@ -8023,7 +8036,8 @@ case class RefreshMaterializedViewCommand(
 
   private case class WindowSinglePassWrite(
       directSql: String,
-      cascadeSql: String
+      cascadeSql: String,
+      predicate: Option[String] = None
   ) extends WindowSinglePassPlan
 
   private case class WindowDeleteMerge(targetCol: String, sourceCol: String, subquery: String)
@@ -8242,8 +8256,31 @@ case class RefreshMaterializedViewCommand(
           |SELECT $targetColumns
           |FROM delta.`$escapedDeltaPath`
           |WHERE `openivm_multiplicity` > 0""".stripMargin
-    WindowSinglePassWrite(directSql, cascadeSql)
+    WindowSinglePassWrite(directSql, cascadeSql, Some(predicate))
   }
+
+  private def windowReplacementOutputUnchanged(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      predicate: String
+  ): Boolean =
+    try {
+      val target   = spark.table(MvCommandHelper.sqlIdent(targetId))
+      val snapshot = spark.table(quoteCol(s"openivm_new_${name.table}"))
+      val fields   = target.schema.fields.toSeq
+      val names    = fields.map(_.name)
+      fields.nonEmpty &&
+      fields.map(f => f.name -> f.dataType) == snapshot.schema.fields.toSeq.map(f => f.name -> f.dataType) &&
+      fields.forall(f => windowNetChangeGroupingIsLossless(f.dataType)) &&
+      names.forall(n => names.count(_.equalsIgnoreCase(n)) == 1) && {
+        val previous = target.where(predicate)
+        previous.exceptAll(snapshot).union(snapshot.exceptAll(previous)).limit(1).count() == 0L
+      }
+    } catch {
+      case NonFatal(error) =>
+        logWarning("[openivm-mv] Window output equality probe failed; using the conservative refresh path", error)
+        false
+    }
 
   private def buildWindowCascadeMergeShape(
       targetId: TableIdentifier,
