@@ -4220,6 +4220,10 @@ case class RefreshMaterializedViewCommand(
         } else
           OpenIvmStateBarrier.withMutation(spark) {
             if (expectedQueryHash.isDefined) {
+              if (FeatureGate.stateSyncAsyncEnabled(spark))
+                throw new IllegalStateException(
+                  "Guarded refresh requires synchronous state synchronization"
+                )
               val (currentKeys, currentDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
               if (currentKeys != upstreamMvSourceKeys || currentDeps != upstreamMvDeps)
                 throw new IllegalStateException(

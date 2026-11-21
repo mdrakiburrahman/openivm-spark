@@ -23,9 +23,11 @@ The single result row contains `status`, `query_hash`, `target`,
 `target_table_id`, `refresh_id`, and `outcome`. `target` is the input identifier
 rendered with each component backtick-quoted and escaped; it is not resolved to
 a default namespace. One to three identifier components are supported; four or
-more are rejected. The final three fields are null for `absent`. A `refreshed` result follows the configured state-sync behavior:
-asynchronous mode does not imply remote publication has completed. Older JARs
-do not advertise the capability and clients must retain their normal fallback.
+more are rejected. The final three fields are null for `absent`. A guarded
+refresh of a registered MV requires `spark.openivm.stateSync.async.enabled=false`
+and fails before writing otherwise. When a state-sync URI is configured, a
+`refreshed` result follows synchronous publication. Older JARs do not advertise
+the capability and clients must retain their normal fallback.
 
 ## Crash-safe state-sync snapshots
 

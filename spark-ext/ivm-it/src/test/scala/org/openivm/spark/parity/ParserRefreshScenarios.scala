@@ -4,6 +4,7 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{MvCatalog, MvMetadata}
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 
 /** Slice of `ParserSpec` covering REFRESH idempotency, INSERT+DELETE-in-the-
   * same-window net-zero deltas, DROP+recreate with a different body, and
@@ -160,42 +161,82 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         s"CREATE MATERIALIZED VIEW default.ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15"
       )
       sql("INSERT INTO ensure_src_p15 VALUES (2)")
-      intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
-      spark.table("ensure_mv_p15").count() shouldBe 1L
-      val proof = guarded(target).head
-      proof.getString(0) shouldBe "refreshed"
-      proof.getString(1) shouldBe hash
-      proof.getString(2) shouldBe target
-      (3 to 5).foreach(i => proof.getString(i) should not be empty)
-      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
-      val meta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
-      val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
-      sql("INSERT INTO ensure_src_p15 VALUES (3)")
+      val originalAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "true")
+      val asyncFailure = intercept[Exception](guarded(target))
+      Iterator
+        .iterate[Throwable](asyncFailure)(_.getCause)
+        .takeWhile(_ != null)
+        .exists(e =>
+          Option(e.getMessage).exists(_.contains("requires synchronous state synchronization"))
+        ) shouldBe true
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id = 1")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
       try {
-        val identityKey = MvMetadata.TargetDeltaTableIdKey
-        MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+        intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
+        spark.table("ensure_mv_p15").count() shouldBe 1L
+        val proof = guarded(target).head
+        proof.getString(0) shouldBe "refreshed"
+        proof.getString(1) shouldBe hash
+        proof.getString(2) shouldBe target
+        (3 to 5).foreach(i => proof.getString(i) should not be empty)
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        val meta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        sql("INSERT INTO ensure_src_p15 VALUES (3)")
+        try {
+          val identityKey = MvMetadata.TargetDeltaTableIdKey
+          MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+          intercept[Exception](guarded(target))
+          MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
+          intercept[Exception](guarded(target))
+        } finally {
+          MvCatalog.upsert(spark, meta)
+        }
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+        sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
+        val changedPropertyVersion =
+          io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
         intercept[Exception](guarded(target))
-        MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
-        intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable
+          .forPath(spark, meta.location)
+          .history(1)
+          .head()
+          .getLong(0) shouldBe changedPropertyVersion
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+        sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = '$hash')")
+        sql("REFRESH MATERIALIZED VIEW default.ensure_mv_p15")
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        sql("INSERT INTO ensure_src_p15 VALUES (4)")
+        var attempts = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-v2-backup-failure"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          attempts += 1
+          throw new java.io.IOException("guarded backup failure")
+        }
+        try {
+          val failure = intercept[Exception](guarded(target))
+          Iterator
+            .iterate[Throwable](failure)(_.getCause)
+            .takeWhile(_ != null)
+            .exists(_.getMessage == "guarded backup failure") shouldBe true
+          attempts shouldBe 1
+        } finally {
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        val finalVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
         MvCatalog.remove(spark, meta.name)
         intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe finalVersion
       } finally {
-        MvCatalog.upsert(spark, meta)
+        originalAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
       }
-      io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
-      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
-      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
-      val changedPropertyVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
-      intercept[Exception](guarded(target))
-      io.delta.tables.DeltaTable
-        .forPath(spark, meta.location)
-        .history(1)
-        .head()
-        .getLong(0) shouldBe changedPropertyVersion
-      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
-      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = '$hash')")
-      sql("REFRESH MATERIALIZED VIEW default.ensure_mv_p15")
-      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
     }
   }
 }
