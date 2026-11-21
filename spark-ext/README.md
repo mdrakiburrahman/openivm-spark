@@ -46,6 +46,27 @@ generations are pruned according to the configured retention. Archives are bound
 100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
 rejected.
 
+The opt-in synchronous checkpoint canary is disabled by default:
+`spark.openivm.stateSync.checkpoint.enabled=true`. It reuses only a committed V2
+archive whose captured mutation generation covers the new request. Eligibility
+requires an explicit local `spark.openivm.statePath` disjoint from the Spark
+warehouse, single-process RocksDB, no telemetry file sinks, and a destination URI
+not observed with a second local state root in this driver. Any unresolved/shared
+configuration takes a fresh synchronous capture on every request; it never reuses
+an in-flight pass or cached archive. Opt-in receipts bind acknowledgements to the
+committed generation, captured/requested mutation generations, archive SHA256 and
+byte count. Async backups retain their existing behavior and invalidate synchronous
+reuse proof. The URI must still have a single writer
+across JVMs: another process using the same destination cannot be detected by the
+in-process root check. This opt-in changes neither the V2 archive nor restore format.
+
+`spark.openivm.stateSync.parallelCapture.enabled=true` is a separate, default-off
+option for single-process RocksDB. It checkpoints independent shards on at most
+four workers while the publisher holds the same root capture barrier. Shard
+handles retain their existing locks, and the publisher joins all workers before
+packing or releasing the barrier, including after errors. Multi-process mode
+continues to capture serially. Publication, acknowledgement and restore are unchanged.
+
 ## Cross-thread query-hash annotations
 
 When an event callback began capture on a different Java thread, append

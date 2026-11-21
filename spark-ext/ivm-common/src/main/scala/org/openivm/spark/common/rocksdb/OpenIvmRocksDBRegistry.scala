@@ -254,9 +254,14 @@ object OpenIvmRocksDBRegistry {
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
     OpenIvmStateSync.maybeRestore(spark)
-    OpenIvmStateBarrier.withDbOperation(dbPath) {
-      getOrOpenAfterRestore(spark, dbPath, columnFamilies)
-    }
+    if (new java.io.File(dbPath, "CURRENT").isFile)
+      OpenIvmStateBarrier.withDbOperation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
+    else
+      OpenIvmStateBarrier.withDbMutation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
   }
 
   private def getOrOpenAfterRestore(
@@ -351,7 +356,7 @@ object OpenIvmRocksDBRegistry {
     * per-slot; other paths are never blocked.
     */
   def closeAndDelete(dbPath: String)(delete: String => Unit): Unit =
-    OpenIvmStateBarrier.withDbOperation(dbPath) {
+    OpenIvmStateBarrier.withDbMutation(dbPath) {
       closeAndDeleteUnderBarrier(dbPath)(delete)
     }
 

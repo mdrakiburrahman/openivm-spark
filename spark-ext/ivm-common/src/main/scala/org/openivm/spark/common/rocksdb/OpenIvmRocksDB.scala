@@ -779,8 +779,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * threads serialise; the external lock then mutexes other JVMs.
     */
   private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A =
-    OpenIvmStateBarrier.withDbOperation(normalizedDbPath) {
-      withNativeHandleUnderBarrier(operation)(body)
+    operation match {
+      case "with_batch" | "compact_range" =>
+        OpenIvmStateBarrier.withDbMutation(normalizedDbPath) { withNativeHandleUnderBarrier(operation)(body) }
+      case _ => OpenIvmStateBarrier.withDbOperation(normalizedDbPath) { withNativeHandleUnderBarrier(operation)(body) }
     }
 
   private def withNativeHandleUnderBarrier[A](operation: String)(body: => A): A = {
@@ -1092,16 +1094,18 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     versionValue
   }
 
-  def cleanup(minVersionsToRetain: Int): Unit = withWriteLock {
-    if (closed) return
-    require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
-    def body(): Unit = {
-      val threshold = readCurrentVersion() - minVersionsToRetain
-      manifestVersions.filter(_ < threshold).foreach { version =>
-        Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+  def cleanup(minVersionsToRetain: Int): Unit = OpenIvmStateBarrier.withDbMutation(normalizedDbPath) {
+    withWriteLock {
+      if (closed) return
+      require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
+      def body(): Unit = {
+        val threshold = readCurrentVersion() - minVersionsToRetain
+        manifestVersions.filter(_ < threshold).foreach { version =>
+          Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+        }
       }
+      if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
     }
-    if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
   }
 
   def compactRange(): Unit = withNativeHandle("compact_range") {
