@@ -6993,6 +6993,16 @@ case class RefreshMaterializedViewCommand(
                 ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
                 else None
               val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
+              val groupCdfCompanionIdx =
+                if (
+                  FeatureGate.groupCdfCompanionSkipEnabled(spark) &&
+                  meta.refreshType == RefreshTypeCode.GroupRecompute &&
+                  propagation.requiresMvCdf && !propagation.requiresDmlInterception &&
+                  preparedSourceAdvance.isEmpty && refreshResolvedPins.isEmpty &&
+                  cdfChangeBatches.size == changeBatches.size && !diagnosticsEnabled
+                )
+                  groupCdfUnusedCompanionIdx(mergeTargetId, rewrittenSql, viewDeltaPath)
+                else None
               val windowCascadeMergeShape: Option[WindowCascadeMergeShape] =
                 if (
                   FeatureGate.windowCascadeMergeEnabled(spark) &&
@@ -7162,6 +7172,9 @@ case class RefreshMaterializedViewCommand(
 
                 if (skipCdfWindowRefresh) {
                   logSkippedStmt(idx, "window_cdf_net_zero_skipped")
+                } else if (groupCdfCompanionIdx.contains(idx)) {
+                  RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='group_target_cdf_cascade_skip'")
+                  logSkippedStmt(idx, "group_target_cdf_cascade_skipped")
                 } else if (materializeWindowAffectedKeys) {
                   executeSqlAt(refinedWindowAffectedSql.getOrElse(sql), idx)
                   val shape = windowCascadeMergeShape.get
@@ -8907,6 +8920,44 @@ case class RefreshMaterializedViewCommand(
     upper.startsWith(s"MERGE INTO ${MvCommandHelper.sqlIdent(targetId).toUpperCase(java.util.Locale.ROOT)} AS ") &&
     (upper.contains("OPENIVM_DELTA_") || upper.contains(s"OPENIVM_AFFECTED_$view")) &&
     parseWindowDeleteMerge(sql).isDefined
+  }
+
+  private def groupCdfUnusedCompanionIdx(
+      targetId: TableIdentifier,
+      statements: Seq[String],
+      viewDeltaPath: String
+  ): Option[Int] = {
+    if (statements.size != 9) return None
+    val target = java.util.regex.Pattern.quote(MvCommandHelper.sqlIdent(targetId))
+    def identifier(s: String): String =
+      "(?:`" + java.util.regex.Pattern.quote(s) + "`|" + java.util.regex.Pattern.quote(s) + ")"
+    val affected = identifier(s"openivm_affected_${name.table}")
+    val old      = identifier(s"openivm_old_${name.table}")
+    val fresh    = identifier(s"openivm_new_${name.table}")
+    def matches(sql: String, regex: String): Boolean =
+      ("(?is)^\\s*" + regex + "\\s*;?\\s*$").r.pattern.matcher(sql).matches()
+    def create(idx: Int, ident: String): Boolean =
+      matches(statements(idx), "CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+" + ident + "\\s+AS\\s+.+")
+    def drop(idx: Int, ident: String): Boolean =
+      matches(statements(idx), "DROP\\s+VIEW\\s+IF\\s+EXISTS\\s+" + ident)
+    val delete = "MERGE\\s+INTO\\s+" + target + "\\s+AS\\s+v\\s+USING\\s+" +
+      affected + "\\s+AS\\s+d\\s+ON\\s+.+\\s+WHEN\\s+MATCHED\\s+THEN\\s+DELETE"
+    val insert = "INSERT\\s+INTO\\s+" + target + "\\s+SELECT\\s+\\*\\s+FROM\\s+" + fresh
+    val signed = "SELECT\\s+\\*\\s*,\\s*CAST\\s*\\(\\s*-1\\s+AS\\s+INTEGER\\s*\\)" +
+      "\\s+AS\\s+openivm_multiplicity\\s*,\\s*CURRENT_TIMESTAMP\\s+AS\\s+openivm_timestamp\\s+FROM\\s+" +
+      old + "\\s+UNION\\s+ALL\\s+SELECT\\s+\\*\\s*,\\s*CAST\\s*\\(\\s*1\\s+AS\\s+INTEGER\\s*\\)" +
+      "\\s+AS\\s+openivm_multiplicity\\s*,\\s*CURRENT_TIMESTAMP\\s+AS\\s+openivm_timestamp\\s+FROM\\s+" + fresh
+    val body = SparkRefreshRewriter.extractViewDeltaCtasBody(statements(5), viewDeltaPath)
+    val otherUses = statements.zipWithIndex.exists { case (sql, idx) =>
+      idx != 5 && (sql.contains(viewDeltaPath) || sql.contains("/_ivm/view_deltas/"))
+    }
+    if (
+      create(0, affected) && create(1, old) && create(2, fresh) &&
+      matches(statements(3), delete) && matches(statements(4), insert) &&
+      body.exists(matches(_, signed)) && !otherUses &&
+      drop(6, affected) && drop(7, old) && drop(8, fresh)
+    ) Some(5)
+    else None
   }
 
   private def isRawWindowSnapshotCtas(

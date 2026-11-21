@@ -422,6 +422,8 @@ object FeatureGate {
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
+  val GroupCdfCompanionSkipEnabledKey: String = "spark.openivm.refresh.groupCdfCompanionSkip.enabled"
+
   /** Reuse a materialized affected-partition key set plus the persisted signed
     * WINDOW_PARTITION cascade for target DELETE+INSERT when the literal-key
     * `REPLACE WHERE` path is unavailable. Default ON; flip OFF to disable key
@@ -762,6 +764,12 @@ object FeatureGate {
 
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
+
+  def groupCdfCompanionSkipEnabled(conf: SparkConf): Boolean =
+    boolConf(conf, GroupCdfCompanionSkipEnabledKey, default = false)
+
+  def groupCdfCompanionSkipEnabled(spark: SparkSession): Boolean =
+    groupCdfCompanionSkipEnabled(spark.sparkContext.getConf)
 
   def windowCascadeMergeEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowCascadeMergeEnabledKey, default = true)
