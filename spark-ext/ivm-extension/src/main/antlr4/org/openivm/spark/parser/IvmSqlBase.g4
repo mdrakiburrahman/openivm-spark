@@ -77,6 +77,7 @@ ivmStatement
       | refreshMaterializedView
       | advanceMaterializedViewSourceVersions
       | dropMaterializedView
+      | showOpenivmRefreshEligibility
       | showOpenivmRefreshProfile
       | showOpenivmQueryLog
       | beginOpenivmInsightsRequest
@@ -133,6 +134,10 @@ sourceVersionEntry
 
 dropMaterializedView
     : DROP MATERIALIZED VIEW (IF EXISTS)? multipartIdentifier
+    ;
+
+showOpenivmRefreshEligibility
+    : SHOW OPENIVM REFRESH ELIGIBILITY multipartIdentifier EXPECT QUERY HASH expectedQueryHash=STRING
     ;
 
 showOpenivmRefreshProfile
@@ -237,6 +242,7 @@ nonReserved
     | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP | LIKE
     | INSIGHTS | BEGIN | REQUEST | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
     | MATERIALIZATION | TARGET | ERROR_CLASS | ERROR_CODE | ANNOTATE | HASH | OLD | NEW | POLICY | DECISION | REASON
+    | ELIGIBILITY
     ;
 
 CREATE        : [Cc][Rr][Ee][Aa][Tt][Ee];
@@ -262,6 +268,7 @@ OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
 PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
 QUERY         : [Qq][Uu][Ee][Rr][Yy];
 EXPECT        : [Ee][Xx][Pp][Ee][Cc][Tt];
+ELIGIBILITY   : [Ee][Ll][Ii][Gg][Ii][Bb][Ii][Ll][Ii][Tt][Yy];
 LOG           : [Ll][Oo][Gg];
 EXPLAIN       : [Ee][Xx][Pp][Ll][Aa][Ii][Nn];
 CLUSTER       : [Cc][Ll][Uu][Ss][Tt][Ee][Rr];

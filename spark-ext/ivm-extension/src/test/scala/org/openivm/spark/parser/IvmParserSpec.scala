@@ -21,6 +21,7 @@ import org.openivm.spark.commands.ReleaseOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowOpenIvmInsightsCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
+import org.openivm.spark.commands.ShowRefreshEligibilityCommand
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -342,6 +343,23 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   // Test 3 — REFRESH MATERIALIZED VIEW
   // ---------------------------------------------------------------------------
   describe("REFRESH MATERIALIZED VIEW") {
+    it("parses eligibility with canonical hash and rejects malformed inputs") {
+      val prefix = "SHOW OPENIVM REFRESH ELIGIBILITY "
+      val suffix = " EXPECT QUERY HASH '0123456789ABCDEFabcdef0123456789'"
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(prefix + "`Lakehouse`.`dbo`.`mv`" + suffix)
+        .asInstanceOf[ShowRefreshEligibilityCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("dbo"), Some("Lakehouse"))
+      cmd.expectedQueryHash shouldBe "0123456789abcdefabcdef0123456789"
+      cmd.output.map(_.name) shouldBe Seq("status", "query_hash", "target", "target_table_id", "reason")
+      Seq(
+        prefix + "`a`.`b`.`c`.`d`" + suffix,
+        prefix + "mv EXPECT QUERY HASH 'bad'",
+        prefix + "mv EXPECT QUERY HASH 0123456789abcdef0123456789abcdef",
+        prefix + "mv EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' EXTRA"
+      ).foreach(sqlText => intercept[ParseException](spark.sessionState.sqlParser.parsePlan(sqlText)))
+    }
+
     it("parses to RefreshMaterializedViewCommand") {
       val plan = spark.sessionState.sqlParser.parsePlan("REFRESH MATERIALIZED VIEW v")
       plan shouldBe a[RefreshMaterializedViewCommand]

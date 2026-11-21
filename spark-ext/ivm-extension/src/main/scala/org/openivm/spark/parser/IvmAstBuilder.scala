@@ -15,6 +15,7 @@ import org.openivm.spark.commands.RefreshMaterializedViewCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowQueryLogCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
+import org.openivm.spark.commands.ShowRefreshEligibilityCommand
 import org.openivm.spark.commands.ShowStreamingTablesCommand
 import org.openivm.spark.commands.StopStreamingTableCommand
 import org.openivm.spark.commands.BeginOpenIvmInsightsRequestCommand
@@ -76,18 +77,26 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
   override def visitRefreshMaterializedView(
       ctx: IvmSqlBaseParser.RefreshMaterializedViewContext
   ): AnyRef = {
-    val expectedQueryHash = Option(ctx.expectedQueryHash).map { token =>
-      val literal = token.getText
-      if (!literal.matches("'[0-9a-fA-F]{32}'")) {
-        parseError("expected query hash must be exactly 32 hexadecimal characters")
-      }
-      literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
-    }
+    val expectedQueryHash = Option(ctx.expectedQueryHash).map(token => parseExpectedQueryHash(token.getText))
     RefreshMaterializedViewCommand(
       toTableIdentifier(ctx.multipartIdentifier()),
       expectedQueryHash = expectedQueryHash
     )
   }
+
+  private def parseExpectedQueryHash(literal: String): String = {
+    if (!literal.matches("'[0-9a-fA-F]{32}'"))
+      parseError("expected query hash must be exactly 32 hexadecimal characters")
+    literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
+  }
+
+  override def visitShowOpenivmRefreshEligibility(
+      ctx: IvmSqlBaseParser.ShowOpenivmRefreshEligibilityContext
+  ): AnyRef =
+    ShowRefreshEligibilityCommand(
+      toTableIdentifier(ctx.multipartIdentifier()),
+      parseExpectedQueryHash(ctx.expectedQueryHash.getText)
+    )
 
   override def visitAdvanceMaterializedViewSourceVersions(
       ctx: IvmSqlBaseParser.AdvanceMaterializedViewSourceVersionsContext

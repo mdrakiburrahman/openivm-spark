@@ -29,6 +29,22 @@ and fails before writing otherwise. When a state-sync URI is configured, a
 `refreshed` result follows synchronous publication. Older JARs do not advertise
 the capability and clients must retain their normal fallback.
 
+The loaded engine also advertises `ensure_refresh_eligibility_v1`. Before a
+strict guard, clients may run:
+
+```sql
+SHOW OPENIVM REFRESH ELIGIBILITY db.view EXPECT QUERY HASH '0123456789abcdef0123456789abcdef'
+```
+
+The single row contains `status`, `query_hash`, `target`, `target_table_id`,
+and `reason`. `eligible` has a verified physical ID and null reason;
+`lifecycle_required` has a null ID and one of `registration_missing`,
+`legacy_identity_missing`, `query_hash_policy`, `public_relation_missing`,
+or `async_unsupported`. The command does not refresh or publish state. Unsafe
+ownership, mismatched physical identity, and validation failures are errors.
+Eligibility is not a refresh result: a later strict guard revalidates and any
+subsequent failure must not trigger fallback.
+
 ## Crash-safe state-sync snapshots
 
 Synchronous backups retain per-namespace request barriers: only requests captured

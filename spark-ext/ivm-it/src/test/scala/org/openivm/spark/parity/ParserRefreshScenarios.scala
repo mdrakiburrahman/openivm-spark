@@ -135,10 +135,21 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
     val hash = "0123456789abcdef0123456789abcdef"
     def guarded(target: String, expected: String = hash) =
       sql(s"REFRESH MATERIALIZED VIEW $target EXPECT QUERY HASH '$expected' IF EXISTS").collect()
+    def eligibility(target: String, expected: String = hash) =
+      sql(s"SHOW OPENIVM REFRESH ELIGIBILITY $target EXPECT QUERY HASH '$expected'").collect().head
+    def decline(target: String, reason: String, expected: String = hash): Unit = {
+      val row = eligibility(target, expected)
+      row.getString(0) shouldBe "lifecycle_required"
+      row.getString(1) shouldBe expected
+      row.getString(2) shouldBe target
+      row.isNullAt(3) shouldBe true
+      row.getString(4) shouldBe reason
+    }
 
     it("reports only truly absent names as absent") {
       val capability = sql("SET spark.openivm.capabilities").collect().head
       capability.getString(1) should include("ensure_refresh_v2")
+      capability.getString(1) should include("ensure_refresh_eligibility_v1")
       spark.conf.set("spark.openivm.enabled", "false")
       try {
         sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v2")
@@ -150,6 +161,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       (3 to 5).foreach(i => absent.isNullAt(i) shouldBe true)
       sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
       intercept[Exception](guarded("ensure_unmanaged_p14"))
+      decline("`ensure_unmanaged_p14`", "registration_missing")
     }
 
     it("validates the live definition before writing and returns refresh proof") {
@@ -163,6 +175,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       sql("INSERT INTO ensure_src_p15 VALUES (2)")
       val originalAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
       spark.conf.set("spark.openivm.stateSync.async.enabled", "true")
+      decline(target, "async_unsupported")
       val asyncFailure = intercept[Exception](guarded(target))
       Iterator
         .iterate[Throwable](asyncFailure)(_.getCause)
@@ -173,6 +186,30 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id = 1")
       spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
       try {
+        val beforeMeta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        val beforeVersion = io.delta.tables.DeltaTable.forPath(spark, beforeMeta.location).history(1).head().getLong(0)
+        var probeBackups  = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-v2-probe-backup"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => probeBackups += 1 }
+        try {
+          val result = eligibility(target)
+          result.getString(0) shouldBe "eligible"
+          result.getString(1) shouldBe hash
+          result.getString(2) shouldBe target
+          result.getString(3) should not be empty
+          result.isNullAt(4) shouldBe true
+          decline(target, "query_hash_policy", "ffffffffffffffffffffffffffffffff")
+          probeBackups shouldBe 0
+        } finally {
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get shouldBe beforeMeta
+        io.delta.tables.DeltaTable
+          .forPath(spark, beforeMeta.location)
+          .history(1)
+          .head()
+          .getLong(0) shouldBe beforeVersion
         intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
         spark.table("ensure_mv_p15").count() shouldBe 1L
         val proof = guarded(target).head
@@ -187,8 +224,10 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         try {
           val identityKey = MvMetadata.TargetDeltaTableIdKey
           MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+          decline(target, "legacy_identity_missing")
           intercept[Exception](guarded(target))
           MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
+          intercept[Exception](eligibility(target))
           intercept[Exception](guarded(target))
         } finally {
           MvCatalog.upsert(spark, meta)
@@ -198,6 +237,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
         val changedPropertyVersion =
           io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        decline(target, "query_hash_policy")
         intercept[Exception](guarded(target))
         io.delta.tables.DeltaTable
           .forPath(spark, meta.location)
@@ -229,12 +269,49 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
         val finalVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
         MvCatalog.remove(spark, meta.name)
+        decline(target, "registration_missing")
         intercept[Exception](guarded(target))
         io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe finalVersion
       } finally {
         originalAsync match {
           case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
           case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+
+      it("only routes a missing public view when its backing identity is intact") {
+        val key      = "dbt.fabricspark.materialized_view.query_hash"
+        val target   = "`spark_catalog`.`default`.`ensure_mv_p16`"
+        val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+        spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+        try {
+          sql("CREATE TABLE ensure_src_p16 (grp INT, val INT) USING DELTA")
+          sql("INSERT INTO ensure_src_p16 VALUES (1, 2)")
+          sql(
+            s"CREATE MATERIALIZED VIEW default.ensure_mv_p16 TBLPROPERTIES ('$key' = '$hash') AS " +
+              "SELECT grp, SUM(val) AS total FROM ensure_src_p16 GROUP BY grp HAVING SUM(val) > 0"
+          )
+          val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p16", Some("default"))).get
+          meta.usesBackingDataTable shouldBe true
+          val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+          eligibility(target).getString(0) shouldBe "eligible"
+          sql("DROP VIEW default.ensure_mv_p16")
+          decline(target, "public_relation_missing")
+          MvCatalog.upsert(
+            spark,
+            meta.copy(properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> "foreign"))
+          )
+          intercept[Exception](eligibility(target))
+          MvCatalog.upsert(spark, meta)
+          sql("CREATE VIEW default.ensure_mv_p16 AS SELECT grp, CAST(val AS BIGINT) AS total FROM ensure_src_p16")
+          intercept[Exception](eligibility(target))
+          intercept[Exception](guarded(target))
+          io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+        } finally {
+          oldAsync match {
+            case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+            case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+          }
         }
       }
     }

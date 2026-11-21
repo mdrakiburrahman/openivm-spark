@@ -51,8 +51,9 @@ class StreamingFeatureGateSpec extends AnyFunSpec with Matchers with BeforeAndAf
   }
 
   it("does not advertise guarded refresh when the loaded master gate is disabled") {
-    spark.conf.set("spark.openivm.capabilities", "ensure_refresh_v2")
+    spark.conf.set("spark.openivm.capabilities", "ensure_refresh_v2,ensure_refresh_eligibility_v1")
     val result = spark.sql("SET spark.openivm.capabilities").collect().head
     result.getString(1) should not include "ensure_refresh_v2"
+    result.getString(1) should not include "ensure_refresh_eligibility_v1"
   }
 }
