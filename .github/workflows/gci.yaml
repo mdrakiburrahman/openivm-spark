@@ -40,6 +40,11 @@ jobs:
       - name: Install locked tooling from the warmed cache
         run: npm ci --prefer-offline --no-audit --no-fund
 
+      - name: Show formatting changes
+        run: |
+          npx --no-install nx run spark-ext:fmt --configuration=${{ matrix.target }}
+          git --no-pager diff -- spark-ext
+
       - name: Verify
         run: >-
           npx --no-install nx run spark-ext:verify
