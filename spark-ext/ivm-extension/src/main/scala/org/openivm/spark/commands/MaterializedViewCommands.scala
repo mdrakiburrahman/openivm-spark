@@ -4217,32 +4217,35 @@ case class RefreshMaterializedViewCommand(
             throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
           absent = true
           Seq(Row("absent", expectedQueryHash.get, sqlIdent(name), null, null, null))
-        } else OpenIvmStateBarrier.withMutation(spark) {
-          if (expectedQueryHash.isDefined) {
-            val (currentKeys, currentDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
-            if (currentKeys != upstreamMvSourceKeys || currentDeps != upstreamMvDeps)
-              throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} dependencies changed while acquiring locks")
-            OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
-          }
-          // Under the acquired upstream locks, re-verify each upstream MV still has
-          // the exact physical Delta identity the map recorded at CREATE; a rebind,
-          // vanished upstream, or catalog read failure fails the refresh closed.
-          validateUpstreamMvDependenciesUnderLock(spark, name, upstreamMvDeps)
-          val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
-          OpenIvmMetrics.RefreshInflight.incrementAndGet()
-          try {
-            DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
-              org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-                runUnderLock(
-                  cloned,
-                  lockAcqMs,
-                  id => targetTableId = Some(id),
-                  (id, outcome) => completedRefresh = Some(id -> outcome)
+        } else
+          OpenIvmStateBarrier.withMutation(spark) {
+            if (expectedQueryHash.isDefined) {
+              val (currentKeys, currentDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
+              if (currentKeys != upstreamMvSourceKeys || currentDeps != upstreamMvDeps)
+                throw new IllegalStateException(
+                  s"Materialized view ${sqlIdent(name)} dependencies changed while acquiring locks"
                 )
-              }
+              OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
             }
-          } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
-        }
+            // Under the acquired upstream locks, re-verify each upstream MV still has
+            // the exact physical Delta identity the map recorded at CREATE; a rebind,
+            // vanished upstream, or catalog read failure fails the refresh closed.
+            validateUpstreamMvDependenciesUnderLock(spark, name, upstreamMvDeps)
+            val lockAcqMs = (System.nanoTime() - lockT0) / 1000000L
+            OpenIvmMetrics.RefreshInflight.incrementAndGet()
+            try {
+              DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
+                org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
+                  runUnderLock(
+                    cloned,
+                    lockAcqMs,
+                    id => targetTableId = Some(id),
+                    (id, outcome) => completedRefresh = Some(id -> outcome)
+                  )
+                }
+              }
+            } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
+          }
       }
       if (absent) {
         commandCompleted = true
@@ -4815,11 +4818,13 @@ case class RefreshMaterializedViewCommand(
             throw new IllegalStateException(
               s"Materialized view ${sqlIdent(name)} is not the registered live target: ${ownership.reason}"
             )
-          val key = "dbt.fabricspark.materialized_view.query_hash"
+          val key  = "dbt.fabricspark.materialized_view.query_hash"
           val rows = spark.sql(s"SHOW TBLPROPERTIES ${sqlIdent(name)} ('$key')").collect()
           val liveHash =
-            if (rows.length == 1 && rows.head.length == 2 && !rows.head.isNullAt(0) &&
-                rows.head.getString(0) == key && !rows.head.isNullAt(1)) Some(rows.head.getString(1))
+            if (
+              rows.length == 1 && rows.head.length == 2 && !rows.head.isNullAt(0) &&
+              rows.head.getString(0) == key && !rows.head.isNullAt(1)
+            ) Some(rows.head.getString(1))
             else None
           if (!loadedMeta.properties.get(key).contains(hash) || !liveHash.contains(hash))
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} query hash mismatch")

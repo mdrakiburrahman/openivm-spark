@@ -152,11 +152,13 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
     }
 
     it("validates the live definition before writing and returns refresh proof") {
-      val key = "dbt.fabricspark.materialized_view.query_hash"
+      val key    = "dbt.fabricspark.materialized_view.query_hash"
       val target = "`spark_catalog`.`default`.`ensure_mv_p15`"
       sql("CREATE TABLE ensure_src_p15 (id INT) USING DELTA")
       sql("INSERT INTO ensure_src_p15 VALUES (1)")
-      sql(s"CREATE MATERIALIZED VIEW default.ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15")
+      sql(
+        s"CREATE MATERIALIZED VIEW default.ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15"
+      )
       sql("INSERT INTO ensure_src_p15 VALUES (2)")
       intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
       spark.table("ensure_mv_p15").count() shouldBe 1L
@@ -166,7 +168,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       proof.getString(2) shouldBe target
       (3 to 5).foreach(i => proof.getString(i) should not be empty)
       assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
-      val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+      val meta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
       val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
       sql("INSERT INTO ensure_src_p15 VALUES (3)")
       try {
@@ -185,7 +187,11 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
       val changedPropertyVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
       intercept[Exception](guarded(target))
-      io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe changedPropertyVersion
+      io.delta.tables.DeltaTable
+        .forPath(spark, meta.location)
+        .history(1)
+        .head()
+        .getLong(0) shouldBe changedPropertyVersion
       assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
       sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = '$hash')")
       sql("REFRESH MATERIALIZED VIEW default.ensure_mv_p15")
