@@ -283,8 +283,9 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
     }
 
     it("does not create a missing Delta catalog and rejects an invalid catalog") {
-      val root = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")), "eligibility_catalog")
-      val metadata = new java.io.File(root, "mv_metadata")
+      val warehouse = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")))
+      val root      = new java.io.File(warehouse, "eligibility_catalog")
+      val metadata  = new java.io.File(root, "mv_metadata")
       metadata.exists() shouldBe false
       val oldBackend = spark.conf.getOption("spark.openivm.catalog.backend")
       val oldPath    = spark.conf.getOption("spark.openivm.catalog.path")
