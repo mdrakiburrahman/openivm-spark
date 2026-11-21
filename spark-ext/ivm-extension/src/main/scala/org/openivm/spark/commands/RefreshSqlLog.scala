@@ -57,10 +57,12 @@ final class RefreshSqlLog private (
     *                   `register_source_delta`,
     *                   `rewritten_stmt`, `count_monoid_cleanup`,
     *                   `post_cleanup_stage`, `drop_cleanup`,
-    *                   `full_refresh_stmt`, `fused_view_delta_select`).
+    *                   `full_refresh_stmt`, `fused_view_delta_select`,
+    *                   `compiler_program_native`, `compiler_program_normalized`).
     * @param stmtOrder  monotonic position in the lifecycle (0-based). -1 for
     *                   the `original_query` event (which is not executed by
-    *                   us — it's the user's CREATE-MV body text).
+    *                   us — it's the user's CREATE-MV body text); -2 for
+    *                   compiler program evidence, which is not an action.
     * @param attemptIdx 0 for first attempt; 1+ for Delta-OCC retries.
     * @param stmtKind   classifier (`merge`, `insert_into`, `view_delta_ctas`,
     *                   `ctas`, `temp_view`, `delete`, `select`, `other`, etc.)
@@ -68,7 +70,8 @@ final class RefreshSqlLog private (
     * @param sql        full SQL text — **no truncation**.
     * @param durationMs wall-clock for this single execution. -1 for events
     *                   that were not actually executed by Spark (the
-    *                   user-supplied `original_query`).
+    *                   user-supplied `original_query` or compiler program).
+    * @param emitInsight whether to emit an action event for this record.
     */
   def record(
       category: String,
@@ -77,11 +80,12 @@ final class RefreshSqlLog private (
       stmtKind: String,
       sql: String,
       durationMs: Long,
-      succeeded: Boolean = true
+      succeeded: Boolean = true,
+      emitInsight: Boolean = true
   ): Unit = {
     if (durationMs >= 0L)
       OpenIvmMetrics.recordSqlStatement(stmtKind, durationMs * 1000000L, Option(sql).fold(0)(_.length), attemptIdx)
-    if (insightActive)
+    if (insightActive && emitInsight)
       OpenIvmInsightsBroker.emit(spark) {
         OpenIvmInsightsContract.EventDraft(
           operation =

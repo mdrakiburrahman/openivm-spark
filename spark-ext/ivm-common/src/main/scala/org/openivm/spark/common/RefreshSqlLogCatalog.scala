@@ -19,7 +19,7 @@ import java.sql.Timestamp
   *   - `stmt_order        INT`       — monotonic per-refresh, 0-based; matches the order Spark actually executed statements
   *   - `attempt_idx       INT`       — 0 for the first attempt; 1+ for Delta-OCC retries. Each retry attempt is recorded as its own row so the bench can see all the work Spark did.
   *   - `mode              STRING`    — `create` or `refresh`
-  *   - `category          STRING`    — one of `original_query`, `initial_load_ctas`, `aggregate_having_view`, `register_source_delta`, `rewritten_stmt`, `count_monoid_cleanup`, `post_cleanup_stage`, `drop_cleanup`, `full_refresh_stmt`, `fused_view_delta_select`
+  *   - `category          STRING`    — e.g. `original_query`, `rewritten_stmt`, `full_refresh_stmt`, `compiler_program_native`, `compiler_program_normalized`
   *   - `stmt_kind         STRING`    — reuses [[org.openivm.spark.commands.RefreshPerf.classify]] (e.g. `merge` / `insert_into` / `view_delta_ctas`)
   *   - `duration_ms       BIGINT`    — wall-clock for this single execution (-1 if the statement was not executed by us, e.g. `original_query` capture, or 0 for synthetic events)
   *   - `sql_text          STRING`    — full SQL — **no truncation**
@@ -93,20 +93,22 @@ object RefreshSqlLogCatalog {
       refreshId: String,
       profileTsMicros: Long,
       stmtOrder: Int,
-      attemptIdx: Int
+      attemptIdx: Int,
+      category: String
   ): Array[Byte] =
     RocksDBCodec.compositeKey(
       Seq(
         RocksDBCodec.encodeLongBE(profileTsMicros),
         RocksDBCodec.utf8(refreshId),
         RocksDBCodec.encodeLongBE(stmtOrder.toLong),
-        RocksDBCodec.encodeLongBE(attemptIdx.toLong)
+        RocksDBCodec.encodeLongBE(attemptIdx.toLong),
+        RocksDBCodec.utf8(category)
       )
     )
 
   private def decodeKey(key: Array[Byte]): (Long, String, Int, Int) = {
-    val parts = RocksDBCodec.splitComposite(key, maxParts = 4)
-    require(parts.length == 4, s"Malformed refresh_sql_log key (expected 4 parts, found ${parts.length})")
+    val parts = RocksDBCodec.splitComposite(key, maxParts = 5)
+    require(parts.length == 4 || parts.length == 5, s"Malformed refresh_sql_log key (found ${parts.length} parts)")
     val tsMicros = RocksDBCodec.decodeLongBE(parts(0))
     val refresh  = RocksDBCodec.fromUtf8(parts(1))
     val stmtOrd  = RocksDBCodec.decodeLongBE(parts(2)).toInt
@@ -155,7 +157,8 @@ object RefreshSqlLogCatalog {
           row.refreshId,
           tsToMicros(row.profileTimestamp),
           row.stmtOrder,
-          row.attemptIdx
+          row.attemptIdx,
+          row.category
         )
         val value = encodeValue(row)
         OpenIvmRocksDBBatchOps.put(db, batch, CfName, key, value)
@@ -262,11 +265,14 @@ object RefreshSqlLogCatalog {
   def scanAll(spark: SparkSession): Seq[RefreshSqlLogRow] = {
     val db  = openDb(spark)
     val it  = db.prefixScan(CfName, Array.emptyByteArray)
-    val out = scala.collection.mutable.ArrayBuffer.empty[RefreshSqlLogRow]
+    val out = scala.collection.mutable.LinkedHashMap.empty[(Long, String, Int, Int, String), RefreshSqlLogRow]
     try {
       while (it.hasNext) {
         val (key, value) = it.next()
-        out += decodeRow(key, value)
+        val row          = decodeRow(key, value)
+        // A replay of a legacy key may coexist with its category-qualified replacement.
+        // The legacy key sorts first, so the replacement wins without duplicating SHOW rows.
+        out.update((tsToMicros(row.profileTimestamp), row.refreshId, row.stmtOrder, row.attemptIdx, row.category), row)
       }
     } finally {
       it match {
@@ -278,7 +284,7 @@ object RefreshSqlLogCatalog {
     }
     // Composite-key ordering already gives us (ts, refresh, stmt, attempt) order.
     // Sort defensively to make the contract explicit; cheap (≤ thousands of rows).
-    out
+    out.values.toSeq
       .sortBy(r => (r.profileTimestamp.getTime, r.refreshId, r.stmtOrder, r.attemptIdx))
       .toSeq
   }

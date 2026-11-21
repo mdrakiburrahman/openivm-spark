@@ -5250,6 +5250,10 @@ case class RefreshMaterializedViewCommand(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
             "outcome='no_pending_deltas'"
         )
+        profile.appendObservedSkip(
+          "execute_refresh_sql_attempt",
+          "work_class=refresh_sql_skipped;reason=no_pending_deltas;origin_class=unknown;credit_ns=0"
+        )
         emitEnd("no_pending_deltas", meta.refreshTypeName, 0)
         return Seq.empty
       }
@@ -5354,6 +5358,10 @@ case class RefreshMaterializedViewCommand(
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
             "outcome='noop_fast_exit'"
+        )
+        profile.appendObservedSkip(
+          "execute_refresh_sql_attempt",
+          "work_class=refresh_sql_skipped;reason=noop_fast_exit;origin_class=unknown;credit_ns=0"
         )
         emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
         return Seq.empty
@@ -5792,32 +5800,44 @@ case class RefreshMaterializedViewCommand(
                   "writer_metrics=unavailable"
               ) {
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtCounter, kind) {
-                  RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                    val t0 = System.nanoTime()
-                    try {
-                      val df = spark.sql(fullRefreshSql)
-                      df.write
-                        .format("delta")
-                        .mode("overwrite")
-                        .option("replaceWhere", "true")
-                        .save(meta.location)
-                      OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
-                      val ms = (System.nanoTime() - t0) / 1000000L
-                      sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
-                      Seq.empty[Row]
-                    } catch {
-                      case t: Throwable =>
+                  profile.timeObservedStep(
+                    "execute_full_refresh_retry",
+                    s"statement=${stmtCounter + 1};query_log_order=$qOrder;work_class=full_refresh_retry"
+                  ) {
+                    RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                      val t0 = System.nanoTime()
+                      try {
+                        profile.timeObservedStep(
+                          "execute_full_refresh_attempt",
+                          s"statement=${stmtCounter + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
+                            s"stmt_kind=$kind;work_class=full_refresh_writer;segment=statement;" +
+                            s"action_id=$qOrder:${attempt - 1}:statement;origin_class=executor_helper;credit_ns=0"
+                        ) {
+                          val df = spark.sql(fullRefreshSql)
+                          df.write
+                            .format("delta")
+                            .mode("overwrite")
+                            .option("replaceWhere", "true")
+                            .save(meta.location)
+                        }
+                        OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                         val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record(
-                          "full_refresh_stmt",
-                          qOrder,
-                          attempt - 1,
-                          kind,
-                          writerLog,
-                          ms,
-                          succeeded = false
-                        )
-                        throw t
+                        sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
+                        Seq.empty[Row]
+                      } catch {
+                        case t: Throwable =>
+                          val ms = (System.nanoTime() - t0) / 1000000L
+                          sqlLog.record(
+                            "full_refresh_stmt",
+                            qOrder,
+                            attempt - 1,
+                            kind,
+                            writerLog,
+                            ms,
+                            succeeded = false
+                          )
+                          throw t
+                      }
                     }
                   }
                 }
@@ -6036,6 +6056,28 @@ case class RefreshMaterializedViewCommand(
           }
         }
       }
+      if (profile.isActive && sqlLog.isActive) {
+        compiled.nativeSql.foreach { nativeSql =>
+          sqlLog.record(
+            category = "compiler_program_native",
+            stmtOrder = -2,
+            attemptIdx = 0,
+            stmtKind = "compiler_program",
+            sql = nativeSql,
+            durationMs = -1L,
+            emitInsight = false
+          )
+        }
+        sqlLog.record(
+          category = "compiler_program_normalized",
+          stmtOrder = -2,
+          attemptIdx = 0,
+          stmtKind = "compiler_program",
+          sql = compiled.sql,
+          durationMs = -1L,
+          emitInsight = false
+        )
+      }
       if (
         preparedSourceAdvance.nonEmpty &&
         (compiled.refreshType == RefreshTypeCode.FullRefresh ||
@@ -6248,6 +6290,10 @@ case class RefreshMaterializedViewCommand(
                 case None =>
                   consumeRefreshChangesWithoutMvWrite(spark, viewNameStr, changeBatches)
               }
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                "work_class=refresh_sql_skipped;reason=runtime_empty_delta_skip;origin_class=unknown;credit_ns=0"
+              )
               emitEnd("runtime_empty_delta_skip", meta.refreshTypeName, changeBatches.size)
               // Total successful completion of this pinned no-op skip: release this
               // operation's OWN write-ahead guard so the next operation proceeds.
@@ -6464,12 +6510,31 @@ case class RefreshMaterializedViewCommand(
                 },
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
-                sourceSnapshotRelations = snapshotRelations
+                sourceSnapshotRelations = snapshotRelations,
+                lineageCapture =
+                  if (profile.isActive || FeatureGate.generatedActionOwnershipEnabled(spark))
+                    Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
+                  else None,
+                lineagePostProcessRules =
+                  if (profile.isActive)
+                    Some(
+                      Seq(
+                        RewriteLineage.RewriteRule("lpts-spark-dialect", "1", RewriteLineage.Unknown),
+                        RewriteLineage.RewriteRule("selective-broadcast-hints", "1", RewriteLineage.Unknown),
+                        RewriteLineage.RewriteRule("skew-fanout-broadcast-hints", "1", RewriteLineage.Unknown)
+                      ) ++
+                        (if (FeatureGate.scd2RangeAccelEnabled(spark))
+                           Seq(RewriteLineage.RewriteRule("scd2-range-acceleration", "1", RewriteLineage.Unknown))
+                         else Seq.empty) ++
+                        Seq(RewriteLineage.RewriteRule("expression-marker-restore", "1", RewriteLineage.Unknown))
+                    )
+                  else None
               )
             }
           }
           expressionBridge.markers.requireAllSeen()
 
+          var literalPruneApplied = false
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
               val requests = rewrittenBase.statements.flatMap(SparkRefreshRewriter.regularNtermKeyRequests).distinct
@@ -6479,6 +6544,7 @@ case class RefreshMaterializedViewCommand(
                   s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                     s"outcome='regular_nterm_literal_prune' key_sets='${literals.size}'"
                 )
+                literalPruneApplied = true
                 rewrittenBase.copy(
                   statements = rewrittenBase.statements.map(
                     SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(_, literals)
@@ -6550,15 +6616,98 @@ case class RefreshMaterializedViewCommand(
                 done = current > stmtIdx || stmtCounter.compareAndSet(current, stmtIdx + 1)
               }
             }
-            def executeSqlAt(sql: String, stmtIdx: Int): Unit = {
-              executeSqlRowsAt(sql, stmtIdx)
+            def lineageDetail(
+                sourceIndex: Option[Int],
+                executed: String,
+                dispatchRule: String = "strip-execution-marker@1",
+                digestKind: String = "sql_utf8"
+            ): String =
+              sourceIndex
+                .flatMap { index =>
+                  rewritten.lineage.flatMap { lineage =>
+                    lineage.outputs.lift(index).map { source =>
+                      val pipeline = source.additionalRewriteRules.map(rule => s"${rule.name}@${rule.version}") ++
+                        (if (literalPruneApplied) Seq("regular-nterm-literal-prune@1") else Seq.empty) ++
+                        Seq(dispatchRule)
+                      s";compiler_program_digest=${lineage.compilerProgramDigest};" +
+                        s"compiler_program_digest_kind=${lineage.compilerProgramDigestKind};" +
+                        s"normalized_program_digest=${lineage.normalizedProgramDigest};" +
+                        "source_ordinal_basis=zero_based_compiler_program_split;" +
+                        "source_digest_basis=split_statement_utf8_without_delimiter;" +
+                        s"source_ordinal=${source.sourceOrdinal};source_digest=${source.sourceStatementDigest};" +
+                        s"rewrite_rule=${source.rewriteRuleName};rewrite_version=${source.rewriteRuleVersion};" +
+                        s"rewrite_pipeline=${pipeline.mkString(",")};executed_digest_kind=$digestKind;" +
+                        s"executed_digest=${RewriteLineage.sha256Utf8(executed)}"
+                    }
+                  }
+                }
+                .getOrElse("")
+
+            def fusedAggregateLineageDetail(indices: Seq[Int], executed: String): String =
+              rewritten.lineage
+                .flatMap { lineage =>
+                  val outputs = indices.flatMap(index => lineage.outputs.lift(index).toSeq)
+                  if (
+                    outputs.size != indices.size || outputs.isEmpty ||
+                    outputs.exists(_.additionalRewriteRules != outputs.head.additionalRewriteRules)
+                  ) None
+                  else {
+                    val rules = outputs.map(out => s"${out.rewriteRuleName}@${out.rewriteRuleVersion}")
+                    val pipeline = outputs.head.additionalRewriteRules.map(rule => s"${rule.name}@${rule.version}") ++
+                      (if (literalPruneApplied) Seq("regular-nterm-literal-prune@1") else Seq.empty) ++
+                      Seq("inline-view-delta-ctas-into-merge@1")
+                    Some(
+                      s";compiler_program_digest=${lineage.compilerProgramDigest};" +
+                        s"compiler_program_digest_kind=${lineage.compilerProgramDigestKind};" +
+                        s"normalized_program_digest=${lineage.normalizedProgramDigest};" +
+                        "source_ordinal_basis=zero_based_compiler_program_split;" +
+                        "source_digest_basis=split_statement_utf8_without_delimiter;" +
+                        s"source_output_indices=${indices.mkString(",")};" +
+                        s"source_ordinals=${outputs.map(_.sourceOrdinal).mkString(",")};" +
+                        s"source_digests=${outputs.map(_.sourceStatementDigest).mkString(",")};" +
+                        s"source_rewrite_rules=${rules.mkString(",")};rewrite_pipeline=${pipeline.mkString(",")};" +
+                        s"executed_digest_kind=sql_utf8;executed_digest=${RewriteLineage.sha256Utf8(executed)}"
+                    )
+                  }
+                }
+                .getOrElse("")
+
+            def executeSqlAt(
+                sql: String,
+                stmtIdx: Int,
+                fullDomainCdfMerge: Boolean = false,
+                sourceIndex: Option[Int] = None,
+                fusedAggregateSources: Seq[Int] = Seq.empty,
+                sourceDispatchRule: String = "strip-execution-marker@1"
+            ): Unit = {
+              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex, fusedAggregateSources, sourceDispatchRule)
               ()
             }
-            def executeSqlRowsAt(sql: String, stmtIdx: Int): Array[Row] = {
+            def actionOwnership(order: Int, segment: String, lineage: String): Option[String] =
+              if (lineage.nonEmpty && FeatureGate.generatedActionOwnershipEnabled(spark))
+                Some(s"refresh_id=$refreshId;action_id=$order:0:$segment;attempt=0;credit_ns=0$lineage")
+              else None
+
+            def executeSqlRowsAt(
+                sql: String,
+                stmtIdx: Int,
+                fullDomainCdfMerge: Boolean = false,
+                sourceIndex: Option[Int] = None,
+                fusedAggregateSources: Seq[Int] = Seq.empty,
+                sourceDispatchRule: String = "strip-execution-marker@1"
+            ): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)
-              val kind     = RefreshPerf.classify(sql, viewDeltaPath)
-              val sqlBytes = sql.length
-              val qOrder   = qlogOrder.getAndIncrement()
+              val kind =
+                if (fullDomainCdfMerge) "global_window_cdf_merge" else RefreshPerf.classify(sql, viewDeltaPath)
+              val origin =
+                if (fullDomainCdfMerge) "origin_class=executor_helper;credit_reason=full_domain_rewrite"
+                else "origin_class=unknown;credit_reason=unverified_mixed_interval"
+              val lineage =
+                if (fusedAggregateSources.nonEmpty) fusedAggregateLineageDetail(fusedAggregateSources, sql)
+                else lineageDetail(sourceIndex, sql, sourceDispatchRule)
+              val sqlBytes  = sql.length
+              val qOrder    = qlogOrder.getAndIncrement()
+              val ownership = if (fullDomainCdfMerge) None else actionOwnership(qOrder, "statement", lineage)
               profile.timeStep(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
@@ -6566,8 +6715,16 @@ case class RefreshMaterializedViewCommand(
                 RefreshPerf.timeStmt(refreshId, viewLabel, stmtIdx, kind) {
                   val t0 = System.nanoTime()
                   try {
-                    val df = spark.sql(sql)
-                    val r  = df.collect()
+                    val (df, r) = profile.timeObservedStep(
+                      "execute_refresh_sql_attempt",
+                      s"statement=${stmtIdx + 1};query_log_order=$qOrder;attempt=0;stmt_kind=$kind;" +
+                        s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
+                        s"$origin;credit_ns=0$lineage"
+                    ) {
+                      val result = GeneratedActionOwnership.withBoundary(spark, ownership, "sql")(spark.sql(sql))
+                      val rows   = GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
+                      result -> rows
+                    }
                     recordPlanMetrics(df, kind)
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
@@ -6604,6 +6761,11 @@ case class RefreshMaterializedViewCommand(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};stmt_kind=$kind",
                 0L
+              )
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                s"statement=${stmtIdx + 1};stmt_kind=$kind;work_class=incremental_sql;segment=statement;" +
+                  "origin_class=unknown;credit_ns=0"
               )
             }
 
@@ -6645,13 +6807,18 @@ case class RefreshMaterializedViewCommand(
                 "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
                 0L
               )
+              profile.appendObservedSkip(
+                "execute_refresh_sql_attempt",
+                "statement=1;stmt_kind=view_delta_inlined;work_class=incremental_sql;segment=statement;" +
+                  "origin_class=unknown;credit_ns=0"
+              )
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                   "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
               )
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(directAggregateMerge.get, 1)
+                executeSqlAt(directAggregateMerge.get, 1, fusedAggregateSources = Seq(0, 1))
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────
@@ -6679,13 +6846,44 @@ case class RefreshMaterializedViewCommand(
                       val t0          = System.nanoTime()
                       try {
                         val rowCount = withPlanTimeBroadcastDisabled {
-                          val d = spark.sql(selectBody)
-                          d.createOrReplaceGlobalTempView(scratchView)
-                          spark.catalog.cacheTable(s"global_temp.$scratchView")
+                          val d = profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
+                              s"work_class=incremental_sql;segment=fused_analysis;action_id=$qOrder:0:fused_analysis;" +
+                              "origin_class=executor_helper;credit_ns=0;credit_reason=analysis" +
+                              lineageDetail(Some(0), selectBody, "extract-view-delta-ctas-body@1")
+                          ) {
+                            spark.sql(selectBody)
+                          }
+                          profile.timeObservedStep(
+                            "execute_refresh_fused_setup",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;" +
+                              s"work_class=incremental_auxiliary;segment=fused_setup;action_id=$qOrder:0:fused_setup;" +
+                              "origin_class=executor_helper;credit_ns=0;credit_reason=cache_registration"
+                          ) {
+                            d.createOrReplaceGlobalTempView(scratchView)
+                            spark.catalog.cacheTable(s"global_temp.$scratchView")
+                          }
                           // Force materialisation so the cache holds the rows before
                           // any negative-row probe / INSERT read. count() is the
                           // cheapest force-eval action that respects the cache.
-                          spark.table(s"global_temp.$scratchView").count()
+                          val actionLineage = lineageDetail(
+                            Some(0),
+                            s"spark.table(global_temp.$scratchView).count()",
+                            "fused-cache-materialization@1",
+                            "action_descriptor_utf8"
+                          )
+                          val owner = actionOwnership(qOrder, "fused_action", actionLineage)
+                          profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
+                              s"work_class=incremental_sql;segment=fused_action;action_id=$qOrder:0:fused_action;" +
+                              "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization" +
+                              actionLineage
+                          ) {
+                            val scratch = spark.table(s"global_temp.$scratchView")
+                            GeneratedActionOwnership.withBoundary(spark, owner, "count")(scratch.count())
+                          }
                         }
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
                         advanceStmtCounterPast(0)
@@ -6752,7 +6950,11 @@ case class RefreshMaterializedViewCommand(
 
               if (fusedView.isEmpty) {
                 withPlanTimeBroadcastDisabled {
-                  executeSqlAt(SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head), 0)
+                  executeSqlAt(
+                    SparkRefreshRewriter.stripExecutionMarker(rewritten.statements.head),
+                    0,
+                    sourceIndex = Some(0)
+                  )
                 }
                 logViewDeltaDiagnostics(spark, name, viewDeltaPath, 0)
               }
@@ -6863,12 +7065,33 @@ case class RefreshMaterializedViewCommand(
                     // body, which trips Spark's 8 GiB `BroadcastExchangeExec`
                     // cap. See `SparkRefreshRewriter.isMergeStatement` for the
                     // full rationale.
+                    // The bag INSERT is a typed compiler output even when its net-view input
+                    // reads fused scratch. Do not assign a single source to the composed apply.
+                    val mappedBagInsert = fusedView.nonEmpty &&
+                      RefreshPerf.classify(sql, viewDeltaPath) == "insert_into" &&
+                      rewritten.lineage
+                        .flatMap(_.outputs.lift(stmtIdx))
+                        .exists(
+                          _.rewriteRuleName == "simple-projection-data-insert"
+                        )
+                    val directSourceIndex =
+                      if (atomicSql.isEmpty && (fusedView.isEmpty || mappedBagInsert))
+                        Some(stmtIdx)
+                      else None
+                    val dispatchRule =
+                      if (sqlForExec == sql) "strip-execution-marker@1"
+                      else "strip-execution-marker@1,substitute-cached-view-delta@1"
                     if (SparkRefreshRewriter.isMergeStatement(sqlForExec)) {
                       withPlanTimeBroadcastDisabled {
-                        executeSqlAt(sqlForExec, stmtIdx)
+                        executeSqlAt(sqlForExec, stmtIdx, sourceIndex = directSourceIndex)
                       }
                     } else {
-                      executeSqlAt(sqlForExec, stmtIdx)
+                      executeSqlAt(
+                        sqlForExec,
+                        stmtIdx,
+                        sourceIndex = directSourceIndex,
+                        sourceDispatchRule = dispatchRule
+                      )
                     }
                     if (atomicSql.nonEmpty) atomicApplyInsertIdx = Some(stmtIdx + 1)
                   }
@@ -7284,10 +7507,10 @@ case class RefreshMaterializedViewCommand(
                     SparkRefreshRewriter.extractViewDeltaCtasBody(stmt, viewDeltaPath).isDefined
                   if (SparkRefreshRewriter.isMergeStatement(sql) || isViewDeltaCtas) {
                     withPlanTimeBroadcastDisabled {
-                      executeSqlAt(sql, idx)
+                      executeSqlAt(sql, idx, sourceIndex = Some(idx))
                     }
                   } else {
-                    executeSqlAt(sql, idx)
+                    executeSqlAt(sql, idx, sourceIndex = Some(idx))
                   }
                   if (isViewDeltaCtas && idx == windowCascadeCtasIdx) {
                     val targetWritePending = windowCascadeMergePlan.nonEmpty || deferredWindowTargetSql.nonEmpty
@@ -7405,25 +7628,24 @@ case class RefreshMaterializedViewCommand(
                   s"statement=${idx + 1};bytes=${deleteSql.length};stmt_kind=count_monoid_cleanup"
                 ) {
                   RefreshPerf.timeStmt(refreshId, viewLabel, idx, "count_monoid_cleanup") {
-                    RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
-                      val t0 = System.nanoTime()
-                      try {
-                        val df = spark.sql(deleteSql)
-                        val r  = df.collect()
-                        recordPlanMetrics(df, "delete")
-                        val ms = (System.nanoTime() - t0) / 1000000L
-                        sqlLog.record(
-                          "count_monoid_cleanup",
-                          qOrder,
-                          attempt - 1,
-                          "delete",
-                          deleteSql,
-                          ms,
-                          succeeded = false
-                        )
-                        r
-                      } catch {
-                        case t: Throwable =>
+                    profile.timeObservedStep(
+                      "execute_refresh_cleanup_retry",
+                      s"statement=${idx + 1};query_log_order=$qOrder;work_class=incremental_cleanup_retry"
+                    ) {
+                      RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
+                        val t0 = System.nanoTime()
+                        try {
+                          val (df, r) = profile.timeObservedStep(
+                            "execute_refresh_sql_attempt",
+                            s"statement=${idx + 1};query_log_order=$qOrder;attempt=${attempt - 1};" +
+                              s"stmt_kind=count_monoid_cleanup;work_class=incremental_cleanup;segment=statement;" +
+                              s"action_id=$qOrder:${attempt - 1}:statement;origin_class=executor_helper;" +
+                              "credit_ns=0;credit_reason=cleanup"
+                          ) {
+                            val result = spark.sql(deleteSql)
+                            result -> result.collect()
+                          }
+                          recordPlanMetrics(df, "delete")
                           val ms = (System.nanoTime() - t0) / 1000000L
                           sqlLog.record(
                             "count_monoid_cleanup",
@@ -7433,7 +7655,21 @@ case class RefreshMaterializedViewCommand(
                             deleteSql,
                             ms
                           )
-                          throw t
+                          r
+                        } catch {
+                          case t: Throwable =>
+                            val ms = (System.nanoTime() - t0) / 1000000L
+                            sqlLog.record(
+                              "count_monoid_cleanup",
+                              qOrder,
+                              attempt - 1,
+                              "delete",
+                              deleteSql,
+                              ms,
+                              succeeded = false
+                            )
+                            throw t
+                        }
                       }
                     }
                   }
