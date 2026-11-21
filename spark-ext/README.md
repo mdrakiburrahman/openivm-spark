@@ -44,6 +44,10 @@ or `async_unsupported`. The command does not refresh or publish state. Unsafe
 ownership, mismatched physical identity, and validation failures are errors.
 Eligibility is not a refresh result: a later strict guard revalidates and any
 subsequent failure must not trigger fallback.
+The strict v2 command does not accept the probed table ID as an input: a
+managed drop/recreate can validate a new identity, and a drop can yield
+`absent`. Callers must inspect the strict result and compare its identity to
+the probe when their policy requires continuity.
 
 ## Crash-safe state-sync snapshots
 

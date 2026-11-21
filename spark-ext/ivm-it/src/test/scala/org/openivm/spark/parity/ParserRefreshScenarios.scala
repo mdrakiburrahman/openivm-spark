@@ -278,40 +278,72 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
           case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
         }
       }
+    }
 
-      it("only routes a missing public view when its backing identity is intact") {
-        val key      = "dbt.fabricspark.materialized_view.query_hash"
-        val target   = "`spark_catalog`.`default`.`ensure_mv_p16`"
-        val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
-        spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
-        try {
-          sql("CREATE TABLE ensure_src_p16 (grp INT, val INT) USING DELTA")
-          sql("INSERT INTO ensure_src_p16 VALUES (1, 2)")
-          sql(
-            s"CREATE MATERIALIZED VIEW default.ensure_mv_p16 TBLPROPERTIES ('$key' = '$hash') AS " +
-              "SELECT grp, SUM(val) AS total FROM ensure_src_p16 GROUP BY grp HAVING SUM(val) > 0"
-          )
-          val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p16", Some("default"))).get
-          meta.usesBackingDataTable shouldBe true
-          val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
-          eligibility(target).getString(0) shouldBe "eligible"
-          sql("DROP VIEW default.ensure_mv_p16")
-          decline(target, "public_relation_missing")
-          MvCatalog.upsert(
-            spark,
-            meta.copy(properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> "foreign"))
-          )
-          intercept[Exception](eligibility(target))
-          MvCatalog.upsert(spark, meta)
-          sql("CREATE VIEW default.ensure_mv_p16 AS SELECT grp, CAST(val AS BIGINT) AS total FROM ensure_src_p16")
-          intercept[Exception](eligibility(target))
-          intercept[Exception](guarded(target))
-          io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
-        } finally {
-          oldAsync match {
-            case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
-            case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
-          }
+    it("only routes a missing public view when its backing identity is intact") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p16`"
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p16 (grp INT, val INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p16 VALUES (1, 2)")
+        sql(
+          s"CREATE MATERIALIZED VIEW default.ensure_mv_p16 TBLPROPERTIES ('$key' = '$hash') AS " +
+            "SELECT grp, SUM(val) AS total FROM ensure_src_p16 GROUP BY grp HAVING SUM(val) > 0"
+        )
+        val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p16", Some("default"))).get
+        meta.usesBackingDataTable shouldBe true
+        val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        eligibility(target).getString(0) shouldBe "eligible"
+        sql("DROP VIEW default.ensure_mv_p16")
+        decline(target, "public_relation_missing")
+        MvCatalog.upsert(
+          spark,
+          meta.copy(properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> "foreign"))
+        )
+        intercept[Exception](eligibility(target))
+        MvCatalog.upsert(spark, meta)
+        sql("CREATE VIEW default.ensure_mv_p16 AS SELECT grp, CAST(val AS BIGINT) AS total FROM ensure_src_p16")
+        intercept[Exception](eligibility(target))
+        intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+    }
+
+    it("reports strict results after managed replacement or disappearance following eligibility") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p17`"
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p17 (id INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p17 VALUES (1)")
+        val create = s"CREATE MATERIALIZED VIEW default.ensure_mv_p17 TBLPROPERTIES ('$key' = '$hash') AS " +
+          "SELECT id FROM ensure_src_p17"
+        sql(create)
+        val first = eligibility(target)
+        first.getString(0) shouldBe "eligible"
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p17")
+        sql(create)
+        val second = eligibility(target)
+        second.getString(0) shouldBe "eligible"
+        second.getString(3) should not be first.getString(3)
+        val refreshed = guarded(target).head
+        refreshed.getString(0) shouldBe "refreshed"
+        refreshed.getString(3) shouldBe second.getString(3)
+        eligibility(target).getString(0) shouldBe "eligible"
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p17")
+        guarded(target).head.getString(0) shouldBe "absent"
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
         }
       }
     }
