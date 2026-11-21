@@ -46,8 +46,8 @@ Eligibility is not a refresh result: a later strict guard revalidates and any
 subsequent failure must not trigger fallback.
 The strict v2 command does not accept the probed table ID as an input: a
 managed drop/recreate can validate a new identity, and a drop can yield
-`absent`. Callers must inspect the strict result and compare its identity to
-the probe when their policy requires continuity.
+`absent`. Comparing the strict result's identity to the probe after return
+detects replacement but cannot prevent writing to the replacement.
 
 When the loaded engine advertises `ensure_refresh_table_id_v1`, callers can
 pin the eligible physical ID before refresh writes:
@@ -62,7 +62,9 @@ The pinned form fails if the target is absent or its validated live and
 persisted ID differs from the pin. It does not fall back or recreate the view.
 Failure telemetry may be recorded, but the rejected refresh does not advance
 the target or source state or publish a checkpoint. The unpinned v2 form
-retains its original behavior.
+retains its original behavior. The pin check is protected against concurrent
+managed operations sharing the same resolved metadata lock key in one driver;
+it is not an alias-based or distributed lock.
 
 ## Crash-safe state-sync snapshots
 
