@@ -6759,9 +6759,10 @@ case class RefreshMaterializedViewCommand(
                 stmtIdx: Int,
                 fullDomainCdfMerge: Boolean = false,
                 sourceIndex: Option[Int] = None,
-                fusedAggregateSources: Seq[Int] = Seq.empty
+                fusedAggregateSources: Seq[Int] = Seq.empty,
+                sourceDispatchRule: String = "strip-execution-marker@1"
             ): Unit = {
-              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex, fusedAggregateSources)
+              executeSqlRowsAt(sql, stmtIdx, fullDomainCdfMerge, sourceIndex, fusedAggregateSources, sourceDispatchRule)
               ()
             }
             def actionOwnership(order: Int, segment: String, lineage: String): Option[String] =
@@ -6774,7 +6775,8 @@ case class RefreshMaterializedViewCommand(
                 stmtIdx: Int,
                 fullDomainCdfMerge: Boolean = false,
                 sourceIndex: Option[Int] = None,
-                fusedAggregateSources: Seq[Int] = Seq.empty
+                fusedAggregateSources: Seq[Int] = Seq.empty,
+                sourceDispatchRule: String = "strip-execution-marker@1"
             ): Array[Row] = {
               advanceStmtCounterPast(stmtIdx)
               val kind =
@@ -6784,7 +6786,7 @@ case class RefreshMaterializedViewCommand(
                 else "origin_class=unknown;credit_reason=unverified_mixed_interval"
               val lineage =
                 if (fusedAggregateSources.nonEmpty) fusedAggregateLineageDetail(fusedAggregateSources, sql)
-                else lineageDetail(sourceIndex, sql)
+                else lineageDetail(sourceIndex, sql, sourceDispatchRule)
               val sqlBytes  = sql.length
               val qOrder    = qlogOrder.getAndIncrement()
               val ownership = if (fullDomainCdfMerge) None else actionOwnership(qOrder, "statement", lineage)
@@ -7151,13 +7153,33 @@ case class RefreshMaterializedViewCommand(
                     // body, which trips Spark's 8 GiB `BroadcastExchangeExec`
                     // cap. See `SparkRefreshRewriter.isMergeStatement` for the
                     // full rationale.
-                    val directSourceIndex = if (atomicSql.isEmpty && fusedView.isEmpty) Some(stmtIdx) else None
+                    // The bag INSERT is a typed compiler output even when its net-view input
+                    // reads fused scratch. Do not assign a single source to the composed apply.
+                    val mappedBagInsert = fusedView.nonEmpty &&
+                      RefreshPerf.classify(sql, viewDeltaPath) == "insert_into" &&
+                      rewritten.lineage
+                        .flatMap(_.outputs.lift(stmtIdx))
+                        .exists(
+                          _.rewriteRuleName == "simple-projection-data-insert"
+                        )
+                    val directSourceIndex =
+                      if (atomicSql.isEmpty && (fusedView.isEmpty || mappedBagInsert))
+                        Some(stmtIdx)
+                      else None
+                    val dispatchRule =
+                      if (sqlForExec == sql) "strip-execution-marker@1"
+                      else "strip-execution-marker@1,substitute-cached-view-delta@1"
                     if (SparkRefreshRewriter.isMergeStatement(sqlForExec)) {
                       withPlanTimeBroadcastDisabled {
                         executeSqlAt(sqlForExec, stmtIdx, sourceIndex = directSourceIndex)
                       }
                     } else {
-                      executeSqlAt(sqlForExec, stmtIdx, sourceIndex = directSourceIndex)
+                      executeSqlAt(
+                        sqlForExec,
+                        stmtIdx,
+                        sourceIndex = directSourceIndex,
+                        sourceDispatchRule = dispatchRule
+                      )
                     }
                     if (atomicSql.nonEmpty) atomicApplyInsertIdx = Some(stmtIdx + 1)
                   }

@@ -7,6 +7,8 @@
 SQL dispatches. Join by `refresh_id` and `action_id`; `boundary=sql` is the
 potentially eager SQL call and `boundary=collect` is the result action.
 Compiler/source and execution digests identify the statement, not its stages.
+A simple-projection bag INSERT retains its compiler source when its net-view
+input reads fused scratch; an atomic apply combining outputs is not assigned a single source.
 Nested Delta log/state jobs may inherit this property, and deferred work on
 other threads may lack it. Helpers without a proven source mapping are
 untagged. This diagnostic is off by default and assigns no execution-time credit.
