@@ -11,8 +11,7 @@ import org.openivm.spark.common.{
 }
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
-abstract class GroupCdfCompanionScenarios
-    extends IvmParitySpecBase("group-cdf-companion") {
+abstract class GroupCdfCompanionScenarios extends IvmParitySpecBase("group-cdf-companion") {
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
@@ -44,7 +43,9 @@ abstract class GroupCdfCompanionScenarios
     sql("INSERT INTO gcc_src VALUES ('a','1',10), ('a','1',15), ('b','2',5)")
     refreshMv("gcc_mv")
     mvDataVersion("gcc_mv") shouldBe before + 2
-    val statements = sql("SHOW OPENIVM QUERY LOG").collect().toSeq
+    val statements = sql("SHOW OPENIVM QUERY LOG")
+      .collect()
+      .toSeq
       .filter(r => r.getString(1).split("\\.").last == "gcc_mv" && r.getString(6) == "rewritten_stmt")
       .map(_.getString(9))
     statements.exists(_.contains("WHEN MATCHED THEN DELETE")) shouldBe true
@@ -57,9 +58,10 @@ abstract class GroupCdfCompanionScenarios
       cdf.filter("_change_type = 'insert'").count() shouldBe 2L
       cdf.filter("NOT (k1 <=> 'a' AND k2 <=> '1') AND NOT (k1 <=> 'b' AND k2 <=> '2')").count() shouldBe 0L
     } else {
-      val childId = spark.sessionState.sqlParser.parseTableIdentifier("gcc_child")
+      val childId   = spark.sessionState.sqlParser.parseTableIdentifier("gcc_child")
       val childMeta = MvCatalog.lookup(spark, childId).get
-      StagingCatalog.collectFor(spark, "gcc_child", childMeta.sourceTables)
+      StagingCatalog
+        .collectFor(spark, "gcc_child", childMeta.sourceTables)
         .exists(_.opType == StagingDelta.OpTypes.MvViewDelta) shouldBe true
     }
     assertMvCorrect("gcc_mv", expected)
@@ -80,5 +82,5 @@ abstract class GroupCdfCompanionScenarios
   }
 }
 
-class GroupCdfCompanionCdfSpec extends GroupCdfCompanionScenarios with CdfMode
+class GroupCdfCompanionCdfSpec       extends GroupCdfCompanionScenarios with CdfMode
 class GroupCdfCompanionInterceptSpec extends GroupCdfCompanionScenarios with InterceptMode
