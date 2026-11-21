@@ -1,5 +1,32 @@
 # Spark extension
 
+## Guarded refresh
+
+When the extension and feature gate are enabled, `SET spark.openivm.capabilities`
+advertises `ensure_refresh_v2`. Clients can opt in using
+
+```sql
+REFRESH MATERIALIZED VIEW db.view EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' IF EXISTS
+```
+
+The 32-character MD5 is the existing
+`dbt.fabricspark.materialized_view.query_hash` property, calculated by the client
+from its exact UTF-8 compiled SQL. Under the refresh locks, OpenIVM checks the
+stored and live properties and validates the live target ownership before
+running the ordinary refresh. A mismatch or invalid target fails; only a name
+with neither a registered MV nor a live relation returns `absent`.
+Guarded refresh also requires the physical Delta table ID recorded by CREATE;
+legacy MVs without this identity fail closed and remain usable through the
+ordinary refresh path.
+
+The single result row contains `status`, `query_hash`, `target`,
+`target_table_id`, `refresh_id`, and `outcome`. `target` is the input identifier
+rendered with each component backtick-quoted and escaped; it is not resolved to
+a default namespace. One to three identifier components are supported; four or
+more are rejected. The final three fields are null for `absent`. A `refreshed` result follows the configured state-sync behavior:
+asynchronous mode does not imply remote publication has completed. Older JARs
+do not advertise the capability and clients must retain their normal fallback.
+
 ## Crash-safe state-sync snapshots
 
 Synchronous backups retain per-namespace request barriers: only requests captured

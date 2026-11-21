@@ -75,8 +75,19 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
 
   override def visitRefreshMaterializedView(
       ctx: IvmSqlBaseParser.RefreshMaterializedViewContext
-  ): AnyRef =
-    RefreshMaterializedViewCommand(toTableIdentifier(ctx.multipartIdentifier()))
+  ): AnyRef = {
+    val expectedQueryHash = Option(ctx.expectedQueryHash).map { token =>
+      val literal = token.getText
+      if (!literal.matches("'[0-9a-fA-F]{32}'")) {
+        parseError("expected query hash must be exactly 32 hexadecimal characters")
+      }
+      literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
+    }
+    RefreshMaterializedViewCommand(
+      toTableIdentifier(ctx.multipartIdentifier()),
+      expectedQueryHash = expectedQueryHash
+    )
+  }
 
   override def visitAdvanceMaterializedViewSourceVersions(
       ctx: IvmSqlBaseParser.AdvanceMaterializedViewSourceVersionsContext

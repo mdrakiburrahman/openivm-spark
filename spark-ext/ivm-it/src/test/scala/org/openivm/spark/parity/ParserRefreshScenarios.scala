@@ -3,7 +3,7 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.MvCatalog
+import org.openivm.spark.common.{MvCatalog, MvMetadata}
 
 /** Slice of `ParserSpec` covering REFRESH idempotency, INSERT+DELETE-in-the-
   * same-window net-zero deltas, DROP+recreate with a different body, and
@@ -127,6 +127,69 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ine_p13 AS SELECT id, val + 99 FROM ine_p13"
       )
       spark.table("mv_ine_p13").collect().toSet shouldBe before
+    }
+  }
+
+  describe("guarded refresh") {
+    val hash = "0123456789abcdef0123456789abcdef"
+    def guarded(target: String, expected: String = hash) =
+      sql(s"REFRESH MATERIALIZED VIEW $target EXPECT QUERY HASH '$expected' IF EXISTS").collect()
+
+    it("reports only truly absent names as absent") {
+      val capability = sql("SET spark.openivm.capabilities").collect().head
+      capability.getString(1) should include("ensure_refresh_v2")
+      spark.conf.set("spark.openivm.enabled", "false")
+      try {
+        sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v2")
+      } finally spark.conf.set("spark.openivm.enabled", "true")
+      val absent = guarded("ensure_absent_p14").head
+      absent.getString(0) shouldBe "absent"
+      absent.getString(1) shouldBe hash
+      absent.getString(2) shouldBe "`ensure_absent_p14`"
+      (3 to 5).foreach(i => absent.isNullAt(i) shouldBe true)
+      sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
+      intercept[Exception](guarded("ensure_unmanaged_p14"))
+    }
+
+    it("validates the live definition before writing and returns refresh proof") {
+      val key = "dbt.fabricspark.materialized_view.query_hash"
+      val target = "`spark_catalog`.`default`.`ensure_mv_p15`"
+      sql("CREATE TABLE ensure_src_p15 (id INT) USING DELTA")
+      sql("INSERT INTO ensure_src_p15 VALUES (1)")
+      sql(s"CREATE MATERIALIZED VIEW default.ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15")
+      sql("INSERT INTO ensure_src_p15 VALUES (2)")
+      intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
+      spark.table("ensure_mv_p15").count() shouldBe 1L
+      val proof = guarded(target).head
+      proof.getString(0) shouldBe "refreshed"
+      proof.getString(1) shouldBe hash
+      proof.getString(2) shouldBe target
+      (3 to 5).foreach(i => proof.getString(i) should not be empty)
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+      val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+      val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+      sql("INSERT INTO ensure_src_p15 VALUES (3)")
+      try {
+        val identityKey = MvMetadata.TargetDeltaTableIdKey
+        MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+        intercept[Exception](guarded(target))
+        MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
+        intercept[Exception](guarded(target))
+        MvCatalog.remove(spark, meta.name)
+        intercept[Exception](guarded(target))
+      } finally {
+        MvCatalog.upsert(spark, meta)
+      }
+      io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
+      val changedPropertyVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+      intercept[Exception](guarded(target))
+      io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe changedPropertyVersion
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = '$hash')")
+      sql("REFRESH MATERIALIZED VIEW default.ensure_mv_p15")
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
     }
   }
 }

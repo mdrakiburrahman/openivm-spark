@@ -7,6 +7,7 @@
  *     [USING <provider>] [<table_clauses>] [CLUSTER BY (<cols>)] AS <query>
  *
  *   REFRESH MATERIALIZED VIEW <multipart_identifier>
+ *     [EXPECT QUERY HASH '<32-hex>' IF EXISTS]
  *
  *   ALTER MATERIALIZED VIEW <multipart_identifier>
  *     ADVANCE SOURCE VERSIONS (<source>=<version> [, ...])
@@ -118,6 +119,7 @@ showRefreshSql
 
 refreshMaterializedView
     : REFRESH MATERIALIZED VIEW multipartIdentifier
+      (EXPECT QUERY HASH expectedQueryHash=STRING IF EXISTS)?
     ;
 
 advanceMaterializedViewSourceVersions
@@ -231,7 +233,7 @@ identifier
 nonReserved
     : IF | NOT | EXISTS | USING | PARTITIONED | TBLPROPERTIES
     | AS  | BY  | DROP   | REFRESH | SHOW | OPENIVM | PROFILE
-    | QUERY | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
+    | QUERY | EXPECT | LOG | EXPLAIN | CLUSTER | SQL | FOR | ALTER | ADVANCE
     | SOURCE | VERSIONS | STREAMING | TABLE | TABLES | LOCATION | OPTIONS | IN | STOP | LIKE
     | INSIGHTS | BEGIN | REQUEST | RUN | NODE | AFTER | LIMIT | END | STATUS | SUCCEEDED | FAILED | RELEASE
     | MATERIALIZATION | TARGET | ERROR_CLASS | ERROR_CODE | ANNOTATE | HASH | OLD | NEW | POLICY | DECISION | REASON
@@ -259,6 +261,7 @@ LIKE          : [Ll][Ii][Kk][Ee];
 OPENIVM       : [Oo][Pp][Ee][Nn][Ii][Vv][Mm];
 PROFILE       : [Pp][Rr][Oo][Ff][Ii][Ll][Ee];
 QUERY         : [Qq][Uu][Ee][Rr][Yy];
+EXPECT        : [Ee][Xx][Pp][Ee][Cc][Tt];
 LOG           : [Ll][Oo][Gg];
 EXPLAIN       : [Ee][Xx][Pp][Ll][Aa][Ii][Nn];
 CLUSTER       : [Cc][Ll][Uu][Ss][Tt][Ee][Rr];

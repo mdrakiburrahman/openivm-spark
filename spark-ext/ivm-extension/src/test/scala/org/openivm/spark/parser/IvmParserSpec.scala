@@ -347,6 +347,64 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       plan shouldBe a[RefreshMaterializedViewCommand]
       val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("v")
+      cmd.expectedQueryHash shouldBe None
+    }
+
+    it("parses and normalizes an expected query hash for a qualified target") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "refresh materialized view `db`.`expect` expect query hash '0123456789ABCDEFabcdef0123456789' if exists;"
+      )
+      val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("expect", Some("db"))
+      cmd.expectedQueryHash shouldBe Some("0123456789abcdefabcdef0123456789")
+    }
+
+    it("preserves three-part targets and rejects four-part targets") {
+      val suffix = "EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' IF EXISTS"
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(s"REFRESH MATERIALIZED VIEW `Lakehouse`.`dbo`.`mv` $suffix")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("dbo"), Some("Lakehouse"))
+      val error = intercept[ParseException] {
+        spark.sessionState.sqlParser.parsePlan(
+          s"REFRESH MATERIALIZED VIEW `Workspace`.`Lakehouse`.`dbo`.`mv` $suffix"
+        )
+      }
+      error.getMessage should include("Identifier has too many parts")
+    }
+
+    it("preserves EXPECT as a non-reserved identifier") {
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan("REFRESH MATERIALIZED VIEW expect")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("expect")
+      cmd.expectedQueryHash shouldBe None
+    }
+
+    it("rejects malformed or incomplete expected query hash clauses") {
+      val validHash = "0123456789abcdef0123456789abcdef"
+      val statements = Seq(
+        "EXPECT QUERY HASH",
+        s"EXPECT QUERY HASH '$validHash'",
+        s"EXPECT QUERY HASH '$validHash' IF",
+        s"EXPECT QUERY HASH '$validHash' EXISTS",
+        s"EXPECT QUERY HASH '$validHash' IF NOT EXISTS",
+        s"EXPECT QUERY HASH '$validHash' IF EXISTS EXTRA",
+        s"EXPECT HASH '$validHash' IF EXISTS",
+        s"EXPECT QUERY HASH $validHash IF EXISTS",
+        "EXPECT QUERY HASH '' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcde' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcdef0' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcdeg' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcde''f' IF EXISTS"
+      )
+      statements.foreach { suffix =>
+        withClue(suffix) {
+          an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(
+            s"REFRESH MATERIALIZED VIEW v $suffix"
+          )
+        }
+      }
     }
   }
 
