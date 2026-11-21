@@ -5600,7 +5600,7 @@ case class RefreshMaterializedViewCommand(
             CompiledRefresh(meta.refreshType, meta.refreshTypeName, sql, initialLoad.getOrElse(""))
           }
         else None
-      val cached          = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
+      val cached = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
       val compileCacheHit = cached.isDefined
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
