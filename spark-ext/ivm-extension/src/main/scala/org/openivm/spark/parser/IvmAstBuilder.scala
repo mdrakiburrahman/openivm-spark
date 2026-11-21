@@ -80,13 +80,20 @@ private[parser] class IvmAstBuilder(session: SparkSession, delegate: ParserInter
     val expectedQueryHash = Option(ctx.expectedQueryHash).map(token => parseExpectedQueryHash(token.getText))
     RefreshMaterializedViewCommand(
       toTableIdentifier(ctx.multipartIdentifier()),
-      expectedQueryHash = expectedQueryHash
+      expectedQueryHash = expectedQueryHash,
+      expectedTableId = Option(ctx.expectedTableId).map(token => parseExpectedTableId(token.getText))
     )
   }
 
   private def parseExpectedQueryHash(literal: String): String = {
     if (!literal.matches("'[0-9a-fA-F]{32}'"))
       parseError("expected query hash must be exactly 32 hexadecimal characters")
+    literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
+  }
+
+  private def parseExpectedTableId(literal: String): String = {
+    if (!literal.matches("'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'"))
+      parseError("expected table ID must be a canonical Delta UUID")
     literal.substring(1, literal.length - 1).toLowerCase(java.util.Locale.ROOT)
   }
 

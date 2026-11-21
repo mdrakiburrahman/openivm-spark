@@ -4205,8 +4205,11 @@ case class ShowRefreshEligibilityCommand(name: TableIdentifier, expectedQueryHas
 case class RefreshMaterializedViewCommand(
     name: TableIdentifier,
     sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None,
-    expectedQueryHash: Option[String] = None
+    expectedQueryHash: Option[String] = None,
+    expectedTableId: Option[String] = None
 ) extends LeafRunnableCommand {
+
+  require(expectedTableId.isEmpty || expectedQueryHash.isDefined, "A table ID pin requires an expected query hash")
 
   override val output: Seq[Attribute] =
     if (expectedQueryHash.isDefined)
@@ -4269,6 +4272,8 @@ case class RefreshMaterializedViewCommand(
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         val missing = expectedQueryHash.isDefined && MvCatalog.lookup(spark, name).isEmpty
         if (missing) {
+          if (expectedTableId.isDefined)
+            throw new IllegalStateException(s"Pinned materialized view ${sqlIdent(name)} is absent")
           if (spark.catalog.tableExists(sqlIdent(name)))
             throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
           absent = true
@@ -4890,6 +4895,10 @@ case class RefreshMaterializedViewCommand(
               s"Materialized view ${sqlIdent(name)} has no matching persisted physical Delta table ID; " +
                 "guarded refresh cannot verify this target"
             )
+          expectedTableId.foreach { expected =>
+            if (expected != tableId)
+              throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} expected table ID mismatch")
+          }
           recordTargetId(tableId)
         }
       }

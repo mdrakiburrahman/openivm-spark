@@ -375,6 +375,23 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
       val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("expect", Some("db"))
       cmd.expectedQueryHash shouldBe Some("0123456789abcdefabcdef0123456789")
+      cmd.expectedTableId shouldBe None
+    }
+
+    it("parses a canonical table identity pin and rejects malformed pins") {
+      val prefix = "REFRESH MATERIALIZED VIEW `Lakehouse`.`dbo`.`id` EXPECT QUERY HASH " +
+        "'0123456789abcdef0123456789abcdef' EXPECT TABLE ID "
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(prefix + "'ABCDEF01-2345-6789-ABCD-EF0123456789' IF EXISTS")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("id", Some("dbo"), Some("Lakehouse"))
+      cmd.expectedTableId shouldBe Some("abcdef01-2345-6789-abcd-ef0123456789")
+      Seq(
+        prefix + "'abcdef0123456789abcdef0123456789' IF EXISTS",
+        prefix + "'abcdef01-2345-6789-abcd-ef012345678g' IF EXISTS",
+        prefix + "'abcdef01-2345-6789-abcd-ef0123456789'",
+        "REFRESH MATERIALIZED VIEW v EXPECT TABLE ID 'abcdef01-2345-6789-abcd-ef0123456789' IF EXISTS"
+      ).foreach(sqlText => intercept[ParseException](spark.sessionState.sqlParser.parsePlan(sqlText)))
     }
 
     it("preserves three-part targets and rejects four-part targets") {

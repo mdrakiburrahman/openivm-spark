@@ -49,6 +49,21 @@ managed drop/recreate can validate a new identity, and a drop can yield
 `absent`. Callers must inspect the strict result and compare its identity to
 the probe when their policy requires continuity.
 
+When the loaded engine advertises `ensure_refresh_table_id_v1`, callers can
+pin the eligible physical ID before refresh writes:
+
+```sql
+REFRESH MATERIALIZED VIEW `lakehouse`.`schema`.`view`
+EXPECT QUERY HASH '0123456789abcdef0123456789abcdef'
+EXPECT TABLE ID '01234567-89ab-cdef-0123-456789abcdef' IF EXISTS
+```
+
+The pinned form fails if the target is absent or its validated live and
+persisted ID differs from the pin. It does not fall back or recreate the view.
+Failure telemetry may be recorded, but the rejected refresh does not advance
+the target or source state or publish a checkpoint. The unpinned v2 form
+retains its original behavior.
+
 ## Crash-safe state-sync snapshots
 
 Synchronous backups retain per-namespace request barriers: only requests captured

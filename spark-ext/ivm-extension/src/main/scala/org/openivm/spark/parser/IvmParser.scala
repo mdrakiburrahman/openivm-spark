@@ -49,7 +49,10 @@ class IvmParser(session: SparkSession, override protected val delegate: ParserIn
     if (sqlText.trim.stripSuffix(";").trim.equalsIgnoreCase("SET spark.openivm.capabilities")) {
       val capabilitiesKey = "spark.openivm.capabilities"
       if (FeatureGate.enabled(session)) {
-        session.conf.set(capabilitiesKey, "ensure_refresh_v2,ensure_refresh_eligibility_v1")
+        session.conf.set(
+          capabilitiesKey,
+          "ensure_refresh_v2,ensure_refresh_eligibility_v1,ensure_refresh_table_id_v1"
+        )
       } else {
         session.conf.unset(capabilitiesKey)
       }
