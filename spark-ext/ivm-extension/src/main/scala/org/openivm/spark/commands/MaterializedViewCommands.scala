@@ -8380,7 +8380,7 @@ case class RefreshMaterializedViewCommand(
     val inserts = statements.zipWithIndex.filter { case (s, _) => insertRe.findFirstIn(s).isDefined }
     if (deletes.size != 1 || inserts.size != 1 || inserts.head._2 != deletes.head._2 + 1) return None
     val (deleteSql, deleteIdx) = deletes.head
-    val resolver              = spark.sessionState.analyzer.resolver
+    val resolver               = spark.sessionState.analyzer.resolver
     def keyPair(e: Expression): Option[(String, String)] = e match {
       case EqualNullSafe(a: UnresolvedAttribute, b: UnresolvedAttribute)
           if a.nameParts.size == 2 && b.nameParts.size == 2 =>
@@ -8436,16 +8436,21 @@ case class RefreshMaterializedViewCommand(
     val sourceKeys = keyFields.zip(keyNames).map { case ((_, source), key) =>
       s"${quoteCol(source.name)} AS ${quoteCol(key)}"
     }
-    val condition = keyFields.zip(keyNames).map { case ((targetField, _), key) =>
-      s"v.${quoteCol(targetField.name)} <=> d.${quoteCol(key)}"
-    }.mkString(" AND ")
+    val condition = keyFields
+      .zip(keyNames)
+      .map { case ((targetField, _), key) =>
+        s"v.${quoteCol(targetField.name)} <=> d.${quoteCol(key)}"
+      }
+      .mkString(" AND ")
     Some(
       s"""|MERGE INTO $target AS v
           |USING (
           |  SELECT ${columns.mkString(", ")}, ${emptyKeys.mkString(", ")}, false AS ${quoteCol(deleteName)}
           |  FROM ${quoteCol(newView)}
           |  UNION ALL
-          |  SELECT DISTINCT ${emptyColumns.mkString(", ")}, ${sourceKeys.mkString(", ")}, true AS ${quoteCol(deleteName)}
+          |  SELECT DISTINCT ${emptyColumns.mkString(", ")}, ${sourceKeys.mkString(", ")}, true AS ${quoteCol(
+           deleteName
+         )}
           |  FROM ${quoteCol(shape.affectedView)}
           |) AS d
           |ON d.${quoteCol(deleteName)} AND $condition
