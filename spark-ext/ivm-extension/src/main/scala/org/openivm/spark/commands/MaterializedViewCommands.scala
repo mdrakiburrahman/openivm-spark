@@ -4162,7 +4162,7 @@ case class ShowRefreshEligibilityCommand(name: TableIdentifier, expectedQueryHas
       Seq(Row("lifecycle_required", expectedQueryHash, target, null, reason))
 
     RefreshMutex.withReadLock(metaName(name)) {
-      MvCatalog.lookup(spark, name) match {
+      MvCatalog.lookupReadOnly(spark, name) match {
         case None => decline("registration_missing")
         case Some(meta) =>
           val ownership = MaterializedViewLifecycle.liveOwnership(spark, name, meta)

@@ -713,6 +713,23 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
+  override def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
+    val path = perMvDbPath(spark, serializeName(name))
+    val exists =
+      try {
+        Files.readAttributes(Paths.get(path), classOf[BasicFileAttributes])
+        true
+      } catch {
+        case _: java.nio.file.NoSuchFileException => false
+      }
+    if (!exists) None
+    else
+      Some(readMetadataAtPath(spark, path).getOrElse {
+        throw new IllegalStateException(s"Incomplete MV registration for ${serializeName(name)}")
+      })
+  }
+
   def list(spark: SparkSession): Seq[MvMetadata] = {
     OpenIvmStateSync.maybeRestore(spark)
     OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
@@ -862,6 +879,9 @@ object MvCatalog {
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
+
+  def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    backend(spark).lookupReadOnly(spark, name)
 
   def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
 

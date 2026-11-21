@@ -162,6 +162,8 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
       intercept[Exception](guarded("ensure_unmanaged_p14"))
       decline("`ensure_unmanaged_p14`", "registration_missing")
+      MvCatalog.prepareCreate(spark, TableIdentifier("ensure_corrupt_p14", Some("default")))
+      intercept[Exception](eligibility("`default`.`ensure_corrupt_p14`"))
     }
 
     it("validates the live definition before writing and returns refresh proof") {
@@ -276,6 +278,31 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         originalAsync match {
           case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
           case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+    }
+
+    it("does not create a missing Delta catalog and rejects an invalid catalog") {
+      val root = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")), "eligibility_catalog")
+      val metadata = new java.io.File(root, "mv_metadata")
+      metadata.exists() shouldBe false
+      val oldBackend = spark.conf.getOption("spark.openivm.catalog.backend")
+      val oldPath    = spark.conf.getOption("spark.openivm.catalog.path")
+      spark.conf.set("spark.openivm.catalog.backend", "delta")
+      spark.conf.set("spark.openivm.catalog.path", root.toString)
+      try {
+        decline("`default`.`ensure_delta_absent_p18`", "registration_missing")
+        metadata.exists() shouldBe false
+        metadata.mkdirs() shouldBe true
+        intercept[Exception](eligibility("`default`.`ensure_delta_absent_p18`"))
+      } finally {
+        oldBackend match {
+          case Some(value) => spark.conf.set("spark.openivm.catalog.backend", value)
+          case None        => spark.conf.unset("spark.openivm.catalog.backend")
+        }
+        oldPath match {
+          case Some(value) => spark.conf.set("spark.openivm.catalog.path", value)
+          case None        => spark.conf.unset("spark.openivm.catalog.path")
         }
       }
     }

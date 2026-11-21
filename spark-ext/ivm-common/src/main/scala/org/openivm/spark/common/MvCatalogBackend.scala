@@ -8,6 +8,7 @@ private[common] trait MvCatalogBackend {
   def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = ()
   def upsert(spark: SparkSession, meta: MvMetadata): Unit
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata]
+  def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata]
   def list(spark: SparkSession): Seq[MvMetadata]
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata]
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit

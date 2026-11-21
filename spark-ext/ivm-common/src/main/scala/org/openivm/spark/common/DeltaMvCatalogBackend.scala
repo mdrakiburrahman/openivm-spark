@@ -116,6 +116,25 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       .map(decode)
   }
 
+  override def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val catalogPath = new org.apache.hadoop.fs.Path(path(spark))
+    val fs          = catalogPath.getFileSystem(spark.sessionState.newHadoopConf())
+    if (!fs.exists(catalogPath)) None
+    else {
+      val rows = spark.read
+        .format("delta")
+        .load(path(spark))
+        .filter(col(Name) === lit(serializedName(name)))
+        .take(2)
+      if (rows.length > 1)
+        throw new IllegalStateException(s"Duplicate MV registration for ${serializedName(name)}")
+      rows.headOption.map { row =>
+        if (row.anyNull) throw new IllegalStateException(s"Incomplete MV registration for ${serializedName(name)}")
+        decode(row)
+      }
+    }
+  }
+
   override def list(spark: SparkSession): Seq[MvMetadata] = {
     ensureTables(spark)
     spark.read.format("delta").load(path(spark)).orderBy(col(Name)).collect().toSeq.map(decode)
