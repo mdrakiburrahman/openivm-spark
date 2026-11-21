@@ -181,17 +181,19 @@ object LptsSparkDialect {
     * producing an alias-arity error when the source has multiple columns.
     * The parentheses around one boolean column carry no SQL semantics.
     */
-  private[compiler] def rewriteParenthesizedBareWhere(sql: String): String =
+  private[compiler] def rewriteParenthesizedBareWhere(sql: String): String = {
+    val matcher = BareWhereParenRe.pattern.matcher(sql)
+    if (!matcher.find()) return sql
     SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
       if (
         !sql.regionMatches(true, index, "WHERE", 0, 5) ||
         (index > 0 && (Character.isLetterOrDigit(sql.charAt(index - 1)) || sql.charAt(index - 1) == '_'))
       ) None
       else {
-        val matcher = BareWhereParenRe.pattern.matcher(sql).region(index, sql.length)
-        if (matcher.lookingAt()) Some((matcher.end(), s"WHERE ${matcher.group(1)}")) else None
+        if (matcher.region(index, sql.length).lookingAt()) Some((matcher.end(), s"WHERE ${matcher.group(1)}")) else None
       }
     }
+  }
 
   /** Spark keeps DISTINCT on a generated anti-join RHS as a hash aggregate.
     * The DuckDB 2.0 optimizer omits it because the anti join is semantically

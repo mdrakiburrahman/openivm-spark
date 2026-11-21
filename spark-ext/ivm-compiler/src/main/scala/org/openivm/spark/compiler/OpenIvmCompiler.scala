@@ -22,7 +22,7 @@ final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
     sql: String,             // full refresh SQL program in the target dialect
-    initialLoadSql: String   // SELECT query for initial MV load including hidden columns; empty if unavailable
+    initialLoadSql: String   // Spark SQL for initial MV load including hidden columns; empty if unavailable
 )
 
 /** Sources: Spark table name → resolved StructType.  Used by the bridge to

@@ -1015,11 +1015,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         LptsSparkDialect.translate(s)
     }
 
-    it("is idempotent for SQL containing backslash/quote literals (double translate, as happens in production)") {
-      // OpenIvmCompiler.parseInitialLoadSql already calls translate() once
-      // before storing initialLoadSql; MaterializedViewCommands then calls
-      // translate() again on that already-translated value at every CREATE
-      // call site. This must be a safe no-op on the second call.
+    it("is idempotent for SQL containing backslash/quote literals") {
       val s =
         "SELECT id, REPLACE(REPLACE(os_name, '\\', '_'), '''', '_') AS cleaned FROM t"
       LptsSparkDialect.translate(LptsSparkDialect.translate(s)) shouldBe

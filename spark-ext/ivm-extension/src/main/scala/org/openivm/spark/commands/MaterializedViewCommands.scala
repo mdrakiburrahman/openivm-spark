@@ -2233,7 +2233,7 @@ private[commands] object MvCommandHelper {
       case None                                       => spec
       case Some(_) if compiled.initialLoadSql.isEmpty => spec.copy(suffixSql = None)
       case Some(suffix) =>
-        val inner = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val inner = compiled.initialLoadSql
         val cols  = userOutputColumns.map(c => s"`${c.replace("`", "``")}`").mkString(", ")
         try {
           spark.sql(s"SELECT $cols FROM ($inner) __openivm_topk_preview $suffix").queryExecution.analyzed
@@ -2409,7 +2409,7 @@ private[commands] object MvCommandHelper {
     else {
       val incrementalViewBodySql =
         if (compiled.initialLoadSql.isEmpty) originalQueryText
-        else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        else compiled.initialLoadSql
       try
         Some(
           spark
@@ -3186,7 +3186,7 @@ case class CreateMaterializedViewCommand(
           pinBinding.resolvedPins
         )
       else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        compiled.initialLoadSql
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
     }
