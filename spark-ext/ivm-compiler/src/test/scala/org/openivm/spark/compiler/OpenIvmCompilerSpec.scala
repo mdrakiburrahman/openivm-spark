@@ -7,8 +7,9 @@ import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, T
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, WorkloadFacts}
+import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -250,6 +251,76 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
     result.sql should not be empty
+  }
+
+  it should "translate native struct access and LAG SQL for Spark initial load" in {
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_struct_lag",
+        viewSql =
+          "SELECT id, payload.name AS name, LAG(ts) OVER (PARTITION BY id ORDER BY ts) AS prior FROM struct_src",
+        sources = Map("struct_src" -> StructType.fromDDL("id INT, payload STRUCT<name: STRING>, ts TIMESTAMP"))
+      )
+    )
+    val sql = LptsSparkDialect.translate(result.initialLoadSql)
+    sql.toLowerCase(java.util.Locale.ROOT) should not include "system.main"
+    sql.toUpperCase(java.util.Locale.ROOT) should not include "LAG(TS) OVER (PARTITION BY ID ORDER BY TS ROWS"
+    noException should be thrownBy org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(sql)
+  }
+
+  it should "translate the joined TPC-DI offset window initial load" in {
+    val schemas = Map(
+      "brokerage_trade"         -> StructType.fromDDL("t_id BIGINT, t_dts TIMESTAMP, t_st_id STRING, t_tt_id STRING"),
+      "brokerage_trade_history" -> StructType.fromDDL("th_t_id BIGINT, th_dts TIMESTAMP, th_st_id STRING"),
+      "reference_trade_type"    -> StructType.fromDDL("tt_id STRING"),
+      "reference_status_type"   -> StructType.fromDDL("st_id STRING")
+    )
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_joined_lag",
+        viewSql = """SELECT t.t_id, coalesce(lag(h.th_dts) OVER (
+            | PARTITION BY t.t_id ORDER BY h.th_dts DESC, t.t_dts DESC, t.t_st_id DESC, h.th_st_id DESC
+            |) - INTERVAL 1 MILLISECOND, to_timestamp('9999-12-31 23:59:59.999')) AS end_timestamp,
+            |CASE WHEN row_number() OVER (
+            | PARTITION BY t.t_id ORDER BY h.th_dts DESC, t.t_dts DESC, t.t_st_id DESC, h.th_st_id DESC
+            |) = 1 THEN true ELSE false END AS is_current
+            |FROM brokerage_trade t JOIN brokerage_trade_history h ON t.t_id = h.th_t_id
+            |JOIN reference_trade_type tt ON t.t_tt_id = tt.tt_id
+            |JOIN reference_status_type ts ON t.t_st_id = ts.st_id
+            |JOIN reference_status_type us ON h.th_st_id = us.st_id""".stripMargin,
+        sources = schemas
+      )
+    )
+    val sql = LptsSparkDialect.translate(result.initialLoadSql)
+    // DuckDB 2.0 may serialize LAG's implicit offset and default explicitly.
+    sql.toLowerCase(java.util.Locale.ROOT) should fullyMatch regex
+      "(?s).*lag\\(th_dts(?:, 1, cast\\(null as timestamp\\))?\\) over.*"
+    noException should be thrownBy org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(sql)
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-offset-window-test")
+      .config("spark.ui.enabled", "false")
+      .getOrCreate()
+    try {
+      schemas.foreach { case (name, schema) =>
+        spark.createDataFrame(spark.sparkContext.emptyRDD[Row], schema).createOrReplaceTempView(name)
+      }
+      noException should be thrownBy spark.sql(sql).queryExecution.analyzed
+      val leadSql = LptsSparkDialect.translate(
+        "SELECT lead(th_dts, CAST(2 AS BIGINT)) OVER (ORDER BY th_dts) FROM brokerage_trade_history"
+      )
+      noException should be thrownBy spark.sql(leadSql).queryExecution.analyzed
+      val monthSql = LptsSparkDialect.translate(
+        "SELECT CAST(DATE '2015-01-31' + system.main.add(system.main.to_months(1), system.main.to_days(0)) AS DATE)"
+      )
+      spark.sql(monthSql).collect()(0).getDate(0).toLocalDate shouldBe LocalDate.parse("2015-02-28")
+      val microsSql = LptsSparkDialect.translate(
+        "SELECT CAST(TIMESTAMP '2020-01-01 00:00:00.000001' - " +
+          "system.main.add(system.main.to_months(0), system.main.to_microseconds(1)) AS STRING)"
+      )
+      spark.sql(microsSql).collect()(0).getString(0) shouldBe "2020-01-01 00:00:00"
+    } finally spark.stop()
   }
 
   it should "preserve TRY_TO_TIMESTAMP in compiled refresh and initial load SQL" in {
@@ -963,6 +1034,47 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     sharedCompiler.declareRelyFkStatements(req) should contain only
       """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
+  }
+
+  it should "apply qualified source delta shapes to the short DuckDB compiler tables" in {
+    val sources = Map(
+      "orders"   -> StructType.fromDDL("order_id INT, product_id INT"),
+      "products" -> StructType.fromDDL("product_id INT, product_name STRING")
+    )
+    val qualifiedFacts = WorkloadFacts(
+      deltaShape = Map("sales.orders" -> DeltaShape.InsertOnly, "catalog.sales.products" -> DeltaShape.Unchanged)
+    )
+    val req = CompileRequest(
+      viewName = "mv_qualified_delta_shape",
+      viewSql =
+        "SELECT o.order_id, p.product_name FROM sales.orders o JOIN catalog.sales.products p ON o.product_id = p.product_id",
+      sources = sources,
+      sourceQualifiedNames = Map("orders" -> "sales.orders", "products" -> "catalog.sales.products"),
+      facts = qualifiedFacts
+    )
+    sharedCompiler.nativeDeltaShape(req) shouldBe Map(
+      "orders"   -> DeltaShape.InsertOnly,
+      "products" -> DeltaShape.Unchanged
+    )
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
+    ) shouldBe Map("other.products" -> DeltaShape.Unchanged)
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts =
+        WorkloadFacts(deltaShape =
+          Map(
+            "catalog.sales.products" -> DeltaShape.Unchanged,
+            "products"               -> DeltaShape.InsertOnly
+          )
+        )
+      )
+    ) shouldBe Map("products" -> DeltaShape.General)
+
+    val compiled = sharedCompiler.compile(req)
+    compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+    val viewDelta = compiled.sql.take(compiled.sql.indexOf("INSERT INTO openivm_delta_mv_qualified_delta_shape"))
+    viewDelta should include("openivm_delta_orders")
+    viewDelta should not include "openivm_delta_products"
   }
 
   it should "terminate a stalled DuckDB CLI within the compilation deadline" in {

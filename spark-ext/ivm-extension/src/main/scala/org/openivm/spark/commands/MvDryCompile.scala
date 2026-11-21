@@ -210,7 +210,7 @@ object MvDryCompile {
     import MvCommandHelper._
     if (classification.refreshType == RefreshTypeCode.FullRefresh) {
       val body =
-        if (compiled.initialLoadSql.nonEmpty) LptsSparkDialect.translate(compiled.initialLoadSql)
+        if (compiled.initialLoadSql.nonEmpty) compiled.initialLoadSql
         else queryText
       SparkMergeAssembler
         .assemble(

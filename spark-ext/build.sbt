@@ -99,8 +99,11 @@ lazy val ivmExtension = (project in file("ivm-extension"))
         case Some(dir) =>
           val outDir = (Compile / resourceManaged).value / "openivm-native"
           IO.createDirectory(outDir)
-          Seq("duckdb", "openivm.duckdb_extension").flatMap { name =>
-            val src = file(dir) / name
+          val nativeDir = file(dir)
+          val required  = Seq("duckdb", "openivm.duckdb_extension")
+          val libraries = Seq("libstdc++.so.6", "libgcc_s.so.1").filter(name => (nativeDir / name).exists())
+          (required ++ libraries).flatMap { name =>
+            val src = nativeDir / name
             if (!src.exists())
               sys.error(s"OPENIVM_NATIVE_DIR set but missing native binary: $src")
             val dst = outDir / name

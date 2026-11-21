@@ -55,7 +55,7 @@ import org.openivm.spark.telemetry.{
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
-import java.util.{Collections, UUID}
+import java.util.{Collections, LinkedHashMap, UUID}
 import java.util.concurrent.locks.ReentrantLock
 import scala.util.control.NonFatal
 
@@ -64,10 +64,34 @@ import scala.util.control.NonFatal
 // ---------------------------------------------------------------------------
 private[commands] object OpenIvmCompilers {
 
-  private val cache: java.util.Map[SparkSession, OpenIvmCompiler] =
-    Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, OpenIvmCompiler]())
+  final class SessionCompiler(val compiler: OpenIvmCompiler) {
+    private val refreshPrograms = new LinkedHashMap[CompileRequest, CompiledRefresh](16, 0.75f, true)
 
-  def forSession(spark: SparkSession): OpenIvmCompiler = {
+    def cachedRefresh(request: CompileRequest): Option[CompiledRefresh] =
+      refreshPrograms.synchronized(Option(refreshPrograms.get(request)))
+
+    def rememberRefresh(request: CompileRequest, compiled: CompiledRefresh): Unit =
+      if (
+        compiled.refreshType != RefreshTypeCode.FullRefresh && compiled.sql.nonEmpty &&
+        compiled.sql.length.toLong + compiled.initialLoadSql.length <= 256 * 1024
+      ) {
+        refreshPrograms.synchronized {
+          refreshPrograms.put(request, compiled)
+          if (refreshPrograms.size() > 64) {
+            val oldest = refreshPrograms.keySet().iterator()
+            oldest.next()
+            oldest.remove()
+          }
+        }
+      }
+  }
+
+  private val cache: java.util.Map[SparkSession, SessionCompiler] =
+    Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, SessionCompiler]())
+
+  def forSession(spark: SparkSession): OpenIvmCompiler = session(spark).compiler
+
+  def session(spark: SparkSession): SessionCompiler = {
     val existing = cache.get(spark)
     if (existing != null) return existing
     val waitStarted = System.nanoTime()
@@ -75,10 +99,11 @@ private[commands] object OpenIvmCompilers {
       OpenIvmMetrics.updateTimer("compiler.cache.lock.wait", System.nanoTime() - waitStarted)
       val existing2 = cache.get(spark)
       if (existing2 != null) return existing2
-      val c = buildForSession(spark)
-      cache.put(spark, c)
-      Runtime.getRuntime.addShutdownHook(new Thread(() => c.close()))
-      c
+      val compiler = buildForSession(spark)
+      val session  = new SessionCompiler(compiler)
+      cache.put(spark, session)
+      Runtime.getRuntime.addShutdownHook(new Thread(() => compiler.close()))
+      session
     }
   }
 
@@ -118,14 +143,14 @@ private[commands] object OpenIvmCompilers {
       OpenIvmCompiler.build(
         extensionPath = extEnv,
         cliPath = cliEnv,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(Option(new java.io.File(cliEnv).getParent))
       )
     else {
       val (extPath, cliPath) = extractBundledAssets(spark)
       OpenIvmCompiler.build(
         extensionPath = extPath,
         cliPath = cliPath,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(Option(new java.io.File(cliPath).getParent))
       )
     }
   }
@@ -159,6 +184,11 @@ private[commands] object OpenIvmCompilers {
 
     extract("/openivm-native/openivm.duckdb_extension", ext)
     extract("/openivm-native/duckdb", cli)
+    Seq("libstdc++.so.6", "libgcc_s.so.1").foreach { name =>
+      val resource = s"/openivm-native/$name"
+      if (getClass.getResource(resource) != null)
+        extract(resource, new java.io.File(localDir, name))
+    }
     cli.setExecutable(true, /* ownerOnly = */ false)
     (ext.getAbsolutePath, cli.getAbsolutePath)
   }
@@ -2228,7 +2258,7 @@ private[commands] object MvCommandHelper {
       case None                                       => spec
       case Some(_) if compiled.initialLoadSql.isEmpty => spec.copy(suffixSql = None)
       case Some(suffix) =>
-        val inner = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val inner = compiled.initialLoadSql
         val cols  = userOutputColumns.map(c => s"`${c.replace("`", "``")}`").mkString(", ")
         try {
           spark.sql(s"SELECT $cols FROM ($inner) __openivm_topk_preview $suffix").queryExecution.analyzed
@@ -2404,7 +2434,7 @@ private[commands] object MvCommandHelper {
     else {
       val incrementalViewBodySql =
         if (compiled.initialLoadSql.isEmpty) originalQueryText
-        else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        else compiled.initialLoadSql
       try
         Some(
           spark
@@ -2925,6 +2955,8 @@ case class CreateMaterializedViewCommand(
         )
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
+          val compileCause = Option(e.getMessage).getOrElse(e.toString).replace('\n', ' ').take(512)
+          profile.timeStep("create_compile_failure", s"cause=$compileCause") { () }
           val compileFailedClassification =
             authoritativeFullRefreshClassification(
               compileRefreshTypeName = "COMPILE_FAILED",
@@ -3103,6 +3135,10 @@ case class CreateMaterializedViewCommand(
     val classifyReason           = classification.reason
     val effectiveRefreshTypeName = classification.refreshTypeName
     val emitsCascadeViewDelta    = classification.emitsCascadeViewDelta
+    profile.timeStep(
+      "create_compiler_verdict",
+      s"compiled=${classification.compileRefreshTypeName};effective=$effectiveRefreshTypeName;reason=$classifyReason"
+    ) { () }
     OpenIvmExecutionSpan.recordActiveRefreshClassification(
       compileRefreshType = Some(classification.compileRefreshTypeName),
       effectiveRefreshType = Some(effectiveRefreshTypeName),
@@ -3175,7 +3211,7 @@ case class CreateMaterializedViewCommand(
           pinBinding.resolvedPins
         )
       else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        compiled.initialLoadSql
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
     }
@@ -5521,56 +5557,51 @@ case class RefreshMaterializedViewCommand(
         refreshResolvedPins,
         freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
       )
-      val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
-      val constraintFacts     = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
-      val cacheTierFacts = WorkloadFacts(
+      val compileCacheEnabled      = FeatureGate.compileClassificationCacheEnabled(spark)
+      val constraintFacts          = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
+      val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
+      val compileFacts = WorkloadFacts(
         forceViewDeltaCascade = !terminalInsertOnlyAggregate,
         assumeInsertOnly = insertOnlyAggregate ||
-          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
-            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+          (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+        runningWindowIncremental = runningWindowIncremental,
         deltaShape = sourceDeltaShape,
         fkRelations = constraintFacts.fkRelations,
         uniqueKeys = constraintFacts.uniqueKeys,
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
       )
-      val compileCacheTier                            = MvMetadata.compileCacheTier(cacheTierFacts)
-      var refreshProperties                           = meta.properties
-      var observedCompileFacts: Option[WorkloadFacts] = None
-      def refreshCompileFacts(): WorkloadFacts = {
-        val statsFacts = SparkDeltaStatsService
-          .forRefresh()
-          .workloadFactsFor(spark, meta.sourceTables, changeBatches)
-        val facts = statsFacts.copy(
-          deltaShape = sourceDeltaShape,
-          fkRelations = constraintFacts.fkRelations,
-          uniqueKeys = constraintFacts.uniqueKeys,
-          declareRelyFk = FeatureGate.declareRelyFkEnabled(spark),
-          runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
-          forceViewDeltaCascade = !terminalInsertOnlyAggregate,
-          assumeInsertOnly = insertOnlyAggregate ||
-            (FeatureGate.windowRunningIncrementalEnabled(spark) &&
-              meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly)
-        )
-        observedCompileFacts = Some(facts)
-        facts
+      // Quantitative statistics are consumed by Spark's cost model. The native
+      // compiler receives shape and constraint facts, so row counts do not
+      // invalidate a reusable SQL program.
+      lazy val refreshCostFacts = {
+        val stats = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, meta.sourceTables, changeBatches)
+        compileFacts.copy(tableStats = stats.tableStats, columnStats = stats.columnStats, deltaStats = stats.deltaStats)
       }
+      val compileCacheTier  = MvMetadata.compileCacheTier(compileFacts)
+      var refreshProperties = meta.properties
+      val compileRequest = CompileRequest(
+        viewName = name.table,
+        viewSql = meta.querySql,
+        sources = compileSchemas,
+        sourceQualifiedNames = shortToQual,
+        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
+        facts = compileFacts
+      )
+      lazy val sessionCompiler = OpenIvmCompilers.session(spark)
+      val reuseInSession       = preparedSourceAdvance.isEmpty && refreshResolvedPins.isEmpty
 
-      // Reuse only the schema/tier-keyed, shape-stable compiled SQL.  The cached
-      // text is intentionally NOT rewritten SQL: every REFRESH below still calls
-      // SparkRefreshRewriter.rewrite, which recreates the per-refresh
-      // `openivm_old_*` / `openivm_new_*` snapshot temp views and substitutes a
-      // fresh view-delta path before execution.
-      val cachedCompiledSql =
+      // Store the native program before rewriting it for this invocation's
+      // Delta versions, temporary views, and output paths.
+      val persisted =
         if (compileCacheEnabled)
-          MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
+          MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier).map { sql =>
+            val initialLoad =
+              MvMetadata.cachedInitialLoadSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
+            CompiledRefresh(meta.refreshType, meta.refreshTypeName, sql, initialLoad.getOrElse(""))
+          }
         else None
-      val cachedInitialLoadSql =
-        if (compileCacheEnabled) {
-          MvMetadata
-            .cachedInitialLoadSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
-            .getOrElse("")
-        } else ""
-      val compileCacheHit = cachedCompiledSql.isDefined
+      val cached = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
+      val compileCacheHit = cached.isDefined
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
         "generate_refresh_sql.compile",
@@ -5582,49 +5613,31 @@ case class RefreshMaterializedViewCommand(
           "compile",
           s"compile_cache_hit=$compileCacheHit compile_cache_tier=$compileCacheTier"
         ) {
-          cachedCompiledSql match {
-            case Some(sql) =>
-              org.openivm.spark.compiler.CompiledRefresh(
-                refreshType = meta.refreshType,
-                refreshTypeName = meta.refreshTypeName,
-                sql = sql,
-                initialLoadSql = cachedInitialLoadSql
-              )
-            case None =>
-              val compiler     = OpenIvmCompilers.forSession(spark)
-              val compileFacts = refreshCompileFacts()
-              val fresh = compiler.compile(
-                CompileRequest(
-                  viewName = name.table,
-                  viewSql = meta.querySql,
-                  sources = compileSchemas,
-                  sourceQualifiedNames = shortToQual,
-                  sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-                  facts = compileFacts
+          cached.getOrElse {
+            val fresh = sessionCompiler.compiler.compile(compileRequest)
+            if (reuseInSession) sessionCompiler.rememberRefresh(compileRequest, fresh)
+            if (compileCacheEnabled && fresh.sql.nonEmpty) {
+              val backfilled = refreshProperties ++
+                MvMetadata.compiledProperties(
+                  meta.sourceSchemaFingerprint,
+                  compileCacheTier,
+                  fresh.sql,
+                  fresh.initialLoadSql,
+                  fresh.refreshType,
+                  fresh.refreshTypeName
                 )
-              )
-              if (compileCacheEnabled && fresh.sql.nonEmpty) {
-                val backfilled = refreshProperties ++
-                  MvMetadata.compiledProperties(
-                    meta.sourceSchemaFingerprint,
-                    compileCacheTier,
-                    fresh.sql,
-                    fresh.initialLoadSql,
-                    fresh.refreshType,
-                    fresh.refreshTypeName
+              try {
+                MvCatalog.updateProperties(spark, name, backfilled)
+                refreshProperties = backfilled
+              } catch {
+                case t: Throwable =>
+                  logWarning(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
+                      s"${t.getClass.getName}: ${t.getMessage}"
                   )
-                try {
-                  MvCatalog.updateProperties(spark, name, backfilled)
-                  refreshProperties = backfilled
-                } catch {
-                  case t: Throwable =>
-                    logWarning(
-                      s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
-                        s"${t.getClass.getName}: ${t.getMessage}"
-                    )
-                }
               }
-              fresh
+            }
+            fresh
           }
         }
       }
@@ -5748,7 +5761,7 @@ case class RefreshMaterializedViewCommand(
             } else None
 
           if (unifiedIntelligenceEnabled || FeatureGate.costModelEnabled(spark)) {
-            val facts    = observedCompileFacts.getOrElse(refreshCompileFacts())
+            val facts    = refreshCostFacts
             val estimate = RefreshCostModel.estimate(facts)
             val decision = RefreshIntelligence.decide(facts, estimate, runtimeDeltaSizeForDecision)
             OpenIvmInsightEvents.refreshDecision(spark, refreshId, viewMeta, decision)

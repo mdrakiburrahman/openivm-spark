@@ -540,6 +540,8 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       val tier1 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.InsertOnly)))
       val tier2 = MvMetadata.compileCacheTier(WorkloadFacts(deltaShape = Map("orders" -> DeltaShape.General)))
 
+      val runningWindowTier = MvMetadata.compileCacheTier(WorkloadFacts(runningWindowIncremental = true))
+      MvMetadata.compileCacheTier(WorkloadFacts()) should not equal runningWindowTier
       tier1 should not equal tier2
       val props = MvMetadata.compiledProperties(fp1, tier1, "SQL", "INIT", 0, "AGGREGATE_GROUP")
 

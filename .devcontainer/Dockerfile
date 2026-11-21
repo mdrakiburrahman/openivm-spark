@@ -42,7 +42,8 @@ WORKDIR /src
 
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . \
-    && git checkout "${OPENIVM_COMMIT}" \
+    && git fetch --depth 1 origin "${OPENIVM_COMMIT}" \
+    && git checkout --detach "${OPENIVM_COMMIT}" \
     && git config --global url."https://github.com/".insteadOf "git@github.com:" \
     && git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" \
     && git submodule sync --recursive \
@@ -102,7 +103,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 LABEL org.opencontainers.image.description="OpenIVM Spark development and CI toolchain" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://github.com/mdrakiburrahman/openivm-spark" \
+      org.opencontainers.image.source="https://github.com/openivm/openivm-spark" \
       org.opencontainers.image.title="openivm-spark-devcontainer"
 
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \

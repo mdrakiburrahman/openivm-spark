@@ -22,6 +22,7 @@ import org.openivm.spark.common.{
   MvCatalog,
   MvMetadata,
   RefreshTypeCode,
+  SparkRefreshRewriter,
   StagingCatalog,
   StagingChangeBatch,
   StagingDelta,
@@ -29,7 +30,7 @@ import org.openivm.spark.common.{
   TimeTravelPinStatus
 }
 import org.openivm.spark.analyzer.IvmDmlInterceptorRule
-import org.openivm.spark.compiler.CompiledRefresh
+import org.openivm.spark.compiler.{CompiledRefresh, LptsSparkDialect}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.{
   OpenIvmExecutionSpan,
@@ -953,6 +954,63 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("full-refresh cascade view-delta") {
+    it("reuses a fully replaced target for positive cascade rows") {
+      val suffix      = UUID.randomUUID().toString.take(8)
+      val target      = s"published_reuse_$suffix"
+      val source      = s"published_source_$suffix"
+      val targetPath  = s"$warehouseDir/_ivm/test/$target"
+      val deltaPath   = s"$warehouseDir/_ivm/test/${target}_delta"
+      val priorBypass = IvmDmlInterceptorRule.bypass.get()
+      IvmDmlInterceptorRule.bypass.set(true)
+      try {
+        spark
+          .sql(
+            s"CREATE TABLE `$target` USING DELTA LOCATION '$targetPath' AS " +
+              "SELECT col1 AS k, col2 AS v FROM VALUES ('a', 1), ('b', 2), ('b', 2) AS t(col1, col2)"
+          )
+          .collect()
+        spark
+          .sql(
+            s"CREATE OR REPLACE TEMP VIEW `$source` AS " +
+              "SELECT col1 AS k, col2 AS v FROM VALUES ('b', 2), ('c', 3) AS t(col1, col2)"
+          )
+          .collect()
+        val oldVersion = DeltaTableVersion.requireLatest(spark, targetPath)
+        val compiled =
+          s"""CREATE OR REPLACE TEMP TABLE openivm_old_mv_reuse AS SELECT * FROM openivm_data_mv_reuse;
+             |CREATE OR REPLACE TEMP TABLE openivm_new_mv_reuse AS SELECT * FROM `$source`;
+             |DELETE FROM openivm_data_mv_reuse;
+             |INSERT INTO openivm_data_mv_reuse SELECT * FROM openivm_new_mv_reuse;
+             |INSERT INTO openivm_delta_mv_reuse
+             |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_reuse
+             |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_reuse;
+             |DROP TABLE IF EXISTS openivm_old_mv_reuse;
+             |DROP TABLE IF EXISTS openivm_new_mv_reuse;
+             |""".stripMargin
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = compiled,
+          mvName = TableIdentifier(target),
+          mvLocation = targetPath,
+          viewLogicalName = "mv_reuse",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = deltaPath,
+          mvVersionBeforeRefresh = Some(oldVersion)
+        )
+        rewritten.statements.foreach(sql => spark.sql(sql).collect())
+        assertSqlBagEqual(s"SELECT k, v FROM `$target`", s"SELECT k, v FROM `$source`")
+        assertSqlBagEqual(
+          s"SELECT k, v, openivm_multiplicity FROM delta.`$deltaPath`",
+          "SELECT col1 AS k, col2 AS v, col3 AS openivm_multiplicity " +
+            "FROM VALUES ('a', 1, -1), ('b', 2, -1), ('b', 2, -1), " +
+            "('b', 2, 1), ('c', 3, 1) AS t(col1, col2, col3)"
+        )
+      } finally {
+        spark.sql(s"DROP VIEW IF EXISTS `$source`").collect()
+        spark.sql(s"DROP TABLE IF EXISTS `$target`").collect()
+        IvmDmlInterceptorRule.bypass.set(priorBypass)
+      }
+    }
+
     def cascadeFixture(): (String, Long, Seq[String]) = {
       val path           = s"$warehouseDir/_ivm/test/full_refresh_cascade_${UUID.randomUUID().toString.take(8)}"
       val previousBypass = IvmDmlInterceptorRule.bypass.get()
@@ -2274,6 +2332,64 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       mv.exceptAll(groundTruth).count() shouldBe 0L
       groundTruth.exceptAll(mv).count() shouldBe 0L
     }
+
+    it("maintains a RIGHT-join projection after one mixed delta batch") {
+      spark.sql("CREATE TABLE right_fact_t10(id INT, ka INT, kb INT) USING DELTA")
+      spark.sql("CREATE TABLE right_dim_t10(k INT, v STRING) USING DELTA")
+      spark.sql("CREATE TABLE right_aux_t10(k INT, v STRING) USING DELTA")
+      spark.sql("INSERT INTO right_fact_t10 VALUES (1, 10, 20), (2, 11, 21), (3, 12, 20)")
+      spark.sql("INSERT INTO right_dim_t10 VALUES (10, 'a10'), (10, 'a10b'), (11, 'a11')")
+      spark.sql("INSERT INTO right_aux_t10 VALUES (20, 'b20'), (21, 'b21')")
+
+      val query =
+        "SELECT f.id, a.v AS av, b.v AS bv FROM right_dim_t10 a " +
+          "RIGHT JOIN right_fact_t10 f ON a.k = f.ka " +
+          "LEFT JOIN right_aux_t10 b ON f.kb = b.k"
+      spark.sql(s"CREATE MATERIALIZED VIEW right_mv_t10 AS $query")
+      assertSqlBagEqual("SELECT id, av, bv FROM right_mv_t10", query)
+
+      spark.sql("INSERT INTO right_dim_t10 VALUES (12, 'a12')")
+      spark.sql("DELETE FROM right_aux_t10 WHERE k = 21")
+      spark.sql("UPDATE right_dim_t10 SET v = concat(v, 'x') WHERE k = 10")
+      spark.sql("UPDATE right_fact_t10 SET kb = 21 WHERE id = 1")
+      spark.sql("INSERT INTO right_fact_t10 VALUES (4, 12, 21)")
+      spark.sql("DELETE FROM right_dim_t10 WHERE k = 11")
+      spark.sql("REFRESH MATERIALIZED VIEW right_mv_t10")
+      assertSqlBagEqual("SELECT id, av, bv FROM right_mv_t10", query)
+    }
+
+    it("preserves anti-join bag semantics with duplicate right-hand rows") {
+      spark.sql("CREATE TABLE anti_brokers_t10(id INT, name STRING) USING DELTA")
+      spark.sql("CREATE TABLE anti_accounts_t10(id INT, broker_id INT) USING DELTA")
+      spark.sql("CREATE TABLE anti_trades_t10(account_id INT) USING DELTA")
+      spark.sql("INSERT INTO anti_brokers_t10 VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+      spark.sql("INSERT INTO anti_accounts_t10 VALUES (10, 1), (11, 1), (20, 2)")
+      spark.sql("INSERT INTO anti_trades_t10 VALUES (10), (10), (11)")
+
+      val query =
+        "SELECT b.id, b.name FROM anti_brokers_t10 b WHERE NOT EXISTS (" +
+          "SELECT 1 FROM anti_accounts_t10 a JOIN anti_trades_t10 t ON a.id = t.account_id " +
+          "WHERE a.broker_id = b.id)"
+      spark.sql(s"CREATE MATERIALIZED VIEW anti_mv_t10 AS $query")
+      val refreshSql = MvDryCompile.dryCompile(spark, TableIdentifier("anti_mv_dry_t10"), query).compiled.sql
+      val translated = LptsSparkDialect.translate(refreshSql)
+      translated.toUpperCase(java.util.Locale.ROOT) should include("ANTI JOIN")
+      val initialSql = MvCatalog
+        .lookup(spark, TableIdentifier("anti_mv_t10"))
+        .get
+        .properties(MvMetadata.CompiledInitialLoadSqlKey)
+      val initialPlanSql = "EXPLAIN FORMATTED " + LptsSparkDialect.translate(initialSql)
+      val initialPlan    = spark.sql(initialPlanSql).collect().mkString("\n")
+      initialPlan should include("LeftAnti")
+      assertSqlBagEqual("SELECT id, name FROM anti_mv_t10", query)
+
+      spark.sql("DELETE FROM anti_trades_t10 WHERE account_id = 11")
+      spark.sql("INSERT INTO anti_trades_t10 VALUES (20), (20)")
+      spark.sql("UPDATE anti_accounts_t10 SET broker_id = 3 WHERE id = 10")
+      spark.sql("REFRESH MATERIALIZED VIEW anti_mv_t10")
+      assertSqlBagEqual("SELECT id, name FROM anti_mv_t10", query)
+    }
+
   }
 
   // ---------------------------------------------------------------------------

@@ -18,11 +18,11 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
   private var sharedCompiler: OpenIvmCompiler = _
 
   private val goldenHashes: Map[String, String] = Map(
-    "aggregate-group"   -> "bd91dd2c51fb6979d9378b19adabe4b2b26f5d44081c49aea834fa7119fd38a6",
-    "simple-aggregate"  -> "aadb5bbd47d2809c30bfb93990755aaeccd4c2d4be1462f8f506cf9b6766ac77",
-    "simple-projection" -> "18d935257c938c1ec37e170ca74007edbb66c3dd4cbeb8674be1e7f342b42baa",
-    "window-partition"  -> "3418a93acb2dee0a5aee4ddb7f746a4fa44697d0b6e9c118d4caf4935bd473fd",
-    "group-recompute"   -> "84004ce70205de1de41c709acd9a01ea36a588ffbd668d44c755b356041a2520"
+    "aggregate-group"   -> "b1cb5c5e4bd980fe61056710abdbe64c707cdf74f74ca9619c2194aa70ee0a5c",
+    "simple-aggregate"  -> "5cced3f53e5ebbe948ad97e0615258173aa1a949e53d351d2d686a8766eb6cb0",
+    "simple-projection" -> "3a001b9eb0720d66cfc20f562db1780a5a723a350e66c62394c298a0c9997ee5",
+    "window-partition"  -> "2a8a4c0b769586f3db53a5589dcacc7961050449773072709e3a1e1869700cf3",
+    "group-recompute"   -> "8ce86d5a00634b6106840661ddd780282b900d791feccae28842ebf8e26593a9"
   )
 
   private val cases: Seq[GoldenCase] = Seq(

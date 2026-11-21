@@ -6,7 +6,13 @@ import java.util.{Comparator, Locale}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
-import org.openivm.spark.common.{ForeignKeyRelation, MemoryMainRefs, PinnedSourcePathMissingException, WorkloadFacts}
+import org.openivm.spark.common.{
+  DeltaShape,
+  ForeignKeyRelation,
+  MemoryMainRefs,
+  PinnedSourcePathMissingException,
+  WorkloadFacts
+}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
@@ -16,7 +22,7 @@ final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
     sql: String,             // full refresh SQL program in the target dialect
-    initialLoadSql: String   // SELECT query for initial MV load including hidden columns; empty if unavailable
+    initialLoadSql: String   // Spark SQL for initial MV load including hidden columns; empty if unavailable
 )
 
 /** Sources: Spark table name → resolved StructType.  Used by the bridge to
@@ -318,7 +324,9 @@ class OpenIvmCompiler private (
     //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
     //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
     //                                   MV-over-MV chains never fall back to FULL_REFRESH.
-    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(req.facts.toJson)}');\n"
+    // The temporary DuckDB source tables use short names, so qualified Spark facts need the same identity.
+    val nativeFacts = req.facts.copy(deltaShape = nativeDeltaShape(req))
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(nativeFacts.toJson)}');\n"
     sb.toString
   }
 
@@ -510,24 +518,33 @@ class OpenIvmCompiler private (
     )
   }
 
+  private[compiler] def nativeSourceName(req: CompileRequest, table: String): Option[String] = {
+    val exactShort = req.sources.keys.find(_.equalsIgnoreCase(table))
+    val fromQual = req.sourceQualifiedNames.collectFirst {
+      case (short, qualified) if qualified.equalsIgnoreCase(table) && req.sources.contains(short) => short
+    }
+    val trailing =
+      table.split('.').lastOption.flatMap(short => req.sources.keys.find(_.equalsIgnoreCase(short))).filter { short =>
+        !req.sourceQualifiedNames.keys.exists(_.equalsIgnoreCase(short))
+      }
+    exactShort.orElse(fromQual).orElse(trailing)
+  }
+
+  private[compiler] def nativeDeltaShape(req: CompileRequest): Map[String, DeltaShape] =
+    req.facts.deltaShape.foldLeft(Map.empty[String, DeltaShape]) { case (mapped, (table, shape)) =>
+      val source = nativeSourceName(req, table).getOrElse(table)
+      mapped.updated(source, mapped.get(source).filter(_ != shape).map(_ => DeltaShape.General).getOrElse(shape))
+    }
+
   private[compiler] def declareRelyFkStatements(req: CompileRequest): Seq[String] = {
     if (!req.facts.declareRelyFk) return Seq.empty
-
-    def normalizeTableName(table: String): Option[String] = {
-      val exactShort = req.sources.get(table).map(_ => table)
-      val fromQual = req.sourceQualifiedNames.collectFirst {
-        case (short, qualified) if qualified.equalsIgnoreCase(table) && req.sources.contains(short) => short
-      }
-      val trailing = table.split('.').lastOption.filter(req.sources.contains)
-      exactShort.orElse(fromQual).orElse(trailing)
-    }
 
     req.facts.fkRelations
       .filter(fk => fk.rely && fk.childColumns.nonEmpty && fk.parentColumns.nonEmpty)
       .flatMap { fk =>
         for {
-          child  <- normalizeTableName(fk.childTable)
-          parent <- normalizeTableName(fk.parentTable)
+          child  <- nativeSourceName(req, fk.childTable)
+          parent <- nativeSourceName(req, fk.parentTable)
         } yield declareRelyFkStatement(fk.copy(childTable = child, parentTable = parent))
       }
       .distinct

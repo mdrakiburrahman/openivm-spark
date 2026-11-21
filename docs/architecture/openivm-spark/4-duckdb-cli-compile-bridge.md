@@ -62,19 +62,19 @@ The dependency file says this directly:
 
 ```scala
 // spark-ext/project/Dependencies.scala:7-10
-// DuckDB JDBC pinned to track openivm's bundled DuckDB v1.5.x.
+// DuckDB JDBC pinned to track openivm's bundled DuckDB v2.0.x.
 // The .duckdb_extension binary is built from openivm@OPENIVM_COMMIT inside
 // the spark-ext Docker image.  The compiler module uses the CLI at
 // /opt/openivm/duckdb (same ABI version as the extension) rather than JDBC.
-val duckdbV = "1.5.2.1"
+val duckdbV = "2.0.0.1"
 ```
 
 The dev pin file carries the same version contract:
 
 ```text
 # spark-ext/dev/pins.env:55-56
-# DuckDB JDBC (must match openivm's bundled DuckDB ABI; openivm CI pins v1.5.2)
-DUCKDB_JDBC_VERSION=1.5.2.1
+# DuckDB JDBC matches the DuckDB 2.0 native compiler ABI.
+DUCKDB_JDBC_VERSION=2.0.0.1
 ```
 
 The parity spec that exercises this path is

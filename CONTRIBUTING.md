@@ -22,7 +22,7 @@ well.
 1. Clone the repo on Windows, then check out and push the branch you want to work on:
 
    ```powershell
-   git clone https://github.com/mdrakiburrahman/openivm-spark.git
+   git clone https://github.com/openivm/openivm-spark.git
    ```
 
 1. From an **elevated PowerShell 7** prompt in the checkout, install [Task](https://taskfile.dev) and run

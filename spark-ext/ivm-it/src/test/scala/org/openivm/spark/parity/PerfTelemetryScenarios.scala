@@ -130,6 +130,33 @@ abstract class PerfTelemetryScenarios extends IvmParitySpecBase("perf-telemetry"
       }
     }
 
+    it("reuses the compile in one session while binding each batch to its own changes") {
+      sql("CREATE TABLE perftel_reuse_src(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO perftel_reuse_src VALUES (1, 10)")
+      val definition = "SELECT id, amount FROM perftel_reuse_src WHERE amount > 0"
+      sql(s"CREATE MATERIALIZED VIEW perftel_reuse_mv AS $definition")
+
+      def refreshAndCheck(query: String, cacheHit: Boolean): Unit = {
+        val compile = withLogCapture { appender =>
+          refreshMv("perftel_reuse_mv")
+          perfLinesFor(appender.messages, "perftel_reuse_mv").find(phaseOf(_).contains("compile"))
+        }
+        compile.get should include(s"compile_cache_hit=$cacheHit")
+        assertMvCorrect("perftel_reuse_mv", query)
+      }
+
+      sql("INSERT INTO perftel_reuse_src VALUES (2, 20)")
+      refreshAndCheck(definition, cacheHit = false)
+      sql("INSERT INTO perftel_reuse_src VALUES (3, 30)")
+      refreshAndCheck(definition, cacheHit = true)
+
+      sql("DROP MATERIALIZED VIEW perftel_reuse_mv")
+      val replacement = "SELECT id, amount FROM perftel_reuse_src WHERE amount > 20"
+      sql(s"CREATE MATERIALIZED VIEW perftel_reuse_mv AS $replacement")
+      sql("INSERT INTO perftel_reuse_src VALUES (4, 5), (5, 50)")
+      refreshAndCheck(replacement, cacheHit = false)
+    }
+
     it("emits end with outcome='no_pending_deltas' when nothing to refresh") {
       sql("DROP TABLE IF EXISTS perftel_users_nop")
       sql("DROP MATERIALIZED VIEW IF EXISTS perftel_mv_nop")

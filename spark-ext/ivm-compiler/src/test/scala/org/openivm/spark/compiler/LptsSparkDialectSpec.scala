@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -9,6 +10,93 @@ import org.scalatest.matchers.should.Matchers
   * at the end verify the full [[LptsSparkDialect.translate]] pipeline.
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
+
+  describe("parenthesized boolean scan filters") {
+    it("removes redundant parentheses that Spark misanalyzes in generated CTEs") {
+      val sql        = "WITH r(flag) AS (SELECT flag FROM source WHERE   (flag)) SELECT * FROM r"
+      val translated = LptsSparkDialect.translate(sql)
+      translated shouldBe "WITH r(flag) AS (SELECT flag FROM source WHERE flag) SELECT * FROM r"
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("does not rewrite strings, comments, identifiers, or compound predicates") {
+      val sql = "SELECT 'WHERE (flag)', `WHERE (flag)` FROM t WHERE (a AND b) -- WHERE (flag)\n" +
+        "/* WHERE (flag) */ SELECT * FROM t WHERE (flag)"
+      LptsSparkDialect.rewriteParenthesizedBareWhere(sql) shouldBe
+        sql.replace("SELECT * FROM t WHERE (flag)", "SELECT * FROM t WHERE flag")
+    }
+  }
+
+  describe("DuckDB 2.0 qualified interval functions") {
+    it("translates the initial-load interval expression without catalog-qualified functions") {
+      val sql = """SELECT ts - "system".main."add"("system".main."add"(
+        |"system".main.to_months(0), "system".main.to_days(0)),
+        |"system".main.to_microseconds(CAST(1000 AS BIGINT))) AS shifted FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("make_interval(0, 0, 0, 0, 0, 0,")
+      translated should include("/ 1000000.0)")
+      translated should not include "to_microseconds"
+      translated should not include "system"
+      translated should not include "add("
+      noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("leaves quoted identifiers, strings, and comments alone") {
+      val sql = """SELECT 'system.main.add(1, 2)', "system.main.add", x
+        |-- system.main.add(1, 2)
+        |/* system.main.to_days(1) */ FROM t""".stripMargin
+      LptsSparkDialect.translate(sql) should include("'system.main.add(1, 2)'")
+      LptsSparkDialect.translate(sql) should include("/* system.main.to_days(1) */")
+      LptsSparkDialect.translate(sql) should include("\"system.main.add\"")
+    }
+
+    it("dequalifies other built-in calls before translating nested struct fields") {
+      val sql = """SELECT "system"."main"."struct_extract"(
+        |  "system"."main"."struct_extract"(Customer, 'Name'), 'C_F_NAME') AS first_name FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("Customer.Name.C_F_NAME")
+      translated should not include "system"
+      noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+    }
+
+    it("removes DuckDB's unused LAG and LEAD frames accepted by Spark") {
+      val sql = """SELECT lag(th_dts) OVER (PARTITION BY t_id ORDER BY th_dts DESC
+        |  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        |lead(th_dts, 1) OVER (PARTITION BY t_id ORDER BY th_dts
+        |  RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+        |sum(amount) OVER (PARTITION BY t_id ORDER BY th_dts
+        |  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated.toUpperCase(java.util.Locale.ROOT).split("ROWS BETWEEN", -1).length shouldBe 2
+      translated.toUpperCase(java.util.Locale.ROOT) should not include "RANGE BETWEEN"
+      noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("keeps an ORDER BY column named rows while removing a real frame") {
+      val sql        = "SELECT lag(x) OVER (ORDER BY rows ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t"
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("ORDER BY rows)")
+      translated.toUpperCase(java.util.Locale.ROOT) should not include "ROWS BETWEEN"
+      LptsSparkDialect.translate("SELECT lag(x) OVER (ORDER BY rows) FROM t") shouldBe
+        "SELECT lag(x) OVER (ORDER BY rows) FROM t"
+      noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+    }
+
+    it("uses bare literal offsets for Spark LAG and LEAD analysis") {
+      val sql = """SELECT lag(ts, CAST(1 AS BIGINT), CAST(NULL AS TIMESTAMP)) OVER (ORDER BY ts),
+        |lead(ts, CAST(2 AS INTEGER)) OVER (ORDER BY ts),
+        |lag(ts, CAST(n AS BIGINT)) OVER (ORDER BY ts),
+        |'lag(ts, CAST(1 AS BIGINT))' FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("lag(ts, 1, CAST(NULL AS TIMESTAMP))")
+      translated should include("lead(ts, 2)")
+      translated should include("lag(ts, CAST(n AS BIGINT))")
+      translated should include("'lag(ts, CAST(1 AS BIGINT))'")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+  }
 
   describe("null-on-error timestamp parser shim") {
     it("renames the safe parser without changing literals or comments") {
@@ -26,7 +114,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
   describe("integer casts around DuckDB numeric truncation") {
     it("uses Spark's truncating integer cast for native interval constructors") {
       val input    = "SELECT to_months(CAST(trunc(CAST(-12 AS DOUBLE)) AS INTEGER))"
-      val expected = "SELECT ((CAST(CAST(-12 AS DOUBLE) AS INTEGER)) * INTERVAL 1 MONTH)"
+      val expected = "SELECT make_interval(0, CAST(CAST(-12 AS DOUBLE) AS INTEGER), 0, 0, 0, 0, 0)"
       LptsSparkDialect.translate(input) shouldBe expected
       LptsSparkDialect.translate(expected) shouldBe expected
     }
@@ -811,6 +899,22 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         "REPLACE(s, concat(chr(92), chr(39)), '_')"
     }
 
+    it("deduplicates an anti-join projection used only as its RHS") {
+      val sql =
+        """WITH t8_projection_materialized_for_join (scalar_0, sk_broker_id) AS (
+          |    SELECT 1, sk_broker_id FROM trades
+          |)
+          |SELECT b.sk_broker_id FROM brokers b ANTI JOIN t8_projection_materialized_for_join
+          |ON b.sk_broker_id <=> t8_projection_materialized_for_join.sk_broker_id""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("SELECT DISTINCT 1, sk_broker_id FROM trades")
+      LptsSparkDialect.translate(translated) shouldBe translated
+      noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+
+      val reused = sql + " UNION ALL SELECT sk_broker_id FROM t8_projection_materialized_for_join"
+      LptsSparkDialect.translate(reused) shouldBe reused
+    }
+
     it("preserves surrounding plain-text segments around an embedded quote") {
       val sql = "REPLACE(s, 'it''s', '_')"
       LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe
@@ -911,11 +1015,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         LptsSparkDialect.translate(s)
     }
 
-    it("is idempotent for SQL containing backslash/quote literals (double translate, as happens in production)") {
-      // OpenIvmCompiler.parseInitialLoadSql already calls translate() once
-      // before storing initialLoadSql; MaterializedViewCommands then calls
-      // translate() again on that already-translated value at every CREATE
-      // call site. This must be a safe no-op on the second call.
+    it("is idempotent for SQL containing backslash/quote literals") {
       val s =
         "SELECT id, REPLACE(REPLACE(os_name, '\\', '_'), '''', '_') AS cleaned FROM t"
       LptsSparkDialect.translate(LptsSparkDialect.translate(s)) shouldBe

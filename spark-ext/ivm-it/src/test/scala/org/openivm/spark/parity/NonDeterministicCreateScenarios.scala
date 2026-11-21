@@ -1,19 +1,13 @@
 package org.openivm.spark.parity
 
-import org.apache.spark.sql.AnalysisException
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 
-/** CREATE MATERIALIZED VIEW rejects an incrementally maintained query whose result depends on
-  * evaluation time or randomness: maintaining it incrementally re-evaluates the expression only for
-  * changed rows, so the view would diverge from a recompute of its query. Views recomputed on every
-  * refresh stay accepted. Detection of each random expression is covered by `MvDeterminismSpec`;
-  * Spark itself rejects them inside aggregate arguments, and OpenIVM recomputes them elsewhere.
+/** Time-dependent queries must use full refresh, so results are reevaluated for every source row.
+  * Spark's expression-level rejection of unsafe incremental plans is covered by `MvDeterminismSpec`.
   */
 abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-deterministic-create") {
   self: IvmParityMode =>
-
-  private val AllowKey = "spark.openivm.create.allowNonDeterministic"
 
   private def refreshType(name: String): Int =
     MvCatalog
@@ -21,51 +15,38 @@ abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-de
       .map(_.refreshType)
       .getOrElse(fail(s"MV $name not found in catalog"))
 
-  private def withNonDeterministicAllowed[T](body: => T): T = {
-    spark.conf.set(AllowKey, "true")
-    try body
-    finally spark.conf.unset(AllowKey)
-  }
-
-  /** Creates `mv` with the escape hatch, proves it is maintained incrementally, drops it, and
-    * asserts CREATE without the escape hatch rejects it naming `expression`.
-    */
-  private def assertRejectedIncremental(mv: String, query: String, expression: String): Unit = {
-    withNonDeterministicAllowed(sql(s"CREATE MATERIALIZED VIEW $mv AS $query"))
-    refreshType(mv) should not be RefreshTypeCode.FullRefresh
-    sql(s"DROP MATERIALIZED VIEW $mv")
-
-    val error = intercept[AnalysisException](sql(s"CREATE MATERIALIZED VIEW $mv AS $query"))
-    error.getMessage should include(expression)
-    error.getMessage should include("diverge from a recompute")
-    error.getMessage should include(AllowKey)
-    MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)) shouldBe None
-    spark.catalog.tableExists(mv) shouldBe false
+  private def assertRecomputed(mv: String, query: String, insert: String): Unit = {
+    sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+    refreshType(mv) shouldBe RefreshTypeCode.FullRefresh
+    assertMvCorrect(mv, query)
+    sql(insert)
+    refreshMv(mv)
+    assertMvCorrect(mv, query)
   }
 
   describe("CREATE MATERIALIZED VIEW determinism guard") {
 
-    it("rejects a time-dependent expression in an incrementally maintained view") {
+    it("fully refreshes a view with a time-dependent date expression") {
       sql("CREATE TABLE nd_date_src (k INT, d DATE, v BIGINT) USING DELTA")
       sql("INSERT INTO nd_date_src VALUES (1, current_date(), 10), (1, DATE '2020-01-01', 20), (2, current_date(), 5)")
-      assertRejectedIncremental(
+      assertRecomputed(
         "nd_date_mv",
         "SELECT k, SUM(CASE WHEN d >= current_date() THEN v ELSE 0 END) AS today_total, COUNT(*) AS n " +
           "FROM nd_date_src GROUP BY k",
-        "current_date"
+        "INSERT INTO nd_date_src VALUES (3, current_date(), 7)"
       )
     }
 
-    it("rejects current_timestamp() in an incrementally maintained view") {
+    it("fully refreshes a view with a time-dependent timestamp expression") {
       sql("CREATE TABLE nd_ts_src (k INT, ts TIMESTAMP, v BIGINT) USING DELTA")
       sql(
         "INSERT INTO nd_ts_src VALUES (1, TIMESTAMP '2020-01-01 00:00:00', 10), (2, TIMESTAMP '2999-01-01 00:00:00', 5)"
       )
-      assertRejectedIncremental(
+      assertRecomputed(
         "nd_ts_mv",
         "SELECT k, SUM(CASE WHEN ts <= current_timestamp() THEN v ELSE 0 END) AS elapsed_total, COUNT(*) AS n " +
           "FROM nd_ts_src GROUP BY k",
-        "current_timestamp"
+        "INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2020-01-01 00:00:00', 7)"
       )
     }
 

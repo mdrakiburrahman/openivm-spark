@@ -11,14 +11,23 @@ object OpenIvmMaintenanceCoordinator {
 
   private val registrations = mutable.HashMap.empty[OpenIvmRocksDB, OpenIvmRocksDBConf]
 
-  @volatile private var running    = false
-  private var daemonThread: Thread = _
+  @volatile private var running                               = false
+  private var daemonThread: Thread                            = _
+  @volatile private var beforeSleepHookForTesting: () => Unit = () => ()
+
+  private[rocksdb] def setBeforeSleepHookForTesting(hook: () => Unit): Unit =
+    beforeSleepHookForTesting = hook
+
+  private[rocksdb] def clearBeforeSleepHookForTesting(): Unit =
+    beforeSleepHookForTesting = () => ()
 
   def register(db: OpenIvmRocksDB, conf: OpenIvmRocksDBConf): Unit = {
     val threadToInterrupt = this.synchronized {
+      val previousInterval = currentIntervalMsLocked()
+      val existingDaemon   = daemonThread != null && daemonThread.isAlive
       registrations.update(db, conf)
       startDaemonIfNeededLocked()
-      daemonThread
+      if (existingDaemon && currentIntervalMsLocked() < previousInterval) daemonThread else null
     }
     if (threadToInterrupt != null) {
       threadToInterrupt.interrupt()
@@ -26,12 +35,8 @@ object OpenIvmMaintenanceCoordinator {
   }
 
   def unregister(db: OpenIvmRocksDB): Unit = {
-    val threadToInterrupt = this.synchronized {
+    this.synchronized {
       registrations.remove(db)
-      daemonThread
-    }
-    if (threadToInterrupt != null) {
-      threadToInterrupt.interrupt()
     }
   }
 
@@ -92,41 +97,48 @@ object OpenIvmMaintenanceCoordinator {
         return
       }
 
-      try {
-        Thread.sleep(sleepMs)
-      } catch {
-        case _: InterruptedException => ()
-      }
+      beforeSleepHookForTesting()
+      val intervalElapsed =
+        try {
+          Thread.sleep(sleepMs)
+          true
+        } catch {
+          // Registration and removal wake us to recalculate the interval. They
+          // must not turn a scheduled maintenance pass into an immediate sweep.
+          case _: InterruptedException => false
+        }
 
       if (!running) {
         return
       }
 
-      val snapshot = this.synchronized {
-        registrations.toSeq
-      }
+      if (intervalElapsed) {
+        val snapshot = this.synchronized {
+          registrations.toSeq
+        }
 
-      snapshot.foreach { case (db, conf) =>
-        try {
-          if (!db.isClosed) {
-            val runStarted = System.nanoTime()
-            OpenIvmMetrics.increment("rocksdb.maintenance.run.count")
-            db.withWriteLock {
-              val holdStarted = System.nanoTime()
-              if (!db.isClosed) {
-                db.cleanup(conf.minVersionsToRetain)
-                if (db.sstFileCount > conf.compactionThresholdSstCount) {
-                  OpenIvmMetrics.increment("rocksdb.maintenance.compaction.count")
-                  db.compactRange()
+        snapshot.foreach { case (db, conf) =>
+          try {
+            if (!db.isClosed) {
+              val runStarted = System.nanoTime()
+              OpenIvmMetrics.increment("rocksdb.maintenance.run.count")
+              db.withWriteLock {
+                val holdStarted = System.nanoTime()
+                if (!db.isClosed) {
+                  db.cleanup(conf.minVersionsToRetain)
+                  if (db.sstFileCount > conf.compactionThresholdSstCount) {
+                    OpenIvmMetrics.increment("rocksdb.maintenance.compaction.count")
+                    db.compactRange()
+                  }
                 }
+                OpenIvmMetrics.updateTimer("rocksdb.maintenance.lock_hold", System.nanoTime() - holdStarted)
               }
-              OpenIvmMetrics.updateTimer("rocksdb.maintenance.lock_hold", System.nanoTime() - holdStarted)
+              OpenIvmMetrics.updateTimer("rocksdb.maintenance.run", System.nanoTime() - runStarted)
             }
-            OpenIvmMetrics.updateTimer("rocksdb.maintenance.run", System.nanoTime() - runStarted)
+          } catch {
+            case NonFatal(error) =>
+              log.warn(s"openivm-rocksdb maintenance failed for ${db.path}", error)
           }
-        } catch {
-          case NonFatal(error) =>
-            log.warn(s"openivm-rocksdb maintenance failed for ${db.path}", error)
         }
       }
     }
