@@ -409,68 +409,68 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
           case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
         }
       }
+    }
 
-      it("rejects a stale table ID before advancing the replacement") {
-        val key      = "dbt.fabricspark.materialized_view.query_hash"
-        val target   = "`spark_catalog`.`default`.`ensure_mv_p18`"
-        val metaName = "default.ensure_mv_p18"
-        val ident    = TableIdentifier("ensure_mv_p18", Some("default"))
-        val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
-        spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+    it("rejects a stale table ID before advancing the replacement") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p18`"
+      val metaName = "default.ensure_mv_p18"
+      val ident    = TableIdentifier("ensure_mv_p18", Some("default"))
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p18 (id INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p18 VALUES (1)")
+        val create = s"CREATE MATERIALIZED VIEW default.ensure_mv_p18 TBLPROPERTIES ('$key' = '$hash') AS " +
+          "SELECT id FROM ensure_src_p18"
+        sql(create)
+        val firstId = eligibility(target).getString(3)
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
+        sql(create)
+        val secondId = eligibility(target).getString(3)
+        secondId should not be firstId
+        sql("INSERT INTO ensure_src_p18 VALUES (2)")
+        val before  = MvCatalog.lookup(spark, ident).get
+        val delta   = io.delta.tables.DeltaTable.forPath(spark, before.location)
+        val version = delta.history(1).head().getLong(0)
+        val cdf     = CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables)
+        val staging = StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks)
+        var backups = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-id-pin-test"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => backups += 1 }
         try {
-          sql("CREATE TABLE ensure_src_p18 (id INT) USING DELTA")
-          sql("INSERT INTO ensure_src_p18 VALUES (1)")
-          val create = s"CREATE MATERIALIZED VIEW default.ensure_mv_p18 TBLPROPERTIES ('$key' = '$hash') AS " +
-            "SELECT id FROM ensure_src_p18"
-          sql(create)
-          val firstId = eligibility(target).getString(3)
-          sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
-          sql(create)
-          val secondId = eligibility(target).getString(3)
-          secondId should not be firstId
-          sql("INSERT INTO ensure_src_p18 VALUES (2)")
-          val before  = MvCatalog.lookup(spark, ident).get
-          val delta   = io.delta.tables.DeltaTable.forPath(spark, before.location)
-          val version = delta.history(1).head().getLong(0)
-          val cdf     = CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables)
-          val staging = StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks)
-          var backups = 0
-          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-id-pin-test"))
-          OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => backups += 1 }
-          try {
-            val failure = intercept[Exception](pinned(target, firstId))
-            Iterator
-              .iterate[Throwable](failure)(_.getCause)
-              .takeWhile(_ != null)
-              .exists(e => Option(e.getMessage).exists(_.contains("expected table ID mismatch"))) shouldBe true
-            backups shouldBe 0
-          } finally {
-            OpenIvmStateSync.setBackupPassHookForTesting(null)
-            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
-          }
-          MvCatalog.lookup(spark, ident).get shouldBe before
-          CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables) shouldBe cdf
-          StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks) shouldBe staging
-          delta.history(1).head().getLong(0) shouldBe version
-          eligibility(target).getString(3) shouldBe secondId
-          assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18 WHERE id = 1")
-          val result = pinned(target, secondId).head
-          result.getString(0) shouldBe "refreshed"
-          result.getString(3) shouldBe secondId
-          delta.history(1).head().getLong(0) should be > version
-          assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18")
-          sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
-          val absentFailure = intercept[Exception](pinned(target, secondId))
+          val failure = intercept[Exception](pinned(target, firstId))
           Iterator
-            .iterate[Throwable](absentFailure)(_.getCause)
+            .iterate[Throwable](failure)(_.getCause)
             .takeWhile(_ != null)
-            .exists(e => Option(e.getMessage).exists(_.contains("is absent"))) shouldBe true
-          guarded(target).head.getString(0) shouldBe "absent"
+            .exists(e => Option(e.getMessage).exists(_.contains("expected table ID mismatch"))) shouldBe true
+          backups shouldBe 0
         } finally {
-          oldAsync match {
-            case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
-            case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
-          }
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        MvCatalog.lookup(spark, ident).get shouldBe before
+        CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables) shouldBe cdf
+        StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks) shouldBe staging
+        delta.history(1).head().getLong(0) shouldBe version
+        eligibility(target).getString(3) shouldBe secondId
+        assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18 WHERE id = 1")
+        val result = pinned(target, secondId).head
+        result.getString(0) shouldBe "refreshed"
+        result.getString(3) shouldBe secondId
+        delta.history(1).head().getLong(0) should be > version
+        assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18")
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
+        val absentFailure = intercept[Exception](pinned(target, secondId))
+        Iterator
+          .iterate[Throwable](absentFailure)(_.getCause)
+          .takeWhile(_ != null)
+          .exists(e => Option(e.getMessage).exists(_.contains("is absent"))) shouldBe true
+        guarded(target).head.getString(0) shouldBe "absent"
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
         }
       }
     }

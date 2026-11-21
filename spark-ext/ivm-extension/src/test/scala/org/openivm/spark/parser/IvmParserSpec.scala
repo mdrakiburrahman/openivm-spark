@@ -386,6 +386,10 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
         .asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("id", Some("dbo"), Some("Lakehouse"))
       cmd.expectedTableId shouldBe Some("abcdef01-2345-6789-abcd-ef0123456789")
+      spark.sessionState.sqlParser
+        .parsePlan("REFRESH MATERIALIZED VIEW default.id")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+        .name shouldBe TableIdentifier("id", Some("default"))
       Seq(
         prefix + "'abcdef0123456789abcdef0123456789' IF EXISTS",
         prefix + "'abcdef01-2345-6789-abcd-ef012345678g' IF EXISTS",
