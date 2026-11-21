@@ -220,8 +220,30 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         proof.getString(2) shouldBe target
         (3 to 5).foreach(i => proof.getString(i) should not be empty)
         assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
-        val meta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
-        val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        val meta           = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        val version        = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        val oldBackend     = spark.conf.getOption("spark.openivm.catalog.backend")
+        val oldCatalogPath = spark.conf.getOption("spark.openivm.catalog.path")
+        val warehouse      = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")))
+        val catalogRoot    = new java.io.File(warehouse, "eligibility_existing_catalog")
+        spark.conf.set("spark.openivm.catalog.backend", "delta")
+        spark.conf.set("spark.openivm.catalog.path", catalogRoot.toString)
+        try {
+          MvCatalog.upsert(spark, meta)
+          val catalog = io.delta.tables.DeltaTable.forPath(spark, new java.io.File(catalogRoot, "mv_metadata").toString)
+          val catalogVersion = catalog.history(1).head().getLong(0)
+          eligibility(target).getString(0) shouldBe "eligible"
+          catalog.history(1).head().getLong(0) shouldBe catalogVersion
+        } finally {
+          oldBackend match {
+            case Some(value) => spark.conf.set("spark.openivm.catalog.backend", value)
+            case None        => spark.conf.unset("spark.openivm.catalog.backend")
+          }
+          oldCatalogPath match {
+            case Some(value) => spark.conf.set("spark.openivm.catalog.path", value)
+            case None        => spark.conf.unset("spark.openivm.catalog.path")
+          }
+        }
         sql("INSERT INTO ensure_src_p15 VALUES (3)")
         try {
           val identityKey = MvMetadata.TargetDeltaTableIdKey
