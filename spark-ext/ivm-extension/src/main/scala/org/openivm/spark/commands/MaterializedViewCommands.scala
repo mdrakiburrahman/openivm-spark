@@ -10,6 +10,7 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
+  And,
   AttributeReference,
   EqualNullSafe,
   Expression,
@@ -6993,6 +6994,15 @@ case class RefreshMaterializedViewCommand(
                 ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
                 else None
               val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
+              val groupAtomicShape =
+                if (
+                  FeatureGate.groupAtomicReplaceEnabled(spark) &&
+                  meta.refreshType == RefreshTypeCode.GroupRecompute &&
+                  !propagation.requiresDmlInterception && propagation.requiresMvCdf
+                )
+                  buildGroupAtomicShape(spark, mergeTargetId, rewrittenSql)
+                else None
+              var groupAtomicSql = Option.empty[String]
               val windowCascadeMergeShape: Option[WindowCascadeMergeShape] =
                 if (
                   FeatureGate.windowCascadeMergeEnabled(spark) &&
@@ -7162,6 +7172,16 @@ case class RefreshMaterializedViewCommand(
 
                 if (skipCdfWindowRefresh) {
                   logSkippedStmt(idx, "window_cdf_net_zero_skipped")
+                } else if (groupAtomicShape.exists(_.deleteStmtIdx == idx)) {
+                  groupAtomicSql = groupAtomicShape.flatMap(buildGroupAtomicSql(spark, mergeTargetId, _))
+                  if (groupAtomicSql.isDefined) {
+                    logSkippedStmt(idx, "group_atomic_delete_deferred")
+                  } else {
+                    executeSqlAt(sql, idx)
+                  }
+                } else if (groupAtomicShape.exists(_.insertStmtIdx == idx) && groupAtomicSql.isDefined) {
+                  logInfo(s"[openivm-mv] refresh view='${sqlIdent(name)}' outcome='group_atomic_replace'")
+                  withPlanTimeBroadcastDisabled { executeSqlAt(groupAtomicSql.get, idx) }
                 } else if (materializeWindowAffectedKeys) {
                   executeSqlAt(refinedWindowAffectedSql.getOrElse(sql), idx)
                   val shape = windowCascadeMergeShape.get
@@ -8038,6 +8058,13 @@ case class RefreshMaterializedViewCommand(
       affectedCol: String
   )
 
+  private case class GroupAtomicShape(
+      affectedView: String,
+      deleteStmtIdx: Int,
+      insertStmtIdx: Int,
+      keys: Seq[(String, String)]
+  )
+
   private case class WindowCascadeMergePlan(
       deleteStmtIdx: Int,
       insertStmtIdx: Int,
@@ -8330,6 +8357,101 @@ case class RefreshMaterializedViewCommand(
         insertSql = insertSql,
         restoreSql = restoreSql
       )
+    )
+  }
+
+  private def buildGroupAtomicShape(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      statements: Seq[String]
+  ): Option[GroupAtomicShape] = {
+    val target   = java.util.regex.Pattern.quote(MvCommandHelper.sqlIdent(targetId))
+    val affected = s"openivm_affected_${name.table}"
+    val newView  = s"openivm_new_${name.table}"
+    def identifier(s: String): String =
+      "(?:`" + java.util.regex.Pattern.quote(s) + "`|" + java.util.regex.Pattern.quote(s) + ")"
+    val deleteRe =
+      ("(?is)^\\s*MERGE\\s+INTO\\s+" + target + "\\s+AS\\s+v\\s+USING\\s+" +
+        identifier(affected) + "\\s+AS\\s+d\\s+ON\\s+.+\\s+WHEN\\s+MATCHED\\s+THEN\\s+DELETE\\s*;?\\s*$").r
+    val insertRe =
+      ("(?is)^\\s*INSERT\\s+INTO\\s+" + target + "\\s+SELECT\\s+\\*\\s+FROM\\s+" +
+        identifier(newView) + "\\s*;?\\s*$").r
+    val deletes = statements.zipWithIndex.filter { case (s, _) => deleteRe.findFirstIn(s).isDefined }
+    val inserts = statements.zipWithIndex.filter { case (s, _) => insertRe.findFirstIn(s).isDefined }
+    if (deletes.size != 1 || inserts.size != 1 || inserts.head._2 != deletes.head._2 + 1) return None
+    val (deleteSql, deleteIdx) = deletes.head
+    val resolver              = spark.sessionState.analyzer.resolver
+    def keyPair(e: Expression): Option[(String, String)] = e match {
+      case EqualNullSafe(a: UnresolvedAttribute, b: UnresolvedAttribute)
+          if a.nameParts.size == 2 && b.nameParts.size == 2 =>
+        if (resolver(a.nameParts.head, "v") && resolver(b.nameParts.head, "d"))
+          Some(a.nameParts.last -> b.nameParts.last)
+        else if (resolver(b.nameParts.head, "v") && resolver(a.nameParts.head, "d"))
+          Some(b.nameParts.last -> a.nameParts.last)
+        else None
+      case _ => None
+    }
+    def pairs(e: Expression): Option[Seq[(String, String)]] = e match {
+      case And(left, right) => for { a <- pairs(left); b <- pairs(right) } yield a ++ b
+      case other            => keyPair(other).map(Seq(_))
+    }
+    val keys = spark.sessionState.sqlParser.parsePlan(deleteSql) match {
+      case merge: MergeIntoTable => pairs(merge.mergeCondition)
+      case _                     => None
+    }
+    keys.filter(_.nonEmpty).map(GroupAtomicShape(affected, deleteIdx, inserts.head._2, _))
+  }
+
+  private def buildGroupAtomicSql(
+      spark: SparkSession,
+      targetId: TableIdentifier,
+      shape: GroupAtomicShape
+  ): Option[String] = {
+    val target       = MvCommandHelper.sqlIdent(targetId)
+    val targetSchema = spark.table(target).schema
+    val newView      = s"openivm_new_${name.table}"
+    val newSchema    = spark.table(newView).schema
+    val resolver     = spark.sessionState.analyzer.resolver
+    if (
+      targetSchema.length != newSchema.length ||
+      !targetSchema.fields.zip(newSchema.fields).forall { case (a, b) =>
+        resolver(a.name, b.name) && a.dataType == b.dataType
+      }
+    ) return None
+    val affectedSchema = spark.table(shape.affectedView).schema
+    val keyNames       = shape.keys.indices.map(i => s"__openivm_group_key_$i")
+    val deleteName     = "__openivm_group_delete"
+    if (targetSchema.fieldNames.exists(c => (keyNames :+ deleteName).exists(resolver(c, _)))) return None
+    val keyFields = shape.keys.map { case (targetKey, affectedKey) =>
+      val targetMatches   = targetSchema.fields.filter(f => resolver(f.name, targetKey))
+      val affectedMatches = affectedSchema.fields.filter(f => resolver(f.name, affectedKey))
+      if (targetMatches.length != 1 || affectedMatches.length != 1) return None
+      (targetMatches.head, affectedMatches.head)
+    }
+    val columns      = targetSchema.fieldNames.toSeq.map(quoteCol)
+    val emptyColumns = targetSchema.fields.map(f => s"CAST(NULL AS ${f.dataType.sql}) AS ${quoteCol(f.name)}")
+    val emptyKeys = keyFields.zip(keyNames).map { case ((_, source), key) =>
+      s"CAST(NULL AS ${source.dataType.sql}) AS ${quoteCol(key)}"
+    }
+    val sourceKeys = keyFields.zip(keyNames).map { case ((_, source), key) =>
+      s"${quoteCol(source.name)} AS ${quoteCol(key)}"
+    }
+    val condition = keyFields.zip(keyNames).map { case ((targetField, _), key) =>
+      s"v.${quoteCol(targetField.name)} <=> d.${quoteCol(key)}"
+    }.mkString(" AND ")
+    Some(
+      s"""|MERGE INTO $target AS v
+          |USING (
+          |  SELECT ${columns.mkString(", ")}, ${emptyKeys.mkString(", ")}, false AS ${quoteCol(deleteName)}
+          |  FROM ${quoteCol(newView)}
+          |  UNION ALL
+          |  SELECT DISTINCT ${emptyColumns.mkString(", ")}, ${sourceKeys.mkString(", ")}, true AS ${quoteCol(deleteName)}
+          |  FROM ${quoteCol(shape.affectedView)}
+          |) AS d
+          |ON d.${quoteCol(deleteName)} AND $condition
+          |WHEN MATCHED THEN DELETE
+          |WHEN NOT MATCHED AND NOT d.${quoteCol(deleteName)} THEN
+          |  INSERT (${columns.mkString(", ")}) VALUES (${columns.map(c => s"d.$c").mkString(", ")})""".stripMargin
     )
   }
 
