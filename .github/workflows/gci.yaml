@@ -43,7 +43,7 @@ jobs:
       - name: Show formatting changes
         run: |
           npx --no-install nx run spark-ext:fmt --configuration=${{ matrix.target }}
-          git --no-pager diff -- spark-ext
+          git --no-pager diff --exit-code -- spark-ext
 
       - name: Verify
         run: >-
